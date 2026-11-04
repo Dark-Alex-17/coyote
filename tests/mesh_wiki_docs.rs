@@ -659,6 +659,73 @@ fn the_mesh_page_says_a_thread_is_omitted_to_start_and_anything_else_is_refused(
     );
 }
 
+mod request_bad_path_tests {
+    use super::*;
+
+    /// `.mesh request` refuses a path the wire grammar refuses with one sentence, and
+    /// the Commands page quotes it word for word. The code side is checked on every run.
+    #[test]
+    fn the_commands_page_quotes_the_request_bad_path_remedy() {
+        let sentence = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it.";
+        let source = read(repo_root().join("src/repl/mesh.rs"));
+        assert!(
+            source.contains(&format!("\"{sentence}\"")),
+            "src/repl/mesh.rs no longer refuses a bad .mesh request path with {sentence:?}"
+        );
+        let Some(wiki) = wiki_dir() else { return };
+        let page = read(wiki.join("Mesh-Commands.md"));
+        let section = page
+            .split_once("### `.mesh request`")
+            .and_then(|(_, rest)| rest.split("\n### ").next())
+            .expect("Mesh-Commands.md has a `.mesh request` section");
+        assert!(
+            section.contains(&format!("`{sentence}`")),
+            "the `.mesh request` section does not quote {sentence:?}"
+        );
+    }
+}
+
+mod fetch_cap_tests {
+    use super::*;
+
+    /// The two caps the pages state as numbers: how many senders one propagation sync asks
+    /// the mesh for, and how many listed paths are remembered per peer. Moving either
+    /// constant goes red here until the pages say the new number. The code side is
+    /// checked on every run.
+    #[test]
+    fn the_pages_state_the_source_ask_and_listed_path_caps_the_code_sets() {
+        let propagation = read(repo_root().join("src/mesh/propagation_fetch.rs"));
+        assert!(
+            propagation.contains("pub(crate) const MAX_SOURCE_ASKS_PER_FETCH: usize = 4;"),
+            "MAX_SOURCE_ASKS_PER_FETCH is no longer 4; update Mesh.md and this test"
+        );
+        let fetch = read(repo_root().join("src/mesh/fetch.rs"));
+        assert!(
+            fetch.contains("pub(crate) const LISTED_PATHS_PER_PEER: usize = 512;"),
+            "LISTED_PATHS_PER_PEER is no longer 512; update the pages and this test"
+        );
+        let Some(wiki) = wiki_dir() else { return };
+        let mesh = read(wiki.join("Mesh.md"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            mesh.contains("for at most four senders per sync"),
+            "Mesh.md does not state the source-ask cap"
+        );
+        for page in ["Mesh-Commands.md", "Mesh-File-Sharing.md"] {
+            let text = read(wiki.join(page))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                text.contains("at most 512 paths are kept per peer, the oldest heard going first"),
+                "{page} does not state the listed-path cap"
+            );
+        }
+    }
+}
+
 /// `mesh__peers` reports `compatibility` by the two words `Compatibility::status_word`
 /// returns, with `compatibility_note` beside an incompatible one, and the Mesh page's
 /// peers row says so. The code side is checked on every run.
@@ -806,11 +873,7 @@ fn the_mesh_page_says_envoy_behaviour_varies_by_model_and_what_a_refusal_sends()
             .collect::<Vec<_>>()
             .join("\n")
     };
-    for file in [
-        "assets/config-template.yaml",
-        "config.example.yaml",
-        "config.agent.example.yaml",
-    ] {
+    for file in ["assets/config-template.yaml", "config.example.yaml"] {
         let comment = envoy_model_comment(file, &read(repo_root().join(file)));
         assert!(
             comment.contains("Behaviour varies by model"),

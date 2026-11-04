@@ -1646,6 +1646,7 @@ impl ReceiptFixture {
             sink: &bench.sink,
             node: "fuzz",
             asked: Default::default(),
+            cancel: Default::default(),
         };
         let observed = self
             .rt

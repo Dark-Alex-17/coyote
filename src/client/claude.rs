@@ -719,9 +719,11 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
             }
         }
     }
+    let refusal = (data["stop_reason"].as_str() == Some("refusal"))
+        .then(|| ProviderRefusal::from_stop_details(&data["stop_details"]));
     if text.is_empty() && tool_calls.is_empty() {
-        if data["stop_reason"].as_str() == Some("refusal") {
-            return Err(ProviderRefusal::from_stop_details(&data["stop_details"]).into());
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
         }
         bail!("Invalid response data: {data}");
     }
@@ -731,6 +733,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         tool_calls,
         thinking,
         usage: claude_parse_usage(&data["usage"]),
+        refusal,
     };
     Ok(output)
 }
@@ -1747,5 +1750,36 @@ mod refusal_tests {
         res.unwrap();
         let (text, _, _, _) = handler.take();
         assert_eq!(text, "partial");
+    }
+
+    mod non_stream_refusal_tests {
+        use super::*;
+
+        #[test]
+        fn a_refusal_after_text_keeps_the_text_and_carries_the_refusal() {
+            let data = json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": "refusal",
+                "stop_details": {"category": "cyber"}
+            });
+
+            let output = claude_extract_chat_completions(&data).unwrap();
+
+            assert_eq!(output.text, "partial");
+            let refusal = output.refusal.expect("the refusal rides with the text");
+            assert_eq!(refusal.category.as_deref(), Some("cyber"));
+        }
+
+        #[test]
+        fn an_ordinary_stop_after_text_carries_no_refusal() {
+            let data = json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn"
+            });
+
+            let output = claude_extract_chat_completions(&data).unwrap();
+
+            assert!(output.refusal.is_none());
+        }
     }
 }

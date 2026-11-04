@@ -214,6 +214,8 @@ const DELIVERED: &str = "COYOTE_MESH_DELIVERED";
 const STORED: &str = "COYOTE_MESH_STORED";
 const UNREACHABLE: &str = "COYOTE_MESH_UNREACHABLE";
 const REFUSED: &str = "COYOTE_MESH_REFUSED";
+const THROTTLED: &str = "COYOTE_MESH_THROTTLED";
+const RETRY_LATER: &str = "COYOTE_MESH_RETRY_LATER";
 const BRIEF_SOURCE: &str = "COYOTE_MESH_BRIEF_SOURCE";
 const BRIEF_CHARS: &str = "COYOTE_MESH_BRIEF_CHARS";
 const SIZE: &str = "COYOTE_MESH_SIZE";
@@ -302,6 +304,8 @@ pub(crate) const MESH_HOOK_ENVS: &[(HookEvent, &[&str])] = &[
             STORED,
             UNREACHABLE,
             REFUSED,
+            THROTTLED,
+            RETRY_LATER,
         ],
     ),
     (HookEvent::MeshBriefUpdated, &[BRIEF_SOURCE, BRIEF_CHARS]),
@@ -534,6 +538,8 @@ impl MeshEvent {
                 envs.push((STORED, tally.stored.to_string()));
                 envs.push((UNREACHABLE, tally.unreachable.to_string()));
                 envs.push((REFUSED, tally.refused.to_string()));
+                envs.push((THROTTLED, tally.throttled.to_string()));
+                envs.push((RETRY_LATER, tally.retry_later.to_string()));
             }
             Self::BriefUpdated { source, chars } => {
                 let source = match source {
@@ -744,11 +750,13 @@ mod tests {
             MeshEvent::BulletinSent {
                 id: "b-2".to_string(),
                 tally: BulletinTally {
-                    recipients: 4,
+                    recipients: 6,
                     delivered: 1,
                     stored: 1,
                     unreachable: 1,
                     refused: 1,
+                    throttled: 1,
+                    retry_later: 1,
                 },
             },
             MeshEvent::BriefUpdated {

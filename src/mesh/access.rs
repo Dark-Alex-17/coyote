@@ -601,6 +601,8 @@ impl MeshRuntime {
     /// peer-unreachable errors fall back to store-and-forward: a refusal of any code
     /// means the peer heard and said no, and an oversize or undecodable frame means the
     /// exchange reached the peer, so nothing is held for later.
+    /// A request whose upload ran out before the peer had all of it falls back too: the
+    /// peer never read it, so the stored copy cannot land twice.
     pub(crate) async fn request_access_wire(
         &self,
         destination: &DestinationDesc,
@@ -633,6 +635,7 @@ impl MeshRuntime {
             }
             Err(
                 err @ (RequestError::Timeout { .. }
+                | RequestError::RequestIncomplete { .. }
                 | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
@@ -1713,7 +1716,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh peers` lists the nodes this Coyote has heard from.",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh peers` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );

@@ -379,6 +379,37 @@ mod tests {
         );
     }
 
+    mod record_order_tests {
+        use super::*;
+
+        /// Two threads recording at once: each write is the snapshot its change took, and
+        /// the writes land in the order those snapshots were taken, so the file left
+        /// behind is the newest snapshot, the lists as they are in memory, never an
+        /// older one written last.
+        #[test]
+        fn racing_records_leave_the_newest_snapshot_on_disk() {
+            let tmp = TempDir::new("sent-threads-race");
+            let store = store(&tmp);
+            for round in 0..10 {
+                std::thread::scope(|scope| {
+                    for side in ["a", "b"] {
+                        let store = &store;
+                        scope.spawn(move || {
+                            for i in 0..10 {
+                                store.record_sent(&format!("{side}-{round}-{i}")).unwrap();
+                            }
+                        });
+                    }
+                });
+
+                let file = written(store.path());
+                assert_eq!(file.sent, sent(&store), "round {round}");
+                assert_eq!(file.received, received(&store), "round {round}");
+            }
+            assert_eq!(sent(&store).len(), 10 * 2 * 10);
+        }
+    }
+
     #[test]
     fn received_threads_beyond_the_cap_evict_received_ones_and_no_sent_one() {
         let tmp = TempDir::new("sent-threads-received-flood");

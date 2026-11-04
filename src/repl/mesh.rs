@@ -8232,34 +8232,17 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
     if outcome.recipients.is_empty() {
         return "No trusted peer has a known path right now; nothing was sent. `.mesh peers` lists what this node has heard from.".to_string();
     }
-    let (mut delivered, mut stored, mut unreachable, mut refused) = (0, 0, 0, 0);
     let mut lines = Vec::with_capacity(outcome.recipients.len() + 1);
     for recipient in &outcome.recipients {
         let status = match &recipient.outcome {
-            RecipientOutcome::Delivered => {
-                delivered += 1;
-                "delivered".to_string()
-            }
-            RecipientOutcome::StoreAndForward => {
-                stored += 1;
-                "store-and-forward".to_string()
-            }
-            RecipientOutcome::Unreachable { reason } => {
-                unreachable += 1;
-                format!("unreachable: {reason}")
-            }
-            RecipientOutcome::Refused { reason } => {
-                refused += 1;
-                format!("refused: {reason}")
-            }
-            RecipientOutcome::NotTrustedByPeer(refusal) => {
-                refused += 1;
-                refusal.to_string()
-            }
-            RecipientOutcome::NoAnswer(no_answer) => {
-                refused += 1;
-                no_answer.to_string()
-            }
+            RecipientOutcome::Delivered => "delivered".to_string(),
+            RecipientOutcome::StoreAndForward => "store-and-forward".to_string(),
+            RecipientOutcome::Unreachable { reason } => format!("unreachable: {reason}"),
+            RecipientOutcome::Refused { reason } => format!("refused: {reason}"),
+            RecipientOutcome::NotTrustedByPeer(refusal) => refusal.to_string(),
+            RecipientOutcome::NoAnswer(no_answer) => no_answer.to_string(),
+            RecipientOutcome::Throttled { reason } => format!("throttled, not stored: {reason}"),
+            RecipientOutcome::RetryLater { reason } => format!("not stored: {reason}"),
         };
         lines.push(format!(
             "  {} ({}): {status}",
@@ -8267,11 +8250,67 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
             short(&recipient.destination)
         ));
     }
+    let tally = outcome.tally();
+    let mut later = String::new();
+    if tally.throttled > 0 {
+        later.push_str(&format!(", {} throttled", tally.throttled));
+    }
+    if tally.retry_later > 0 {
+        later.push_str(&format!(", {} to retry", tally.retry_later));
+    }
     lines.push(format!(
-        "Bulletin {}: {delivered} delivered, {stored} store-and-forward, {unreachable} unreachable, {refused} refused.",
-        short(&outcome.id)
+        "Bulletin {}: {} delivered, {} store-and-forward, {} unreachable, {} refused{later}.",
+        short(&outcome.id),
+        tally.delivered,
+        tally.stored,
+        tally.unreachable,
+        tally.refused
     ));
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod broadcast_row_tests {
+    use super::*;
+    use crate::mesh::message::RecipientReport;
+
+    /// A throttled peer and one whose wait ran out short of silence each get their own
+    /// row and count, never unreachable or refused, and say nothing was stored.
+    #[test]
+    fn throttled_and_retry_rows_are_counted_apart_from_unreachable() {
+        let row = |seed: &str, outcome: RecipientOutcome| RecipientReport {
+            destination: seed.repeat(16),
+            display_name: None,
+            outcome,
+        };
+        let outcome = BroadcastOutcome {
+            id: "b1".repeat(16),
+            recipients: vec![
+                row("aa", RecipientOutcome::Delivered),
+                row(
+                    "bb",
+                    RecipientOutcome::Throttled {
+                        reason: "bbbbbbbb refused it: busy. Try again in a minute.".to_string(),
+                    },
+                ),
+                row(
+                    "cc",
+                    RecipientOutcome::RetryLater {
+                        reason: "The message could not be sent: slow. Try again in a minute"
+                            .to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let text = render_broadcast(&outcome);
+
+        let expected = format!(
+            "  (no name) (aaaaaaaa): delivered\n  (no name) (bbbbbbbb): throttled, not stored: bbbbbbbb refused it: busy. Try again in a minute.\n  (no name) (cccccccc): not stored: The message could not be sent: slow. Try again in a minute\nBulletin {}: 1 delivered, 0 store-and-forward, 0 unreachable, 0 refused, 1 throttled, 1 to retry.",
+            short(&"b1".repeat(16))
+        );
+        assert_eq!(text, expected);
+    }
 }
 
 #[cfg(test)]
@@ -28089,7 +28128,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         let own = started.runtime.current_destination_hash();
                         let no_answer = format!(
-                            "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
                             short(&peer)
                         );
 

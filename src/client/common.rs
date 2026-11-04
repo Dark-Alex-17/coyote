@@ -397,6 +397,10 @@ pub struct ChatCompletionsOutput {
     pub tool_calls: Vec<ToolCall>,
     pub thinking: Vec<ThinkingBlock>,
     pub usage: Option<TokenUsage>,
+    /// Set when the provider stopped on a refusal after writing some of the reply. The
+    /// text is still returned as the answer; the non-streaming callers raise the
+    /// context's `refused_after_output` for it and nothing else changes.
+    pub refusal: Option<ProviderRefusal>,
 }
 
 impl ChatCompletionsOutput {
@@ -723,6 +727,7 @@ pub async fn call_chat_completions(
                 tool_calls,
                 thinking,
                 usage,
+                refusal,
             } = ret;
             if !text.is_empty() {
                 if extract_code {
@@ -733,6 +738,9 @@ pub async fn call_chat_completions(
                 }
             }
             ctx.record_token_usage(usage, client.model());
+            if refusal.is_some() {
+                ctx.note_refusal_after_output();
+            }
             finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => {
@@ -910,8 +918,12 @@ pub async fn call_chat_completions_streaming_quiet(
             tool_calls,
             thinking,
             usage,
+            refusal,
         } = output;
         ctx.record_token_usage(usage, client.model());
+        if refusal.is_some() {
+            ctx.note_refusal_after_output();
+        }
         if abort_signal.aborted() {
             hooks::fire(
                 HookEvent::LlmRequestFailed,
@@ -1009,10 +1021,11 @@ impl std::fmt::Display for ApiStatusError {
 
 impl std::error::Error for ApiStatusError {}
 
-/// The model answered with a refusal and nothing else. Claude reports this
+/// The model's provider refused the request. Claude reports this
 /// as `stop_reason: refusal`; Bedrock Converse as `stopReason:
-/// content_filtered`, which carries no category.
-#[derive(Debug, Default)]
+/// content_filtered`, which carries no category; Gemini as a
+/// `promptFeedback.blockReason` or a `finishReason: SAFETY`.
+#[derive(Debug, Clone, Default)]
 pub struct ProviderRefusal {
     pub category: Option<String>,
     pub explanation: Option<String>,
@@ -1740,6 +1753,7 @@ mod tests {
                 tool_calls: vec![paced_tool_call()],
                 thinking: vec![paced_thinking()],
                 usage: None,
+                refusal: None,
             })
         }
 

@@ -302,7 +302,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             description: format!(
                 "Post a bulletin to every trusted mesh peer this node currently has a path to, a few at a \
                  time, and report each recipient's outcome (delivered, store_and_forward, unreachable, \
-                 refused, not_trusted_by_peer or no_answer); a not_trusted_by_peer or no_answer row \
+                 refused, not_trusted_by_peer, no_answer, throttled or retry_later); a throttled or \
+                 retry_later row was not stored and its `reason` says when to try again; a \
+                 not_trusted_by_peer or no_answer row \
                  carries `message` and `next_action` naming which side has to act. Peers without a \
                  known path are skipped, not queued. {PEER_TEXT_IS_DATA} {CHECK_IN_GUIDANCE}"
             ),
@@ -1244,6 +1246,8 @@ async fn handle_broadcast(runtime: &MeshRuntime, args: &Value) -> Result<Value> 
         "store_and_forward": tally.stored,
         "unreachable": tally.unreachable,
         "refused": tally.refused,
+        "throttled": tally.throttled,
+        "retry_later": tally.retry_later,
         "note": PEER_TEXT_IS_DATA,
     }))
 }
@@ -2145,6 +2149,12 @@ mod tests {
                 "0a".repeat(16),
             )),
             RecipientOutcome::NoAnswer(NoAnswer::new(&"ab".repeat(16), "0a".repeat(16))),
+            RecipientOutcome::Throttled {
+                reason: "busy".to_string(),
+            },
+            RecipientOutcome::RetryLater {
+                reason: "still arriving".to_string(),
+            },
         ];
         // Exhaustive on purpose: a new variant fails to compile here until it is added to
         // the list above and to the description.
@@ -2155,7 +2165,9 @@ mod tests {
                 | RecipientOutcome::Unreachable { .. }
                 | RecipientOutcome::Refused { .. }
                 | RecipientOutcome::NotTrustedByPeer(_)
-                | RecipientOutcome::NoAnswer(_) => {}
+                | RecipientOutcome::NoAnswer(_)
+                | RecipientOutcome::Throttled { .. }
+                | RecipientOutcome::RetryLater { .. } => {}
             }
         }
         let mut serialised: Vec<String> = outcomes
@@ -2398,6 +2410,33 @@ mod tests {
                 .unwrap()
                 .contains("default 30, at most 600")
         );
+    }
+
+    mod thread_schema_tests {
+        use super::*;
+
+        /// The `thread` argument `mesh__send` and `mesh__ask` share, word for word, so
+        /// no clause of it changes without this test and the Mesh page's twin moving.
+        #[test]
+        fn the_thread_argument_says_exactly_how_a_thread_is_started_and_continued() {
+            let declarations = mesh_function_declarations();
+            for action in ["send", "ask"] {
+                let declaration = declarations
+                    .iter()
+                    .find(|declaration| {
+                        declaration.name == format!("{MESH_FUNCTION_PREFIX}{action}")
+                    })
+                    .unwrap();
+                let thread = &declaration.parameters.properties.as_ref().unwrap()["thread"];
+                assert_eq!(
+                    thread.description.as_deref(),
+                    Some(
+                        "Omit for a new conversation; reuse the thread that came back in the reply to continue. A thread shown on a received message continues it too; any other value is refused. A reply without it inherits the answered message's thread."
+                    ),
+                    "{action}"
+                );
+            }
+        }
     }
 
     #[test]

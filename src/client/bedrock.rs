@@ -213,15 +213,32 @@ async fn chat_completions_streaming(
         bail!("Invalid response data: {data}");
     }
 
+    // Converse sends the usage after `messageStop`, so a refusal is returned only once
+    // the stream has ended and the billed tokens are on record. A stream that breaks
+    // after the refusal still ends on the refusal, the answer the model gave.
+    let mut refused = false;
+    let streamed = read_event_stream(res, handler, &mut refused).await;
+    if !refused {
+        return streamed;
+    }
+    if handler.has_received_visible_output() {
+        debug!("stream ended with a provider refusal after partial output");
+        return Ok(());
+    }
+    Err(ProviderRefusal::default().into())
+}
+
+async fn read_event_stream(
+    res: reqwest::Response,
+    handler: &mut SseHandler,
+    refused: &mut bool,
+) -> Result<()> {
     let mut function_name = String::new();
     let mut function_arguments = String::new();
     let mut function_id = String::new();
     let mut reasoning_state = 0;
     let mut thinking_text = String::new();
     let mut thinking_signature = String::new();
-    // Converse sends the usage after `messageStop`, so a refusal is returned only once
-    // the stream has ended and the billed tokens are on record.
-    let mut refused = false;
 
     let mut stream = res.bytes_stream();
     let mut buffer = BytesMut::new();
@@ -316,11 +333,7 @@ async fn chat_completions_streaming(
                             }
                         }
                         "messageStop" if is_refusal_stop(&data["stopReason"]) => {
-                            if handler.has_received_visible_output() {
-                                debug!("stream ended with a provider refusal after partial output");
-                            } else {
-                                refused = true;
-                            }
+                            *refused = true;
                         }
                         _ => {}
                     }
@@ -338,9 +351,6 @@ async fn chat_completions_streaming(
                 }
             }
         }
-    }
-    if refused {
-        return Err(ProviderRefusal::default().into());
     }
     Ok(())
 }
@@ -761,9 +771,10 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         }
     }
 
+    let refusal = is_refusal_stop(&data["stopReason"]).then(ProviderRefusal::default);
     if text.is_empty() && tool_calls.is_empty() {
-        if is_refusal_stop(&data["stopReason"]) {
-            return Err(ProviderRefusal::default().into());
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
         }
         bail!("Invalid response data: {data}");
     }
@@ -773,6 +784,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         tool_calls,
         thinking,
         usage: bedrock_parse_usage(&data["usage"]),
+        refusal,
     };
     Ok(output)
 }
@@ -1569,5 +1581,122 @@ mod refusal_tests {
         let usage = usage.unwrap();
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    mod partial_and_broken_stream_tests {
+        use super::*;
+
+        /// Serves the frames under a `Content-Length` longer than them and then
+        /// closes, so the client reads every frame and then a broken body.
+        async fn serve_truncated(body: Vec<u8>) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len() + 64
+                );
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(&body).await.unwrap();
+            });
+            format!("http://{addr}/")
+        }
+
+        async fn stream_from(url: String) -> (Result<()>, SseHandler) {
+            let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut handler = SseHandler::new(sender, crate::utils::create_abort_signal());
+            handler.set_silent(true);
+            let builder = ReqwestClient::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(url);
+            let res = chat_completions_streaming(builder, &mut handler).await;
+            (res, handler)
+        }
+
+        fn text_then(stop: Option<&'static str>) -> Vec<u8> {
+            let mut frames = event("contentBlockDelta", json!({"delta": {"text": "partial"}}));
+            if let Some(stop_reason) = stop {
+                frames.extend(event("messageStop", json!({"stopReason": stop_reason})));
+            }
+            frames
+        }
+
+        #[tokio::test]
+        async fn a_refusal_after_streamed_text_keeps_the_text() {
+            let url = serve_events(text_then(Some("content_filtered"))).await;
+
+            let (res, handler) = stream_from(url).await;
+
+            res.unwrap();
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "partial");
+        }
+
+        #[tokio::test]
+        async fn a_stream_that_breaks_after_a_refusal_returns_the_refusal() {
+            let url = serve_truncated(event(
+                "messageStop",
+                json!({"stopReason": "content_filtered"}),
+            ))
+            .await;
+
+            let (res, _) = stream_from(url).await;
+
+            let err = res.unwrap_err();
+            assert!(err.downcast_ref::<ProviderRefusal>().is_some(), "{err:#}");
+        }
+
+        #[tokio::test]
+        async fn a_stream_that_breaks_after_text_and_a_refusal_keeps_the_text() {
+            let url = serve_truncated(text_then(Some("content_filtered"))).await;
+
+            let (res, handler) = stream_from(url).await;
+
+            res.unwrap();
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "partial");
+        }
+
+        #[tokio::test]
+        async fn a_stream_that_breaks_without_a_refusal_is_a_transport_error() {
+            let url = serve_truncated(text_then(None)).await;
+
+            let (res, _) = stream_from(url).await;
+
+            let err = res.unwrap_err();
+            assert!(err.downcast_ref::<ProviderRefusal>().is_none(), "{err:#}");
+        }
+    }
+
+    mod non_stream_refusal_tests {
+        use super::*;
+
+        fn text_reply(stop_reason: &str) -> Value {
+            json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "partial"}]}},
+                "stopReason": stop_reason,
+                "usage": {"inputTokens": 10, "outputTokens": 3, "totalTokens": 13}
+            })
+        }
+
+        #[test]
+        fn a_refusal_after_text_keeps_the_text_and_carries_the_refusal() {
+            let output = extract_chat_completions(&text_reply("content_filtered")).unwrap();
+
+            assert_eq!(output.text, "partial");
+            assert!(output.refusal.is_some());
+        }
+
+        #[test]
+        fn an_ordinary_stop_after_text_carries_no_refusal() {
+            let output = extract_chat_completions(&text_reply("end_turn")).unwrap();
+
+            assert!(output.refusal.is_none());
+        }
     }
 }

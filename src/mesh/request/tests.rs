@@ -120,6 +120,10 @@ fn every_request_error_has_a_next_step() {
             path: "/status".to_string(),
             after: Duration::from_secs(5),
         },
+        RequestError::RequestIncomplete {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
         RequestError::LinkFailed("no path".to_string()),
         RequestError::LinkClosed,
         RequestError::Oversize { len: 9, max: 8 },
@@ -2343,6 +2347,52 @@ pub(crate) mod network {
                     after: SHORT_REQUEST_TIMEOUT,
                 }
             );
+            requester.stop().await;
+            responder.stop().await;
+        }
+    }
+
+    mod request_upload_tests {
+        use super::*;
+
+        /// A request too large for one packet goes out as a resource. While the peer has
+        /// not taken the whole of it, the peer cannot have answered, so a wait that runs
+        /// out then is the request's own transfer falling short, never the `Timeout`
+        /// that reads as distrust. Holding the responder's interface manager keeps its
+        /// inbound path from reading the advertisement, so the upload never completes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_request_whose_upload_never_completes_is_not_silence() {
+            let recorder = Arc::new(Recorder::default());
+            let (responder, requester, desc) = pair(recorder.clone()).await;
+            let link = identified_link(&requester, &responder, &desc).await;
+            let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
+            RngCore::fill_bytes(&mut OsRng, &mut random);
+            let before = recorder.seen_count();
+
+            let manager = responder.transport.iface_manager();
+            let held = manager.lock().await;
+            let result = timeout(
+                INTEROP_TIMEOUT,
+                request_on(
+                    &requester,
+                    &link,
+                    "/slow",
+                    Value::Binary(random),
+                    SHORT_REQUEST_TIMEOUT,
+                ),
+            )
+            .await
+            .unwrap();
+            drop(held);
+
+            assert_eq!(
+                result.unwrap_err(),
+                RequestError::RequestIncomplete {
+                    path: "/slow".to_string(),
+                    after: SHORT_REQUEST_TIMEOUT,
+                }
+            );
+            assert_eq!(recorder.seen_count(), before, "the handler never had it");
             requester.stop().await;
             responder.stop().await;
         }
@@ -10454,6 +10504,180 @@ pub(crate) mod network {
         node.stop().await;
     }
 
+    mod stalled_upload_fallback_tests {
+        use super::*;
+
+        /// What a request sent as a resource ends with when its upload never completes,
+        /// as `a_request_whose_upload_never_completes_is_not_silence` stages it on a bare
+        /// link. A live node's requests always fit one packet, so the tests here hand the
+        /// node that error in place of the wire.
+        fn stalled_upload(path: &str) -> RequestError {
+            RequestError::RequestIncomplete {
+                path: path.to_string(),
+                after: SHORT_REQUEST_TIMEOUT,
+            }
+        }
+
+        fn hello() -> OutboundPeer {
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap()
+        }
+
+        /// The peer never had the whole message, so storing it with the propagation node
+        /// cannot deliver it twice: the send reads as store-and-forward, not the retry.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_message_whose_upload_stalled_is_stored_with_the_propagation_node() {
+            let (pair, mut node) =
+                pair_with_propagation_node_trusting("request-peer-stalled-upload", trusting_b)
+                    .await;
+            pair.introduce_b_to_a().await;
+            let b_instance = pair.responder.desc.address_hash.to_hex_string();
+            let message = hello();
+            pair.node_a.fail_next_request(stalled_upload("/message"));
+
+            let sent = pair
+                .node_a
+                .send_peer_with(&b_instance, &message, peer_send_options())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sent,
+                SendOutcome {
+                    id: message.id.clone(),
+                    via: PeerVia::StoreAndForward,
+                }
+            );
+            let received = node.next_received().await;
+            let stored = stored_peer(
+                received.bytes(),
+                &pair.responder.identity,
+                &pair.a_desc.identity,
+            );
+            assert!(
+                matches!(stored, PeerLxmf::Peer(ref peer) if peer.id == message.id),
+                "{stored:?}"
+            );
+            assert_eq!(pair.recorder_b.seen_count(), 0, "nothing reached node B");
+            node.nothing_else_received();
+            pair.stop_node_a().await;
+            node.stop().await;
+        }
+
+        /// With no propagation node known, a stalled upload says nothing was queued
+        /// rather than that the peer stayed silent.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_message_whose_upload_stalled_with_no_node_reports_no_propagation_node() {
+            let pair =
+                NodePair::start_with("request-peer-stalled-no-node", |_| {}, trusting_b).await;
+            pair.introduce_b_to_a().await;
+            let b_instance = pair.responder.desc.address_hash.to_hex_string();
+            pair.node_a.fail_next_request(stalled_upload("/message"));
+
+            let err = pair
+                .node_a
+                .send_peer_with(&b_instance, &hello(), peer_send_options())
+                .await
+                .unwrap_err();
+
+            assert_eq!(err, SendError::NoPropagationNode);
+            pair.stop_node_a().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_access_request_whose_upload_stalled_is_stored_with_the_propagation_node() {
+            let (pair, mut node) =
+                pair_with_propagation_node("request-access-stalled-upload").await;
+            let (ghost, ghost_desc) = ghost_destination();
+            let request = access_request("acc-1", &["src/x.rs"], "need the struct");
+            pair.node_a.fail_next_request(stalled_upload("/access"));
+
+            let outcome = pair
+                .node_a
+                .request_access_wire(&ghost_desc, &request, fallback_access_options())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                outcome,
+                AccessRequestOutcome {
+                    id: "acc-1".to_string(),
+                    status: AccessOutcome::Pending,
+                    via: PeerVia::StoreAndForward,
+                }
+            );
+            let received = node.next_received().await;
+            let stored = stored_access(received.bytes(), &ghost, &pair.a_desc.identity);
+            assert!(
+                matches!(stored, AccessMessage::Access { request: ref got, .. } if *got == request),
+                "{stored:?}"
+            );
+            node.nothing_else_received();
+            pair.stop_node_a().await;
+            node.stop().await;
+        }
+
+        /// A knock the peer never had whole drew no answer, as a silent link does, so it
+        /// is stored as unanswered rather than read as the peer being out of reach.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_knock_whose_upload_stalled_is_stored_as_unanswered() {
+            let (pair, mut node) = pair_with_propagation_node("request-knock-stalled-upload").await;
+            let (ghost, ghost_desc) = ghost_destination();
+            pair.node_a.fail_next_request(stalled_upload("/knock"));
+
+            let outcome = pair
+                .node_a
+                .knock_with(
+                    &ghost_desc,
+                    &KnockIntro::new("anyone home").unwrap(),
+                    fallback_knock_options(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                outcome,
+                KnockOutcome {
+                    via: KnockVia::StoreAndForward,
+                    fallback: Some(KnockFallback::Unanswered),
+                }
+            );
+            let received = node.next_received().await;
+            let knock = stored_knock(received.bytes(), &ghost, &pair.a_desc.identity);
+            assert!(
+                matches!(knock, KnockMessage::Knock { intro: Some(ref intro), .. } if intro == "anyone home"),
+                "{knock:?}"
+            );
+            node.nothing_else_received();
+            pair.stop_node_a().await;
+            node.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_knock_whose_upload_stalled_with_no_node_is_unanswered() {
+            let pair = NodePair::start("request-knock-stalled-no-node").await;
+            let (_, ghost_desc) = ghost_destination();
+            pair.node_a.fail_next_request(stalled_upload("/knock"));
+
+            let err = pair
+                .node_a
+                .knock_with(
+                    &ghost_desc,
+                    &KnockIntro::new("anyone home").unwrap(),
+                    fallback_knock_options(),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err,
+                KnockError::Unanswered {
+                    dest8: short(&ghost_desc.address_hash.to_hex_string()).to_string(),
+                }
+            );
+            pair.stop_node_a().await;
+        }
+    }
+
     /// Node B answers the message with a response frame one byte over the path cap, sent
     /// as a Resource. The library refuses the advertisement, so the send fails as
     /// `ResponseOversize` naming the cap; the exchange reached the peer, so it is
@@ -10882,6 +11106,53 @@ pub(crate) mod network {
         );
         pair.stop_node_a().await;
         responder_c.stop().await;
+    }
+
+    mod broadcast_throttle_tests {
+        use super::*;
+
+        /// A peer answering `Throttled` reads the same in a broadcast as in a single send:
+        /// its own row carrying the single send's sentence, counted throttled and never
+        /// refused or unreachable.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_throttled_peer_is_its_own_broadcast_row_as_in_a_single_send() {
+            let pair =
+                NodePair::start_with("request-broadcast-throttled", |_| {}, trusting_b).await;
+            pair.introduce_b_to_a().await;
+            let b_instance = pair.responder.desc.address_hash.to_hex_string();
+            let message =
+                OutboundPeer::new(PeerKind::Bulletin, "all hands", None, None, None).unwrap();
+            pair.recorder_b
+                .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
+            let single = pair
+                .node_a
+                .send_peer_with(&b_instance, &message, peer_send_options())
+                .await
+                .unwrap_err();
+            assert!(matches!(single, SendError::Throttled { .. }), "{single:?}");
+            pair.recorder_b
+                .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
+
+            let outcome = pair
+                .node_a
+                .broadcast_with(&message, peer_send_options())
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.recipients.len(), 1, "{:?}", outcome.recipients);
+            assert_eq!(
+                outcome.recipients[0].outcome,
+                RecipientOutcome::Throttled {
+                    reason: single.to_string()
+                }
+            );
+            let tally = outcome.tally();
+            assert_eq!(
+                (tally.throttled, tally.refused, tally.unreachable),
+                (1, 0, 0)
+            );
+            pair.stop_node_a().await;
+        }
     }
 
     /// An envoy that takes everything and counts what it was offered.

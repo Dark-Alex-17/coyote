@@ -26,6 +26,7 @@ use crate::mesh::envoy::{EnvoyJob, EnvoySink, fence_peer_text};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoyRole, EnvoySessions, EnvoyTurn};
 use crate::mesh::events::MeshEvent;
 use crate::mesh::idle::{IdleNotify, Origin};
+use crate::mesh::inbox::inbox_relative;
 use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS,
@@ -51,6 +52,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -195,10 +197,12 @@ fn peer_turn(card: &PeerCard, message: &PeerMessage) -> String {
 }
 
 /// One line per part of `message`, read by the envoy inside the fence after the text:
-/// where an inline file was staged, what a reference file can be fetched as, a text or
-/// data part's content quoted as data and cut at `ENVOY_PART_TEXT_MAX_CHARS`, and how
-/// many parts did not arrive. Empty for a message with no parts. A file is only named
-/// here, never read: the envoy does not see or serve file bytes.
+/// where in the inbox an inline file was staged, relative to the inbox root so the
+/// envoy never learns this node's filesystem layout, what a reference file can be
+/// fetched as, a text or data part's content quoted as data and cut at
+/// `ENVOY_PART_TEXT_MAX_CHARS`, and how many parts did not arrive. Empty for a message
+/// with no parts. A file is only named here, never read: the envoy does not see or
+/// serve file bytes.
 fn envoy_parts_summary(message: &PeerMessage) -> String {
     use Part::{Data, File, Text};
 
@@ -219,10 +223,12 @@ fn envoy_parts_summary(message: &PeerMessage) -> String {
                 size,
                 staged: Some(staged),
                 ..
-            } => Some(format!(
-                "attached: {name} ({size} B), staged at {}",
-                staged.display()
-            )),
+            } => Some(match inbox_relative(staged, &message.source_destination) {
+                Some(relative) => {
+                    format!("attached: {name} ({size} B), staged in the inbox at {relative}")
+                }
+                None => format!("attached: {name} ({size} B), staged in the inbox"),
+            }),
             File {
                 size,
                 reference: Some(reference),
@@ -387,6 +393,9 @@ pub(crate) struct EnvoyRunner {
     /// The human's answers a held run took, in order. The peer hears them word for word
     /// in place of whatever the run then comes to.
     consumed_answer: Mutex<Option<String>>,
+    /// Raised by the running job's model calls when a reply came with a provider
+    /// refusal, and taken by its delivery.
+    refused_after_output: Arc<AtomicBool>,
     cancel: CancellationToken,
     current_abort: Mutex<Option<AbortSignal>>,
     current_cancel: Mutex<Option<CancellationToken>>,
@@ -422,6 +431,7 @@ impl EnvoyRunner {
             jobs,
             held: Mutex::new(None),
             consumed_answer: Mutex::new(None),
+            refused_after_output: Arc::new(AtomicBool::new(false)),
             cancel: CancellationToken::new(),
             current_abort: Mutex::new(None),
             current_cancel: Mutex::new(None),
@@ -688,6 +698,7 @@ impl EnvoyRunner {
         ctx.current_depth = 1;
         let queue = Arc::new(EscalationQueue::new());
         ctx.escalation_queue = Some(Arc::clone(&queue));
+        ctx.refused_after_output = Some(Arc::clone(&self.refused_after_output));
         ctx.self_agent_id = Some(terminal.agent_id.clone());
         ctx.ensure_supervisor_with_jobs_cap(Some(0));
 
@@ -1093,8 +1104,9 @@ impl EnvoyRunner {
     /// refusal line or the human's held answer. A run that timed out, was interrupted,
     /// found the envoy unavailable or failed said nothing of its own and adds nothing, and
     /// neither does a withheld reply or the interim escalated notice. Nor does a provider
-    /// refusal: remembering the peer's turn would replay the text the provider refused on
-    /// every later message in the thread.
+    /// refusal, even one that came with the reply's text or after the human's held answer
+    /// was taken (the peer is still sent that reply): remembering the peer's turn would
+    /// replay the text the provider refused on every later message in the thread.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -1113,6 +1125,7 @@ impl EnvoyRunner {
             .lock()
             .take()
             .and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS));
+        let refused_after_output = self.refused_after_output.swap(false, Ordering::Relaxed);
         // The filed question is settled only by the envoy's own last word on an
         // escalated run or by the human's; an escalation or a failure leaves it open.
         let settles_question = human_answer.is_some()
@@ -1168,14 +1181,16 @@ impl EnvoyRunner {
         let unsent = if !owed {
             None
         } else {
-            let said_something = human_answer.is_some()
-                || matches!(
-                    outcome,
-                    EnvoyOutcome::Answered(_)
-                        | EnvoyOutcome::Declined(_)
-                        | EnvoyOutcome::Escalated { .. }
-                        | EnvoyOutcome::Refused(_)
-                );
+            let said_something = !refused_after_output
+                && !matches!(outcome, EnvoyOutcome::ProviderRefused { .. })
+                && (human_answer.is_some()
+                    || matches!(
+                        outcome,
+                        EnvoyOutcome::Answered(_)
+                            | EnvoyOutcome::Declined(_)
+                            | EnvoyOutcome::Escalated { .. }
+                            | EnvoyOutcome::Refused(_)
+                    ));
             if let Some(memory) = memory.filter(|_| said_something) {
                 // The sender's standing is judged again here, not at run start: an
                 // owner who blocked or untrusted it meanwhile had its threads forgotten,
@@ -6108,6 +6123,15 @@ mod tests {
             }))
         }
 
+        /// The test peer's directory under the inbox root.
+        fn peer_dir() -> String {
+            hex_lower(&[0xab; 16])
+        }
+
+        fn staged_under_root(rel: &str) -> String {
+            format!("/staging/inst-a/{}/{rel}", peer_dir())
+        }
+
         #[test]
         fn a_message_with_no_parts_lists_nothing() {
             assert_eq!(envoy_parts_summary(&message_carrying(Vec::new(), 0)), "");
@@ -6117,7 +6141,7 @@ mod tests {
         fn each_part_kind_gets_its_own_line_in_order() {
             let message = message_carrying(
                 vec![
-                    staged_file("docs/hello.md", 13, "/staging/abababab/docs/hello.md"),
+                    staged_file("docs/hello.md", 13, &staged_under_root("docs/hello.md")),
                     part(json!({
                         "type": "file",
                         "name": "report.pdf",
@@ -6139,7 +6163,11 @@ mod tests {
             assert_eq!(
                 envoy_parts_summary(&message),
                 [
-                    "attached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md",
+                    format!(
+                        "attached: docs/hello.md (13 B), staged in the inbox at {}/docs/hello.md",
+                        peer_dir()
+                    )
+                    .as_str(),
                     "fetchable as shared/report.pdf (2048 B)",
                     "listed but not sent: notes.txt (7 B)",
                     "text part, quoted as data: \"see the attached notes\"",
@@ -6175,7 +6203,7 @@ mod tests {
                 vec![staged_file(
                     "docs/hello.md",
                     13,
-                    "/staging/abababab/docs/hello.md",
+                    &staged_under_root("docs/hello.md"),
                 )],
                 0,
             );
@@ -6191,10 +6219,41 @@ mod tests {
                 user,
                 fence_peer_text(
                     &message.source_destination,
-                    "Name: alice\nMessage id: msg-parts\nsee the attached\nattached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md"
+                    &format!(
+                        "Name: alice\nMessage id: msg-parts\nsee the attached\nattached: docs/hello.md (13 B), staged in the inbox at {}/docs/hello.md",
+                        peer_dir()
+                    )
                 )
             );
             assert!(!tail.contains("docs/hello.md"), "{tail}");
+        }
+
+        mod inbox_relative_path_tests {
+            use super::*;
+
+            #[test]
+            fn a_staged_file_never_shows_the_absolute_path() {
+                let staged = staged_under_root("docs/hello.md");
+                let message = message_carrying(vec![staged_file("docs/hello.md", 13, &staged)], 0);
+
+                let summary = envoy_parts_summary(&message);
+
+                assert!(!summary.contains("/staging"), "{summary}");
+                assert!(!summary.contains(&staged), "{summary}");
+            }
+
+            #[test]
+            fn a_staged_path_outside_the_peer_s_directory_names_only_the_file() {
+                let message = message_carrying(
+                    vec![staged_file("docs/hello.md", 13, "/elsewhere/docs/hello.md")],
+                    0,
+                );
+
+                assert_eq!(
+                    envoy_parts_summary(&message),
+                    "attached: docs/hello.md (13 B), staged in the inbox"
+                );
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6206,7 +6265,7 @@ mod tests {
             let staged = tmp
                 .path
                 .join("inbox")
-                .join("abababab")
+                .join(peer_dir())
                 .join("docs/hello.md");
             std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
             std::fs::write(&staged, b"Hello, mesh!\n").unwrap();
@@ -6261,15 +6320,16 @@ mod tests {
             let end = sent
                 .find(&peer_fence_end(&destination))
                 .expect("the fence closes");
-            // The request is JSON, so a path with a backslash in it is sent escaped.
-            let attached = serde_json::to_string(&format!(
-                "attached: docs/hello.md (13 B), staged at {staged}"
-            ))
-            .unwrap();
+            let attached = format!(
+                "attached: docs/hello.md (13 B), staged in the inbox at {}/docs/hello.md",
+                peer_dir()
+            );
             let line = sent
-                .find(attached.trim_matches('"'))
+                .find(&attached)
                 .unwrap_or_else(|| panic!("no attached line in {sent}"));
             assert!(begin < line && line < end, "{sent}");
+            let absolute = serde_json::to_string(&staged).unwrap();
+            assert!(!sent.contains(absolute.trim_matches('"')), "{sent}");
 
             let (envelopes, _) = app.mesh.peer_inbox().drain();
             assert_eq!(envelopes.len(), 2);
@@ -6297,6 +6357,7 @@ mod tests {
                 )],
                 thinking: vec![],
                 usage: None,
+                refusal: None,
             },
             ChatCompletionsOutput::new("I cannot do that."),
         ]);
@@ -10021,6 +10082,144 @@ mod tests {
         source.remove_dir();
     }
 
+    mod refusal_memory_tests {
+        use super::*;
+
+        fn cyber() -> ProviderRefusal {
+            ProviderRefusal {
+                category: Some("cyber".into()),
+                explanation: None,
+            }
+        }
+
+        #[test]
+        fn the_owners_answer_is_what_the_peer_is_sent_after_a_provider_refusal() {
+            let message = threaded_job(&PEER_IDENTITY, "q-held", "t-9", "merge?").message;
+            let outcome = EnvoyOutcome::ProviderRefused {
+                category: Some("cyber".into()),
+            };
+
+            let out = envoy_reply(
+                &outcome,
+                Some("yes, merge"),
+                PROVIDER_REFUSAL_TEXT.into(),
+                &message,
+            )
+            .unwrap();
+
+            assert_eq!(out.disposition, Some(Disposition::Answered));
+            assert_eq!(out.content, "yes, merge");
+        }
+
+        /// The run took the human's answer and then the provider refused: the peer is
+        /// relayed that answer, and the thread remembers nothing of the run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_refusal_after_the_owner_answered_is_not_remembered() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-held-refusal");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-memory-held-refusal");
+            let app = app_holding_for(30);
+            let store = memory_for(&app, &tmp);
+            app.mesh
+                .set_inbound_store_for_tests(Arc::new(InboundStore::new(&tmp.path, "inst-a")));
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = EnvoyRunner::start_with(
+                Arc::clone(&app),
+                drive_of(|ctx, _, _| async move {
+                    let mut ctx = ctx;
+                    handle_user_tool(
+                        &mut ctx,
+                        "user__ask",
+                        &json!({"question": "Should we merge?"}),
+                    )
+                    .await?;
+                    Err(cyber().into())
+                }),
+            );
+            assert!(
+                runner
+                    .accept(threaded_job(
+                        &PEER_IDENTITY,
+                        "q-held",
+                        "t-9",
+                        "merge the branch"
+                    ))
+                    .is_ok()
+            );
+            wait_until("the question to reach the human", || {
+                idle.has("asks: Should we merge?")
+            })
+            .await;
+            assert!(runner.answer("q-held", "yes, merge"));
+            wait_until("the human's answer to be relayed", || {
+                idle.count("envoy replied: yes, merge") == 1
+            })
+            .await;
+            runner.stop().await;
+
+            let turns = turns_of(&store, &PEER_IDENTITY, "q-held");
+            assert!(turns.is_empty(), "{turns:?}");
+            source.remove_dir();
+        }
+
+        /// A provider that refuses after writing part of a reply still sends that text:
+        /// the peer is sent it, and the thread remembers nothing of the run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_reply_that_came_with_a_refusal_is_sent_but_not_remembered() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-partial-refusal");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-memory-partial-refusal");
+            let app = test_app();
+            let store = memory_for(&app, &tmp);
+            let idle = RecordingIdleSink::attach(&app);
+            let client = ScriptedClient::new(vec![ChatCompletionsOutput {
+                refusal: Some(cyber()),
+                ..ChatCompletionsOutput::new("Port 22 is open.")
+            }]);
+            let runner = EnvoyRunner::start_with(
+                Arc::clone(&app),
+                drive_of(move |ctx, input, abort| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut ctx = ctx;
+                        let (output, _) = call_chat_completions(
+                            &input,
+                            false,
+                            false,
+                            client.as_ref(),
+                            &mut ctx,
+                            abort,
+                        )
+                        .await?;
+                        Ok(output)
+                    }
+                }),
+            );
+            assert!(
+                runner
+                    .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-1", "scan a port"))
+                    .is_ok()
+            );
+            wait_until("the reply to land", || {
+                idle.has("envoy replied: Port 22 is open.")
+            })
+            .await;
+            runner.stop().await;
+
+            let turns = turns_of(&store, &PEER_IDENTITY, "t-1");
+            assert!(turns.is_empty(), "{turns:?}");
+            let turns = turns_of(&store, &PEER_IDENTITY, "q-1");
+            assert!(turns.is_empty(), "{turns:?}");
+            assert!(
+                !runner.refused_after_output.load(Ordering::Relaxed),
+                "the next job starts clear"
+            );
+            source.remove_dir();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_hand_off_without_a_wait_remembers_the_escalated_line() {
@@ -10510,11 +10709,11 @@ mod tests {
                 [
                     EnvoyTurn {
                         role: EnvoyRole::User,
-                        text: "q ".repeat(200),
+                        text: "q ".repeat(400),
                     },
                     EnvoyTurn {
                         role: EnvoyRole::Assistant,
-                        text: "a ".repeat(200),
+                        text: "a ".repeat(400),
                     },
                 ]
             })
@@ -10570,7 +10769,7 @@ mod tests {
         };
         let extra = tokens(&PEER_IDENTITY).saturating_sub(tokens(&OTHER_IDENTITY));
         assert!(
-            extra >= history_tokens * 9 / 10 + note_tokens,
+            extra >= history_tokens * 9 / 10 + note_tokens && extra >= 10 * note_tokens,
             "resumed {} vs fresh {}: extra {extra}, history {history_tokens}, note {note_tokens}",
             tokens(&PEER_IDENTITY),
             tokens(&OTHER_IDENTITY)

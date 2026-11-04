@@ -100,6 +100,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use std::{env, fs, slice};
@@ -1091,6 +1092,10 @@ pub struct RequestContext {
     /// will run, consumed by `run_agent_for_graph`.
     pub peer_assignment: Option<(String, Arc<Inbox>)>,
     pub escalation_queue: Option<Arc<EscalationQueue>>,
+    /// Raised when a call in this run came back with text and a provider refusal. Only
+    /// the envoy sets one, to keep such a reply out of its thread memory; branches share
+    /// it and children start without.
+    pub refused_after_output: Option<Arc<AtomicBool>>,
     pub notification_queue: Arc<NotificationQueue>,
     pub current_depth: usize,
     pub auto_continue_count: usize,
@@ -1175,6 +1180,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: None,
+            refused_after_output: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
@@ -1265,6 +1271,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: None,
+            refused_after_output: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
@@ -1390,6 +1397,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: self.escalation_queue.clone(),
+            refused_after_output: self.refused_after_output.clone(),
             notification_queue: self.notification_queue.clone(),
             current_depth: self.current_depth,
             auto_continue_count: 0,
@@ -1466,6 +1474,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: parent.escalation_queue.clone(),
+            refused_after_output: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth,
             auto_continue_count: 0,
@@ -1508,6 +1517,12 @@ impl RequestContext {
 
     pub fn root_escalation_queue(&self) -> Option<&Arc<EscalationQueue>> {
         self.escalation_queue.as_ref()
+    }
+
+    pub fn note_refusal_after_output(&self) {
+        if let Some(flag) = &self.refused_after_output {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 
     /// A context that carries a session signal was handed the turn's interrupt
@@ -2066,10 +2081,7 @@ impl RequestContext {
     }
 
     pub fn envoy_model(&self) -> Option<String> {
-        self.agent
-            .as_ref()
-            .and_then(|a| a.envoy_model().map(|s| s.to_string()))
-            .or_else(|| self.app.config.mesh.envoy_model.clone())
+        self.app.config.mesh.envoy_model.clone()
     }
 
     pub fn compression_info(&self, app: &AppConfig) -> Result<CompressionInfo> {
@@ -10748,27 +10760,6 @@ mod tests {
             ..(*ctx.app).clone()
         });
         assert_eq!(ctx.envoy_model(), Some("openai:app-model".to_string()));
-    }
-
-    #[test]
-    fn envoy_model_agent_overrides_app_config() {
-        let mut ctx = create_test_ctx();
-        ctx.app = Arc::new(AppState {
-            config: Arc::new(AppConfig {
-                mesh: MeshConfig {
-                    envoy_model: Some("openai:app-model".to_string()),
-                    ..MeshConfig::default()
-                },
-                ..(*ctx.app.config).clone()
-            }),
-            ..(*ctx.app).clone()
-        });
-        ctx.agent = Some(Agent::test_new(AgentConfig {
-            name: "test-agent".to_string(),
-            envoy_model: Some("openai:agent-model".to_string()),
-            ..AgentConfig::default()
-        }));
-        assert_eq!(ctx.envoy_model(), Some("openai:agent-model".to_string()));
     }
 
     fn windowed_model(max_input_tokens: usize) -> Model {

@@ -958,7 +958,9 @@ pub(crate) enum FetchError {
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(err) if err.is_retryable_wait() => {
+            Self::Transport(err)
+                if err.is_retryable_wait() || matches!(err, RequestError::Timeout { .. }) =>
+            {
                 write!(f, "{err}. {}.", request_remedy(err))
             }
             Self::Transport(err) => write!(f, "{err}"),
@@ -1112,6 +1114,11 @@ impl PeerMemory {
         self.listed_paths
             .get(destination_hex)
             .is_some_and(|paths| paths.iter().any(|known| known == path))
+    }
+
+    /// `true` when a listing page or a claim from `destination_hex` is still remembered.
+    fn has_answered(&self, destination_hex: &str) -> bool {
+        self.lists.contains(destination_hex) || self.claims.contains(destination_hex)
     }
 
     /// The claims `identity_hex` holds at `destination_hex`; none when the entry there is
@@ -1539,6 +1546,10 @@ impl<T: Clone> Recent<T> {
             .map(|(_, value)| value.clone())
     }
 
+    fn contains(&self, key: &str) -> bool {
+        self.entries.lock().iter().any(|(known, _)| known == key)
+    }
+
     fn take(&self, key: &str) -> Option<T> {
         let mut entries = self.entries.lock();
         let at = entries.iter().position(|(known, _)| known == key)?;
@@ -1591,14 +1602,18 @@ impl<T: Default> Recent<T> {
 impl MeshRuntime {
     /// A request failure as a listing or fetch reports it: the peer's `NoAccess` or its
     /// silence once the link came up names which side has not trusted whom; anything else
-    /// is the transport's to describe.
+    /// is the transport's to describe. Silence from a peer this node has heard a listing
+    /// or a claim from since it started is the transport's too: that peer answered this
+    /// instance, so it trusts it, and a retry is the step.
     fn fetch_failure(&self, destination: &DestinationDesc, err: RequestError) -> FetchError {
         let dest_hex = destination.address_hash.to_hex_string();
         match err {
             err if err.is_access_refusal() => {
                 FetchError::NotTrustedByPeer(self.remote_refusal(&dest_hex))
             }
-            RequestError::Timeout { .. } => FetchError::NoAnswer(self.no_answer(&dest_hex)),
+            RequestError::Timeout { .. } if !self.memory().has_answered(&dest_hex) => {
+                FetchError::NoAnswer(self.no_answer(&dest_hex))
+            }
             err => FetchError::Transport(err),
         }
     }
@@ -1772,7 +1787,7 @@ mod no_answer_tests {
         assert_eq!(
             silent.to_string(),
             format!(
-                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
                 short(&to)
             )
         );
@@ -1797,6 +1812,80 @@ mod no_answer_tests {
         assert_eq!(
             never_linked.to_string(),
             "No mesh link to the peer came up within 2.0s. Try again in a minute; `.mesh peers` shows when the peer was last heard."
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod listed_then_timeout_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A peer that answered a listing, or lent this node a file, has trusted this
+    /// instance, so its silence on a later request is a transport hiccup to retry, never
+    /// the distrust a silent stranger is reported as.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listed_then_the_fetch_timed_out() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("fetch-listed").await;
+        let runtime = &started.runtime;
+        let to = stub.destination_hex();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let timed_out = RequestError::Timeout {
+            path: FETCH_PATH.to_string(),
+            after: Duration::from_secs(2),
+        };
+        runtime.memory().remember_listing_for_tests(
+            &to,
+            vec![ListedFile {
+                path: "docs/a.md".to_string(),
+                size: 3,
+            }],
+            SystemTime::now(),
+        );
+
+        let after_listing = runtime.fetch_failure(&desc, timed_out.clone());
+
+        assert!(
+            matches!(&after_listing, FetchError::Transport(err) if *err == timed_out),
+            "{after_listing:?}"
+        );
+        assert_eq!(
+            after_listing.to_string(),
+            format!("{timed_out}. {}.", request_remedy(&timed_out))
+        );
+        assert!(
+            !after_listing.to_string().contains("trusted"),
+            "{after_listing}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lent_a_file_then_the_fetch_timed_out() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("fetch-lent").await;
+        let runtime = &started.runtime;
+        let to = stub.destination_hex();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let timed_out = RequestError::Timeout {
+            path: FETCH_PATH.to_string(),
+            after: Duration::from_secs(2),
+        };
+        runtime
+            .memory()
+            .remember_reference(&to, &"cc".repeat(16), "message-1", "docs/a.md");
+
+        let after_claim = runtime.fetch_failure(&desc, timed_out.clone());
+
+        assert!(
+            matches!(&after_claim, FetchError::Transport(err) if *err == timed_out),
+            "{after_claim:?}"
         );
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
