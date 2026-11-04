@@ -6412,12 +6412,13 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     }
 }
 
-/// The Commands page's `.mesh pending` sample shows the block shape
-/// `render_question_block` prints under the three section titles: a dot-separated header
-/// (a state word, `<name> (<dest8>)`, a relative age under its `asked` or `sent` label,
-/// `id <id8>`), the indented body, `envoy asks:` on its own row, and a footer carrying the
-/// full id; the prose names every state word, header segment and footer. The `.mesh
-/// answer` section says the block is printed first, quotes the prompt, the nothing-sent
+/// The Commands page's `.mesh pending` sample shows the three sections `render_pending`
+/// prints in its order, each header carrying its count and the commands it names once,
+/// then numbered entries ending in `id <id8>` (a peer's with `expires in <span>`, this
+/// node's own led by `->`), the quoted question and `envoy asks:` indented under them;
+/// the prose names the entry shapes, the titles and the outbound state words. The `.mesh
+/// answer` section says the block is printed first, that an id may be given by prefix,
+/// quotes the prompt, the nothing-sent
 /// line, the refusal a non-terminal gets and the completion row shape with its cut
 /// length, and no longer quotes the retired `Nothing sent.`. The Mesh page's envoy
 /// section says escalations reach the human only through the REPL, and no Mesh page
@@ -6452,9 +6453,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             "",
             "path",
             "paths",
-            "grant: .mesh grant {} | refuse: .mesh refuse {}",
         ],
-        "QuestionRow::access's state word, label, path count and footer moved"
+        "QuestionRow::access's state word, label and path count moved"
     );
     assert_eq!(
         string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")),
@@ -6483,19 +6483,45 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         block.contains("tool_name_text_forced(&header)"),
         "render_question_block does not paint the header in the tool-call name colour:\n{block}"
     );
-    let titles = string_literals(&fn_body("src/repl/mesh.rs", "render_pending"));
+    let pending_literals = string_literals(&fn_body("src/repl/mesh.rs", "render_pending"));
     assert_eq!(
-        titles,
+        pending_literals,
         [
-            "  none",
-            "\n\n",
-            "{title}\n{body}",
-            "Questions this node asked (awaiting a reply):",
-            "Questions peers asked (escalated to you):",
-            "Access requests (decide with grant or refuse):",
-            "\n\n",
+            "Waiting for YOU",
+            "answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+            "Access requests",
+            "grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>",
+            "Asked by this node",
+            "collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+            "{title} ({})",
+            "{title}: none",
+            "{counted:<column$}{commands}",
+            "\n",
         ],
-        "render_pending's titles and separators moved"
+        "render_pending's titles, commands and header shapes moved"
+    );
+    let sections: Vec<(&str, &str)> = pending_literals[..6]
+        .chunks(2)
+        .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+        .collect();
+    let entry_literals = string_literals(&fn_body("src/repl/mesh.rs", "pending_entry"));
+    for needle in [
+        "-> {peer} {age} . {} . id {}",
+        "{peer} asked {age}{expires} . id {}",
+        " . expires in {}",
+        "  {number}. ",
+        "\"{body}\"",
+        "envoy asks: ",
+    ] {
+        assert!(
+            entry_literals.iter().any(|literal| literal == needle),
+            "pending_entry no longer prints {needle:?}: {entry_literals:?}"
+        );
+    }
+    let render = fn_body("src/repl/mesh.rs", "render_pending");
+    assert!(
+        render.contains("tool_name_text_forced(&header)"),
+        "render_pending does not paint the section headers in the tool-call name colour:\n{render}"
     );
     let prompt = const_str("src/repl/mesh.rs", "ANSWER_PROMPT");
     assert_eq!(prompt, "Your answer:");
@@ -6564,132 +6590,116 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .and_then(|block| block.split("\n```").next())
         .expect("the `.mesh pending` section opens with a text sample");
     let lines: Vec<&str> = sample.lines().collect();
-    let title_lines: Vec<&str> = lines
-        .iter()
-        .copied()
-        .filter(|line| titles.iter().any(|title| title == line))
-        .collect();
-    assert_eq!(
-        title_lines,
-        [
-            "Questions this node asked (awaiting a reply):",
-            "Questions peers asked (escalated to you):",
-            "Access requests (decide with grant or refuse):",
-        ],
-        "the `.mesh pending` sample shows the three section titles in order:\n{sample}"
-    );
-    for (index, line) in lines.iter().enumerate().skip(1) {
-        if title_lines.contains(line) {
-            assert_eq!(
-                lines[index - 1],
-                "",
-                "the `.mesh pending` sample puts a blank line before {line:?}, as render_pending joins its sections:\n{sample}"
-            );
-        }
-    }
     let headers: Vec<&str> = lines
         .iter()
         .copied()
-        .filter(|line| !line.is_empty() && !line.starts_with("  ") && !title_lines.contains(line))
+        .filter(|line| !line.starts_with("  "))
         .collect();
-    assert_eq!(headers.len(), 3, "one block per section:\n{sample}");
-    for (header, state, label, expires) in [
-        (headers[0], "open", " . sent ", false),
-        (headers[1], "awaiting your answer", " . asked ", true),
-        (headers[2], "access request", " . asked ", true),
-    ] {
-        assert!(
-            header.starts_with(&format!("{state} . "))
-                && header.contains(label)
-                && header.contains(" ago . id "),
-            "the `.mesh pending` sample header {header:?} is not `{state} . <name> (<dest8>){label}<age> . id <id8> [ . expires in <span>]`"
-        );
-        let after_id = header.rsplit(" . id ").next().unwrap();
-        let id8 = after_id.split(" . ").next().unwrap();
-        assert!(
-            id8.len() == 8 && id8.chars().all(|c| c.is_ascii_hexdigit()),
-            "the header carries an 8-hex id: {header:?}"
-        );
-        let span = header
-            .rsplit(" . expires in ")
-            .next()
-            .filter(|_| header.contains(" . expires in "));
-        if expires {
-            let span = span.unwrap_or_else(|| {
-                panic!("a peer's row in the `.mesh pending` sample ends with ` . expires in <span>`: {header:?}")
+    assert_eq!(
+        headers.len(),
+        sections.len(),
+        "the `.mesh pending` sample shows one header per section:\n{sample}"
+    );
+    for (header, (title, commands)) in headers.iter().zip(&sections) {
+        let rest = header.strip_prefix(title).unwrap_or_else(|| {
+            panic!("the `.mesh pending` sample shows the sections in order, {title:?} here: {header:?}")
+        });
+        let (count, after) = rest
+            .strip_prefix(" (")
+            .and_then(|rest| rest.split_once(')'))
+            .unwrap_or_else(|| {
+                panic!("the sample header {header:?} is not `{title} (<count>)  {commands}`")
             });
-            let (digits, unit) = span.split_at(span.len().saturating_sub(1));
-            assert!(
-                !digits.is_empty()
-                    && digits.bytes().all(|b| b.is_ascii_digit())
-                    && matches!(unit, "s" | "m" | "h" | "d"),
-                "the span is a whole number of s, m, h or d: {header:?}"
-            );
-        } else {
-            assert!(
-                span.is_none(),
-                "this node's own question carries no expiry in the sample: {header:?}"
-            );
+        assert!(
+            !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()),
+            "the sample header {header:?} counts its entries"
+        );
+        assert_eq!(
+            after.trim_start(),
+            *commands,
+            "the sample header {header:?} names the commands render_pending prints"
+        );
+    }
+    let mut section_index = 0;
+    let mut entries = 0;
+    for line in &lines {
+        if headers.contains(line) {
+            section_index = headers.iter().position(|header| header == line).unwrap();
+            continue;
         }
+        if line.starts_with("     ") {
+            continue;
+        }
+        let (_, head) = line
+            .strip_prefix("  ")
+            .and_then(|rest| rest.split_once(". "))
+            .filter(|(number, _)| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+            .unwrap_or_else(|| {
+                panic!("a `.mesh pending` sample line is neither a header, a numbered entry nor indented under one: {line:?}")
+            });
+        entries += 1;
+        let id8 = head.rsplit(" . id ").next().unwrap();
+        assert!(
+            head.contains(" . id ")
+                && id8.len() == 8
+                && id8.chars().all(|c| c.is_ascii_hexdigit()),
+            "the entry ends with an 8-hex id: {head:?}"
+        );
+        if section_index == 2 {
+            assert!(
+                head.starts_with("-> ") && !head.contains(" . expires in "),
+                "this node's own question reads `-> <name> (<dest8>) <age> . <state> . id <id8>`: {head:?}"
+            );
+            continue;
+        }
+        let span = head
+            .split(" . expires in ")
+            .nth(1)
+            .and_then(|rest| rest.split(" . ").next())
+            .unwrap_or_else(|| {
+                panic!("a peer's entry reads `<name> (<dest8>) asked <age> . expires in <span> . id <id8>`: {head:?}")
+            });
+        assert!(head.contains(") asked "), "{head:?}");
+        let (digits, unit) = span.split_at(span.len().saturating_sub(1));
+        assert!(
+            !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && matches!(unit, "s" | "m" | "h" | "d"),
+            "the span is a whole number of s, m, h or d: {head:?}"
+        );
     }
     assert!(
-        lines.iter().any(|line| line.starts_with("  envoy asks: ")),
+        entries >= 3,
+        "the `.mesh pending` sample has an entry in every section:\n{sample}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("     envoy asks: ")),
         "the `.mesh pending` sample has no `envoy asks:` row of its own:\n{sample}"
     );
-    let footers: Vec<&str> = lines
-        .iter()
-        .copied()
-        .filter(|line| {
-            line.starts_with("  answer: .mesh answer ") || line.starts_with("  grant: .mesh grant ")
-        })
-        .collect();
-    assert_eq!(footers.len(), 3, "each block ends with a footer:\n{sample}");
-    for footer in footers {
-        let id = footer
-            .split_whitespace()
-            .nth(3)
-            .unwrap_or_else(|| panic!("the footer {footer:?} names no id"));
-        assert!(
-            id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()),
-            "the footer carries the full 32-hex id, not a short one: {footer:?}"
-        );
-    }
     assert!(
-        lines.iter().all(|line| {
-            line.is_empty()
-                || line.starts_with("  ")
-                || line.contains(" . ")
-                || title_lines.contains(line)
-        }),
-        "a `.mesh pending` sample line is neither a title, a header nor indented:\n{sample}"
+        lines
+            .iter()
+            .any(|line| line.starts_with("     \"") && line.ends_with('"')),
+        "the `.mesh pending` sample quotes no question:\n{sample}"
     );
 
-    // Flattening would fold the two spaces inside the `  none` span, so this one is read raw.
-    assert!(pending.contains("Empty lists print `  none`"), "{pending}");
     let prose = flat(&pending);
     let mut needles = vec![
+        "`<title>: none`".to_string(),
         "`<name> (<dest8>)`".to_string(),
         "the short destination standing in for the name when this node has never heard one"
             .to_string(),
         "`<dest8> (<dest8>)`".to_string(),
-        "`asked <age>`".to_string(),
-        "`sent <age>`".to_string(),
-        "`id <id8>`".to_string(),
+        "`<name> (<dest8>) asked <age> . expires in <span> . id <id8>`".to_string(),
+        "`-> <name> (<dest8>) <age> . <state> . id <id8>`".to_string(),
         "`envoy asks: <what the envoy wanted decided>`".to_string(),
-        "`answer: .mesh answer <id> \"<text>\"`".to_string(),
-        "`grant: .mesh grant <id> | refuse: .mesh refuse <id>`".to_string(),
-        "a blank line between the blocks of a section and between the sections".to_string(),
+        "any 8 or more of an id's first characters".to_string(),
         "plain under `NO_COLOR`".to_string(),
         "word-wrapped to the terminal width".to_string(),
         "the paths and the reason are never printed here".to_string(),
     ];
-    needles.extend(
-        outbound[..3]
-            .iter()
-            .chain(&inbound[..1])
-            .chain(&access[..1])
-            .map(|word| format!("`{word}`")),
-    );
+    needles.extend(outbound[..3].iter().map(|word| format!("`{word}`")));
+    needles.extend(sections.iter().map(|(title, _)| format!("`{title}`")));
     for needle in &needles {
         assert!(
             prose.contains(needle.as_str()),
@@ -6699,7 +6709,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
 
     let answer_prose = flat(&section("Mesh-Commands.md", &page, "### `.mesh answer`"));
     for needle in [
-        "`.mesh answer <id>` first prints the question's block as `.mesh pending` shows it"
+        "`.mesh answer <id>` first prints the question's block".to_string(),
+        "any 8 or more of its first characters, as long as they begin only one pending id"
             .to_string(),
         format!("the prompt `{prompt}`"),
         format!(
