@@ -1459,6 +1459,11 @@ check("quality bar answer: an explicit rigor=, a bare rigor word, surfaces= and 
       gates._quality_bar_answer("rigor=prototype, surfaces=http,other:grpc", "production", "x") == ("prototype", "http,other:grpc")
       and gates._quality_bar_answer("rigor=poc, surfaces=(as proposed)", "production", "http") == ("poc", "http")
       and gates._quality_bar_answer("go with poc", "production", "http") == ("poc", "http"))
+check("quality bar answer: an empty surfaces= stays empty, surfaces named in passing keep the proposal, a bare rigor word is lowercased",
+      gates._quality_bar_answer("rigor=production, surfaces=", "production", "") == ("production", "")
+      and gates._quality_bar_answer("go with poc, the surfaces listed are fine", "production", "http") == ("poc", "http")
+      and gates._quality_bar_answer("Prototype please", "production", "http") == ("prototype", "http")
+      and gates._quality_bar_answer("prototype, surfaces api", "production", "http") == ("prototype", "api"))
 u = AA("quality_bar", "rigor=poc", esc=escalation("quality_bar", "q", data={"multiple_choice": True, "index": 0}))
 check("apply_answer: quality_bar -> recorded through the queue -> quality_bar_gate", u["_next"] == "quality_bar_gate" and u["choice_index"] == 1)
 u = AA("checklist_accept", "Drop", esc=escalation("checklist_accept", "q", data={"multiple_choice": True, "index": 0}))

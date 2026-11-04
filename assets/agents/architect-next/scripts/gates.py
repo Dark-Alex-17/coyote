@@ -618,9 +618,10 @@ QUALITY_RIGORS = ("production", "prototype", "poc")
 def _quality_bar_answer(answer, rigor, surfaces):
     """(rigor, surfaces) named by a quality bar answer, each falling back to the proposal when the answer omits it."""
     m = re.search(r"rigor\s*=\s*([\w-]+)", answer) or re.search(rf"(?i)\b({'|'.join(QUALITY_RIGORS)})\b", answer)
-    s = re.search(r"surfaces\s*[=:]?\s*([^;\n]+)", answer)
+    # a bare "surfaces <value>" only counts as its own clause, so prose that mentions surfaces keeps the proposal
+    s = re.search(r"(?i)(?:\bsurfaces\s*[=:]\s*|(?:^|[,;])\s*surfaces\s+)([^;\n]*)", answer)
     picked = s.group(1).strip() if s else surfaces
-    return (m.group(1) if m else rigor).strip(), (surfaces if "(as proposed)" in picked else picked).strip()
+    return (m.group(1) if m else rigor).strip().lower(), (surfaces if "(as proposed)" in picked else picked).strip()
 
 
 def quality_bar_gate(state):
