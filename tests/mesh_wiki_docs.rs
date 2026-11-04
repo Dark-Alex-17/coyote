@@ -6606,30 +6606,44 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "QuestionRow::access's state word, label and path count moved"
     );
     assert_eq!(
-        string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")),
-        ["answer: .mesh answer {id} \"<text>\""],
+        string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")).first(),
+        Some(&"answer: .mesh answer {id} \"<text>\"".to_string()),
         "answer_footer's literal moved"
     );
-    let header = string_literals(&fn_body("src/repl/mesh.rs", "question_header"));
+    let header_source = fn_body("src/repl/mesh.rs", "question_header");
+    let header = string_literals(&header_source);
     assert_eq!(
         header,
         [
             "at an unknown time",
-            "{} . {} ({}) . {} {age} . id {}",
+            "{} . ",
+            " ({}) . {} {age} . id ",
             " . expires in {}",
         ],
         "question_header's literals moved"
     );
+    assert_in_source_order(
+        "question_header",
+        &header_source,
+        &[
+            r#""{} . ""#,
+            ".peer(row.name.clone())",
+            r#"" ({}) . {} {age} . id ""#,
+            ".peer(short(&row.id))",
+        ],
+    );
     let block = fn_body("src/repl/mesh.rs", "render_question_block");
     let block_literals = string_literals(&block);
-    for needle in ["", "envoy asks: ", "  {}"] {
+    for needle in ["", "envoy asks: ", "  "] {
         assert!(
             block_literals.iter().any(|literal| literal == needle),
             "render_question_block no longer prints {needle:?}:\n{block}"
         );
     }
     assert!(
-        block.contains("tool_name_text_forced(&header)"),
+        block.contains("painted_header(header)")
+            && fn_body("src/repl/mesh.rs", "painted_header")
+                .contains("tool_name_text_forced(&plain)"),
         "render_question_block does not paint the header in the tool-call name colour:\n{block}"
     );
     let pending_literals = string_literals(&fn_body("src/repl/mesh.rs", "render_pending"));
@@ -6655,8 +6669,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .collect();
     let entry_literals = string_literals(&fn_body("src/repl/mesh.rs", "pending_entry"));
     for needle in [
-        "-> {peer} {age} . {} . id {id}",
-        "{peer} {} {age}{expires} . id {id}",
+        "{marker}-> ",
+        " {age} . {} . id ",
+        " {} {age}{expires} . id ",
         " . expires in {}",
         "  {number}. ",
         "\"{body}\"",
@@ -6678,7 +6693,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     assert_eq!(
         nothing_sent,
         [
-            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\".",
+            "id",
         ]
     );
     let refusal = string_literals(&fn_body("src/repl/mesh.rs", "prompt_answer_text_with"))
@@ -7976,12 +7992,20 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     }
     let gone_tail = const_str("src/mesh/fetch.rs", "GONE_COPY_TAIL");
     assert_eq!(gone_tail, " That copy is no longer at that path.");
-    for (path, name) in [
-        ("src/repl/mesh.rs", "not_shared_refusal"),
-        ("src/function/mesh.rs", "fetch_result"),
+    for (path, name, appends) in [
+        (
+            "src/repl/mesh.rs",
+            "not_shared_refusal",
+            "sentence.frame(GONE_COPY_TAIL)",
+        ),
+        (
+            "src/function/mesh.rs",
+            "fetch_result",
+            "push_str(GONE_COPY_TAIL)",
+        ),
     ] {
         assert!(
-            fn_body(path, name).contains("push_str(GONE_COPY_TAIL)"),
+            fn_body(path, name).contains(appends),
             "{path}'s {name} no longer appends GONE_COPY_TAIL for a staged copy that is gone"
         );
     }
@@ -7995,7 +8019,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     let local_tail = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
         .into_iter()
         .find(|literal| literal.contains("answered from this node's own records"))
-        .and_then(|literal| literal.strip_prefix("{} ").map(str::to_string))
+        .and_then(|literal| literal.strip_prefix(' ').map(str::to_string))
         .expect("the REPL's fetch says a spent attachment was answered from this node's records")
         .replace("{peer}", "<dest8>");
     assert!(

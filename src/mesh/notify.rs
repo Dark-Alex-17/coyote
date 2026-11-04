@@ -106,6 +106,36 @@ impl NoticeText {
         self
     }
 
+    /// `template` with each `{name}` in it filled, from `frames` as this node's own text
+    /// or from `quoted` as a peer run kept verbatim, so a sentence stays one literal
+    /// while the values a peer chose are quoted. A name in neither stays as written.
+    pub(crate) fn from_template(
+        template: &str,
+        frames: &[(&str, &str)],
+        quoted: &[(&str, &str)],
+    ) -> Self {
+        let mut text = Self::default();
+        let mut frame = String::new();
+        let mut rest = template;
+        while let Some((open, close)) = rest
+            .find('{')
+            .and_then(|open| Some((open, open + rest[open..].find('}')?)))
+        {
+            let name = &rest[open + 1..close];
+            frame.push_str(&rest[..open]);
+            if let Some((_, value)) = quoted.iter().find(|(key, _)| *key == name) {
+                text = text.frame(std::mem::take(&mut frame)).peer(*value);
+            } else if let Some((_, value)) = frames.iter().find(|(key, _)| *key == name) {
+                frame.push_str(value);
+            } else {
+                frame.push_str(&rest[open..=close]);
+            }
+            rest = &rest[close + 1..];
+        }
+        frame.push_str(rest);
+        text.frame(frame)
+    }
+
     /// The text with every run joined, as the terminal shows it under the dot prefix.
     pub(crate) fn plain(&self) -> String {
         self.0.iter().map(NoticeSpan::text).collect()
@@ -137,6 +167,28 @@ impl NoticeText {
 impl From<String> for NoticeText {
     fn from(text: String) -> Self {
         Self::default().frame(text)
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn a_template_quotes_its_peer_values_and_spells_its_own_hints() {
+        let text = NoticeText::from_template(
+            "`{id}` from {peer}; run .mesh grant {id} or {missing}",
+            &[("peer", "abcd1234")],
+            &[("id", ".vault")],
+        );
+        assert_eq!(
+            text.render(CommandPrefix::Dot),
+            "`.vault` from abcd1234; run .mesh grant .vault or {missing}"
+        );
+        assert_eq!(
+            text.render(CommandPrefix::Slash),
+            "`.vault` from abcd1234; run /mesh grant .vault or {missing}"
+        );
     }
 }
 

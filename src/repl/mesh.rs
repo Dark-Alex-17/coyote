@@ -6,7 +6,9 @@ use crate::mesh::access::{
     ValidAccess, validate_access,
 };
 use crate::mesh::brief::{Brief, BriefSource};
-use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
+use crate::mesh::card::{
+    CardSource, DISPLAY_NAME_MAX_CHARS, StatusError, StatusHandler, render_for_human,
+};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
@@ -22,7 +24,7 @@ use crate::mesh::knock::{
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
-    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
+    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, SendError, is_wire_id,
     left_mesh_hint, unreachable_head,
 };
 use crate::mesh::notify::NoticeText;
@@ -770,7 +772,7 @@ async fn status(
             ));
             result_follows();
             let card = tokio::select! {
-                outcome = runtime.request_status(&desc) => outcome?,
+                outcome = runtime.request_status(&desc) => outcome.map_err(quoted_status_failure)?,
                 _ = wait_user_interrupt(Some(abort_signal)) => {
                     out_text("Status request interrupted.");
                     return Ok(());
@@ -1578,7 +1580,8 @@ async fn message(
     )?;
     let outcome = runtime
         .send_peer_lending_reference(&destination, &out)
-        .await?;
+        .await
+        .map_err(quoted_send_failure)?;
     out_text(&format!(
         "Sent {} to {} (via {}).",
         short(&outcome.id),
@@ -1586,6 +1589,123 @@ async fn message(
         via_text(outcome.via)
     ));
     Ok(())
+}
+
+/// A peer-side refusal ends with the command the peer's owner runs on that node, which
+/// stays as that owner types it under any prefix; what this node adds after it is its
+/// own and follows the prefix.
+fn quoted_peer_side(err: &dyn std::fmt::Display, remedy: &dyn std::fmt::Display) -> anyhow::Error {
+    let whole = err.to_string();
+    let remedy = remedy.to_string();
+    let text = match whole.strip_prefix(remedy.as_str()) {
+        Some(tail) => NoticeText::default().peer(remedy.as_str()).frame(tail),
+        None => NoticeText::default().peer(whole.as_str()),
+    };
+    QuotingError::wrap(text)
+}
+
+fn quoted_status_failure(err: StatusError) -> anyhow::Error {
+    match &err {
+        StatusError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
+        StatusError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        _ => err.into(),
+    }
+}
+
+fn quoted_send_failure(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast_ref::<SendError>() {
+        Some(send @ SendError::NotTrustedByPeer(refusal)) => quoted_peer_side(send, refusal),
+        Some(send @ SendError::NoAnswer(no_answer)) => quoted_peer_side(send, no_answer),
+        _ => err,
+    }
+}
+
+fn quoted_access_failure(err: AccessError) -> anyhow::Error {
+    match &err {
+        AccessError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
+        AccessError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        _ => anyhow!(err.to_string()),
+    }
+}
+
+fn quoted_fetch_failure(err: FileFetchError) -> anyhow::Error {
+    match &err {
+        FileFetchError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
+        FileFetchError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        _ => anyhow!(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod peer_side_refusal_tests {
+    use super::*;
+    use crate::mesh::request::{NoAnswer, RemoteRefusal};
+    use crate::render::{MeshVerbError, command_error_text};
+
+    fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
+        command_error_text(
+            &MeshVerbError::wrap(err.context("`.mesh fetch` failed")),
+            prefix,
+        )
+    }
+
+    fn refusal() -> RemoteRefusal {
+        RemoteRefusal::new(&"ab".repeat(16), Some(".session"), "cd".repeat(16))
+    }
+
+    #[test]
+    fn a_peer_refusal_keeps_the_owner_remedy_and_name_as_written_in_every_verb() {
+        let refused = refusal().to_string();
+        let cases = [
+            (
+                quoted_fetch_failure(FileFetchError::NotTrustedByPeer(refusal())),
+                refused.clone(),
+            ),
+            (
+                quoted_access_failure(AccessError::NotTrustedByPeer(refusal())),
+                refused.clone(),
+            ),
+            (
+                quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into()),
+                refused.clone(),
+            ),
+            (
+                quoted_status_failure(StatusError::NotTrustedByPeer(refusal())),
+                StatusError::NotTrustedByPeer(refusal()).to_string(),
+            ),
+        ];
+        for (err, today) in cases {
+            let dot = shown_as(anyhow!(err.to_string()), CommandPrefix::Dot);
+            assert!(dot.ends_with(&format!("    {today}")), "{dot}");
+            let slash = shown_as(err, CommandPrefix::Slash);
+            assert!(slash.starts_with("Error: `/mesh fetch` failed"), "{slash}");
+            assert!(slash.ends_with(&format!("    {today}")), "{slash}");
+            assert!(slash.contains(&format!("\"{}\"", ".session")), "{slash}");
+            assert!(
+                slash.contains(&format!("can run .mesh trust {}", "cd".repeat(16))),
+                "{slash}"
+            );
+        }
+    }
+
+    #[test]
+    fn silence_keeps_the_owner_remedy_while_this_node_hint_slashes() {
+        let no_answer = NoAnswer::new(&"ab".repeat(16), "cd".repeat(16));
+        let err = AccessError::NoAnswer(no_answer.clone());
+        let today = err.to_string();
+        let quoted = quoted_access_failure(err);
+        assert_eq!(quoted.to_string(), today);
+        let slash = shown_as(quoted, CommandPrefix::Slash);
+        let tail = today.strip_prefix(&no_answer.to_string()).unwrap();
+        assert!(
+            slash.ends_with(&format!(
+                "    {no_answer}{}",
+                tail.replace("`.mesh peers`", "`/mesh peers`")
+            )),
+            "{slash}"
+        );
+        assert!(tail.contains("`.mesh peers`"), "{tail}");
+    }
 }
 
 /// The pre-flight every verb that contacts one peer runs: a destination the trust list
@@ -2362,7 +2482,7 @@ async fn send_request(
             &valid.paths,
             live_prefix(),
         )),
-        Err(err) => bail!(err.to_string()),
+        Err(err) => return Err(quoted_access_failure(err)),
     }
     Ok(())
 }
@@ -2488,10 +2608,11 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         &args.path,
         SystemTime::now(),
     ) {
-        bail!(
-            "{} This was answered from this node's own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}.",
-            not_shared_refusal(peer, &shown, &args.path, &reason)
-        );
+        return Err(QuotingError::wrap(
+            not_shared_refusal(peer, &shown, &args.path, &reason).frame(format!(
+                " This was answered from this node's own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}."
+            )),
+        ));
     }
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
@@ -2541,26 +2662,32 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 &args.path,
                 SystemTime::now(),
             );
-            bail!(not_shared_refusal(peer, &shown, &args.path, &reason))
+            return Err(QuotingError::wrap(not_shared_refusal(
+                peer, &shown, &args.path, &reason,
+            )));
         }
-        Ok(Fetched::InvalidPath { rule }) => bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it."
-            ))
-        ),
-        Ok(Fetched::TooLarge { limit }) => bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way."
-            ))
-        ),
-        Err(FileFetchError::NotServed) => bail!(not_shared_sentence(
-            peer,
-            &shown,
-            &args.path,
-            &NotSharedReason::PeerWithoutFetch
-        )),
+        Ok(Fetched::InvalidPath { rule }) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it.",
+                &[("rule", &rule), ("peer", peer)],
+                &[("shown", &shown)],
+            )));
+        }
+        Ok(Fetched::TooLarge { limit }) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way.",
+                &[("peer", peer), ("limit", &limit.to_string())],
+                &[("shown", &shown)],
+            )));
+        }
+        Err(FileFetchError::NotServed) => {
+            return Err(QuotingError::wrap(not_shared_sentence(
+                peer,
+                &shown,
+                &args.path,
+                &NotSharedReason::PeerWithoutFetch,
+            )));
+        }
         // A reply this Coyote could not read is a fragment that names the fault and
         // nothing else; the other arms already carry a whole sentence of their own.
         Err(
@@ -2568,28 +2695,48 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             | FileFetchError::Oversize { .. }
             | FileFetchError::Corrupt
             | FileFetchError::UnknownStatus),
-        ) => bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {}` again; if it repeats, the peer may run a different Coyote.",
-                args.path
-            ))
-        ),
-        Err(err) => bail!(err.to_string()),
+        ) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {path}` again; if it repeats, the peer may run a different Coyote.",
+                &[("peer", peer), ("err", &err.to_string())],
+                &[("shown", &shown), ("path", &args.path)],
+            )));
+        }
+        Err(err) => return Err(quoted_fetch_failure(err)),
     }
     Ok(())
 }
 
 /// The refusal for a path the peer did not serve, read against what this node knows,
 /// with the gone-copy tail when an already fetched copy has since been removed.
-fn not_shared_refusal(peer: &str, shown: &str, path: &str, reason: &NotSharedReason) -> String {
-    let mut sentence = not_shared_sentence(peer, shown, path, reason);
+fn not_shared_refusal(peer: &str, shown: &str, path: &str, reason: &NotSharedReason) -> NoticeText {
+    let sentence = not_shared_sentence(peer, shown, path, reason);
     if let NotSharedReason::AlreadyFetched { staged, .. } = reason
         && !staged.is_file()
     {
-        sentence.push_str(GONE_COPY_TAIL);
+        return sentence.frame(GONE_COPY_TAIL);
     }
     sentence
+}
+
+#[cfg(test)]
+mod not_shared_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_gone_copy_keeps_the_peer_paths_while_the_message_hint_slashes() {
+        let reason = NotSharedReason::AlreadyFetched {
+            message_id: "m-1".to_string(),
+            staged: PathBuf::from("/nonexistent/.vault"),
+        };
+        let refusal = not_shared_refusal("abcd1234", ".session", ".session", &reason);
+        let today = "`.session` was a one-time attachment from abcd1234 and this node already fetched it (staged at /nonexistent/.vault). Ask for it again with .mesh message abcd1234 if you need a fresh copy. That copy is no longer at that path.";
+        assert_eq!(refusal.render(CommandPrefix::Dot), today);
+        assert_eq!(
+            refusal.render(CommandPrefix::Slash),
+            today.replace(".mesh message", "/mesh message")
+        );
+    }
 }
 
 struct FetchArgs {
@@ -6691,10 +6838,11 @@ const ANSWER_PROMPT: &str = "Your answer:";
 /// open, so the line carries the full id, quoted as the peer chose it, for the one-line
 /// form.
 fn nothing_sent(id: &str) -> NoticeText {
-    NoticeText::default()
-        .frame("Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer ")
-        .peer(id)
-        .frame(" \"<text>\".")
+    NoticeText::from_template(
+        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\".",
+        &[],
+        &[("id", id)],
+    )
 }
 
 /// Asks for the answer to `id` when none came on the line: no terminal on stdin is an
@@ -8394,10 +8542,7 @@ fn time_left(received_at: &str, now: SystemTime) -> Option<Duration> {
 }
 
 fn answer_footer(id: &str) -> NoticeText {
-    NoticeText::default()
-        .frame("answer: .mesh answer ")
-        .peer(id)
-        .frame(" \"<text>\"")
+    NoticeText::from_template("answer: .mesh answer {id} \"<text>\"", &[], &[("id", id)])
 }
 
 /// A question block in the `.mesh inbox` shape: a header the colour paints, then the
