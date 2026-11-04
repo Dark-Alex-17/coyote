@@ -5348,14 +5348,11 @@ fn looks_like_hash(token: &str) -> bool {
 /// both, with as many characters as tell them apart; a prefix nothing known begins is
 /// refused with the unheard wording; anything else is not a hash. Every verb sends or
 /// looks up only what this returns, so a prefix never leaves the keyboard.
-/// A pending id follows `resolve_pending_id` instead, as peers choose their own ids.
+/// A pending id goes through `resolve_pending_id` instead, as peers choose their own ids.
 fn resolve_hash<I>(token: &str, kind: HashKind, known: I) -> Result<String>
 where
     I: IntoIterator<Item = String>,
 {
-    if kind == HashKind::Message {
-        return resolve_pending_id(token, known.into_iter().collect());
-    }
     if let Some(hash) = canonical_hash(token) {
         return Ok(hash);
     }
@@ -5400,19 +5397,21 @@ where
 /// The id this node holds that `token` names: the one held id equal to it or beginning
 /// with it, compared without regard to case. Short of the whole id, a token needs
 /// `HASH_PREFIX_MIN_CHARS` characters, what `.mesh pending` prints at the least. A token
-/// two held ids begin is refused naming both, even when it is the whole of one of them,
-/// so an id a peer chose to begin another never takes the other's place. A token no held
+/// two held ids begin is refused, even when it is the whole of one of them, so an id a
+/// peer chose to begin another never takes the other's place. A token no held
 /// id begins comes back as typed (32 hex digits lower-cased), so the verb's own lookup
 /// says which kind of id it has no open entry for.
-fn resolve_pending_id(token: &str, held: Vec<String>) -> Result<String> {
+/// Each held id comes with the kind of inbound entry it is, `None` for a question this
+/// node asked, so a token that is a whole id can be told how its entries clear.
+fn resolve_pending_id(token: &str, held: Vec<(String, Option<InboundKind>)>) -> Result<String> {
     let lowered = token.to_ascii_lowercase();
-    let mut matches: Vec<String> = held
+    let mut matches: Vec<(String, Option<InboundKind>)> = held
         .into_iter()
-        .filter(|id| id.to_ascii_lowercase().starts_with(&lowered))
+        .filter(|(id, _)| id.to_ascii_lowercase().starts_with(&lowered))
         .collect();
-    matches.sort_unstable();
-    matches.dedup();
-    let whole = matches.iter().any(|id| id.eq_ignore_ascii_case(token));
+    matches.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    matches.dedup_by(|a, b| a.0 == b.0);
+    let whole = matches.iter().any(|(id, _)| id.eq_ignore_ascii_case(token));
     if token.len() < HASH_PREFIX_MIN_CHARS && !whole {
         if matches.is_empty() && !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(token.to_string());
@@ -5424,24 +5423,111 @@ fn resolve_pending_id(token: &str, held: Vec<String>) -> Result<String> {
     }
     match matches.len() {
         0 => Ok(canonical_hash(token).unwrap_or_else(|| token.to_string())),
-        1 => Ok(matches.remove(0)),
+        1 => Ok(matches.remove(0).0),
+        _ if whole => bail!(whole_id_refusal(token, &matches)),
         count => {
-            let folded: Vec<String> = matches.iter().map(|id| id.to_ascii_lowercase()).collect();
-            let shown = distinguishing_len(&folded);
-            let candidates: Vec<String> = matches
-                .iter()
-                .map(|id| match id.get(..shown) {
-                    Some(head) if head.len() < id.len() => format!("{head}..."),
-                    _ => id.clone(),
-                })
-                .collect();
+            let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
             bail!(
                 "'{token}' matches {count} {}: {}; give one of these (or enough of its characters to tell it apart).",
                 HashKind::Message.plural(),
-                candidates.join(", ")
+                pending_candidates(&ids, &ids).join(", ")
             )
         }
     }
+}
+
+/// Each of `ids` as a refusal names it: whole, or cut to the length that tells every one
+/// of `among` apart, compared without regard to case, and marked as cut.
+fn pending_candidates(ids: &[&str], among: &[&str]) -> Vec<String> {
+    let folded: Vec<String> = among.iter().map(|id| id.to_ascii_lowercase()).collect();
+    let shown = distinguishing_len(&folded);
+    ids.iter()
+        .map(|id| match id.get(..shown) {
+            Some(head) if head.len() < id.len() => format!("{head}..."),
+            _ => id.to_string(),
+        })
+        .collect()
+}
+
+/// The refusal for a token that is the whole of a held id and also begins another, or
+/// matches ids that differ only in case. No form of the token can ever pick the short or
+/// twinned id, so the sentence names how the entries in the way leave instead. A longer
+/// id a peer sent goes once it is acted on, which a question this node asked does not.
+fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> String {
+    let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
+    let shown = pending_candidates(&ids, &ids);
+    let (twins, longer): (Vec<usize>, Vec<usize>) =
+        (0..ids.len()).partition(|&at| ids[at].eq_ignore_ascii_case(token));
+    let names = |at: &[usize]| at.iter().map(|&i| shown[i].clone()).collect::<Vec<_>>();
+    let clear = pending_clear_clause(&names(&(0..ids.len()).collect::<Vec<_>>()), matches);
+    if twins.len() > 1 {
+        let quoted: Vec<String> = names(&twins).iter().map(|id| format!("'{id}'")).collect();
+        let none = if twins.len() == 2 { "neither" } else { "none" };
+        return format!(
+            "{} differ only in case, so {none} can be picked; {clear}.",
+            join_and(&quoted)
+        );
+    }
+    let longer_names = names(&longer).join(", ");
+    let verb = if longer.len() == 1 { "begins" } else { "begin" };
+    let what = format!(
+        "'{token}' is a whole pending id and also how {longer_names} {verb}, so it cannot pick one"
+    );
+    if longer.iter().any(|&at| matches[at].1.is_none()) {
+        return format!("{what}; {clear}.");
+    }
+    let it = if longer.len() == 1 { "it" } else { "them" };
+    format!(
+        "{what}. Act on {longer_names} first, typed as `.mesh pending` lists {it}, then '{token}' picks the one left; or {clear}."
+    )
+}
+
+/// How the entries `shown` names leave `.mesh pending` when no id can pick them: a peer's
+/// questions by `.mesh dismiss --all`, which leaves access requests alone, an access
+/// request at its expiry, and a question this node asked by no verb at all.
+fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind>)]) -> String {
+    let of_kind = |kind: Option<InboundKind>| {
+        matches
+            .iter()
+            .zip(shown)
+            .filter(|((_, held), _)| *held == kind)
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>()
+    };
+    let questions = of_kind(Some(InboundKind::Question));
+    let access = of_kind(Some(InboundKind::Access));
+    let asked = of_kind(None);
+    if questions.len() == matches.len() {
+        let all = if matches.len() == 2 { "both" } else { "them" };
+        return format!("clear {all} with `.mesh dismiss --all`");
+    }
+    let mut clauses = Vec::new();
+    if !questions.is_empty() {
+        clauses.push(format!(
+            "`.mesh dismiss --all` clears {}",
+            join_and(&questions)
+        ));
+    }
+    if !access.is_empty() {
+        let (leave, expire) = if access.len() == 1 {
+            ("leaves", "it expires")
+        } else {
+            ("leave", "they expire")
+        };
+        clauses.push(format!(
+            "{} {leave} `.mesh pending` when {expire}",
+            join_and(&access)
+        ));
+    }
+    if !asked.is_empty() {
+        let what = if asked.len() == 1 {
+            "is a question this node asked"
+        } else {
+            "are questions this node asked"
+        };
+        clauses.push(format!("{} {what}, which no verb clears", join_and(&asked)));
+    }
+    clauses.join(", and ")
 }
 
 /// The fewest leading characters, never under `HASH_PREFIX_MIN_CHARS`, at which every hash
@@ -5541,14 +5627,17 @@ fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<Stri
         .and_then(|store| store.list(now).ok())
         .unwrap_or_default();
     let outbound = ctx.app.mesh.correlations().list();
-    resolve_hash(
+    resolve_pending_id(
         token,
-        HashKind::Message,
-        inbound.into_iter().map(|record| record.id).chain(
-            outbound
-                .into_iter()
-                .map(|correlation| correlation.record.id),
-        ),
+        inbound
+            .into_iter()
+            .map(|record| (record.id, Some(record.kind)))
+            .chain(
+                outbound
+                    .into_iter()
+                    .map(|correlation| (correlation.record.id, None)),
+            )
+            .collect(),
     )
 }
 
@@ -7785,7 +7874,10 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> String {
 /// entries. Entries show only the short id, which those commands take as a prefix. The
 /// header commands start in one column so the three read as a list. An id whose short
 /// form another listed id shares is shown at the length that tells them apart, so every
-/// printed id can be typed back.
+/// printed id picks its entry when typed back, except an id that is the whole of one
+/// entry's id and also how another's begins, or one that differs from another only in
+/// case. Those stay ambiguous on purpose, so a peer cannot mint an id that takes the
+/// place of another, and the refusal names how the entries clear.
 fn render_pending(
     asked: &[QuestionRow],
     escalated: &[QuestionRow],
@@ -12048,12 +12140,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         const SECOND: &str = "320b8f7b9999bbbb320b8f7b9999bbbb";
         const OTHER: &str = "1046c2c6aaaa1111bbbb2222cccc3333";
 
-        fn resolve(token: &str) -> Result<String> {
-            resolve_hash(
+        /// `token` resolved against `ids`, every one held as a peer's question.
+        fn pick(token: &str, ids: &[&str]) -> Result<String> {
+            held_as(token, ids, Some(InboundKind::Question))
+        }
+
+        fn held_as(token: &str, ids: &[&str], kind: Option<InboundKind>) -> Result<String> {
+            resolve_pending_id(
                 token,
-                HashKind::Message,
-                [FIRST, SECOND, OTHER, "acc-1"].map(String::from),
+                ids.iter().map(|id| (id.to_string(), kind)).collect(),
             )
+        }
+
+        fn resolve(token: &str) -> Result<String> {
+            pick(token, &[FIRST, SECOND, OTHER, "acc-1"])
         }
 
         #[test]
@@ -12083,19 +12183,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         #[test]
         fn a_prefix_of_a_peer_chosen_id_resolves_to_the_held_id() {
-            let held = || ["req-2026-11-0001", OTHER].map(String::from);
+            let held = ["req-2026-11-0001", OTHER];
             assert_eq!(
-                resolve_hash("req-2026", HashKind::Message, held()).unwrap(),
+                pick("req-2026", &held).unwrap(),
                 "req-2026-11-0001"
             );
             assert_eq!(
-                resolve_hash("REQ-2026-11", HashKind::Message, held()).unwrap(),
+                pick("REQ-2026-11", &held).unwrap(),
                 "req-2026-11-0001"
             );
             assert_eq!(
-                resolve_hash("req-20", HashKind::Message, held())
-                    .unwrap_err()
-                    .to_string(),
+                pick("req-20", &held).unwrap_err().to_string(),
                 "'req-20' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them."
             );
         }
@@ -12103,10 +12201,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn an_upper_case_id_resolves_from_either_case_to_the_id_as_held() {
             let upper = FIRST.to_ascii_uppercase();
-            let held = || [upper.clone(), OTHER.to_string()];
             for token in ["320b8f7b", "320B8F7B", FIRST, upper.as_str()] {
                 assert_eq!(
-                    resolve_hash(token, HashKind::Message, held()).unwrap(),
+                    pick(token, &[upper.as_str(), OTHER]).unwrap(),
                     upper,
                     "{token}"
                 );
@@ -12114,19 +12211,70 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
 
         /// A whole id that also begins another held id names neither, so a peer cannot
-        /// mint an id equal to the short form of another and take its place.
+        /// mint an id equal to the short form of another and take its place. The refusal
+        /// says the longer one goes first, and the longer one is picked by its own prefix.
         #[test]
         fn a_whole_id_that_begins_another_is_ambiguous() {
-            let held = || ["320b8f7b", FIRST, OTHER].map(String::from);
+            let held = ["320b8f7b", FIRST, OTHER];
             assert_eq!(
-                resolve_hash("320b8f7b", HashKind::Message, held())
+                pick("320b8f7b", &held).unwrap_err().to_string(),
+                "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh pending` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh dismiss --all`."
+            );
+            assert_eq!(pick("320b8f7b1", &held).unwrap(), FIRST);
+        }
+
+        #[test]
+        fn a_short_whole_id_names_every_longer_id_it_begins() {
+            assert_eq!(
+                pick("q1", &["q1", "q10", "q11"]).unwrap_err().to_string(),
+                "'q1' is a whole pending id and also how q10, q11 begin, so it cannot pick one. Act on q10, q11 first, typed as `.mesh pending` lists them, then 'q1' picks the one left; or clear them with `.mesh dismiss --all`."
+            );
+        }
+
+        #[test]
+        fn ids_that_differ_only_in_case_name_the_way_they_clear() {
+            assert_eq!(
+                pick("ab12cd34", &["ab12cd34", "AB12CD34"])
                     .unwrap_err()
                     .to_string(),
-                "'320b8f7b' matches 2 pending ids: 320b8f7b, 320b8f7b1...; give one of these (or enough of its characters to tell it apart)."
+                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`."
             );
             assert_eq!(
-                resolve_hash("320b8f7b1", HashKind::Message, held()).unwrap(),
-                FIRST
+                held_as("ab12cd34", &["ab12cd34", "AB12CD34"], Some(InboundKind::Access))
+                    .unwrap_err()
+                    .to_string(),
+                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
+            );
+        }
+
+        /// `.mesh dismiss --all` clears only questions, so an access request in the way
+        /// is named by when it leaves, and a question this node asked, which no verb
+        /// clears, takes away the advice to act on the longer id first.
+        #[test]
+        fn the_way_out_follows_the_kind_of_each_entry_in_the_way() {
+            let held = vec![
+                ("q1".to_string(), Some(InboundKind::Question)),
+                ("q10".to_string(), Some(InboundKind::Access)),
+            ];
+            assert_eq!(
+                resolve_pending_id("q1", held).unwrap_err().to_string(),
+                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one. Act on q10 first, typed as `.mesh pending` lists it, then 'q1' picks the one left; or `.mesh dismiss --all` clears q1, and q10 leaves `.mesh pending` when it expires."
+            );
+            let held = vec![
+                ("q1".to_string(), Some(InboundKind::Access)),
+                ("q10".to_string(), None),
+            ];
+            assert_eq!(
+                resolve_pending_id("q1", held).unwrap_err().to_string(),
+                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one; q1 leaves `.mesh pending` when it expires, and q10 is a question this node asked, which no verb clears."
+            );
+        }
+
+        #[test]
+        fn a_prefix_that_is_no_whole_id_keeps_the_shared_prefix_sentence() {
+            assert_eq!(
+                pick("q1", &["q10", "q11"]).unwrap_err().to_string(),
+                "'q1' matches 2 pending ids: q10, q11; give one of these (or enough of its characters to tell it apart)."
             );
         }
 
@@ -38882,8 +39030,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// A held id that begins a longer held id is listed whole and the longer
                 /// one at the length that tells them apart. The longer one is answered by
-                /// what the listing prints; the shorter, being the start of both, names
-                /// both and sends nothing.
+                /// what the listing prints; the shorter, being the start of both, sends
+                /// nothing and says to act on the longer one first.
                 #[test]
                 #[serial]
                 fn a_whole_id_that_begins_another_is_listed_apart_and_never_picks_one() {
@@ -38900,7 +39048,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh answer 320b8f7b \"x\"").await,
-                            "'320b8f7b' matches 2 pending ids: 320b8f7b, 320b8f7b1...; give one of these (or enough of its characters to tell it apart)."
+                            "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh pending` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh dismiss --all`."
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
 
@@ -38911,6 +39059,40 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(seen.len(), 1, "{seen:?}");
                         assert_eq!(seen[0].in_reply_to.as_deref(), Some(FIRST));
                         assert_eq!(fx.pending_ids(), ["320b8f7b"]);
+
+                        out_of(&mut fx.ctx, ".mesh answer 320b8f7b \"y\"")
+                            .await
+                            .unwrap();
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 2, "{seen:?}");
+                        assert_eq!(seen[1].in_reply_to.as_deref(), Some("320b8f7b"));
+                        assert!(fx.pending_ids().is_empty(), "{:?}", fx.pending_ids());
+                        fx.stop().await;
+                    });
+                }
+
+                /// Access requests whose ids differ only in case cannot be picked by any
+                /// verb, and `.mesh dismiss --all` leaves them, so the refusal names their
+                /// expiry instead.
+                #[test]
+                #[serial]
+                fn access_requests_that_differ_only_in_case_are_never_picked() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-refuse-case-twins");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-refuse-case-twins").await;
+                        fx.file("ab12cd34", InboundKind::Access, &["src/x.rs"]);
+                        fx.file("AB12CD34", InboundKind::Access, &["src/x.rs"]);
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh refuse ab12cd34").await,
+                            "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        let mut left = fx.pending_ids();
+                        left.sort();
+                        assert_eq!(left, ["AB12CD34", "ab12cd34"]);
                         fx.stop().await;
                     });
                 }

@@ -6716,6 +6716,11 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             .to_string(),
         "'<prefix>' matches <N> pending ids: <id>..., <id>...; give one of these (or enough of its characters to tell it apart)."
             .to_string(),
+        "'<id>' is a whole pending id and also how <id>... begins, so it cannot pick one. Act on <id>... first, typed as `.mesh pending` lists it, then '<id>' picks the one left; or clear both with `.mesh dismiss --all`."
+            .to_string(),
+        "'<ID>' and '<id>' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`."
+            .to_string(),
+        "<id> leaves `.mesh pending` when it expires".to_string(),
         format!("the prompt `{prompt}`"),
         format!(
             "prints `{}`, and the question stays open",
