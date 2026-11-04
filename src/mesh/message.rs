@@ -1733,8 +1733,9 @@ fn recipient_outcome(sent: Result<SendOutcome, SendError>) -> RecipientOutcome {
 mod recipient_outcome_tests {
     use super::*;
 
-    /// Every wait that ran out short of the peer's silence is the retry in a broadcast row
-    /// too, with the single send's sentence, and is never counted unreachable.
+    /// Every wait that ran out short of the peer's silence and was not stored is the
+    /// retry in a broadcast row too, with the single send's sentence, and is never
+    /// counted unreachable.
     #[test]
     fn a_wait_short_of_silence_is_a_retry_row_with_the_single_send_text() {
         let (path, after) = ("/message".to_string(), Duration::from_secs(15));
@@ -1747,14 +1748,7 @@ mod recipient_outcome_tests {
                 path: path.clone(),
                 after,
             },
-            RequestError::ResponseIncomplete {
-                path: path.clone(),
-                after,
-            },
-            RequestError::RequestIncomplete {
-                path: path.clone(),
-                after,
-            },
+            RequestError::ResponseIncomplete { path, after },
         ] {
             let single = SendError::Direct(wait.clone()).to_string();
 
@@ -1821,8 +1815,10 @@ impl MeshRuntime {
     /// a refusal of any code means the peer heard and said no, and storing a message it
     /// has refused would deliver it behind its back. A wait that ran out on this node's
     /// side, or with the peer's answer still arriving, is reported with the retry and
-    /// not stored. Posts to the propagation node queue behind `posting`, since
-    /// `propagate` needs one caller per node at a time.
+    /// not stored. A message whose upload ran out before the peer had all of it is
+    /// stored: the peer never read it, so the stored copy cannot land twice. Posts to
+    /// the propagation node queue behind `posting`, since `propagate` needs one caller
+    /// per node at a time.
     pub(crate) async fn send_peer_with(
         &self,
         destination_hex: &str,
@@ -1919,6 +1915,7 @@ impl MeshRuntime {
             }
             Err(
                 err @ (RequestError::Timeout { .. }
+                | RequestError::RequestIncomplete { .. }
                 | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),

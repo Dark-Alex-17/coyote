@@ -670,6 +670,10 @@ pub(crate) struct MeshRuntime {
     /// which the loopback fixtures only do on unix.
     #[cfg(all(test, unix))]
     requests_made: parking_lot::Mutex<Vec<(String, RequestOptions)>>,
+    /// An error the next request ends with before it touches the wire, for the tests that
+    /// pin how a caller routes a failure loopback cannot stage.
+    #[cfg(all(test, unix))]
+    next_request_error: parking_lot::Mutex<Option<RequestError>>,
 }
 
 impl MeshRuntime {
@@ -928,6 +932,8 @@ impl MeshRuntime {
             tasks: parking_lot::Mutex::new(Vec::new()),
             #[cfg(all(test, unix))]
             requests_made: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(all(test, unix))]
+            next_request_error: parking_lot::Mutex::new(None),
         });
         runtime.register_task(tokio::spawn(receive_announces(
             announces,
@@ -1109,6 +1115,11 @@ impl MeshRuntime {
     #[cfg(all(test, unix))]
     pub(crate) fn requests_made(&self) -> Vec<(String, RequestOptions)> {
         self.requests_made.lock().clone()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_next_request(&self, err: RequestError) {
+        *self.next_request_error.lock() = Some(err);
     }
 
     /// The ceilings an inbound message's parts are admitted under.
@@ -1407,6 +1418,10 @@ impl MeshRuntime {
     ) -> Result<rmpv::Value, RequestError> {
         #[cfg(all(test, unix))]
         self.requests_made.lock().push((path.to_string(), options));
+        #[cfg(all(test, unix))]
+        if let Some(err) = self.next_request_error.lock().take() {
+            return Err(err);
+        }
         let dest_hex = destination.address_hash.to_hex_string();
         refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
         let transport = self
@@ -1462,6 +1477,8 @@ impl MeshRuntime {
     /// A link that came up and drew no reply is kept apart from one that never came up:
     /// a peer that does not trust this identity answers a knock with silence, so that
     /// outcome is reported as unanswered, never as the peer being unreachable.
+    /// A knock whose upload ran out before the peer had all of it is unanswered too: the
+    /// peer never filed it, so the stored copy cannot land twice.
     /// A wait that ran out on this node's side, or with the peer's answer still
     /// arriving, is neither: it is reported with the retry and not stored.
     /// Posts to the propagation node queue behind `posting`, since `propagate` needs one
@@ -1489,7 +1506,9 @@ impl MeshRuntime {
                     fallback: None,
                 });
             }
-            Err(err @ RequestError::Timeout { .. }) => (KnockFallback::Unanswered, err),
+            Err(err @ (RequestError::Timeout { .. } | RequestError::RequestIncomplete { .. })) => {
+                (KnockFallback::Unanswered, err)
+            }
             Err(
                 err @ (RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)

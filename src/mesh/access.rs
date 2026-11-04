@@ -595,6 +595,8 @@ impl MeshRuntime {
     /// peer-unreachable errors fall back to store-and-forward: a refusal of any code
     /// means the peer heard and said no, and an oversize or undecodable frame means the
     /// exchange reached the peer, so nothing is held for later.
+    /// A request whose upload ran out before the peer had all of it falls back too: the
+    /// peer never read it, so the stored copy cannot land twice.
     pub(crate) async fn request_access_wire(
         &self,
         destination: &DestinationDesc,
@@ -627,6 +629,7 @@ impl MeshRuntime {
             }
             Err(
                 err @ (RequestError::Timeout { .. }
+                | RequestError::RequestIncomplete { .. }
                 | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
