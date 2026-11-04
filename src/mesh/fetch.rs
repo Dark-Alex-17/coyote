@@ -1772,7 +1772,7 @@ mod no_answer_tests {
         assert_eq!(
             silent.to_string(),
             format!(
-                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
                 short(&to)
             )
         );

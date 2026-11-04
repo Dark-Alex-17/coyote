@@ -2623,7 +2623,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from.",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );

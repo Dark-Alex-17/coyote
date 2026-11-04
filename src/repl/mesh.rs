@@ -26868,7 +26868,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         let own = started.runtime.current_destination_hash();
                         let no_answer = format!(
-                            "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
                             short(&peer)
                         );
 

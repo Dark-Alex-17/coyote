@@ -653,7 +653,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). A status request is answered live or not at all; nothing queues it for later.",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). A status request is answered live or not at all; nothing queues it for later.",
                 short(&to)
             )
         );

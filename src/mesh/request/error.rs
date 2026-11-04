@@ -25,6 +25,9 @@ pub(crate) enum RequestError {
     IdentifyTimeout { path: String, after: Duration },
     /// The peer began a response but it had not finished arriving within `after`.
     ResponseIncomplete { path: String, after: Duration },
+    /// The request was too large for one packet and went out as a resource whose upload
+    /// had not completed within `after`, so the peer never had the whole request to answer.
+    RequestIncomplete { path: String, after: Duration },
     /// The link could not be established or the packet could not be put on its interface.
     LinkFailed(String),
     /// The link closed while the request was pending, or was gone by the time we replied.
@@ -70,8 +73,9 @@ impl RequestError {
     }
 
     /// `true` for a wait that ran out for a reason other than the peer's silence: the link
-    /// never came up, this node's own side was slow, or an answer was still arriving. None
-    /// of these says anything about the peer's trust, and a retry is the step.
+    /// never came up, this node's own side was slow, the request or an answer was still
+    /// in transfer. None of these says anything about the peer's trust, and a retry is the
+    /// step.
     pub(crate) fn is_retryable_wait(&self) -> bool {
         matches!(
             self,
@@ -79,6 +83,7 @@ impl RequestError {
                 | Self::LocalTimeout { .. }
                 | Self::IdentifyTimeout { .. }
                 | Self::ResponseIncomplete { .. }
+                | Self::RequestIncomplete { .. }
         )
     }
 }
@@ -109,6 +114,11 @@ impl fmt::Display for RequestError {
             Self::ResponseIncomplete { after, .. } => write!(
                 f,
                 "The peer started to answer, but the answer had not finished arriving within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::RequestIncomplete { after, .. } => write!(
+                f,
+                "The request was too large for one packet, and its upload to the peer had not finished within {:.1}s, so the peer never had all of it to answer",
                 after.as_secs_f64()
             ),
             Self::LinkFailed(reason) => write!(f, "The mesh link failed: {reason}"),
@@ -204,6 +214,7 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
         | RequestError::LocalTimeout { .. }
         | RequestError::IdentifyTimeout { .. }
         | RequestError::ResponseIncomplete { .. }
+        | RequestError::RequestIncomplete { .. }
         | RequestError::LinkFailed(_)
         | RequestError::LinkClosed => {
             "Try again in a minute; `.mesh peers` shows when the peer was last heard"
@@ -333,8 +344,9 @@ impl fmt::Display for RemoteRefusal {
 
 /// A peer that opened the link and then said nothing to a request. A Coyote answers
 /// every identity it trusts, even with a refusal, and stays silent to one it does not
-/// know or has blocked, so silence after the link came up means the remedy is on the
-/// peer's side, as for a `RemoteRefusal`.
+/// know or has blocked, so silence after the link came up most likely means the remedy
+/// is on the peer's side, as for a `RemoteRefusal`; a lost answer reads the same, which
+/// is why the sentence hedges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoAnswer {
     destination: String,
@@ -376,7 +388,7 @@ impl fmt::Display for NoAnswer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
             short(&self.destination),
             own = self.own_destination
         )
@@ -396,7 +408,7 @@ mod no_answer_tests {
         assert_eq!(
             no_answer.to_string(),
             format!(
-                "no answer from bbbbbbbb: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance)."
+                "no answer from bbbbbbbb: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance)."
             )
         );
         let next = no_answer.next_action();
@@ -442,6 +454,10 @@ mod no_answer_tests {
                 after,
             },
             RequestError::ResponseIncomplete {
+                path: path.clone(),
+                after,
+            },
+            RequestError::RequestIncomplete {
                 path: path.clone(),
                 after,
             },

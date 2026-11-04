@@ -120,6 +120,10 @@ fn every_request_error_has_a_next_step() {
             path: "/status".to_string(),
             after: Duration::from_secs(5),
         },
+        RequestError::RequestIncomplete {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
         RequestError::LinkFailed("no path".to_string()),
         RequestError::LinkClosed,
         RequestError::Oversize { len: 9, max: 8 },
@@ -2343,6 +2347,52 @@ pub(crate) mod network {
                     after: SHORT_REQUEST_TIMEOUT,
                 }
             );
+            requester.stop().await;
+            responder.stop().await;
+        }
+    }
+
+    mod request_upload_tests {
+        use super::*;
+
+        /// A request too large for one packet goes out as a resource. While the peer has
+        /// not taken the whole of it, the peer cannot have answered, so a wait that runs
+        /// out then is the request's own transfer falling short, never the `Timeout`
+        /// that reads as distrust. Holding the responder's interface manager keeps its
+        /// inbound path from reading the advertisement, so the upload never completes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_request_whose_upload_never_completes_is_not_silence() {
+            let recorder = Arc::new(Recorder::default());
+            let (responder, requester, desc) = pair(recorder.clone()).await;
+            let link = identified_link(&requester, &responder, &desc).await;
+            let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
+            RngCore::fill_bytes(&mut OsRng, &mut random);
+            let before = recorder.seen_count();
+
+            let manager = responder.transport.iface_manager();
+            let held = manager.lock().await;
+            let result = timeout(
+                INTEROP_TIMEOUT,
+                request_on(
+                    &requester,
+                    &link,
+                    "/slow",
+                    Value::Binary(random),
+                    SHORT_REQUEST_TIMEOUT,
+                ),
+            )
+            .await
+            .unwrap();
+            drop(held);
+
+            assert_eq!(
+                result.unwrap_err(),
+                RequestError::RequestIncomplete {
+                    path: "/slow".to_string(),
+                    after: SHORT_REQUEST_TIMEOUT,
+                }
+            );
+            assert_eq!(recorder.seen_count(), before, "the handler never had it");
             requester.stop().await;
             responder.stop().await;
         }

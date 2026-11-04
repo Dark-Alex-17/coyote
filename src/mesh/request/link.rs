@@ -256,13 +256,18 @@ pub(crate) async fn request_on_link(
     Ok(value)
 }
 
-/// A response wait that ran out: `ResponseIncomplete` once the peer has begun a response,
-/// `Timeout` while nothing of one has arrived, the only case that reads as the peer's
-/// silence.
+/// A response wait that ran out: `RequestIncomplete` while a request sent as a resource is
+/// still uploading, `ResponseIncomplete` once the peer has begun a response, `Timeout`
+/// while nothing of one has arrived to a request the peer has whole, the only case that
+/// reads as the peer's silence. The receipt's response clock starts at the send of a
+/// request packet and, for a request resource, only once that resource completes or a
+/// response is advertised, so an unstarted clock is an upload still in flight.
 fn unanswered(receipt: &RequestReceipt, path: &str, after: Duration) -> RequestError {
     let path = path.to_string();
     if receipt.response_size().is_some() {
         RequestError::ResponseIncomplete { path, after }
+    } else if receipt.started_at().is_none() {
+        RequestError::RequestIncomplete { path, after }
     } else {
         RequestError::Timeout { path, after }
     }
