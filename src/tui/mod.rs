@@ -420,7 +420,10 @@ impl Cell {
                 lines,
             } => lines
                 .get_or_insert_with(|| {
-                    let mut lines = vec![Line::from(Span::styled(format!("> {name}"), DIM))];
+                    // The header is the typed line; scrubbed like a User
+                    // cell's, so a pasted escape cannot paint through it.
+                    let header = render::plain_text(&format!("> {name}"));
+                    let mut lines = vec![Line::from(Span::styled(header, DIM))];
                     if !output.is_empty() {
                         lines.extend(render::preformatted_lines(output));
                     }

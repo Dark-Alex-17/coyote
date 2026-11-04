@@ -97,6 +97,10 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
             }
             Some(c) if STRING_INTRODUCERS.contains(c) => {
                 i += 2;
+                // The string runs to ST (`ESC \`) or BEL. A bare ESC ends
+                // it too, as it does on a terminal: an unterminated string
+                // must not swallow the rest of the text, and the sequence
+                // the ESC starts is handled by the next round.
                 loop {
                     match chars.get(i) {
                         None => break,
@@ -104,8 +108,10 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
                             i += 1;
                             break;
                         }
-                        Some(&ESC) if chars.get(i + 1) == Some(&'\\') => {
-                            i += 2;
+                        Some(&ESC) => {
+                            if chars.get(i + 1) == Some(&'\\') {
+                                i += 2;
+                            }
                             break;
                         }
                         Some(_) => i += 1,
@@ -443,6 +449,32 @@ mod tests {
         assert_eq!(sanitize_ansi(input), "link up \x1b[1mbold\x1b[0m");
         assert_eq!(sanitize_ansi("\x1b(Bx\x1b=y\tz\n"), "xy\tz\n");
         assert_eq!(sanitize_ansi("\x1b]0;title\x1b\\after"), "after");
+    }
+
+    /// A control string ends at ST (`ESC \`), at BEL, or at a bare ESC
+    /// the way a terminal ends it: the text after the terminator is kept
+    /// whole, and an unterminated string swallows nothing past the next
+    /// escape, whose own sequence is then handled by the normal rules.
+    #[test]
+    fn a_control_string_ends_at_st_bel_or_a_bare_escape() {
+        assert_eq!(
+            plain_text("see \x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\ end"),
+            "see link end"
+        );
+        assert_eq!(plain_text("a\x1b]0;title\x07b"), "ab");
+        // A lone ESC cuts the string; `ESC [31m` after it is a CSI, dropped.
+        assert_eq!(plain_text("a\x1b]8;;http://x\x1b[31mb\x1b[0m"), "ab");
+        // ... and the two-byte escape a stripped `ESC \` leaves behind
+        // takes the character it introduces, as on a terminal.
+        assert_eq!(
+            plain_text("zw-\x1b]8;;http://x\x1blink\x1b]8;;\x1b-end-q"),
+            "zw-inknd-q"
+        );
+        assert_eq!(plain_text("tail\x1b]8;;open"), "tail");
+        assert_eq!(
+            sanitize_ansi("\x1b]8;;http://x\x1b[1mbold\x1b[0m"),
+            "\x1b[1mbold\x1b[0m"
+        );
     }
 
     /// Conceal is the one attribute a reader must not get: a span painted

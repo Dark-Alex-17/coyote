@@ -6371,7 +6371,11 @@ fn a_pasted_user_line_with_escapes_and_a_zero_width_space_is_drawn_as_plain_word
 /// path carries a colour SGR, a zero-width space and an OSC 8 hyperlink:
 /// nothing of the sequences painted as text in the `> .file ...` header
 /// or in the error, the format character never sent, the UI keeps taking
-/// keys and leaves clean.
+/// keys and leaves clean. The header shows the typed line; the error
+/// names the path the `.file` argument splitter hands the loader, which
+/// drops a lone backslash (REPL semantics), so the hyperlink's `ESC \`
+/// terminators reach it as bare escapes: each cuts its string short and
+/// takes the character it introduces, as on a terminal.
 #[test]
 #[serial]
 fn an_error_notice_echoing_escapes_and_a_zero_width_space_is_drawn_as_plain_words() {
@@ -6404,9 +6408,17 @@ fn an_error_notice_echoing_escapes_and_a_zero_width_space_is_drawn_as_plain_word
     let header_squeezed = squeezed(header);
     let error_squeezed = squeezed(error);
     let mut failures = Vec::new();
-    for (what, text) in [
-        ("the command header", &header_squeezed),
-        ("the error notice", &error_squeezed),
+    for (what, text, plain) in [
+        (
+            "the command header",
+            &header_squeezed,
+            "/nonexistent-r9/see-red-zw-link-end-q3u",
+        ),
+        (
+            "the error notice",
+            &error_squeezed,
+            "/nonexistent-r9/see-red-zw-inknd-q3u",
+        ),
     ] {
         for leaked in ["[31m", "[0m", "]8;;", "x.invalid"] {
             if text.contains(leaked) {
@@ -6416,7 +6428,7 @@ fn an_error_notice_echoing_escapes_and_a_zero_width_space_is_drawn_as_plain_word
         if text.contains('\u{200B}') {
             failures.push(format!("{what}: the zero-width space was painted"));
         }
-        if !text.contains("/nonexistent-r9/see-red-zw-link-end-q3u") {
+        if !text.contains(plain) {
             failures.push(format!(
                 "{what}: the path was not drawn plain and whole (got {text:?})"
             ));
