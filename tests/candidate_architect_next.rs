@@ -537,115 +537,233 @@ fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
 /// before `review_update` resolves anything, the trusted author of an own
 /// comment, the failed-read exclusion that keeps `_poll_permissions` from
 /// re-reading the same failing logins every poll, the ready-seed filter, the
-/// `status: consumed` write on a used seed, the hard trigger that keeps
-/// `seed_confirm` and `draft_confirm` off the autonomous ladder, the
-/// `confirm_draft` terminal prompt, the `draft_confirm` branch that reads an
-/// edit mentioning abort before the generic abort check, and the confirmed
-/// draft becoming the design doc.
+/// `status: consumed` write on a seed the run oriented on, and the hard
+/// trigger that keeps `draft_confirm` off the autonomous ladder. The rest of
+/// the intake guards run in the ignored tail below, which keeps this test near
+/// two minutes.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
-    let sabotages = [
-        (
-            "read-permission",
-            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
-            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
-            "permission: a COLLABORATOR with read -> untrusted, no body, one lookup",
-        ),
-        (
-            "approval-veto",
-            "return not any(r[\"state\"] == \"CHANGES_REQUESTED\" for r in verdicts) and any(",
-            "return any(",
-            "approval: empty decision, one author approves on head, another's latest requests \
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "read-permission",
+                "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
+                "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
+                "permission: a COLLABORATOR with read -> untrusted, no body, one lookup",
+            ),
+            (
+                "approval-veto",
+                "return not any(r[\"state\"] == \"CHANGES_REQUESTED\" for r in verdicts) and any(",
+                "return any(",
+                "approval: empty decision, one author approves on head, another's latest requests \
              changes -> not approved",
-        ),
-        (
-            "fix-origin",
-            "ret = state.get(\"fix_origin_return\") or state.get(\"fix_return_to\") or ",
-            "ret = state.get(\"fix_return_to\") or ",
-            "fix origin: fix_done after a BLOCKED review fix round -> review_update, origin \
+            ),
+            (
+                "fix-origin",
+                "ret = state.get(\"fix_origin_return\") or state.get(\"fix_return_to\") or ",
+                "ret = state.get(\"fix_return_to\") or ",
+                "fix origin: fix_done after a BLOCKED review fix round -> review_update, origin \
              cleared",
-        ),
-        (
-            "truncation",
-            "    if overflow:\n        u.update({\"review_status\": \"truncated\"",
-            "    if False:\n        u.update({\"review_status\": \"truncated\"",
-            "truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in \
+            ),
+            (
+                "truncation",
+                "    if overflow:\n        u.update({\"review_status\": \"truncated\"",
+                "    if False:\n        u.update({\"review_status\": \"truncated\"",
+                "truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in \
              review_truncated, review_items untouched",
-        ),
-        (
-            "visit-budget",
-            "    u[\"review_polls_run\"] = runs + 1\n    if runs >= POLL_VISIT_BUDGET:\n",
-            "    u[\"review_polls_run\"] = runs + 1\n    if runs > POLL_VISIT_BUDGET:\n",
-            "watch: review_poll at the run-wide visit budget -> visit_cap -> review_route",
-        ),
-        (
-            "push-check",
-            "    if not sha or oid != sha:\n",
-            "    if False:\n",
-            "watch: review_update with a head mismatch -> review_push_mismatch, nothing resolved \
+            ),
+            (
+                "visit-budget",
+                "    u[\"review_polls_run\"] = runs + 1\n    if runs >= POLL_VISIT_BUDGET:\n",
+                "    u[\"review_polls_run\"] = runs + 1\n    if runs > POLL_VISIT_BUDGET:\n",
+                "watch: review_poll at the run-wide visit budget -> visit_cap -> review_route",
+            ),
+            (
+                "push-check",
+                "    if not sha or oid != sha:\n",
+                "    if False:\n",
+                "watch: review_update with a head mismatch -> review_push_mismatch, nothing resolved \
              or posted, stop ledgered",
-        ),
-        (
-            "own-author",
-            "return _trusted(state, u, c) and (OWN_MARKER in body",
-            "return (OWN_MARKER in body",
-            "own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
-        ),
-        (
-            "permission-stall",
-            "if login and login not in cached and login not in failed]",
-            "if login and login not in cached]",
-            "permission stall: a single failing login is read once across three polls",
-        ),
-        (
-            "seed-ready",
-            "            if fm.get(\"status\") != \"ready\":\n",
-            "            if False:\n",
-            "intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
-        ),
-        (
-            "seed-consumed",
-            "                set_frontmatter(seed, k, v)\n",
-            "                pass\n",
-            "apply_answer: seed_confirm use -> design doc is the seed, orient_read, seed consumed",
-        ),
-        (
-            "seed-hard-trigger",
-            "hard_trigger=True, tier3_ok=False, data={\"seed_path\": seed}",
-            "hard_trigger=False, tier3_ok=False, data={\"seed_path\": seed}",
-            "escalate_gate: seed_confirm skips the ladder under escalation_policy=autonomous",
-        ),
-        (
-            "draft-hard-trigger",
-            "hard_trigger=True, tier3_ok=False, data={\"draft_path\": path}",
-            "hard_trigger=False, tier3_ok=False, data={\"draft_path\": path}",
-            "draft_route: a good draft -> design-draft.md in the run dir with the title heading \
+            ),
+            (
+                "own-author",
+                "return _trusted(state, u, c) and (OWN_MARKER in body",
+                "return (OWN_MARKER in body",
+                "own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
+            ),
+            (
+                "permission-stall",
+                "if login and login not in cached and login not in failed]",
+                "if login and login not in cached]",
+                "permission stall: a single failing login is read once across three polls",
+            ),
+            (
+                "seed-ready",
+                "            if fm.get(\"status\") != \"ready\":\n",
+                "            if False:\n",
+                "intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
+            ),
+            (
+                "seed-consumed",
+                "            set_frontmatter(path, k, v)\n",
+                "            pass\n",
+                "research_dispatch: a confirmed seed is consumed once orientation succeeded",
+            ),
+            (
+                "draft-hard-trigger",
+                "hard_trigger=True, tier3_ok=False, data={\"draft_path\": path}",
+                "hard_trigger=False, tier3_ok=False, data={\"draft_path\": path}",
+                "draft_route: a good draft -> design-draft.md in the run dir with the title heading \
              prefixed, hard-trigger draft_confirm holding the draft",
-        ),
-        (
-            "draft-prompt",
-            ", \"draft_confirm\": \"confirm_draft\"}",
-            "}",
-            "ask_dispatch: draft_confirm -> confirm_draft",
-        ),
-        (
-            "draft-abort-order",
-            "    if kind == \"draft_confirm\":\n",
-            "    if kind == \"draft_confirm\" and abort:\n        u[\"failure_reason\"] = kind\n        \
+            ),
+        ],
+    );
+}
+
+/// The rest of the intake guards, each removed from a scratch copy, turn
+/// their smoke row red: the re-check that a seed is still ready before it is
+/// consumed, the consumption at the step after a successful orientation, the
+/// hard trigger on `seed_confirm`, the `confirm_seed` and `confirm_draft`
+/// terminal prompts, explicit-path precedence over a seed, the project filter,
+/// the blank-input stop, the `draft_possible: false` and empty-draft
+/// fallbacks, `draft_fault`, the `DRAFT_ROUNDS_MAX` check, the drafting
+/// node's output reset, the `draft_confirm` branch read before the generic
+/// abort check, both explicit Abort branches, and the confirmed draft
+/// becoming the design doc.
+#[test]
+#[ignore = "seventeen smoke battery runs take about three minutes; run with -- --ignored"]
+fn intake_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "seed-consume-recheck",
+                "    if frontmatter(read_file(path))[0].get(\"status\") == \"ready\":\n",
+                "    if True:\n",
+                "research_dispatch: a non-seed design doc is untouched and an already consumed seed \
+             keeps its consumer",
+            ),
+            (
+                "seed-consume-at-orient",
+                "    _consume_seed(state, u)\n",
+                "",
+                "intake seed: an explicit path to a ready seed -> consumed at research_dispatch -> a \
+             later go-ahead drafts instead",
+            ),
+            (
+                "seed-hard-trigger",
+                "hard_trigger=True, tier3_ok=False, data={\"seed_path\": seed}",
+                "hard_trigger=False, tier3_ok=False, data={\"seed_path\": seed}",
+                "escalate_gate: seed_confirm skips the ladder under escalation_policy=autonomous",
+            ),
+            (
+                "seed-prompt",
+                "\"seed_confirm\": \"confirm_seed\", \"draft_confirm\"",
+                "\"draft_confirm\"",
+                "ask_dispatch: seed_confirm -> confirm_seed, parked recorded",
+            ),
+            (
+                "draft-prompt",
+                ", \"draft_confirm\": \"confirm_draft\"}",
+                "}",
+                "ask_dispatch: draft_confirm -> confirm_draft",
+            ),
+            (
+                "draft-abort-order",
+                "    if kind == \"draft_confirm\":\n",
+                "    if kind == \"draft_confirm\" and abort:\n        u[\"failure_reason\"] = kind\n        \
              u[\"_next\"] = \"end_aborted\"\n    elif kind == \"draft_confirm\":\n",
-            "apply_answer: draft_confirm free-text edit mentioning abort -> draft_brief with the \
+                "apply_answer: draft_confirm free-text edit mentioning abort -> draft_brief with the \
              feedback, round 1",
-        ),
-        (
-            "draft-use",
-            "            u[\"design_doc_path\"] = os.path.abspath(draft)\n",
-            "            u[\"design_doc_path\"] = \"\"\n",
-            "apply_answer: draft_confirm use -> design doc is the draft, orient_read",
-        ),
-    ];
-    for (label, old, new, row) in sabotages {
+            ),
+            (
+                "draft-use",
+                "            u[\"design_doc_path\"] = os.path.abspath(draft)\n",
+                "            u[\"design_doc_path\"] = \"\"\n",
+                "apply_answer: draft_confirm use -> design doc is the draft, orient_read",
+            ),
+            (
+                "explicit-precedence",
+                "        seed = \"\" if dd else _find_seed(u)\n",
+                "        seed = _find_seed(u)\n",
+                "intake seed: an explicit design doc wins over a ready seed, seed untouched",
+            ),
+            (
+                "seed-project",
+                "            if not fm.get(\"project\") or \
+             os.path.realpath(os.path.expanduser(fm[\"project\"])) not in projects:\n",
+                "            if False:\n",
+                "intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
+            ),
+            (
+                "blank-input",
+                "bool(brief.strip() or str(state.get(\"previous_turns\") or \"\").strip())",
+                "True",
+                "intake draft: a blank message and blank earlier turns -> escalation need_design_doc, \
+             nothing drafted",
+            ),
+            (
+                "draft-not-possible",
+                "    if not truthy(state.get(\"draft_possible\")) or not markdown:\n",
+                "    if not markdown:\n",
+                "draft_route: draft_possible false with markdown present -> need_design_doc, no draft \
+             written",
+            ),
+            (
+                "draft-empty",
+                "    if not truthy(state.get(\"draft_possible\")) or not markdown:\n",
+                "    if not truthy(state.get(\"draft_possible\")):\n",
+                "draft_route: an empty draft -> need_design_doc",
+            ),
+            (
+                "draft-fault",
+                "    return raise_escalation(state, u, _need_design_doc_escalation(\n        \"The step \
+             that drafts",
+                "    u[\"_next\"] = \"orient_read\"\n    return u\n    return raise_escalation(state, \
+             u, _need_design_doc_escalation(\n        \"The step that drafts",
+                "draft_fault: -> need_design_doc naming the failed drafting step",
+            ),
+            (
+                "draft-rounds-max",
+                "        elif rounds > DRAFT_ROUNDS_MAX:\n",
+                "        elif False:\n",
+                "apply_answer: draft_confirm edit at the redraft cap -> need_design_doc",
+            ),
+            (
+                "draft-output-reset",
+                "_DRAFT_OUTPUT_RESET = {\"draft_possible\": False, \"draft_title\": \"\", \
+             \"draft_markdown\": \"\", \"draft_reason\": \"\"}",
+                "_DRAFT_OUTPUT_RESET = {}",
+                "apply_answer: draft_confirm redraft clears the drafting node's last output",
+            ),
+            (
+                "draft-abort",
+                "        if picked == \"Abort the run\":\n",
+                "        if False:\n",
+                "apply_answer: draft_confirm abort -> end_aborted",
+            ),
+            (
+                "seed-abort",
+                "\"mode_invalid\", \"need_design_doc\", \"seed_confirm\", \"clarify\"",
+                "\"mode_invalid\", \"need_design_doc\", \"clarify\"",
+                "apply_answer: seed_confirm abort -> end_aborted, seed still ready",
+            ),
+        ],
+    );
+}
+
+/// One `(label, guard, sabotaged guard, smoke row)` per guard: the guard must
+/// occur exactly once in gates.py, and with it replaced in a scratch copy the
+/// smoke battery must fail with exactly that row's `FAIL` line.
+fn run_smoke_sabotages(python: &Path, yq: &Path, sabotages: &[(&str, &str, &str, &str)]) {
+    for &(label, old, new, row) in sabotages {
         let scratch = scratch_dir(&format!("sabotage-{label}"));
         let copy = scratch_candidate_copy(&scratch);
         let gates = copy.join("scripts").join("gates.py");
@@ -656,7 +774,7 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "{label}: {old:?} must occur exactly once in gates.py"
         );
         fs::write(&gates, text.replacen(old, new, 1)).unwrap();
-        let mut cmd = battery(&python, &scratch);
+        let mut cmd = battery(python, &scratch);
         cmd.current_dir(&copy)
             .env("PATH", path_with(yq.parent().unwrap()))
             .arg("scripts/smoke_test.py");
