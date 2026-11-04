@@ -185,7 +185,8 @@ fn tty_flag_tokens(transcript: &str) -> Vec<&str> {
 /// Raw mode clears both; the UI must have put both back.
 fn assert_tty_restored(transcript: &str) {
     let tokens = tty_flag_tokens(transcript);
-    for flag in ["echo", "icanon"] {
+    // Raw mode clears all four; a restored line discipline has them back.
+    for flag in ["echo", "icanon", "isig", "opost"] {
         assert!(
             tokens.contains(&flag),
             "stty did not report {flag} after the UI left:\n{transcript}"
@@ -5649,7 +5650,7 @@ const LINGERING_TOOL: &str = "#!/usr/bin/env bash\n\
 /// in-process.
 #[test]
 #[serial]
-fn a_tool_leaving_a_background_writer_behind_keeps_the_ui_live_and_folds_its_output() {
+fn a_tool_leaving_a_lingering_writer_behind_keeps_the_ui_live_and_folds_its_output() {
     let dir = fresh_config_dir("tool-late-output");
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![
@@ -5678,7 +5679,6 @@ fn a_tool_leaving_a_background_writer_behind_keeps_the_ui_live_and_folds_its_out
     let one = painted_at(pty.raw(), b"late-line-one-k7a", submitted_at);
     let two = painted_at(pty.raw(), b"late-line-two-k7b", submitted_at);
     let three = painted_at(pty.raw(), b"late-line-three-k7c", submitted_at);
-    eprintln!("late output positions: {one:?} / {two:?} / {three:?}");
     if let (Some(&(row_one, col_one)), Some(&(row_two, col_two))) = (one.last(), two.last()) {
         assert_eq!(
             (row_two, col_two),

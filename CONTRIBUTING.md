@@ -56,6 +56,12 @@ cz commit
    will run lint and test.
 7. Create a PR
 
+### Snapshot tests
+The TUI's frame tests are [insta](https://insta.rs) snapshots under `src/tui/snapshots/`. A changed frame fails the
+test and writes a `*.snap.new` beside the old file (git ignores it): compare the two, and when the change is intended
+re-run that test with `INSTA_UPDATE=always` (or use `cargo insta review`) and commit the updated `.snap`. Never commit
+a `.snap.new`.
+
 ### CI/CD Testing with Act
 If you also are planning on testing out your changes before pushing them with [Act](https://github.com/nektos/act), you will need to set up `act`,
 `docker`, and configure your local system to run different architectures:
