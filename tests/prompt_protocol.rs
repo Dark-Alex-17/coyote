@@ -246,6 +246,152 @@ fn assert_fails_closed_under_the_tui(transcript: &str, exit_line: &str) {
     assert!(!transcript.contains("coyote_prompt"), "{transcript}");
 }
 
+/// The wrapper tail every fail-closed `password` case runs after the
+/// helper: the exit code, the length of whatever came back, and the
+/// terminal's line discipline, so a refusal that left echo off would show.
+const PASSWORD_REPORT: &str = "echo \"password-rc=$rc len=${#v}\"; \
+     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
+
+/// The refusal is the whole of what the helper says: the one-line message
+/// exactly once, the question never painted (so nothing was read from the
+/// terminal either), and echo still on afterwards.
+fn assert_password_refused_cleanly(transcript: &str, question_marker: &str) {
+    assert_eq!(
+        transcript.matches(TUI_NO_CHANNEL).count(),
+        1,
+        "the refusal is not exactly one line:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains(question_marker),
+        "the password question was painted on the terminal:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "the helper returned a value instead of failing:\n{transcript}"
+    );
+    let flags = transcript
+        .lines()
+        .find_map(|line| line.strip_prefix("tty-flags: "))
+        .unwrap_or_else(|| panic!("no tty-flags line:\n{transcript}"));
+    let tokens: Vec<&str> = flags
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .collect();
+    assert!(
+        tokens.contains(&"echo") && !tokens.contains(&"-echo"),
+        "the refused password left echo off:\n{transcript}"
+    );
+}
+
+/// `password` is the fallback a hidden terminal read would hurt most (a
+/// secret typed into the UI's composer), so under the full-screen UI the
+/// bash helper refuses it before touching the terminal: the one-line
+/// message on stderr, exit 1, no `Secret?` painted, echo left on.
+#[test]
+fn under_the_tui_bash_password_without_channel_fails_closed() {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; source \"{HELPER}\"; v=\"$(password \"Secret? tui-pw-sh-r8\")\"; rc=$?; {PASSWORD_REPORT}"
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_fails_closed_under_the_tui(&transcript, "password-rc=1 len=0");
+    assert_password_refused_cleanly(&transcript, "Secret?");
+}
+
+/// The Python helper's `password` has its own terminal path (getpass, not
+/// `_tty_line`), so it is pinned on its own: exit 1, no value, no
+/// `Secret?` painted, echo left on.
+#[test]
+fn under_the_tui_python_password_without_channel_fails_closed() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let driver = python_password_driver("tui-pw-py-r8");
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; v=$(python3 -c '{driver}' \"{PY_HELPER}\"); rc=$?; {PASSWORD_REPORT}"
+        ))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_fails_closed_under_the_tui(&transcript, "password-rc=1 len=0");
+    assert_password_refused_cleanly(&transcript, "Secret?");
+}
+
+/// The TypeScript helper's `password` (the hidden `ttyLine`), same shape.
+#[test]
+fn under_the_tui_typescript_password_without_channel_fails_closed() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tui-ts-password");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("tui-pw-ts-r8")).unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; v=$(NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"); rc=$?; {PASSWORD_REPORT}",
+            driver.display(),
+            helper.display()
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_fails_closed_under_the_tui(&transcript, "password-rc=1 len=0");
+    assert_password_refused_cleanly(&transcript, "Secret?");
+}
+
+/// The gate is the TUI's, not every host's: the same `COYOTE_UI` value
+/// spelled differently (`repl`, unset) keeps the terminal fallback, so a
+/// tool run from the plain REPL still asks on the tty. Pinned so the
+/// refusal cannot widen to every run without a channel.
+#[test]
+fn outside_the_tui_bash_confirm_without_channel_still_asks_the_terminal() {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; source \"{HELPER}\"; v=\"$(confirm \"Go? repl-x7x\")\"; echo \"confirm-result=$v\""
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "repl")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    pty.wait_for("(y/N)", PTY_DEADLINE).unwrap();
+    pty.send(b"\x1b[5;1R").unwrap();
+    pty.send(b"n").unwrap();
+    let transcript = pty.wait_for("confirm-result=0", PTY_DEADLINE).unwrap();
+    assert!(
+        !transcript.contains(TUI_NO_CHANNEL),
+        "the TUI refusal fired outside the TUI:\n{transcript}"
+    );
+}
+
 /// The Python helper's `select` fallback lists each option on its own
 /// line and reads the pick from the terminal.
 #[test]

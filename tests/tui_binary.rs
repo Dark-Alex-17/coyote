@@ -5707,3 +5707,490 @@ fn a_tool_leaving_a_lingering_writer_behind_keeps_the_ui_live_and_folds_its_outp
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+// ---------------------------------------------------------------------------
+// A tool question carrying invisible format characters, a reply in palette
+// grey, a rebuild whose document fails to load, and an MCP conflict on
+// `.install` under the UI and headless.
+// ---------------------------------------------------------------------------
+
+/// The UTF-8 of each format character the question below carries, so the
+/// raw terminal stream can be searched for them.
+const FORMAT_CHARACTERS: [(&str, &[u8]); 5] = [
+    ("U+202E right-to-left override", "\u{202E}".as_bytes()),
+    ("U+202C pop directional formatting", "\u{202C}".as_bytes()),
+    ("U+200B zero-width space", "\u{200B}".as_bytes()),
+    ("U+200F right-to-left mark", "\u{200F}".as_bytes()),
+    ("U+FEFF byte-order mark", "\u{FEFF}".as_bytes()),
+];
+
+/// A confirm tool whose question wraps the thing being approved in a
+/// right-to-left override (which would display `txt.safe` reversed), pads
+/// it with a zero-width space and ends in a right-to-left mark and a
+/// byte-order mark.
+fn format_character_confirm_tool() -> String {
+    RECORDING_CONFIRM_TOOL.replace(
+        "Really do it? q9d-q",
+        "Delete \u{202E}txt.safe\u{202C} \u{200B}k7m\u{200F}\u{FEFF}? q9d-q",
+    )
+}
+
+/// A tool-authored question carrying bidi overrides and zero-width
+/// characters is drawn in its stored order without them: the modal reads
+/// `Delete txt.safe k7m?`, none of the characters reaches the terminal
+/// (where a real emulator would reorder or hide the text around them),
+/// `y` still answers the tool as a yes, and nothing of them is left on
+/// the normal screen after the UI leaves.
+#[test]
+#[serial]
+fn a_tools_confirm_question_with_format_characters_is_drawn_without_them() {
+    let dir = fresh_config_dir("tool-confirm-format-chars");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture done f8c".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(
+        &dir,
+        "fixture_confirm_rec.sh",
+        &format_character_confirm_tool(),
+    );
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let submitted_at = pty.raw().len();
+    pty.send(b"call the confirm tool\r").unwrap();
+    pty.wait_for("q9d-q", PTY_DEADLINE)
+        .expect("the tool's confirm question never reached the screen");
+    pty.read_for(HOTKEY_GAP);
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[submitted_at..]));
+    assert!(
+        squeezed(&since).contains("Deletetxt.safek7m?q9d-q"),
+        "the question was not drawn in its stored order with the format characters dropped:\n{since}"
+    );
+    for (name, bytes) in FORMAT_CHARACTERS {
+        assert!(
+            find(pty.raw(), bytes, submitted_at).is_none(),
+            "{name} reached the terminal while the modal was up:\n{since}"
+        );
+    }
+
+    pty.send(b"y").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done f8c", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "`y` on the scrubbed question did not reach the tool as a yes:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    for (name, bytes) in FORMAT_CHARACTERS {
+        assert!(
+            find(pty.raw(), bytes, submitted_at).is_none(),
+            "{name} reached the terminal by the time the UI left:\n{transcript}"
+        );
+    }
+}
+
+/// A reply coloured with the palette index 8 (`ESC[38;5;8m`, the grey
+/// most prompts use for de-emphasis) is painted as colour: the word is
+/// visible, the sequence is not drawn as text, the palette foreground is
+/// what reaches the terminal, and nothing conceals. The `8` inside an
+/// extended colour is a colour argument, not the conceal attribute.
+#[test]
+#[serial]
+fn a_reply_in_palette_grey_is_painted_as_colour_not_stripped_as_conceal() {
+    let dir = fresh_config_dir("palette-grey");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text(
+        "before g8a \x1b[38;5;8mgrey-word-g8b\x1b[0m after g8c".to_string(),
+    )]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let submitted_at = pty.raw().len();
+    pty.send(b"grey please\r").unwrap();
+    let transcript = wait_for_squeezed(&mut pty, "after g8c", "the reply's tail");
+    assert_eq!(fake.served(), 1, "{transcript}");
+    pty.read_for(Duration::from_millis(600));
+
+    let raw = pty.raw();
+    let visible = strip_ansi(&String::from_utf8_lossy(&raw[submitted_at..]));
+    assert!(
+        squeezed(&visible).contains("grey-word-g8b"),
+        "the grey word was not painted:\n{visible}"
+    );
+    assert!(
+        !visible.contains("[38;5;8m") && !visible.contains("[0m"),
+        "the colour sequence was painted as text:\n{visible}"
+    );
+    let params = sgr_params(&raw[submitted_at..]);
+    assert!(
+        params.iter().any(|p| p.windows(3).any(|w| w == [38, 5, 8])),
+        "the palette-grey foreground never reached the terminal (stripped as conceal?); SGRs seen: {params:?}\n{visible}"
+    );
+    let concealing: Vec<_> = params.iter().filter(|p| is_conceal_sgr(p)).collect();
+    assert!(
+        concealing.is_empty(),
+        "a conceal SGR reached the tty: {concealing:?}\n{visible}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The dry-run config with two embedding models and a document loader
+/// for the `broken` extension that always fails. Returns the loader.
+fn write_dry_run_config_with_a_failing_loader(dir: &Path) -> PathBuf {
+    let script = dir.join("broken-loader.sh");
+    fs::write(
+        &script,
+        "#!/usr/bin/env bash\necho 'loader refused r8l' >&2\nexit 1\n",
+    )
+    .unwrap();
+    write_config(
+        dir,
+        &format!(
+            "\x20     - name: dry-embed-a\n\
+             \x20       type: embedding\n\
+             \x20       max_input_tokens: 2048\n\
+             \x20       default_chunk_size: 1000\n\
+             \x20       max_batch_size: 100\n\
+             save_session: false\n\
+             document_loaders:\n\
+             \x20 broken: 'bash {} $1'\n",
+            script.display()
+        ),
+    );
+    script
+}
+
+/// A named yaml rag over one document whose loader fails, with no files
+/// indexed yet, so `.rag <name>` loads it and `.rebuild rag` has to load
+/// the document.
+fn seed_rag_with_a_failing_document(dir: &Path, name: &str) -> (PathBuf, String) {
+    let document = dir.join("doc.broken");
+    fs::write(&document, "body\n").unwrap();
+    let rags = dir.join("rags");
+    fs::create_dir_all(&rags).unwrap();
+    let rag_path = rags.join(format!("{name}.yaml"));
+    let seeded = format!(
+        "driver: yaml\n\
+         embedding_model: dryrun:dry-embed-a\n\
+         chunk_size: 1000\n\
+         chunk_overlap: 50\n\
+         top_k: 5\n\
+         document_paths:\n\
+         - '{}'\n\
+         files: {{}}\n\
+         marker: rag-survives-r8r\n",
+        document.display()
+    );
+    fs::write(&rag_path, &seeded).unwrap();
+    (rag_path, seeded)
+}
+
+/// `.rebuild rag` over a document whose loader fails: in the REPL the
+/// sync asks whether to go on without it; under the UI there is no one to
+/// ask, so the load's warning row is followed by `Aborted` naming the
+/// plain REPL as the way to choose, not by the generic prompt refusal and
+/// not by a hidden `Continue?` the UI would sit on. The rag file is left
+/// exactly as it was, the terminal is never released, and the UI keeps
+/// taking keys and leaves clean.
+#[test]
+#[serial]
+fn dot_rebuild_rag_with_a_failing_document_aborts_naming_the_plain_repl() {
+    let dir = fresh_config_dir("rebuild-rag-failed-doc");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_a_failing_loader(&dir);
+    let name = "kb-r8";
+    let (rag_path, seeded) = seed_rag_with_a_failing_document(&dir, name);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(40, 120).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(format!(".rag {name}\r").as_bytes()).unwrap();
+    pty.read_for(Duration::from_millis(1500));
+    let before = pty.raw().len();
+    let sent = std::time::Instant::now();
+    pty.send(b".rebuild rag\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let since = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        assert!(
+            !since.contains(PROMPT_REFUSAL),
+            "the failed document was refused through the generic prompt gate instead of aborting the sync:\n{since}"
+        );
+        assert!(
+            !since.contains("Continue?"),
+            "the `Some documents failed to load. Continue?` question was painted under the UI:\n{since}"
+        );
+        assert!(
+            !since.contains("No RAG"),
+            "`.rag {name}` did not seat the rag, so the rebuild had nothing to work on:\n{since}"
+        );
+        if squeezed(&since).contains("Aborted") {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`.rebuild rag` over a failing document neither aborted nor asked within the deadline:\n{since}"
+        );
+    };
+    let took = sent.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "the abort took {took:?}; a hidden question was waited on first:\n{since}"
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    let squeezed_since = squeezed(&since);
+    // The load row names the document's full path, which a Command cell
+    // cuts at the pane's edge; the row's head and the scenario dir are
+    // enough to place it.
+    assert!(
+        squeezed_since.contains("Load/") && squeezed_since.contains("rebuild-rag-failed-doc"),
+        "the load row for the document was not printed before the abort:\n{since}"
+    );
+    assert!(
+        // The warning row leads with the warning sign (U+26A0).
+        squeezed_since.contains("loaderrefusedr8l") || squeezed_since.contains("\u{26a0}"),
+        "the warning row for the failed document was not printed:\n{since}"
+    );
+    assert!(
+        squeezed_since.contains(&squeezed("Aborted: some documents failed to load")),
+        "the abort does not say which question it stands in for:\n{since}"
+    );
+    assert!(
+        squeezed_since.contains(&squeezed("Re-run in the plain REPL")),
+        "the abort does not name the plain REPL as the way to choose:\n{since}"
+    );
+    assert!(
+        !squeezed_since.contains(&squeezed("Re-run in a terminal")),
+        "the abort says `Re-run in a terminal`, but the UI is on a terminal:\n{since}"
+    );
+    assert!(
+        !since.contains("exit="),
+        "the aborted rebuild quit the UI:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&rag_path).unwrap(),
+        seeded,
+        "the aborted rebuild rewrote the rag file:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the aborted rebuild released the terminal:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("`.info` after the aborted rebuild never rendered");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(
+        fs::read_to_string(&rag_path).unwrap(),
+        seeded,
+        "the rag file changed by the time the UI left:\n{transcript}"
+    );
+}
+
+/// A local `mcp.json` holding the bundle's server under a different
+/// definition, so the merge hits a conflict it would otherwise resolve
+/// through a menu.
+fn write_conflicting_local_mcp(dir: &Path) -> String {
+    let local = "{\"mcpServers\": {\"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \
+                 \"args\": [\"local-definition-r8\"], \"env\": {}}}}\n";
+    fs::write(dir.join("mcp.json"), local).unwrap();
+    local.to_string()
+}
+
+const MCP_CONFLICT_REFUSAL: &str = "Refusing to merge non-interactively";
+const REPL_HINT: &str = "Re-run in the plain REPL";
+const TERMINAL_HINT: &str = "Re-run in a terminal";
+
+/// `.install <local bundle>` whose `mcp.json` defines a server the local
+/// `mcp.json` already holds differently: the menu that resolves the
+/// conflict cannot be shown under the UI, so the merge is refused with a
+/// message naming the plain REPL (not "a terminal") and the flags that
+/// settle it, the local server definition is untouched, the UI keeps
+/// taking keys and leaves clean.
+#[test]
+#[serial]
+fn dot_install_with_a_conflicting_mcp_server_is_refused_naming_the_plain_repl() {
+    let dir = fresh_config_dir("install-mcp-conflict-tui");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![]);
+    write_fake_llm_config(&dir, &fake);
+    let local_before = write_conflicting_local_mcp(&dir);
+    let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let install_at = pty.raw().len();
+    let sent = std::time::Instant::now();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let since = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+        let squeezed_since = squeezed(&since);
+        assert!(
+            !since.contains(PROMPT_REFUSAL),
+            "the conflict was refused through the generic prompt gate, not the merge's own refusal:\n{since}"
+        );
+        assert!(
+            !squeezed_since.contains("ConflictonMCPserver"),
+            "the conflict menu was painted under the UI:\n{since}"
+        );
+        if squeezed_since.contains(&squeezed(MCP_CONFLICT_REFUSAL)) {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`.install` with an MCP conflict was neither refused nor completed:\n{since}"
+        );
+    };
+    let took = sent.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "the refusal took {took:?}; a hidden menu was waited on first:\n{since}"
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    let squeezed_since = squeezed(&since);
+    assert!(
+        squeezed_since.contains(&squeezed(REPL_HINT)),
+        "the refusal under the UI does not say {REPL_HINT:?}:\n{since}"
+    );
+    assert!(
+        !squeezed_since.contains(&squeezed(TERMINAL_HINT)),
+        "the refusal under the UI says {TERMINAL_HINT:?}, but the UI is on a terminal:\n{since}"
+    );
+    assert!(
+        squeezed_since.contains("bundle-k7s-server"),
+        "the refusal does not name the conflicting server:\n{since}"
+    );
+    assert!(
+        squeezed_since.contains("--install-force"),
+        "the refusal does not name the flag that settles it:\n{since}"
+    );
+    assert!(
+        !since.contains("exit="),
+        "the refused install quit the UI:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("mcp.json")).unwrap(),
+        local_before,
+        "the refused merge changed the local mcp.json:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the refused install released the terminal:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("`.info` after the refused install never rendered");
+    assert_eq!(
+        fake.served(),
+        0,
+        "a refused bundle install reached the model"
+    );
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(
+        fs::read_to_string(dir.join("mcp.json")).unwrap(),
+        local_before,
+        "the local mcp.json changed by the time the UI left:\n{transcript}"
+    );
+}
+
+/// The same conflict headless: `coyote --install <bundle>` with stdout a
+/// file (the shape of `coyote --install x > log`), no UI involved. The
+/// menu cannot be shown without a terminal, so the merge is refused
+/// non-interactively naming "a terminal" (not the plain REPL, which is
+/// not what stands in the way), the command fails, and the local server
+/// definition is untouched.
+#[test]
+#[serial]
+fn headless_install_with_a_conflicting_mcp_server_is_refused_naming_a_terminal() {
+    let dir = fresh_config_dir("install-mcp-conflict-headless");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![]);
+    write_fake_llm_config(&dir, &fake);
+    let local_before = write_conflicting_local_mcp(&dir);
+    let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
+    let captured = dir.join("stdout.log");
+    let wrapper = format!(
+        "'{{coyote}}' --install '{}' <{{stdin}} >'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
+        repo.display(),
+        captured.display()
+    );
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], &wrapper, "/dev/tty");
+
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let file = String::from_utf8_lossy(&fs::read(&captured).unwrap_or_default()).to_string();
+    let everything = format!("{transcript}\n{file}");
+    assert!(
+        everything.contains(MCP_CONFLICT_REFUSAL),
+        "the headless install with an MCP conflict was not refused:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
+    );
+    assert!(
+        everything.contains(TERMINAL_HINT),
+        "the headless refusal does not say {TERMINAL_HINT:?}:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
+    );
+    assert!(
+        !everything.contains(REPL_HINT),
+        "the headless refusal says {REPL_HINT:?}, but no UI stood in the way:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
+    );
+    assert!(
+        everything.contains("bundle-k7s-server") && everything.contains("--install-force"),
+        "the headless refusal does not name the server and the flag that settles it:\n{everything}"
+    );
+    assert!(
+        !everything.contains("Conflict on MCP server"),
+        "the conflict menu was shown without a terminal on stdout:\n{everything}"
+    );
+    assert_ne!(
+        exit_code(&transcript),
+        0,
+        "a refused headless install exited 0:\n{everything}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("mcp.json")).unwrap(),
+        local_before,
+        "the refused headless merge changed the local mcp.json:\n{everything}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "a headless install entered the alternate screen:\n{transcript}"
+    );
+    assert_tty_restored(&transcript);
+}
