@@ -712,7 +712,7 @@ impl MeshRuntime {
         let minted = !paths.identity_path.exists();
         let core_identity = identity::load_or_mint_identity(&paths.identity_path)?;
         let fingerprint = identity::fingerprint(&core_identity);
-        let self_trust_granted = trust.seed_self_trust(&fingerprint, minted, SystemTime::now())?;
+        trust.set_own_identity(&fingerprint)?;
         let transport_identity = to_transport_private_identity(&core_identity);
         let peers = Arc::new(PeerTable::load(
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
@@ -876,6 +876,7 @@ impl MeshRuntime {
                 }
             }
         }
+        let self_trust_granted = seed_own_grant(&trust, &fingerprint, minted);
         debug!(
             "Started mesh node {} (instance {instance_id}) as destination {}",
             short(&fingerprint),
@@ -2127,6 +2128,22 @@ async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time:
         warn!(
             "Mesh request handlers did not stop within the shutdown window; the node releases its locks with them still running"
         );
+    }
+}
+
+/// Seeds this node's own grant once the start can no longer fail, so a refused start
+/// writes none. A seed that fails leaves the node running without the grant, warned
+/// about with the command that gives it, and reads as not granted.
+fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
+    match trust.seed_self_trust(fingerprint, minted, SystemTime::now()) {
+        Ok(granted) => granted,
+        Err(err) => {
+            warn!(
+                "The mesh is on, but this node's own identity could not be trusted for your other sessions ({}). Your sessions on this computer are treated like an unknown peer until you run `.mesh trust --identity {fingerprint}`.",
+                redact_hashes(&format!("{err:#}"))
+            );
+            false
+        }
     }
 }
 
@@ -16465,6 +16482,42 @@ mod tests {
     }
 
     const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";
+
+    mod own_grant_seed_tests {
+        use super::*;
+
+        const OWN: &str = "00112233445566778899aabbccddeeff";
+
+        #[test]
+        fn a_seed_that_writes_reads_as_granted() {
+            let tmp = TempDir::new("node-seed-own-grant");
+            let trust = TrustStore::open(&tmp.path).unwrap();
+
+            assert!(seed_own_grant(&trust, OWN, true));
+        }
+
+        /// The trust file turns unreadable after the store loaded it, so the seed's
+        /// write is refused while the start has nothing left that can fail.
+        #[test]
+        fn a_seed_that_fails_is_a_warning_naming_the_trust_command() {
+            install_log_collector();
+            let tmp = TempDir::new("node-seed-own-grant-fails");
+            let trust = TrustStore::open(&tmp.path).unwrap();
+            std::fs::create_dir_all(trust.path().parent().unwrap()).unwrap();
+            std::fs::write(trust.path(), "{not yaml").unwrap();
+
+            assert!(!seed_own_grant(&trust, OWN, true));
+
+            let remedy = format!("`.mesh trust --identity {OWN}`");
+            let warned = warn_snapshot();
+            assert!(
+                warned
+                    .iter()
+                    .any(|line| line.contains("could not be trusted") && line.contains(&remedy)),
+                "{warned:#?}"
+            );
+        }
+    }
 
     fn peer_turns() -> Vec<EnvoyTurn> {
         vec![

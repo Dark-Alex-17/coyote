@@ -877,9 +877,10 @@ struct State {
     last_reload_failure: Option<String>,
     session_identities: BTreeMap<String, IdentityEntry>,
     session_destinations: BTreeMap<String, DestinationEntry>,
-    /// This node's own identity, as last passed to `seed_self_trust`, or the new key of
-    /// `rotate_self_trust`. Its grant covers only the node's own instances, so it is no
-    /// reason to ask the network for a destination nothing has announced.
+    /// This node's own identity, as last passed to `set_own_identity` or
+    /// `seed_self_trust`, or the new key of `rotate_self_trust`. Its grant covers only
+    /// the node's own instances, so it is no reason to ask the network for a
+    /// destination nothing has announced.
     own_identity: Option<String>,
     seen: BTreeMap<String, SystemTime>,
     /// Per instance the presence rung has refused someone for, its memo, with insertion
@@ -1320,6 +1321,14 @@ impl TrustStore {
 
     fn collision_protection(&self) -> bool {
         self.collision_protection.load(Ordering::Relaxed)
+    }
+
+    /// Records this node's own identity without writing anything, so a node that is
+    /// still starting never takes its own grant for a reason to ask for a destination.
+    pub(crate) fn set_own_identity(&self, identity_hash: &str) -> Result<()> {
+        let identity = valid_hash("identity", identity_hash)?;
+        self.inner.lock().own_identity = Some(identity);
+        Ok(())
     }
 
     #[cfg(test)]

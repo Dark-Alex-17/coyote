@@ -21,7 +21,7 @@ use crate::mesh::pending::{
     PendingState, WaitOutcome,
 };
 use crate::mesh::request::short;
-use crate::mesh::trust::{Decision, IdentityStanding, Rule, Verdict};
+use crate::mesh::trust::{Decision, IdentityStanding, Rule, Verdict, same_hash};
 use crate::mesh::{
     MeshRuntime, MeshSlot, PeerRecord, RequestOptions, canonical_hash, decode_hex, display_text,
     hex_lower, redact_hashes, rfc3339_utc,
@@ -941,7 +941,9 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         if let Some(note) = peer.compatibility_line() {
             row["compatibility_note"] = json!(note);
         }
-        if let Some(session) = own_sessions.get(&peer.destination_hash) {
+        if let Some(session) = own_sessions.get(&peer.destination_hash)
+            && same_hash(&peer.identity_hash, runtime.fingerprint())
+        {
             row["session"] = json!(session);
         }
         peers.push(row);
@@ -6947,6 +6949,78 @@ mod tests {
                 assert!(ctx.app.mesh.stop().await.unwrap());
                 assert!(temp_slot.stop().await.unwrap());
                 relay_handle.abort();
+            }
+
+            mod foreign_identity_tests {
+                use super::*;
+                use crate::config::mesh_config::MeshConfig;
+
+                /// A peer table row pairing one of this node's registered destinations with
+                /// another identity is a sighting this node cannot vouch for, so it names
+                /// no session. `temp` does not announce, so the only sighting of its
+                /// destination is the forged one.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                #[serial]
+                async fn an_own_destination_announced_by_another_identity_names_no_session() {
+                    let _guard = TestConfigDirGuard::new("mesh-tool-peers-session-foreign");
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let tmp = TempDir::new("mesh-tool-peers-session-foreign");
+                    let a = start_as("a", &tmp, addr.port()).await;
+                    let mut session = Session::default();
+                    session.set_name("temp".to_string());
+                    let temp = MeshRuntime::start(
+                        &MeshConfig {
+                            announce: false,
+                            ..private_config(addr.port())
+                        },
+                        true,
+                        &mut session,
+                        mesh_paths(&tmp),
+                        NodeOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let temp_slot = Arc::new(MeshSlot::default());
+                    temp_slot.install(temp.clone()).unwrap();
+                    let mut ctx = plain_ctx();
+                    ctx.app.mesh.install(a.clone()).unwrap();
+                    let temp_dest = temp.current_destination_hash();
+                    a.peers().observe(
+                        PeerSighting {
+                            destination_hash: temp_dest.clone(),
+                            identity_hash: hex_lower(&[0x12; 16]),
+                            name_hash: String::new(),
+                            public_key: None,
+                            display_name: None,
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        SystemTime::now(),
+                    );
+
+                    let result = handle_mesh_tool(
+                        &mut ctx,
+                        &format!("{MESH_FUNCTION_PREFIX}peers"),
+                        &json!({}),
+                    )
+                    .await
+                    .unwrap();
+
+                    let row = result["peers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["destination"] == temp_dest.as_str())
+                        .unwrap_or_else(|| panic!("{temp_dest} missing from {result}"));
+                    assert!(
+                        !row.as_object().unwrap().contains_key("session"),
+                        "{result}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    assert!(temp_slot.stop().await.unwrap());
+                    relay_handle.abort();
+                }
             }
         }
 
