@@ -1143,14 +1143,17 @@ fn pending(ctx: &RequestContext) -> Result<()> {
             InboundKind::Question => escalated.push(QuestionRow::inbound(record, name, now)),
         }
     }
-    out_text(&render_pending(
-        &asked,
-        &escalated,
-        &access,
-        now,
-        terminal_width(),
-        !*NO_COLOR,
-    ));
+    out_path_text(
+        &render_pending(
+            &asked,
+            &escalated,
+            &access,
+            now,
+            terminal_width(),
+            !*NO_COLOR,
+        )
+        .render(live_prefix()),
+    );
     Ok(())
 }
 
@@ -1210,18 +1213,15 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         _ => bail!(no_open_question(id)),
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
-    out_text(&render_question_block(
-        &row,
-        now,
-        terminal_width(),
-        !*NO_COLOR,
-    ));
+    out_path_text(
+        &render_question_block(&row, now, terminal_width(), !*NO_COLOR).render(live_prefix()),
+    );
     let text = match given {
         Some(text) => text.to_string(),
         None => match prompt_answer_text(id)? {
             Some(text) => text,
             None => {
-                out_text(&nothing_sent(id));
+                out_path_text(&nothing_sent(id).render(live_prefix()));
                 return Ok(());
             }
         },
@@ -1345,12 +1345,15 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     let id = &record.id;
     ctx.app.mesh.refuse_dismiss_held_by_envoy(id)?;
     let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
-    out_text(&render_question_block(
-        &QuestionRow::inbound(&record, name.clone(), now),
-        now,
-        terminal_width(),
-        !*NO_COLOR,
-    ));
+    out_path_text(
+        &render_question_block(
+            &QuestionRow::inbound(&record, name.clone(), now),
+            now,
+            terminal_width(),
+            !*NO_COLOR,
+        )
+        .render(live_prefix()),
+    );
     if silent {
         ctx.app.mesh.dismiss_inbound(id, true).await?;
         out_text(&format!(
@@ -5784,7 +5787,9 @@ where
 /// id begins comes back as typed (32 hex digits lower-cased), so the verb's own lookup
 /// says which kind of id it has no open entry for.
 /// Each held id comes with the kind of inbound entry it is, `None` for a question this
-/// node asked, so a token that is a whole id can be told how its entries clear.
+/// node asked, so a token that is a whole id can be told how its entries clear. The
+/// refusals quote the token and the ids as they stand, since a peer may have chosen an
+/// id that reads as a command.
 fn resolve_pending_id(token: &str, held: Vec<(String, Option<InboundKind>)>) -> Result<String> {
     let lowered = token.to_ascii_lowercase();
     let mut matches: Vec<(String, Option<InboundKind>)> = held
@@ -5798,22 +5803,32 @@ fn resolve_pending_id(token: &str, held: Vec<(String, Option<InboundKind>)>) -> 
         if matches.is_empty() && !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(token.to_string());
         }
-        bail!(
-            "'{token}' is too short to pick a pending id: give the whole id or {HASH_PREFIX_MIN_CHARS} or more of its first characters; {} them.",
-            HashKind::Message.listing()
-        );
+        return Err(QuotingError::wrap(
+            NoticeText::from("'").peer(token).frame(format!(
+                "' is too short to pick a pending id: give the whole id or {HASH_PREFIX_MIN_CHARS} or more of its first characters; {} them.",
+                HashKind::Message.listing()
+            )),
+        ));
     }
     match matches.len() {
         0 => Ok(canonical_hash(token).unwrap_or_else(|| token.to_string())),
         1 => Ok(matches.remove(0).0),
-        _ if whole => bail!(whole_id_refusal(token, &matches)),
+        _ if whole => Err(QuotingError::wrap(whole_id_refusal(token, &matches))),
         count => {
             let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
-            bail!(
-                "'{token}' matches {count} {}: {}; give one of these (or enough of its characters to tell it apart).",
-                HashKind::Message.plural(),
-                pending_candidates(&ids, &ids).join(", ")
-            )
+            Err(QuotingError::wrap(
+                NoticeText::from("'")
+                    .peer(token)
+                    .frame(format!(
+                        "' matches {count} {}: ",
+                        HashKind::Message.plural()
+                    ))
+                    .then(joined_text(
+                        quoted_ids(&pending_candidates(&ids, &ids)),
+                        ", ",
+                    ))
+                    .frame("; give one of these (or enough of its characters to tell it apart)."),
+            ))
         }
     }
 }
@@ -5835,7 +5850,7 @@ fn pending_candidates(ids: &[&str], among: &[&str]) -> Vec<String> {
 /// matches ids that differ only in case. No form of the token can ever pick the short or
 /// twinned id, so the sentence names how the entries in the way leave instead. A longer
 /// id a peer sent goes once it is acted on, which a question this node asked does not.
-fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> String {
+fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> NoticeText {
     let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
     let shown = pending_candidates(&ids, &ids);
     let (twins, longer): (Vec<usize>, Vec<usize>) =
@@ -5843,31 +5858,42 @@ fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> S
     let names = |at: &[usize]| at.iter().map(|&i| shown[i].clone()).collect::<Vec<_>>();
     let clear = pending_clear_clause(&names(&(0..ids.len()).collect::<Vec<_>>()), matches);
     if twins.len() > 1 {
-        let quoted: Vec<String> = names(&twins).iter().map(|id| format!("'{id}'")).collect();
+        let quoted: Vec<NoticeText> = names(&twins)
+            .into_iter()
+            .map(|id| NoticeText::from("'").peer(id).frame("'"))
+            .collect();
         let none = if twins.len() == 2 { "neither" } else { "none" };
-        return format!(
-            "{} differ only in case, so {none} can be picked; {clear}.",
-            join_and(&quoted)
-        );
+        return join_and_text(quoted)
+            .frame(format!(" differ only in case, so {none} can be picked; "))
+            .then(clear)
+            .frame(".");
     }
-    let longer_names = names(&longer).join(", ");
+    let longer_names = joined_text(quoted_ids(&names(&longer)), ", ");
     let verb = if longer.len() == 1 { "begins" } else { "begin" };
-    let what = format!(
-        "'{token}' is a whole pending id and also how {longer_names} {verb}, so it cannot pick one"
-    );
+    let what = NoticeText::from("'")
+        .peer(token)
+        .frame("' is a whole pending id and also how ")
+        .then(longer_names.clone())
+        .frame(format!(" {verb}, so it cannot pick one"));
     if longer.iter().any(|&at| matches[at].1.is_none()) {
-        return format!("{what}; {clear}.");
+        return what.frame("; ").then(clear).frame(".");
     }
     let it = if longer.len() == 1 { "it" } else { "them" };
-    format!(
-        "{what}. Act on {longer_names} first, typed as `.mesh pending` lists {it}, then '{token}' picks the one left; or {clear}."
-    )
+    what.frame(". Act on ")
+        .then(longer_names)
+        .frame(format!(
+            " first, typed as `.mesh pending` lists {it}, then '"
+        ))
+        .peer(token)
+        .frame("' picks the one left; or ")
+        .then(clear)
+        .frame(".")
 }
 
 /// How the entries `shown` names leave `.mesh pending` when no id can pick them: a peer's
 /// questions by `.mesh dismiss --all`, which leaves access requests alone, an access
 /// request at its expiry, and a question this node asked by no verb at all.
-fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind>)]) -> String {
+fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind>)]) -> NoticeText {
     let of_kind = |kind: Option<InboundKind>| {
         matches
             .iter()
@@ -5881,14 +5907,14 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
     let asked = of_kind(None);
     if questions.len() == matches.len() {
         let all = if matches.len() == 2 { "both" } else { "them" };
-        return format!("clear {all} with `.mesh dismiss --all`");
+        return format!("clear {all} with `.mesh dismiss --all`").into();
     }
     let mut clauses = Vec::new();
     if !questions.is_empty() {
-        clauses.push(format!(
-            "`.mesh dismiss --all` clears {}",
-            join_and(&questions)
-        ));
+        clauses.push(
+            NoticeText::from("`.mesh dismiss --all` clears ")
+                .then(join_and_text(quoted_ids(&questions))),
+        );
     }
     if !access.is_empty() {
         let (leave, expire) = if access.len() == 1 {
@@ -5896,10 +5922,10 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
         } else {
             ("leave", "they expire")
         };
-        clauses.push(format!(
-            "{} {leave} `.mesh pending` when {expire}",
-            join_and(&access)
-        ));
+        clauses.push(
+            join_and_text(quoted_ids(&access))
+                .frame(format!(" {leave} `.mesh pending` when {expire}")),
+        );
     }
     if !asked.is_empty() {
         let what = if asked.len() == 1 {
@@ -5907,9 +5933,11 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
         } else {
             "are questions this node asked"
         };
-        clauses.push(format!("{} {what}, which no verb clears", join_and(&asked)));
+        clauses.push(
+            join_and_text(quoted_ids(&asked)).frame(format!(" {what}, which no verb clears")),
+        );
     }
-    clauses.join(", and ")
+    joined_text(clauses, ", and ")
 }
 
 /// The fewest leading characters, never under `HASH_PREFIX_MIN_CHARS`, at which every hash
@@ -6664,11 +6692,13 @@ pub(crate) fn confirm_or_flag_with(
 const ANSWER_PROMPT: &str = "Your answer:";
 
 /// What a blank or cancelled `Your answer:` prompt leaves behind: the question stays
-/// open, so the line carries the full id for the one-line form.
-fn nothing_sent(id: &str) -> String {
-    format!(
-        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
-    )
+/// open, so the line carries the full id, quoted as the peer chose it, for the one-line
+/// form.
+fn nothing_sent(id: &str) -> NoticeText {
+    NoticeText::default()
+        .frame("Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer ")
+        .peer(id)
+        .frame(" \"<text>\".")
 }
 
 /// Asks for the answer to `id` when none came on the line: no terminal on stdin is an
@@ -8366,8 +8396,11 @@ fn time_left(received_at: &str, now: SystemTime) -> Option<Duration> {
         .map(|end| end.duration_since(now).unwrap_or_default())
 }
 
-fn answer_footer(id: &str) -> String {
-    format!("answer: .mesh answer {id} \"<text>\"")
+fn answer_footer(id: &str) -> NoticeText {
+    NoticeText::default()
+        .frame("answer: .mesh answer ")
+        .peer(id)
+        .frame(" \"<text>\"")
 }
 
 /// A question block in the `.mesh inbox` shape: a header the colour paints, then the
@@ -8375,46 +8408,106 @@ fn answer_footer(id: &str) -> String {
 /// `width` through `indented_rows`, then the answer footer on its own indented line.
 /// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
 /// is rendered at the length the store keeps it, never shorter. The footer is this
-/// node's own text and carries the full id, so it is neither wrapped nor shortened.
-fn render_question_block(row: &QuestionRow, now: SystemTime, width: usize, colour: bool) -> String {
+/// node's own text and carries the full id, so it is neither wrapped nor shortened. The
+/// peer's name, id and words are quoted as they stand; only this node's hints follow the
+/// prefix.
+fn render_question_block(
+    row: &QuestionRow,
+    now: SystemTime,
+    width: usize,
+    colour: bool,
+) -> NoticeText {
     let header = question_header(row, now);
     let mut lines = vec![if colour {
-        tool_name_text_forced(&header)
+        painted_header(header)
     } else {
         header
     }];
     if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
-        lines.extend(indented_rows("", &body, width));
+        lines.extend(quoted_rows("", &body, width));
     }
     if let Some(question) = peer_line(Some(&row.envoy_question), INBOUND_ENVOY_QUESTION_MAX_CHARS) {
-        lines.extend(indented_rows("envoy asks: ", &question, width));
+        lines.extend(quoted_rows("envoy asks: ", &question, width));
     }
     for (label, text) in &row.extra {
-        lines.extend(indented_rows(label, text, width));
+        lines.extend(
+            indented_rows(label, text, width)
+                .into_iter()
+                .map(NoticeText::from),
+        );
     }
-    lines.push(format!("  {}", answer_footer(&row.id)));
-    lines.join("\n")
+    lines.push(NoticeText::from("  ").then(answer_footer(&row.id)));
+    joined_text(lines, "\n")
 }
 
 /// A question block's first line, dot-separated: state, peer, when it was asked or
 /// sent as a relative age, the short id, and the time left when that is known.
-fn question_header(row: &QuestionRow, now: SystemTime) -> String {
+fn question_header(row: &QuestionRow, now: SystemTime) -> NoticeText {
     let age = match row.when {
         Some(when) => age_text(now, when),
         None => "at an unknown time".to_string(),
     };
-    let mut header = format!(
-        "{} . {} ({}) . {} {age} . id {}",
-        row.state,
-        row.name,
-        short(&row.destination),
-        row.when_label,
-        short(&row.id)
-    );
+    let mut header = NoticeText::default()
+        .frame(format!("{} . ", row.state))
+        .peer(row.name.clone())
+        .frame(format!(
+            " ({}) . {} {age} . id ",
+            short(&row.destination),
+            row.when_label
+        ))
+        .peer(short(&row.id));
     if let Some(left) = row.expires_in {
-        header.push_str(&format!(" . expires in {}", span_text(left)));
+        header = header.frame(format!(" . expires in {}", span_text(left)));
     }
     header
+}
+
+/// `header` painted as `tool_name_text_forced` paints a line, its runs kept apart so the
+/// peer's part is still quoted as it stands.
+fn painted_header(header: NoticeText) -> NoticeText {
+    let plain = header.plain();
+    let painted = tool_name_text_forced(&plain);
+    match painted.split_once(plain.as_str()) {
+        Some((open, close)) => NoticeText::from(open).then(header).frame(close),
+        None => header,
+    }
+}
+
+/// `indented_rows` over peer text: every row is quoted as it stands. The label and the
+/// indent wrap with the text and carry no command hint.
+fn quoted_rows(label: &str, text: &str, width: usize) -> Vec<NoticeText> {
+    indented_rows(label, text, width)
+        .into_iter()
+        .map(|row| NoticeText::default().peer(row))
+        .collect()
+}
+
+/// `parts` in order with `separator`, a frame run, between each two.
+fn joined_text(parts: impl IntoIterator<Item = NoticeText>, separator: &str) -> NoticeText {
+    let mut joined = NoticeText::default();
+    for (index, part) in parts.into_iter().enumerate() {
+        if index > 0 {
+            joined = joined.frame(separator);
+        }
+        joined = joined.then(part);
+    }
+    joined
+}
+
+/// `join_and` over runs: `a, b and c`, the commas and the `and` this node's own words.
+fn join_and_text(mut parts: Vec<NoticeText>) -> NoticeText {
+    match parts.pop() {
+        None => NoticeText::default(),
+        Some(last) if parts.is_empty() => last,
+        Some(last) => joined_text(parts, ", ").frame(" and ").then(last),
+    }
+}
+
+/// Each of `ids` quoted as it stands.
+fn quoted_ids(ids: &[String]) -> Vec<NoticeText> {
+    ids.iter()
+        .map(|id| NoticeText::default().peer(id.clone()))
+        .collect()
 }
 
 /// Three sections in a fixed order, every one shown: a header carrying the count and,
@@ -8425,7 +8518,8 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> String {
 /// printed id picks its entry when typed back, except an id that is the whole of one
 /// entry's id and also how another's begins, or one that differs from another only in
 /// case. Those stay ambiguous on purpose, so a peer cannot mint an id that takes the
-/// place of another, and the refusal names how the entries clear.
+/// place of another, and the refusal names how the entries clear. Peer names, ids and
+/// words are quoted as they stand; the headers' hints follow the prefix.
 fn render_pending(
     asked: &[QuestionRow],
     escalated: &[QuestionRow],
@@ -8433,7 +8527,7 @@ fn render_pending(
     now: SystemTime,
     width: usize,
     colour: bool,
-) -> String {
+) -> NoticeText {
     let sections = [
         (
             "Waiting for YOU",
@@ -8470,17 +8564,17 @@ fn render_pending(
         } else {
             format!("{counted:<column$}{commands}")
         };
-        lines.push(if colour {
+        lines.push(NoticeText::from(if colour {
             tool_name_text_forced(&header)
         } else {
             header
-        });
+        }));
         for (index, row) in rows.iter().enumerate() {
             let id_len = shown_id_len(&row.id, &ids);
             lines.extend(pending_entry(index + 1, row, *outbound, id_len, now, width));
         }
     }
-    lines.join("\n")
+    joined_text(lines, "\n")
 }
 
 /// How many characters of `id` tell it apart, without regard to case, from every id in
@@ -8514,41 +8608,49 @@ fn pending_entry(
     id_len: usize,
     now: SystemTime,
     width: usize,
-) -> Vec<String> {
+) -> Vec<NoticeText> {
     let age = match row.when {
         Some(when) => age_text(now, when),
         None => "at an unknown time".to_string(),
     };
-    let peer = format!("{} ({})", row.name, short(&row.destination));
+    let marker = format!("  {number}. ");
+    let peer = NoticeText::default()
+        .peer(row.name.clone())
+        .frame(format!(" ({})", short(&row.destination)));
     let id = row.id.get(..id_len).unwrap_or(&row.id);
     let head = if outbound {
-        format!("-> {peer} {age} . {} . id {id}", row.state)
+        NoticeText::from(format!("{marker}-> "))
+            .then(peer)
+            .frame(format!(" {age} . {} . id ", row.state))
     } else {
         let expires = row
             .expires_in
             .map(|left| format!(" . expires in {}", span_text(left)))
             .unwrap_or_default();
-        format!("{peer} {} {age}{expires} . id {id}", row.when_label)
+        NoticeText::from(marker.clone())
+            .then(peer)
+            .frame(format!(" {} {age}{expires} . id ", row.when_label))
     };
-    let marker = format!("  {number}. ");
-    let mut lines = vec![format!("{marker}{head}")];
+    let mut lines = vec![head.peer(id)];
     let indent = " ".repeat(marker.len() - 2);
     let inner = width.saturating_sub(indent.len());
-    let mut push = |label: &str, text: &str| {
-        lines.extend(
-            indented_rows(label, text, inner)
-                .into_iter()
-                .map(|row| format!("{indent}{row}")),
-        );
+    let mut push = |label: &str, text: &str, quoted: bool| {
+        lines.extend(indented_rows(label, text, inner).into_iter().map(|row| {
+            if quoted {
+                NoticeText::from(indent.as_str()).peer(row)
+            } else {
+                NoticeText::from(format!("{indent}{row}"))
+            }
+        }));
     };
     if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
-        push("", &format!("\"{body}\""));
+        push("", &format!("\"{body}\""), true);
     }
     if let Some(question) = peer_line(Some(&row.envoy_question), INBOUND_ENVOY_QUESTION_MAX_CHARS) {
-        push("envoy asks: ", &question);
+        push("envoy asks: ", &question, true);
     }
     for (label, text) in &row.extra {
-        push(label, text);
+        push(label, text, false);
     }
     lines
 }
@@ -12335,7 +12437,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn pending_lists_both_directions_or_says_none() {
         let now = pending_now();
-        let empty = render_pending(&[], &[], &[], now, 80, false);
+        let empty = render_pending(&[], &[], &[], now, 80, false).plain();
         let lines: Vec<&str> = empty.lines().collect();
         assert_eq!(
             lines,
@@ -12354,7 +12456,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             escalated_row("p1", "Share the plan?"),
             escalated_row("p2", ""),
         ];
-        let text = render_pending(&asked, &escalated, &[], now, 80, false);
+        let text = render_pending(&asked, &escalated, &[], now, 80, false).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines,
@@ -12437,7 +12539,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let row = QuestionRow::inbound(&record, "alice".to_string(), now);
         assert_eq!(row.expires_in, Some(PENDING_TTL - day));
         assert_eq!(
-            question_header(&row, now),
+            question_header(&row, now).plain(),
             "awaiting your answer . alice (12121212) . asked 1d ago . id p1 . expires in 6d"
         );
 
@@ -12445,7 +12547,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         access.received_at = rfc3339_utc(now - day);
         let row = QuestionRow::access(&access, "carol".to_string(), now);
         assert_eq!(
-            question_header(&row, now),
+            question_header(&row, now).plain(),
             "access request . carol (12121212) . asked 1d ago . id acc-1 . expires in 6d"
         );
 
@@ -12454,7 +12556,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let row = QuestionRow::inbound(&record, "alice".to_string(), now);
             assert_eq!(row.expires_in, Some(Duration::ZERO), "{past:?}");
             assert!(
-                question_header(&row, now).ends_with(" . id p1 . expires in 0s"),
+                question_header(&row, now)
+                    .plain()
+                    .ends_with(" . id p1 . expires in 0s"),
                 "{past:?}"
             );
         }
@@ -12462,7 +12566,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         record.received_at = "not a stamp".to_string();
         let row = QuestionRow::inbound(&record, "alice".to_string(), now);
         assert_eq!(row.expires_in, None);
-        assert!(question_header(&row, now).ends_with(" . id p1"));
+        assert!(question_header(&row, now).plain().ends_with(" . id p1"));
     }
 
     /// The block for each kind of question `.mesh answer` prints, rendered plain: header,
@@ -12472,7 +12576,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn question_block_renders_outbound_and_inbound_rows() {
         let now = pending_now();
-        let text = render_question_block(&asked_row("q1", PendingState::Open), now, 80, false);
+        let text =
+            render_question_block(&asked_row("q1", PendingState::Open), now, 80, false).plain();
         assert_eq!(
             text.lines().collect::<Vec<_>>(),
             [
@@ -12482,7 +12587,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ]
         );
 
-        let text = render_question_block(&escalated_row("p1", "Share the plan?"), now, 80, false);
+        let text =
+            render_question_block(&escalated_row("p1", "Share the plan?"), now, 80, false).plain();
         assert_eq!(
             text.lines().collect::<Vec<_>>(),
             [
@@ -12498,7 +12604,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         row.name = short(&row.destination).to_string();
         row.when = None;
         row.expires_in = Some(Duration::from_secs(6 * 86_400));
-        let text = render_question_block(&row, now, 80, false);
+        let text = render_question_block(&row, now, 80, false).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
@@ -12517,7 +12623,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     fn question_block_wraps_the_body_but_never_the_footer() {
         let mut row = escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "");
         row.body = "please delete docs/notes.md and docs/old.md before the merge lands".to_string();
-        let text = render_question_block(&row, pending_now(), 30, false);
+        let text = render_question_block(&row, pending_now(), 30, false).plain();
         let lines: Vec<&str> = text.lines().collect();
         let body = &lines[1..lines.len() - 1];
         assert!(body.len() > 1, "the body wrapped: {text}");
@@ -12537,10 +12643,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let row = escalated_row("p1", "Share the plan?");
         let now = pending_now();
 
-        let plain = render_question_block(&row, now, 80, false);
+        let plain = render_question_block(&row, now, 80, false).plain();
         assert!(!plain.contains('\x1b'), "{plain:?}");
 
-        let painted = render_question_block(&row, now, 80, true);
+        let painted = render_question_block(&row, now, 80, true).plain();
         let plain_header = plain.lines().next().unwrap();
         let mut painted_lines = painted.lines();
         assert_eq!(
@@ -12554,8 +12660,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "only the header is painted: {painted:?}"
         );
 
-        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, true);
-        let plain_pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false);
+        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, true).plain();
+        let plain_pending =
+            render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false).plain();
         for (painted, plain) in pending.lines().zip(plain_pending.lines()) {
             if plain.starts_with("  ") {
                 assert_eq!(painted, plain, "entries stay plain: {pending:?}");
@@ -12585,7 +12692,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             pending_now(),
             400,
             false,
-        );
+        )
+        .plain();
         let envoy_line = text
             .lines()
             .find(|line| line.starts_with("     envoy asks: "))
@@ -12606,7 +12714,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             now,
             80,
             false,
-        );
+        )
+        .plain();
         let lines: Vec<&str> = text.lines().collect();
         let access_title = lines
             .iter()
@@ -12637,7 +12746,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
 
-        let questions_only = render_pending(&[], &[question], &[], now, 80, false);
+        let questions_only = render_pending(&[], &[question], &[], now, 80, false).plain();
         assert!(
             questions_only.contains("\nAccess requests: none\n"),
             "an empty access section still shows: {questions_only}"
@@ -12670,7 +12779,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "9e519dff000011112222333344445555",
                 PendingState::Answered,
             )];
-            let text = render_pending(&asked, &escalated, &access, now, 80, false);
+            let text = render_pending(&asked, &escalated, &access, now, 80, false).plain();
             assert_eq!(
                 text.lines().collect::<Vec<_>>(),
                 [
@@ -12694,7 +12803,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn pending_shows_every_section_as_none_when_nothing_waits() {
             assert_eq!(
-                render_pending(&[], &[], &[], pending_now(), 80, false),
+                render_pending(&[], &[], &[], pending_now(), 80, false).plain(),
                 "Waiting for YOU: none\nAccess requests: none\nAsked by this node: none"
             );
         }
@@ -12706,7 +12815,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut row = escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "");
             row.body =
                 "please delete docs/notes.md and docs/old.md before the merge lands".to_string();
-            let text = render_pending(&[], &[row], &[], pending_now(), 30, false);
+            let text = render_pending(&[], &[row], &[], pending_now(), 30, false).plain();
             let body: Vec<&str> = text
                 .lines()
                 .skip(2)
@@ -12726,7 +12835,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 HASH_PREFIX_MIN_CHARS,
                 pending_now(),
                 80,
-            );
+            )
+            .iter()
+            .map(NoticeText::plain)
+            .collect::<Vec<_>>();
             assert_eq!(
                 entry,
                 [
@@ -12748,7 +12860,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 pending_now(),
                 80,
                 false,
-            );
+            )
+            .plain();
             for full in [
                 "9e519dff000011112222333344445555",
                 "3fe1be40a1b2c3d43fe1be40a1b2c3d4",
@@ -12776,12 +12889,161 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 pending_now(),
                 80,
                 false,
-            );
+            )
+            .plain();
             let ids: Vec<&str> = text
                 .lines()
                 .filter_map(|line| line.rsplit_once(" . id ").map(|(_, id)| id))
                 .collect();
             assert_eq!(ids, ["320b8f7b1", "1046c2c6", "320B8F7B9"], "{text}");
+        }
+    }
+
+    mod pending_quoting_tests {
+        use super::*;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        /// A peer's question whose name, id and words all read as commands.
+        fn command_shaped_row() -> QuestionRow {
+            let mut row = escalated_row(".vault", "");
+            row.name = ".session".to_string();
+            row.body = ".mesh trust x".to_string();
+            row
+        }
+
+        fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
+            command_error_text(
+                &MeshVerbError::wrap(err.context("`.mesh answer` failed")),
+                prefix,
+            )
+        }
+
+        #[test]
+        fn the_listing_keeps_peer_names_ids_and_words_while_its_hints_slash() {
+            let listing =
+                render_pending(&[], &[command_shaped_row()], &[], pending_now(), 80, false);
+            assert_eq!(
+                listing.render(CommandPrefix::Dot),
+                "Waiting for YOU (1)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh trust x\"\nAccess requests: none\nAsked by this node: none"
+            );
+            assert_eq!(
+                listing.render(CommandPrefix::Slash),
+                "Waiting for YOU (1)     answer: /mesh answer <id> \"<text>\" . dismiss: /mesh dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh trust x\"\nAccess requests: none\nAsked by this node: none"
+            );
+        }
+
+        #[test]
+        fn the_question_block_and_nothing_sent_keep_the_peer_id_while_the_hint_slashes() {
+            let block = render_question_block(&command_shaped_row(), pending_now(), 80, false);
+            let header = "awaiting your answer . .session (12121212) . asked 3m ago . id .vault . expires in 6d";
+            assert_eq!(
+                block.render(CommandPrefix::Dot),
+                format!("{header}\n  .mesh trust x\n  answer: .mesh answer .vault \"<text>\"")
+            );
+            assert_eq!(
+                block.render(CommandPrefix::Slash),
+                format!("{header}\n  .mesh trust x\n  answer: /mesh answer .vault \"<text>\"")
+            );
+            let painted = render_question_block(&command_shaped_row(), pending_now(), 80, true)
+                .render(CommandPrefix::Slash);
+            assert_eq!(
+                painted.lines().next(),
+                Some(tool_name_text_forced(header).as_str())
+            );
+
+            let left = nothing_sent(".vault");
+            assert_eq!(
+                left.render(CommandPrefix::Dot),
+                "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer .vault \"<text>\"."
+            );
+            assert_eq!(
+                left.render(CommandPrefix::Slash),
+                "Nothing was sent: the answer was left blank or cancelled. Answer later with /mesh answer .vault \"<text>\"."
+            );
+        }
+
+        #[test]
+        fn pending_id_refusals_quote_the_token_and_ids_as_typed() {
+            let question = Some(InboundKind::Question);
+            let held = |ids: &[(&str, Option<InboundKind>)]| {
+                ids.iter()
+                    .map(|(id, kind)| (id.to_string(), *kind))
+                    .collect::<Vec<_>>()
+            };
+            let cases = [
+                (
+                    resolve_pending_id(".vault", held(&[(".vault:a", question)])),
+                    "'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them.",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[(".session:a", question), (".session:b", question)]),
+                    ),
+                    "'.session' matches 2 pending ids: .session:a, .session:b; give one of these (or enough of its characters to tell it apart).",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[(".session", question), (".session:b", question)]),
+                    ),
+                    "'.session' is a whole pending id and also how .session:... begins, so it cannot pick one. Act on .session:... first, typed as `.mesh pending` lists it, then '.session' picks the one left; or clear both with `.mesh dismiss --all`.",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[(".session", question), (".SESSION", question)]),
+                    ),
+                    "'.SESSION' and '.session' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`.",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[
+                            (".session", question),
+                            (".session:a", Some(InboundKind::Access)),
+                            (".session:b", None),
+                        ]),
+                    ),
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `.mesh dismiss --all` clears .session, and .session:a leaves `.mesh pending` when it expires, and .session:b is a question this node asked, which no verb clears.",
+                ),
+            ];
+            for (refused, dot) in cases {
+                let err = refused.unwrap_err();
+                assert_eq!(err.to_string(), dot);
+                assert!(shown_as(err, CommandPrefix::Dot).ends_with(dot));
+            }
+
+            let slashed = shown_as(
+                resolve_pending_id(
+                    ".session",
+                    held(&[
+                        (".session", question),
+                        (".session:a", Some(InboundKind::Access)),
+                        (".session:b", None),
+                    ]),
+                )
+                .unwrap_err(),
+                CommandPrefix::Slash,
+            );
+            assert!(
+                slashed.starts_with("Error: `/mesh answer` failed"),
+                "{slashed}"
+            );
+            assert!(
+                slashed.ends_with(
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `/mesh dismiss --all` clears .session, and .session:a leaves `/mesh pending` when it expires, and .session:b is a question this node asked, which no verb clears."
+                ),
+                "{slashed}"
+            );
+            let short = shown_as(
+                resolve_pending_id(".vault", held(&[(".vault:a", question)])).unwrap_err(),
+                CommandPrefix::Slash,
+            );
+            assert!(
+                short.ends_with("'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `/mesh pending` lists them."),
+                "{short}"
+            );
         }
     }
 
@@ -13343,7 +13605,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             pending_now(),
             200,
             false,
-        );
+        )
+        .plain();
         for c in forbidden {
             assert!(
                 !text.contains(c),
@@ -13408,7 +13671,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(rows[0][4], "(no intro)", "{text}");
         let mut escalated = escalated_row("p2", blank);
         escalated.body = blank.to_string();
-        let text = render_pending(&[], &[escalated], &[], pending_now(), 200, false);
+        let text = render_pending(&[], &[escalated], &[], pending_now(), 200, false).plain();
         assert!(
             !text.contains("envoy asks"),
             "a blank envoy question prints no envoy line: {text}"
@@ -20625,9 +20888,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ["  what now?", "  answer: .mesh answer q1 \"<text>\""],
                         "{out:?}"
                     );
-                    assert_eq!(out[3], nothing_sent("q1"), "{out:?}");
+                    assert_eq!(out[3], nothing_sent("q1").plain(), "{out:?}");
                     assert!(out[4].starts_with(&inbound_header), "{out:?}");
-                    assert_eq!(out[8], nothing_sent("p1"), "{out:?}");
+                    assert_eq!(out[8], nothing_sent("p1").plain(), "{out:?}");
                     assert!(
                         !out.iter()
                             .any(|line| line.contains("Sending your answer to")),
@@ -20769,7 +21032,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines()[before..].join("\n");
                     let out: Vec<&str> = out.lines().collect();
                     assert!(out[0].starts_with(&outbound_header), "{out:?}");
-                    assert_eq!(out[3], nothing_sent("q1"), "{out:?}");
+                    assert_eq!(out[3], nothing_sent("q1").plain(), "{out:?}");
                     assert!(
                         !out.iter()
                             .any(|line| line.contains("Sending your answer to")),
