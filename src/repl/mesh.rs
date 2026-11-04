@@ -25,6 +25,7 @@ use crate::mesh::message::{
     PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
     left_mesh_hint, unreachable_head,
 };
+use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
     Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
     PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingState, access_not_a_question,
@@ -32,9 +33,9 @@ use crate::mesh::pending::{
 };
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
-    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
-    WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
-    validate_override, validate_pattern,
+    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, ShareWriteError,
+    Verdict as ShareVerdict, WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer,
+    protected_segment, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule,
@@ -50,6 +51,7 @@ use crate::mesh::{
     canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
     loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
+use crate::render::QuotingError;
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{
@@ -1805,19 +1807,23 @@ pub(crate) fn attachment(
     let shown = shown_pattern(path_text);
     if Path::new(path_text).is_absolute() || path_text.starts_with('/') || path_text.contains('\\')
     {
-        bail!(
-            "`--attach` takes a path relative to {}, as `.mesh allow` does; '{shown}' is not one.",
-            root.display()
-        );
+        return Err(QuotingError::wrap(
+            NoticeText::default()
+                .frame("`--attach` takes a path relative to ")
+                .peer(root.display().to_string())
+                .frame(", as `.mesh allow` does; '")
+                .peer(shown)
+                .frame("' is not one."),
+        ));
     }
     if let Err(invalid) = WirePath::parse(path_text) {
-        bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "`{shown}` is not a path the mesh carries (rule `{}`), so it cannot travel as a file part; rename or move the file and attach it again.",
+        return Err(attach_path_error(
+            &shown,
+            format!(
+                " is not a path the mesh carries (rule `{}`), so it cannot travel as a file part; rename or move the file and attach it again.",
                 invalid.rule
-            ))
-        );
+            ),
+        ));
     }
     let (set, _warning) = ShareSet::load_quietly(locations);
     if let Some(head) = set.protected_head(path_text) {
@@ -1827,10 +1833,13 @@ pub(crate) fn attachment(
     let metadata = match fs::symlink_metadata(&file_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "`{shown}` is not under {}; nothing was sent.",
-                root.display()
-            )
+            return Err(attach_path_error(
+                &shown,
+                NoticeText::default()
+                    .frame(" is not under ")
+                    .peer(root.display().to_string())
+                    .frame("; nothing was sent."),
+            ));
         }
         Err(err) => {
             return Err(err)
@@ -1838,17 +1847,25 @@ pub(crate) fn attachment(
         }
     };
     if metadata.file_type().is_symlink() {
-        bail!("'{shown}' is a symlink; attach the file it points to instead.");
+        return Err(QuotingError::wrap(
+            NoticeText::default()
+                .frame("'")
+                .peer(shown)
+                .frame("' is a symlink; attach the file it points to instead."),
+        ));
     }
     if metadata.is_dir() {
-        bail!("`{shown}` is a directory; attach one file.");
+        return Err(attach_path_error(
+            &shown,
+            " is a directory; attach one file.",
+        ));
     }
     if !metadata.is_file() {
-        bail!("`{shown}` is not a regular file.");
+        return Err(attach_path_error(&shown, " is not a regular file."));
     }
     let (file, metadata) = open_attachment(&file_path)?;
     if !metadata.is_file() {
-        bail!("`{shown}` is not a regular file.");
+        return Err(attach_path_error(&shown, " is not a regular file."));
     }
     let canonical = canonicalize(&root)
         .and_then(|canonical_root| {
@@ -1858,42 +1875,66 @@ pub(crate) fn attachment(
         .ok()
         .flatten();
     let Some(canonical) = canonical else {
-        bail!(
-            "`{shown}` lies outside {} once its links are followed; nothing was sent.",
-            root.display()
-        );
+        return Err(attach_path_error(
+            &shown,
+            NoticeText::default()
+                .frame(" lies outside ")
+                .peer(root.display().to_string())
+                .frame(" once its links are followed; nothing was sent."),
+        ));
     };
     if !opened_the_judged_file(&metadata, &canonical) {
-        bail!("`{shown}` changed under this node while it was being read; nothing was sent.");
+        return Err(attach_path_error(
+            &shown,
+            " changed under this node while it was being read; nothing was sent.",
+        ));
     }
     let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
     match (set.builtin_denies(path_text, case_insensitive)?, force) {
-        (Some(BuiltinHit::ByText), false) => bail!(
-            "`{shown}` is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it."
-        ),
+        (Some(BuiltinHit::ByText), false) => {
+            return Err(attach_path_error(
+                &shown,
+                " is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it.",
+            ));
+        }
         (Some(BuiltinHit::ByText), true) | (None, false) => {}
         (Some(BuiltinHit::ByResolution { resolved }), _) => {
-            let resolved = shown_pattern(&resolved);
-            bail!(
-                "`{shown}` resolves to `{resolved}`, which the built-in deny names; attach that file by its own name with `--force` if you mean it."
-            )
+            return Err(attach_path_error(
+                &shown,
+                NoticeText::default()
+                    .frame(" resolves to `")
+                    .peer(shown_pattern(&resolved))
+                    .frame("`, which the built-in deny names; attach that file by its own name with `--force` if you mean it."),
+            ));
         }
         (Some(BuiltinHit::LinkNamedLikeASecret { resolved }), _) => {
             let resolved = shown_pattern(&resolved);
-            bail!(
-                "`{shown}` is a link to `{resolved}`, which the built-in deny does not name; attach `{resolved}` by that name; nothing was sent."
-            )
+            return Err(attach_path_error(
+                &shown,
+                NoticeText::default()
+                    .frame(" is a link to `")
+                    .peer(resolved.clone())
+                    .frame("`, which the built-in deny does not name; attach `")
+                    .peer(resolved)
+                    .frame("` by that name; nothing was sent."),
+            ));
         }
-        (Some(BuiltinHit::UnresolvableLink), _) => bail!(
-            "`{shown}` is reached through a link to nothing, so it cannot be sent; nothing was sent."
-        ),
-        (None, true) => bail!(
-            "`{shown}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
-        ),
+        (Some(BuiltinHit::UnresolvableLink), _) => {
+            return Err(attach_path_error(
+                &shown,
+                " is reached through a link to nothing, so it cannot be sent; nothing was sent.",
+            ));
+        }
+        (None, true) => {
+            return Err(attach_path_error(
+                &shown,
+                " is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`.",
+            ));
+        }
     }
     let size = metadata.len();
     if size == 0 {
-        bail!("`{shown}` is empty; nothing to attach.");
+        return Err(attach_path_error(&shown, " is empty; nothing to attach."));
     }
     let name = path_text.to_string();
     if size <= limits.inline_max_bytes {
@@ -1916,21 +1957,27 @@ pub(crate) fn attachment(
         });
     }
     if size > serving_limit {
-        bail!(
-            "`{shown}` is {} and this node serves at most {serving_limit} bytes by reference; nothing was sent.",
-            human_size(size)
-        );
+        return Err(attach_path_error(
+            &shown,
+            format!(
+                " is {} and this node serves at most {serving_limit} bytes by reference; nothing was sent.",
+                human_size(size)
+            ),
+        ));
     }
     if let Some(refusal) = set.refusal() {
-        bail!("{} Nothing was sent.", shown_refusal(refusal));
+        return Err(refused_at_load(refusal, " Nothing was sent."));
     }
     if let Some(reason) = set
         .verdict_for(&PeerRef::unscoped(), path_text, case_insensitive)?
         .and_then(|(verdict, _)| unserved_reason(verdict))
     {
-        bail!(
-            "`{shown}` would travel as a reference, which this node would not serve ({reason}); lift the rule first; nothing was sent."
-        );
+        return Err(attach_path_error(
+            &shown,
+            format!(
+                " would travel as a reference, which this node would not serve ({reason}); lift the rule first; nothing was sent."
+            ),
+        ));
     }
     let mut hasher = Sha256::new();
     std::io::copy(&mut std::io::BufReader::new(file), &mut hasher)
@@ -1947,6 +1994,18 @@ pub(crate) fn attachment(
         size,
         form: AttachForm::Reference,
     })
+}
+
+/// An `--attach` error that opens with the path the human typed, quoted as typed; the
+/// rest follows the prefix but for any quoted runs of its own.
+fn attach_path_error(shown: &str, rest: impl Into<NoticeText>) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("`")
+            .peer(shown)
+            .frame("`")
+            .then(rest.into()),
+    )
 }
 
 /// `path` opened for reading, with the metadata of that very handle, so what is sized,
@@ -2031,7 +2090,7 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let out = OutboundPeer::new(PeerKind::Bulletin, outgoing.text, None, None, None)?;
     let outcome = runtime.broadcast(&out).await?;
-    out_text(&render_broadcast(&outcome));
+    out_path_text(&render_broadcast(&outcome).render(live_prefix()));
     Ok(())
 }
 
@@ -4155,7 +4214,8 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 peer,
             },
             target.write_scope(),
-        )?
+        )
+        .map_err(quoted_share_write)?
         .changed;
     if force {
         changed |= set
@@ -4164,7 +4224,8 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     path: pattern.clone(),
                 },
                 target.write_scope(),
-            )?
+            )
+            .map_err(quoted_share_write)?
             .changed;
     }
     if !changed {
@@ -4265,12 +4326,14 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         set = loaded_for_writing(ctx)?.1;
     }
-    let applied = set.apply(
-        Mutation::Deny {
-            pattern: pattern.clone(),
-        },
-        target.write_scope(),
-    )?;
+    let applied = set
+        .apply(
+            Mutation::Deny {
+                pattern: pattern.clone(),
+            },
+            target.write_scope(),
+        )
+        .map_err(quoted_share_write)?;
     if applied.changed {
         out_path_text(&format!(
             "Denied `{pattern}` to every peer; written to {}.",
@@ -4331,11 +4394,11 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         })
         .collect();
     let Some((first_layer, first_held)) = targets.first().cloned() else {
-        bail!(
-            "No share rule has the pattern `{pattern}` in {} or {}; `.mesh shares` lists them.",
+        return Err(no_share_rule(
+            &pattern,
             path_of(Layer::Global),
-            path_of(Layer::Workspace)
-        );
+            path_of(Layer::Workspace),
+        ));
     };
     match scope {
         WriteScope::Global | WriteScope::Workspace => {
@@ -4344,34 +4407,31 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 _ => Layer::Global,
             };
             if !targets.iter().any(|(held, _)| *held == picked) {
-                bail!(
-                    "{}",
-                    ctx.render_hints(&format!(
-                        "`{pattern}` is held by {} ({}), not by {}. Run `.mesh unshare {pattern} {}` to remove it from {}.",
-                        path_of(first_layer),
-                        kind_list(&first_held),
-                        path_of(picked),
-                        flag_of(first_layer),
-                        path_of(first_layer)
-                    ))
-                );
+                return Err(held_elsewhere(
+                    &pattern,
+                    &path_of(first_layer).to_string(),
+                    &kind_list(&first_held),
+                    NoticeText::default()
+                        .frame(", not by ")
+                        .peer(path_of(picked).to_string()),
+                    flag_of(first_layer),
+                ));
             }
             targets.retain(|(held, _)| *held == picked);
         }
         WriteScope::Auto => {
             let reach = set.write_target(WriteScope::Auto);
             if !targets.iter().any(|(held, _)| *held == reach) {
-                bail!(
-                    "{}",
-                    ctx.render_hints(&format!(
-                        "`{pattern}` is held by {} ({}); without a flag `.mesh unshare` edits {}, which does not hold it. Run `.mesh unshare {pattern} {}` to remove it from {}.",
-                        path_of(first_layer),
-                        kind_list(&first_held),
-                        path_of(reach),
-                        flag_of(first_layer),
-                        path_of(first_layer)
-                    ))
-                );
+                return Err(held_elsewhere(
+                    &pattern,
+                    &path_of(first_layer).to_string(),
+                    &kind_list(&first_held),
+                    NoticeText::default()
+                        .frame("; without a flag `.mesh unshare` edits ")
+                        .peer(path_of(reach).to_string())
+                        .frame(", which does not hold it"),
+                    flag_of(first_layer),
+                ));
             }
         }
     }
@@ -4444,7 +4504,8 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 pattern: pattern.clone(),
             },
             scope,
-        )?;
+        )
+        .map_err(quoted_share_write)?;
         out_path_text(&format!(
             "Removed the {} for `{pattern}` from {}.",
             kind_list(held),
@@ -4477,7 +4538,7 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .transpose()?;
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        err_text(&shown_refusal(refusal));
+        err_path_text(&shown_refusal(refusal));
         out_text("Nothing is shared until it is fixed.");
         return Ok(());
     }
@@ -4631,19 +4692,23 @@ fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Resul
         None => None,
     };
     match record {
-        Some(record) if record.is_expired(now) => bail!(no_open_access_request(id)),
+        Some(record) if record.is_expired(now) => Err(no_open_access_request(id)),
         Some(record) if record.kind == InboundKind::Question => {
             bail!(question_not_an_access_request(id))
         }
         Some(record) => Ok(record),
         None if ctx.app.mesh.correlations().get(id).is_some() => bail!(asked_by_this_node(id)),
-        None => bail!(no_open_access_request(id)),
+        None => Err(no_open_access_request(id)),
     }
 }
 
-fn no_open_access_request(id: &str) -> String {
-    format!(
-        "No open access request has id {id}. `.mesh pending` lists the ones this node knows about."
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+fn no_open_access_request(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("No open access request has id ")
+            .peer(id)
+            .frame(". `.mesh pending` lists the ones this node knows about."),
     )
 }
 
@@ -4662,7 +4727,7 @@ fn refuse_unservable(
 ) -> Result<()> {
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        bail!("{} Nothing was sent.", shown_refusal(refusal));
+        return Err(refused_at_load(refusal, " Nothing was sent."));
     }
     let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
     let peer = PeerRef {
@@ -4676,27 +4741,260 @@ fn refuse_unservable(
         };
         let shown = listed_paths(std::slice::from_ref(path));
         if let Some(reason) = unserved_reason(verdict) {
-            bail!(
-                "{shown} would not be served even once granted ({reason}); refuse the request with `.mesh refuse {id}`, or lift the rule first."
-            );
+            return Err(unservable(shown, reason, id));
         }
         let Ok(metadata) = fs::metadata(&canonical) else {
             continue;
         };
         if !metadata.is_file() {
-            bail!(
-                "{shown} would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse {id}`, or lift the rule first."
-            );
+            return Err(unservable(shown, "it is not a regular file", id));
         }
         let size = metadata.len();
         if size > limit {
-            bail!(
-                "{shown} would not be served even once granted (it is {} and this node serves at most {limit} bytes); refuse the request with `.mesh refuse {id}`, or lift the rule first.",
-                human_size(size),
-            );
+            return Err(unservable(
+                shown,
+                format!(
+                    "it is {} and this node serves at most {limit} bytes",
+                    human_size(size)
+                ),
+                id,
+            ));
         }
     }
     Ok(())
+}
+
+/// The requested path is the peer's text, quoted as it wrote it; the remedy is this
+/// node's own and follows the prefix.
+fn unservable(shown: String, why: impl std::fmt::Display, id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(shown)
+            .frame(format!(
+                " would not be served even once granted ({why}); refuse the request with `.mesh refuse "
+            ))
+            .peer(id)
+            .frame("`, or lift the rule first."),
+    )
+}
+
+/// The pattern is the human's own text and the files are paths, both quoted as typed.
+fn no_share_rule(
+    pattern: &str,
+    global: impl std::fmt::Display,
+    workspace: impl std::fmt::Display,
+) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("No share rule has the pattern `")
+            .peer(pattern)
+            .frame("` in ")
+            .peer(global.to_string())
+            .frame(" or ")
+            .peer(workspace.to_string())
+            .frame("; `.mesh shares` lists them."),
+    )
+}
+
+/// A pattern held only by the file `.mesh unshare` was not pointed at. The pattern and
+/// the files are quoted as typed; the sentence and the command follow the prefix.
+fn held_elsewhere(
+    pattern: &str,
+    holder: &str,
+    kinds: &str,
+    not_here: NoticeText,
+    flag: &str,
+) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("`")
+            .peer(pattern)
+            .frame("` is held by ")
+            .peer(holder)
+            .frame(format!(" ({kinds})"))
+            .then(not_here)
+            .frame(". Run `.mesh unshare ")
+            .peer(pattern)
+            .frame(format!(" {flag}` to remove it from "))
+            .peer(holder)
+            .frame("."),
+    )
+}
+
+#[cfg(test)]
+mod peer_text_prefix_tests {
+    use super::*;
+    use crate::render::{MeshVerbError, command_error_text};
+
+    fn shown_under_slash(err: anyhow::Error) -> String {
+        command_error_text(
+            &MeshVerbError::wrap(err.context("`.mesh grant` failed")),
+            CommandPrefix::Slash,
+        )
+    }
+
+    #[test]
+    fn a_grant_refused_over_a_bare_vault_keeps_the_path_and_slashes_the_hint() {
+        for err in [
+            unservable(
+                listed_paths(&[".vault".to_string()]),
+                "a deny rule names it",
+                "a-1",
+            ),
+            unservable(
+                listed_paths(&[".vault".to_string()]),
+                "it is not a regular file",
+                "a-1",
+            ),
+        ] {
+            let text = shown_under_slash(err);
+            assert!(text.starts_with("Error: `/mesh grant` failed"), "{text}");
+            assert!(text.contains("    `.vault` would not be served"), "{text}");
+            assert!(text.contains("`/mesh refuse a-1`"), "{text}");
+        }
+    }
+
+    #[test]
+    fn unshare_of_vault_keeps_the_pattern_and_slashes_the_hint() {
+        let text = shown_under_slash(no_share_rule(".vault", ".coyote/shares.yaml", ".shares"));
+        assert!(
+            text.ends_with(
+                "No share rule has the pattern `.vault` in .coyote/shares.yaml or .shares; `/mesh shares` lists them."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_share_file_refused_at_load_is_quoted_byte_for_byte() {
+        let refusal = "shares.yaml line 2: `.vault` is a protected path; run .mesh shares";
+        let text = shown_under_slash(refused_at_load(refusal, " Nothing was sent."));
+        assert!(text.starts_with("Error: `/mesh grant` failed"), "{text}");
+        assert!(
+            text.ends_with(&format!("    {refusal} Nothing was sent.")),
+            "{text}"
+        );
+    }
+
+    mod wire_id_tests {
+        use super::*;
+
+        #[test]
+        fn a_peer_chosen_id_keeps_its_dot_in_the_refuse_and_pending_hints() {
+            let refused = shown_under_slash(unservable(
+                listed_paths(&["docs/a.md".to_string()]),
+                "a deny rule names it",
+                ".session",
+            ));
+            assert!(
+                refused.contains("refuse the request with `/mesh refuse .session`"),
+                "{refused}"
+            );
+            let missing = shown_under_slash(no_open_access_request(".session"));
+            assert!(
+                missing.ends_with(
+                    "No open access request has id .session. `/mesh pending` lists the ones this node knows about."
+                ),
+                "{missing}"
+            );
+        }
+    }
+
+    mod attach_path_tests {
+        use super::*;
+
+        #[test]
+        fn an_attached_bare_vault_keeps_its_dot_while_the_hint_slashes() {
+            let directory = shown_under_slash(attach_path_error(
+                ".vault",
+                " is a directory; attach one file.",
+            ));
+            assert!(
+                directory.ends_with("`.vault` is a directory; attach one file."),
+                "{directory}"
+            );
+            let carried = shown_under_slash(attach_path_error(
+                ".vault",
+                " is not a path the mesh carries; see `.mesh help`.",
+            ));
+            assert!(
+                carried.ends_with("`.vault` is not a path the mesh carries; see `/mesh help`."),
+                "{carried}"
+            );
+        }
+    }
+
+    mod share_write_tests {
+        use super::*;
+
+        #[test]
+        fn a_refused_write_quotes_the_share_file_and_the_pattern_as_they_stand() {
+            let refused = shown_under_slash(quoted_share_write(
+                ShareWriteError::Refused("`.vault` is not a pattern; run .mesh shares".into())
+                    .into(),
+            ));
+            assert!(
+                refused.ends_with(
+                    "    `.vault` is not a pattern; run .mesh shares Nothing was written."
+                ),
+                "{refused}"
+            );
+            let missing = shown_under_slash(quoted_share_write(
+                ShareWriteError::NoSuchPattern {
+                    file: PathBuf::from(".coyote/shares.yaml"),
+                    pattern: ".vault".into(),
+                }
+                .into(),
+            ));
+            assert!(
+                missing.ends_with(
+                    "No share entry in '.coyote/shares.yaml' has the pattern `.vault`; nothing was changed."
+                ),
+                "{missing}"
+            );
+        }
+    }
+
+    mod held_elsewhere_tests {
+        use super::*;
+
+        #[test]
+        fn a_flag_pointed_at_the_wrong_file_keeps_the_pattern_and_paths() {
+            let text = shown_under_slash(held_elsewhere(
+                ".vault",
+                ".coyote/shares.yaml",
+                "deny",
+                NoticeText::default().frame(", not by ").peer(".shares"),
+                "--global",
+            ));
+            assert!(
+                text.ends_with(
+                    "`.vault` is held by .coyote/shares.yaml (deny), not by .shares. Run `/mesh unshare .vault --global` to remove it from .coyote/shares.yaml."
+                ),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn no_flag_keeps_the_pattern_and_paths_and_slashes_both_commands() {
+            let text = shown_under_slash(held_elsewhere(
+                ".vault",
+                ".coyote/shares.yaml",
+                "allow",
+                NoticeText::default()
+                    .frame("; without a flag `.mesh unshare` edits ")
+                    .peer(".shares")
+                    .frame(", which does not hold it"),
+                "--global",
+            ));
+            assert!(
+                text.ends_with(
+                    "`.vault` is held by .coyote/shares.yaml (allow); without a flag `/mesh unshare` edits .shares, which does not hold it. Run `/mesh unshare .vault --global` to remove it from .coyote/shares.yaml."
+                ),
+                "{text}"
+            );
+        }
+    }
 }
 
 /// The requested paths in backticks, a backtick inside one made an apostrophe as the
@@ -4877,6 +5175,33 @@ fn shown_pattern(pattern: &str) -> String {
 /// stripped the way a pattern's are.
 fn shown_refusal(refusal: &str) -> String {
     display_text(refusal, 4096).unwrap_or_default()
+}
+
+/// A `.mesh` error that quotes a share file refused at load; the file's words keep
+/// their bytes whatever the prefix.
+fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(shown_refusal(refusal))
+            .frame(tail),
+    )
+}
+
+/// A refused share-list write with the share file's words and the human's pattern quoted
+/// as they stand; any other error is passed on unchanged.
+fn quoted_share_write(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<ShareWriteError>() {
+        Ok(ShareWriteError::Refused(refusal)) => refused_at_load(&refusal, " Nothing was written."),
+        Ok(ShareWriteError::NoSuchPattern { file, pattern }) => QuotingError::wrap(
+            NoticeText::default()
+                .frame("No share entry in '")
+                .peer(file.display().to_string())
+                .frame("' has the pattern `")
+                .peer(pattern)
+                .frame("`; nothing was changed."),
+        ),
+        Err(err) => err,
+    }
 }
 
 struct ShareArgs {
@@ -5151,7 +5476,7 @@ fn writable_share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet, bool)>
 fn loaded_for_writing(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        bail!("{} Nothing was written.", shown_refusal(refusal));
+        return Err(refused_at_load(refusal, " Nothing was written."));
     }
     Ok((root, set))
 }
@@ -8228,27 +8553,40 @@ fn pending_entry(
     lines
 }
 
-fn render_broadcast(outcome: &BroadcastOutcome) -> String {
+/// The peers' names and their owners' remedies are quoted as they stand; the counts and
+/// this node's own hints follow the prefix.
+fn render_broadcast(outcome: &BroadcastOutcome) -> NoticeText {
     if outcome.recipients.is_empty() {
-        return "No trusted peer has a known path right now; nothing was sent. `.mesh peers` lists what this node has heard from.".to_string();
+        return "No trusted peer has a known path right now; nothing was sent. `.mesh peers` lists what this node has heard from.".into();
     }
-    let mut lines = Vec::with_capacity(outcome.recipients.len() + 1);
+    let mut report = NoticeText::default();
     for recipient in &outcome.recipients {
         let status = match &recipient.outcome {
-            RecipientOutcome::Delivered => "delivered".to_string(),
-            RecipientOutcome::StoreAndForward => "store-and-forward".to_string(),
-            RecipientOutcome::Unreachable { reason } => format!("unreachable: {reason}"),
-            RecipientOutcome::Refused { reason } => format!("refused: {reason}"),
-            RecipientOutcome::NotTrustedByPeer(refusal) => refusal.to_string(),
-            RecipientOutcome::NoAnswer(no_answer) => no_answer.to_string(),
-            RecipientOutcome::Throttled { reason } => format!("throttled, not stored: {reason}"),
-            RecipientOutcome::RetryLater { reason } => format!("not stored: {reason}"),
+            RecipientOutcome::Delivered => NoticeText::from("delivered"),
+            RecipientOutcome::StoreAndForward => NoticeText::from("store-and-forward"),
+            RecipientOutcome::Unreachable { reason } => {
+                NoticeText::from(format!("unreachable: {reason}"))
+            }
+            RecipientOutcome::Refused { reason } => NoticeText::from(format!("refused: {reason}")),
+            RecipientOutcome::NotTrustedByPeer(refusal) => {
+                NoticeText::default().peer(refusal.to_string())
+            }
+            RecipientOutcome::NoAnswer(no_answer) => {
+                NoticeText::default().peer(no_answer.to_string())
+            }
+            RecipientOutcome::Throttled { reason } => {
+                NoticeText::from(format!("throttled, not stored: {reason}"))
+            }
+            RecipientOutcome::RetryLater { reason } => {
+                NoticeText::from(format!("not stored: {reason}"))
+            }
         };
-        lines.push(format!(
-            "  {} ({}): {status}",
-            name_label(recipient.display_name.as_deref()),
-            short(&recipient.destination)
-        ));
+        report = report
+            .frame("  ")
+            .peer(name_label(recipient.display_name.as_deref()))
+            .frame(format!(" ({}): ", short(&recipient.destination)))
+            .then(status)
+            .frame("\n");
     }
     let tally = outcome.tally();
     let mut later = String::new();
@@ -8258,15 +8596,14 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
     if tally.retry_later > 0 {
         later.push_str(&format!(", {} to retry", tally.retry_later));
     }
-    lines.push(format!(
+    report.frame(format!(
         "Bulletin {}: {} delivered, {} store-and-forward, {} unreachable, {} refused{later}.",
         short(&outcome.id),
         tally.delivered,
         tally.stored,
         tally.unreachable,
         tally.refused
-    ));
-    lines.join("\n")
+    ))
 }
 
 #[cfg(test)]
@@ -12829,7 +13166,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             id: "b1".repeat(16),
             recipients: vec![],
         };
-        assert!(render_broadcast(&nobody).starts_with("No trusted peer has a known path"));
+        assert!(
+            render_broadcast(&nobody)
+                .plain()
+                .starts_with("No trusted peer has a known path")
+        );
 
         let outcome = BroadcastOutcome {
             id: "b1".repeat(16),
@@ -12859,7 +13200,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 ),
             ],
         };
-        let text = render_broadcast(&outcome);
+        let text = render_broadcast(&outcome).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 7, "{text}");
         assert_eq!(lines[0], format!("  Ann ({}): delivered", "ab".repeat(4)));
@@ -12884,6 +13225,54 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "b1".repeat(4)
             )
         );
+    }
+
+    mod broadcast_prefix_tests {
+        use super::*;
+        use crate::mesh::request::NoAnswer;
+
+        #[test]
+        fn peer_names_and_their_owners_remedies_keep_their_dots_under_slash() {
+            let own = "0a".repeat(16);
+            let refusal = RemoteRefusal::new(&"ab".repeat(16), Some(".info Bea"), own.clone());
+            let no_answer = NoAnswer::new(&"cd".repeat(16), own.clone());
+            let outcome = BroadcastOutcome {
+                id: "b1".repeat(16),
+                recipients: vec![
+                    recipient(
+                        Some(".info Bea"),
+                        RecipientOutcome::NotTrustedByPeer(refusal.clone()),
+                    ),
+                    recipient(
+                        Some(".session"),
+                        RecipientOutcome::NoAnswer(no_answer.clone()),
+                    ),
+                ],
+            };
+            let text = render_broadcast(&outcome).render(CommandPrefix::Slash);
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(
+                lines[0].starts_with(&format!("  .info Bea (abababab): {refusal}")),
+                "{text}"
+            );
+            assert!(
+                lines[0].contains(&format!("run .mesh trust {own}")),
+                "{text}"
+            );
+            assert!(
+                lines[1].starts_with(&format!("  .session (abababab): {no_answer}")),
+                "{text}"
+            );
+            let nobody = BroadcastOutcome {
+                id: "b1".repeat(16),
+                recipients: vec![],
+            };
+            assert!(
+                render_broadcast(&nobody)
+                    .render(CommandPrefix::Slash)
+                    .contains("`/mesh peers` lists"),
+            );
+        }
     }
 
     #[test]
@@ -13218,7 +13607,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let mut ctx = off_ctx();
                 let live = ctx.app.mesh.command_prefix().clone();
                 let _prefix = live_prefix_override::install(live.clone());
-                let printer = PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live);
+                let printer =
+                    PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live).with_width(80);
                 let attached = printer.attach();
                 let knock = || Notification::new(Source::Knock, "`.mesh trust 1a2b`").render();
                 let _capture = capture::install();
@@ -15477,7 +15867,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             impl IdleSink for Recording {
                 fn push(&self, note: IdleNotify) -> std::result::Result<(), IdleNotify> {
-                    self.0.lock().push(note.text);
+                    self.0.lock().push(note.text.plain());
                     Ok(())
                 }
 
@@ -15543,8 +15933,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(ctx.app.mesh.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: "still routed".to_string(),
-                        verbatim: Vec::new(),
+                        text: "still routed".into(),
                         origin: Origin::Local,
                         model_note: None,
                     }));
@@ -16439,8 +16828,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.config.mesh.enabled);
                     assert!(ctx.app.mesh.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: "routed after on".to_string(),
-                        verbatim: Vec::new(),
+                        text: "routed after on".into(),
                         origin: Origin::Local,
                         model_note: None,
                     }));

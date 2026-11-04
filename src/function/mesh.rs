@@ -511,15 +511,69 @@ fn refusal_hints(result: Value, prefix: CommandPrefix) -> Value {
     }
 }
 
+/// Names the field that carries the opening of a refusal's `message` written for the
+/// peer's owner; `with_prose_hints` takes it off before the model sees the result.
+const PEER_SIDE_REMEDY: &str = "peer_side_remedy";
+
+/// A peer-side refusal keeps its `next_action` and the opening of its `message` as they
+/// stand: they quote the peer's name and name commands the peer's owner runs in the
+/// peer's own prefix. What follows in `message` is this node's own and is rendered.
 fn with_prose_hints(mut value: Value, prefix: CommandPrefix) -> Value {
-    for key in ["message", "next_action"] {
-        if let Some(Value::String(text)) = value.get_mut(key)
-            && let Cow::Owned(rendered) = prefix.render_hints(text)
-        {
-            *text = rendered;
-        }
+    let peer_side = value
+        .as_object_mut()
+        .and_then(|fields| fields.remove(PEER_SIDE_REMEDY));
+    let peer_side = peer_side.as_ref().and_then(Value::as_str);
+    if let Some(Value::String(text)) = value.get_mut("message") {
+        let (kept, rest) = peer_side
+            .and_then(|lead| text.strip_prefix(lead).map(|rest| (lead, rest)))
+            .unwrap_or(("", text.as_str()));
+        let rendered = format!("{kept}{}", prefix.render_hints(rest));
+        *text = rendered;
+    }
+    if peer_side.is_none()
+        && let Some(Value::String(text)) = value.get_mut("next_action")
+        && let Cow::Owned(rendered) = prefix.render_hints(text)
+    {
+        *text = rendered;
     }
     value
+}
+
+#[cfg(test)]
+mod peer_text_prefix_tests {
+    use super::*;
+    use crate::mesh::request::{NoAnswer, RemoteRefusal};
+
+    #[test]
+    fn a_peer_side_refusal_keeps_its_canonical_next_action_under_slash() {
+        let own = hex_lower(&[0xaa; 16]);
+        let refusal = RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some(".info Bea"), own.clone());
+        let result = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
+        let rendered = with_prose_hints(result.clone(), CommandPrefix::Slash);
+        assert!(rendered.get(PEER_SIDE_REMEDY).is_none(), "{rendered}");
+        assert_eq!(rendered["message"], refusal.to_string());
+        assert_eq!(rendered["next_action"], refusal.next_action());
+        assert!(
+            rendered["next_action"]
+                .as_str()
+                .is_some_and(|action| action.contains(&format!("run .mesh trust {own}"))),
+            "{rendered}"
+        );
+        let no_answer = NoAnswer::new(&hex_lower(&[0xbb; 16]), own.clone());
+        let silent = with_prose_hints(
+            send_error(&SendError::NoAnswer(no_answer.clone())),
+            CommandPrefix::Slash,
+        );
+        assert!(silent.get(PEER_SIDE_REMEDY).is_none(), "{silent}");
+        assert_eq!(silent["next_action"], no_answer.next_action());
+        let message = silent["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with(&no_answer.to_string()), "{message}");
+        assert!(message.contains(&format!(".mesh trust {own}")), "{message}");
+        assert!(
+            message.ends_with("`/mesh peers` lists the nodes this Coyote has heard from."),
+            "{message}"
+        );
+    }
 }
 
 /// Moves the notes the slot queued while this turn held the context onto the context's
@@ -785,11 +839,15 @@ fn send_error(err: &SendError) -> Value {
     match err {
         SendError::NotTrustedByPeer(refusal) => {
             result["next_action"] = json!(refusal.next_action());
+            result[PEER_SIDE_REMEDY] = json!(refusal.to_string());
         }
         SendError::UnknownThread(_) => {
             result["next_action"] = json!(UNKNOWN_THREAD_NEXT_ACTION);
         }
-        SendError::NoAnswer(no_answer) => result["next_action"] = json!(no_answer.next_action()),
+        SendError::NoAnswer(no_answer) => {
+            result["next_action"] = json!(no_answer.next_action());
+            result[PEER_SIDE_REMEDY] = json!(no_answer.to_string());
+        }
         _ => {}
     }
     result
@@ -1662,9 +1720,11 @@ fn fetch_error(err: &FileFetchError, verb: FetchVerb) -> Value {
     match err {
         FileFetchError::NotTrustedByPeer(refusal) => {
             result["next_action"] = json!(refusal.next_action());
+            result[PEER_SIDE_REMEDY] = json!(refusal.to_string());
         }
         FileFetchError::NoAnswer(no_answer) => {
             result["next_action"] = json!(no_answer.next_action());
+            result[PEER_SIDE_REMEDY] = json!(no_answer.to_string());
         }
         _ => {}
     }
@@ -1706,9 +1766,11 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
             match &err {
                 AccessError::NotTrustedByPeer(refusal) => {
                     result["next_action"] = json!(refusal.next_action());
+                    result[PEER_SIDE_REMEDY] = json!(refusal.to_string());
                 }
                 AccessError::NoAnswer(no_answer) => {
                     result["next_action"] = json!(no_answer.next_action());
+                    result[PEER_SIDE_REMEDY] = json!(no_answer.to_string());
                 }
                 _ => {}
             }
@@ -6893,7 +6955,7 @@ mod tests {
 
         impl IdleSink for RecordingIdle {
             fn push(&self, note: IdleNotify) -> std::result::Result<(), IdleNotify> {
-                self.0.lock().push(note.text);
+                self.0.lock().push(note.text.plain());
                 Ok(())
             }
 

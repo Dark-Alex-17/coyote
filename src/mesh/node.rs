@@ -38,7 +38,7 @@ use crate::mesh::message::{
     PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPart, RawPeerMessage,
     SendError, SendOutcome, collect_next_action, is_wire_id, unix_now,
 };
-use crate::mesh::notify::{Notification, NotificationSink, Source};
+use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
     PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
 };
@@ -3169,8 +3169,7 @@ async fn watch_interfaces(
                     info!("Mesh interface {label} connected");
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: format!("{label} connected"),
-                        verbatim: Vec::new(),
+                        text: format!("{label} connected").into(),
                         origin: Origin::Local,
                         model_note: None,
                     });
@@ -3203,8 +3202,7 @@ async fn watch_interfaces(
                     }
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: line,
-                        verbatim: Vec::new(),
+                        text: line.into(),
                         origin: Origin::Local,
                         model_note: None,
                     });
@@ -4269,11 +4267,7 @@ impl MeshSlot {
         match self.idle.load_full() {
             Some(sink) => sink.push(note).is_ok(),
             None => {
-                self.notify(Notification::with_verbatim(
-                    note.source,
-                    note.text,
-                    note.verbatim,
-                ));
+                self.notify(Notification::new(note.source, note.text));
                 true
             }
         }
@@ -4362,16 +4356,18 @@ impl MeshSlot {
         for record in expired {
             let id8 = short(&record.id);
             let name = self.peer_name_at(&record.peer_destination);
-            let text = match record.kind {
-                InboundKind::Question => {
-                    format!("question {id8} from {name} expired unanswered")
-                }
-                InboundKind::Access => format!("access request {id8} from {name} expired"),
+            let (what, outcome) = match record.kind {
+                InboundKind::Question => ("question", "expired unanswered"),
+                InboundKind::Access => ("access request", "expired"),
             };
             self.push_idle(IdleNotify {
                 source: Source::Message,
-                text,
-                verbatim: Vec::new(),
+                text: NoticeText::default()
+                    .frame(format!("{what} "))
+                    .peer(id8)
+                    .frame(" from ")
+                    .peer(name)
+                    .frame(format!(" {outcome}")),
                 origin: Origin::Peer(short(&record.peer_identity).to_string()),
                 model_note: None,
             });
@@ -4581,14 +4577,13 @@ impl MeshSlot {
         self.push_peer_lines(identity, fold_report_lines(who, &reports));
     }
 
-    fn push_peer_lines(&self, identity: &str, lines: Vec<String>) {
+    fn push_peer_lines(&self, identity: &str, lines: Vec<NoticeText>) {
         let id8 = short(identity).to_string();
         for text in lines {
             self.push_idle(IdleNotify {
                 source: Source::Message,
                 origin: Origin::Peer(id8.clone()),
                 text,
-                verbatim: Vec::new(),
                 model_note: None,
             });
         }
@@ -4635,13 +4630,15 @@ impl MeshSlot {
         let half = PEER_LINE_MAX_CHARS / 2;
         let asked_words = original.capped_words(half);
         let replied_words = reply.capped_words(half);
-        let mut text = format!(
-            "{who} {asked}: {}; envoy replied: {}",
-            asked_words.text, replied_words.text
-        );
-        if asked_words.cut || replied_words.cut {
-            text.push(' ');
-            text.push_str(INBOX_FULL_TEXT_POINTER);
+        let cut = asked_words.cut || replied_words.cut;
+        let mut text = NoticeText::default()
+            .peer(who)
+            .frame(format!(" {asked}: "))
+            .peer(asked_words.text)
+            .frame("; envoy replied: ")
+            .peer(replied_words.text);
+        if cut {
+            text = text.frame(format!(" {INBOX_FULL_TEXT_POINTER}"));
         }
         let local_id = format!("peer:{}", short(&original.source_destination));
         let id8 = short(&original.source_identity).to_string();
@@ -4659,7 +4656,6 @@ impl MeshSlot {
             source: Source::Message,
             origin: Origin::Peer(id8),
             text,
-            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -4680,12 +4676,11 @@ impl MeshSlot {
         reason: &str,
         next: &str,
     ) {
-        let text = format!(
-            "{reason}; {}",
+        let text = NoticeText::default().frame(format!("{reason}; ")).then(
             original.summary_line_with_tail(
                 self.display_name_of(&original).as_deref(),
-                &format!(" is in the inbox{next}")
-            )
+                &format!(" is in the inbox{next}"),
+            ),
         );
         let id8 = short(&original.source_identity).to_string();
         self.file_in_inbox(original, false);
@@ -4693,7 +4688,6 @@ impl MeshSlot {
             source: Source::Message,
             origin: Origin::Peer(id8),
             text,
-            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -4726,8 +4720,9 @@ impl MeshSlot {
         self.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(id8),
-            text: format!("envoy escalated to the human; {summary}"),
-            verbatim: Vec::new(),
+            text: NoticeText::default()
+                .frame("envoy escalated to the human; ")
+                .then(summary),
             model_note: None,
         });
     }
@@ -4984,15 +4979,16 @@ impl MeshSlot {
         let dest8 = short(&record.peer_destination).to_string();
         let (text, note) = match reply_kind {
             HumanReply::Declined => (
-                format!("you declined {dest8}'s question"),
+                NoticeText::from(format!("you declined {dest8}'s question")),
                 "the human declined via `.mesh dismiss`; nothing to do",
             ),
             HumanReply::Answered => {
                 let words = reply.capped_words(PEER_LINE_MAX_CHARS);
-                let mut text = format!("you answered {dest8}: {}", words.text);
+                let mut text = NoticeText::default()
+                    .frame(format!("you answered {dest8}: "))
+                    .peer(words.text);
                 if words.cut {
-                    text.push(' ');
-                    text.push_str(INBOX_FULL_TEXT_POINTER);
+                    text = text.frame(format!(" {INBOX_FULL_TEXT_POINTER}"));
                 }
                 (text, "the human answered via `.mesh answer`; nothing to do")
             }
@@ -5010,7 +5006,6 @@ impl MeshSlot {
             source: Source::Message,
             origin: Origin::Peer(short(&record.peer_identity).to_string()),
             text,
-            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -5156,7 +5151,6 @@ impl MeshSlot {
             source,
             origin: Origin::Peer(id8),
             text,
-            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -5170,7 +5164,7 @@ impl MeshSlot {
     /// event) by `peer:<instance>`, so no peer-chosen text reaches the note. An
     /// escalated reply has no answer to collect yet, so its note points at the inbox
     /// rather than at a `mesh__collect` that would block for its whole timeout.
-    fn file_in_inbox(&self, message: PeerMessage, answered: bool) -> String {
+    fn file_in_inbox(&self, message: PeerMessage, answered: bool) -> NoticeText {
         let text = message.summary_line(self.display_name_of(&message).as_deref());
         let local_id = format!("peer:{}", short(&message.source_destination));
         let (event, id, next_action) = match (answered, message.kind) {
@@ -5359,24 +5353,25 @@ enum RefusalPath {
 
 /// The REPL lines for one refusal of `reason` from `who`, as `note_refusal` folds it:
 /// the rolled-over counts first, then the one line the first refusal of the hour earns.
+/// `who` is the peer's label and is printed as it is.
 fn fold_lines(
     who: &str,
     reason: RefusalReason,
     path: RefusalPath,
     notice: &FoldNotice,
-) -> Vec<String> {
+) -> Vec<NoticeText> {
     let mut lines = fold_report_lines(who, &notice.reports);
     if notice.surface {
-        lines.push(format!(
-            "{who}: {}; further {} refusals from this peer are folded for the hour",
+        lines.push(NoticeText::default().peer(who).frame(format!(
+            ": {}; further {} refusals from this peer are folded for the hour",
             refusal_phrase(reason, path),
             reason.as_str()
-        ));
+        )));
     }
     lines
 }
 
-fn fold_report_lines(who: &str, reports: &[(RefusalReason, u32)]) -> Vec<String> {
+fn fold_report_lines(who: &str, reports: &[(RefusalReason, u32)]) -> Vec<NoticeText> {
     reports
         .iter()
         .map(|(reason, count)| {
@@ -5385,10 +5380,13 @@ fn fold_report_lines(who: &str, reports: &[(RefusalReason, u32)]) -> Vec<String>
             } else {
                 ("s", "were")
             };
-            format!(
-                "{count} more {} refusal{plural} from {who} {verb} folded in the last hour",
-                reason.as_str()
-            )
+            NoticeText::default()
+                .frame(format!(
+                    "{count} more {} refusal{plural} from ",
+                    reason.as_str()
+                ))
+                .peer(who)
+                .frame(format!(" {verb} folded in the last hour"))
         })
         .collect()
 }
@@ -6249,8 +6247,7 @@ mod tests {
     fn idle_note(text: &str) -> IdleNotify {
         IdleNotify {
             source: Source::Message,
-            text: text.to_string(),
-            verbatim: Vec::new(),
+            text: text.into(),
             origin: Origin::Peer("deadbeef".into()),
             model_note: Some(Box::new(
                 crate::supervisor::notification::mesh_notification(
@@ -6275,7 +6272,7 @@ mod tests {
         assert!(slot.push_idle(idle_note("hello")));
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 1);
-        assert_eq!(pushed[0].text, "hello");
+        assert_eq!(pushed[0].text.plain(), "hello");
         assert!(pushed[0].model_note.is_some());
         assert!(notifier.0.lock().is_empty());
     }
@@ -6456,10 +6453,22 @@ mod tests {
             ],
             "only a reply that answers an open question is a reply line"
         );
-        assert_eq!(pushed[0].text, format!("{dest8} says: words of m-1"));
-        assert_eq!(pushed[1].text, format!("{dest8} announces: words of b-1"));
-        assert_eq!(pushed[2].text, format!("{dest8} asks: words of a-1"));
-        assert_eq!(pushed[3].text, format!("{dest8} replies: words of r-1"));
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("{dest8} says: words of m-1")
+        );
+        assert_eq!(
+            pushed[1].text.plain(),
+            format!("{dest8} announces: words of b-1")
+        );
+        assert_eq!(
+            pushed[2].text.plain(),
+            format!("{dest8} asks: words of a-1")
+        );
+        assert_eq!(
+            pushed[3].text.plain(),
+            format!("{dest8} replies: words of r-1")
+        );
         drop(pushed);
         assert_eq!(
             slot.correlations()
@@ -6509,7 +6518,11 @@ mod tests {
         assert_eq!(events, ["peer_bulletin", "peer_reply", "peer_message"]);
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 3);
-        assert!(pushed.iter().all(|note| !note.text.contains("envoy")));
+        assert!(
+            pushed
+                .iter()
+                .all(|note| !note.text.plain().contains("envoy"))
+        );
     }
 
     #[test]
@@ -6755,11 +6768,14 @@ mod tests {
             "the exchange line and the repeat's summary line"
         );
         assert!(
-            pushed[0].text.contains("envoy replied: answered"),
+            pushed[0].text.plain().contains("envoy replied: answered"),
             "{}",
             pushed[0].text
         );
-        assert_eq!(pushed[1].text, format!("{dest8} says: words of m-1"));
+        assert_eq!(
+            pushed[1].text.plain(),
+            format!("{dest8} says: words of m-1")
+        );
     }
 
     #[test]
@@ -7034,9 +7050,12 @@ mod tests {
         assert_eq!(pushed.len(), 2, "the summary line and one busy line");
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         let id8 = &hex_lower(&PEER_IDENTITY)[..8];
-        assert_eq!(pushed[0].text, format!("{dest8} asks: words of a-1"));
         assert_eq!(
-            pushed[1].text,
+            pushed[0].text.plain(),
+            format!("{dest8} asks: words of a-1")
+        );
+        assert_eq!(
+            pushed[1].text.plain(),
             format!(
                 "{id8}: the envoy queue is full, filed in the inbox; further envoy_busy refusals from this peer are folded for the hour"
             )
@@ -7070,9 +7089,9 @@ mod tests {
         let (envelopes, _) = slot.peer_inbox().drain();
         assert_eq!(peer_ids(&envelopes), ["a-0", "a-1", "a-2", "a-3", "a-4"]);
         let pushed = idle.pushed.lock();
-        let folded: Vec<&str> = pushed
+        let folded: Vec<String> = pushed
             .iter()
-            .map(|note| note.text.as_str())
+            .map(|note| note.text.plain())
             .filter(|text| text.contains("already has a message with the envoy"))
             .collect();
         assert_eq!(folded.len(), 1, "{pushed:?}");
@@ -7143,6 +7162,12 @@ mod tests {
 
     #[test]
     fn fold_lines_report_rolled_counts_then_the_first_refusal_of_the_hour() {
+        let fold_lines = |who, reason, path, notice: &FoldNotice| -> Vec<String> {
+            super::fold_lines(who, reason, path, notice)
+                .iter()
+                .map(NoticeText::plain)
+                .collect()
+        };
         let surfaced = FoldNotice {
             surface: true,
             reports: vec![
@@ -7393,7 +7418,7 @@ mod tests {
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 1, "{pushed:?}");
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!(
                 "{a8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
             )
@@ -7474,7 +7499,7 @@ mod tests {
             idle.pushed
                 .lock()
                 .iter()
-                .filter(|note| note.text.contains("over the hourly message limit"))
+                .filter(|note| note.text.plain().contains("over the hourly message limit"))
                 .count(),
             1
         );
@@ -7702,7 +7727,7 @@ mod tests {
             .pushed
             .lock()
             .iter()
-            .map(|note| note.text.clone())
+            .map(|note| note.text.plain())
             .filter(|text| text.contains("hourly message limit"))
             .collect();
         assert_eq!(
@@ -8114,7 +8139,7 @@ mod tests {
         assert_eq!(pushed.len(), 1);
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!("{dest8} asked: words of a-1; envoy replied: the envoy's answer")
         );
         assert_eq!(pushed[0].source, Source::Message);
@@ -8151,7 +8176,7 @@ mod tests {
         // Six words and their spaces are 71 characters; the seventh would run past the
         // half budget, so each side keeps exactly those six and the pointer comes once.
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!(
                 "{} said: {}...; envoy replied: {}... (full text: .mesh inbox)",
                 &hex_lower(&PEER_INSTANCE)[..8],
@@ -8161,7 +8186,7 @@ mod tests {
         );
         assert_eq!(words('q', 6).chars().count(), 71);
         assert!(words('q', 7).chars().count() > half);
-        assert_eq!(pushed[0].text.matches(".mesh inbox").count(), 1);
+        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
     }
 
     #[test]
@@ -8175,7 +8200,7 @@ mod tests {
 
         let pushed = idle.pushed.lock();
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!(
                 "{} asked: words of a-1; envoy replied: {}... (full text: .mesh inbox)",
                 &hex_lower(&PEER_INSTANCE)[..8],
@@ -8409,7 +8434,7 @@ mod tests {
         assert_eq!(pushed.len(), 1, "{pushed:?}");
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!("envoy timed out; {dest8} says: words of m-1 is in the inbox")
         );
     }
@@ -8428,13 +8453,13 @@ mod tests {
         assert_eq!(pushed.len(), 1, "{pushed:?}");
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!(
                 "envoy timed out; {dest8} says: {}... is in the inbox (full text: .mesh inbox)",
                 "q".repeat(PEER_LINE_MAX_CHARS)
             )
         );
-        assert_eq!(pushed[0].text.matches(".mesh inbox").count(), 1);
+        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
     }
 
     #[test]
@@ -8460,7 +8485,7 @@ mod tests {
         assert_eq!(pushed.len(), 1);
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!("envoy escalated to the human; {dest8} asks: words of a-1 is in the inbox")
         );
     }
@@ -8478,13 +8503,13 @@ mod tests {
         let pushed = idle.pushed.lock();
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!(
                 "envoy escalated to the human; {dest8} asks: {}... is in the inbox (full text: .mesh inbox)",
                 "q".repeat(PEER_LINE_MAX_CHARS)
             )
         );
-        assert_eq!(pushed[0].text.matches(".mesh inbox").count(), 1);
+        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
     }
 
     fn inbound_record(id: &str) -> InboundRecord {
@@ -8810,7 +8835,7 @@ mod tests {
             .pushed
             .lock()
             .iter()
-            .map(|note| note.text.clone())
+            .map(|note| note.text.plain())
             .collect();
         assert_eq!(idle_lines, [format!("you declined {dest8}'s question")]);
         assert!(slot.stop().await.unwrap());
@@ -9805,7 +9830,7 @@ mod tests {
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 1);
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!("you answered {dest8}: yes, merge it")
         );
     }
@@ -9831,7 +9856,7 @@ mod tests {
             .join(" ");
         assert_eq!(kept.chars().count(), PEER_LINE_MAX_CHARS - 1);
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!("you answered {dest8}: {kept}... (full text: .mesh inbox)")
         );
     }
@@ -10311,7 +10336,7 @@ mod tests {
         assert_eq!(pushed[0].source, Source::Reply);
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
-            pushed[0].text,
+            pushed[0].text.plain(),
             format!("{dest8} replies: words of r-1"),
             "the asker's notice is the reply's summary line"
         );
@@ -16830,7 +16855,7 @@ mod tests {
             assert_eq!(
                 pushed
                     .iter()
-                    .map(|note| note.text.as_str())
+                    .map(|note| note.text.plain())
                     .collect::<Vec<_>>(),
                 [
                     format!("access request stale-a from {dest8} expired"),
@@ -16901,7 +16926,7 @@ mod tests {
             idle.pushed
                 .lock()
                 .iter()
-                .map(|note| note.text.as_str())
+                .map(|note| note.text.plain())
                 .collect::<Vec<_>>(),
             [format!("question stale-q from {dest8} expired unanswered")]
         );
@@ -17659,7 +17684,7 @@ mod tests {
             idle.pushed
                 .lock()
                 .iter()
-                .map(|note| note.text.as_str())
+                .map(|note| note.text.plain())
                 .collect::<Vec<_>>(),
             [
                 format!("question stale-q from {dest8} expired unanswered"),

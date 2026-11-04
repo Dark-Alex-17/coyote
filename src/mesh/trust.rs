@@ -77,7 +77,7 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knock::KnockSurface;
 use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::node::MeshSlot;
-use crate::mesh::notify::Source;
+use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::peers::{PeerRecord, PeerTable};
 use crate::mesh::request::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
@@ -1700,7 +1700,8 @@ impl TrustStore {
                             &seen_identity,
                             &new_destination,
                             outcome,
-                        ),
+                        )
+                        .into(),
                     );
                     if offered != Offered::Shown {
                         self.inner
@@ -1904,7 +1905,7 @@ impl TrustStore {
         }
     }
 
-    fn offer_line(&self, seen_identity: &str, destination_hash: &str, text: String) -> Offered {
+    fn offer_line(&self, seen_identity: &str, destination_hash: &str, text: NoticeText) -> Offered {
         let Some(surface) = self.surface.lock().as_ref().and_then(Weak::upgrade) else {
             debug!(
                 "Mesh key change on destination {} was not surfaced: nothing is attached",
@@ -1916,7 +1917,6 @@ impl TrustStore {
             source: Source::Mesh,
             origin: Origin::Peer(short(seen_identity).to_string()),
             text,
-            verbatim: Vec::new(),
             model_note: None,
         });
         if shown {
@@ -3383,11 +3383,12 @@ pub(crate) fn decode_name_hash(hex: &str) -> Option<[u8; NAME_HASH_LEN]> {
 /// serves a mark raised by an announce and one raised by a link, knock or stored request,
 /// so it names no path and speaks of what the identity gets when it asks, not of what it
 /// got. Full hashes, because the human pastes them.
+/// The instance is the human's own label when one was set, quoted as they wrote it.
 fn key_change_text(
     change: &MarkedKeyChange,
     new_destination: &str,
     outcome: KeyChangeOutcome,
-) -> String {
+) -> NoticeText {
     let instance = change
         .label
         .clone()
@@ -3399,21 +3400,52 @@ fn key_change_text(
     } else {
         "its grant stays with the old key"
     };
-    match outcome {
-        KeyChangeOutcome::Served => format!(
-            "warning: instance {instance} is bound to identity {bound} but was presented under \
+    let (lead, rest) = match outcome {
+        KeyChangeOutcome::Served => (
+            "warning: instance ",
+            format!(
+                " is bound to identity {bound} but was presented under \
              identity {seen}, which is trusted for all destinations and is served while it \
              asks; the record is marked and {standing}. If the peer rotated, confirm with its \
              holder out of band and run .mesh trust {new_destination} to clear the mark; \
              otherwise .mesh block --identity {seen}"
+            ),
         ),
-        KeyChangeOutcome::Refused => format!(
-            "error: instance {instance} is bound to identity {bound} but was presented under \
+        KeyChangeOutcome::Refused => (
+            "error: instance ",
+            format!(
+                " is bound to identity {bound} but was presented under \
              identity {seen} and is refused when it asks; {standing} and the new key is a \
              stranger. Confirm with the identity's holder out of band before granting anything: \
              if the peer rotated, run .mesh trust {new_destination} to trust the new key and \
              clear the mark; otherwise .mesh block --identity {seen} silences it"
+            ),
         ),
+    };
+    NoticeText::default().frame(lead).peer(instance).frame(rest)
+}
+
+#[cfg(test)]
+mod key_change_prefix_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+
+    #[test]
+    fn the_humans_label_keeps_its_dot_while_the_hints_slash() {
+        let change = MarkedKeyChange {
+            destination_hash: "ab".repeat(16),
+            bound_identity: "cd".repeat(16),
+            seen_identity: "ef".repeat(16),
+            label: Some(".info".to_string()),
+            denied: false,
+        };
+        for outcome in [KeyChangeOutcome::Served, KeyChangeOutcome::Refused] {
+            let text =
+                key_change_text(&change, &"12".repeat(16), outcome).render(CommandPrefix::Slash);
+            assert!(text.contains("instance .info is bound"), "{text}");
+            assert!(text.contains("run /mesh trust "), "{text}");
+            assert!(!text.contains("/info"), "{text}");
+        }
     }
 }
 

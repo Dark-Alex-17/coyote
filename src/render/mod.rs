@@ -7,7 +7,10 @@ pub use inquire::prompt_theme;
 pub use self::markdown::{MarkdownRender, RenderOptions};
 use self::stream::{markdown_stream, raw_stream};
 
-use crate::utils::{AbortSignal, IS_STDOUT_TERMINAL, pretty_error, stderr_error_text};
+use crate::mesh::notify::NoticeText;
+use crate::utils::{
+    AbortSignal, IS_STDOUT_TERMINAL, pretty_error, pretty_error_with, stderr_error_text,
+};
 use crate::{
     client::SseEvent,
     config::{AppConfig, CommandPrefix},
@@ -64,11 +67,21 @@ pub fn render_command_error(err: anyhow::Error, prefix: CommandPrefix) {
 }
 
 pub(crate) fn command_error_text(err: &anyhow::Error, prefix: CommandPrefix) -> String {
-    let text = pretty_error(err);
     if err.downcast_ref::<MeshVerbError>().is_none() {
-        return text;
+        return pretty_error(err);
     }
-    prefix.render_hints(&text).into_owned()
+    pretty_error_with(err, |link| match quoted_text(link) {
+        Some(text) => text.render(prefix),
+        None => prefix.render_hints(&link.to_string()).into_owned(),
+    })
+}
+
+fn quoted_text<'a>(link: &'a (dyn std::error::Error + 'static)) -> Option<&'a NoticeText> {
+    if let Some(verb) = link.downcast_ref::<MeshVerbError>() {
+        return quoted_text(verb.0.as_ref());
+    }
+    link.downcast_ref::<QuotingError>()
+        .map(|quoting| &quoting.0)
 }
 
 /// Marks an error the `.mesh` verb raised. Display and source pass straight through, so
@@ -93,6 +106,27 @@ impl std::error::Error for MeshVerbError {
         self.0.chain().nth(1)
     }
 }
+
+/// A `.mesh` error that quotes text this node did not write: a path a peer named, a
+/// share rule's pattern, or a share file's own words. Only its frame runs are spelled
+/// in the prefix, so a quoted `.vault` keeps its dot while the hints beside it follow
+/// the prefix.
+#[derive(Debug)]
+pub(crate) struct QuotingError(NoticeText);
+
+impl QuotingError {
+    pub(crate) fn wrap(text: NoticeText) -> anyhow::Error {
+        anyhow::Error::new(Self(text))
+    }
+}
+
+impl fmt::Display for QuotingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for QuotingError {}
 
 #[cfg(test)]
 mod tests {
@@ -121,6 +155,41 @@ mod tests {
                     "{prefix}"
                 );
             }
+        }
+
+        fn quoting() -> anyhow::Error {
+            QuotingError::wrap(
+                NoticeText::default()
+                    .frame("No share rule has the pattern `")
+                    .peer(".vault")
+                    .frame("`; `.mesh shares` lists them."),
+            )
+        }
+
+        #[test]
+        fn a_quoting_error_raised_bare_keeps_its_quote_and_slashes_its_hint() {
+            let text = command_error_text(&MeshVerbError::wrap(quoting()), CommandPrefix::Slash);
+            assert!(
+                text.ends_with(
+                    "No share rule has the pattern `.vault`; `/mesh shares` lists them."
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("/vault"), "{text}");
+        }
+
+        #[test]
+        fn a_quoting_error_under_context_keeps_its_quote_and_slashes_both_hints() {
+            let err = MeshVerbError::wrap(quoting().context("`.mesh unshare` failed"));
+            let text = command_error_text(&err, CommandPrefix::Slash);
+            assert!(text.starts_with("Error: `/mesh unshare` failed"), "{text}");
+            assert!(
+                text.ends_with(
+                    "No share rule has the pattern `.vault`; `/mesh shares` lists them."
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("/vault"), "{text}");
         }
 
         #[test]

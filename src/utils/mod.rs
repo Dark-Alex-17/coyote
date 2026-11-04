@@ -220,14 +220,23 @@ where
 }
 
 pub fn pretty_error(err: &anyhow::Error) -> String {
+    pretty_error_with(err, |link| link.to_string())
+}
+
+/// `pretty_error` with each link of the chain spelled by `show`.
+pub fn pretty_error_with(
+    err: &anyhow::Error,
+    show: impl Fn(&(dyn std::error::Error + 'static)) -> String,
+) -> String {
     let mut output = vec![];
-    output.push(format!("Error: {err}"));
-    let causes: Vec<_> = err.chain().skip(1).collect();
+    let mut links = err.chain().map(show);
+    output.push(format!("Error: {}", links.next().unwrap_or_default()));
+    let causes: Vec<_> = links.collect();
     let causes_len = causes.len();
     if causes_len > 0 {
         output.push("\nCaused by:".to_string());
         if causes_len == 1 {
-            output.push(format!("    {}", indent_text(causes[0], 4).trim()));
+            output.push(format!("    {}", indent_text(&causes[0], 4).trim()));
         } else {
             for (i, cause) in causes.into_iter().enumerate() {
                 output.push(format!("{i:5}: {}", indent_text(cause, 7).trim()));

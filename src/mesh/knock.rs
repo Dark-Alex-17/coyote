@@ -13,7 +13,7 @@ use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockCach
 use crate::mesh::message::{
     KNOCKS_FULL_TEXT_POINTER, KNOCKS_NOT_KEPT_NOTE, PEER_LINE_MAX_CHARS, propagation_remedy,
 };
-use crate::mesh::notify::Source;
+use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
@@ -662,7 +662,6 @@ impl KnockGate {
             source: Source::Knock,
             origin: Origin::Peer(id8.to_string()),
             text: knock_text(&knock, display_name.as_deref(), cached),
-            verbatim: Vec::new(),
             model_note: None,
         });
         if !shown {
@@ -813,30 +812,76 @@ impl KnockGate {
 /// text cannot close its own quotes and pose as the frame. An intro longer than a peer
 /// line is cut on a word, and `(full text: .mesh knocks)` follows the closing quote; when
 /// the cache refused the knock, `.mesh knocks` has nothing to show, so the quote is
-/// followed by a note that the rest is gone instead.
-fn knock_text(knock: &InboundKnock, display_name: Option<&str>, cached: bool) -> String {
-    let who = display_name.map_or_else(
-        || "A peer".to_string(),
-        |name| format!("\"{}\"", name.replace('"', "'")),
-    );
-    let intro = knock
+/// followed by a note that the rest is gone instead. The name and the intro are peer
+/// runs, printed as the peer wrote them.
+fn knock_text(knock: &InboundKnock, display_name: Option<&str>, cached: bool) -> NoticeText {
+    let mut text = match display_name {
+        Some(name) => NoticeText::default()
+            .frame("\"")
+            .peer(name.replace('"', "'"))
+            .frame("\""),
+        None => NoticeText::from("A peer"),
+    };
+    text = text.frame(format!(
+        " (identity {identity}) knocks from instance {destination}",
+        identity = knock.identity_hash,
+        destination = knock.destination_hash,
+    ));
+    if let Some(intro) = knock
         .intro
         .as_deref()
         .and_then(|intro| capped_peer_text(intro, PEER_LINE_MAX_CHARS))
-        .map(|intro| {
-            let pointer = match (intro.cut, cached) {
-                (false, _) => String::new(),
-                (true, true) => format!(" {KNOCKS_FULL_TEXT_POINTER}"),
-                (true, false) => format!(" {KNOCKS_NOT_KEPT_NOTE}"),
-            };
-            format!(": \"{}\"{pointer}", intro.text.replace('"', "'"))
-        })
-        .unwrap_or_default();
-    format!(
-        "{who} (identity {identity}) knocks from instance {destination}{intro}\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}",
+    {
+        let pointer = match (intro.cut, cached) {
+            (false, _) => String::new(),
+            (true, true) => format!(" {KNOCKS_FULL_TEXT_POINTER}"),
+            (true, false) => format!(" {KNOCKS_NOT_KEPT_NOTE}"),
+        };
+        text = text
+            .frame(": \"")
+            .peer(intro.text.replace('"', "'"))
+            .frame(format!("\"{pointer}"));
+    }
+    text.frame(format!(
+        "\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}",
         identity = knock.identity_hash,
         destination = knock.destination_hash,
-    )
+    ))
+}
+
+#[cfg(test)]
+mod peer_text_prefix_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::mesh::notify::{Notification, Source};
+
+    #[test]
+    fn the_peer_name_and_intro_keep_their_bytes_while_the_hints_follow_the_prefix() {
+        let identity = "cd".repeat(16);
+        let destination = "ab".repeat(16);
+        let knock = InboundKnock {
+            identity_hash: identity.clone(),
+            destination_hash: destination.clone(),
+            name_hash: "ef".repeat(16),
+            via: KnockVia::Direct,
+            intro: Some(".mesh trust x".to_string()),
+        };
+        let text = knock_text(&knock, Some(".info"), true);
+        let lines = Notification::new(Source::Knock, text)
+            .render()
+            .render_notification_lines(CommandPrefix::Slash);
+        assert_eq!(
+            lines,
+            [
+                format!(
+                    "[mesh:knock] \".info\" (identity {identity}) knocks from instance {destination}: \".mesh trust x\""
+                ),
+                format!(
+                    "[mesh:knock] trust: /mesh trust {destination} | who: /mesh info {destination} | silence: /mesh block --identity {identity}"
+                ),
+            ]
+        );
+    }
 }
 
 /// Feeds the dispatcher's knocks to the gate until the node stops. `admit` rewrites the
@@ -933,7 +978,7 @@ impl RecordingSurface {
         self.notes
             .lock()
             .iter()
-            .map(|note| note.text.clone())
+            .map(|note| note.text.plain())
             .collect()
     }
 }
@@ -1321,7 +1366,7 @@ mod tests {
             notes[0].model_note.is_none(),
             "knocks are for the human only"
         );
-        let text = &notes[0].text;
+        let text = notes[0].text.plain();
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!(lines.len(), 2, "{text}");
         assert_eq!(
@@ -3318,14 +3363,15 @@ mod tests {
         );
         let dest = hash_of("inst-bare");
         assert_eq!(
-            notes[0].text,
+            notes[0].text.plain(),
             format!(
                 "A peer (identity {identity}) knocks from instance {dest}\n\
                  trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"
             )
         );
-        assert!(!notes[0].text.contains('"'), "no quote without words");
-        assert!(!notes[0].text.to_ascii_lowercase().contains("deny"));
+        let text = notes[0].text.plain();
+        assert!(!text.contains('"'), "no quote without words");
+        assert!(!text.to_ascii_lowercase().contains("deny"));
         drop(notes);
         assert_eq!(rig.cached()[0].display_name, None);
         assert_eq!(rig.cached()[0].intro, None);

@@ -4,14 +4,17 @@ pub(crate) mod idle;
 pub(crate) mod mesh;
 #[cfg(test)]
 pub(crate) mod mesh_share_vectors;
-pub(crate) mod printer;
+mod printer;
 mod prompt;
 mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::idle::IdleDriver;
+#[cfg(not(test))]
 use self::printer::PromptPrinter;
+#[cfg(test)]
+pub(crate) use self::printer::{PROMPT_PRINTER_CAPACITY, PromptPrinter};
 use self::prompt::ReplPrompt;
 
 use crate::client::{
@@ -843,7 +846,7 @@ impl Repl {
         // Cloned so the context guard is not held across the await.
         let mesh = Arc::clone(&self.ctx.read().app.mesh);
         if let Err(err) = mesh.stop().await {
-            render_error(err);
+            render_command_error(MeshVerbError::wrap(err), self.command_prefix());
         }
         // After the node's own `mesh.stopped`, so nothing left in the slot can run hooks
         // against a session on its way out.
@@ -955,6 +958,26 @@ impl Repl {
     fn create_menu() -> ReedlineMenu {
         let completion_menu = ColumnarMenu::default().with_name(MENU_NAME);
         ReedlineMenu::EngineCompleter(Box::new(completion_menu))
+    }
+}
+
+#[cfg(test)]
+mod exit_stop_error_tests {
+    /// The node's stop on the way out is a `.mesh` error like autostart's: its hints
+    /// follow the prefix the human typed in.
+    #[test]
+    fn the_exit_time_stop_error_renders_as_a_mesh_verb_error() {
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let surfaced = strip(
+            &[
+                "if let Err(err) = mesh.",
+                "stop().await { render_command_",
+                "error(MeshVerbError::wrap(err), self.command_prefix()); }",
+            ]
+            .concat(),
+        );
+        assert_eq!(source.matches(&surfaced).count(), 1);
     }
 }
 

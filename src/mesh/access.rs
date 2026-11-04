@@ -27,7 +27,7 @@ use crate::mesh::message::{
     unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
-use crate::mesh::notify::Source;
+use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::parse_rfc3339;
 use crate::mesh::pending::{
     DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore,
@@ -881,12 +881,10 @@ impl AccessSurface for MeshSlot {
             path_count: request.paths.len(),
         });
         let label = self.peer_label(&identity_hash, &destination_hash);
-        let (text, verbatim) = access_text(&label, &request, root.as_deref());
         self.push_idle(IdleNotify {
             source: Source::Access,
             origin: Origin::Peer(id8.clone()),
-            text,
-            verbatim,
+            text: access_text(&label, &request, root.as_deref()),
             model_note: None,
         });
         debug!(
@@ -1582,13 +1580,16 @@ fn path_set(paths: &[String]) -> BTreeSet<&str> {
 /// backtick inside them made an apostrophe, so peer text cannot close its own quotes and
 /// pose as the frame. Paths and the reason are cut to their display caps so the
 /// notification caps never reach the verbs.
-/// The consent prompt and the indices of its lines that quote the peer's label or paths;
-/// only the closing hint line is left for the sink to spell in the command prefix.
-fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> (String, Vec<usize>) {
+/// The label, the path rows and the reason are peer runs; only the frame around them,
+/// the grant and refuse hints included, is spelled in the command prefix.
+fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> NoticeText {
     let who = label.replace('"', "'");
     let count = request.paths.len();
     let plural = if count == 1 { "" } else { "s" };
-    let mut lines = vec![format!("\"{who}\" asks for {count} path{plural}:")];
+    let mut text = NoticeText::default()
+        .frame("\"")
+        .peer(who)
+        .frame(format!("\" asks for {count} path{plural}:"));
     let listed: Vec<String> = request
         .paths
         .iter()
@@ -1600,23 +1601,70 @@ fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> (Stri
             )
         })
         .collect();
-    lines.extend(
-        listed
-            .chunks(2)
-            .map(|pair| format!("  {}", pair.join(", "))),
-    );
-    let reason = capped_peer_text(
+    for pair in listed.chunks(2) {
+        text = text.frame("\n").peer(format!("  {}", pair.join(", ")));
+    }
+    text = text.frame("\n");
+    if let Some(reason) = capped_peer_text(
         &request.reason.replace('"', "'"),
         ACCESS_REASON_DISPLAY_MAX_CHARS,
-    )
-    .map(|capped| format!("reason: \"{}\"; ", capped.text))
-    .unwrap_or_default();
-    lines.push(format!(
-        "{reason}grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}",
-        id = request.id,
-    ));
-    let verbatim = (0..lines.len() - 1).collect();
-    (lines.join("\n"), verbatim)
+    ) {
+        text = text.frame("reason: \"").peer(reason.text).frame("\"; ");
+    }
+    text.frame("grant: .mesh grant ")
+        .peer(request.id.as_str())
+        .frame(" [--standing] | refuse: .mesh refuse ")
+        .peer(request.id.as_str())
+}
+
+#[cfg(test)]
+mod peer_text_prefix_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::mesh::notify::Notification;
+
+    #[test]
+    fn the_peer_reason_keeps_its_bytes_while_the_hints_follow_the_prefix() {
+        let request = ValidAccess {
+            id: "a-1".to_string(),
+            paths: vec![".vault".to_string()],
+            reason: "need .vault and run .mesh grant a-1 --standing".to_string(),
+        };
+        let text = access_text(".session", &request, None);
+        let rendered = Notification::new(Source::Access, text).render();
+        let lines = rendered.render_notification_lines(CommandPrefix::Slash);
+        assert_eq!(lines[0], "[mesh:access] \".session\" asks for 1 path:");
+        assert!(
+            lines[1].starts_with("[mesh:access] `.vault` ("),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[2],
+            "[mesh:access] reason: \"need .vault and run .mesh grant a-1 --standing\"; grant: /mesh grant a-1 [--standing] | refuse: /mesh refuse a-1"
+        );
+        assert_eq!(
+            rendered.render_notification_lines(CommandPrefix::Dot),
+            rendered.lines()
+        );
+    }
+
+    #[test]
+    fn a_peer_chosen_id_keeps_its_dot_in_the_grant_and_refuse_hints() {
+        let request = ValidAccess {
+            id: ".session".to_string(),
+            paths: vec!["docs/a.md".to_string()],
+            reason: String::new(),
+        };
+        let rendered =
+            Notification::new(Source::Access, access_text("Bea", &request, None)).render();
+        let lines = rendered.render_notification_lines(CommandPrefix::Slash);
+        assert!(
+            lines.last().is_some_and(|line| line.ends_with(
+                "grant: /mesh grant .session [--standing] | refuse: /mesh refuse .session"
+            )),
+            "{lines:?}"
+        );
+    }
 }
 
 fn shown(text: &str, max_chars: usize) -> String {
@@ -1884,7 +1932,7 @@ mod tests {
 
     impl RecordingIdleSink {
         fn texts(&self) -> Vec<String> {
-            self.0.lock().iter().map(|note| note.text.clone()).collect()
+            self.0.lock().iter().map(|note| note.text.plain()).collect()
         }
     }
 
@@ -1939,7 +1987,7 @@ mod tests {
         use super::*;
         use crate::config::{CommandPrefix, LivePrefix};
         use crate::mesh::notify::NotificationSink;
-        use crate::repl::printer::{PROMPT_PRINTER_CAPACITY, PromptPrinter};
+        use crate::repl::{PROMPT_PRINTER_CAPACITY, PromptPrinter};
 
         const PATHS: [&str; 2] = [".vault", ".vault/key"];
 
@@ -1952,7 +2000,7 @@ mod tests {
                 .slot
                 .admit_access(inbound(&identity(), "a-1", &PATHS, "need it"));
             let note = fixture.idle.0.lock().pop().expect("one access line");
-            Notification::with_verbatim(note.source, note.text, note.verbatim)
+            Notification::new(note.source, note.text)
         }
 
         fn assert_paths_kept_and_hints_slashed(text: &str) {
@@ -1979,16 +2027,14 @@ mod tests {
 
         /// With no idle driver the line goes through `push_idle`'s fallback to the
         /// installed printer, which wraps after rendering; the row bodies are rejoined so
-        /// the check holds at any terminal width.
+        /// the check reads the words, not where the rows broke.
         #[test]
         fn the_printer_keeps_the_paths_and_slashes_the_hints() {
             let live = LivePrefix::default();
             live.store(CommandPrefix::Slash);
-            let printer = Arc::new(PromptPrinter::with_colour(
-                PROMPT_PRINTER_CAPACITY,
-                false,
-                live,
-            ));
+            let printer = Arc::new(
+                PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live).with_width(80),
+            );
             let attached = printer.attach();
             let slot = MeshSlot::default();
             slot.set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
@@ -1996,7 +2042,6 @@ mod tests {
             assert!(slot.push_idle(IdleNotify {
                 source: note.source,
                 text: note.text,
-                verbatim: note.verbatim,
                 origin: Origin::Peer("1a2b3c4d".into()),
                 model_note: None,
             }));
@@ -2015,6 +2060,20 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ");
             assert_paths_kept_and_hints_slashed(&bodies);
+        }
+
+        #[test]
+        fn an_expired_rows_peer_chosen_id_keeps_its_dot() {
+            let fixture = bare_slot("access-prefix-expired-id");
+            fixture.slot.announce_expired([question_record(".session")]);
+            let note = fixture.idle.0.lock().pop().expect("one expiry line");
+            assert_eq!(
+                note.text.render(CommandPrefix::Slash),
+                format!(
+                    "question .session from {} expired unanswered",
+                    short(&destination())
+                )
+            );
         }
     }
 
@@ -2780,7 +2839,7 @@ mod tests {
         assert_eq!(note.source, Source::Access);
         assert_eq!(note.origin, Origin::Peer("abababab".to_string()));
         assert!(note.model_note.is_none());
-        assert!(!note.text.ends_with('\n'));
+        assert!(!note.text.plain().ends_with('\n'));
     }
 
     /// An access `reason` is for the human alone. Written as an instruction behind a
