@@ -3635,6 +3635,8 @@ mod tests {
         const REPL_PAINTER: &str =
             "polled by the spinner and the REPL stream painter, both replaced under the TUI";
         const NULL_STDIN: &str = "a unit test; the child it waits on has stdin at /dev/null";
+        const LOADER_STDIN_CLOSED: &str =
+            "a document loader; its child runs with stdin at /dev/null on every path";
         let allowlist: &[(&str, &str, &str)] = &[
             (
                 "src/client/common.rs",
@@ -3721,6 +3723,11 @@ mod tests {
                 "a_signal_killed_loader_is_not_a_success",
                 NULL_STDIN,
             ),
+            (
+                "src/utils/command.rs",
+                "run_loader_command",
+                LOADER_STDIN_CLOSED,
+            ),
             ("src/vault/mod.rs", "add_secret", PROMPT_GATED),
             ("src/vault/mod.rs", "update_secret", PROMPT_GATED),
             (
@@ -3800,9 +3807,15 @@ mod tests {
                 .iter()
                 .any(|r| r.file == "src/utils/command.rs" && r.function == "edit_file" && r.gated)
         );
-        assert!(readers.iter().any(|r| r.file == "src/utils/command.rs"
-            && r.function == "run_loader_command"
-            && r.gated));
+        // The loader never reads the terminal: both of its branches hand
+        // the child /dev/null, so the source says `Stdio::null()` for every
+        // spawn it makes and never `Stdio::inherit()`.
+        let loader = fn_body(
+            include_str!("../utils/command.rs"),
+            "pub async fn run_loader_command",
+        );
+        assert!(!loader.contains("Stdio::inherit()"), "{loader}");
+        assert_eq!(loader.matches("Stdio::null()").count(), 2, "{loader}");
     }
 
     /// The two stdin readers outside this module stand down while the UI
