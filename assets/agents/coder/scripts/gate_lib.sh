@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Helpers for the coder's baseline_tests, verify_build and verify_tests gates.
-# Sourced after .shared/utils.sh, never run on its own.
+# Helpers for the coder's baseline_tests, verify_build, verify_tests and
+# fix_loop_gate scripts; sourced, never run on its own. gate_workdir,
+# gate_test_command and run_gate_until call functions from .shared/utils.sh,
+# so a script using them sources that file first. The rest, GATE_JQ_CAP
+# included, do not: fix_loop_gate sources this file without utils.sh.
 
 # gate_posix_path prints `path` in the form bash's own file tests and dirname
 # read. A Windows drive path (C:\x or C:/x), which is what a Git Bash script
@@ -102,13 +105,14 @@ gate_test_command() {
 }
 
 # gate_test_command_for_run prints test command `cmd` as the gates run it:
-# every `cargo test` (or `cargo +toolchain test`) lacking --no-fail-fast gets
-# it right after `test`. Without it cargo stops at the first failing target,
-# so the failures of later targets never show and cannot be compared with the
-# baseline. Other commands are printed unchanged.
+# every `cargo test` or `cargo t` (also after `+toolchain`) lacking
+# --no-fail-fast gets it right after the subcommand. Without it cargo stops
+# at the first failing target, so the failures of later targets never show
+# and cannot be compared with the baseline. Other commands are printed
+# unchanged.
 gate_test_command_for_run() {
   local rest=$1 out='' match after seg end_re="^[[:space:];&|)'\"]"
-  local re="(^|[[:space:];&|('\"])cargo([[:space:]]+\\+[^[:space:];&|]+)?[[:space:]]+test"
+  local re="(^|[[:space:];&|('\"])cargo([[:space:]]+\\+[^[:space:];&|]+)?[[:space:]]+t(est)?"
   while [[ "$rest" =~ $re ]]; do
     match=${BASH_REMATCH[0]}
     out+=${rest%%"$match"*}$match
@@ -140,6 +144,17 @@ gate_plain_text() {
 # failures it printed are not the whole story.
 gate_killed_by_signal() {
   gate_plain_text "$1" | LC_ALL=C grep -qE "process didn't exit successfully: .*\(signal: [0-9]+"
+}
+
+# gate_cargo_stopped_early succeeds when test output file `file` shows cargo
+# stopping at its first failing target: a rerun hint with no closing
+# `N targets failed:` summary, which only --no-fail-fast prints. The later
+# targets never ran, so the failures shown are not the whole story.
+gate_cargo_stopped_early() {
+  local text
+  text=$(gate_plain_text "$1")
+  LC_ALL=C grep -q '^error: test failed, to rerun pass' <<<"$text" &&
+    ! LC_ALL=C grep -qE '^error: [0-9]+ targets? failed:' <<<"$text"
 }
 
 # gate_scan_tests reads test output file `file` for the unittest, pytest,
@@ -285,9 +300,11 @@ gate_scan_tests() {
 
 # gate_failing_tests prints the sorted unique ids of the failing tests named
 # in test output file `file`, one per line, or nothing when they cannot all
-# be identified (see gate_scan_tests) or a test target died of a signal.
+# be identified (see gate_scan_tests), a test target died of a signal, or
+# cargo stopped at the first failing target.
 gate_failing_tests() {
   gate_killed_by_signal "$1" && return 0
+  gate_cargo_stopped_early "$1" && return 0
   gate_scan_tests failing "$1"
 }
 
@@ -302,6 +319,10 @@ gate_passing_tests() {
 gate_unidentified_reason() {
   if gate_killed_by_signal "$1"; then
     printf '%s\n' "a test target was killed by a signal"
+    return 0
+  fi
+  if gate_cargo_stopped_early "$1"; then
+    printf '%s\n' "cargo stopped at the first failing target"
     return 0
   fi
   gate_scan_tests reason "$1"

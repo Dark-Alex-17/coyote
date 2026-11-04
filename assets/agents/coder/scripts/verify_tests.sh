@@ -126,10 +126,12 @@ trim_output "$output" | jq -Rsc \
           "_next": "self_review"
         }
     else
-      (if $signal then "\nA test target was killed by a signal, so its remaining tests never ran; this run cannot pass against the baseline." else "" end) as $crash
+      (if $signal and $red then "\nA test target was killed by a signal, so its remaining tests never ran; this run cannot pass against the baseline." else "" end) as $crash
       | (if $red | not then ""
        else "\nBaseline exit code: \($base_rc) (the suite already failed before this run)"
-         + (if ($cur | length) > 0 then
+         + (if ($cur | length) > 0 and ($base | length) == 0 then
+              "\nFailing tests (the baseline'"'"'s failures could not be identified, so none can be compared): " + ($cur | gate_cap(", "))
+            elif ($cur | length) > 0 then
               (($cur - $base) | if length > 0 then "\nNew failures: " + gate_cap(", ") else "" end)
               + (($cur - ($cur - $base)) | if length > 0 then "\nPre-existing failures: " + gate_cap(", ") else "" end)
             else "\nNo failing test could be identified in this output (\(env.GATE_REASON)), so none can be matched to the baseline."

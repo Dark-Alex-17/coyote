@@ -104,7 +104,7 @@ initial_state:
   baseline_exit_code: 0
   baseline_failures: []
   baseline_failure_hash: ''
-  baseline_note: ''
+  baseline_note: No baseline was recorded.
   baseline_report: ''
 
 start: resolve_paths
