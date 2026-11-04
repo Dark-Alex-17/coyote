@@ -11453,7 +11453,8 @@ mod tests {
 
     /// A trusted peer the table knows but nothing on the network can route to: the send
     /// asks for a path once, waits out `PATH_REQUEST_TIMEOUT` and no longer, and the
-    /// refusal says so in plain words with the number the constant renders.
+    /// refusal says so in plain words with the number the constant renders. The peer
+    /// announced just now, so the refusal adds that it may have left the mesh.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_destination_is_refused_within_the_path_request_timeout_with_the_new_wording()
@@ -11489,6 +11490,7 @@ mod tests {
             err,
             SendError::UnknownDestination {
                 destination: destination.clone(),
+                recently_seen: true,
             }
         );
         assert!(
@@ -11499,7 +11501,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
             )
         );
         slot.stop().await.unwrap();

@@ -14,7 +14,7 @@ use crate::mesh::fetch::{
 };
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, SendError,
-    collect_next_action, unreachable_head,
+    collect_next_action, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::pending::{
     DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord,
@@ -607,16 +607,17 @@ async fn resolved_destination(
 ) -> Result<DestinationDesc, Value> {
     match runtime.resolve_destination(destination).await {
         Some(desc) => Ok(desc),
-        None => Err(unreachable_live(destination)),
+        None => Err(unreachable_live(runtime, destination)),
     }
 }
 
-fn unreachable_live(destination: &str) -> Value {
+fn unreachable_live(runtime: &MeshRuntime, destination: &str) -> Value {
+    let hint = left_mesh_hint(runtime.peers().get(destination).as_ref(), SystemTime::now());
     json!({
         "status": "error",
         "kind": "unknown_destination",
         "message": format!(
-            "{} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            "{}{hint} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
             unreachable_head(destination)
         ),
     })
@@ -1664,7 +1665,9 @@ fn access_error_kind(err: &AccessError) -> &'static str {
     match err {
         AccessError::NotRunning => "not_running",
         AccessError::Untrusted => "not_trusted",
-        AccessError::UnknownDestination | AccessError::Unheard { .. } => "unknown_destination",
+        AccessError::UnknownDestination { .. } | AccessError::Unheard { .. } => {
+            "unknown_destination"
+        }
         AccessError::Invalid(_) => "invalid",
         AccessError::NotFiled(_) => "not_filed",
         AccessError::Refused(_)
@@ -3677,12 +3680,15 @@ mod tests {
         assert!(message.contains("1..=1"), "{message}");
         assert_eq!(access_error_kind(&AccessError::Untrusted), "not_trusted");
         assert_eq!(
-            access_error_kind(&AccessError::UnknownDestination),
+            access_error_kind(&AccessError::UnknownDestination {
+                recently_seen: false
+            }),
             "unknown_destination"
         );
         assert_eq!(
             send_error(&SendError::UnknownDestination {
-                destination: "ab".repeat(16)
+                destination: "ab".repeat(16),
+                recently_seen: false,
             })["kind"],
             "unknown_destination"
         );
@@ -7044,7 +7050,7 @@ mod tests {
             assert_eq!(
                 result["message"],
                 format!(
-                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard."
+                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard."
                 ),
                 "{result}"
             );

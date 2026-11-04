@@ -1352,6 +1352,7 @@ pub(crate) enum SendError {
     /// peer whose key is known, and a key arrives only with the peer's announce.
     UnknownDestination {
         destination: String,
+        recently_seen: bool,
     },
     /// Unheard, but the trust list could allow it, so the network was asked for it and
     /// no row was filed. Nothing is queued, as for `UnknownDestination`.
@@ -1412,10 +1413,14 @@ impl fmt::Display for SendError {
                 f,
                 "Destination {destination} is not trusted for messaging. Trust it first with `.mesh trust {destination}`; `.mesh peers` lists what this Coyote has heard from."
             ),
-            Self::UnknownDestination { destination } => write!(
+            Self::UnknownDestination {
+                destination,
+                recently_seen,
+            } => write!(
                 f,
-                "{} Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard.",
-                unreachable_head(destination)
+                "{}{} Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard.",
+                unreachable_head(destination),
+                left_mesh_hint_when(*recently_seen)
             ),
             Self::Unheard { destination, miss } => write!(f, "{}", miss.refusal(destination)),
             Self::NotRunning => write!(
@@ -1789,6 +1794,7 @@ impl MeshRuntime {
             .await
             .ok_or_else(|| SendError::UnknownDestination {
                 destination: destination.clone(),
+                recently_seen: !peer.is_stale(SystemTime::now()),
             })?;
         let dest8 = short(&destination);
         let (kind, id) = (message.kind, message.id.as_str());
@@ -2139,6 +2145,87 @@ impl MeshRuntime {
 /// could not route to; each surface adds what, if anything, was queued for it.
 pub(crate) fn unreachable_head(destination: &str) -> String {
     format!("Destination {destination} {}", unreachable_cause())
+}
+
+/// The sentence a "no answer" refusal adds after `unreachable_head` or `unreachable_cause`
+/// when the peer announced recently: a session that exits sends no goodbye, so a peer heard
+/// within `PEER_STALE_AFTER` that no longer answers has most likely gone. Empty for a stale
+/// row or none, where the silence says nothing new.
+pub(crate) fn left_mesh_hint(peer: Option<&PeerRecord>, now: SystemTime) -> &'static str {
+    left_mesh_hint_when(peer.is_some_and(|peer| !peer.is_stale(now)))
+}
+
+/// `left_mesh_hint` for an error that kept only whether the peer was recently seen.
+pub(crate) fn left_mesh_hint_when(recently_seen: bool) -> &'static str {
+    if recently_seen {
+        " It may have left the mesh; a session that exits says nothing."
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod left_mesh_hint_tests {
+    use super::*;
+    use crate::mesh::peers::PEER_STALE_AFTER;
+    use crate::mesh::protocol::Compatibility;
+
+    fn seen(ago: Duration, now: SystemTime) -> PeerRecord {
+        PeerRecord {
+            destination_hash: "ab".repeat(16),
+            identity_hash: "cd".repeat(16),
+            name_hash: String::new(),
+            public_key: None,
+            display_name: None,
+            protocol_version: 1,
+            compatibility: Compatibility::Compatible,
+            hops: 1,
+            first_seen: now - ago,
+            last_seen: now - ago,
+        }
+    }
+
+    #[test]
+    fn a_peer_heard_within_the_stale_window_may_have_left_the_mesh() {
+        let now = SystemTime::now();
+        let recent = seen(PEER_STALE_AFTER - Duration::from_secs(1), now);
+        assert_eq!(
+            left_mesh_hint(Some(&recent), now),
+            " It may have left the mesh; a session that exits says nothing."
+        );
+    }
+
+    #[test]
+    fn a_stale_or_unknown_peer_gets_no_extra_sentence() {
+        let now = SystemTime::now();
+        let stale = seen(PEER_STALE_AFTER, now);
+        assert_eq!(left_mesh_hint(Some(&stale), now), "");
+        assert_eq!(left_mesh_hint(None, now), "");
+    }
+
+    /// `.mesh message` and `mesh__send` refuse an unroutable peer with `UnknownDestination`,
+    /// which carries the same sentence when the peer was recently seen and none otherwise.
+    #[test]
+    fn the_message_refusal_adds_the_sentence_only_for_a_recent_peer() {
+        let refusal = |recently_seen| {
+            SendError::UnknownDestination {
+                destination: "ab".repeat(16),
+                recently_seen,
+            }
+            .to_string()
+        };
+        let recent = refusal(true);
+        assert!(
+            recent.contains("cannot reach. It may have left the mesh; a session that exits says nothing. Nothing was queued"),
+            "{recent}"
+        );
+        let stale = refusal(false);
+        assert!(!stale.contains("left the mesh"), "{stale}");
+        assert!(
+            stale.contains("cannot reach. Nothing was queued"),
+            "{stale}"
+        );
+    }
 }
 
 /// Why asking the network for a destination the peer table lacks filed no row for it.
@@ -4043,6 +4130,7 @@ mod tests {
             (
                 SendError::UnknownDestination {
                     destination: destination.clone(),
+                    recently_seen: false,
                 },
                 "unknown_destination",
             ),

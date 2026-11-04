@@ -23,7 +23,7 @@ use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
     PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
-    unreachable_head,
+    left_mesh_hint, unreachable_head,
 };
 use crate::mesh::pending::{
     Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
@@ -233,6 +233,8 @@ const INFO_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destina
 const TRUST_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; run `.mesh unblock <destination>`, then `.mesh trust <destination>` again.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
+const OWN_IDENTITY_TRUSTED: &str =
+    "This is your own identity: your other sessions on this config dir can now message this one.";
 const DRY_RUN_NOTHING_CHANGED: &str = "This was a dry run; nothing changed.";
 const SHARE_ROOT_UNKNOWN: &str =
     "The share root is unknown until a turn completes in this session; run one, then try again.";
@@ -257,7 +259,7 @@ pub(crate) async fn run(
     match verb {
         "on" => turn_on(ctx, rest).await,
         "off" => turn_off(ctx, rest).await,
-        "peers" => peers(ctx),
+        "peers" => peers(ctx).await,
         "knocks" => knocks(ctx),
         "info" => info(ctx, &abort_signal, rest).await,
         "status" => status(ctx, &abort_signal, rest).await,
@@ -509,11 +511,18 @@ async fn stop_node(ctx: &mut RequestContext) -> Result<()> {
     Ok(())
 }
 
-fn peers(ctx: &RequestContext) -> Result<()> {
+async fn peers(ctx: &RequestContext) -> Result<()> {
     let runtime = live(ctx)?;
     let now = SystemTime::now();
     let mut records = runtime.peers().snapshot();
     records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+    let mut facts = Vec::with_capacity(records.len());
+    for peer in &records {
+        facts.push(HeardFacts {
+            no_route: !runtime.path_known(&peer.destination_hash).await,
+            is_you: peer.identity_hash == runtime.fingerprint(),
+        });
+    }
     let trust = runtime.trust();
     let heard: Vec<String> = records
         .iter()
@@ -522,14 +531,15 @@ fn peers(ctx: &RequestContext) -> Result<()> {
     let trust_records = trust.records();
     let mut rows: Vec<PeerRow> = records
         .iter()
-        .map(|peer| {
+        .zip(facts)
+        .map(|(peer, facts)| {
             let standing = trust.identity_standing(&peer.identity_hash);
             let label = trust_label(
                 trust.authorize(&peer.identity_hash, &peer.destination_hash),
                 standing,
             );
             let mark = key_change_mark(peer, &trust_records, standing_grants_all(standing));
-            PeerRow::Heard(peer.clone(), label, mark)
+            PeerRow::Heard(peer.clone(), label, mark, facts)
         })
         .collect();
     let successors: Vec<(String, &PeerRecord)> = records
@@ -734,17 +744,17 @@ async fn status(
         StatusArg::Fetch(token) => {
             let runtime = live(ctx)?;
             let destination = destination_hash(ctx, token)?;
-            if peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal)
-                .await?
-                .is_none()
-            {
+            let Some(peer) =
+                peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal).await?
+            else {
                 return Ok(());
-            }
+            };
             let desc = match route_to(&runtime, &destination, abort_signal).await {
                 Ok(desc) => desc,
                 Err(Unrouted::NoAnswer) => bail!(
-                    "{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
-                    unreachable_head(&destination)
+                    "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+                    unreachable_head(&destination),
+                    left_mesh_hint(Some(&peer), SystemTime::now())
                 ),
                 Err(Unrouted::Interrupted) => {
                     out_text("Status request interrupted.");
@@ -2089,8 +2099,9 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
         Err(Unrouted::NoAnswer) => bail!(
-            "{} Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
-            unreachable_head(&destination)
+            "{}{} Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+            unreachable_head(&destination),
+            left_mesh_hint(Some(&peer), SystemTime::now())
         ),
         Err(Unrouted::Interrupted) => {
             out_text("Knock interrupted.");
@@ -2229,8 +2240,9 @@ async fn send_request(
     match route_to(runtime, destination, abort_signal).await {
         Ok(_) => {}
         Err(Unrouted::NoAnswer) => bail!(
-            "{} Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard.",
-            unreachable_head(destination)
+            "{}{} Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard.",
+            unreachable_head(destination),
+            left_mesh_hint(runtime.peers().get(destination).as_ref(), SystemTime::now())
         ),
         Err(Unrouted::Interrupted) => {
             out_text("Request interrupted; nothing was sent.");
@@ -2410,8 +2422,9 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
         Err(Unrouted::NoAnswer) => bail!(
-            "{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
-            unreachable_head(&destination)
+            "{}{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            unreachable_head(&destination),
+            left_mesh_hint(Some(&record), SystemTime::now())
         ),
         Err(Unrouted::Interrupted) => {
             out_path_text(&format!(
@@ -3071,6 +3084,21 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         }
         TrustArg::Identity { target, label, yes } => {
             let identity = identity_hash(ctx, &target)?;
+            let own_identity = live(ctx)?.fingerprint() == identity;
+            if own_identity
+                && grants_all(&store, &identity)
+                && (label.is_none()
+                    || store.records().iter().any(|record| {
+                        record.tier == Tier::Identity
+                            && record.hash == identity
+                            && record.label == label
+                    }))
+            {
+                out_text(&format!(
+                    "{OWN_IDENTITY_TRUSTED} It is already trusted for every instance, so nothing was changed; .mesh untrust --identity {identity} takes the grant back."
+                ));
+                return Ok(());
+            }
             let mut preview = format!(
                 "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is surfaced from the peer table when heard, never marked; .mesh trust <destination> is the grant that carries a mark.",
                 short(&identity)
@@ -3090,11 +3118,15 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             let change =
                 store.trust_identity(mesh, &identity, TrustOptions { label, note: None }, now)?;
             reset_knock_surfacing(ctx, &identity);
-            out_text(&format!(
+            let mut lines = vec![format!(
                 "Trusted identity {}, all destinations - {}.",
                 short(&identity),
                 change_text(change)
-            ));
+            )];
+            if own_identity {
+                lines.push(OWN_IDENTITY_TRUSTED.to_string());
+            }
+            out_text(&lines.join("\n"));
         }
         TrustArg::Prune {
             older_than,
@@ -6732,9 +6764,18 @@ fn name_label(name: Option<&str>) -> String {
 /// so the deny (and any mark it carries) is visible; or a marked record whose destination
 /// has aged out of the peer table, listed so the mark outlives the row it was first shown on.
 enum PeerRow {
-    Heard(PeerRecord, &'static str, Option<KeyChangeMark>),
+    Heard(PeerRecord, &'static str, Option<KeyChangeMark>, HeardFacts),
     DenyOnly(TrustRecord, Option<KeyChangeMark>),
     MarkedOnly(TrustRecord, &'static str, KeyChangeMark),
+}
+
+/// What this node knows about a heard row beyond its record: whether the transport holds
+/// no path to it, from the cached path table alone, and whether it announces this node's
+/// own identity, as another session on the same config dir does.
+#[derive(Debug, Default, Clone, Copy)]
+struct HeardFacts {
+    no_route: bool,
+    is_you: bool,
 }
 
 /// A trust record's key-change mark with, when the peer table has heard it, the destination
@@ -6815,7 +6856,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     let mut key_changes = Vec::new();
     for row in rows {
         let cells = match row {
-            PeerRow::Heard(peer, trust, key_changed) => {
+            PeerRow::Heard(peer, trust, key_changed, facts) => {
                 let successor = peer.successor_in(heard.iter().copied(), now);
                 if let Some(mark) = key_changed {
                     key_changes.push(key_change_footer_line(
@@ -6825,9 +6866,18 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                         now,
                     ));
                 }
-                let state = [row_state(peer, successor, now), peer.compatibility_line()];
+                let marker = match successor {
+                    None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),
+                    _ => row_state(peer, successor, now),
+                };
+                let name = if facts.is_you {
+                    "(you)".to_string()
+                } else {
+                    name_label(peer.display_name.as_deref())
+                };
+                let state = [marker, peer.compatibility_line()];
                 [
-                    name_label(peer.display_name.as_deref()),
+                    name,
                     short(&peer.destination_hash).to_string(),
                     short(&peer.identity_hash).to_string(),
                     trust.to_string(),
@@ -6883,6 +6933,129 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
+mod peers_route_tests {
+    use super::tests::{peer, table_rows};
+    use super::*;
+
+    const NO_PATH: HeardFacts = HeardFacts {
+        no_route: true,
+        is_you: false,
+    };
+
+    fn heard(peer: PeerRecord, facts: HeardFacts) -> PeerRow {
+        PeerRow::Heard(peer, "trusted", None, facts)
+    }
+
+    fn at(destination_byte: &str, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
+        PeerRecord {
+            destination_hash: destination_byte.repeat(16),
+            ..peer(Some("Ann"), seen_secs_ago, now)
+        }
+    }
+
+    /// A current row the transport holds no path to reads `no route`, and the legend says
+    /// what that means; a current row with a path keeps an empty state.
+    #[test]
+    fn a_current_row_with_no_path_reads_no_route_and_the_legend_explains_it() {
+        let now = SystemTime::now();
+        let rows = vec![
+            heard(at("11", 5, now), NO_PATH),
+            heard(at("22", 5, now), HeardFacts::default()),
+        ];
+
+        let text = render_peers(&rows, now);
+
+        let cells = table_rows(&text);
+        assert_eq!(cells[0][6], NO_ROUTE_STATE, "{text}");
+        assert_eq!(cells[1][6], "", "{text}");
+        assert!(
+            peers_legend().contains("no route = this node has no path to it right now"),
+            "{text}"
+        );
+        assert!(text.ends_with(&peers_legend()), "{text}");
+    }
+
+    /// A stale row with no path shows `no route` alone: the missing path is the stronger
+    /// sign that the peer has gone, and two markers in one cell would say it twice.
+    #[test]
+    fn a_stale_row_with_no_path_reads_no_route_alone() {
+        let now = SystemTime::now();
+        let rows = vec![heard(at("11", PEER_STALE_AFTER.as_secs(), now), NO_PATH)];
+
+        let text = render_peers(&rows, now);
+
+        assert_eq!(table_rows(&text)[0][6], NO_ROUTE_STATE, "{text}");
+        assert!(!text.contains("(stale:"), "{text}");
+    }
+
+    /// A superseded row says where its identity went whether or not a path to it is held.
+    #[test]
+    fn superseded_outranks_no_route() {
+        let now = SystemTime::now();
+        let rows = vec![
+            heard(at("11", 5, now), HeardFacts::default()),
+            heard(at("22", PEER_STALE_AFTER.as_secs(), now), NO_PATH),
+        ];
+
+        let text = render_peers(&rows, now);
+
+        let state = &table_rows(&text)[1][6];
+        assert!(state.starts_with("(superseded by 11111111"), "{text}");
+        assert!(!state.contains("no route"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod peers_you_tests {
+    use super::tests::{peer, table_rows};
+    use super::*;
+
+    /// A row announcing this node's own identity is named `(you)` over its display name or
+    /// `(no name)`, and the legend says what that means.
+    #[test]
+    fn a_row_of_the_own_identity_is_named_you() {
+        let now = SystemTime::now();
+        let you = HeardFacts {
+            no_route: false,
+            is_you: true,
+        };
+        let rows = vec![
+            PeerRow::Heard(peer(Some("Laptop"), 5, now), "trusted", None, you),
+            PeerRow::Heard(
+                PeerRecord {
+                    destination_hash: "12".repeat(16),
+                    ..peer(None, 5, now)
+                },
+                "trusted",
+                None,
+                you,
+            ),
+            PeerRow::Heard(
+                PeerRecord {
+                    destination_hash: "34".repeat(16),
+                    ..peer(Some("Ann"), 5, now)
+                },
+                "trusted",
+                None,
+                HeardFacts::default(),
+            ),
+        ];
+
+        let text = render_peers(&rows, now);
+
+        let names: Vec<String> = table_rows(&text)
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect();
+        assert_eq!(names, ["(you)", "(you)", "Ann"], "{text}");
+        assert!(
+            peers_legend().contains("(you) = another session of yours on this config dir"),
+            "{text}"
+        );
+    }
+}
+
 /// Why a heard row is not current, if it is not. A successor is only ever found for a
 /// stale row, and a later row of the same identity at another destination says where the
 /// identity went, which is more useful than how long this row has been silent, so a
@@ -6905,6 +7078,12 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
     })
 }
 
+/// The `state` of a heard row the transport holds no path to. It outranks `stale`, which
+/// only says how long the row has been silent, and yields to `superseded`, which says
+/// where the identity went.
+const NO_ROUTE_STATE: &str =
+    "(no route: this node has no path to it right now, so it has probably left the mesh)";
+
 /// The standing of a deny-only record: a block with no heard peer to judge is the
 /// `DestinationDenied` verdict whatever the identity's standing.
 fn deny_only_label() -> &'static str {
@@ -6922,10 +7101,10 @@ fn trust_legend() -> &'static str {
     "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>"
 }
 
-/// The last line of a non-empty `.mesh peers`, reading the two row markers.
+/// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` name.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you) = another session of yours on this config dir",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -7829,7 +8008,7 @@ mod tests {
         }
     }
 
-    fn peer(name: Option<&str>, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
+    pub(super) fn peer(name: Option<&str>, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
         PeerRecord {
             destination_hash: "ab".repeat(16),
             identity_hash: "cd".repeat(16),
@@ -7869,7 +8048,7 @@ mod tests {
     /// those are folded back into the row, the cell's lines joined with a newline, so a
     /// row reads as its renderer built it. The first column of every mesh table is never
     /// empty, which is what tells a continuation line from a row.
-    fn table_rows(text: &str) -> Vec<Vec<String>> {
+    pub(super) fn table_rows(text: &str) -> Vec<Vec<String>> {
         let table = text
             .split_once('┌')
             .map(|(_, rest)| rest)
@@ -9194,9 +9373,19 @@ mod tests {
             ..peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now)
         };
         let rows = vec![
-            PeerRow::Heard(peer(Some("Ann"), 5, now), "trusted", None),
-            PeerRow::Heard(old, "blocked (instance)", None),
-            PeerRow::Heard(peer(None, 30, now), "untrusted", None),
+            PeerRow::Heard(
+                peer(Some("Ann"), 5, now),
+                "trusted",
+                None,
+                HeardFacts::default(),
+            ),
+            PeerRow::Heard(old, "blocked (instance)", None, HeardFacts::default()),
+            PeerRow::Heard(
+                peer(None, 30, now),
+                "untrusted",
+                None,
+                HeardFacts::default(),
+            ),
         ];
         let text = render_peers(&rows, now);
         assert_eq!(
@@ -9232,7 +9421,7 @@ mod tests {
             [
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you) = another session of yours on this config dir",
             ],
             "{text}"
         );
@@ -9267,10 +9456,10 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120)
     }
 
-    /// The whole `.mesh peers` text for a current trusted row whose key changed, a current
-    /// successor, the stale row it supersedes and a stale row of its own: the sample the
-    /// Commands page carries. The test harness renders without a terminal, so the table
-    /// takes its content width.
+    /// The whole `.mesh peers` text for another session of the owner's, a current trusted
+    /// row whose key changed, a row with no route, a current successor, the stale row it
+    /// supersedes and a stale row of its own: the sample the Commands page carries. The test
+    /// harness renders without a terminal, so the table takes its content width.
     #[test]
     fn peers_table_snapshot() {
         let now = fixed_now();
@@ -9284,6 +9473,15 @@ mod tests {
         };
         let rows = vec![
             PeerRow::Heard(
+                row(Some("laptop"), "2c3d4e5f", "8b9c0d1e", 1, 3),
+                "trusted",
+                None,
+                HeardFacts {
+                    no_route: false,
+                    is_you: true,
+                },
+            ),
+            PeerRow::Heard(
                 row(Some("alice"), "1a2b3c4d", "9f8e7d6c", 1, 12),
                 "trusted",
                 Some(KeyChangeMark {
@@ -9295,11 +9493,16 @@ mod tests {
                     denied: false,
                     identity_grants_all: false,
                 }),
+                HeardFacts::default(),
             ),
             PeerRow::Heard(
                 row(Some("bob"), "7c8d9e0f", "4a5b6c7d", 1, 40),
                 "trusted",
                 None,
+                HeardFacts {
+                    no_route: true,
+                    is_you: false,
+                },
             ),
             PeerRow::Heard(
                 row(
@@ -9311,31 +9514,35 @@ mod tests {
                 ),
                 "trusted",
                 None,
+                HeardFacts::default(),
             ),
             PeerRow::Heard(
                 row(None, "5e6f7a8b", "0c1d2e3f", 2, PEER_STALE_AFTER.as_secs()),
                 "untrusted",
                 None,
+                HeardFacts::default(),
             ),
         ];
         assert_eq!(render_peers(&rows, now), PEERS_SNAPSHOT);
     }
 
-    const PEERS_SNAPSHOT: &str = r#"┌───────────┬──────────┬──────────┬───────────┬──────┬───────────┬──────────────────────────────────────────────────────────────────┐
-│ name      ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                            │
-╞═══════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪══════════════════════════════════════════════════════════════════╡
-│ alice     ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                  │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob       ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆                                                                  │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob       ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance) │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (no name) ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h) │
-└───────────┴──────────┴──────────┴───────────┴──────┴───────────┴──────────────────────────────────────────────────────────────────┘
+    const PEERS_SNAPSHOT: &str = r#"┌───────────┬──────────┬──────────┬───────────┬──────┬───────────┬─────────────────────────────────────────────────────────────────────────────────────┐
+│ name      ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                               │
+╞═══════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪═════════════════════════════════════════════════════════════════════════════════════╡
+│ (you)     ┆ 2c3d4e5f ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                     │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ alice     ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                     │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob       ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: this node has no path to it right now, so it has probably left the mesh) │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob       ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                    │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ (no name) ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                    │
+└───────────┴──────────┴──────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────┘
 1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
-4 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
+5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you) = another session of yours on this config dir"#;
 
     /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
     #[test]
@@ -9715,8 +9922,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let new = at("12", Some("Bob"), 5);
         let old = at("ef", Some("Bob"), PEER_STALE_AFTER.as_secs());
         let rows = vec![
-            PeerRow::Heard(new.clone(), "trusted", None),
-            PeerRow::Heard(live.clone(), "trusted", None),
+            PeerRow::Heard(new.clone(), "trusted", None, HeardFacts::default()),
+            PeerRow::Heard(live.clone(), "trusted", None, HeardFacts::default()),
         ];
         let text = render_peers(&rows, now);
         let rows = table_rows(&text);
@@ -9733,8 +9940,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(!text.contains("superseded by"), "{text}");
 
         let rows = vec![
-            PeerRow::Heard(new.clone(), "trusted", None),
-            PeerRow::Heard(old.clone(), "trusted", None),
+            PeerRow::Heard(new.clone(), "trusted", None, HeardFacts::default()),
+            PeerRow::Heard(old.clone(), "trusted", None, HeardFacts::default()),
         ];
         let text = render_peers(&rows, now);
         let rows = table_rows(&text);
@@ -9747,8 +9954,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         let renamed = at("12", Some("Carol"), 5);
         let rows = vec![
-            PeerRow::Heard(renamed, "trusted", None),
-            PeerRow::Heard(old.clone(), "trusted", None),
+            PeerRow::Heard(renamed, "trusted", None, HeardFacts::default()),
+            PeerRow::Heard(old.clone(), "trusted", None, HeardFacts::default()),
         ];
         let text = render_peers(&rows, now);
         assert!(
@@ -9758,8 +9965,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         let nameless = at("12", None, 5);
         let rows = vec![
-            PeerRow::Heard(nameless, "trusted", None),
-            PeerRow::Heard(old.clone(), "trusted", None),
+            PeerRow::Heard(nameless, "trusted", None, HeardFacts::default()),
+            PeerRow::Heard(old.clone(), "trusted", None, HeardFacts::default()),
         ];
         let text = render_peers(&rows, now);
         assert!(
@@ -9823,7 +10030,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             deny_record(&bound, Some(&"99".repeat(16))),
         ];
         let heard_hashes = vec![heard.destination_hash.clone()];
-        let mut rows = vec![PeerRow::Heard(heard.clone(), "trusted", None)];
+        let mut rows = vec![PeerRow::Heard(
+            heard.clone(),
+            "trusted",
+            None,
+            HeardFacts::default(),
+        )];
         rows.extend(unheard_rows(
             records,
             &heard_hashes,
@@ -9882,6 +10094,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     denied: false,
                     identity_grants_all: false,
                 }),
+                HeardFacts::default(),
             ),
             PeerRow::Heard(
                 peer(Some("Bob"), 5, now),
@@ -9895,8 +10108,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     denied: true,
                     identity_grants_all: false,
                 }),
+                HeardFacts::default(),
             ),
-            PeerRow::Heard(peer(Some("Cy"), 5, now), "trusted", None),
+            PeerRow::Heard(
+                peer(Some("Cy"), 5, now),
+                "trusted",
+                None,
+                HeardFacts::default(),
+            ),
             PeerRow::Heard(
                 peer(Some("Dee"), 5, now),
                 "trusted",
@@ -9909,6 +10128,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     denied: false,
                     identity_grants_all: true,
                 }),
+                HeardFacts::default(),
             ),
         ];
         let text = render_peers(&rows, now);
@@ -10022,7 +10242,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let heard = vec![successor.destination_hash.clone()];
         let successors = vec![(old_destination.clone(), &successor)];
 
-        let mut rows = vec![PeerRow::Heard(successor.clone(), "untrusted", None)];
+        let mut rows = vec![PeerRow::Heard(
+            successor.clone(),
+            "untrusted",
+            None,
+            HeardFacts::default(),
+        )];
         rows.extend(unheard_rows(
             vec![record.clone(), unlabeled, unmarked],
             &heard,
@@ -10248,8 +10473,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let mut unheard = deny_record(&"33".repeat(16), Some(&"88".repeat(16)));
         unheard.denied = false;
         let rows = vec![
-            PeerRow::Heard(heard, "trusted", Some(mark(false))),
-            PeerRow::Heard(peer(Some("Cy"), 5, now), "trusted", None),
+            PeerRow::Heard(heard, "trusted", Some(mark(false)), HeardFacts::default()),
+            PeerRow::Heard(
+                peer(Some("Cy"), 5, now),
+                "trusted",
+                None,
+                HeardFacts::default(),
+            ),
             PeerRow::DenyOnly(deny_record(&"22".repeat(16), None), Some(mark(true))),
             PeerRow::MarkedOnly(unheard, "trusted", mark(false)),
         ];
@@ -12031,13 +12261,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ..peer(Some("Bad"), 2, now)
         };
         let rows = vec![
-            PeerRow::Heard(old, "blocked (instance)", None),
+            PeerRow::Heard(old, "blocked (instance)", None, HeardFacts::default()),
             PeerRow::Heard(
                 peer(Some("Bad"), PEER_STALE_AFTER.as_secs(), now),
                 "blocked (identity)",
                 None,
+                HeardFacts::default(),
             ),
-            PeerRow::Heard(moved, "blocked (identity)", None),
+            PeerRow::Heard(moved, "blocked (identity)", None, HeardFacts::default()),
         ];
         let text = render_peers(&rows, now);
         for marker in [
@@ -14846,6 +15077,56 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
+            mod peers_listing_tests {
+                use super::*;
+
+                /// A row filed in the peer table that the transport holds no path to reads
+                /// `no route`, from the cached path table alone, and a row announcing this
+                /// node's own identity is named `(you)`.
+                #[test]
+                #[serial]
+                fn a_filed_peer_with_no_path_reads_no_route_and_the_own_identity_reads_you() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-peers-no-route");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-peers-no-route").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let runtime = started.runtime.clone();
+                        let (unrouted, _) = heard_peer(&runtime, "Tia", SystemTime::now());
+                        assert!(!runtime.path_known(&unrouted).await);
+                        let other_session = hex_lower(&[0x4e; 16]);
+                        runtime.peers().observe(
+                            PeerSighting {
+                                destination_hash: other_session.clone(),
+                                identity_hash: runtime.fingerprint().to_string(),
+                                name_hash: String::new(),
+                                public_key: None,
+                                display_name: Some("Laptop".to_string()),
+                                protocol_version: 1,
+                                hops: 1,
+                            },
+                            SystemTime::now(),
+                        );
+
+                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let rows = table_rows(&out);
+                        let row = |destination: &str| {
+                            rows.iter()
+                                .find(|row| row[1] == short(destination))
+                                .unwrap_or_else(|| panic!("no row for {destination} in {out}"))
+                        };
+                        assert_eq!(row(&unrouted)[0], "Tia", "{out}");
+                        assert!(row(&unrouted)[6].starts_with("(no route:"), "{out}");
+                        assert_eq!(row(&other_session)[0], "(you)", "{out}");
+                        assert!(out.contains("no route = "), "{out}");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+            }
+
             /// `.mesh trust <destA>` makes identity I known; a second heard instance destB
             /// of I, with no record of its own, reads `known` rather than `untrusted` in
             /// `.mesh peers`, `.mesh info destB` and the `mesh__peers` tool's `trust` field,
@@ -14926,13 +15207,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh peers` through the command path over the live peer table: a row seen
-            /// exactly two heartbeats ago is stale while one seen a little less than that is
-            /// not; of two stale rows under one identity the older is superseded by the newer
-            /// (the successor need not be live) and the newer is stale; the legend is the last
-            /// line; the markers are render-time only (the persisted table carries no such
-            /// state) and a second listing renders the same bytes. `.mesh info` on the plain
-            /// stale row carries the stale marker, not the superseded one.
+            /// `.mesh peers` through the command path over the live peer table. No row was
+            /// announced over the network, so the transport holds no path to any of them and
+            /// every row reads `no route`, except that of two stale rows under one identity
+            /// the older is superseded by the newer (the successor need not be live); the
+            /// legend is the last line; the markers are render-time only (the persisted table
+            /// carries no such state) and a second listing renders the same bytes. `.mesh
+            /// info`, which reads no path, marks a row seen exactly two heartbeats ago stale,
+            /// not one seen a little less than that.
             #[test]
             #[serial]
             fn peers_marks_boundary_rows_and_persists_nothing_about_the_state() {
@@ -14988,18 +15270,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
                     assert_eq!(
                         row(&first, &live),
-                        ("5s ago".to_string(), String::new()),
-                        "a live row has its age and no state: {first}"
+                        ("5s ago".to_string(), NO_ROUTE_STATE.to_string()),
+                        "a live row with no path reads no route: {first}"
                     );
                     assert_eq!(
                         row(&first, &nearly),
-                        ("2h ago".to_string(), String::new()),
-                        "under two heartbeats is not stale: {first}"
+                        ("2h ago".to_string(), NO_ROUTE_STATE.to_string()),
+                        "{first}"
                     );
                     assert_eq!(
                         row(&first, &exactly),
-                        ("2h ago".to_string(), stale.clone()),
-                        "exactly two heartbeats is stale: {first}"
+                        ("2h ago".to_string(), NO_ROUTE_STATE.to_string()),
+                        "no route outranks stale: {first}"
                     );
                     assert_eq!(
                         row(&first, &older),
@@ -15014,8 +15296,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(
                         row(&first, &newer),
-                        ("2h ago".to_string(), stale.clone()),
-                        "the newer row of the pair is stale, not superseded: {first}"
+                        ("2h ago".to_string(), NO_ROUTE_STATE.to_string()),
+                        "the newer row of the pair is not superseded: {first}"
                     );
                     let footer = table_footer(&first);
                     assert_eq!(footer.len(), 3, "{first}");
@@ -15031,11 +15313,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(
                         footer[2],
-                        format!(
-                            "stale = silent for {}+ hourly heartbeats, dropped after {}; superseded = this identity moved to the instance named",
-                            PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
-                            period_text(PEER_TTL)
-                        ),
+                        peers_legend(),
                         "the legend is the last line: {first}"
                     );
 
@@ -15048,7 +15326,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .join("peers.json"),
                     )
                     .unwrap();
-                    for token in ["stale", "superseded", "successor", "marker"] {
+                    for token in ["stale", "superseded", "successor", "marker", "no route"] {
                         assert!(
                             !persisted.contains(token),
                             "the persisted table carries render-time state {token:?}:\n{persisted}"
@@ -19597,6 +19875,50 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
+            mod status_left_mesh_tests {
+                use super::*;
+
+                /// A `.mesh status` that gets no route says the peer may have left the
+                /// mesh when it announced within the stale window, and not when its row
+                /// is already stale.
+                #[test]
+                #[serial]
+                fn status_no_answer_says_it_may_have_left_only_for_a_recent_peer() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-status-left-mesh");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-status-left-mesh").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let runtime = started.runtime.clone();
+                        let now = SystemTime::now();
+                        let hint = "It may have left the mesh; a session that exits says nothing.";
+
+                        for (seen, says_left) in [(now, true), (now - PEER_STALE_AFTER, false)] {
+                            let (destination, _) = heard_peer(&runtime, "Tia", seen);
+                            runtime
+                                .trust()
+                                .trust_destination(
+                                    ctx.app.mesh.as_ref(),
+                                    &destination,
+                                    TrustOptions::default(),
+                                    now,
+                                )
+                                .unwrap();
+
+                            let err =
+                                refusal(&mut ctx, &format!(".mesh status {destination}")).await;
+
+                            assert!(err.contains("could not be reached"), "{err}");
+                            assert_eq!(err.contains(hint), says_left, "{err}");
+                        }
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+            }
+
             /// `.mesh request` to a trusted peer nothing on the network can route to
             /// fails after the route wait with what to try next, never opens a link, and
             /// leaves no correlation behind.
@@ -21115,6 +21437,83 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
+            }
+
+            mod trust_own_identity_tests {
+                use super::*;
+
+                /// Trusting this node's own identity says what it is for: the owner's other
+                /// sessions on this config dir can message this one. Run again, it asks
+                /// nothing, writes nothing and says nothing changed.
+                #[test]
+                #[serial]
+                fn trusting_the_own_identity_names_it_and_a_second_run_changes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-trust-own-identity");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[true]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-trust-own-identity").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let trust = started.runtime.trust();
+                        let own = started.runtime.fingerprint().to_string();
+                        let sentence = "This is your own identity: your other sessions on this config dir can now message this one.";
+
+                        let first = out_of(&mut ctx, &format!(".mesh trust --identity {own}"))
+                            .await
+                            .unwrap();
+                        assert!(first.contains("added"), "{first}");
+                        assert!(first.contains(sentence), "{first}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(
+                            trust.identity_standing(&own),
+                            IdentityStanding::Trusted {
+                                all_destinations: true
+                            }
+                        );
+                        let before = fs::read(trust.path()).unwrap();
+
+                        let second = out_of(&mut ctx, &format!(".mesh trust --identity {own}"))
+                            .await
+                            .unwrap();
+                        assert!(second.contains(sentence), "{second}");
+                        assert!(
+                            second.contains(
+                                "already trusted for every instance, so nothing was changed"
+                            ),
+                            "{second}"
+                        );
+                        assert!(!second.contains("Trust every instance"), "{second}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fs::read(trust.path()).unwrap(), before);
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// Another identity gets no own-identity line.
+                #[test]
+                #[serial]
+                fn trusting_another_identity_does_not_call_it_your_own() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-trust-other-identity");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-trust-other-identity").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let (_, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                        let out = out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains("added"), "{out}");
+                        assert!(!out.contains("your own identity"), "{out}");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
             }
 
             /// The prune token, not a prompt, is the consent: bare and `--dry-run` only list
