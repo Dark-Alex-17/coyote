@@ -280,6 +280,9 @@ def walk(combo, gates, graph, world, log):
                     "rigor_proposal": "production", "surfaces_proposal": "http", "quality_evidence": "e", "anomalies": []}
         if nid == "amend_plan":
             return {"amended": True, "amend_summary": "applied", "anomalies": []}
+        if nid == "frame_questions":
+            return {"framed_questions": [{**q, "options": [{"text": "keep it", "recommended": True, "evidence": "e"}, {"text": "drop it"}]}
+                                         for q in gates.as_list(st.get("choice_invalid"))], "anomalies": []}
         if nid == "answer_leaks":
             return {"leak_answers": [{"question": "q", "answer": "a"}], "leak_unanswerable": [], "anomalies": []}
         if nid == "gate1":
