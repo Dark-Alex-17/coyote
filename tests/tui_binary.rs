@@ -3705,13 +3705,10 @@ fn new_files_named(dir: &Path, before: &[PathBuf], name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `.role <new-name>` scaffolds a role in `$EDITOR` in the REPL; the UI
-/// refuses it before anything is written: no role file, no editor, the
+/// `.role <new-name>` first asks `Create a new role?` and then scaffolds
+/// the role in `$EDITOR` in the REPL; the UI refuses it through the prompt
+/// gate before the question is built: no role file, no editor, the
 /// terminal never released, and the UI keeps taking keys.
-/// (`RequestContext::new_role` asks `Create a new role?` through a raw
-/// `inquire::Confirm` before it reaches the editor gate, so under the UI
-/// the question is invisible behind `Working`, and the first key it eats
-/// restores cooked mode under the UI - the terminal state this pins.)
 #[test]
 #[serial]
 fn dot_role_for_a_new_role_is_refused_before_it_writes_anything() {
@@ -3727,10 +3724,10 @@ fn dot_role_for_a_new_role_is_refused_before_it_writes_anything() {
     let before = pty.raw().len();
     pty.send(b".role new-role-xk3\r").unwrap();
     let since = pty
-        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
+        .wait_for_after(PROMPT_REFUSAL, before, PTY_DEADLINE)
         .unwrap_or_else(|e| {
             panic!(
-                "`.role <new>` was not refused with the TUI notice; the turn sat on \
+                "`.role <new>` was not refused with {PROMPT_REFUSAL:?}; the turn sat on \
                  `Working` with the REPL's `Create a new role?` prompt hidden: {e:?}\n{}",
                 strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
             )
@@ -5249,13 +5246,13 @@ fn a_signal_killed_loader_is_a_failure(scenario: &str, file_branch: bool) {
     loop {
         pty.read_for(Duration::from_millis(300));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[sent_at..]));
-        let lower = since.to_lowercase();
-        if squeezed(&since).contains("ingestedanywayr8p")
-            || lower.contains("non-zero")
-            || lower.contains("error")
-            || lower.contains("fail")
-            || lower.contains("signal")
-            || lower.contains("killed")
+        // The failure the command module raises for a child that did not
+        // exit 0 (`exited with non-zero`), squeezed because the error cell
+        // wraps; no looser word, so the scenario's own name in the echoed
+        // command line cannot satisfy it.
+        let squeezed_since = squeezed(&since);
+        if squeezed_since.contains("ingestedanywayr8p")
+            || squeezed_since.contains("exitedwithnon-zero")
         {
             break;
         }
@@ -5275,13 +5272,8 @@ fn a_signal_killed_loader_is_a_failure(scenario: &str, file_branch: bool) {
         !squeezed(&since).contains("ingestedanywayr8p"),
         "{scenario}: the model replied to a document whose loader was killed:\n{since}"
     );
-    let lower = since.to_lowercase();
     assert!(
-        lower.contains("non-zero")
-            || lower.contains("error")
-            || lower.contains("fail")
-            || lower.contains("signal")
-            || lower.contains("killed"),
+        squeezed(&since).contains("exitedwithnon-zero"),
         "{scenario}: nothing told the user the loader failed:\n{since}"
     );
     assert!(
@@ -5303,14 +5295,14 @@ fn a_signal_killed_loader_is_a_failure(scenario: &str, file_branch: bool) {
 #[test]
 #[serial]
 fn a_signal_killed_file_loader_is_reported_as_a_failure_not_ingested() {
-    a_signal_killed_loader_is_a_failure("killed-file-loader", true);
+    a_signal_killed_loader_is_a_failure("dying-file-loader", true);
 }
 
 /// Stdout-branch loader killed after writing its stdout.
 #[test]
 #[serial]
 fn a_signal_killed_stdout_loader_is_reported_as_a_failure_not_ingested() {
-    a_signal_killed_loader_is_a_failure("killed-stdout-loader", false);
+    a_signal_killed_loader_is_a_failure("dying-stdout-loader", false);
 }
 
 // ---------------------------------------------------------------------------
