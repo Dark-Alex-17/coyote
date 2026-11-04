@@ -1656,28 +1656,30 @@ mod peer_side_refusal_tests {
     #[test]
     fn a_peer_refusal_keeps_the_owner_remedy_and_name_as_written_in_every_verb() {
         let refused = refusal().to_string();
-        let cases = [
+        let cases: [(fn() -> anyhow::Error, String); 4] = [
             (
-                quoted_fetch_failure(FileFetchError::NotTrustedByPeer(refusal())),
+                || quoted_fetch_failure(FileFetchError::NotTrustedByPeer(refusal())),
                 refused.clone(),
             ),
             (
-                quoted_access_failure(AccessError::NotTrustedByPeer(refusal())),
+                || quoted_access_failure(AccessError::NotTrustedByPeer(refusal())),
                 refused.clone(),
             ),
             (
-                quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into()),
+                || quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into()),
                 refused.clone(),
             ),
             (
-                quoted_status_failure(StatusError::NotTrustedByPeer(refusal())),
+                || quoted_status_failure(StatusError::NotTrustedByPeer(refusal())),
                 StatusError::NotTrustedByPeer(refusal()).to_string(),
             ),
         ];
-        for (err, today) in cases {
-            let dot = shown_as(anyhow!(err.to_string()), CommandPrefix::Dot);
-            assert!(dot.ends_with(&format!("    {today}")), "{dot}");
-            let slash = shown_as(err, CommandPrefix::Slash);
+        for (quoted, today) in cases {
+            assert_eq!(
+                shown_as(quoted(), CommandPrefix::Dot),
+                shown_as(anyhow!(today.clone()), CommandPrefix::Dot)
+            );
+            let slash = shown_as(quoted(), CommandPrefix::Slash);
             assert!(slash.starts_with("Error: `/mesh fetch` failed"), "{slash}");
             assert!(slash.ends_with(&format!("    {today}")), "{slash}");
             assert!(slash.contains(&format!("\"{}\"", ".session")), "{slash}");
@@ -1693,9 +1695,14 @@ mod peer_side_refusal_tests {
         let no_answer = NoAnswer::new(&"ab".repeat(16), "cd".repeat(16));
         let err = AccessError::NoAnswer(no_answer.clone());
         let today = err.to_string();
-        let quoted = quoted_access_failure(err);
-        assert_eq!(quoted.to_string(), today);
-        let slash = shown_as(quoted, CommandPrefix::Slash);
+        assert_eq!(
+            shown_as(
+                quoted_access_failure(AccessError::NoAnswer(no_answer.clone())),
+                CommandPrefix::Dot
+            ),
+            shown_as(anyhow!(today.clone()), CommandPrefix::Dot)
+        );
+        let slash = shown_as(quoted_access_failure(err), CommandPrefix::Slash);
         let tail = today.strip_prefix(&no_answer.to_string()).unwrap();
         assert!(
             slash.ends_with(&format!(
