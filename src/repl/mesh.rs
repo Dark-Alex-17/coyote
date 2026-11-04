@@ -22434,6 +22434,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 fs::read(store.path()).ok()
             }
 
+            /// The node's trust records less the grant its start seeds for its own identity.
+            fn records_of_others(runtime: &MeshRuntime) -> Vec<crate::mesh::trust::TrustRecord> {
+                runtime
+                    .trust()
+                    .records()
+                    .into_iter()
+                    .filter(|record| record.hash != runtime.fingerprint())
+                    .collect()
+            }
+
             fn identity_of(store: &TrustStore, destination: &str) -> String {
                 store
                     .records()
@@ -22464,7 +22474,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
-                    assert!(trust_file(&trust).is_none());
+                    let before = trust_file(&trust);
 
                     let declined = prompt_script::install(&[false]);
                     let out = out_of(&mut ctx, &format!(".mesh trust {dest}"))
@@ -22472,7 +22482,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                     assert!(out.contains(NOTHING_CHANGED), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
-                    assert!(trust_file(&trust).is_none());
+                    assert_eq!(trust_file(&trust), before);
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Refuse);
                     drop(declined);
 
@@ -24038,7 +24048,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(!trust.is_blocked_identity(&id));
                     assert!(trust.blocked().is_empty());
-                    assert!(trust.records().is_empty(), "{:?}", trust.records());
+                    let others = records_of_others(&started.runtime);
+                    assert!(others.is_empty(), "{others:?}");
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
 
                     let before = trust_file(&trust);
@@ -24110,7 +24121,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                     assert!(out.starts_with("This lifts the block on identity"), "{out}");
                     assert!(!trust.is_blocked_identity(&id));
-                    assert!(trust.records().is_empty(), "{:?}", trust.records());
+                    let others = records_of_others(&started.runtime);
+                    assert!(others.is_empty(), "{others:?}");
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -24182,7 +24194,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (_, id, _) = announced_peer();
                     let token = format!("forget-{}", short(&id));
-                    assert!(trust_file(&trust).is_none());
+                    let before = trust_file(&trust);
 
                     let printed = stdout_lines().len();
                     for flag in ["", " --dry-run", &format!(" --confirm {token}")] {
@@ -24201,7 +24213,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         printed,
                         "the teaching error prints nothing else"
                     );
-                    assert!(trust_file(&trust).is_none(), "nothing was written");
+                    assert_eq!(trust_file(&trust), before, "nothing was written");
                     assert!(
                         started
                             .runtime
@@ -24687,7 +24699,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                     );
                     assert_eq!(knocks_of(&id), 0, "the confirmed run empties the cache");
-                    assert!(trust.records().is_empty(), "{:?}", trust.records());
+                    let others = records_of_others(&started.runtime);
+                    assert!(others.is_empty(), "{others:?}");
                     assert_ne!(trust_file(&trust), before);
                     assert!(
                         memory.claims_for_tests(&dest).is_none(),
@@ -25135,7 +25148,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         text: "where were we?".into(),
                     }];
                     store.save(&id, "only", turns, now).unwrap();
-                    assert!(trust_file(&trust).is_none());
+                    let before = trust_file(&trust);
                     let token = format!("forget-{}", short(&id));
 
                     let dry = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
@@ -25163,7 +25176,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                     );
                     assert!(store.load(&id, "only", now).unwrap().is_none());
-                    assert!(trust_file(&trust).is_none(), "nothing was written");
+                    assert_eq!(trust_file(&trust), before, "nothing was written");
 
                     let err = refusal(&mut ctx, &format!(".mesh forget --identity {id}")).await;
                     assert!(err.contains("is a stranger already"), "{err}");
@@ -25201,7 +25214,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let index = third.join("index.json");
                     fs::write(&index, "{not json").unwrap();
                     let (_, id, _) = announced_peer();
-                    assert!(trust_file(&trust).is_none());
+                    let before = trust_file(&trust);
                     let token = format!("forget-{}", short(&id));
 
                     let dry = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
@@ -25215,7 +25228,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                     );
                     assert_eq!(fs::read_to_string(&index).unwrap(), "{not json");
-                    assert!(trust_file(&trust).is_none(), "nothing was written");
+                    assert_eq!(trust_file(&trust), before, "nothing was written");
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -27791,6 +27804,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let gate = started.runtime.knock_gate();
+                    let before = trust_file(&trust);
 
                     let (legacy_dest, legacy_id, _) = announced_peer();
                     let (forged_dest, _, forged_name_hash) = announced_peer();
@@ -27831,7 +27845,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "a forged knock is refused naming the destination: {err}"
                         );
                     }
-                    assert!(trust_file(&trust).is_none(), "nothing was written");
+                    assert_eq!(trust_file(&trust), before, "nothing was written");
                     assert_eq!(
                         trust.authorize(&legacy_id, &legacy_dest).decision,
                         Decision::Refuse
@@ -27859,6 +27873,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    let before = trust_file(&trust);
 
                     let non_tty = prompt_script::install_non_interactive();
                     let err = refusal(&mut ctx, &format!(".mesh trust --identity {id}")).await;
@@ -27872,7 +27887,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                     assert!(out.contains(NOTHING_CHANGED), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
-                    assert!(trust_file(&trust).is_none());
+                    assert_eq!(trust_file(&trust), before);
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Refuse);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -29442,7 +29457,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "{line}: {waited:?}"
                             );
                         }
-                        assert!(ctx.app.mesh.get().unwrap().trust().records().is_empty());
+                        assert!(records_of_others(&started.runtime).is_empty());
 
                         out_of(&mut ctx, &format!(".mesh block {unheard} --yes"))
                             .await
@@ -29528,7 +29543,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )),
                             "{out}"
                         );
-                        assert!(ctx.app.mesh.get().unwrap().trust().records().is_empty());
+                        assert!(records_of_others(&started.runtime).is_empty());
                         assert_eq!(prompt_script::prompts_asked(), 0);
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
@@ -30363,12 +30378,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "`forget` takes no destination"
                     );
                     let forgettable = offers(&ctx, &["forget", "--identity", ""]);
-                    let mut trusted_identities = [refused_id.clone(), plain_id.clone()];
+                    let mut trusted_identities = [
+                        refused_id.clone(),
+                        plain_id.clone(),
+                        started.runtime.fingerprint().to_string(),
+                    ];
                     trusted_identities.sort();
                     assert_eq!(
                         forgettable[..trusted_identities.len()],
                         trusted_identities[..],
-                        "the trusted identities first, the binding-only one included"
+                        "the trusted identities first, the binding-only one and the node's own included"
                     );
                     assert_eq!(
                         &forgettable[trusted_identities.len()..],
