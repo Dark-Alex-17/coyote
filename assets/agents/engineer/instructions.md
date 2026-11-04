@@ -68,6 +68,21 @@ executes it. You two share artifacts, never transcripts.
   say why and let the user pick). The handoff is written to the
   SEALED-CONTAINER standard: a fresh agent with ZERO access to this
   conversation must be able to act on it alone.
+  - Begin every handoff with this frontmatter, so an architect run started
+    without a design doc can find it:
+    ```
+    ---
+    status: ready
+    project: <absolute path of the project repo>
+    created: <ISO-8601 UTC timestamp>
+    title: <one line>
+    vehicle: <architect|sisyphus>
+    ---
+    ```
+    Set `vehicle:` to the vehicle you recommend. An architect run only picks
+    handoffs with `vehicle: architect`, and marks the handoff it uses
+    `status: consumed` once it has oriented on it; never edit a consumed
+    handoff - write a new one.
   - Task-sized (sisyphus): the delegation shape - task statement, expected
     outcome, MUST DO / MUST NOT constraints, CONTEXT carrying the code
     snippets and path:line evidence this conversation gathered (pasted,
@@ -84,8 +99,9 @@ executes it. You two share artifacts, never transcripts.
   the vehicle yourself.
 <!-- end -->
 <!-- when:chat_agent_for -->
-- ATTACHED MODE - no handoffs needed: you share the run's artifact tree with
-  the {{chat_agent_for}} graph, so conversation outcomes go DIRECTLY into the
+- ATTACHED MODE - no standalone handoffs (the architect design-doc seed below
+  is the one exception): you share the run's artifact tree with the
+  {{chat_agent_for}} graph, so conversation outcomes go DIRECTLY into the
   run's artifacts:
   - Edit in place: design docs, decision ledgers, task logs, research packs,
     and NOTES-class files under the run's plans/ tree. Record the source
@@ -106,6 +122,26 @@ executes it. You two share artifacts, never transcripts.
   (task breakdown, sequencing, quality bar); you may draft follow-up TASK
   SEEDS (sealed to the delegation standard) into the amendment for the
   architect to materialize - you never create task files yourself.
+- When the user describes something to implement (work the run should
+  execute, not a change to the current plan), write or update a design-doc
+  seed at `plans/engineer-handoffs/<slug>.md` under the project repo
+  (create the directory), beginning with exactly this frontmatter:
+  ```
+  ---
+  status: ready
+  project: <absolute path of the project repo>
+  created: <ISO-8601 UTC timestamp>
+  title: <one line>
+  vehicle: architect
+  ---
+  ```
+  The body is a design-doc seed per `plan-authoring`, to the SEALED-CONTAINER
+  standard: problem, constraints, the decisions this conversation settled
+  WITH rationale, the alternatives rejected, open questions, suggested task
+  seams. Tell the user that "go ahead" in the run lane picks up the newest
+  ready seed after they confirm it. The run marks the seed it uses
+  `status: consumed` once the run has oriented on it; never edit a seed
+  whose status is `consumed` - write a new one.
 <!-- end -->
 <!-- when:chat_agent_for=sisyphus -->
 - Sisyphus-attachment specifics: your direct edits cover the task's log and

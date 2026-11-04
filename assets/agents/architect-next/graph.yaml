@@ -122,6 +122,10 @@ session:
       mixes both, route CHAT: the engineer can always conclude with an artifact
       the user explicitly runs, but a wrongly-routed RUN performs writes nobody
       asked for.
+      A bare go-ahead ("okay, go ahead and get started", "do it") after the
+      conversation discussed work to implement routes RUN; the run picks up the
+      engineer's ready seed or drafts a brief from the conversation and confirms
+      it with the user before any write to the repos.
   chat:
     agent: engineer
     variables:
@@ -148,6 +152,15 @@ initial_state:
   reference_root_path: ''
   core_tools: ''
   design_doc_path: ''
+  seed_path: ''
+  draft_path: ''
+  draft_rounds: 0
+  draft_feedback: ''
+  draft_text: ''
+  draft_possible: false
+  draft_title: ''
+  draft_markdown: ''
+  draft_reason: ''
   design_title: ''
   owner_away: false
   top_level: true
@@ -386,6 +399,9 @@ nodes:
       (fail-safe: an unknown value asks), resolve the design doc, create the A2 run
       directory (outside both repos), write the brief, detect re-entry
       ("Architect run id:"), confirm the owner identity, and pull the planning repo.
+      With no design doc named, pick up the engineer's newest ready seed and raise a
+      hard-trigger seed_confirm escalation for it; with no seed either, draft a brief
+      from the message and the earlier turns (draft_brief).
     script: scripts/intake.py
     timeout: 120
     fallback: end_failure
@@ -396,6 +412,148 @@ nodes:
     description: Re-entry switch on the phase recorded at exit (A2/A14).
     script: scripts/resume_route.py
     fallback: end_failure
+
+  confirm_seed:
+    id: confirm_seed
+    type: approval
+    description: >-
+      Terminal prompt for the seed_confirm escalation, reached from ask_dispatch or
+      ask_owner_route through _terminal_prompt - confirm the engineer's newest ready
+      seed as the design doc.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Use this seed'
+      - 'Draft a brief from this conversation instead'
+      - 'Give a doc path instead'
+      - 'Abort the run'
+    routes:
+      'Use this seed': apply_answer
+      'Draft a brief from this conversation instead': apply_answer
+      'Give a doc path instead': apply_answer
+      'Abort the run': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  draft_brief:
+    id: draft_brief
+    type: llm
+    description: >-
+      Draft a minimal design doc from the message and the earlier turns when the run
+      has neither a design doc nor a ready seed; on a redraft, apply the requested
+      changes to the previous draft.
+    instructions: |
+      You draft a MINIMAL design doc for the work the user asked to implement, from
+      the message and the earlier turns of this session only. You read; you never
+      edit files and never run build or test commands here.
+
+      The draft is markdown with these sections:
+      - `# Title` (one line)
+      - Problem
+      - Goal and scope
+      - Decisions the conversation settled (each with its rationale)
+      - Constraints
+      - Acceptance criteria (each one checkable)
+      - Out of scope
+      - Open questions
+
+      Never invent requirements the conversation did not state; a gap is an open
+      question. You may read the code repo to name real files, never to add scope.
+      On a redraft, apply the requested changes to the previous draft and keep the
+      rest of it.
+
+      Output:
+      - draft_possible: false when the message and the turns describe no
+        implementable work; true otherwise.
+      - draft_title: the title (one line).
+      - draft_markdown: the whole draft; "" when draft_possible is false.
+      - draft_reason: why no draft was possible; "" otherwise.
+      - anomalies: anything outside this step's job someone should know; empty is
+        the normal case.
+
+      Code repo: {{code_repo_path}}
+      Mode: {{mode_line}}
+    prompt: |
+      ## Message
+      {{brief}}
+
+      ## Earlier turns in this session (empty when none)
+      {{previous_turns}}
+
+      ## Previous draft (empty on the first draft)
+      {{draft_text}}
+
+      ## Requested changes (empty on the first draft)
+      {{draft_feedback}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls]
+    max_iterations: 10
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        draft_possible: { type: boolean }
+        draft_title: { type: string }
+        draft_markdown: { type: string }
+        draft_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [draft_possible]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: draft_fault
+    next: draft_route
+
+  draft_route:
+    id: draft_route
+    type: script
+    description: >-
+      Write the drafted brief to design-draft.md in the run dir and raise a
+      hard-trigger draft_confirm escalation for it; no draft asks for a design doc.
+    script: scripts/draft_route.py
+    fallback: end_failure
+
+  draft_fault:
+    id: draft_fault
+    type: script
+    description: Fail-safe when drafting died - ask for a design doc instead of guessing.
+    script: scripts/draft_fault.py
+    fallback: end_failure
+
+  confirm_draft:
+    id: confirm_draft
+    type: approval
+    description: >-
+      Terminal prompt for the draft_confirm escalation, reached from ask_dispatch or
+      ask_owner_route through _terminal_prompt - confirm the drafted brief as the
+      design doc.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Use this draft'
+      - 'Edit the draft'
+      - 'Abort the run'
+    routes:
+      'Use this draft': apply_answer
+      'Edit the draft': apply_answer
+      'Abort the run': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  draft_edit:
+    id: draft_edit
+    type: input
+    description: Ask what to change in the drafted brief, then redraft it.
+    question: |
+      What should change in the draft at {{draft_path}}?
+    validation: 'len(input) > 0'
+    state_updates:
+      draft_feedback: '{{input}}'
+    next: draft_brief
 
   orient_read:
     id: orient_read

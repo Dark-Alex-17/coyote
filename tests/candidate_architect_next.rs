@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 614;
+const SMOKE_FLOOR: usize = 668;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -535,67 +535,235 @@ fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
 /// target `fix_done` returns to, the overflow stop in `review_poll`, the
 /// `>=` that stops `review_poll` at `POLL_VISIT_BUDGET`, the PR head check
 /// before `review_update` resolves anything, the trusted author of an own
-/// comment and the failed-read exclusion that keeps `_poll_permissions`
-/// from re-reading the same failing logins every poll.
+/// comment, the failed-read exclusion that keeps `_poll_permissions` from
+/// re-reading the same failing logins every poll, the ready-seed filter, the
+/// `status: consumed` write on a seed the run oriented on, and the hard
+/// trigger that keeps `draft_confirm` off the autonomous ladder. The rest of
+/// the intake guards run in the ignored tail below, which keeps this test near
+/// two minutes.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
-    let sabotages = [
-        (
-            "read-permission",
-            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
-            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
-            "permission: a COLLABORATOR with read -> untrusted, no body, one lookup",
-        ),
-        (
-            "approval-veto",
-            "return not any(r[\"state\"] == \"CHANGES_REQUESTED\" for r in verdicts) and any(",
-            "return any(",
-            "approval: empty decision, one author approves on head, another's latest requests \
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "read-permission",
+                "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
+                "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
+                "permission: a COLLABORATOR with read -> untrusted, no body, one lookup",
+            ),
+            (
+                "approval-veto",
+                "return not any(r[\"state\"] == \"CHANGES_REQUESTED\" for r in verdicts) and any(",
+                "return any(",
+                "approval: empty decision, one author approves on head, another's latest requests \
              changes -> not approved",
-        ),
-        (
-            "fix-origin",
-            "ret = state.get(\"fix_origin_return\") or state.get(\"fix_return_to\") or ",
-            "ret = state.get(\"fix_return_to\") or ",
-            "fix origin: fix_done after a BLOCKED review fix round -> review_update, origin \
+            ),
+            (
+                "fix-origin",
+                "ret = state.get(\"fix_origin_return\") or state.get(\"fix_return_to\") or ",
+                "ret = state.get(\"fix_return_to\") or ",
+                "fix origin: fix_done after a BLOCKED review fix round -> review_update, origin \
              cleared",
-        ),
-        (
-            "truncation",
-            "    if overflow:\n        u.update({\"review_status\": \"truncated\"",
-            "    if False:\n        u.update({\"review_status\": \"truncated\"",
-            "truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in \
+            ),
+            (
+                "truncation",
+                "    if overflow:\n        u.update({\"review_status\": \"truncated\"",
+                "    if False:\n        u.update({\"review_status\": \"truncated\"",
+                "truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in \
              review_truncated, review_items untouched",
-        ),
-        (
-            "visit-budget",
-            "    u[\"review_polls_run\"] = runs + 1\n    if runs >= POLL_VISIT_BUDGET:\n",
-            "    u[\"review_polls_run\"] = runs + 1\n    if runs > POLL_VISIT_BUDGET:\n",
-            "watch: review_poll at the run-wide visit budget -> visit_cap -> review_route",
-        ),
-        (
-            "push-check",
-            "    if not sha or oid != sha:\n",
-            "    if False:\n",
-            "watch: review_update with a head mismatch -> review_push_mismatch, nothing resolved \
+            ),
+            (
+                "visit-budget",
+                "    u[\"review_polls_run\"] = runs + 1\n    if runs >= POLL_VISIT_BUDGET:\n",
+                "    u[\"review_polls_run\"] = runs + 1\n    if runs > POLL_VISIT_BUDGET:\n",
+                "watch: review_poll at the run-wide visit budget -> visit_cap -> review_route",
+            ),
+            (
+                "push-check",
+                "    if not sha or oid != sha:\n",
+                "    if False:\n",
+                "watch: review_update with a head mismatch -> review_push_mismatch, nothing resolved \
              or posted, stop ledgered",
-        ),
-        (
-            "own-author",
-            "return _trusted(state, u, c) and (OWN_MARKER in body",
-            "return (OWN_MARKER in body",
-            "own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
-        ),
-        (
-            "permission-stall",
-            "if login and login not in cached and login not in failed]",
-            "if login and login not in cached]",
-            "permission stall: a single failing login is read once across three polls",
-        ),
-    ];
-    for (label, old, new, row) in sabotages {
+            ),
+            (
+                "own-author",
+                "return _trusted(state, u, c) and (OWN_MARKER in body",
+                "return (OWN_MARKER in body",
+                "own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
+            ),
+            (
+                "permission-stall",
+                "if login and login not in cached and login not in failed]",
+                "if login and login not in cached]",
+                "permission stall: a single failing login is read once across three polls",
+            ),
+            (
+                "seed-ready",
+                "            if fm.get(\"status\") != \"ready\":\n",
+                "            if False:\n",
+                "intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
+            ),
+            (
+                "seed-consumed",
+                "            set_frontmatter(path, k, v)\n",
+                "            pass\n",
+                "research_dispatch: a confirmed seed is consumed once orientation succeeded",
+            ),
+            (
+                "draft-hard-trigger",
+                "hard_trigger=True, tier3_ok=False, data={\"draft_path\": path}",
+                "hard_trigger=False, tier3_ok=False, data={\"draft_path\": path}",
+                "draft_route: a good draft -> design-draft.md in the run dir with the title heading \
+             prefixed, hard-trigger draft_confirm holding the draft",
+            ),
+        ],
+    );
+}
+
+/// The rest of the intake guards, each removed from a scratch copy, turn
+/// their smoke row red: the re-check that a seed is still ready before it is
+/// consumed, the consumption at the step after a successful orientation, the
+/// hard trigger on `seed_confirm`, the `confirm_seed` and `confirm_draft`
+/// terminal prompts, explicit-path precedence over a seed, the project filter,
+/// the blank-input stop, the `draft_possible: false` and empty-draft
+/// fallbacks, `draft_fault`, the `DRAFT_ROUNDS_MAX` check, the drafting
+/// node's output reset, the `draft_confirm` branch read before the generic
+/// abort check, both explicit Abort branches, and the confirmed draft
+/// becoming the design doc.
+#[test]
+#[ignore = "seventeen smoke battery runs take about three minutes; run with -- --ignored"]
+fn intake_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "seed-consume-recheck",
+                "    if frontmatter(read_file(path))[0].get(\"status\") == \"ready\":\n",
+                "    if True:\n",
+                "research_dispatch: a non-seed design doc is untouched and an already consumed seed \
+             keeps its consumer",
+            ),
+            (
+                "seed-consume-at-orient",
+                "    _consume_seed(state, u)\n",
+                "",
+                "intake seed: an explicit path to a ready seed -> consumed at research_dispatch -> a \
+             later go-ahead drafts instead",
+            ),
+            (
+                "seed-hard-trigger",
+                "hard_trigger=True, tier3_ok=False, data={\"seed_path\": seed}",
+                "hard_trigger=False, tier3_ok=False, data={\"seed_path\": seed}",
+                "escalate_gate: seed_confirm skips the ladder under escalation_policy=autonomous",
+            ),
+            (
+                "seed-prompt",
+                "\"seed_confirm\": \"confirm_seed\", \"draft_confirm\"",
+                "\"draft_confirm\"",
+                "ask_dispatch: seed_confirm -> confirm_seed, parked recorded",
+            ),
+            (
+                "draft-prompt",
+                ", \"draft_confirm\": \"confirm_draft\"}",
+                "}",
+                "ask_dispatch: draft_confirm -> confirm_draft",
+            ),
+            (
+                "draft-abort-order",
+                "    if kind == \"draft_confirm\":\n",
+                "    if kind == \"draft_confirm\" and abort:\n        u[\"failure_reason\"] = kind\n        \
+             u[\"_next\"] = \"end_aborted\"\n    elif kind == \"draft_confirm\":\n",
+                "apply_answer: draft_confirm free-text edit mentioning abort -> draft_brief with the \
+             feedback, round 1",
+            ),
+            (
+                "draft-use",
+                "            u[\"design_doc_path\"] = os.path.abspath(draft)\n",
+                "            u[\"design_doc_path\"] = \"\"\n",
+                "apply_answer: draft_confirm use -> design doc is the draft, orient_read",
+            ),
+            (
+                "explicit-precedence",
+                "        seed = \"\" if dd else _find_seed(u)\n",
+                "        seed = _find_seed(u)\n",
+                "intake seed: an explicit design doc wins over a ready seed, seed untouched",
+            ),
+            (
+                "seed-project",
+                "            if not fm.get(\"project\") or \
+             os.path.realpath(os.path.expanduser(fm[\"project\"])) not in projects:\n",
+                "            if False:\n",
+                "intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
+            ),
+            (
+                "blank-input",
+                "bool(brief.strip() or str(state.get(\"previous_turns\") or \"\").strip())",
+                "True",
+                "intake draft: a blank message and blank earlier turns -> escalation need_design_doc, \
+             nothing drafted",
+            ),
+            (
+                "draft-not-possible",
+                "    if not truthy(state.get(\"draft_possible\")) or not markdown:\n",
+                "    if not markdown:\n",
+                "draft_route: draft_possible false with markdown present -> need_design_doc, no draft \
+             written",
+            ),
+            (
+                "draft-empty",
+                "    if not truthy(state.get(\"draft_possible\")) or not markdown:\n",
+                "    if not truthy(state.get(\"draft_possible\")):\n",
+                "draft_route: an empty draft -> need_design_doc",
+            ),
+            (
+                "draft-fault",
+                "    return raise_escalation(state, u, _need_design_doc_escalation(\n        \"The step \
+             that drafts",
+                "    u[\"_next\"] = \"orient_read\"\n    return u\n    return raise_escalation(state, \
+             u, _need_design_doc_escalation(\n        \"The step that drafts",
+                "draft_fault: -> need_design_doc naming the failed drafting step",
+            ),
+            (
+                "draft-rounds-max",
+                "        elif rounds > DRAFT_ROUNDS_MAX:\n",
+                "        elif False:\n",
+                "apply_answer: draft_confirm edit at the redraft cap -> need_design_doc",
+            ),
+            (
+                "draft-output-reset",
+                "_DRAFT_OUTPUT_RESET = {\"draft_possible\": False, \"draft_title\": \"\", \
+             \"draft_markdown\": \"\", \"draft_reason\": \"\"}",
+                "_DRAFT_OUTPUT_RESET = {}",
+                "apply_answer: draft_confirm redraft clears the drafting node's last output",
+            ),
+            (
+                "draft-abort",
+                "        if picked == \"Abort the run\":\n",
+                "        if False:\n",
+                "apply_answer: draft_confirm abort -> end_aborted",
+            ),
+            (
+                "seed-abort",
+                "\"mode_invalid\", \"need_design_doc\", \"seed_confirm\", \"clarify\"",
+                "\"mode_invalid\", \"need_design_doc\", \"clarify\"",
+                "apply_answer: seed_confirm abort -> end_aborted, seed still ready",
+            ),
+        ],
+    );
+}
+
+/// One `(label, guard, sabotaged guard, smoke row)` per guard: the guard must
+/// occur exactly once in gates.py, and with it replaced in a scratch copy the
+/// smoke battery must fail with exactly that row's `FAIL` line.
+fn run_smoke_sabotages(python: &Path, yq: &Path, sabotages: &[(&str, &str, &str, &str)]) {
+    for &(label, old, new, row) in sabotages {
         let scratch = scratch_dir(&format!("sabotage-{label}"));
         let copy = scratch_candidate_copy(&scratch);
         let gates = copy.join("scripts").join("gates.py");
@@ -606,7 +774,7 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "{label}: {old:?} must occur exactly once in gates.py"
         );
         fs::write(&gates, text.replacen(old, new, 1)).unwrap();
-        let mut cmd = battery(&python, &scratch);
+        let mut cmd = battery(python, &scratch);
         cmd.current_dir(&copy)
             .env("PATH", path_with(yq.parent().unwrap()))
             .arg("scripts/smoke_test.py");
@@ -655,6 +823,83 @@ fn session_block_check_passes_under_mikefarah_yq() {
     );
 }
 
+/// The run's seed pickup reads what the attached engineer writes, and the
+/// standalone handoff paragraph is hidden in attached mode, so the
+/// architect-attachment block itself must state the seed contract.
+#[test]
+fn engineer_architect_block_states_the_seed_contract() {
+    let text = fs::read_to_string(agents_dir().join("engineer/instructions.md")).unwrap();
+    let open = "<!-- when:chat_agent_for=architect -->";
+    let start = text.find(open).expect("no architect-attachment block") + open.len();
+    let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "When the user describes something to implement",
+        "plans/engineer-handoffs/",
+        "status: ready",
+        "project:",
+        "created:",
+        "vehicle: architect",
+        "once the run has oriented on it",
+        "never edit a seed whose status is `consumed`",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the architect-attachment block does not state {needle:?}:\n{block}"
+        );
+    }
+}
+
+/// An architect run started without a design doc picks up standalone
+/// handoffs, so the standalone block must state the frontmatter it filters on.
+#[test]
+fn engineer_standalone_block_states_the_handoff_contract() {
+    let text = fs::read_to_string(agents_dir().join("engineer/instructions.md")).unwrap();
+    let open = "<!-- when:!chat_agent_for -->";
+    let start = text.find(open).expect("no standalone block") + open.len();
+    let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "plans/engineer-handoffs/",
+        "status: ready",
+        "project:",
+        "created:",
+        "vehicle:",
+        "An architect run only picks handoffs with `vehicle: architect`",
+        "once it has oriented on it",
+        "never edit a consumed handoff",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the standalone block does not state {needle:?}:\n{block}"
+        );
+    }
+}
+
+/// A bare go-ahead after a design discussion is what starts a run without a
+/// doc path, so the session router must send it to RUN, where the seed pickup
+/// or the drafted brief takes over.
+#[test]
+fn route_instructions_send_a_bare_go_ahead_to_run() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let route = doc["session"]["route"]["instructions"]
+        .as_str()
+        .expect("graph.yaml has session.route.instructions");
+    let flat = route.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "A bare go-ahead (\"okay, go ahead and get started\", \"do it\")",
+        "routes RUN",
+        "the run picks up the engineer's ready seed or drafts a brief",
+        "confirms it with the user before any write to the repos",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the route instructions do not state {needle:?}:\n{route}"
+        );
+    }
+}
+
 /// Opt-in: the walk runs all 48 mode combinations through the real gates
 /// inside scratch repos and takes three to five minutes, so it is ignored by
 /// default and run with `cargo test --test candidate_architect_next -- --ignored`.
@@ -691,6 +936,13 @@ fn mode_matrix_walks_every_combination() {
         "the matrix shrank below {MATRIX_FLOOR} checks: {total}\n{report}"
     );
     assert_no_bytecode_under_candidate();
+    // Echo the battery's own summary lines so `-- --nocapture` shows the
+    // measured N/N and region count the README records.
+    for line in stdout.lines() {
+        if line.ends_with("checks passed") || line.contains("live regions") {
+            println!("mode matrix: {line}");
+        }
+    }
 }
 
 /// The matrix has no stub branch left: when the repo asset `.shared/utils.sh`
@@ -2291,10 +2543,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![44, 2724, 2733],
+        vec![44, 2910, 2919],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2724, 2733] {
+    for line in [2910, 2919] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -3971,8 +4223,8 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 
 /// Every integer field of every node in the shipped baseline (`timeout`,
 /// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
-/// plus the frozen budgets row and the review watch nodes; a node absent here
-/// declares none.
+/// plus the frozen budgets row, the review watch nodes and `draft_brief`; a
+/// node absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -4003,6 +4255,8 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("debt_assign", "timeout", 300),
     ("delegate", "max_attempts", 1),
     ("delegate", "timeout", 0),
+    ("draft_brief", "max_iterations", 10),
+    ("draft_brief", "timeout", 600),
     ("explore_slice_solo", "max_attempts", 2),
     ("explore_slice_solo", "timeout", 1800),
     ("explore_slice_team", "max_attempts", 2),
@@ -4080,6 +4334,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "ci_rounds",
     "ci_started_at",
     "design_rounds",
+    "draft_rounds",
     "final_integration_strikes",
     "gate_fault_retries",
     "group_index",
@@ -4109,6 +4364,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("CI_WALL_SECS", "", "14400", 14400),
     ("CONFLICT_CYCLES_MAX", "", "2", 2),
     ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
+    ("DRAFT_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
     ("GH_CALL_SECS", "", "90", 90),
     ("GH_LOOP_SECS", "", "180", 180),
     ("OWNER_POLL_MAX", "", "2", 2),
@@ -4442,8 +4698,9 @@ fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
 }
 
 /// How each llm node's output schema carries the `anomalies` channel in the
-/// staging baseline plus `review_triage`: `Plain` is the optional
-/// string-array property, `NoSchema` is a node with no `output_schema` at all.
+/// staging baseline plus `review_triage` and `draft_brief`: `Plain` is the
+/// optional string-array property, `NoSchema` is a node with no
+/// `output_schema` at all.
 #[derive(Clone, Copy, Debug)]
 enum AnomaliesChannel {
     Plain,
@@ -4456,6 +4713,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("author_plan", AnomaliesChannel::Plain),
     ("batch_triage", AnomaliesChannel::Plain),
     ("ci_diagnose", AnomaliesChannel::Plain),
+    ("draft_brief", AnomaliesChannel::Plain),
     ("integrate_findings", AnomaliesChannel::Plain),
     ("ladder_judge", AnomaliesChannel::Plain),
     ("orient_read", AnomaliesChannel::Plain),
@@ -5295,7 +5553,7 @@ fn census_files(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// The README's recorded census is a live `diff -u` against the staging
+/// The README's recorded census is a live `diff --minimal -u` against the staging
 /// tree: the same set of differing files, each with the hunk count it
 /// states. A file only the candidate has is diffed against `/dev/null`, so it
 /// must be listed too; a staging file the candidate lacks fails. The staging
@@ -5331,15 +5589,16 @@ fn readme_census_matches_a_live_diff_against_the_staging_tree() {
         };
         let out = output_with_timeout(
             Command::new("diff")
+                .arg("--minimal")
                 .arg("-u")
                 .arg(base)
                 .arg(candidate_dir().join(rel)),
             GATE_LIMIT,
-            "diff -u",
+            "diff --minimal -u",
         );
         assert!(
             matches!(out.status.code(), Some(0 | 1)),
-            "diff -u {rel}: {}",
+            "diff --minimal -u {rel}: {}",
             transcript(&out)
         );
         let hunks = String::from_utf8_lossy(&out.stdout)

@@ -45,3 +45,11 @@ Graph sessions: `session.chat.agent: engineer` in an orchestrator graph, with
 
 Standalone handoffs land in `plans/engineer-handoffs/<slug>.md`, outside the
 numbered step handoffs a phased plan keeps in `plans/handoffs/`.
+
+Attached to `architect-next`, the engineer also writes a design-doc seed there
+when the user describes work to implement. Each seed and handoff starts with
+`status: ready`, `project:`, `created:`, `title:` and `vehicle:` frontmatter.
+A run started with no doc path offers the newest ready seed for its project
+whose `vehicle` is `architect` (a seed with no `vehicle` key counts as
+`architect`), and marks the one it uses `status: consumed` once the run has
+oriented on it.
