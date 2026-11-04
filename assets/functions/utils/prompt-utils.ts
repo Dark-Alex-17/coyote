@@ -209,6 +209,18 @@ function promptChannel(action: Action, question: string, options: string[]): Ans
   return mapped;
 }
 
+const TUI_NO_CHANNEL = "prompts are not available in the TUI without the reply channel";
+
+// Under the full-screen UI the terminal belongs to the UI's own reader: a
+// fallback prompt would be invisible and a typed answer (a password included)
+// would land in its composer. Without the channel the helper fails closed.
+function refuseTerminalUnderTui(): void {
+  if (process.env.COYOTE_UI === "tui") {
+    showError(TUI_NO_CHANNEL);
+    process.exit(1);
+  }
+}
+
 // Where terminal prompts are written and read: /dev/tty when it opens, else
 // stderr and stdin.
 interface Terminal {
@@ -291,6 +303,7 @@ function readHidden(tty: Terminal, saved: string, prompt: string): string | null
 }
 
 function ttyLine(prompt: string, optionLines: string[] = [], hidden = false): string | null {
+  refuseTerminalUnderTui();
   const tty = openTerminal();
   try {
     if (!hidden) {

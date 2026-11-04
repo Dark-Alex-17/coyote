@@ -223,7 +223,20 @@ _coyote_prompt() {
   printf '%s' "$answer"
 }
 
+_COYOTE_TUI_NO_CHANNEL="prompts are not available in the TUI without the reply channel"
+
+# Under the full-screen UI the terminal belongs to the UI's own reader: a
+# fallback prompt would be invisible and a typed answer (a password included)
+# would land in its composer. Without the channel the helper fails closed.
+_coyote_refuse_terminal_under_tui() {
+  if [[ "${COYOTE_UI:-}" == "tui" ]]; then
+    echo "$_COYOTE_TUI_NO_CHANNEL" >&2
+    exit 1
+  fi
+}
+
 _read_stdin() {
+  _coyote_refuse_terminal_under_tui
   read -r "$@" </dev/tty
 }
 
@@ -303,6 +316,7 @@ input() {
     _coyote_prompt input "$1"
     return $?
   fi
+  _coyote_refuse_terminal_under_tui
   _prompt_text "$1"
   echo -en "\033[36m\c" >&2
   _read_stdin -r text
@@ -314,6 +328,7 @@ confirm() {
     _coyote_prompt confirm "$1"
     return $?
   fi
+  _coyote_refuse_terminal_under_tui
   # stty targets stdin, which is /dev/null when the host spawns tool scripts;
   # point it at the real terminal and stay quiet when there isn't one.
   trap "stty echo </dev/tty 2>/dev/null; exit" EXIT
@@ -352,6 +367,7 @@ list() {
     _coyote_prompt select "$1" "${@:2}"
     return $?
   fi
+  _coyote_refuse_terminal_under_tui
   _prompt_text "$1 "
   declare opts=("${@:2}")
   declare opts_count=$(($# - 1))
@@ -400,6 +416,7 @@ checkbox() {
     _coyote_prompt checkbox "$1" "${@:2}"
     return $?
   fi
+  _coyote_refuse_terminal_under_tui
   _prompt_text "$1"
   declare opts
   opts=("${@:2}")
@@ -473,6 +490,7 @@ password() {
     _coyote_prompt password "$1"
     return $?
   fi
+  _coyote_refuse_terminal_under_tui
   _prompt_text "$1"
   echo -en "\033[36m" >&2
   declare password=''
@@ -500,6 +518,7 @@ password() {
 }
 
 editor() {
+  _coyote_refuse_terminal_under_tui
   tmpfile=$(mktemp)
   _prompt_text "$1"
   echo "" >&2

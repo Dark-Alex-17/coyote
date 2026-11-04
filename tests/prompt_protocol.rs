@@ -145,6 +145,107 @@ fn typescript_confirm_without_channel_reads_the_controlling_terminal() {
     );
 }
 
+const TUI_NO_CHANNEL: &str = "prompts are not available in the TUI without the reply channel";
+
+/// Under the full-screen UI the terminal belongs to the UI's own reader,
+/// so without a reply channel the bash helper fails closed: the message
+/// on stderr, a non-zero exit, and no `(y/N)` ever asked on the terminal.
+#[test]
+fn under_the_tui_confirm_without_channel_fails_closed() {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; source \"{HELPER}\"; v=\"$(confirm \"Go? tui-x7x\")\"; echo \"confirm-rc=$? v=[$v]\""
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("confirm-rc=", PTY_DEADLINE).unwrap();
+    assert_fails_closed_under_the_tui(&transcript, "confirm-rc=1 v=[]");
+}
+
+/// The Python helper, same shape: `confirm` exits the process non-zero.
+#[test]
+fn under_the_tui_python_confirm_without_channel_fails_closed() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let driver = "import importlib.util, sys\n\
+        sys.dont_write_bytecode = True\n\
+        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
+        m = importlib.util.module_from_spec(spec)\n\
+        spec.loader.exec_module(m)\n\
+        print(\"confirm-result=\" + str(m.confirm(\"Go? tui-py-x7x\")))\n";
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\"; echo \"confirm-rc=$?\""
+        ))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("confirm-rc=", PTY_DEADLINE).unwrap();
+    assert_fails_closed_under_the_tui(&transcript, "confirm-rc=1");
+    assert!(!transcript.contains("confirm-result="), "{transcript}");
+}
+
+/// The TypeScript helper, same shape.
+#[test]
+fn under_the_tui_typescript_confirm_without_channel_fails_closed() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tui-ts");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(
+        &driver,
+        "import { pathToFileURL } from \"node:url\";\n\
+         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
+         console.log(\"confirm-result=\" + JSON.stringify(prompt.confirm(\"Go? tui-ts-x7x\")));\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"; echo \"confirm-rc=$?\"",
+            driver.display(),
+            helper.display()
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("confirm-rc=", PTY_DEADLINE).unwrap();
+    assert_fails_closed_under_the_tui(&transcript, "confirm-rc=1");
+    assert!(!transcript.contains("confirm-result="), "{transcript}");
+}
+
+fn assert_fails_closed_under_the_tui(transcript: &str, exit_line: &str) {
+    assert!(transcript.contains(TUI_NO_CHANNEL), "{transcript}");
+    assert!(transcript.contains(exit_line), "{transcript}");
+    assert!(
+        !transcript.contains("(y/N)"),
+        "the terminal was asked:\n{transcript}"
+    );
+    assert!(!transcript.contains("coyote_prompt"), "{transcript}");
+}
+
 /// The Python helper's `select` fallback lists each option on its own
 /// line and reads the pick from the terminal.
 #[test]

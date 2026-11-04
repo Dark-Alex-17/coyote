@@ -135,6 +135,18 @@ def _prompt_channel(action, question, options):
     return mapped
 
 
+TUI_NO_CHANNEL = "prompts are not available in the TUI without the reply channel"
+
+
+# Under the full-screen UI the terminal belongs to the UI's own reader: a
+# fallback prompt would be invisible and a typed answer (a password included)
+# would land in its composer. Without the channel the helper fails closed.
+def _refuse_terminal_under_tui():
+    if os.environ.get("COYOTE_UI", "") == "tui":
+        _show_error(TUI_NO_CHANNEL)
+        sys.exit(1)
+
+
 def _open_tty():
     # Built the way getpass does it: open("/dev/tty", "r+") wraps the fd in a
     # BufferedRandom, whose seek test fails on a Linux tty (ESPIPE), so the
@@ -151,6 +163,7 @@ def _clean(text):
 
 
 def _tty_line(prompt, option_lines=()):
+    _refuse_terminal_under_tui()
     text = "".join(option_lines) + prompt
     try:
         tty = _open_tty()
@@ -225,6 +238,7 @@ def input(question):
 def password(question):
     if _channel_enabled():
         return _prompt_channel("password", question, [])
+    _refuse_terminal_under_tui()
     try:
         return getpass.getpass(f"? {_clean(question)} ")
     except EOFError:
