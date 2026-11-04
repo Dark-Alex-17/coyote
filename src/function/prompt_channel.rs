@@ -486,6 +486,28 @@ mod tests {
         );
     }
 
+    /// The descriptor number the dead-reply-path cases point at. A test
+    /// process with many files open may well have it, and a live
+    /// descriptor would turn the "unopenable" path into a working channel
+    /// and the case into a false pass: every driver closes it in the child
+    /// before exec, whatever the parent holds.
+    const DEAD_REPLY_FD: RawFd = 97;
+
+    /// `/dev/fd/<DEAD_REPLY_FD>`; the bash driver checks the number is not
+    /// the channel it opened (closing that one in the child would take the
+    /// real channel away).
+    fn dead_reply_path() -> String {
+        format!("/dev/fd/{DEAD_REPLY_FD}")
+    }
+
+    /// Closes the dead reply descriptor in a child between fork and exec,
+    /// in case the number was opened by another thread after the check.
+    fn close_dead_reply_fd() -> std::io::Result<()> {
+        // SAFETY: close is async-signal-safe; EBADF (already closed) is fine.
+        unsafe { libc::close(DEAD_REPLY_FD) };
+        Ok(())
+    }
+
     /// Installs a bash tool that sources the shipped helper on the
     /// functions bin dir the active config guard points at.
     fn install_tool(name: &str, body: &str) {
@@ -1661,6 +1683,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             stray: Stray,
         ) -> Run {
             let mut server = Server::open().unwrap();
+            assert_ne!(
+                server.child_fd, DEAD_REPLY_FD,
+                "the dead reply descriptor collides with the test's own channel"
+            );
             let mut cmd = Command::new(bash_program().unwrap());
             cmd.arg("-c")
                 .arg(format!("source \"$PROMPT_UTILS\"; {body}"))
@@ -1674,16 +1700,16 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             server.configure(&mut cmd);
-            if detach {
-                // SAFETY: setsid is async-signal-safe and touches no shared state.
-                unsafe {
-                    cmd.pre_exec(|| {
-                        if libc::setsid() < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
+            // SAFETY: close and setsid are async-signal-safe and touch no
+            // shared state.
+            unsafe {
+                cmd.pre_exec(move || {
+                    close_dead_reply_fd()?;
+                    if detach && libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
             }
             let mut child = cmd.spawn().expect("spawn bash");
             server.spawned();
@@ -2657,10 +2683,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             // escape is still answered rather than deadlocking the harness.
             // Descriptor 97 is closed first: a test process with many files
             // open may well have it, and then the path would be live.
+            let dead = dead_reply_path();
             let body = format!(
-                "exec 97>&-; {}; \
-                 COYOTE_PROMPT_REPLY=/dev/fd/97 timeout 10 bash -c '{}'; echo \"outer rc=$?\"; \
-                 COYOTE_PROMPT_REPLY=/dev/fd/97 timeout 10 bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
+                "{}; \
+                 COYOTE_PROMPT_REPLY={dead} timeout 10 bash -c '{}'; echo \"outer rc=$?\"; \
+                 COYOTE_PROMPT_REPLY={dead} timeout 10 bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
                 capture("confirm \"Warm up?\""),
                 "source \"$PROMPT_UTILS\"; v=\"$(confirm \"Go?\")\"; rc=$?; echo \"v=[$v] rc=$rc\"; exit 0",
             );
@@ -3965,9 +3992,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            // SAFETY: setsid is async-signal-safe and touches no shared state.
+            // SAFETY: close and setsid are async-signal-safe and touch no
+            // shared state.
             unsafe {
                 cmd.pre_exec(|| {
+                    close_dead_reply_fd()?;
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -4022,7 +4051,8 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             dir: &Path,
         ) {
             let missing = dir.join("missing").join("reply");
-            for reply in [missing.to_str().unwrap(), "/dev/fd/97"] {
+            let dead = dead_reply_path();
+            for reply in [missing.to_str().unwrap(), dead.as_str()] {
                 let run = drive_with_dead_reply(command("confirm(\"Go?\")"), reply);
                 assert_eq!(run.requests, 0, "{reply}: request sent over a dead channel");
                 assert_eq!(run.code, 0, "{reply}: {}", run.stderr);
