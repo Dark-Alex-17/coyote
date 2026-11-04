@@ -619,11 +619,14 @@ mod tests {
     fn production_half(source: &str) -> &str {
         // A test module is gated plain or, when every case needs unix,
         // with the target in the same attribute.
-        ["\n#[cfg(test)]\nmod tests", "\n#[cfg(all(test, unix))]\nmod tests"]
-            .iter()
-            .filter_map(|marker| source.find(marker))
-            .min()
-            .map_or(source, |end| &source[..end])
+        [
+            "\n#[cfg(test)]\nmod tests",
+            "\n#[cfg(all(test, unix))]\nmod tests",
+        ]
+        .iter()
+        .filter_map(|marker| source.find(marker))
+        .min()
+        .map_or(source, |end| &source[..end])
     }
 
     /// The top-level arguments of the call whose opening paren starts `rest`.
