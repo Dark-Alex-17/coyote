@@ -7756,6 +7756,73 @@ mod tests {
             stub.stop().await;
         }
 
+        mod name_addressing_tests {
+            use super::*;
+
+            /// A trust label the human verbs resolve is still not a destination to the
+            /// tools: `to` and `peer` given the label are refused exactly as a token that
+            /// names nothing is, and the labelled hash appears nowhere in the reply.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn the_tools_refuse_a_label_on_to_and_peer_as_any_other_non_hash() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-name-addressing");
+                let started = started_runtime("mesh-tool-name-addressing").await;
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                let laptop = derived_sighting("name-laptop", Some("maki"));
+                let to = laptop.destination_hash.clone();
+                started.runtime.peers().observe(laptop, SystemTime::now());
+                started
+                    .runtime
+                    .trust()
+                    .trust_destination(
+                        ctx.app.mesh.as_ref(),
+                        &to,
+                        TrustOptions {
+                            label: Some("maki-laptop".to_string()),
+                            note: None,
+                        },
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                assert!(
+                    ctx.app
+                        .mesh
+                        .address_names()
+                        .iter()
+                        .any(|name| name.name == "maki-laptop"
+                            && name.target.destination() == Some(to.as_str())),
+                    "the human verbs resolve the label"
+                );
+
+                for (action, field, extra) in [
+                    ("send", "to", json!({"message": "hi"})),
+                    ("fetch", "peer", json!({"path": "docs/a.md"})),
+                ] {
+                    let call = |token: &str| {
+                        let mut args = extra.clone();
+                        args[field] = json!(token);
+                        args
+                    };
+                    let tool = format!("{MESH_FUNCTION_PREFIX}{action}");
+                    let named = handle_mesh_tool(&mut ctx, &tool, &call("maki-laptop"))
+                        .await
+                        .unwrap();
+                    let nothing = handle_mesh_tool(&mut ctx, &tool, &call("no-such-name"))
+                        .await
+                        .unwrap();
+                    assert_eq!(named["status"], "error", "{action}: {named}");
+                    assert_eq!(
+                        named["kind"], nothing["kind"],
+                        "{action}: {named} {nothing}"
+                    );
+                    assert!(!named.to_string().contains(&to), "{action}: {named}");
+                }
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+            }
+        }
+
         /// A thread is continued, never authored: `mesh__send` and `mesh__ask` take a
         /// `thread` only when this node sent it, asked in it or received a message in it.
         mod thread_rule_tests {
