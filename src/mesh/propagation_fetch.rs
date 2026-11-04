@@ -1245,6 +1245,10 @@ pub(crate) struct BodyPipeline<'a> {
     /// sender's bodies cost one ask however many of them the node serves. A skip for
     /// want of time is not kept, since it says nothing about the sender.
     pub asked: Mutex<HashMap<AddressHash, SourceAsk>>,
+    /// The fetch's own stop: an ask waits on the network, so a stop that fires during
+    /// one ends that wait at once and the body defers unasked, as when the time is
+    /// spent, while the loop runs on to persist what it recorded.
+    pub cancel: CancellationToken,
 }
 
 pub(crate) fn check_bounds(body: &[u8]) -> Result<(), Discard> {
@@ -1339,7 +1343,9 @@ impl BodyPipeline<'_> {
     /// is followed by one more key lookup. `Err(asked)` when the key is still unknown.
     /// The bodies delivered so far are written to disk before an ask waits on the
     /// network; if they cannot be, the ask is skipped rather than risk delivering them
-    /// twice, and the write after the body loop reports the failure.
+    /// twice, and the write after the body loop reports the failure. A stop during the
+    /// ask, or before it, reads as `NoTimeLeft`: nothing is learned about the sender, so
+    /// the next sync asks.
     async fn ask_then_retry(
         &self,
         source: &AddressHash,
@@ -1373,7 +1379,11 @@ impl BodyPipeline<'_> {
                     );
                     return Ok(Err(false));
                 }
-                self.keys.ask_for_source(source).await?
+                tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => SourceAsk::NoTimeLeft,
+                    ask = self.keys.ask_for_source(source) => ask?,
+                }
             }
         };
         if ask != SourceAsk::NoTimeLeft {
@@ -1392,6 +1402,13 @@ impl BodyPipeline<'_> {
             SourceAsk::NotInTable => {
                 debug!(
                     "Propagation fetch from {}: claimed source {source_hex} is not in the peer table, so there is no destination to ask the mesh for",
+                    self.node
+                );
+                Ok(Err(false))
+            }
+            SourceAsk::NoTimeLeft if self.cancel.is_cancelled() => {
+                debug!(
+                    "Propagation fetch from {}: claimed source {source_hex} not asked for yet: the fetch was stopped; the next sync asks",
                     self.node
                 );
                 Ok(Err(false))
@@ -1484,10 +1501,10 @@ impl BodyPipeline<'_> {
 }
 
 /// `wait` on the node, unless `cancel` fires first. Only the waits on the node are
-/// cancellable: the body loop between rounds 2 and 3 runs to its end, so what it records
-/// is persisted however the fetch ends. The token is polled first, so a stopped fetch reads
-/// as `Cancelled` rather than the `LinkClosed` or `Timeout` the library's receipt would
-/// report later.
+/// cancelled this way: the body loop between rounds 2 and 3 runs to its end, its asks of
+/// the mesh cut short by the same token, so what it records is persisted however the fetch
+/// ends. The token is polled first, so a stopped fetch reads as `Cancelled` rather than
+/// the `LinkClosed` or `Timeout` the library's receipt would report later.
 async fn unless_cancelled<T>(
     cancel: &CancellationToken,
     wait: impl Future<Output = Result<T, RequestError>>,
@@ -1629,6 +1646,7 @@ pub(crate) async fn fetch(
         sink,
         node: node_short,
         asked: Mutex::default(),
+        cancel: cancel.clone(),
     };
     let acks =
         process_and_persist(&pipeline, &bodies, store, &mut report, &node_hex, failed).await?;
@@ -2156,6 +2174,7 @@ mod tests {
             sink,
             node: "fake",
             asked: Mutex::default(),
+            cancel: CancellationToken::new(),
         };
         pipeline.process(body, store, now).await.unwrap()
     }
@@ -3320,6 +3339,7 @@ mod tests {
                     sink: &self.sink,
                     node: "fake",
                     asked: Mutex::default(),
+                    cancel: CancellationToken::new(),
                 };
                 let mut report = FetchReport::new("fake".to_string());
                 process_bodies(&pipeline, bodies, &mut self.store, &mut report)
@@ -3489,6 +3509,180 @@ mod tests {
             }
         }
 
+        mod ask_stop_tests {
+            use super::*;
+
+            /// A stop while an ask waits on a silent mesh ends that wait at once: the body
+            /// defers unasked, as when the lookup time is spent, the loop still finishes,
+            /// and the body delivered before the ask stays delivered.
+            #[tokio::test]
+            async fn a_stop_during_a_stalled_ask_defers_the_body_unasked() {
+                install_log_collector();
+                let known = CorePrivateIdentity::new_from_rand(OsRng);
+                let known_id = transport_identity_of(&known);
+                let stranger = CorePrivateIdentity::new_from_rand(OsRng);
+                let stranger_id = transport_identity_of(&stranger);
+                let mut bench = AskBench::new("fetch-ask-stopped", &known_id);
+                let me = bench.me();
+                let bodies = vec![
+                    honest_body(&known, &me, b"delivered before the stop"),
+                    honest_body(&stranger, &me, b"waits on the ask"),
+                ];
+                let stalled = StalledAskKeys {
+                    source: lxmf_delivery_hash(&known_id),
+                    identity: known_id,
+                };
+                let cancel = CancellationToken::new();
+                let pipeline = BodyPipeline {
+                    recipient: &bench.recipient,
+                    delivery: lxmf_delivery_hash(&me),
+                    keys: &stalled,
+                    trust: &bench.trust,
+                    sink: &bench.sink,
+                    node: "fake",
+                    asked: Mutex::default(),
+                    cancel: cancel.clone(),
+                };
+                let mut report = FetchReport::new("fake".to_string());
+                let stop = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    cancel.cancel();
+                });
+
+                let finished = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    process_bodies(&pipeline, &bodies, &mut bench.store, &mut report),
+                )
+                .await;
+
+                stop.await.unwrap();
+                finished
+                    .expect("the stop ended the stalled ask")
+                    .expect("the loop finished");
+                assert_eq!(bench.sink.count(), 1);
+                assert_eq!((report.deferred, report.deferred_after_ask), (1, 0));
+                assert!(pipeline.asked.lock().is_empty(), "a stop is not kept");
+                let stranger_body = transient_id_of(&bodies[1]);
+                assert_eq!(
+                    bench.store.deferral_of(&stranger_body).map(|d| d.asked),
+                    Some(false)
+                );
+                let expected = format!(
+                    "Propagation fetch from fake: claimed source {} not asked for yet: the fetch was stopped; the next sync asks",
+                    short(&lxmf_delivery_hash(&stranger_id).to_hex_string())
+                );
+                assert!(
+                    debug_snapshot().iter().any(|line| line == &expected),
+                    "no debug line {expected:?}"
+                );
+            }
+
+            /// Asks that never go out for want of time.
+            #[derive(Default)]
+            struct NoTimeKeys {
+                asks: Mutex<usize>,
+            }
+
+            #[async_trait]
+            impl SourceKeys for NoTimeKeys {
+                async fn identity_for(
+                    &self,
+                    _source: &AddressHash,
+                ) -> Result<Option<Identity>, RequestError> {
+                    Ok(None)
+                }
+
+                async fn ask_for_source(
+                    &self,
+                    _source: &AddressHash,
+                ) -> Result<SourceAsk, RequestError> {
+                    *self.asks.lock() += 1;
+                    Ok(SourceAsk::NoTimeLeft)
+                }
+            }
+
+            /// A skip for want of time says nothing about the sender, so it is not kept:
+            /// the sender's next body in the same fetch asks again, and each defers unasked.
+            #[tokio::test]
+            async fn an_ask_with_no_time_left_defers_unasked_and_is_not_kept() {
+                install_log_collector();
+                let sender = CorePrivateIdentity::new_from_rand(OsRng);
+                let sender_id = transport_identity_of(&sender);
+                let mut bench = AskBench::new("fetch-ask-no-time", &sender_id);
+                let me = bench.me();
+                let bodies = vec![
+                    honest_body(&sender, &me, b"first"),
+                    honest_body(&sender, &me, b"second"),
+                ];
+                let keys = NoTimeKeys::default();
+                let pipeline = BodyPipeline {
+                    recipient: &bench.recipient,
+                    delivery: lxmf_delivery_hash(&me),
+                    keys: &keys,
+                    trust: &bench.trust,
+                    sink: &bench.sink,
+                    node: "fake",
+                    asked: Mutex::default(),
+                    cancel: CancellationToken::new(),
+                };
+                let mut report = FetchReport::new("fake".to_string());
+
+                process_bodies(&pipeline, &bodies, &mut bench.store, &mut report)
+                    .await
+                    .unwrap();
+
+                assert_eq!(*keys.asks.lock(), 2);
+                assert_eq!((report.deferred, report.deferred_after_ask), (2, 0));
+                assert!(pipeline.asked.lock().is_empty());
+                let expected = format!(
+                    "Propagation fetch from fake: claimed source {} not asked for yet: this fetch's key-lookup time is nearly spent; the next sync asks",
+                    short(&lxmf_delivery_hash(&sender_id).to_hex_string())
+                );
+                assert!(
+                    debug_snapshot().iter().any(|line| line == &expected),
+                    "no debug line {expected:?}"
+                );
+            }
+
+            /// The bodies delivered so far are saved before an ask waits on the network;
+            /// when they cannot be, the ask is skipped rather than risk delivering them
+            /// twice, and the body defers unasked.
+            #[tokio::test]
+            async fn a_save_that_fails_before_an_ask_skips_the_ask() {
+                install_log_collector();
+                let known = CorePrivateIdentity::new_from_rand(OsRng);
+                let known_id = transport_identity_of(&known);
+                let stranger = CorePrivateIdentity::new_from_rand(OsRng);
+                let stranger_id = transport_identity_of(&stranger);
+                let mut bench = AskBench::new("fetch-ask-save-failed", &known_id);
+                let blocker = bench._tmp.path.join("not-a-directory");
+                std::fs::write(&blocker, b"a file").unwrap();
+                bench.store.path = blocker.join("propagation.json");
+                let keys = AskingKeys::default().in_table(&stranger_id, true);
+                keys.known
+                    .lock()
+                    .insert(lxmf_delivery_hash(&known_id), known_id);
+                let me = bench.me();
+                let bodies = vec![
+                    honest_body(&known, &me, b"delivered first"),
+                    honest_body(&stranger, &me, b"would be asked for"),
+                ];
+
+                let report = bench.fetch(&keys, &bodies).await;
+
+                assert_eq!(keys.asks(), 0, "no ask went out");
+                assert_eq!(bench.sink.count(), 1);
+                assert_eq!((report.deferred, report.deferred_after_ask), (1, 0));
+                assert!(
+                    debug_snapshot().iter().any(|line| line.contains(&format!(
+                        "claimed source {} not asked for yet: the messages delivered so far could not be saved first (",
+                        short(&lxmf_delivery_hash(&stranger_id).to_hex_string())
+                    ))),
+                    "no save-failed line"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn a_fetch_dropped_during_an_ask_does_not_deliver_its_earlier_bodies_again() {
             let known = CorePrivateIdentity::new_from_rand(OsRng);
@@ -3512,6 +3706,7 @@ mod tests {
                 sink: &bench.sink,
                 node: "fake",
                 asked: Mutex::default(),
+                cancel: CancellationToken::new(),
             };
             let mut report = FetchReport::new("fake".to_string());
 
@@ -4313,6 +4508,7 @@ mod tests {
                 sink: &fetcher.sink,
                 node: "fake",
                 asked: Mutex::default(),
+                cancel: CancellationToken::new(),
             };
             let mut store = fetcher.store();
             let mut report = FetchReport::new(fake.hex());
