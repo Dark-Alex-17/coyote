@@ -66,7 +66,7 @@ use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
-    Decision, InstancePresence, KeyChangeOutcome, TrustStore, decode_name_hash, parse_hash,
+    Decision, InstancePresence, KeyChangeOutcome, Tier, TrustStore, decode_name_hash, parse_hash,
 };
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
@@ -593,6 +593,50 @@ struct CurrentIds {
     destination_hash: String,
 }
 
+/// A name the human `.mesh` verbs take in place of a hash: one of your running sessions,
+/// or a label you gave a grant in the trust list. Peers never supply these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddressName {
+    pub name: String,
+    pub target: NameTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameTarget {
+    /// A session the instance registry lists as running here, by the destination it serves.
+    Session {
+        destination: String,
+        identity: String,
+    },
+    /// The label of a destination grant.
+    DestinationLabel {
+        destination: String,
+        identity: Option<String>,
+    },
+    /// The label of an identity grant, with every instance of that identity the peer
+    /// table holds, in hash order.
+    IdentityLabel {
+        identity: String,
+        instances: Vec<String>,
+    },
+}
+
+impl NameTarget {
+    /// The one destination the name stands for: an identity label only stands for one
+    /// when the peer table holds exactly one instance of the identity.
+    pub(crate) fn destination(&self) -> Option<&str> {
+        match self {
+            Self::Session { destination, .. } | Self::DestinationLabel { destination, .. } => {
+                Some(destination)
+            }
+            Self::IdentityLabel { instances, .. } => match instances.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            },
+        }
+    }
+}
+
 /// One in-process Reticulum node: a transport over the configured interfaces, one destination
 /// derived from the session's mesh instance id, and the tasks that announce it and track peers.
 pub(crate) struct MeshRuntime {
@@ -1024,6 +1068,58 @@ impl MeshRuntime {
         let mut row = self.instance_row.lock();
         row.session = session.to_string();
         instances::register(&self.cache_dir, &self.current_instance_id(), row.clone());
+    }
+
+    /// Every name the human verbs resolve: your running sessions in destination order,
+    /// then the labelled grants in the trust list's order. An unnamed session and a blank
+    /// label name nothing.
+    pub(crate) fn address_names(&self) -> Vec<AddressName> {
+        let mut sessions: Vec<(String, String)> = self
+            .own_sessions()
+            .into_iter()
+            .filter(|(_, session)| !session.trim().is_empty())
+            .collect();
+        sessions.sort_unstable();
+        let peers = self.peers().snapshot();
+        let mut names: Vec<AddressName> = sessions
+            .into_iter()
+            .map(|(destination, session)| AddressName {
+                name: session,
+                target: NameTarget::Session {
+                    destination,
+                    identity: self.fingerprint.clone(),
+                },
+            })
+            .collect();
+        for record in self.trust().records() {
+            let Some(label) = record.label.filter(|label| !label.trim().is_empty()) else {
+                continue;
+            };
+            let target = match record.tier {
+                Tier::Destination => NameTarget::DestinationLabel {
+                    destination: record.hash,
+                    identity: record.identity,
+                },
+                Tier::Identity => {
+                    let mut instances: Vec<String> = peers
+                        .iter()
+                        .filter(|peer| peer.identity_hash == record.hash)
+                        .map(|peer| peer.destination_hash.clone())
+                        .collect();
+                    instances.sort_unstable();
+                    instances.dedup();
+                    NameTarget::IdentityLabel {
+                        identity: record.hash,
+                        instances,
+                    }
+                }
+            };
+            names.push(AddressName {
+                name: label,
+                target,
+            });
+        }
+        names
     }
 
     /// A peer's `NoAccess` as every request path reports it: the peer by the name the
@@ -5080,7 +5176,8 @@ impl MeshSlot {
         }
     }
 
-    fn display_name_at(&self, destination: &str) -> Option<String> {
+    /// The display name the peer table filed for `destination`, as the peer announced it.
+    pub(crate) fn display_name_at(&self, destination: &str) -> Option<String> {
         self.get()
             .and_then(|runtime| runtime.peers().get(destination))
             .and_then(|peer| peer.display_name)
@@ -5107,6 +5204,13 @@ impl MeshSlot {
     pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
         self.get()
             .map(|runtime| runtime.own_sessions())
+            .unwrap_or_default()
+    }
+
+    /// `MeshRuntime::address_names`, empty while the mesh is off.
+    pub(crate) fn address_names(&self) -> Vec<AddressName> {
+        self.get()
+            .map(|runtime| runtime.address_names())
             .unwrap_or_default()
     }
 

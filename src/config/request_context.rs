@@ -58,8 +58,9 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
-    MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, capped_peer_text, display_text,
-    parse_rfc3339, redact_hashes, rfc3339_utc, short,
+    AddressName, MeshPaths, MeshRuntime, MeshSlot, NameTarget, PeerRecord, age_text,
+    canonical_hash, capped_peer_text, display_text, parse_rfc3339, redact_hashes, rfc3339_utc,
+    short,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -325,6 +326,30 @@ struct DestinationCandidate {
     /// The standing of the record's own identity when the sighting shown is held under
     /// another key; `None` when there is no record or the two agree.
     record_standing: Option<IdentityStanding>,
+    /// What the row offers to type in place of the hash, when the verbs resolve it back
+    /// to this destination and nothing else.
+    typed: Option<TypedName>,
+}
+
+/// A name of yours a completion row offers as its value: a session running here, or the
+/// trust label on the row's grant or on its identity's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypedName {
+    Session(String),
+    Label(String),
+}
+
+impl DestinationCandidate {
+    /// Where the row sorts: your sessions, then your labels, then peers that announce a
+    /// name, then the rest.
+    fn group(&self) -> u8 {
+        match (&self.typed, &self.name) {
+            (Some(TypedName::Session(_)), _) => 0,
+            (Some(TypedName::Label(_)), _) => 1,
+            (None, Some(_)) => 2,
+            (None, None) => 3,
+        }
+    }
 }
 
 /// What a `.mesh` verb accepts as its destination argument; the only thing that differs
@@ -398,8 +423,19 @@ impl DestinationFilter {
 /// `{name or id8} . {dest8} . {trust} . {hops} hops . heard {age}`, a knocker's row ending
 /// ` . {intro}`; a record no cache has heard from has no hops and reads `heard never`. A
 /// deny without an identity falls back to the destination's own short hash for the name.
+/// A row with a name to type offers that name as its value and leads with it, one of
+/// your sessions marked `(you)` after it.
 fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>) {
-    let who = candidate.name.clone().unwrap_or_else(|| {
+    let cut = |name: &str| display_text(name, DISPLAY_NAME_MAX_CHARS);
+    let who = match &candidate.typed {
+        Some(TypedName::Session(session)) => {
+            cut(session).map(|session| format!("{session} . (you)"))
+        }
+        Some(TypedName::Label(label)) => cut(label),
+        None => None,
+    }
+    .or_else(|| candidate.name.clone())
+    .unwrap_or_else(|| {
         let hash = if candidate.identity.is_empty() {
             &candidate.destination
         } else {
@@ -420,7 +456,37 @@ fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>)
         description.push_str(" . ");
         description.push_str(extra);
     }
-    (candidate.destination.clone(), Some(description))
+    let value = match &candidate.typed {
+        Some(TypedName::Session(name) | TypedName::Label(name)) => name.clone(),
+        None => candidate.destination.clone(),
+    };
+    (value, Some(description))
+}
+
+/// The name a row for `destination` offers in place of its hash: your session running
+/// there, else your trust label on it. A name is offered only when it is one word, is not
+/// itself a whole hash (which the verbs would take as given), and every name spelled the
+/// same stands for this destination, which is when the verbs resolve it here.
+fn typed_name(names: &[AddressName], destination: &str) -> Option<TypedName> {
+    let resolves_here = |name: &str| {
+        let spelled = name.to_lowercase();
+        !name.contains(char::is_whitespace)
+            && canonical_hash(name).is_none()
+            && names
+                .iter()
+                .filter(|other| other.name.to_lowercase() == spelled)
+                .all(|other| other.target.destination() == Some(destination))
+    };
+    let pick = |session: bool| {
+        names.iter().find(|name| {
+            matches!(name.target, NameTarget::Session { .. }) == session
+                && name.target.destination() == Some(destination)
+                && resolves_here(&name.name)
+        })
+    };
+    pick(true)
+        .map(|name| TypedName::Session(name.name.clone()))
+        .or_else(|| pick(false).map(|name| TypedName::Label(name.name.clone())))
 }
 
 enum Sighting<'a> {
@@ -498,13 +564,15 @@ impl Sighting<'_> {
             verdict,
             standing,
             record_standing,
+            typed: None,
         }
     }
 }
 
 /// Every destination the caches know, one row each: the peer table newest first, then
 /// the knock cache newest first with one row per destination (its newest knock), then
-/// the destination records nothing above covers, in the list's order. A destination's
+/// the destination records nothing above covers, in the list's order; that order holds
+/// within each group of `DestinationCandidate::group`, the groups in turn. A destination's
 /// first sighting is the one shown and the one judged, which is the sighting `trust`
 /// resolves it from. The trust list is read twice, once for the records and once for
 /// every verdict at a go, the record's own identity judged in the same batch where the
@@ -566,7 +634,8 @@ fn collect_destination_rows(
     );
     let (judged, rekeyed_verdicts) = verdicts.split_at(sightings.len());
     let mut rekeyed_verdicts = rekeyed_verdicts.iter();
-    sightings
+    let names = runtime.address_names();
+    let candidates: Vec<DestinationCandidate> = sightings
         .into_iter()
         .zip(sighted)
         .zip(judged)
@@ -577,11 +646,21 @@ fn collect_destination_rows(
                     .expect("one extra verdict per record held under another key")
                     .1
             });
-            sighting.candidate(record, *verdict, *standing, record_standing, now)
+            let mut candidate =
+                sighting.candidate(record, *verdict, *standing, record_standing, now);
+            candidate.typed = typed_name(&names, &candidate.destination);
+            candidate
         })
         .filter(|candidate| filter.keep(candidate))
-        .map(|candidate| destination_row(&candidate))
-        .collect()
+        .collect();
+    ordered_rows(candidates)
+}
+
+/// The completion rows for `candidates`, grouped by `DestinationCandidate::group` and
+/// in the given order within a group.
+fn ordered_rows(mut candidates: Vec<DestinationCandidate>) -> Vec<(String, Option<String>)> {
+    candidates.sort_by_key(DestinationCandidate::group);
+    candidates.iter().map(destination_row).collect()
 }
 
 fn trust_record_label(record: &TrustRecord) -> String {
@@ -36669,6 +36748,7 @@ mod tests {
                 all_destinations: false,
             },
             record_standing: None,
+            typed: None,
         };
         assert_eq!(
             destination_row(&heard),
@@ -36757,6 +36837,106 @@ mod tests {
         );
     }
 
+    mod name_addressing_tests {
+        use super::*;
+
+        fn hash(byte: u8) -> String {
+            crate::mesh::hex_lower(&[byte; 16])
+        }
+
+        fn session(name: &str, destination: &str) -> AddressName {
+            AddressName {
+                name: name.to_string(),
+                target: NameTarget::Session {
+                    destination: destination.to_string(),
+                    identity: hash(0xee),
+                },
+            }
+        }
+
+        fn label(name: &str, destination: &str) -> AddressName {
+            AddressName {
+                name: name.to_string(),
+                target: NameTarget::DestinationLabel {
+                    destination: destination.to_string(),
+                    identity: None,
+                },
+            }
+        }
+
+        fn candidate(
+            destination: &str,
+            name: Option<&str>,
+            names: &[AddressName],
+        ) -> DestinationCandidate {
+            DestinationCandidate {
+                source: DestinationSource::Peer,
+                destination: destination.to_string(),
+                identity: hash(0xa1),
+                name: name.map(str::to_string),
+                heard: Some((1, "3m ago".to_string())),
+                extra: None,
+                provable: true,
+                trusted_record: true,
+                verdict: Verdict {
+                    decision: Decision::Allow,
+                    rule: Rule::DestinationTrusted,
+                },
+                standing: IdentityStanding::Trusted {
+                    all_destinations: false,
+                },
+                record_standing: None,
+                typed: typed_name(names, destination),
+            }
+        }
+
+        /// Your sessions come first with their name as the value, then your labels, then
+        /// peers that announce a name, then the nameless, each group in the caches' order.
+        #[test]
+        fn completion_rows_offer_sessions_then_labels_then_named_then_nameless() {
+            let (temp, laptop, bea, bare) = (hash(0x11), hash(0x22), hash(0x33), hash(0x44));
+            let names = vec![session("temp", &temp), label("maki-laptop", &laptop)];
+            let rows = ordered_rows(vec![
+                candidate(&bare, None, &names),
+                candidate(&bea, Some("Bea"), &names),
+                candidate(&laptop, Some("maki-laptop"), &names),
+                candidate(&temp, Some("Coyote"), &names),
+            ]);
+            let described: Vec<String> = rows
+                .into_iter()
+                .map(|(value, description)| format!("{value} | {}", description.unwrap()))
+                .collect();
+            assert_eq!(
+                described,
+                [
+                    "temp | temp . (you) . 11111111 . trusted . 1 hops . heard 3m ago".to_string(),
+                    "maki-laptop | maki-laptop . 22222222 . trusted . 1 hops . heard 3m ago"
+                        .to_string(),
+                    format!("{bea} | Bea . 33333333 . trusted . 1 hops . heard 3m ago"),
+                    format!("{bare} | a1a1a1a1 . 44444444 . trusted . 1 hops . heard 3m ago"),
+                ]
+            );
+        }
+
+        /// A name is offered as the value only when the verbs would resolve it back to the
+        /// row: not when another name is spelled the same, nor when it is a whole hash or
+        /// two words.
+        #[test]
+        fn a_name_that_would_not_resolve_here_is_not_offered() {
+            let (a, b) = (hash(0x11), hash(0x22));
+            let shared = vec![session("maki", &a), label("Maki", &b)];
+            assert_eq!(typed_name(&shared, &a), None);
+            assert_eq!(typed_name(&shared, &b), None);
+            assert_eq!(typed_name(&[label("two words", &a)], &a), None);
+            assert_eq!(typed_name(&[label(&b, &a)], &a), None);
+            assert_eq!(
+                typed_name(&[session("temp", &a), label("mine", &a)], &a),
+                Some(TypedName::Session("temp".to_string())),
+                "a session beats a label on the same destination"
+            );
+        }
+    }
+
     /// Each verb's filter against eleven candidates that differ in source, proof,
     /// verdict, identity standing or the record's own identity's standing; no filter
     /// reads anything else.
@@ -36775,6 +36955,7 @@ mod tests {
                 verdict: Verdict { decision, rule },
                 standing,
                 record_standing: None,
+                typed: None,
             };
         let known = IdentityStanding::Trusted {
             all_destinations: false,
@@ -37175,7 +37356,6 @@ mod tests {
                         short(&trusted)
                     ))
                 ),
-                (named.clone(), Some(peer_description.clone())),
                 (
                     named_peer.clone(),
                     Some(format!(
@@ -37184,8 +37364,9 @@ mod tests {
                         short(&named_peer)
                     ))
                 ),
+                (named.clone(), Some(peer_description.clone())),
             ],
-            "peer rows read `{{label or name or id8}} . {{dest8}} . {{trust}} . N hops . heard {{age}}`, most recently seen first, the label and the name cut to the display cap"
+            "peer rows read `{{label or name or id8}} . {{dest8}} . {{trust}} . N hops . heard {{age}}`, the named most recently seen first, then the nameless, the label and the name cut to the display cap"
         );
         let knock = ctx.repl_complete(".mesh", &["knock", ""], "");
         assert_eq!(
@@ -37271,32 +37452,32 @@ mod tests {
         }
 
         let info = ctx.repl_complete(".mesh", &["info", ""], "");
-        assert_eq!(
-            &info[..before.len()],
-            &before[..],
-            "`info` leads with the peer table unchanged"
+        let kim_row = (
+            kim.clone(),
+            Some(format!(
+                "Kim . {} . untrusted . 1 hops . heard 5m ago . {}",
+                short(&kim),
+                &long_intro[..DISPLAY_NAME_MAX_CHARS]
+            )),
+        );
+        let bare_row = (
+            bare.clone(),
+            Some(format!(
+                "{} . {} . untrusted . 1 hops . heard 5m ago . let me in",
+                short(&bare_identity),
+                short(&bare)
+            )),
         );
         assert_eq!(
-            &info[before.len()..],
+            info,
             [
-                (
-                    bare.clone(),
-                    Some(format!(
-                        "{} . {} . untrusted . 1 hops . heard 5m ago . let me in",
-                        short(&bare_identity),
-                        short(&bare)
-                    ))
-                ),
-                (
-                    kim.clone(),
-                    Some(format!(
-                        "Kim . {} . untrusted . 1 hops . heard 5m ago . {}",
-                        short(&kim),
-                        &long_intro[..DISPLAY_NAME_MAX_CHARS]
-                    ))
-                ),
+                before[0].clone(),
+                before[1].clone(),
+                kim_row,
+                before[2].clone(),
+                bare_row,
             ],
-            "then the knockers newest first in the same shape ending with the intro cut to the display cap, a destination with four cached knocks once with its newest age, and the shared destination not again"
+            "`info` offers the named rows before the nameless ones, the peer table before the knockers within each, in the same shape, a knocker's row ending with the intro cut to the display cap, a destination with four cached knocks once with its newest age, and the shared destination not again"
         );
         assert!(
             !info.iter().any(|(_, description)| description
@@ -38187,11 +38368,11 @@ mod tests {
                 fixture.trusted_destination.as_str(),
                 fixture.heard_destination.as_str(),
                 fixture.legacy_destination.as_str(),
-                fixture.legacy_knock.destination_hash.as_str(),
                 fixture.provable_knock.destination_hash.as_str(),
+                fixture.legacy_knock.destination_hash.as_str(),
                 "--identity ",
             ],
-            "heard peers newest first, then knockers newest first, less the blocked instance and the blocked identity's, then the flag"
+            "named rows before nameless ones, each heard peers newest first, then knockers newest first, less the blocked instance and the blocked identity's, then the flag"
         );
         assert!(
             !destinations
@@ -38484,7 +38665,7 @@ mod tests {
         for (args, kept, offers_identities) in [
             (
                 &["info", ""][..],
-                vec![bea, cal, dov, eve, fay, dov_knock, bare, kim],
+                vec![bea, cal, dov, eve, fay, dov_knock, kim, bare],
                 false,
             ),
             (&["status", ""], vec![bea], false),
@@ -38492,7 +38673,7 @@ mod tests {
             (&["knock", ""], vec![bea, cal, fay], false),
             (&["trust", ""], vec![bea, cal, eve, kim], false),
             (&["untrust", ""], vec![bea], false),
-            (&["block", ""], vec![bea, cal, fay, bare, kim], false),
+            (&["block", ""], vec![bea, cal, fay, kim, bare], false),
             (&["unblock", ""], vec![eve], false),
             (&["fetch", ""], vec![bea], false),
             (&["allow", "x", "--peer", ""], vec![bea], true),

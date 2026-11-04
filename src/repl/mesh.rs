@@ -44,12 +44,13 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    AlreadyClosed, FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED,
-    InterfaceState, InterfaceStatus, LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH,
-    MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER,
-    PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
-    loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
+    AddressName, AlreadyClosed, FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS,
+    HUMAN_DECLINED, InterfaceState, InterfaceStatus, LocalEndpoint, LoggingInboundSink,
+    MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NameTarget, NodeOptions,
+    PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord,
+    PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
+    display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339, redact_hashes,
+    refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::render::QuotingError;
 use crate::repl::printer::terminal_width;
@@ -522,12 +523,14 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
     let mut records = runtime.peers().snapshot();
     records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
     let own_sessions = runtime.own_sessions();
+    let names = runtime.address_names();
     let mut facts = Vec::with_capacity(records.len());
     for peer in &records {
         facts.push(HeardFacts {
             no_route: !runtime.path_known(&peer.destination_hash).await,
             is_you: peer.identity_hash == runtime.fingerprint(),
             own_session: own_sessions.get(&peer.destination_hash).cloned(),
+            label: owner_label(&names, &peer.destination_hash).map(str::to_string),
         });
     }
     let trust = runtime.trust();
@@ -569,7 +572,7 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
         |record| unheard_label(&trust, record),
         |identity| grants_all(&trust, identity),
     ));
-    out_text(&render_peers(&rows, now));
+    out_path_text(&render_peers(&rows, now).render(live_prefix()));
     Ok(())
 }
 
@@ -1117,9 +1120,15 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
     let own_sessions = ctx.app.mesh.own_sessions();
+    let names = ctx.app.mesh.address_names();
     let name_at = |destination: &str| match own_sessions.get(destination) {
         Some(session) => own_session_name(session),
-        None => ctx.app.mesh.peer_name_at(destination),
+        None => match owner_label(&names, destination) {
+            Some(label) => {
+                labelled_name(label, ctx.app.mesh.display_name_at(destination).as_deref())
+            }
+            None => ctx.app.mesh.peer_name_at(destination),
+        },
     };
     let asked: Vec<QuestionRow> = ctx
         .app
@@ -2901,13 +2910,7 @@ fn parse_memory_forget_args(
         }
         ForgetScope::All
     } else {
-        let identity = resolve_hash(
-            &target,
-            HashKind::Identity,
-            std::iter::once_with(|| known_hashes(ctx, HashKind::Identity))
-                .flatten()
-                .chain(std::iter::once_with(remembered).flatten()),
-        )?;
+        let identity = resolve_known(ctx, &target, HashKind::Identity, remembered)?;
         match thread {
             Some(thread) if !is_wire_id(&thread) => bail!(
                 "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {}",
@@ -5719,11 +5722,6 @@ fn is_hash_prefix(token: &str) -> bool {
         && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Whether `token` could name a hash at all: a whole one or a prefix of one.
-fn looks_like_hash(token: &str) -> bool {
-    canonical_hash(token).is_some() || is_hash_prefix(token)
-}
-
 /// The whole hash `token` names: 32 hex digits are taken as given, lower-cased, whether or
 /// not this node knows them; a shorter token of at least `HASH_PREFIX_MIN_CHARS` hex digits
 /// must begin exactly one of `known`. A prefix two known hashes share is refused naming
@@ -5974,27 +5972,538 @@ fn known_hashes(ctx: &RequestContext, kind: HashKind) -> Vec<String> {
     known
 }
 
-/// `resolve_hash` over what the node knows of `kind`, gathered only once a prefix has to
-/// be matched, so a whole hash costs no store read.
-fn resolve_known(ctx: &RequestContext, token: &str, kind: HashKind) -> Result<String> {
+/// The hash `token` names for a verb: a whole hash as given, else one of your session
+/// names or trust labels spelled exactly (case aside), else `resolve_hash` over what the
+/// node knows of `kind` and what `also_known` adds. A name therefore beats a hex prefix
+/// it happens to look like. The stores are read only once a whole hash has been ruled
+/// out, and the prefix candidates only once no name matched.
+fn resolve_known(
+    ctx: &RequestContext,
+    token: &str,
+    kind: HashKind,
+    also_known: impl FnOnce() -> Vec<String>,
+) -> Result<String> {
+    if let Some(hash) = canonical_hash(token) {
+        return Ok(hash);
+    }
+    let names = ctx.app.mesh.address_names();
+    if let Some(resolved) = resolve_name(token, kind, &names) {
+        return resolved;
+    }
+    if !is_hash_prefix(token)
+        && let Some(refusal) = unknown_name(token, kind, &names)
+    {
+        return Err(QuotingError::wrap(refusal));
+    }
     resolve_hash(
         token,
         kind,
-        std::iter::once_with(|| known_hashes(ctx, kind)).flatten(),
+        std::iter::once_with(|| known_hashes(ctx, kind))
+            .flatten()
+            .chain(std::iter::once_with(also_known).flatten()),
     )
 }
 
 fn destination_hash(ctx: &RequestContext, token: &str) -> Result<String> {
-    resolve_known(ctx, token, HashKind::Destination)
+    resolve_known(ctx, token, HashKind::Destination, Vec::new)
 }
 
 fn identity_hash(ctx: &RequestContext, token: &str) -> Result<String> {
-    resolve_known(ctx, token, HashKind::Identity)
+    resolve_known(ctx, token, HashKind::Identity, Vec::new)
 }
 
-/// `--peer` on the share verbs: an identity or a destination, whole or by prefix.
+/// `--peer` on the share verbs: an identity or a destination, whole, by prefix or by name.
 fn peer_hash(ctx: &RequestContext, token: &str) -> Result<String> {
-    resolve_known(ctx, token, HashKind::Peer)
+    resolve_known(ctx, token, HashKind::Peer, Vec::new)
+}
+
+/// Whether a name can stand for a `kind` argument. Sessions and destination labels name
+/// instances, so an identity is only ever named by the label of an identity grant.
+fn name_applies(kind: HashKind, target: &NameTarget) -> bool {
+    match kind {
+        HashKind::Destination | HashKind::Peer => true,
+        HashKind::Identity => matches!(target, NameTarget::IdentityLabel { .. }),
+        HashKind::Message => false,
+    }
+}
+
+/// The hash a name gives a `kind` argument; `None` for an identity label that does not
+/// pick one instance when a destination is wanted.
+fn named_hash(kind: HashKind, target: &NameTarget) -> Option<String> {
+    match (kind, target) {
+        (HashKind::Peer | HashKind::Identity, NameTarget::IdentityLabel { identity, .. }) => {
+            Some(identity.clone())
+        }
+        _ => target.destination().map(str::to_string),
+    }
+}
+
+/// The hash the names spelled `token` agree on, case aside; `None` when no name is
+/// spelled so, which leaves `token` to the hash rules. Names that disagree are refused
+/// with every candidate, as is a name that cannot give `kind` a hash.
+fn resolve_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<Result<String>> {
+    let spelled = token.to_lowercase();
+    let matches: Vec<&AddressName> = names
+        .iter()
+        .filter(|name| name.name.to_lowercase() == spelled)
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    let usable: Vec<&AddressName> = matches
+        .iter()
+        .copied()
+        .filter(|name| name_applies(kind, &name.target))
+        .collect();
+    if usable.is_empty() {
+        return Some(Err(QuotingError::wrap(not_an_identity(token, &matches))));
+    }
+    let hashes: Vec<Option<String>> = usable
+        .iter()
+        .map(|name| named_hash(kind, &name.target))
+        .collect();
+    if let Some(Some(first)) = hashes.first()
+        && hashes.iter().all(|hash| hash.as_ref() == Some(first))
+    {
+        return Some(Ok(first.clone()));
+    }
+    let refusal = match usable.as_slice() {
+        [
+            AddressName {
+                name,
+                target:
+                    NameTarget::IdentityLabel {
+                        identity,
+                        instances,
+                    },
+            },
+        ] => unpicked_identity_label(name, identity, instances),
+        _ => ambiguous_name(token, kind, &usable),
+    };
+    Some(Err(QuotingError::wrap(refusal)))
+}
+
+/// One name as a refusal lists it, with the hash a reader can type in its place.
+fn describe_name(name: &AddressName, kind: HashKind) -> NoticeText {
+    let text = NoticeText::default();
+    match &name.target {
+        NameTarget::Session { destination, .. } => text
+            .frame("your session `")
+            .peer(name.name.as_str())
+            .frame(format!("` at {}", short(destination))),
+        NameTarget::DestinationLabel { destination, .. } => text
+            .frame("the trust label `")
+            .peer(name.name.as_str())
+            .frame(format!("` on destination {}", short(destination))),
+        NameTarget::IdentityLabel {
+            identity,
+            instances,
+        } => {
+            let text = text
+                .frame("the trust label `")
+                .peer(name.name.as_str())
+                .frame(format!("` on identity {}", short(identity)));
+            if kind != HashKind::Destination {
+                return text;
+            }
+            match instances.as_slice() {
+                [] => text.frame(", not heard yet"),
+                heard => {
+                    let shorts: Vec<String> =
+                        heard.iter().map(|hash| short(hash).to_string()).collect();
+                    text.frame(format!(", heard at {}", join_and(&shorts)))
+                }
+            }
+        }
+    }
+}
+
+fn joined_names(names: &[&AddressName], kind: HashKind) -> NoticeText {
+    names
+        .iter()
+        .enumerate()
+        .fold(NoticeText::default(), |text, (at, name)| {
+            let text = match at {
+                0 => text,
+                _ if at + 1 == names.len() => text.frame(" and "),
+                _ => text.frame(", "),
+            };
+            text.then(describe_name(name, kind))
+        })
+}
+
+/// Two or more names spelled `token` that give different hashes.
+fn ambiguous_name(token: &str, kind: HashKind, names: &[&AddressName]) -> NoticeText {
+    NoticeText::default()
+        .frame("'")
+        .peer(token)
+        .frame(format!("' names more than one {}: ", kind.noun()))
+        .then(joined_names(names, kind))
+        .frame(
+            ". Type the hash of the one you mean in its place; the 8 characters shown are enough.",
+        )
+}
+
+/// An identity label wanted as a destination when the peer table holds no instance of
+/// the identity, or more than one.
+fn unpicked_identity_label(name: &str, identity: &str, instances: &[String]) -> NoticeText {
+    let head = NoticeText::default()
+        .frame("The trust label `")
+        .peer(name)
+        .frame(format!("` is on identity {}", short(identity)));
+    if instances.is_empty() {
+        return head.frame(", and this node has heard no instance of it, so there is no destination to use yet. Wait until it announces (`.mesh peers` lists it then), or type a destination hash in its place.");
+    }
+    let shorts: Vec<String> = instances
+        .iter()
+        .map(|hash| short(hash).to_string())
+        .collect();
+    head.frame(format!(
+        ", which runs {} instances this node has heard: {}. Type the one you mean in its place, or give each its own name with `.mesh trust <destination> --label <name>`.",
+        instances.len(),
+        join_and(&shorts)
+    ))
+}
+
+/// Names spelled `token` that only stand for instances, given where an identity is wanted.
+fn not_an_identity(token: &str, names: &[&AddressName]) -> NoticeText {
+    let mut identities: Vec<String> = names
+        .iter()
+        .filter_map(|name| match &name.target {
+            NameTarget::Session { identity, .. } => Some(identity.clone()),
+            NameTarget::DestinationLabel { identity, .. } => identity.clone(),
+            NameTarget::IdentityLabel { identity, .. } => Some(identity.clone()),
+        })
+        .collect();
+    identities.sort_unstable();
+    identities.dedup();
+    let text = NoticeText::default()
+        .frame("'")
+        .peer(token)
+        .frame("' is ")
+        .then(joined_names(names, HashKind::Identity))
+        .frame(", which names a running instance, not an identity; ");
+    match identities.as_slice() {
+        [] => text.frame("type the identity hash `.mesh peers` lists for it in its place."),
+        [one] => text.frame(format!("type its identity hash {one} in its place.")),
+        many => text.frame(format!(
+            "type one of the identity hashes {} in its place.",
+            many.join(", ")
+        )),
+    }
+}
+
+/// The refusal for a token that is neither a hash nor one of the names `kind` takes,
+/// listing those names and the closest one; `None` when there are none to list, which
+/// leaves the hash rules' own wording. Only one-word names are listed, as only those
+/// can be typed where one token is read.
+fn unknown_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<NoticeText> {
+    let mut sessions: Vec<&str> = Vec::new();
+    let mut labels: Vec<&str> = Vec::new();
+    for name in names
+        .iter()
+        .filter(|name| name_applies(kind, &name.target) && !name.name.contains(char::is_whitespace))
+    {
+        let list = match name.target {
+            NameTarget::Session { .. } => &mut sessions,
+            NameTarget::DestinationLabel { .. } | NameTarget::IdentityLabel { .. } => &mut labels,
+        };
+        if !list.contains(&name.name.as_str()) {
+            list.push(&name.name);
+        }
+    }
+    if sessions.is_empty() && labels.is_empty() {
+        return None;
+    }
+    let noun = kind.noun();
+    let article = kind.article();
+    let named = if sessions.is_empty() {
+        "trust labels"
+    } else {
+        "sessions or trust labels"
+    };
+    let mut text = NoticeText::default().frame("'").peer(token).frame(format!(
+        "' is not {article} {noun} hash, and none of your {named} is called that."
+    ));
+    if let Some(closest) = closest_name(token, sessions.iter().chain(&labels).copied()) {
+        text = text
+            .frame(" Did you mean `")
+            .peer(closest)
+            .frame("`? Type it in its place.");
+    }
+    for (heading, list) in [
+        ("Your sessions: ", &sessions),
+        ("Your trust labels: ", &labels),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        text = text.frame(format!(" {heading}"));
+        for (at, name) in list.iter().enumerate() {
+            if at > 0 {
+                text = text.frame(", ");
+            }
+            text = text.frame("`").peer(*name).frame("`");
+        }
+        text = text.frame(".");
+    }
+    Some(text.frame(format!(
+        " A name is spelled whole; otherwise give {article} {noun} hash or a unique prefix of one {} ({HASH_PREFIX_MIN_CHARS} or more characters).",
+        kind.listing()
+    )))
+}
+
+/// The name nearest `token` by edit distance, case aside, when it is within half the
+/// longer spelling, so a slip of a letter or two is caught and an unrelated word is not.
+fn closest_name<'a>(token: &str, names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let typed = token.to_lowercase();
+    names
+        .map(|name| (edit_distance(&typed, &name.to_lowercase()), name))
+        .filter(|(distance, name)| *distance <= typed.chars().count().max(name.chars().count()) / 2)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name)
+}
+
+/// Levenshtein distance over characters: the fewest insertions, deletions and
+/// substitutions that turn `a` into `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, left) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, right) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if left == *right {
+                diagonal
+            } else {
+                1 + diagonal.min(above).min(row[j])
+            };
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+#[cfg(test)]
+mod name_addressing_tests {
+    use super::tests::{peer, table_rows};
+    use super::*;
+
+    const TEMP: &str = "11111111111111111111111111111111";
+    const LAPTOP: &str = "22222222222222222222222222222222";
+    const MAKI: &str = "33333333333333333333333333333333";
+    const MAKI_DESK: &str = "44444444444444444444444444444444";
+    const ME: &str = "55555555555555555555555555555555";
+
+    fn session(name: &str, destination: &str) -> AddressName {
+        AddressName {
+            name: name.to_string(),
+            target: NameTarget::Session {
+                destination: destination.to_string(),
+                identity: ME.to_string(),
+            },
+        }
+    }
+
+    fn destination_label(name: &str, destination: &str) -> AddressName {
+        AddressName {
+            name: name.to_string(),
+            target: NameTarget::DestinationLabel {
+                destination: destination.to_string(),
+                identity: Some(MAKI.to_string()),
+            },
+        }
+    }
+
+    fn identity_label(name: &str, instances: &[&str]) -> AddressName {
+        AddressName {
+            name: name.to_string(),
+            target: NameTarget::IdentityLabel {
+                identity: MAKI.to_string(),
+                instances: instances.iter().map(|hash| hash.to_string()).collect(),
+            },
+        }
+    }
+
+    fn names() -> Vec<AddressName> {
+        vec![
+            session("temp", TEMP),
+            destination_label("maki-laptop", LAPTOP),
+            identity_label("maki", &[LAPTOP]),
+        ]
+    }
+
+    fn resolved(token: &str, kind: HashKind, names: &[AddressName]) -> String {
+        resolve_name(token, kind, names)
+            .unwrap_or_else(|| panic!("{token} names nothing"))
+            .unwrap()
+    }
+
+    fn refusal(token: &str, kind: HashKind, names: &[AddressName]) -> String {
+        resolve_name(token, kind, names)
+            .unwrap_or_else(|| panic!("{token} names nothing"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// Your session name and your labels give their destination, spelled in any case.
+    #[test]
+    fn a_session_name_or_a_label_gives_its_destination() {
+        let names = names();
+        assert_eq!(resolved("temp", HashKind::Destination, &names), TEMP);
+        assert_eq!(resolved("TEMP", HashKind::Destination, &names), TEMP);
+        assert_eq!(
+            resolved("maki-laptop", HashKind::Destination, &names),
+            LAPTOP
+        );
+        assert_eq!(resolved("maki-laptop", HashKind::Peer, &names), LAPTOP);
+        assert_eq!(
+            resolved("maki", HashKind::Destination, &names),
+            LAPTOP,
+            "an identity label with one heard instance gives that instance"
+        );
+    }
+
+    /// An identity is named only by an identity label; the peer form takes it as the
+    /// identity, and an instance name is refused with the identity hash to type.
+    #[test]
+    fn an_identity_is_named_only_by_an_identity_label() {
+        let names = names();
+        assert_eq!(resolved("maki", HashKind::Identity, &names), MAKI);
+        assert_eq!(resolved("maki", HashKind::Peer, &names), MAKI);
+        let text = refusal("temp", HashKind::Identity, &names);
+        assert!(text.contains("not an identity"), "{text}");
+        assert!(text.contains(&format!("identity hash {ME}")), "{text}");
+    }
+
+    /// A name two targets share is refused with both, and an identity label over two
+    /// heard instances is refused with each instance and how to name it.
+    #[test]
+    fn an_ambiguous_name_is_refused_with_the_candidates() {
+        let names = vec![session("maki", TEMP), destination_label("Maki", LAPTOP)];
+        let text = refusal("maki", HashKind::Destination, &names);
+        assert!(text.contains("names more than one destination"), "{text}");
+        assert!(
+            text.contains(short(TEMP)) && text.contains(short(LAPTOP)),
+            "{text}"
+        );
+        assert!(text.contains("Type the hash of the one you mean"), "{text}");
+
+        let names = vec![identity_label("maki", &[LAPTOP, MAKI_DESK])];
+        let text = refusal("maki", HashKind::Destination, &names);
+        assert!(text.contains("runs 2 instances"), "{text}");
+        assert!(text.contains(short(MAKI_DESK)), "{text}");
+        assert!(
+            text.contains("`.mesh trust <destination> --label <name>`"),
+            "{text}"
+        );
+
+        let names = vec![identity_label("maki", &[])];
+        let text = refusal("maki", HashKind::Destination, &names);
+        assert!(text.contains("heard no instance"), "{text}");
+    }
+
+    /// A token no name is spelled as is left to the hash rules, so whole hashes and
+    /// prefixes still resolve; a label that looks like a prefix is taken as the label.
+    #[test]
+    fn hashes_and_prefixes_still_resolve() {
+        let names = names();
+        assert!(resolve_name(LAPTOP, HashKind::Destination, &names).is_none());
+        assert!(resolve_name(&LAPTOP[..8], HashKind::Destination, &names).is_none());
+        assert_eq!(
+            resolve_hash(&LAPTOP[..8], HashKind::Destination, [LAPTOP.to_string()]).unwrap(),
+            LAPTOP
+        );
+        let names = vec![destination_label("33333333", LAPTOP)];
+        assert_eq!(resolved("33333333", HashKind::Destination, &names), LAPTOP);
+    }
+
+    /// An unknown name says so, lists your sessions and labels and offers the closest.
+    #[test]
+    fn an_unknown_name_lists_the_names_with_a_did_you_mean() {
+        let names = names();
+        let text = unknown_name("tmep", HashKind::Destination, &names)
+            .unwrap()
+            .plain();
+        assert!(
+            text.starts_with(
+                "'tmep' is not a destination hash, and none of your sessions or trust labels is called that."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Did you mean `temp`?"), "{text}");
+        assert!(text.contains("Your sessions: `temp`."), "{text}");
+        assert!(
+            text.contains("Your trust labels: `maki-laptop`, `maki`."),
+            "{text}"
+        );
+
+        let text = unknown_name("zebra-crossing", HashKind::Destination, &names)
+            .unwrap()
+            .plain();
+        assert!(!text.contains("Did you mean"), "{text}");
+
+        let text = unknown_name("mako", HashKind::Identity, &names)
+            .unwrap()
+            .plain();
+        assert!(text.contains("Did you mean `maki`?"), "{text}");
+        assert!(
+            !text.contains("temp"),
+            "an identity takes no session: {text}"
+        );
+        assert!(unknown_name("tmep", HashKind::Destination, &[]).is_none());
+        assert!(
+            unknown_name(
+                "tmep",
+                HashKind::Destination,
+                &[destination_label("this node", LAPTOP)]
+            )
+            .is_none(),
+            "a name of two words is not listed as one to type"
+        );
+    }
+
+    #[test]
+    fn edit_distance_counts_single_character_edits() {
+        assert_eq!(edit_distance("temp", "temp"), 0);
+        assert_eq!(edit_distance("tmep", "temp"), 2);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "abc"), 3);
+    }
+
+    /// A labelled peer is named by its own grant's label first, else its identity's,
+    /// with the announced name after it, in `.mesh peers` and `.mesh pending` alike.
+    #[test]
+    fn a_labelled_peer_shows_the_label_then_its_announced_name() {
+        let names = names();
+        assert_eq!(owner_label(&names, LAPTOP), Some("maki-laptop"));
+        assert_eq!(
+            owner_label(&[identity_label("maki", &[LAPTOP])], LAPTOP),
+            Some("maki")
+        );
+        assert_eq!(owner_label(&names, TEMP), None, "a session is not a label");
+        assert_eq!(
+            labelled_name("maki-laptop", Some("maki")),
+            "maki-laptop (maki)"
+        );
+        assert_eq!(labelled_name("maki-laptop", None), "maki-laptop");
+
+        let now = SystemTime::now();
+        let facts = HeardFacts {
+            label: Some("maki-laptop".to_string()),
+            ..HeardFacts::default()
+        };
+        let rows = vec![PeerRow::Heard(
+            peer(Some("maki"), 5, now),
+            "trusted",
+            None,
+            facts,
+        )];
+        let text = render_peers(&rows, now).plain();
+        assert_eq!(table_rows(&text)[0][0], "maki-laptop (maki)", "{text}");
+        assert!(text.contains(NAME_ADDRESSING_LINE), "{text}");
+    }
 }
 
 /// The full id of the entry `token` names among those `.mesh pending` lists: the
@@ -6465,7 +6974,8 @@ enum StatusArg<'a> {
     Own,
     Set(&'a str),
     Clear,
-    /// The token as typed; the verb resolves it against what the node knows.
+    /// The token as typed, a hash or a name; the verb resolves it against what the node
+    /// knows.
     Fetch(&'a str),
     Help,
 }
@@ -6483,10 +6993,10 @@ fn classify_status(rest: Option<&str>) -> StatusArg<'_> {
             text => StatusArg::Set(text),
         };
     }
-    if looks_like_hash(rest) {
-        StatusArg::Fetch(rest)
-    } else {
+    if rest.contains(char::is_whitespace) {
         StatusArg::Help
+    } else {
+        StatusArg::Fetch(rest)
     }
 }
 
@@ -7316,18 +7826,49 @@ enum PeerRow {
 /// What this node knows about a heard row beyond its record: whether the transport holds
 /// no path to it, from the cached path table alone, and whether it announces this node's
 /// own identity, as another session on the same config dir does, with the session's name
-/// when the instance registry lists the row's destination as running here.
+/// when the instance registry lists the row's destination as running here, and the trust
+/// label you gave it.
 #[derive(Debug, Default, Clone)]
 struct HeardFacts {
     no_route: bool,
     is_you: bool,
     own_session: Option<String>,
+    label: Option<String>,
 }
 
 /// How `.mesh peers` and `.mesh pending` name an instance that is one of your own running
 /// sessions.
 fn own_session_name(session: &str) -> String {
     format!("(you: {session})")
+}
+
+/// The label you gave `destination` in the trust list: the one on its own grant, else
+/// the one on the grant of the identity the peer table hears it under.
+fn owner_label<'a>(names: &'a [AddressName], destination: &str) -> Option<&'a str> {
+    let find = |own_grant: bool| {
+        names.iter().find(|name| match &name.target {
+            NameTarget::DestinationLabel {
+                destination: at, ..
+            } => own_grant && at == destination,
+            NameTarget::IdentityLabel { instances, .. } => {
+                !own_grant && instances.iter().any(|at| at == destination)
+            }
+            NameTarget::Session { .. } => false,
+        })
+    };
+    find(true)
+        .or_else(|| find(false))
+        .map(|name| name.name.as_str())
+}
+
+/// How `.mesh peers` and `.mesh pending` name a peer you labelled: the label, then the
+/// name the peer announces, if any, in parentheses.
+fn labelled_name(label: &str, display_name: Option<&str>) -> String {
+    let label = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap_or_else(|| label.to_string());
+    match display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)) {
+        Some(announced) => format!("{label} ({announced})"),
+        None => label,
+    }
 }
 
 /// A trust record's key-change mark with, when the peer table has heard it, the destination
@@ -7382,9 +7923,12 @@ fn unheard_rows(
         .collect()
 }
 
-fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
+/// The table is quoted as it stands, since its name cells hold peer names and your own
+/// labels and session names and no cell carries a hint; the lines under it follow the
+/// prefix.
+fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
     if rows.is_empty() {
-        return "No peers heard yet. Nodes appear here as their announces arrive.".to_string();
+        return "No peers heard yet. Nodes appear here as their announces arrive.".into();
     }
     let heard: Vec<&PeerRecord> = rows
         .iter()
@@ -7425,7 +7969,10 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                 let name = match &facts.own_session {
                     Some(session) => own_session_name(session),
                     None if facts.is_you => "(you)".to_string(),
-                    None => name_label(peer.display_name.as_deref()),
+                    None => match &facts.label {
+                        Some(label) => labelled_name(label, peer.display_name.as_deref()),
+                        None => name_label(peer.display_name.as_deref()),
+                    },
                 };
                 let state = [marker, peer.compatibility_line()];
                 [
@@ -7474,16 +8021,21 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
         };
         table.add_row(cells);
     }
-    let mut lines = vec![table.to_string()];
-    lines.extend(key_changes);
+    let mut lines = key_changes;
     lines.push(format!(
         "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
         rows.len()
     ));
+    lines.push(NAME_ADDRESSING_LINE.to_string());
     lines.push(trust_legend().to_string());
     lines.push(peers_legend());
-    lines.join("\n")
+    NoticeText::default()
+        .peer(table.to_string())
+        .frame(format!("\n{}", lines.join("\n")))
 }
+
+/// The `.mesh peers` line under the count that teaches typing a name in place of a hash.
+const NAME_ADDRESSING_LINE: &str = "Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.";
 
 #[cfg(test)]
 mod peers_route_tests {
@@ -7494,6 +8046,7 @@ mod peers_route_tests {
         no_route: true,
         is_you: false,
         own_session: None,
+        label: None,
     };
 
     fn heard(peer: PeerRecord, facts: HeardFacts) -> PeerRow {
@@ -7517,7 +8070,7 @@ mod peers_route_tests {
             heard(at("22", 5, now), HeardFacts::default()),
         ];
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
 
         let cells = table_rows(&text);
         assert_eq!(cells[0][6], NO_ROUTE_STATE, "{text}");
@@ -7536,7 +8089,7 @@ mod peers_route_tests {
         let now = SystemTime::now();
         let rows = vec![heard(at("11", PEER_STALE_AFTER.as_secs(), now), NO_PATH)];
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
 
         assert_eq!(table_rows(&text)[0][6], NO_ROUTE_STATE, "{text}");
         assert!(!text.contains("(stale:"), "{text}");
@@ -7551,7 +8104,7 @@ mod peers_route_tests {
             heard(at("22", PEER_STALE_AFTER.as_secs(), now), NO_PATH),
         ];
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
 
         let state = &table_rows(&text)[1][6];
         assert!(state.starts_with("(superseded by 11111111"), "{text}");
@@ -7573,6 +8126,7 @@ mod peers_you_tests {
             no_route: false,
             is_you: true,
             own_session: None,
+            label: None,
         };
         let rows = vec![
             PeerRow::Heard(peer(Some("Laptop"), 5, now), "trusted", None, you.clone()),
@@ -7596,7 +8150,7 @@ mod peers_you_tests {
             ),
         ];
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
 
         let names: Vec<String> = table_rows(&text)
             .into_iter()
@@ -7658,7 +8212,7 @@ fn trust_legend() -> &'static str {
 /// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -9464,8 +10018,12 @@ mod tests {
             _ => panic!("an 8-hex prefix fetches"),
         }
         assert!(matches!(classify_status(Some("ship it")), StatusArg::Help));
-        assert!(matches!(classify_status(Some("abc")), StatusArg::Help));
-        assert!(matches!(classify_status(Some("abcd123")), StatusArg::Help));
+        for name in ["temp", "abc", "abcd123"] {
+            match classify_status(Some(name)) {
+                StatusArg::Fetch(token) => assert_eq!(token, name),
+                _ => panic!("one word fetches, resolved as a name or a hash: {name}"),
+            }
+        }
     }
 
     /// Whole hashes pass as before, lower-cased; a prefix of at least eight hex digits is
@@ -9575,9 +10133,6 @@ mod tests {
         assert!(!is_hash_prefix(&a));
         assert!(!is_hash_prefix("0123abc"));
         assert!(!is_hash_prefix("0123abcg"));
-        assert!(looks_like_hash(&a));
-        assert!(looks_like_hash("0123abcd"));
-        assert!(!looks_like_hash("ship it"));
     }
 
     #[test]
@@ -10063,7 +10618,11 @@ mod tests {
     #[test]
     fn peers_marks_a_stale_row_and_explains_the_state() {
         let now = SystemTime::now();
-        assert!(render_peers(&[], now).starts_with("No peers heard yet"));
+        assert!(
+            render_peers(&[], now)
+                .plain()
+                .starts_with("No peers heard yet")
+        );
         let old = PeerRecord {
             destination_hash: "ef".repeat(16),
             identity_hash: "01".repeat(16),
@@ -10085,7 +10644,7 @@ mod tests {
                 HeardFacts::default(),
             ),
         ];
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         assert_eq!(
             table_header(&text),
             [
@@ -10118,8 +10677,9 @@ mod tests {
             table_footer(&text),
             [
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                NAME_ADDRESSING_LINE,
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
             ],
             "{text}"
         );
@@ -10178,6 +10738,7 @@ mod tests {
                     no_route: false,
                     is_you: true,
                     own_session: None,
+                    label: None,
                 },
             ),
             PeerRow::Heard(
@@ -10202,6 +10763,7 @@ mod tests {
                     no_route: true,
                     is_you: false,
                     own_session: None,
+                    label: None,
                 },
             ),
             PeerRow::Heard(
@@ -10223,7 +10785,7 @@ mod tests {
                 HeardFacts::default(),
             ),
         ];
-        assert_eq!(render_peers(&rows, now), PEERS_SNAPSHOT);
+        assert_eq!(render_peers(&rows, now).plain(), PEERS_SNAPSHOT);
     }
 
     const PEERS_SNAPSHOT: &str = r#"┌───────────┬──────────┬──────────┬───────────┬──────┬───────────┬─────────────────────────────────────────────────────────────────────────────────────┐
@@ -10241,8 +10803,9 @@ mod tests {
 └───────────┴──────────┴──────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────┘
 1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
 5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
+Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
 
     /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
     #[test]
@@ -10592,7 +11155,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(words, TRUST_LABELS, "{legend}");
 
         let record = deny_record(&"ab".repeat(16), Some(&"cd".repeat(16)));
-        let text = render_peers(&[PeerRow::DenyOnly(record, None)], SystemTime::now());
+        let text = render_peers(&[PeerRow::DenyOnly(record, None)], SystemTime::now()).plain();
         let row = &table_rows(&text)[0];
         assert_eq!(deny_only_label(), "blocked (instance)");
         assert_eq!(row[3], deny_only_label(), "{text}");
@@ -10625,7 +11188,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             PeerRow::Heard(new.clone(), "trusted", None, HeardFacts::default()),
             PeerRow::Heard(live.clone(), "trusted", None, HeardFacts::default()),
         ];
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(
             (rows[0][5].as_str(), rows[0][6].as_str()),
@@ -10643,7 +11206,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             PeerRow::Heard(new.clone(), "trusted", None, HeardFacts::default()),
             PeerRow::Heard(old.clone(), "trusted", None, HeardFacts::default()),
         ];
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(
             (rows[1][5].as_str(), rows[1][6].as_str()),
@@ -10657,7 +11220,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             PeerRow::Heard(renamed, "trusted", None, HeardFacts::default()),
             PeerRow::Heard(old.clone(), "trusted", None, HeardFacts::default()),
         ];
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         assert!(
             !text.contains("superseded by"),
             "a different name is another instance: {text}"
@@ -10668,7 +11231,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             PeerRow::Heard(nameless, "trusted", None, HeardFacts::default()),
             PeerRow::Heard(old.clone(), "trusted", None, HeardFacts::default()),
         ];
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         assert!(
             table_rows(&text)[1][6] == superseded,
             "a nameless successor still supersedes: {text}"
@@ -10748,7 +11311,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             3,
             "the heard destination's deny is not a second row"
         );
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(rows[1][0], "-", "{text}");
         assert_eq!(rows[1][1], "77".repeat(4), "{text}");
@@ -10765,6 +11328,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             table_footer(&text),
             [
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                NAME_ADDRESSING_LINE,
                 trust_legend(),
                 peers_legend().as_str(),
             ],
@@ -10831,7 +11395,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 HeardFacts::default(),
             ),
         ];
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 4, "{text}");
         let marks = key_change_lines(&text);
@@ -10912,8 +11476,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let footer = table_footer(&text);
         assert_eq!(
             footer.len(),
-            6,
-            "three mark lines, then the three legend lines: {text}"
+            7,
+            "three mark lines, then the count, the name line and the two legend lines: {text}"
         );
         assert!(footer[3].starts_with("4 peer(s)."), "{text}");
     }
@@ -10957,7 +11521,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         ));
         assert_eq!(rows.len(), 3, "a record without a mark is not a row");
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(rows[1][0], "Tia", "{text}");
         assert_eq!(rows[1][1], "77".repeat(4), "{text}");
@@ -11042,7 +11606,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert_eq!(rows.len(), 1);
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][1], "77".repeat(4), "{text}");
@@ -11071,7 +11635,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         });
 
         let rows = unheard_rows(vec![record], &[], &[], |_| "trusted", |_| false);
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
 
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text:?}");
@@ -11124,7 +11688,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "a denied record with a mark is one row, not two"
         );
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][0], "-", "{text}");
@@ -11184,7 +11748,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             PeerRow::MarkedOnly(unheard, "trusted", mark(false)),
         ];
 
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
 
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 4, "{text}");
@@ -11207,10 +11771,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "one line per marked row, in row order, each led by the row's dest: {text}"
         );
         let footer = table_footer(&text);
-        assert_eq!(footer.len(), 6, "{text}");
+        assert_eq!(footer.len(), 7, "{text}");
         assert!(footer[3].starts_with("4 peer(s)."), "{text}");
-        assert_eq!(footer[4], trust_legend(), "{text}");
-        assert_eq!(footer[5], peers_legend(), "{text}");
+        assert_eq!(footer[4], NAME_ADDRESSING_LINE, "{text}");
+        assert_eq!(footer[5], trust_legend(), "{text}");
+        assert_eq!(footer[6], peers_legend(), "{text}");
     }
 
     #[test]
@@ -13302,7 +13867,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ),
             PeerRow::Heard(moved, "blocked (identity)", None, HeardFacts::default()),
         ];
-        let text = render_peers(&rows, now);
+        let text = render_peers(&rows, now).plain();
         for marker in [
             "blocked (instance)",
             "blocked (identity)",
@@ -16541,19 +17106,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the newer row of the pair is not superseded: {first}"
                     );
                     let footer = table_footer(&first);
-                    assert_eq!(footer.len(), 3, "{first}");
+                    assert_eq!(footer.len(), 4, "{first}");
                     assert_eq!(
                         footer[0],
                         "5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                         "{first}"
                     );
                     assert_eq!(
-                        footer[1],
+                        footer[2],
                         trust_legend(),
                         "the trust legend comes before the marker legend: {first}"
                     );
                     assert_eq!(
-                        footer[2],
+                        footer[3],
                         peers_legend(),
                         "the legend is the last line: {first}"
                     );
@@ -17222,7 +17787,6 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ".mesh answer".to_string(),
                         ".mesh broadcast".to_string(),
                         ".mesh broadcast --yes".to_string(),
-                        ".mesh status nonsense".to_string(),
                         ".mesh brief note".to_string(),
                     ] {
                         run(&mut ctx, &line)
@@ -17267,6 +17831,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(err.contains("unique prefix"), "{err}");
 
                     let err = run(&mut ctx, ".mesh message nothex --yes hi")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("unique prefix"), "{err}");
+
+                    let err = run(&mut ctx, ".mesh status nonsense")
                         .await
                         .unwrap_err()
                         .to_string();
