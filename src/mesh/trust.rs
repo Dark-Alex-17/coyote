@@ -117,6 +117,8 @@ const TRUST_FILE_HEADER: &str = "\
 # destinations: the instances (one per destination) this node trusts and serves.\n\
 # denied_destinations: instances refused by .mesh block <destination>.\n\
 # blocked_identities: identities refused outright by .mesh block --identity <identity>.\n\
+# self_trust_seeded: true once this node's own identity got its \"this node\" grant (or was\n\
+#   blocked), so it is never granted again; .mesh untrust --identity takes the grant back.\n\
 # Every entry has added_at and note; identities and destinations also have last_seen_at\n\
 #   and label, a destination names its identity, and key_changed on a destination records\n\
 #   the other identity its name was heard under.\n";
@@ -126,6 +128,9 @@ const TRUST_FILE_REMEDY: Remedy =
 
 pub(crate) const MESH_OFF: &str =
     "Mesh is off, so the trust list cannot be changed. Run `.mesh on` first.";
+
+/// The label `seed_self_trust` gives the node's own identity.
+pub(crate) const SELF_TRUST_LABEL: &str = "this node";
 
 /// A stamp taken within this long of the file's mtime is not trusted to detect the next
 /// write: filesystems round mtime to a second (ext3, FAT, HFS+) or two (FAT), so a write
@@ -225,6 +230,10 @@ struct TrustFile {
     denied_destinations: BTreeMap<String, OverlayEntry>,
     #[serde(default)]
     blocked_identities: BTreeMap<String, OverlayEntry>,
+    /// Set once this node's own identity was given its `this node` grant, or passed over
+    /// because it is blocked, so an untrust or unblock of it is never undone at a restart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    self_trust_seeded: bool,
 }
 
 impl Default for TrustFile {
@@ -235,6 +244,7 @@ impl Default for TrustFile {
             destinations: BTreeMap::new(),
             denied_destinations: BTreeMap::new(),
             blocked_identities: BTreeMap::new(),
+            self_trust_seeded: false,
         }
     }
 }
@@ -259,8 +269,9 @@ struct DestinationEntry {
     label: Option<String>,
     note: Option<String>,
     /// Set once this destination's name hash was seen under an identity other than
-    /// `identity`. A current-version file written without it loads with it absent; that
-    /// tolerance is not a precedent for the next field, which bumps `TRUST_FILE_VERSION`.
+    /// `identity`. A current-version file written without it loads with it absent. A
+    /// field added with a default stays inside the version, since a file without it reads
+    /// as before; a change an older reader would misread bumps `TRUST_FILE_VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_changed: Option<KeyChanged>,
 }
@@ -2120,6 +2131,54 @@ impl TrustStore {
         // The identity now lives on disk, so a session twin would list the same hash twice.
         state.session_identities.remove(&identity);
         Ok(change)
+    }
+
+    /// Grants this node's own identity every destination, labelled `this node`, so the
+    /// sessions sharing one config dir can message each other with no trust command. Done
+    /// once per config dir: once `self_trust_seeded` is set nothing happens, so an untrust
+    /// of the grant sticks. A `minted` key is a new identity and is seeded regardless. A
+    /// blocked identity gets no grant but the marker all the same, so a later unblock does
+    /// not grant it behind the user's back; a grant already there keeps its label. Returns
+    /// whether a grant was written. Needs no running mesh: the node calls it while starting.
+    pub(crate) fn seed_self_trust(
+        &self,
+        identity_hash: &str,
+        minted: bool,
+        now: SystemTime,
+    ) -> Result<bool> {
+        let identity = valid_hash("identity", identity_hash)?;
+        let mut state = self.writing()?;
+        if state.file.self_trust_seeded && !minted {
+            return Ok(false);
+        }
+        let mut file = state.file.clone();
+        file.self_trust_seeded = true;
+        let granted = if file.blocked_identities.contains_key(&identity) {
+            false
+        } else {
+            match file.identities.get_mut(&identity) {
+                Some(entry) => !std::mem::replace(&mut entry.all_destinations, true),
+                None => {
+                    let mut entry = identity_entry(now, now, true);
+                    entry.label = Some(SELF_TRUST_LABEL.to_string());
+                    file.identities.insert(identity.clone(), entry);
+                    true
+                }
+            }
+        };
+        if file == state.file {
+            return Ok(false);
+        }
+        self.commit(
+            &mut state,
+            file,
+            TrustMutation::TrustIdentity {
+                identity: identity.clone(),
+                granted,
+            },
+        )?;
+        state.session_identities.remove(&identity);
+        Ok(granted)
     }
 
     /// Removes one destination record and nothing else: the identity record stays, and
@@ -4687,6 +4746,233 @@ mod tests {
             }
         );
         assert_eq!(listed(&reopened), listed(&fx.store));
+    }
+
+    mod self_trust_tests {
+        use super::*;
+
+        fn own_record(store: &TrustStore, identity: &str) -> Option<TrustRecord> {
+            store
+                .records()
+                .into_iter()
+                .find(|record| record.tier == Tier::Identity && record.hash == identity)
+        }
+
+        fn seeded_on_disk(fx: &Fixture) -> bool {
+            let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
+            parse_trust_file(fx.store.path(), &text)
+                .unwrap()
+                .self_trust_seeded
+        }
+
+        #[test]
+        fn a_version_2_file_without_the_marker_loads_unseeded_and_a_seeded_one_reloads_seeded() {
+            let fx = Fixture::new("trust-self-seed-round-trip");
+            let path = fx.store.path().to_path_buf();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("version: {TRUST_FILE_VERSION}\n")).unwrap();
+            assert!(
+                !parse_trust_file(&path, &fs::read_to_string(&path).unwrap())
+                    .unwrap()
+                    .self_trust_seeded
+            );
+
+            let identity = fake_hash(0x5e);
+            assert!(
+                fx.store
+                    .seed_self_trust(&identity, false, t(2_000))
+                    .unwrap()
+            );
+
+            let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
+            assert!(text.contains("\nself_trust_seeded: true\n"), "{text}");
+            assert!(text.contains(&format!("version: {TRUST_FILE_VERSION}\n")));
+            assert!(seeded_on_disk(&fx));
+            let reopened = fx.reopen();
+            assert!(
+                !reopened
+                    .seed_self_trust(&identity, false, t(3_000))
+                    .unwrap()
+            );
+            assert_eq!(fx.file_bytes().unwrap(), text.into_bytes());
+        }
+
+        #[test]
+        fn an_unseeded_list_is_written_without_the_marker() {
+            let fx = Fixture::new("trust-self-seed-absent");
+            fx.trust_identity(&fake_hash(0x11), t(2_000));
+
+            let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
+            assert!(!text.contains("\nself_trust_seeded:"), "{text}");
+        }
+
+        #[test]
+        fn a_minted_identity_is_granted_every_destination_as_this_node() {
+            let fx = Fixture::new("trust-self-seed-mint");
+            let sink = fx.observed();
+            let identity = fake_hash(0x5e);
+
+            assert!(fx.store.seed_self_trust(&identity, true, t(2_000)).unwrap());
+
+            assert_eq!(
+                fx.store.identity_standing(&identity),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            );
+            let record = own_record(&fx.store, &identity).unwrap();
+            assert_eq!(record.label.as_deref(), Some(SELF_TRUST_LABEL));
+            assert!(seeded_on_disk(&fx));
+            let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
+            assert_eq!(env_value(&envs, "COYOTE_MESH_TRUST_TIER"), Some("identity"));
+        }
+
+        #[test]
+        fn an_upgrade_seeds_once_and_an_untrust_is_not_undone() {
+            let fx = Fixture::new("trust-self-seed-once");
+            let identity = fake_hash(0x5e);
+
+            assert!(
+                fx.store
+                    .seed_self_trust(&identity, false, t(2_000))
+                    .unwrap()
+            );
+            assert!(
+                !fx.store
+                    .seed_self_trust(&identity, false, t(3_000))
+                    .unwrap()
+            );
+            fx.store
+                .untrust_identity(&fx.mesh, &identity, false)
+                .unwrap();
+
+            let reopened = fx.reopen();
+            assert!(
+                !reopened
+                    .seed_self_trust(&identity, false, t(4_000))
+                    .unwrap()
+            );
+            assert_eq!(
+                reopened.identity_standing(&identity),
+                IdentityStanding::Unknown
+            );
+            assert!(seeded_on_disk(&fx));
+        }
+
+        #[test]
+        fn a_new_key_is_seeded_even_once_the_marker_is_set() {
+            let fx = Fixture::new("trust-self-seed-new-key");
+            let old = fake_hash(0x5e);
+            let new = fake_hash(0x6f);
+            fx.store.seed_self_trust(&old, false, t(2_000)).unwrap();
+
+            assert!(fx.store.seed_self_trust(&new, true, t(3_000)).unwrap());
+
+            assert_eq!(
+                own_record(&fx.store, &new).unwrap().label.as_deref(),
+                Some(SELF_TRUST_LABEL)
+            );
+            assert!(own_record(&fx.store, &old).is_some());
+        }
+
+        #[test]
+        fn a_blocked_identity_is_marked_seeded_and_granted_nothing() {
+            let fx = Fixture::new("trust-self-seed-blocked");
+            let identity = fake_hash(0x5e);
+            fx.store
+                .block_identity(&fx.mesh, &identity, None, t(1_500))
+                .unwrap();
+
+            assert!(
+                !fx.store
+                    .seed_self_trust(&identity, false, t(2_000))
+                    .unwrap()
+            );
+
+            assert!(seeded_on_disk(&fx));
+            assert!(own_record(&fx.store, &identity).is_none());
+            fx.store
+                .unblock_identity(&fx.mesh, &identity, false)
+                .unwrap();
+            assert!(
+                !fx.store
+                    .seed_self_trust(&identity, false, t(3_000))
+                    .unwrap()
+            );
+            assert_eq!(
+                fx.store.identity_standing(&identity),
+                IdentityStanding::Unknown
+            );
+        }
+
+        #[test]
+        fn a_minted_key_that_is_blocked_is_granted_nothing() {
+            let fx = Fixture::new("trust-self-seed-minted-blocked");
+            let identity = fake_hash(0x5e);
+            fx.store
+                .block_identity(&fx.mesh, &identity, None, t(1_500))
+                .unwrap();
+
+            assert!(!fx.store.seed_self_trust(&identity, true, t(2_000)).unwrap());
+
+            assert!(own_record(&fx.store, &identity).is_none());
+        }
+
+        #[test]
+        fn an_existing_grant_keeps_its_label_and_only_gains_the_marker() {
+            let fx = Fixture::new("trust-self-seed-existing");
+            let identity = fake_hash(0x5e);
+            fx.store
+                .trust_identity(
+                    &fx.mesh,
+                    &identity,
+                    TrustOptions {
+                        label: Some("laptop".to_string()),
+                        note: None,
+                    },
+                    t(1_500),
+                )
+                .unwrap();
+            let sink = fx.observed();
+
+            assert!(
+                !fx.store
+                    .seed_self_trust(&identity, false, t(2_000))
+                    .unwrap()
+            );
+
+            assert!(seeded_on_disk(&fx));
+            assert_eq!(
+                own_record(&fx.store, &identity).unwrap().label.as_deref(),
+                Some("laptop")
+            );
+            assert!(sink.drain().is_empty(), "nothing new was granted");
+        }
+
+        #[test]
+        fn a_binding_only_record_gains_the_grant_and_keeps_its_label() {
+            let fx = Fixture::new("trust-self-seed-binding-only");
+            let peer = announced("alpha");
+            fx.announce(&peer, t(1_000));
+            fx.trust_destination(&peer, t(1_500));
+
+            assert!(
+                fx.store
+                    .seed_self_trust(&peer.identity_hash, false, t(2_000))
+                    .unwrap()
+            );
+
+            assert_eq!(
+                fx.store.identity_standing(&peer.identity_hash),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            );
+            assert_eq!(
+                own_record(&fx.store, &peer.identity_hash).unwrap().label,
+                None
+            );
+        }
     }
 
     #[test]

@@ -596,6 +596,9 @@ struct CurrentIds {
 /// derived from the session's mesh instance id, and the tasks that announce it and track peers.
 pub(crate) struct MeshRuntime {
     fingerprint: String,
+    /// The start gave this node's existing identity its `this node` grant, which the
+    /// caller tells the user about once; a key minted by the start is granted silently.
+    self_trust_seeded_on_upgrade: bool,
     transport_identity: TransportIdentity,
     app_data: Vec<u8>,
     announce: bool,
@@ -698,8 +701,10 @@ impl MeshRuntime {
         let instance_id = session.ensure_mesh_instance_id().to_string();
         let lock = InstanceLock::acquire(&paths.cache_dir, &instance_id)?;
         let identity_lock = IdentityLock::share(&paths.identity_path)?;
+        let minted = !paths.identity_path.exists();
         let core_identity = identity::load_or_mint_identity(&paths.identity_path)?;
         let fingerprint = identity::fingerprint(&core_identity);
+        let self_trust_granted = trust.seed_self_trust(&fingerprint, minted, SystemTime::now())?;
         let transport_identity = to_transport_private_identity(&core_identity);
         let peers = Arc::new(PeerTable::load(
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
@@ -878,6 +883,7 @@ impl MeshRuntime {
         ));
         let runtime = Arc::new(Self {
             fingerprint,
+            self_trust_seeded_on_upgrade: self_trust_granted && !minted,
             transport_identity,
             app_data,
             announce: config.announce,
@@ -1076,6 +1082,10 @@ impl MeshRuntime {
 
     pub(crate) fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    pub(crate) fn self_trust_seeded_on_upgrade(&self) -> bool {
+        self.self_trust_seeded_on_upgrade
     }
 
     /// The configured display name, as the status card carries it to trusted peers.
@@ -16067,6 +16077,136 @@ mod tests {
         let _rotation = IdentityLock::exclusive(&identity_path)
             .expect("rotation is possible once every node has stopped");
         relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod self_trust_tests {
+        use super::*;
+        use crate::mesh::card::{StatusCard, StatusError};
+        use crate::mesh::test_support::wait_for_peer;
+        use crate::mesh::trust::{IdentityStanding, SELF_TRUST_LABEL};
+        use std::fs;
+
+        async fn start_in(tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut Session::default(),
+                mesh_paths(tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        fn installed(runtime: &Arc<MeshRuntime>) -> Arc<MeshSlot> {
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            slot
+        }
+
+        async fn status_of(
+            asker: &MeshRuntime,
+            answerer: &MeshRuntime,
+        ) -> Result<StatusCard, StatusError> {
+            let desc = asker
+                .resolve_destination(&answerer.current_destination_hash())
+                .await
+                .expect("the answerer's destination resolves from its announce");
+            asker.request_status(&desc).await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn two_sessions_on_a_fresh_config_dir_answer_each_other_with_no_trust_command() {
+            let relay = TransportRelay::start().await;
+            let tmp = TempDir::new("node-self-trust-fresh");
+            let a = start_in(&tmp, relay.port).await;
+            let b = start_in(&tmp, relay.port).await;
+            let (slot_a, slot_b) = (installed(&a), installed(&b));
+            assert_eq!(a.fingerprint(), b.fingerprint());
+            assert!(!a.self_trust_seeded_on_upgrade());
+            assert!(!b.self_trust_seeded_on_upgrade());
+            wait_for_peer(&a, &b.current_destination_hash()).await;
+            wait_for_peer(&b, &a.current_destination_hash()).await;
+
+            status_of(&a, &b).await.expect("b answers a");
+            status_of(&b, &a).await.expect("a answers b");
+
+            let text = fs::read_to_string(a.trust().path()).unwrap();
+            assert!(
+                text.contains(&format!("label: {SELF_TRUST_LABEL}\n")),
+                "{text}"
+            );
+            assert!(text.contains("\nself_trust_seeded: true\n"), "{text}");
+            let own: Vec<_> = a
+                .trust()
+                .records()
+                .into_iter()
+                .filter(|record| record.hash == a.fingerprint())
+                .collect();
+            assert_eq!(own.len(), 1, "{own:?}");
+            assert!(own[0].all_destinations);
+            assert!(slot_a.stop().await.unwrap());
+            assert!(slot_b.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn blocking_one_own_instance_refuses_it_while_the_other_is_served() {
+            let relay = TransportRelay::start().await;
+            let tmp = TempDir::new("node-self-trust-block");
+            let a = start_in(&tmp, relay.port).await;
+            let b = start_in(&tmp, relay.port).await;
+            let (slot_a, slot_b) = (installed(&a), installed(&b));
+            wait_for_peer(&a, &b.current_destination_hash()).await;
+            wait_for_peer(&b, &a.current_destination_hash()).await;
+
+            b.trust()
+                .deny_destination(
+                    slot_b.as_ref(),
+                    &a.current_destination_hash(),
+                    None,
+                    SystemTime::now(),
+                    false,
+                )
+                .unwrap();
+
+            let refused = status_of(&a, &b).await;
+            assert!(
+                matches!(refused, Err(StatusError::NotTrustedByPeer(_))),
+                "{refused:?}"
+            );
+            status_of(&b, &a)
+                .await
+                .expect("the instance that is not blocked is still served");
+            assert!(slot_a.stop().await.unwrap());
+            assert!(slot_b.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_existing_key_is_seeded_on_the_first_start_only() {
+            let (addr, relay_handle, _) = loopback_relay().await;
+            let tmp = TempDir::new("node-self-trust-upgrade");
+            let identity = identity::load_or_mint_identity(&mesh_paths(&tmp).identity_path)
+                .map(|key| identity::fingerprint(&key))
+                .unwrap();
+
+            let first = start_in(&tmp, addr.port()).await;
+            assert!(first.self_trust_seeded_on_upgrade());
+            assert_eq!(
+                first.trust().identity_standing(&identity),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            );
+            first.shutdown().await.unwrap();
+
+            let second = start_in(&tmp, addr.port()).await;
+            assert!(!second.self_trust_seeded_on_upgrade());
+            second.shutdown().await.unwrap();
+            relay_handle.abort();
+        }
     }
 
     const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";

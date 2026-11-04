@@ -37,9 +37,9 @@ use crate::mesh::shares::{
     validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
-    BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule, ServedBy,
-    Tier, TrustChange, TrustOptions, TrustOutcome, TrustRecord, TrustStore, Verdict,
-    decode_name_hash, nothing_to_untrust_identity, parse_hash,
+    BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule,
+    SELF_TRUST_LABEL, ServedBy, Tier, TrustChange, TrustOptions, TrustOutcome, TrustRecord,
+    TrustStore, Verdict, decode_name_hash, nothing_to_untrust_identity, parse_hash,
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
@@ -437,6 +437,9 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
     let app = Arc::clone(&ctx.app.config);
     ctx.refresh_mesh_tools(&app);
     out_text(&render_on_summary(&runtime, fresh));
+    if runtime.self_trust_seeded_on_upgrade() {
+        out_text(&self_trust_notice(runtime.fingerprint()));
+    }
     for warning in interface_warnings(&runtime.interface_states()) {
         err_text(&warning);
     }
@@ -3924,7 +3927,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 ),
                 "  the instance id is unchanged, so the node announces a new destination hash under the new identity".to_string(),
                 "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
-                "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band; your own trust list is unchanged".to_string(),
+                format!("  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band; your own trust list keeps its entries and trusts the new identity as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can still message each other"),
                 format!(
                     "{DRY_RUN_NOTHING_CHANGED} To rotate, run: .mesh rotate --confirm {expected}"
                 ),
@@ -3938,10 +3941,26 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Some(_) => {
             drop(lock);
             let rotation = identity::rotate_identity(&path, &old, SystemTime::now())?;
-            out_text(&format!(
-                "Rotated the mesh identity: {} -> {}.\nPredecessors recorded: {}. Run .mesh on to announce the new identity; peers must re-trust it.",
-                rotation.old_fingerprint, rotation.new_fingerprint, rotation.predecessors
-            ));
+            let new = &rotation.new_fingerprint;
+            // A new key is a new identity, so it gets the grant a first key gets.
+            let seeded = TrustStore::open(&MeshPaths::from_env().config_dir)
+                .and_then(|trust| trust.seed_self_trust(new, true, SystemTime::now()));
+            let mut text = format!(
+                "Rotated the mesh identity: {} -> {new}.\nPredecessors recorded: {}. Run .mesh on to announce the new identity; peers must re-trust it.",
+                rotation.old_fingerprint, rotation.predecessors
+            );
+            if matches!(seeded, Ok(true)) {
+                text.push_str(&format!(
+                    "\nTrusted the new identity {} as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can message each other.",
+                    short(new)
+                ));
+            }
+            out_text(&text);
+            seeded.with_context(|| {
+                format!(
+                    "The new identity was not added to your trust list, so your sessions on this config dir cannot message each other yet. Run .mesh on, then .mesh trust --identity {new}."
+                )
+            })?;
         }
     }
     Ok(())
@@ -6713,6 +6732,15 @@ fn render_on_summary(runtime: &MeshRuntime, fresh: bool) -> String {
         runtime.current_destination_hash(),
         runtime.current_instance_id(),
         runtime.interfaces().join(", ")
+    )
+}
+
+/// Told once, on the first start that gave an existing identity its own grant; a fresh
+/// config dir gets the grant with its first key and needs no telling.
+fn self_trust_notice(identity: &str) -> String {
+    format!(
+        "Trusted your own identity {} as \"{SELF_TRUST_LABEL}\", so your other sessions on this config dir can message this one; .mesh untrust --identity {identity} takes the grant back.",
+        short(identity)
     )
 }
 
@@ -14625,6 +14653,110 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(err.contains("No mesh identity"), "{err}");
             assert!(err.contains(".mesh on"), "{err}");
             assert!(!guard.path.join("mesh").exists());
+        }
+
+        mod self_trust_tests {
+            use super::*;
+
+            #[test]
+            fn the_notice_says_what_was_trusted_why_and_how_to_take_it_back() {
+                let identity = "ab".repeat(16);
+
+                let text = self_trust_notice(&identity);
+
+                assert_eq!(
+                    text,
+                    format!(
+                        "Trusted your own identity abababab as \"this node\", so your other sessions on this config dir can message this one; .mesh untrust --identity {identity} takes the grant back."
+                    )
+                );
+                assert!(text.is_ascii());
+            }
+
+            #[cfg(unix)]
+            #[test]
+            #[serial]
+            fn rotate_trusts_the_new_identity_as_this_node() {
+                let guard = TestConfigDirGuard::new("repl-mesh-rotate-self-trust");
+                let _capture = capture::install();
+                let (_, _, old) = minted_key(&guard);
+                let mut ctx = off_ctx();
+
+                run_async(run(
+                    &mut ctx,
+                    &format!(".mesh rotate --confirm rotate-{}", short(&old)),
+                ))
+                .unwrap();
+
+                let new =
+                    fingerprint(&identity::current_identity(&identity::identity_path()).unwrap());
+                let store = TrustStore::open(&guard.path).unwrap();
+                let record = store
+                    .records()
+                    .into_iter()
+                    .find(|record| record.tier == Tier::Identity && record.hash == new)
+                    .expect("the new identity is trusted");
+                assert!(record.all_destinations);
+                assert_eq!(record.label.as_deref(), Some(SELF_TRUST_LABEL));
+                let out = stdout_lines().join("\n");
+                assert!(
+                    out.contains(&format!(
+                        "Trusted the new identity {} as \"this node\", so your sessions on this config dir can message each other.",
+                        short(&new)
+                    )),
+                    "{out}"
+                );
+            }
+
+            #[cfg(unix)]
+            #[test]
+            #[serial]
+            fn mesh_on_tells_an_existing_identity_once_and_a_fresh_one_never() {
+                use crate::mesh::test_support::{loopback_relay, private_config};
+                use crate::testing::EnvVarGuard;
+                use crate::utils::get_env_name;
+
+                let guard = TestConfigDirGuard::new("repl-mesh-on-self-trust");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let (_, _, identity) = minted_key(&guard);
+                let notice = self_trust_notice(&identity);
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(private_config(addr.port()), true);
+                    ctx.session = Some(Session::default());
+
+                    run(&mut ctx, ".mesh on --yes").await.unwrap();
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    run(&mut ctx, ".mesh on --yes").await.unwrap();
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+
+                    let out = stdout_lines();
+                    assert_eq!(
+                        out.iter().filter(|line| **line == notice).count(),
+                        1,
+                        "{out:?}"
+                    );
+                    let summary = out
+                        .iter()
+                        .position(|line| line.starts_with("Mesh is on for this session"))
+                        .unwrap();
+                    assert_eq!(out[summary + 1], notice, "{out:?}");
+
+                    fs::remove_dir_all(guard.path.join("mesh")).unwrap();
+                    let before = stdout_lines().len();
+                    run(&mut ctx, ".mesh on --yes").await.unwrap();
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    let fresh = &stdout_lines()[before..];
+                    assert!(
+                        !fresh
+                            .iter()
+                            .any(|line| line.starts_with("Trusted your own identity")),
+                        "{fresh:?}"
+                    );
+                    relay_handle.abort();
+                });
+            }
         }
 
         #[cfg(unix)]
