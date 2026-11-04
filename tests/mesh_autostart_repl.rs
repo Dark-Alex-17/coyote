@@ -174,7 +174,12 @@ impl Probe {
         let temp_root = fresh_dir(&format!("{label}-tmp"));
         let vault_pass = config_dir.join("vault-pass");
         fs::write(&vault_pass, "test-password\n").unwrap();
-        let started = marker_command("MESH_STARTED", &config_dir);
+        // The identity is written before the marker, so it is on disk once the marker is.
+        let started = format!(
+            r#"echo "$COYOTE_MESH_IDENTITY" > "{}"; {}"#,
+            own_identity_log(&config_dir).display(),
+            marker_command("MESH_STARTED", &config_dir)
+        );
         let stopped = marker_command("MESH_STOPPED", &config_dir);
         let interfaces: String = relay_ports
             .iter()
@@ -303,6 +308,15 @@ impl Probe {
             .count()
     }
 
+    /// This node's identity hash as the last `mesh.started` hook saw it.
+    fn own_identity(&self) -> String {
+        let text = fs::read_to_string(own_identity_log(&self.config_dir))
+            .expect("the mesh.started hook wrote the node identity");
+        let identity = text.trim().to_string();
+        assert_eq!(identity.len(), 32, "{text:?}");
+        identity
+    }
+
     /// Hooks are spawned, not awaited, by the binary; bounded poll for the marker.
     fn wait_for_marker(&self, marker: &str) {
         self.wait_for_marker_count(marker, 1);
@@ -333,6 +347,10 @@ impl Drop for Probe {
 
 fn marker_log(dir: &Path, marker: &str) -> PathBuf {
     dir.join(format!("mesh-events-{marker}.log"))
+}
+
+fn own_identity_log(dir: &Path) -> PathBuf {
+    dir.join("mesh-own-identity.log")
 }
 
 fn marker_command(marker: &str, dir: &Path) -> String {
@@ -1550,6 +1568,15 @@ fn trust_file_keys(config_dir: &Path, section: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `trust_file_keys`, with `own_identity` left out of `identities`, where every start
+/// seeds this node's own grant. The other sections are read as they stand.
+fn foreign_trust_file_keys(config_dir: &Path, section: &str, own_identity: &str) -> Vec<String> {
+    trust_file_keys(config_dir, section)
+        .into_iter()
+        .filter(|key| section != "identities" || key != own_identity)
+        .collect()
+}
+
 /// Sends `line`, waits for the regex `expected` and returns the escape-stripped
 /// transcript through the next prompt; `expected` is the one line the step pins.
 fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
@@ -1581,6 +1608,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
     probe.wait_for_marker("MESH_STARTED");
     let dir = probe.config_dir.clone();
+    let own = probe.own_identity();
     let dest = "cd".repeat(16);
     let id = "ef".repeat(16);
     let no_entries = |label: &str| {
@@ -1591,7 +1619,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
             "blocked_identities",
         ] {
             assert!(
-                trust_file_keys(&dir, section).is_empty(),
+                foreign_trust_file_keys(&dir, section, &own).is_empty(),
                 "{label}: {section} must be empty"
             );
         }
@@ -1645,7 +1673,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         vec![dest.clone()]
     );
     assert!(trust_file_keys(&dir, "destinations").is_empty());
-    assert!(trust_file_keys(&dir, "identities").is_empty());
+    assert!(foreign_trust_file_keys(&dir, "identities", &own).is_empty());
     assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
 
     // The deny-only row shows in `.mesh peers` as a blocked instance, never heard.
@@ -1755,7 +1783,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         trust_file_keys(&dir, "blocked_identities"),
         vec![id.clone()]
     );
-    assert!(trust_file_keys(&dir, "identities").is_empty());
+    assert!(foreign_trust_file_keys(&dir, "identities", &own).is_empty());
     assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
 
     // `untrust --identity` of the blocked identity names the unblock, the one verb that
@@ -3095,14 +3123,16 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
         ),
     )
     .unwrap();
-    let seeded = fs::read(&trust_path).unwrap();
     let mut command = probe.command();
     command.args(["--session", "probe"]);
     let mut session = spawn_repl(command);
     let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
     assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
     probe.wait_for_marker("MESH_STARTED");
+    // The start seeds this node's own grant; the refusals are checked against that file.
+    let at_start = fs::read(&trust_path).unwrap();
     let dir = probe.config_dir.clone();
+    let own = probe.own_identity();
 
     let refusal = format!(
         "Destination abababab belongs to identity 12121212, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {dest}. To stop trusting the whole identity, run .mesh untrust --identity {id}."
@@ -3123,7 +3153,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
         );
         assert_eq!(
             fs::read(&trust_path).unwrap(),
-            seeded,
+            at_start,
             "{line}: the refusal writes nothing"
         );
     }
@@ -3148,7 +3178,10 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
         vec![dest.clone()]
     );
     assert!(trust_file_keys(&dir, "destinations").is_empty());
-    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert_eq!(
+        foreign_trust_file_keys(&dir, "identities", &own),
+        vec![id.clone()]
+    );
     assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
 
     // `unblock <destination>` lifts the deny only: the grant still stands, no record
@@ -3165,7 +3198,10 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     assert!(!out.contains("Error:"), "{out:?}");
     assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
     assert!(trust_file_keys(&dir, "destinations").is_empty());
-    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert_eq!(
+        foreign_trust_file_keys(&dir, "identities", &own),
+        vec![id.clone()]
+    );
 
     // The verb that line names asks the mesh for the unheard hash first; nothing answers,
     // so the grant stands and no record is written.
@@ -3180,7 +3216,10 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
     assert!(trust_file_keys(&dir, "destinations").is_empty());
-    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert_eq!(
+        foreign_trust_file_keys(&dir, "identities", &own),
+        vec![id.clone()]
+    );
 
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
@@ -3244,14 +3283,16 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
         ),
     )
     .unwrap();
-    let seeded = fs::read(&trust_path).unwrap();
     let mut command = probe.command();
     command.args(["--session", "probe"]);
     let mut session = spawn_repl(command);
     let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
     assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
     probe.wait_for_marker("MESH_STARTED");
+    // The start seeds this node's own grant; the dry runs are checked against that file.
+    let at_start = fs::read(&trust_path).unwrap();
     let dir = probe.config_dir.clone();
+    let own = probe.own_identity();
     let token = "untrust-12121212";
     let bound_both = |label: &str| {
         let mut destinations = trust_file_keys(&dir, "destinations");
@@ -3297,7 +3338,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
         assert!(!out.contains("Error:"), "{line}: {out:?}");
         assert_eq!(
             fs::read(&trust_path).unwrap(),
-            seeded,
+            at_start,
             "{line}: a dry run writes nothing"
         );
     }
@@ -3317,7 +3358,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     ] {
         let out = trust_verb(&mut session, &line, &expected);
         assert!(out.contains("Error:"), "{line}: {out:?}");
-        assert_eq!(fs::read(&trust_path).unwrap(), seeded, "{line}: a refusal writes nothing");
+        assert_eq!(fs::read(&trust_path).unwrap(), at_start, "{line}: a refusal writes nothing");
     }
 
     // The token withdraws the grant alone.
@@ -3337,7 +3378,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     );
     bound_both("after untrust --identity");
     let after_untrust = fs::read(&trust_path).unwrap();
-    assert_ne!(after_untrust, seeded);
+    assert_ne!(after_untrust, at_start);
 
     // With no grant left, the identity-wide untrust is refused in the documented
     // sentence before any prompt, and the file is byte-identical afterwards.
@@ -3379,7 +3420,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
         "blocked_identities",
     ] {
         assert!(
-            trust_file_keys(&dir, section).is_empty(),
+            foreign_trust_file_keys(&dir, section, &own).is_empty(),
             "after forget --identity: {section} must be empty"
         );
     }
@@ -3427,14 +3468,16 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         ),
     )
     .unwrap();
-    let seeded = fs::read(&trust_path).unwrap();
     let mut command = probe.command();
     command.args(["--session", "probe"]);
     let mut session = spawn_repl(command);
     let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
     assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
     probe.wait_for_marker("MESH_STARTED");
+    // The start seeds this node's own grant; the dry run is checked against that file.
+    let at_start = fs::read(&trust_path).unwrap();
     let dir = probe.config_dir.clone();
+    let own = probe.own_identity();
     let token = "untrust-12121212";
 
     // The dry run of the instance untrust previews the record going and writes nothing.
@@ -3450,7 +3493,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
     );
     assert_eq!(
         fs::read(&trust_path).unwrap(),
-        seeded,
+        at_start,
         "a dry run writes nothing"
     );
 
@@ -3465,7 +3508,10 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         trust_file_keys(&dir, "destinations").is_empty(),
         "the destination record is gone"
     );
-    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert_eq!(
+        foreign_trust_file_keys(&dir, "identities", &own),
+        vec![id.clone()]
+    );
     assert_eq!(identity_grants_all(&dir, &id), Some(false));
     assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
     let after_untrust = fs::read(&trust_path).unwrap();
@@ -3529,7 +3575,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         "blocked_identities",
     ] {
         assert!(
-            trust_file_keys(&dir, section).is_empty(),
+            foreign_trust_file_keys(&dir, section, &own).is_empty(),
             "after untrust --identity: {section} must be empty"
         );
     }
