@@ -3050,6 +3050,32 @@ mod tests {
         );
     }
 
+    /// A tool-authored question carrying bidi overrides and zero-width
+    /// characters is drawn without them, so what the user reads is what
+    /// is approved.
+    #[test]
+    fn a_question_with_format_characters_is_drawn_without_them() {
+        let mut harness = Harness::standalone(60, 20);
+        harness.app.begin_turn("remove it", false);
+        let question = "Delete \u{202E}txt.safe\u{202C} \u{200B}k7m\u{200F}\u{FEFF}?";
+        let req = PromptRequest {
+            tool: Some("fs_rm".to_string()),
+            ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let rendered = harness.draw();
+        assert!(rendered.contains("Delete txt.safe k7m?"), "{rendered}");
+        for hidden in ['\u{202E}', '\u{202C}', '\u{200B}', '\u{200F}', '\u{FEFF}'] {
+            assert!(
+                !rendered.contains(hidden),
+                "{hidden:?} reached the frame:\n{rendered}"
+            );
+        }
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+    }
+
     /// A tool-controlled path in the question is shown whole: on 40 columns
     /// a 300-character path wraps over several rows and every character of
     /// it is on screen before `y` can approve it.

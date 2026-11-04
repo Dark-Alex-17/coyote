@@ -32,6 +32,31 @@ pub(crate) fn plain_text(text: &str) -> String {
 /// OSC, DCS, SOS, PM and APC.
 const STRING_INTRODUCERS: [char; 5] = [']', 'P', 'X', '^', '_'];
 
+/// Invisible format characters that reorder or hide what is around them:
+/// bidi embeddings, overrides, isolates and marks, the zero-width space
+/// and non-joiner, the byte-order mark, the soft hyphen, the word joiner
+/// and the tag characters. Text the user approves must read the way it is
+/// stored, so none of them is drawn. The zero-width joiner stays: it only
+/// binds an emoji sequence together and cannot move or hide a glyph.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
 fn scrub(text: &str, keep_sgr: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -39,7 +64,7 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
     while i < chars.len() {
         let c = chars[i];
         if c != ESC {
-            if c == '\n' || c == '\t' || !c.is_control() {
+            if c == '\n' || c == '\t' || !(c.is_control() || is_format_char(c)) {
                 out.push(c);
             }
             i += 1;
@@ -445,6 +470,23 @@ mod tests {
         assert_eq!(sanitize_ansi("\x1b[1;08mx"), "\x1b[1mx");
         let lines = preformatted_lines("\x1b[08mhidden\x1b[0m");
         assert!(every_span(&lines).all(|span| !span.style.add_modifier.contains(Modifier::HIDDEN)));
+    }
+
+    /// Invisible format characters that could reorder or hide approved
+    /// text are dropped by both scrubs; a joiner inside an emoji stays.
+    #[test]
+    fn format_characters_that_reorder_or_hide_text_are_dropped() {
+        let tricky =
+            "rm \u{202E}txt.evil\u{202C} \u{200B}now\u{200F}\u{FEFF}\u{2066}x\u{2069}\u{00AD}";
+        assert_eq!(plain_text(tricky), "rm txt.evil nowx");
+        assert_eq!(sanitize_ansi(tricky), "rm txt.evil nowx");
+        assert_eq!(
+            sanitize_ansi("\u{202E}\x1b[1mbold\x1b[0m"),
+            "\x1b[1mbold\x1b[0m"
+        );
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(plain_text(family), family);
+        assert_eq!(plain_text("tag\u{E0041}\u{E007F}"), "tag");
     }
 
     /// A spinner frame caught in the fd capture: the cursor move and the
