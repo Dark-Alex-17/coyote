@@ -1096,14 +1096,21 @@ impl Rag {
 
         if has_error {
             let mut aborted = true;
-            if *IS_STDOUT_TERMINAL && total > 0 {
-                ensure_prompts_available()?;
+            // The full-screen UI cannot ask whether to go on without the
+            // failed documents; the answer is the non-interactive one.
+            if *IS_STDOUT_TERMINAL && total > 0 && !crate::tui::active() {
                 let ans = Confirm::new("Some documents failed to load. Continue?")
                     .with_default(false)
                     .prompt()?;
                 aborted = !ans;
             }
             if aborted {
+                if crate::tui::active() {
+                    bail!(
+                        "Aborted: some documents failed to load. {} to choose whether to continue without them.",
+                        crate::config::conflict::rerun_hint()
+                    );
+                }
                 bail!("Aborted");
             }
         }
@@ -2892,6 +2899,34 @@ mod tests {
         assert_eq!(ids, vec![DocumentId::new(0, 0)]);
         assert_eq!(embeddings, "[Source: notes.txt]\nthe only chunk");
         assert_eq!(sources, "- notes.txt");
+    }
+
+    /// A sync with a document that fails to load asks whether to go on
+    /// without it in the REPL; under the full-screen UI there is no one to
+    /// ask, so the sync is aborted with the question's way out named and
+    /// no prompt is built.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_document_aborts_the_sync_under_the_tui_without_asking() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = TempDir::new("sync-tui-failed-doc");
+        let doc = dir.path.join("doc.broken");
+        std::fs::write(&doc, "body").unwrap();
+        let rag_path = dir.path.join("kb.yaml");
+        let mut rag = yaml_rag("kb", &rag_path, buildable_data());
+        let loaders = HashMap::from([("broken".to_string(), "false $1".to_string())]);
+
+        let err = rag
+            .sync_documents(&[doc.display().to_string()], true, false, loaders, None)
+            .await
+            .unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.starts_with("Aborted: some documents failed to load"),
+            "{text}"
+        );
+        assert!(text.contains("Re-run in the plain REPL"), "{text}");
     }
 
     /// The RAG wizard's free-standing prompts ask on the raw tty; under

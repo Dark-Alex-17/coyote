@@ -3693,7 +3693,6 @@ mod tests {
             ("src/prompt/mod.rs", "confirm", REPL_PROMPTER),
             ("src/prompt/mod.rs", "prompt", REPL_PROMPTER),
             ("src/rag/mod.rs", "attach", PROMPT_GATED),
-            ("src/rag/mod.rs", "sync_documents", PROMPT_GATED),
             ("src/rag/mod.rs", "select_embedding_model", PROMPT_GATED),
             ("src/rag/mod.rs", "select_rag_driver", PROMPT_GATED),
             ("src/rag/mod.rs", "select_extractor_model", PROMPT_GATED),
