@@ -1174,6 +1174,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let runtime = live(ctx)?;
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
+    let id = &pending_id(ctx, id, now)?;
     let inbound = match ctx.app.mesh.inbound_store() {
         Some(store) => store.get(id)?,
         None => None,
@@ -1339,6 +1340,7 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
     let record = open_escalated_question(ctx, id, now)?;
+    let id = &record.id;
     ctx.app.mesh.refuse_dismiss_held_by_envoy(id)?;
     let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
     out_text(&render_question_block(
@@ -1487,15 +1489,16 @@ fn dismiss_all_summary(
     summary
 }
 
-/// The escalated question `id` names, or the sentence for a missing one, for an access
-/// request (which `grant` and `refuse` decide) or for a question this node asked, which
-/// only the peer's reply or its timeout closes. A row past its expiry that the sweep has
-/// not yet taken out is no question, as the node reads it.
+/// The escalated question `id` names, whole or by prefix, or the sentence for a missing
+/// one, for an access request (which `grant` and `refuse` decide) or for a question this
+/// node asked, which only the peer's reply or its timeout closes. A row past its expiry
+/// that the sweep has not yet taken out is no question, as the node reads it.
 fn open_escalated_question(
     ctx: &RequestContext,
     id: &str,
     now: SystemTime,
 ) -> Result<InboundRecord> {
+    let id = &pending_id(ctx, id, now)?;
     let record = match ctx.app.mesh.inbound_store() {
         Some(store) => store.get(id)?,
         None => None,
@@ -1504,11 +1507,15 @@ fn open_escalated_question(
         Some(record) if record.is_expired(now) => bail!(no_open_question(id)),
         Some(record) if record.kind == InboundKind::Access => bail!(access_not_a_question(id)),
         Some(record) => Ok(record),
-        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(
-            "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
-        ),
+        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(asked_by_this_node(id)),
         None => bail!(no_open_question(id)),
     }
+}
+
+fn asked_by_this_node(id: &str) -> String {
+    format!(
+        "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+    )
 }
 
 fn no_open_question(id: &str) -> String {
@@ -4541,6 +4548,7 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
     let record = open_access_request(ctx, id, now)?;
+    let id = &record.id;
     refuse_unservable(ctx, &runtime, id, &record)?;
     let target = args
         .standing
@@ -4598,6 +4606,7 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
     let record = open_access_request(ctx, id, now)?;
+    let id = &record.id;
     out_text(&sending_notice(&record.peer_destination));
     result_follows();
     let report = ctx.app.mesh.access().refuse(id).await?;
@@ -4611,10 +4620,12 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The access request `id` names, or the sentence for a missing one or for a question,
-/// which `.mesh answer` takes. A row past its expiry that the sweep has not yet taken
-/// out is no request, as the node reads it.
+/// The access request `id` names, whole or by prefix, or the sentence for a missing one
+/// or for a question, which `.mesh answer` takes, or for a question this node asked. A
+/// row past its expiry that the sweep has not yet taken out is no request, as the node
+/// reads it.
 fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Result<InboundRecord> {
+    let id = &pending_id(ctx, id, now)?;
     let record = match ctx.app.mesh.inbound_store() {
         Some(store) => store.get(id)?,
         None => None,
@@ -4625,6 +4636,7 @@ fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Resul
             bail!(question_not_an_access_request(id))
         }
         Some(record) => Ok(record),
+        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(asked_by_this_node(id)),
         None => bail!(no_open_access_request(id)),
     }
 }
@@ -5332,6 +5344,10 @@ enum HashKind {
     Identity,
     /// Either, as `--peer` on the share verbs takes it.
     Peer,
+    /// The id of a question or access request `.mesh pending` lists. Peer-chosen ids
+    /// need not be hex, so these are matched against the ids this node holds by
+    /// `resolve_pending_id`, not by the hash rules.
+    Message,
 }
 
 impl HashKind {
@@ -5340,6 +5356,7 @@ impl HashKind {
             HashKind::Destination => "destination",
             HashKind::Identity => "identity",
             HashKind::Peer => "peer",
+            HashKind::Message => "pending id",
         }
     }
 
@@ -5348,13 +5365,14 @@ impl HashKind {
             HashKind::Destination => "destinations",
             HashKind::Identity => "identities",
             HashKind::Peer => "peers",
+            HashKind::Message => "pending ids",
         }
     }
 
     fn article(self) -> &'static str {
         match self {
             HashKind::Identity => "an",
-            HashKind::Destination | HashKind::Peer => "a",
+            HashKind::Destination | HashKind::Peer | HashKind::Message => "a",
         }
     }
 
@@ -5364,6 +5382,7 @@ impl HashKind {
         match self {
             HashKind::Destination | HashKind::Peer => "`.mesh peers` lists",
             HashKind::Identity => "`.mesh knocks` and `.mesh peers` list",
+            HashKind::Message => "`.mesh pending` lists",
         }
     }
 }
@@ -5386,6 +5405,7 @@ fn looks_like_hash(token: &str) -> bool {
 /// both, with as many characters as tell them apart; a prefix nothing known begins is
 /// refused with the unheard wording; anything else is not a hash. Every verb sends or
 /// looks up only what this returns, so a prefix never leaves the keyboard.
+/// A pending id goes through `resolve_pending_id` instead, as peers choose their own ids.
 fn resolve_hash<I>(token: &str, kind: HashKind, known: I) -> Result<String>
 where
     I: IntoIterator<Item = String>,
@@ -5420,7 +5440,7 @@ where
             let shown = distinguishing_len(&matches);
             let candidates: Vec<String> = matches
                 .iter()
-                .map(|hash| format!("{}...", &hash[..shown]))
+                .map(|hash| format!("{}...", hash.get(..shown).unwrap_or(hash)))
                 .collect();
             bail!(
                 "'{token}' matches {count} known {}: {}; give more characters.",
@@ -5431,13 +5451,152 @@ where
     }
 }
 
+/// The id this node holds that `token` names: the one held id equal to it or beginning
+/// with it, compared without regard to case. Short of the whole id, a token needs
+/// `HASH_PREFIX_MIN_CHARS` characters, what `.mesh pending` prints at the least. A token
+/// two held ids begin is refused, even when it is the whole of one of them, so an id a
+/// peer chose to begin another never takes the other's place. A token no held
+/// id begins comes back as typed (32 hex digits lower-cased), so the verb's own lookup
+/// says which kind of id it has no open entry for.
+/// Each held id comes with the kind of inbound entry it is, `None` for a question this
+/// node asked, so a token that is a whole id can be told how its entries clear.
+fn resolve_pending_id(token: &str, held: Vec<(String, Option<InboundKind>)>) -> Result<String> {
+    let lowered = token.to_ascii_lowercase();
+    let mut matches: Vec<(String, Option<InboundKind>)> = held
+        .into_iter()
+        .filter(|(id, _)| id.to_ascii_lowercase().starts_with(&lowered))
+        .collect();
+    matches.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    matches.dedup_by(|a, b| a.0 == b.0);
+    let whole = matches.iter().any(|(id, _)| id.eq_ignore_ascii_case(token));
+    if token.len() < HASH_PREFIX_MIN_CHARS && !whole {
+        if matches.is_empty() && !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(token.to_string());
+        }
+        bail!(
+            "'{token}' is too short to pick a pending id: give the whole id or {HASH_PREFIX_MIN_CHARS} or more of its first characters; {} them.",
+            HashKind::Message.listing()
+        );
+    }
+    match matches.len() {
+        0 => Ok(canonical_hash(token).unwrap_or_else(|| token.to_string())),
+        1 => Ok(matches.remove(0).0),
+        _ if whole => bail!(whole_id_refusal(token, &matches)),
+        count => {
+            let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
+            bail!(
+                "'{token}' matches {count} {}: {}; give one of these (or enough of its characters to tell it apart).",
+                HashKind::Message.plural(),
+                pending_candidates(&ids, &ids).join(", ")
+            )
+        }
+    }
+}
+
+/// Each of `ids` as a refusal names it: whole, or cut to the length that tells every one
+/// of `among` apart, compared without regard to case, and marked as cut.
+fn pending_candidates(ids: &[&str], among: &[&str]) -> Vec<String> {
+    let folded: Vec<String> = among.iter().map(|id| id.to_ascii_lowercase()).collect();
+    let shown = distinguishing_len(&folded);
+    ids.iter()
+        .map(|id| match id.get(..shown) {
+            Some(head) if head.len() < id.len() => format!("{head}..."),
+            _ => id.to_string(),
+        })
+        .collect()
+}
+
+/// The refusal for a token that is the whole of a held id and also begins another, or
+/// matches ids that differ only in case. No form of the token can ever pick the short or
+/// twinned id, so the sentence names how the entries in the way leave instead. A longer
+/// id a peer sent goes once it is acted on, which a question this node asked does not.
+fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> String {
+    let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
+    let shown = pending_candidates(&ids, &ids);
+    let (twins, longer): (Vec<usize>, Vec<usize>) =
+        (0..ids.len()).partition(|&at| ids[at].eq_ignore_ascii_case(token));
+    let names = |at: &[usize]| at.iter().map(|&i| shown[i].clone()).collect::<Vec<_>>();
+    let clear = pending_clear_clause(&names(&(0..ids.len()).collect::<Vec<_>>()), matches);
+    if twins.len() > 1 {
+        let quoted: Vec<String> = names(&twins).iter().map(|id| format!("'{id}'")).collect();
+        let none = if twins.len() == 2 { "neither" } else { "none" };
+        return format!(
+            "{} differ only in case, so {none} can be picked; {clear}.",
+            join_and(&quoted)
+        );
+    }
+    let longer_names = names(&longer).join(", ");
+    let verb = if longer.len() == 1 { "begins" } else { "begin" };
+    let what = format!(
+        "'{token}' is a whole pending id and also how {longer_names} {verb}, so it cannot pick one"
+    );
+    if longer.iter().any(|&at| matches[at].1.is_none()) {
+        return format!("{what}; {clear}.");
+    }
+    let it = if longer.len() == 1 { "it" } else { "them" };
+    format!(
+        "{what}. Act on {longer_names} first, typed as `.mesh pending` lists {it}, then '{token}' picks the one left; or {clear}."
+    )
+}
+
+/// How the entries `shown` names leave `.mesh pending` when no id can pick them: a peer's
+/// questions by `.mesh dismiss --all`, which leaves access requests alone, an access
+/// request at its expiry, and a question this node asked by no verb at all.
+fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind>)]) -> String {
+    let of_kind = |kind: Option<InboundKind>| {
+        matches
+            .iter()
+            .zip(shown)
+            .filter(|((_, held), _)| *held == kind)
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>()
+    };
+    let questions = of_kind(Some(InboundKind::Question));
+    let access = of_kind(Some(InboundKind::Access));
+    let asked = of_kind(None);
+    if questions.len() == matches.len() {
+        let all = if matches.len() == 2 { "both" } else { "them" };
+        return format!("clear {all} with `.mesh dismiss --all`");
+    }
+    let mut clauses = Vec::new();
+    if !questions.is_empty() {
+        clauses.push(format!(
+            "`.mesh dismiss --all` clears {}",
+            join_and(&questions)
+        ));
+    }
+    if !access.is_empty() {
+        let (leave, expire) = if access.len() == 1 {
+            ("leaves", "it expires")
+        } else {
+            ("leave", "they expire")
+        };
+        clauses.push(format!(
+            "{} {leave} `.mesh pending` when {expire}",
+            join_and(&access)
+        ));
+    }
+    if !asked.is_empty() {
+        let what = if asked.len() == 1 {
+            "is a question this node asked"
+        } else {
+            "are questions this node asked"
+        };
+        clauses.push(format!("{} {what}, which no verb clears", join_and(&asked)));
+    }
+    clauses.join(", and ")
+}
+
 /// The fewest leading characters, never under `HASH_PREFIX_MIN_CHARS`, at which every hash
-/// in `hashes` reads differently from the others.
+/// in `hashes` reads differently from the others. A peer-chosen pending id may be shorter
+/// than that, and then reads whole.
 fn distinguishing_len(hashes: &[String]) -> usize {
     (HASH_PREFIX_MIN_CHARS..32)
         .find(|&len| {
-            let heads: std::collections::BTreeSet<&str> =
-                hashes.iter().map(|hash| &hash[..len]).collect();
+            let heads: std::collections::BTreeSet<&str> = hashes
+                .iter()
+                .map(|hash| hash.get(..len).unwrap_or(hash))
+                .collect();
             heads.len() == hashes.len()
         })
         .unwrap_or(32)
@@ -5511,6 +5670,32 @@ fn identity_hash(ctx: &RequestContext, token: &str) -> Result<String> {
 /// `--peer` on the share verbs: an identity or a destination, whole or by prefix.
 fn peer_hash(ctx: &RequestContext, token: &str) -> Result<String> {
     resolve_known(ctx, token, HashKind::Peer)
+}
+
+/// The full id of the entry `token` names among those `.mesh pending` lists: the
+/// unexpired questions and access requests peers sent, then the questions this node
+/// asked. A store that cannot be read contributes nothing rather than failing the verb,
+/// which reads it again itself.
+fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<String> {
+    let inbound = ctx
+        .app
+        .mesh
+        .inbound_store()
+        .and_then(|store| store.list(now).ok())
+        .unwrap_or_default();
+    let outbound = ctx.app.mesh.correlations().list();
+    resolve_pending_id(
+        token,
+        inbound
+            .into_iter()
+            .map(|record| (record.id, Some(record.kind)))
+            .chain(
+                outbound
+                    .into_iter()
+                    .map(|correlation| (correlation.record.id, None)),
+            )
+            .collect(),
+    )
 }
 
 fn change_text(change: TrustChange) -> &'static str {
@@ -7767,7 +7952,7 @@ fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'stati
     }
 }
 
-/// One `.mesh pending` / `.mesh answer` block: a question and who it is between.
+/// One `.mesh pending` entry or `.mesh answer` block: a question and who it is between.
 struct QuestionRow {
     /// `awaiting your answer`, `access request`, or an outbound state word.
     state: &'static str,
@@ -7787,8 +7972,6 @@ struct QuestionRow {
     /// access row carries its path count here; the paths and the reason are never
     /// rendered.
     extra: Vec<(&'static str, String)>,
-    /// The next command, with the full id.
-    footer: String,
     /// Time left before the record is swept, rendered as `expires in <span>` in the
     /// header: `PENDING_TTL` from arrival for a peer's question or access request. An
     /// outbound row carries none, since `Correlation` holds no expiry of its own (its
@@ -7814,7 +7997,6 @@ impl QuestionRow {
             body: record.question.clone(),
             envoy_question: String::new(),
             extra: Vec::new(),
-            footer: answer_footer(&record.id),
             expires_in: None,
         }
     }
@@ -7830,7 +8012,6 @@ impl QuestionRow {
             body: record.question.clone(),
             envoy_question: record.envoy_question.clone(),
             extra: Vec::new(),
-            footer: answer_footer(&record.id),
             expires_in: time_left(&record.received_at, now),
         }
     }
@@ -7846,10 +8027,6 @@ impl QuestionRow {
             body: String::new(),
             envoy_question: String::new(),
             extra: vec![("", plural(record.paths.len(), "path", "paths"))],
-            footer: format!(
-                "grant: .mesh grant {} | refuse: .mesh refuse {}",
-                record.id, record.id
-            ),
             expires_in: time_left(&record.received_at, now),
         }
     }
@@ -7870,10 +8047,10 @@ fn answer_footer(id: &str) -> String {
 
 /// A question block in the `.mesh inbox` shape: a header the colour paints, then the
 /// body, the envoy's framing and the extra rows, each indented and word-wrapped at
-/// `width` through `indented_rows`, then the footer on its own indented line. The
-/// escalation idle line points cut text at `.mesh pending`, so the envoy's question is
-/// rendered at the length the store keeps it, never shorter. The footer is this node's
-/// own text and carries the full id, so it is neither wrapped nor shortened.
+/// `width` through `indented_rows`, then the answer footer on its own indented line.
+/// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
+/// is rendered at the length the store keeps it, never shorter. The footer is this
+/// node's own text and carries the full id, so it is neither wrapped nor shortened.
 fn render_question_block(row: &QuestionRow, now: SystemTime, width: usize, colour: bool) -> String {
     let header = question_header(row, now);
     let mut lines = vec![if colour {
@@ -7890,7 +8067,7 @@ fn render_question_block(row: &QuestionRow, now: SystemTime, width: usize, colou
     for (label, text) in &row.extra {
         lines.extend(indented_rows(label, text, width));
     }
-    lines.push(format!("  {}", row.footer));
+    lines.push(format!("  {}", answer_footer(&row.id)));
     lines.join("\n")
 }
 
@@ -7915,9 +8092,15 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> String {
     header
 }
 
-/// Three sections, each a title over its blocks or `  none` when there are none, with a
-/// blank line between blocks and between sections; the access section is left out while
-/// no request waits.
+/// Three sections in a fixed order, every one shown: a header carrying the count and,
+/// once, the commands its ids go to (`<title>: none` when empty), then its numbered
+/// entries. Entries show only the short id, which those commands take as a prefix. The
+/// header commands start in one column so the three read as a list. An id whose short
+/// form another listed id shares is shown at the length that tells them apart, so every
+/// printed id picks its entry when typed back, except an id that is the whole of one
+/// entry's id and also how another's begins, or one that differs from another only in
+/// case. Those stay ambiguous on purpose, so a peer cannot mint an id that takes the
+/// place of another, and the refusal names how the entries clear.
 fn render_pending(
     asked: &[QuestionRow],
     escalated: &[QuestionRow],
@@ -7926,28 +8109,123 @@ fn render_pending(
     width: usize,
     colour: bool,
 ) -> String {
-    let section = |title: &str, rows: &[QuestionRow]| {
-        let body = if rows.is_empty() {
-            "  none".to_string()
-        } else {
-            rows.iter()
-                .map(|row| render_question_block(row, now, width, colour))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-        format!("{title}\n{body}")
-    };
-    let mut sections = vec![
-        section("Questions this node asked (awaiting a reply):", asked),
-        section("Questions peers asked (escalated to you):", escalated),
-    ];
-    if !access.is_empty() {
-        sections.push(section(
-            "Access requests (decide with grant or refuse):",
+    let sections = [
+        (
+            "Waiting for YOU",
+            "answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+            escalated,
+            false,
+        ),
+        (
+            "Access requests",
+            "grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>",
             access,
-        ));
+            false,
+        ),
+        (
+            "Asked by this node",
+            "collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+            asked,
+            true,
+        ),
+    ];
+    let counted: Vec<String> = sections
+        .iter()
+        .map(|(title, _, rows, _)| format!("{title} ({})", rows.len()))
+        .collect();
+    let column = counted.iter().map(String::len).max().unwrap_or(0) + 2;
+    let ids: Vec<String> = sections
+        .iter()
+        .flat_map(|(_, _, rows, _)| rows.iter().map(|row| row.id.to_ascii_lowercase()))
+        .collect();
+    let mut lines = Vec::new();
+    for ((title, commands, rows, outbound), counted) in sections.iter().zip(&counted) {
+        let header = if rows.is_empty() {
+            format!("{title}: none")
+        } else {
+            format!("{counted:<column$}{commands}")
+        };
+        lines.push(if colour {
+            tool_name_text_forced(&header)
+        } else {
+            header
+        });
+        for (index, row) in rows.iter().enumerate() {
+            let id_len = shown_id_len(&row.id, &ids);
+            lines.extend(pending_entry(index + 1, row, *outbound, id_len, now, width));
+        }
     }
-    sections.join("\n\n")
+    lines.join("\n")
+}
+
+/// How many characters of `id` tell it apart, without regard to case, from every id in
+/// `ids` that shares its short form; the short form itself when none does.
+fn shown_id_len(id: &str, ids: &[String]) -> usize {
+    let head = |text: &str| {
+        text.get(..HASH_PREFIX_MIN_CHARS)
+            .unwrap_or(text)
+            .to_ascii_lowercase()
+    };
+    let own = head(id);
+    let sharing: Vec<String> = ids
+        .iter()
+        .filter(|other| head(other.as_str()) == own)
+        .cloned()
+        .collect();
+    distinguishing_len(&sharing)
+}
+
+/// One numbered `.mesh pending` entry. The first line is
+/// `-> <name> (<dest8>) <age> . <state> . id <id>` for a question this node asked and
+/// `<name> (<dest8>) asked <age> . expires in <span> . id <id>` for a peer's question or
+/// access request, the id cut to `id_len` characters; the quoted question, the envoy's
+/// framing and the extra rows follow, word-wrapped at `width` and indented under the
+/// entry's text. The envoy's question is kept at the length the store holds, as the
+/// escalation idle line points here for it.
+fn pending_entry(
+    number: usize,
+    row: &QuestionRow,
+    outbound: bool,
+    id_len: usize,
+    now: SystemTime,
+    width: usize,
+) -> Vec<String> {
+    let age = match row.when {
+        Some(when) => age_text(now, when),
+        None => "at an unknown time".to_string(),
+    };
+    let peer = format!("{} ({})", row.name, short(&row.destination));
+    let id = row.id.get(..id_len).unwrap_or(&row.id);
+    let head = if outbound {
+        format!("-> {peer} {age} . {} . id {id}", row.state)
+    } else {
+        let expires = row
+            .expires_in
+            .map(|left| format!(" . expires in {}", span_text(left)))
+            .unwrap_or_default();
+        format!("{peer} {} {age}{expires} . id {id}", row.when_label)
+    };
+    let marker = format!("  {number}. ");
+    let mut lines = vec![format!("{marker}{head}")];
+    let indent = " ".repeat(marker.len() - 2);
+    let inner = width.saturating_sub(indent.len());
+    let mut push = |label: &str, text: &str| {
+        lines.extend(
+            indented_rows(label, text, inner)
+                .into_iter()
+                .map(|row| format!("{indent}{row}")),
+        );
+    };
+    if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
+        push("", &format!("\"{body}\""));
+    }
+    if let Some(question) = peer_line(Some(&row.envoy_question), INBOUND_ENVOY_QUESTION_MAX_CHARS) {
+        push("envoy asks: ", &question);
+    }
+    for (label, text) in &row.extra {
+        push(label, text);
+    }
+    lines
 }
 
 fn render_broadcast(outcome: &BroadcastOutcome) -> String {
@@ -11686,11 +11964,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             lines,
             [
-                "Questions this node asked (awaiting a reply):",
-                "  none",
-                "",
-                "Questions peers asked (escalated to you):",
-                "  none",
+                "Waiting for YOU: none",
+                "Access requests: none",
+                "Asked by this node: none",
             ]
         );
 
@@ -11707,24 +11983,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             lines,
             [
-                "Questions this node asked (awaiting a reply):",
-                "open . bob (abababab) . sent 3m ago . id q1",
-                "  what now?",
-                "  answer: .mesh answer q1 \"<text>\"",
-                "",
-                "answered, awaiting collect . bob (abababab) . sent 3m ago . id q2",
-                "  what now?",
-                "  answer: .mesh answer q2 \"<text>\"",
-                "",
-                "Questions peers asked (escalated to you):",
-                "awaiting your answer . alice (12121212) . asked 3m ago . id p1 . expires in 6d",
-                "  may I read the plan?",
-                "  envoy asks: Share the plan?",
-                "  answer: .mesh answer p1 \"<text>\"",
-                "",
-                "awaiting your answer . alice (12121212) . asked 3m ago . id p2 . expires in 6d",
-                "  may I read the plan?",
-                "  answer: .mesh answer p2 \"<text>\"",
+                "Waiting for YOU (2)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+                "  1. alice (12121212) asked 3m ago . expires in 6d . id p1",
+                "     \"may I read the plan?\"",
+                "     envoy asks: Share the plan?",
+                "  2. alice (12121212) asked 3m ago . expires in 6d . id p2",
+                "     \"may I read the plan?\"",
+                "Access requests: none",
+                "Asked by this node (2)  collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+                "  1. -> bob (abababab) 3m ago . open . id q1",
+                "     \"what now?\"",
+                "  2. -> bob (abababab) 3m ago . answered, awaiting collect . id q2",
+                "     \"what now?\"",
             ],
             "{text}"
         );
@@ -11734,11 +12004,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
     }
 
-    /// The builders give every row its state word, label, stamp and footer; the
-    /// escalated state word in particular is the one `.mesh pending` printed before the
-    /// block shape.
+    /// The builders give every row its state word, label and stamp; the escalated state
+    /// word in particular is the one `.mesh pending` printed before the block shape.
     #[test]
-    fn question_rows_carry_the_state_words_labels_and_footers() {
+    fn question_rows_carry_the_state_words_and_labels() {
         let open = asked_row("q1", PendingState::Open);
         let escalated = asked_row("q2", PendingState::Escalated);
         let answered = asked_row("q3", PendingState::Answered);
@@ -11754,7 +12023,6 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(open.when, parse_rfc3339("2026-09-21T14:13:20Z"));
         assert_eq!(open.body, "what now?");
         assert_eq!(open.envoy_question, "");
-        assert_eq!(open.footer, "answer: .mesh answer q1 \"<text>\"");
         assert_eq!(open.name, "bob");
         assert_eq!(open.destination, "ab".repeat(16));
         assert!(open.extra.is_empty() && open.expires_in.is_none());
@@ -11768,7 +12036,6 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(peer.when, parse_rfc3339("2026-09-21T14:13:20Z"));
         assert_eq!(peer.body, "may I read the plan?");
         assert_eq!(peer.envoy_question, "Share the plan?");
-        assert_eq!(peer.footer, "answer: .mesh answer p1 \"<text>\"");
         assert_eq!(peer.destination, "12".repeat(16));
         assert!(peer.extra.is_empty());
         assert_eq!(peer.expires_in, left);
@@ -11779,10 +12046,6 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(access.body, "");
         assert_eq!(access.envoy_question, "");
         assert_eq!(access.extra, [("", "2 paths".to_string())]);
-        assert_eq!(
-            access.footer,
-            "grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1"
-        );
         assert_eq!(access.expires_in, left);
     }
 
@@ -11826,12 +12089,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(question_header(&row, now).ends_with(" . id p1"));
     }
 
-    /// The block for each kind of row, rendered plain: header, body, envoy row, extra
-    /// rows, footer. A never-heard peer carries its short destination as its name and
-    /// so reads `<dest8> (<dest8>)`, a stamp that does not parse reads as an unknown
-    /// time, and a filled `expires_in` lands at the end of the header.
+    /// The block for each kind of question `.mesh answer` prints, rendered plain: header,
+    /// body, envoy row, footer. A never-heard peer carries its short destination as its
+    /// name and so reads `<dest8> (<dest8>)`, a stamp that does not parse reads as an
+    /// unknown time, and a filled `expires_in` lands at the end of the header.
     #[test]
-    fn question_block_renders_outbound_inbound_and_access_rows() {
+    fn question_block_renders_outbound_and_inbound_rows() {
         let now = pending_now();
         let text = render_question_block(&asked_row("q1", PendingState::Open), now, 80, false);
         assert_eq!(
@@ -11853,20 +12116,6 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "  answer: .mesh answer p1 \"<text>\"",
             ]
         );
-
-        let access = access_row("acc-1");
-        let text = render_question_block(&access, now, 80, false);
-        assert_eq!(
-            text.lines().collect::<Vec<_>>(),
-            [
-                "access request . carol (12121212) . asked 3m ago . id acc-1 . expires in 6d",
-                "  2 paths",
-                "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
-            ]
-        );
-        for secret in ["secret/plan.md", "src/x.rs", "need the struct"] {
-            assert!(!text.contains(secret), "{secret} leaked: {text}");
-        }
 
         let full_id = "3fe1be40a1b2c3d43fe1be40a1b2c3d4";
         let mut row = escalated_row(full_id, "");
@@ -11930,10 +12179,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
 
         let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, true);
+        let plain_pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false);
+        for (painted, plain) in pending.lines().zip(plain_pending.lines()) {
+            if plain.starts_with("  ") {
+                assert_eq!(painted, plain, "entries stay plain: {pending:?}");
+            } else {
+                assert_eq!(painted, tool_name_text_forced(plain), "{pending:?}");
+            }
+        }
         assert_eq!(
             pending.lines().filter(|line| line.contains('\x1b')).count(),
-            1,
-            "the section titles stay plain: {pending:?}"
+            3,
+            "each section header is painted: {pending:?}"
         );
     }
 
@@ -11955,9 +12212,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         let envoy_line = text
             .lines()
-            .find(|line| line.starts_with("  envoy asks: "))
+            .find(|line| line.starts_with("     envoy asks: "))
             .unwrap_or_else(|| panic!("{text}"));
-        assert_eq!(envoy_line, format!("  envoy asks: {question}"));
+        assert_eq!(envoy_line, format!("     envoy asks: {question}"));
     }
 
     #[test]
@@ -11977,12 +12234,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let lines: Vec<&str> = text.lines().collect();
         let access_title = lines
             .iter()
-            .position(|line| *line == "Access requests (decide with grant or refuse):")
+            .position(|line| line.starts_with("Access requests (1)"))
             .unwrap_or_else(|| panic!("{text}"));
         assert!(
             lines[..access_title]
                 .iter()
-                .any(|line| line.ends_with(" . id p1 . expires in 6d")),
+                .any(|line| line.ends_with(" . expires in 6d . id p1")),
             "{text}"
         );
         assert!(
@@ -11994,9 +12251,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             &lines[access_title + 1..],
             [
-                "access request . carol (12121212) . asked 3m ago . id acc-1 . expires in 6d",
-                "  2 paths",
-                "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
+                "  1. carol (12121212) asked 3m ago . expires in 6d . id acc-1",
+                "     2 paths",
+                "Asked by this node: none",
             ],
             "{text}"
         );
@@ -12006,13 +12263,317 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         let questions_only = render_pending(&[], &[question], &[], now, 80, false);
         assert!(
-            !questions_only.contains("Access requests"),
-            "{questions_only}"
+            questions_only.contains("\nAccess requests: none\n"),
+            "an empty access section still shows: {questions_only}"
         );
         assert!(
-            questions_only.ends_with("  answer: .mesh answer p1 \"<text>\""),
-            "each block carries its own footer: {questions_only}"
+            !questions_only.contains("answer: .mesh answer p1"),
+            "the commands sit on the section header, not under each entry: {questions_only}"
         );
+    }
+
+    mod pending_layout_tests {
+        use super::*;
+
+        /// The whole listing for two peer questions (one with the envoy's framing), one
+        /// access request and one question this node asked, as a terminal 80 wide gets it.
+        #[test]
+        fn pending_numbers_each_section_and_names_its_commands_once() {
+            let now = pending_now();
+            let mut second = escalated_row("7c9d2e1f8a7b6c5d7c9d2e1f8a7b6c5d", "");
+            second.body = "Please delete docs/notes.md.".to_string();
+            let escalated = [
+                escalated_row(
+                    "320b8f7b1111aaaa320b8f7b1111aaaa",
+                    "Do you want this rename done here?",
+                ),
+                second,
+            ];
+            let access = [access_row("1046c2c6aaaa1111bbbb2222cccc3333")];
+            let asked = [asked_row(
+                "9e519dff000011112222333344445555",
+                PendingState::Answered,
+            )];
+            let text = render_pending(&asked, &escalated, &access, now, 80, false);
+            assert_eq!(
+                text.lines().collect::<Vec<_>>(),
+                [
+                    "Waiting for YOU (2)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+                    "  1. alice (12121212) asked 3m ago . expires in 6d . id 320b8f7b",
+                    "     \"may I read the plan?\"",
+                    "     envoy asks: Do you want this rename done here?",
+                    "  2. alice (12121212) asked 3m ago . expires in 6d . id 7c9d2e1f",
+                    "     \"Please delete docs/notes.md.\"",
+                    "Access requests (1)     grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>",
+                    "  1. carol (12121212) asked 3m ago . expires in 6d . id 1046c2c6",
+                    "     2 paths",
+                    "Asked by this node (1)  collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+                    "  1. -> bob (abababab) 3m ago . answered, awaiting collect . id 9e519dff",
+                    "     \"what now?\"",
+                ],
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn pending_shows_every_section_as_none_when_nothing_waits() {
+            assert_eq!(
+                render_pending(&[], &[], &[], pending_now(), 80, false),
+                "Waiting for YOU: none\nAccess requests: none\nAsked by this node: none"
+            );
+        }
+
+        /// A long question wraps under the entry's text, not under its number, within the
+        /// terminal width; an entry past the ninth indents one more column.
+        #[test]
+        fn pending_wraps_an_entry_under_its_text() {
+            let mut row = escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "");
+            row.body =
+                "please delete docs/notes.md and docs/old.md before the merge lands".to_string();
+            let text = render_pending(&[], &[row], &[], pending_now(), 30, false);
+            let body: Vec<&str> = text
+                .lines()
+                .skip(2)
+                .take_while(|line| line.starts_with(' '))
+                .collect();
+            assert!(body.len() > 1, "the question wrapped: {text}");
+            assert!(
+                body.iter()
+                    .all(|line| line.starts_with("     ") && line.chars().count() <= 30),
+                "{text}"
+            );
+
+            let entry = pending_entry(
+                10,
+                &escalated_row("p1", ""),
+                false,
+                HASH_PREFIX_MIN_CHARS,
+                pending_now(),
+                80,
+            );
+            assert_eq!(
+                entry,
+                [
+                    "  10. alice (12121212) asked 3m ago . expires in 6d . id p1",
+                    "      \"may I read the plan?\"",
+                ]
+            );
+        }
+
+        #[test]
+        fn pending_entries_show_only_the_short_id() {
+            let text = render_pending(
+                &[asked_row(
+                    "9e519dff000011112222333344445555",
+                    PendingState::Open,
+                )],
+                &[escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "")],
+                &[access_row("1046c2c6aaaa1111bbbb2222cccc3333")],
+                pending_now(),
+                80,
+                false,
+            );
+            for full in [
+                "9e519dff000011112222333344445555",
+                "3fe1be40a1b2c3d43fe1be40a1b2c3d4",
+                "1046c2c6aaaa1111bbbb2222cccc3333",
+            ] {
+                assert!(!text.contains(full), "{full} printed whole: {text}");
+                assert!(text.contains(&format!(" . id {}", &full[..8])), "{text}");
+            }
+        }
+
+        /// Two ids sharing their first eight characters print at the length that tells
+        /// them apart, without regard to case; an id no other shares keeps its short form.
+        #[test]
+        fn pending_lengthens_only_the_ids_whose_short_forms_collide() {
+            let text = render_pending(
+                &[asked_row(
+                    "320B8F7B9999BBBB320B8F7B9999BBBB",
+                    PendingState::Open,
+                )],
+                &[
+                    escalated_row("320b8f7b1111aaaa320b8f7b1111aaaa", ""),
+                    escalated_row("1046c2c6aaaa1111bbbb2222cccc3333", ""),
+                ],
+                &[],
+                pending_now(),
+                80,
+                false,
+            );
+            let ids: Vec<&str> = text
+                .lines()
+                .filter_map(|line| line.rsplit_once(" . id ").map(|(_, id)| id))
+                .collect();
+            assert_eq!(ids, ["320b8f7b1", "1046c2c6", "320B8F7B9"], "{text}");
+        }
+    }
+
+    mod id_prefix_tests {
+        use super::*;
+
+        const FIRST: &str = "320b8f7b1111aaaa320b8f7b1111aaaa";
+        const SECOND: &str = "320b8f7b9999bbbb320b8f7b9999bbbb";
+        const OTHER: &str = "1046c2c6aaaa1111bbbb2222cccc3333";
+
+        /// `token` resolved against `ids`, every one held as a peer's question.
+        fn pick(token: &str, ids: &[&str]) -> Result<String> {
+            held_as(token, ids, Some(InboundKind::Question))
+        }
+
+        fn held_as(token: &str, ids: &[&str], kind: Option<InboundKind>) -> Result<String> {
+            resolve_pending_id(
+                token,
+                ids.iter().map(|id| (id.to_string(), kind)).collect(),
+            )
+        }
+
+        fn resolve(token: &str) -> Result<String> {
+            pick(token, &[FIRST, SECOND, OTHER, "acc-1"])
+        }
+
+        #[test]
+        fn a_held_id_resolves_verbatim_even_when_it_is_no_hex() {
+            assert_eq!(resolve("acc-1").unwrap(), "acc-1");
+        }
+
+        #[test]
+        fn a_whole_id_resolves_lower_cased() {
+            assert_eq!(resolve(OTHER).unwrap(), OTHER);
+            assert_eq!(resolve(&OTHER.to_ascii_uppercase()).unwrap(), OTHER);
+        }
+
+        #[test]
+        fn a_unique_prefix_of_eight_resolves_to_the_whole_id() {
+            assert_eq!(resolve("1046c2c6").unwrap(), OTHER);
+            assert_eq!(resolve("320b8f7b1").unwrap(), FIRST);
+        }
+
+        #[test]
+        fn a_shared_prefix_lists_the_ids_it_matches() {
+            assert_eq!(
+                resolve("320b8f7b").unwrap_err().to_string(),
+                "'320b8f7b' matches 2 pending ids: 320b8f7b1..., 320b8f7b9...; give one of these (or enough of its characters to tell it apart)."
+            );
+        }
+
+        #[test]
+        fn a_prefix_of_a_peer_chosen_id_resolves_to_the_held_id() {
+            let held = ["req-2026-11-0001", OTHER];
+            assert_eq!(
+                pick("req-2026", &held).unwrap(),
+                "req-2026-11-0001"
+            );
+            assert_eq!(
+                pick("REQ-2026-11", &held).unwrap(),
+                "req-2026-11-0001"
+            );
+            assert_eq!(
+                pick("req-20", &held).unwrap_err().to_string(),
+                "'req-20' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them."
+            );
+        }
+
+        #[test]
+        fn an_upper_case_id_resolves_from_either_case_to_the_id_as_held() {
+            let upper = FIRST.to_ascii_uppercase();
+            for token in ["320b8f7b", "320B8F7B", FIRST, upper.as_str()] {
+                assert_eq!(
+                    pick(token, &[upper.as_str(), OTHER]).unwrap(),
+                    upper,
+                    "{token}"
+                );
+            }
+        }
+
+        /// A whole id that also begins another held id names neither, so a peer cannot
+        /// mint an id equal to the short form of another and take its place. The refusal
+        /// says the longer one goes first, and the longer one is picked by its own prefix.
+        #[test]
+        fn a_whole_id_that_begins_another_is_ambiguous() {
+            let held = ["320b8f7b", FIRST, OTHER];
+            assert_eq!(
+                pick("320b8f7b", &held).unwrap_err().to_string(),
+                "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh pending` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh dismiss --all`."
+            );
+            assert_eq!(pick("320b8f7b1", &held).unwrap(), FIRST);
+        }
+
+        #[test]
+        fn a_short_whole_id_names_every_longer_id_it_begins() {
+            assert_eq!(
+                pick("q1", &["q1", "q10", "q11"]).unwrap_err().to_string(),
+                "'q1' is a whole pending id and also how q10, q11 begin, so it cannot pick one. Act on q10, q11 first, typed as `.mesh pending` lists them, then 'q1' picks the one left; or clear them with `.mesh dismiss --all`."
+            );
+        }
+
+        #[test]
+        fn ids_that_differ_only_in_case_name_the_way_they_clear() {
+            assert_eq!(
+                pick("ab12cd34", &["ab12cd34", "AB12CD34"])
+                    .unwrap_err()
+                    .to_string(),
+                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`."
+            );
+            assert_eq!(
+                held_as("ab12cd34", &["ab12cd34", "AB12CD34"], Some(InboundKind::Access))
+                    .unwrap_err()
+                    .to_string(),
+                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
+            );
+        }
+
+        /// `.mesh dismiss --all` clears only questions, so an access request in the way
+        /// is named by when it leaves, and a question this node asked, which no verb
+        /// clears, takes away the advice to act on the longer id first.
+        #[test]
+        fn the_way_out_follows_the_kind_of_each_entry_in_the_way() {
+            let held = vec![
+                ("q1".to_string(), Some(InboundKind::Question)),
+                ("q10".to_string(), Some(InboundKind::Access)),
+            ];
+            assert_eq!(
+                resolve_pending_id("q1", held).unwrap_err().to_string(),
+                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one. Act on q10 first, typed as `.mesh pending` lists it, then 'q1' picks the one left; or `.mesh dismiss --all` clears q1, and q10 leaves `.mesh pending` when it expires."
+            );
+            let held = vec![
+                ("q1".to_string(), Some(InboundKind::Access)),
+                ("q10".to_string(), None),
+            ];
+            assert_eq!(
+                resolve_pending_id("q1", held).unwrap_err().to_string(),
+                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one; q1 leaves `.mesh pending` when it expires, and q10 is a question this node asked, which no verb clears."
+            );
+        }
+
+        #[test]
+        fn a_prefix_that_is_no_whole_id_keeps_the_shared_prefix_sentence() {
+            assert_eq!(
+                pick("q1", &["q10", "q11"]).unwrap_err().to_string(),
+                "'q1' matches 2 pending ids: q10, q11; give one of these (or enough of its characters to tell it apart)."
+            );
+        }
+
+        #[test]
+        fn hex_shorter_than_eight_is_refused() {
+            let refusal = "is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them.";
+            assert_eq!(
+                resolve("1046c2c").unwrap_err().to_string(),
+                format!("'1046c2c' {refusal}")
+            );
+            assert_eq!(
+                resolve("320b").unwrap_err().to_string(),
+                format!("'320b' {refusal}")
+            );
+        }
+
+        /// No id this node holds starts with the token, so the verb's own lookup words
+        /// the miss for the kind of entry it wanted.
+        #[test]
+        fn an_unknown_prefix_or_unheld_peer_id_comes_back_as_typed() {
+            assert_eq!(resolve("deadbeef").unwrap(), "deadbeef");
+            assert_eq!(resolve("old-q").unwrap(), "old-q");
+        }
     }
 
     #[test]
@@ -12367,20 +12928,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
-            10,
-            "one escalated record is a header, one body row, one envoy row and a footer, after the blank line between sections: {text}"
+            8,
+            "one escalated record is an entry line, one body row and one envoy row, under its section header: {text}"
         );
-        assert!(lines[6].ends_with(" . id p1 . expires in 6d"), "{text}");
+        assert!(lines[1].ends_with(" . expires in 6d . id p1"), "{text}");
         assert!(
-            lines[7].contains("STOLEN") && lines[7].contains("fake row"),
+            lines[2].contains("STOLEN") && lines[2].contains("fake row"),
             "the readable part of the text survives on the same row: {text}"
         );
         assert!(
-            lines[8].starts_with("  envoy asks: ") && lines[8].contains("fake row"),
+            lines[3].starts_with("     envoy asks: ") && lines[3].contains("fake row"),
             "{text}"
         );
         assert!(
-            !lines[7].contains("[2J") && !lines[7].contains("[31m"),
+            !lines[2].contains("[2J") && !lines[2].contains("[31m"),
             "escape bodies are stripped, not just their ESC: {text}"
         );
 
@@ -12429,8 +12990,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert_eq!(
             text.lines().count(),
-            6,
-            "two titles with a blank line between the sections, `none`, one header and its footer, no body row for blank text: {text}"
+            4,
+            "three section headers and one entry line, no body row for blank text: {text}"
         );
     }
 
@@ -19895,8 +20456,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
 
-                    // Only an access row: both question sections are empty, the access
-                    // block closes the output, and nothing peer-supplied but the id shows.
+                    // Only an access row: both question sections read `none`, the access
+                    // entry is the only one, and nothing peer-supplied but the id shows.
                     run(&mut ctx, ".mesh pending").await.unwrap();
                     let text = stdout_lines().join("\n");
                     let out: Vec<&str> = text.lines().collect();
@@ -19906,16 +20467,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let access_title = out
                         .iter()
-                        .position(|line| *line == "Access requests (decide with grant or refuse):")
+                        .position(|line| line.starts_with("Access requests (1) "))
                         .unwrap_or_else(|| panic!("{text}"));
-                    assert_eq!(
-                        out[..access_title]
-                            .iter()
-                            .filter(|line| line.trim() == "none")
-                            .count(),
-                        2,
-                        "no question rows: {text}"
-                    );
+                    assert_eq!(out[access_title - 1], "Waiting for YOU: none", "{text}");
                     assert!(
                         !out[..access_title]
                             .iter()
@@ -19925,19 +20479,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let header = out[access_title + 1];
                     assert!(
                         header.starts_with(&format!(
-                            "access request . {} ({}) . asked ",
+                            "  1. {} ({}) asked ",
                             short(&asker_peer),
                             short(&asker_peer)
                         )),
                         "an unheard peer is named by its short destination: {text}"
                     );
-                    assert!(header.ends_with(" . id acc-1 . expires in 6d"), "{text}");
+                    assert!(header.ends_with(" . expires in 6d . id acc-1"), "{text}");
                     assert_eq!(
                         &out[access_title + 2..],
-                        [
-                            "  2 paths",
-                            "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
-                        ],
+                        ["     2 paths", "Asked by this node: none"],
                         "{text}"
                     );
 
@@ -37403,7 +37954,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                             assert!(
                                 out.lines().any(|line| line
-                                    == "  grant: /mesh grant a-1 | refuse: /mesh refuse a-1"),
+                                    == "Access requests (1)     grant: /mesh grant <id> [--standing] . refuse: /mesh refuse <id>"),
                                 "{out}"
                             );
                             assert!(!out.contains(".mesh"), "{out}");
@@ -38946,6 +39497,326 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
             }
 
+            /// The verbs that take a pending id act on the whole id a prefix names, and
+            /// a prefix two ids share sends nothing.
+            mod id_prefix_tests {
+                use super::*;
+
+                const FIRST: &str = "320b8f7b1111aaaa320b8f7b1111aaaa";
+                const SECOND: &str = "320b8f7b9999bbbb320b8f7b9999bbbb";
+                const OTHER: &str = "1046c2c6aaaa1111bbbb2222cccc3333";
+
+                #[test]
+                #[serial]
+                fn answer_by_prefix_answers_the_question_it_names() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-answer-prefix");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-answer-prefix").await;
+                        fx.file(FIRST, InboundKind::Question, &[]);
+                        fx.file(OTHER, InboundKind::Question, &[]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh answer 320b8f7b \"x\"")
+                            .await
+                            .unwrap();
+
+                        assert!(out.ends_with("Answered 320b8f7b."), "{out}");
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some(FIRST));
+                        assert_eq!(seen[0].content, "x");
+                        assert_eq!(fx.pending_ids(), [OTHER]);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn grant_by_prefix_grants_the_whole_id() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-prefix");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-prefix").await;
+                        fx.file(OTHER, InboundKind::Access, &["src/x.rs"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant 1046c2c6").await.unwrap();
+
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].id, OTHER);
+                        assert!(out.contains("Granted 1046c2c6: 1 path for "), "{out}");
+                        assert!(fx.heard().starts_with("access granted:"));
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn refuse_by_prefix_refuses_the_whole_id() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-refuse-prefix");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-refuse-prefix").await;
+                        fx.file(OTHER, InboundKind::Access, &["src/x.rs"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh refuse 1046c2c6aa")
+                            .await
+                            .unwrap();
+
+                        assert!(out.ends_with(&format!(
+                            "Refused 1046c2c6: 1 path for {} (via direct).",
+                            fx.dest()
+                        )));
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some(OTHER));
+                        assert_eq!(seen[0].content, "access denied: 1 path");
+                        assert!(fx.grants().is_empty());
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn dismiss_by_prefix_dismisses_the_whole_id() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-prefix");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-prefix").await;
+                        fx.file(FIRST, InboundKind::Question, &[]);
+                        fx.file(OTHER, InboundKind::Question, &[]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss 320b8f7b").await.unwrap();
+
+                        assert!(out.contains("Dismissed 320b8f7b; Stub hears"), "{out}");
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some(FIRST));
+                        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+                        assert_eq!(fx.pending_ids(), [OTHER]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// A question and an access request share the first eight characters:
+                /// every verb names both and leaves both open, and nothing reaches the
+                /// peer.
+                #[test]
+                #[serial]
+                fn an_ambiguous_prefix_names_the_matches_and_sends_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-ambiguous-prefix");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-ambiguous-prefix").await;
+                        fx.file(FIRST, InboundKind::Question, &[]);
+                        fx.file(SECOND, InboundKind::Access, &["src/x.rs"]);
+
+                        for line in [
+                            ".mesh answer 320b8f7b \"x\"",
+                            ".mesh dismiss 320b8f7b",
+                            ".mesh grant 320b8f7b",
+                            ".mesh refuse 320b8f7b",
+                        ] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "'320b8f7b' matches 2 pending ids: 320b8f7b1..., 320b8f7b9...; give one of these (or enough of its characters to tell it apart).",
+                                "{line}"
+                            );
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+                        assert_eq!(fx.pending_ids().len(), 2);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The ids `.mesh pending` prints, in the order it prints them.
+                async fn listed_ids(fx: &mut PeerFixture) -> Vec<String> {
+                    out_of(&mut fx.ctx, ".mesh pending")
+                        .await
+                        .unwrap()
+                        .lines()
+                        .filter_map(|line| line.rsplit_once(" . id ").map(|(_, id)| id.to_string()))
+                        .collect()
+                }
+
+                fn ask_stub(fx: &PeerFixture, id: &str, thread: &str) {
+                    use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord};
+                    let now = SystemTime::now();
+                    fx.ctx
+                        .app
+                        .mesh
+                        .correlations()
+                        .open(PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: id.to_string(),
+                            peer_destination: fx.stub.destination_hex(),
+                            peer_identity: fx.stub.identity_hex(),
+                            thread: thread.to_string(),
+                            question: "what now?".to_string(),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                        })
+                        .unwrap();
+                }
+
+                /// A peer-chosen id that is no hex, and an upper-case hex id, are each
+                /// answered by the short form the listing prints.
+                #[test]
+                #[serial]
+                fn the_listed_id_of_a_peer_chosen_or_upper_case_id_answers_it() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-answer-listed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-answer-listed").await;
+                        let upper = OTHER.to_ascii_uppercase();
+                        for held in ["req-2026-11-0001", upper.as_str()] {
+                            fx.file(held, InboundKind::Question, &[]);
+                            let listed = listed_ids(&mut fx).await;
+                            assert_eq!(listed, [&held[..8]], "{held}");
+
+                            out_of(&mut fx.ctx, &format!(".mesh answer {} \"x\"", listed[0]))
+                                .await
+                                .unwrap();
+
+                            let seen = fx.stub.seen();
+                            assert_eq!(seen.last().unwrap().in_reply_to.as_deref(), Some(held));
+                            assert!(fx.pending_ids().is_empty(), "{held}");
+                        }
+                        assert_eq!(fx.stub.seen().len(), 2);
+                        fx.stop().await;
+                    });
+                }
+
+                /// A held id that begins a longer held id is listed whole and the longer
+                /// one at the length that tells them apart. The longer one is answered by
+                /// what the listing prints; the shorter, being the start of both, sends
+                /// nothing and says to act on the longer one first.
+                #[test]
+                #[serial]
+                fn a_whole_id_that_begins_another_is_listed_apart_and_never_picks_one() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-answer-collision");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-answer-collision").await;
+                        fx.file("320b8f7b", InboundKind::Question, &[]);
+                        fx.file(FIRST, InboundKind::Question, &[]);
+                        let mut listed = listed_ids(&mut fx).await;
+                        listed.sort();
+                        assert_eq!(listed, ["320b8f7b", "320b8f7b1"]);
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh answer 320b8f7b \"x\"").await,
+                            "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh pending` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh dismiss --all`."
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+
+                        out_of(&mut fx.ctx, ".mesh answer 320b8f7b1 \"x\"")
+                            .await
+                            .unwrap();
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some(FIRST));
+                        assert_eq!(fx.pending_ids(), ["320b8f7b"]);
+
+                        out_of(&mut fx.ctx, ".mesh answer 320b8f7b \"y\"")
+                            .await
+                            .unwrap();
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 2, "{seen:?}");
+                        assert_eq!(seen[1].in_reply_to.as_deref(), Some("320b8f7b"));
+                        assert!(fx.pending_ids().is_empty(), "{:?}", fx.pending_ids());
+                        fx.stop().await;
+                    });
+                }
+
+                /// Access requests whose ids differ only in case cannot be picked by any
+                /// verb, and `.mesh dismiss --all` leaves them, so the refusal names their
+                /// expiry instead.
+                #[test]
+                #[serial]
+                fn access_requests_that_differ_only_in_case_are_never_picked() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-refuse-case-twins");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-refuse-case-twins").await;
+                        fx.file("ab12cd34", InboundKind::Access, &["src/x.rs"]);
+                        fx.file("AB12CD34", InboundKind::Access, &["src/x.rs"]);
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh refuse ab12cd34").await,
+                            "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        let mut left = fx.pending_ids();
+                        left.sort();
+                        assert_eq!(left, ["AB12CD34", "ab12cd34"]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The short id of a question this node asked sends the answer as a
+                /// follow-up in that question's thread.
+                #[test]
+                #[serial]
+                fn answer_by_the_prefix_of_an_asked_question_follows_up_in_its_thread() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-answer-outbound-prefix");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-answer-outbound-prefix").await;
+                        ask_stub(&fx, SECOND, "t-root");
+
+                        out_of(&mut fx.ctx, ".mesh answer 320b8f7b \"x\"")
+                            .await
+                            .unwrap();
+
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Reply);
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some(SECOND));
+                        assert_eq!(seen[0].thread.as_deref(), Some("t-root"));
+                        assert_eq!(seen[0].content, "x");
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn grant_by_the_prefix_of_an_asked_question_names_it_and_sends_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-outbound-prefix");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-outbound-prefix").await;
+                        ask_stub(&fx, SECOND, SECOND);
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh grant 320b8f7b").await,
+                            format!(
+                                "{SECOND} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+                            )
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+                        assert!(fx.ctx.app.mesh.correlations().is_open(SECOND));
+                        fx.stop().await;
+                    });
+                }
+            }
+
             mod dismiss_verb {
                 use super::*;
                 use crate::mesh::HUMAN_DECLINED;
@@ -39944,13 +40815,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             !out.contains("old-q") && !out.contains("old-a"),
                             "an expired row never renders: {out}"
                         );
-                        assert!(out.contains(" . id p1 . expires in 6d"), "{out}");
-                        assert!(!out.contains("Access requests"), "{out}");
+                        assert!(out.contains(" . expires in 6d . id p1"), "{out}");
+                        assert!(out.contains("\nAccess requests: none\n"), "{out}");
                         assert_eq!(fx.pending_ids(), ["p1"]);
 
                         let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
                         assert_eq!(idle.0.lock().len(), 2, "each expiry is announced once");
-                        assert!(out.contains(" . id p1 . expires in 6d"), "{out}");
+                        assert!(out.contains(" . expires in 6d . id p1"), "{out}");
                         fx.stop().await;
                     });
                 }
@@ -40513,11 +41384,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             out.lines().filter(|line| line.contains(" . id ")).collect();
                         assert_eq!(listed.len(), 2, "{out}");
                         assert!(
-                            listed[0].ends_with(" . id old-q . expires in 6d"),
+                            listed[0].ends_with(" . expires in 6d . id old-q"),
                             "the re-asked question heads the listing with a full expiry: {out}"
                         );
-                        assert!(listed[1].ends_with(" . id p0 . expires in 6d"), "{out}");
-                        assert!(out.contains("  are you there now?"), "the new words: {out}");
+                        assert!(listed[1].ends_with(" . expires in 6d . id p0"), "{out}");
+                        assert!(
+                            out.contains("     \"are you there now?\""),
+                            "the new words: {out}"
+                        );
                         assert!(
                             !out.contains("still there?"),
                             "the old words are gone: {out}"
@@ -40554,17 +41428,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         let edge_row = out
                             .lines()
-                            .find(|line| line.contains(" . id edge . "))
+                            .find(|line| line.ends_with(" . id edge"))
                             .unwrap_or_else(|| panic!("edge is listed: {out}"));
                         let secs = edge_row
                             .rsplit_once(" . expires in ")
-                            .and_then(|(_, tail)| tail.strip_suffix('s'))
+                            .and_then(|(_, tail)| tail.strip_suffix("s . id edge"))
                             .and_then(|secs| secs.parse::<u64>().ok())
                             .unwrap_or_else(|| {
                                 panic!("edge's expiry reads in seconds: {edge_row}")
                             });
                         assert!((1..=5).contains(&secs), "{edge_row}");
-                        assert!(!out.contains(" . id gone . "), "{out}");
+                        assert!(!out.contains(" . id gone"), "{out}");
                         assert_eq!(
                             fx.pending_ids(),
                             ["edge", "old-q", "p0"],
@@ -40866,7 +41740,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
                         assert!(
-                            out.contains(" . id a1 . expires in 6d"),
+                            out.contains(" . expires in 6d . id a1"),
                             "the live request lists: {out}"
                         );
                         assert!(
@@ -41074,13 +41948,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// The `--all` rows and summary name questions by their FULL ids, in both
-                /// summary wordings, end to end through the verb: question ids resolve by
-                /// exact key (only destination and identity hashes take a prefix), so the
-                /// 8-char form `.mesh dismiss` refuses, and the id a row or the summary
-                /// offers is the one the single form then takes. The default wording is
-                /// driven by an asker this node has never heard (the refused reply fails
-                /// at the trust check), the silent wording by a store that will not give
-                /// the row up.
+                /// summary wordings, end to end through the verb: the id a row or the
+                /// summary offers is the one the single form then takes, while hex too
+                /// short to pick an id is refused before anything prints. The default
+                /// wording is driven by an asker this node has never heard (the refused
+                /// reply fails at the trust check), the silent wording by a store that
+                /// will not give the row up.
                 #[test]
                 #[serial]
                 fn dismiss_all_names_a_stayed_question_by_its_full_id_in_the_rows_and_the_summary_which_the_single_form_takes()
@@ -41156,13 +42029,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.stub.seen().len(), 1, "the stub's question was told");
                         assert_eq!(fx.pending_ids(), [stayed_id]);
 
-                        // The 8-char form the failure line names is not an id the verb knows.
+                        // Seven characters are too few to pick a pending id.
+                        let stayed7 = &stayed_id[..7];
                         let before = stdout_lines().len();
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh dismiss {stayed8} --silent"))
+                            refusal(&mut fx.ctx, &format!(".mesh dismiss {stayed7} --silent"))
                                 .await,
                             format!(
-                                "No open question has id {stayed8}. `.mesh pending` lists the ones this node knows about."
+                                "'{stayed7}' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them."
                             )
                         );
                         assert_eq!(

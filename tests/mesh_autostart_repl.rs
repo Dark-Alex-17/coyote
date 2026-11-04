@@ -677,6 +677,17 @@ fn literally(text: &str) -> String {
     out
 }
 
+/// How `.mesh pending` opens its first section when one peer question waits.
+const WAITING_FOR_YOU_ONE: &str = "Waiting for YOU (1)";
+
+/// That section's whole header with the other two sections empty: the commands start
+/// two columns past the longest counted title, `Asked by this node (0)`.
+fn waiting_for_you_header() -> String {
+    format!(
+        "{WAITING_FOR_YOU_ONE}     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>"
+    )
+}
+
 /// Cold start, mesh off, no session: the verbs renamed before the release answer
 /// at the first prompt with the words the docs quote, and the old spellings are
 /// refused outright rather than aliased. `.mesh reply` is an unknown verb whose
@@ -2015,11 +2026,12 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
     let pending = command_prints(
         &mut session,
         ".mesh pending",
-        &literally(&format!("  answer: .mesh answer {q1} \"<text>\"")),
+        "Asked by this node: none",
         SESSION_PROMPT,
     );
     assert!(
-        pending.contains(&format!(" . id {} . expires in 6d", &q1[..8]))
+        pending.contains(&format!(" . expires in 6d . id {}", &q1[..8]))
+            && pending.contains("Access requests: none")
             && !pending.contains("expired")
             && !pending.contains(&old_q[..8])
             && !pending.contains(&old_a[..8]),
@@ -2060,13 +2072,14 @@ fn mesh_cache_dir_and_instance_id(temp_root: &Path) -> (PathBuf, String) {
 }
 
 /// Cold start with a node on and nobody heard, through the real binary and a pty. With
-/// nothing filed `.mesh pending` prints the two question titles over `none` and no
-/// closing hint, and `.mesh answer` with an unknown id and no text is refused naming
+/// nothing filed `.mesh pending` prints its three sections as `<title>: none` and no
+/// commands, and `.mesh answer` with an unknown id and no text is refused naming
 /// `.mesh pending` without opening a prompt. A question planted in the instance's
-/// inbound store (read on every verb) is then listed as one block: a header painted in
-/// the tool-call name colour that ends `id <id8>`, the body, `envoy asks:` on its own
-/// row and the `answer:` footer carrying the full id. `.mesh answer <id>` with no text
-/// prints that block and opens the `Your answer:` prompt: Esc cancels it to
+/// inbound store (read on every verb) is then listed under a `Waiting for YOU (1)`
+/// header painted in the tool-call name colour that names the commands, as one numbered
+/// entry ending `id <id8>`, the quoted body and `envoy asks:` on its own row.
+/// `.mesh answer <id>` with no text prints the question block with its `answer:`
+/// footer carrying the full id and opens the `Your answer:` prompt: Esc cancels it to
 /// the `Nothing was sent:` line naming the one-line form, with nothing sent and the
 /// question still filed; a typed answer goes out as `Sending your answer to <dest8>`
 /// and comes back refused, the peer being untrusted, with the question filed again.
@@ -2083,29 +2096,24 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     let (_, empty) = command_row_and_transcript(
         &mut session,
         ".mesh pending",
-        r"Questions peers asked \(escalated to you\):\r\n  none",
+        r"Asked by this node: none",
         SESSION_PROMPT,
     );
     let lines = transcript_lines(&empty);
     let first = lines
         .iter()
-        .position(|line| *line == "Questions this node asked (awaiting a reply):")
+        .position(|line| *line == "Waiting for YOU: none")
         .unwrap_or_else(|| panic!("{empty:?}"));
     assert_eq!(
-        &lines[first..first + 5],
+        &lines[first..first + 3],
         [
-            "Questions this node asked (awaiting a reply):",
-            "  none",
-            "",
-            "Questions peers asked (escalated to you):",
-            "  none",
+            "Waiting for YOU: none",
+            "Access requests: none",
+            "Asked by this node: none",
         ],
         "{empty:?}"
     );
-    assert!(
-        !empty.contains("answer one with") && !empty.contains("Access requests"),
-        "{empty:?}"
-    );
+    assert!(!empty.contains(".mesh answer <id>"), "{empty:?}");
 
     let (_, refused) = command_row_and_transcript(
         &mut session,
@@ -2148,32 +2156,34 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         "  envoy asks: Share the plan?",
         footer.as_str(),
     ];
+    let entry_head = format!("  1. {dest8} ({dest8}) asked ");
+    let entry_tail = [
+        "     \"Please delete docs/notes.md.\"",
+        "     envoy asks: Share the plan?",
+    ];
     session.send(".mesh pending\r").unwrap();
-    let (before, matched) = wait_for_match(&mut session, &literally(&header_head));
+    let (before, matched) = wait_for_match(&mut session, &literally(WAITING_FOR_YOU_ONE));
     let opening = String::from_utf8_lossy(&before);
     let opening = opening.rsplit('\n').next().unwrap_or_default();
     assert!(
         opening.contains("\x1b[1;38;2;") && opening.ends_with('m'),
         "the header opens with bold plus the theme's truecolor foreground: {opening:?}"
     );
-    let row = row_of(&before, &matched);
     let mut listed = strip_escapes(&before) + &strip_escapes(&matched);
     listed.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
     let lines = transcript_lines(&listed);
     let at = lines
         .iter()
-        .position(|line| line.starts_with(&header_head))
+        .position(|line| line.starts_with(WAITING_FOR_YOU_ONE))
         .unwrap_or_else(|| panic!("{listed:?}"));
+    assert_eq!(lines[at], waiting_for_you_header(), "{listed:?}");
+    assert!(lines[at + 1].starts_with(&entry_head), "{listed:?}");
     assert!(
-        lines[at].ends_with(&format!("s ago . id {} . expires in 6d", &id[..8])),
-        "{row:?}"
-    );
-    assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
-    assert_eq!(
-        lines[at - 1],
-        "Questions peers asked (escalated to you):",
+        lines[at + 1].ends_with(&format!("s ago . expires in 6d . id {}", &id[..8])),
         "{listed:?}"
     );
+    assert_eq!(&lines[at + 2..at + 4], entry_tail, "{listed:?}");
+    assert_eq!(lines[at + 4], "Access requests: none", "{listed:?}");
 
     // No text: the block, then the prompt; Esc cancels it and sends nothing.
     session.send(format!(".mesh answer {id}\r")).unwrap();
@@ -2211,10 +2221,11 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     let again = command_prints(
         &mut session,
         ".mesh pending",
-        &literally(&header_head),
+        &literally(&entry_head),
         SESSION_PROMPT,
     );
-    assert!(again.contains(&footer), "{again:?}");
+    assert!(again.contains(entry_tail[0]), "{again:?}");
+    assert!(!again.contains(&footer), "{again:?}");
 
     let status = exit_clean(&mut session);
     probe.wait_for_marker("MESH_STOPPED");
@@ -2267,10 +2278,15 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
         "  envoy asks: Rename it now?",
         footer.as_str(),
     ];
+    let entry_head = format!("  1. {dest8} ({dest8}) asked ");
+    let entry_tail = [
+        "     \"May I rename the branch?\"",
+        "     envoy asks: Rename it now?",
+    ];
 
     // `.mesh pending`: the header row is plain bytes, nothing opens a colour before it.
     session.send(".mesh pending\r").unwrap();
-    let (before, matched) = wait_for_match(&mut session, &literally(&header_head));
+    let (before, matched) = wait_for_match(&mut session, &literally(WAITING_FOR_YOU_ONE));
     assert!(
         !matched.contains(&0x1b),
         "no escape inside the plain header: {:?}",
@@ -2286,13 +2302,15 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
     let lines = transcript_lines(&listed);
     let at = lines
         .iter()
-        .position(|line| line.starts_with(&header_head))
+        .position(|line| line.starts_with(WAITING_FOR_YOU_ONE))
         .unwrap_or_else(|| panic!("{listed:?}"));
+    assert_eq!(lines[at], waiting_for_you_header(), "{listed:?}");
+    assert!(lines[at + 1].starts_with(&entry_head), "{listed:?}");
     assert!(
-        lines[at].ends_with(&format!(" ago . id {} . expires in 6d", &id[..8])),
+        lines[at + 1].ends_with(&format!(" ago . expires in 6d . id {}", &id[..8])),
         "{listed:?}"
     );
-    assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
+    assert_eq!(&lines[at + 2..at + 4], entry_tail, "{listed:?}");
 
     // `.mesh answer <id>`: the plain block, then the prompt; an empty Enter sends nothing.
     session.send(format!(".mesh answer {id}\r")).unwrap();
@@ -2344,11 +2362,11 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
     let again = command_prints(
         &mut session,
         ".mesh pending",
-        &literally(&header_head),
+        &literally(&entry_head),
         SESSION_PROMPT,
     );
     assert!(
-        again.contains(&footer),
+        again.contains(entry_tail[0]),
         "the question is still filed: {again:?}"
     );
 
@@ -2359,13 +2377,14 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
 
 /// Cold start with a node on, through the real binary and a pty. Two questions are
 /// planted in the instance's inbound store, one with the envoy's framing and one without;
-/// `.mesh pending` lists them as two blocks separated by one empty line, and the block
-/// without framing has no `envoy asks:` row. Answering one with the text ON THE LINE
-/// prints that same block, opens no `Your answer:` prompt, then `Sending your answer to
-/// <dest8> over the mesh...`, one empty line, and the result (refused: the peer is
-/// untrusted). After a typed `.mesh off --yes` the bare `.mesh answer <id>` and the
-/// one-line form are both refused by the `.mesh on` teaching line before any block or
-/// prompt, nothing is sent, and the store file is byte-identical afterwards.
+/// `.mesh pending` lists them as two numbered entries under one `Waiting for YOU (2)`
+/// header, and the entry without framing has no `envoy asks:` row. Answering one with
+/// the text ON THE LINE prints its question block, opens no `Your answer:` prompt, then
+/// `Sending your answer to <dest8> over the mesh...`, one empty line, and the result
+/// (refused: the peer is untrusted). After a typed `.mesh off --yes` the bare
+/// `.mesh answer <id>` and the one-line form are both refused by the `.mesh on` teaching
+/// line before any block or prompt, nothing is sent, and the store file is
+/// byte-identical afterwards.
 #[test]
 fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate_precedes_the_prompt()
  {
@@ -2413,47 +2432,56 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
     let framed_footer = format!("  answer: .mesh answer {framed_id} \"<text>\"");
     let bare_footer = format!("  answer: .mesh answer {bare_id} \"<text>\"");
 
-    // Two blocks, one empty line between them, no `envoy asks:` row where the envoy
-    // added no framing.
+    // Two numbered entries under one header, no `envoy asks:` row where the envoy added
+    // no framing.
     let (_, pending) = command_row_and_transcript(
         &mut session,
         ".mesh pending",
-        &literally(&bare_footer),
+        "Asked by this node: none",
         SESSION_PROMPT,
     );
     let lines = transcript_lines(&pending);
-    let headers: Vec<usize> = lines
+    let at = lines
         .iter()
-        .enumerate()
-        .filter(|(_, line)| line.starts_with(&header_head))
-        .map(|(at, _)| at)
+        .position(|line| line.starts_with("Waiting for YOU (2)"))
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    let entry_head = format!("{dest8} ({dest8}) asked ");
+    let entries: Vec<usize> = (at + 1..lines.len())
+        .take_while(|&index| !lines[index].starts_with("Access requests"))
+        .filter(|&index| lines[index].contains(&entry_head))
         .collect();
-    assert_eq!(headers.len(), 2, "two question blocks: {pending:?}");
-    assert_eq!(
-        lines[headers[1] - 1],
-        "",
-        "one empty line separates the blocks: {pending:?}"
+    assert_eq!(entries.len(), 2, "two numbered entries: {pending:?}");
+    assert!(
+        lines[entries[0]].starts_with("  1. ") && lines[entries[1]].starts_with("  2. "),
+        "{pending:?}"
     );
     let bare_at = lines
         .iter()
-        .position(|line| *line == bare_footer)
+        .position(|line| *line == "     \"Is the release note final?\"")
         .unwrap_or_else(|| panic!("{pending:?}"));
     assert!(
-        lines[bare_at - 2].starts_with(&header_head)
-            && lines[bare_at - 1] == "  Is the release note final?",
-        "the unframed block is header, body, footer with no envoy row: {pending:?}"
+        lines[bare_at - 1].ends_with(&format!(" ago . expires in 6d . id {}", &bare_id[..8])),
+        "{pending:?}"
     );
     assert!(
-        lines[bare_at - 2].ends_with(&format!(" ago . id {} . expires in 6d", &bare_id[..8])),
-        "{pending:?}"
+        !lines[bare_at + 1].contains("envoy asks:"),
+        "the unframed entry has no envoy row: {pending:?}"
     );
     let framed_at = lines
         .iter()
-        .position(|line| *line == framed_footer)
+        .position(|line| *line == "     \"Can I archive the old branch?\"")
         .unwrap_or_else(|| panic!("{pending:?}"));
+    assert!(
+        lines[framed_at - 1].ends_with(&format!(" . id {}", &framed_id[..8])),
+        "{pending:?}"
+    );
     assert_eq!(
-        lines[framed_at - 1],
-        "  envoy asks: Archive it?",
+        lines[framed_at + 1],
+        "     envoy asks: Archive it?",
+        "{pending:?}"
+    );
+    assert!(
+        !pending.contains(&framed_footer) && !pending.contains(&bare_footer),
         "{pending:?}"
     );
 
@@ -3985,11 +4013,13 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
 
     // The sweep at the top of `.mesh pending`: the stale pair goes, one idle line each.
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let access_footer = format!("  grant: .mesh grant {acc} | refuse: .mesh refuse {acc}");
+    let access_header =
+        "Access requests (1)     grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>";
+    let entry_head = format!("{dest8} ({dest8}) asked ");
     let (_, pending) = command_row_and_transcript(
         &mut session,
         ".mesh pending",
-        &literally(&access_footer),
+        &literally(access_header),
         SESSION_PROMPT,
     );
     assert!(
@@ -3997,35 +4027,40 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         "an expired row never renders: {pending:?}"
     );
     let lines = transcript_lines(&pending);
-    let headers: Vec<&&str> = lines
+    let waiting_at = lines
         .iter()
-        .filter(|line| line.starts_with(&header_head))
+        .position(|line| line.starts_with("Waiting for YOU (2)"))
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    let access_at = lines
+        .iter()
+        .position(|line| *line == access_header)
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    let entries: Vec<&&str> = lines[waiting_at + 1..access_at]
+        .iter()
+        .filter(|line| line.contains(&entry_head))
         .collect();
-    assert_eq!(headers.len(), 2, "two fresh question blocks: {pending:?}");
-    let mut shown: Vec<String> = headers
+    assert_eq!(entries.len(), 2, "two fresh question entries: {pending:?}");
+    let mut shown: Vec<String> = entries
         .iter()
-        .map(|header| {
-            let (_, tail) = header
+        .map(|entry| {
+            let (head, id8) = entry
                 .rsplit_once(" . id ")
                 .unwrap_or_else(|| panic!("{pending:?}"));
             assert!(
-                tail.ends_with(" . expires in 6d")
-                    && tail.len() == "xxxxxxxx . expires in 6d".len(),
-                "each fresh row carries its time left: {header:?}"
+                head.ends_with(" . expires in 6d") && id8.len() == 8,
+                "each fresh row carries its time left: {entry:?}"
             );
-            tail[..8].to_string()
+            id8.to_string()
         })
         .collect();
     shown.sort_unstable();
     let mut fresh_ids = vec![q1[..8].to_string(), q2[..8].to_string()];
     fresh_ids.sort_unstable();
     assert_eq!(shown, fresh_ids, "{pending:?}");
-    let access_header = lines
-        .iter()
-        .find(|line| line.starts_with(&format!("access request . {dest8} ({dest8}) . asked ")))
-        .unwrap_or_else(|| panic!("{pending:?}"));
+    let access_entry = lines[access_at + 1];
     assert!(
-        access_header.ends_with(&format!(" ago . id {} . expires in 6d", &acc[..8])),
+        access_entry.starts_with(&format!("  1. {entry_head}"))
+            && access_entry.ends_with(&format!(" ago . expires in 6d . id {}", &acc[..8])),
         "{pending:?}"
     );
     let expiry = format!(
@@ -4069,7 +4104,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     let again = command_prints(
         &mut session,
         ".mesh pending",
-        &literally(&access_footer),
+        &literally(access_header),
         SESSION_PROMPT,
     );
     assert!(!again.contains("expired"), "{again:?}");
@@ -4272,15 +4307,15 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     let left = command_prints(
         &mut session,
         ".mesh pending",
-        &literally(&access_footer),
+        "Asked by this node: none",
         SESSION_PROMPT,
     );
     let lines = transcript_lines(&left);
     let escalated = lines
         .iter()
-        .position(|line| *line == "Questions peers asked (escalated to you):")
+        .position(|line| *line == "Waiting for YOU: none")
         .unwrap_or_else(|| panic!("{left:?}"));
-    assert_eq!(lines[escalated + 1], "  none", "{left:?}");
+    assert_eq!(lines[escalated + 1], access_header, "{left:?}");
     let nothing = command_prints(
         &mut session,
         ".mesh dismiss --all --dry-run",
