@@ -481,6 +481,13 @@ def normalize_choices(state, u, item):
 
 DISCUSSION_PARKED = "choice_discussion"
 
+# The gate that asks each choice kind's queue: it asks the current question, or closes the queue once all are answered.
+# leak_question is not asked through the queue yet; it gets an entry here when it is.
+CHOICE_KIND_GATES = {"design_round": "open_questions_gate", "quality_bar": "quality_bar_gate",
+                     "checklist_accept": "checklist_round"}
+CHECKLIST_ACCEPT = "Accept: add it as a criterion"
+CHECKLIST_DROP = "Drop"
+
 
 def _start_choices(u, kind, queue):
     u.update({"choice_kind": kind, "choice_queue": queue, "choice_index": 0, "choice_answers": [], "choice_parks": {},
@@ -601,23 +608,46 @@ def frame_questions_route(state):
         framed = invalid
     kept = [q for q in as_list(state.get("open_questions")) if q not in invalid]
     u.update({"open_questions": kept + framed, "choice_invalid": [], "framed_questions": []})
-    u["_next"] = "open_questions_gate"
+    u["_next"] = CHOICE_KIND_GATES[state.get("choice_kind") or "design_round"]
     return u
+
+
+QUALITY_RIGORS = ("production", "prototype", "poc")
+
+
+def _quality_bar_answer(answer, rigor, surfaces):
+    """(rigor, surfaces) named by a quality bar answer, each falling back to the proposal when the answer omits it."""
+    m = re.search(r"rigor\s*=\s*([\w-]+)", answer) or re.search(rf"(?i)\b({'|'.join(QUALITY_RIGORS)})\b", answer)
+    s = re.search(r"surfaces\s*[=:]?\s*([^;\n]+)", answer)
+    picked = s.group(1).strip() if s else surfaces
+    return (m.group(1) if m else rigor).strip(), (surfaces if "(as proposed)" in picked else picked).strip()
 
 
 def quality_bar_gate(state):
     u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "quality_bar" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, "Quality bar question")
+        answer = str(as_dict(as_list(state.get("choice_answers"))[-1]).get("answer") or "")
+        rigor, surfaces = _quality_bar_answer(answer, queue[0].get("rigor") or "production", queue[0].get("surfaces") or "")
+        u.update({"quality_rigor": rigor, "quality_surfaces": surfaces})
+        _end_choices(u)
+        u["_next"] = "record_quality_bar"
+        return u
     if state.get("quality_rigor") and state.get("quality_surfaces") is not None and state.get("quality_recorded"):
         u["_next"] = "checklist_gate"
         return u
     rigor = state.get("rigor_proposal") or "production"
     surfaces = state.get("surfaces_proposal") or ""
-    return raise_escalation(state, u, escalation(
-        "quality_bar", f"Quality bar for this plan: rigor and surfaces. Proposal: rigor={rigor}, surfaces={surfaces or '(none)'}.",
-        [option(f"rigor={rigor}, surfaces={surfaces}", recommended=True, evidence=state.get("quality_evidence") or "the design doc's own signals"),
-         option("rigor=production, surfaces=(as proposed)"), option("rigor=prototype, surfaces=(as proposed)"),
-         option("rigor=poc, surfaces=(as proposed)")],
-        data={"rigor": rigor, "surfaces": surfaces}))
+    # the proposal's own rigor is already the recommended option, so it is not offered twice
+    options = [option(f"rigor={rigor}, surfaces={surfaces}", recommended=True,
+                      evidence=state.get("quality_evidence") or "the design doc's own signals")]
+    options += [option(f"rigor={r}, surfaces=(as proposed)") for r in QUALITY_RIGORS if r != rigor]
+    _start_choices(u, "quality_bar", [{
+        "question": f"Quality bar for this plan: rigor and surfaces. Proposal: rigor={rigor}, surfaces={surfaces or '(none)'}.",
+        "options": options[:CHOICE_OPTIONS_MAX], "rigor": rigor, "surfaces": surfaces}])
+    return _ask_choice(state, u, "Quality bar question")
 
 
 def record_quality_bar(state):
@@ -653,6 +683,28 @@ def checklist_gate(state):
 
 def checklist_round(state):
     u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "checklist_accept" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, "Best-practice checklist item")
+        accepted = []
+        for item, a in zip(queue, as_list(state.get("choice_answers"))):
+            answer = str(as_dict(a).get("answer") or "").strip()
+            if answer == CHECKLIST_ACCEPT:
+                accepted.append(item["item"])
+            elif answer and answer != CHECKLIST_DROP:
+                accepted.append(f"{item['item']} (owner: {answer})")
+        _end_choices(u)
+        if accepted:
+            u["pending_amendments"] = ["Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
+                                       "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
+                                       + "\n".join(f"- {x}" for x in accepted)]
+            ledger(state, u, f"checklist: {len(accepted)}/{len(queue)} items accepted")
+            u["_next"] = "amend_plan"
+        else:
+            ledger(state, u, "checklist: no items accepted")
+            u["_next"] = "checklist_gate"
+        return u
     labels = as_list(state.get("checklist_labels"))
     findings = as_list(state.get("checklist_findings"))
     items = []
@@ -666,10 +718,11 @@ def checklist_round(state):
         u["_next"] = "reseal_gate"
         return u
     u["checklist_items"] = items
-    return raise_escalation(state, u, escalation(
-        "checklist_accept", "Best-practice checklist round: reply with the item numbers to ACCEPT (e.g. '1,3,4'), "
-                            "'all', or 'none'. Accepted items become acceptance criteria / long-tail criteria in the plan.",
-        [option(it) for it in items[:40]], data={"items": items}))
+    _start_choices(u, "checklist_accept", [
+        {"question": f"{it}\nAccept this as an acceptance criterion (or a long-tail criterion) in the plan?", "item": it,
+         "options": [option(CHECKLIST_ACCEPT, recommended=True, evidence="the checklist reviewer's finding"),
+                     option(CHECKLIST_DROP)]} for it in items[:40]])
+    return _ask_choice(state, u, "Best-practice checklist item")
 
 
 # ====================================================================== 2.3 gates
@@ -2467,7 +2520,7 @@ def parse_answer(state):
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
-    free_text_kinds = ("leak_question", "checklist_accept", "need_design_doc")
+    free_text_kinds = ("leak_question", "need_design_doc")
     if esc.get("kind") == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
@@ -2578,7 +2631,7 @@ def choice_resume(state):
     else:
         ledger(state, u, f"choice: {esc.get('kind')}: resumed without a settled answer -> question "
                          f"{as_int(state.get('choice_index')) + 1} asked again")
-    u["_next"] = "open_questions_gate"
+    u["_next"] = CHOICE_KIND_GATES[state.get("choice_kind") or esc.get("kind")]
     return u
 
 
@@ -2697,36 +2750,9 @@ def apply_answer(state):
         if p and os.path.isfile(p):
             u["design_doc_path"] = os.path.abspath(p)
         u["_next"] = "orient_read"
-    elif kind == "design_round":
+    elif kind in CHOICE_KIND_GATES:
         _record_choice(state, u, answer)
-        u["_next"] = "open_questions_gate"
-    elif kind == "quality_bar":
-        d = as_dict(esc.get("data"))
-        rigor = (re.search(r"rigor\s*=\s*([\w-]+)", answer) or [None, d.get("rigor", "production")])[1]
-        surfaces = (re.search(r"surfaces\s*=\s*([^;\n]+)", answer) or [None, d.get("surfaces", "")])[1]
-        if "(as proposed)" in str(surfaces):
-            surfaces = d.get("surfaces", "")
-        u.update({"quality_rigor": rigor.strip(), "quality_surfaces": str(surfaces).strip()})
-        u["_next"] = "record_quality_bar"
-    elif kind == "checklist_accept":
-        items = as_list(as_dict(esc.get("data")).get("items"))
-        a = answer.strip().lower()
-        if a == "none" or not a:
-            accepted = []
-        elif a == "all":
-            accepted = items
-        else:
-            nums = [int(n) for n in re.findall(r"\d+", a)]
-            accepted = [items[n - 1] for n in nums if 1 <= n <= len(items)] or [it for it in items if it.lower() in a]
-        if accepted:
-            u["pending_amendments"] = ["Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
-                                       "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
-                                       + "\n".join(f"- {x}" for x in accepted)]
-            ledger(state, u, f"checklist: {len(accepted)}/{len(items)} items accepted")
-            u["_next"] = "amend_plan"
-        else:
-            ledger(state, u, "checklist: no items accepted")
-            u["_next"] = "checklist_gate"
+        u["_next"] = CHOICE_KIND_GATES[kind]
     elif kind == "plan_unauthored":
         u["_next"] = "quality_bar_gate"
     elif kind == "amend_cap":

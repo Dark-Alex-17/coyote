@@ -7,7 +7,8 @@ subgraphs stay disjoint from the main flow; every cycle (static + dynamic)
 passes through a node that owns a named bound (section 5); the engine backstop
 is set. Script `_next` targets are harvested per gate function from gates.py
 by AST (string constants assigned to `u["_next"]` and the shared
-`raise_escalation` / `_terminal_prompt` helpers), so the dynamic edges are
+`raise_escalation` / `_terminal_prompt` helpers, plus every gate of the
+CHOICE_KIND_GATES table for a function that reads it), so the dynamic edges are
 attributed to the node that emits them, not smeared over every script node.
 
 Usage: audit_graph.py [agent dir]   (exit 1 on any problem)
@@ -76,15 +77,22 @@ def harvest_gate_targets(gates_src):
     """gate function name -> set of `_next` literals it can emit (incl. helpers)."""
     tree = ast.parse(gates_src)
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    found = [{v.value for v in n.value.values if isinstance(v, ast.Constant)} for n in tree.body
-             if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and any(getattr(t, "id", None) == "_TERMINAL_PROMPTS" for t in n.targets)]
-    if not found:
-        sys.exit("gates.py has no module-level _TERMINAL_PROMPTS dict literal; the terminal prompt edges cannot be audited")
-    prompts = {"ask_user"} | found[0]
+
+    def dict_values(name):
+        found = [{v.value for v in n.value.values if isinstance(v, ast.Constant)} for n in tree.body
+                 if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and any(getattr(t, "id", None) == name for t in n.targets)]
+        if not found:
+            sys.exit(f"gates.py has no module-level {name} dict literal; the edges it drives cannot be audited")
+        return found[0]
+
+    prompts = {"ask_user"} | dict_values("_TERMINAL_PROMPTS")
+    kind_gates = dict_values("CHOICE_KIND_GATES")
 
     def literals(fn):
         out = set()
         for node in ast.walk(fn):
+            if isinstance(node, ast.Name) and node.id == "CHOICE_KIND_GATES":
+                out.update(kind_gates)
             if isinstance(node, ast.Assign):
                 for t in node.targets:
                     if (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "_next"

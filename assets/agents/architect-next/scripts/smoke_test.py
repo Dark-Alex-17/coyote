@@ -555,7 +555,36 @@ check("open_questions_gate: B1 exhausted + changes_scope -> end_blocked (hard st
 u = gates.open_questions_gate(base_state(open_questions=[{"question": "color?", "changes_scope": False}], design_rounds=DESIGN_ROUNDS_MAX))
 check("open_questions_gate: B1 exhausted, non-scope -> carried, continue", u["_next"] == "quality_bar_gate" and u["open_questions"] == [])
 u = gates.quality_bar_gate(base_state(rigor_proposal="prototype", surfaces_proposal="http,other:grpc"))
-check("quality_bar_gate: proposal recommended", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "quality_bar" and u["escalation"]["options"][0]["recommended"])
+QB_TEXTS = [o["text"] for o in u["escalation"]["options"]]
+check("quality_bar_gate: one multiple-choice question through the queue, the proposal recommended first, every option distinct",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "quality_bar" and u["escalation"]["data"]["multiple_choice"]
+      and u["choice_kind"] == "quality_bar" and len(u["choice_queue"]) == 1 and u["escalation"]["options"][0]["recommended"]
+      and [o["recommended"] for o in u["escalation"]["options"]].count(True) == 1
+      and QB_TEXTS[0] == "rigor=prototype, surfaces=http,other:grpc" and len(set(QB_TEXTS)) == len(QB_TEXTS)
+      and "rigor=prototype, surfaces=(as proposed)" not in QB_TEXTS, QB_TEXTS)
+QB = base_state(**{k: v for k, v in u.items() if k != "_next"})
+for reply, rigor, surfaces in (("2", "production", "http,other:grpc"), ("prototype, surfaces api", "prototype", "api"),
+                               ("rigor=poc", "poc", "http,other:grpc")):
+    s = {**QB, "last_answer": reply}
+    s.update(gates.apply_answer(s))
+    s.update(gates.quality_bar_gate(s))
+    check(f"quality_bar walk: {reply!r} -> recorded, the queue closed -> record_quality_bar with rigor={rigor} surfaces={surfaces}",
+          s["_next"] == "record_quality_bar" and s["quality_rigor"] == rigor and s["quality_surfaces"] == surfaces
+          and s["choice_kind"] == "" and s["choice_queue"] == [], s)
+s = {**QB, "last_answer_text": "what does prototype drop?"}
+s.update(gates.choice_park(s))
+check("choice_park: a quality bar question parks like a design question", s["_next"] == "end_discussion"
+      and s["parked"] == "choice_discussion" and s["discussion"]["kind"] == "quality_bar", s)
+u = gates.choice_resume(s)
+u2 = gates.quality_bar_gate({**s, **u})
+check("choice_resume: a parked quality bar resumed without an answer -> quality_bar_gate asks it again",
+      u["_next"] == "quality_bar_gate" and u2["_next"] == "escalate_gate" and u2["escalation"]["kind"] == "quality_bar"
+      and u2["escalation"]["data"]["index"] == 0, (u, u2))
+s.update(settled_answer="rigor=poc")
+s.update(gates.choice_resume(s))
+s.update(gates.quality_bar_gate(s))
+check("choice_resume: a parked quality bar settled as 'rigor=poc' -> record_quality_bar with poc, the proposal's surfaces",
+      s["_next"] == "record_quality_bar" and s["quality_rigor"] == "poc" and s["quality_surfaces"] == "http,other:grpc", s)
 u = gates.quality_bar_gate(base_state(quality_rigor="production", quality_surfaces="", quality_recorded=True))
 check("quality_bar_gate: recorded -> checklist_gate", u["_next"] == "checklist_gate")
 u = gates.record_quality_bar(base_state(quality_rigor="prototype", quality_surfaces="http,other:grpc"))
@@ -564,8 +593,52 @@ u = gates.checklist_gate(base_state(quality_surfaces="http,other:grpc", checklis
 check("checklist_gate: other:<label> -> checklist fan-out", u["_next"] == "checklist_fanout" and u["checklist_labels"] == ["grpc"])
 u = gates.checklist_gate(base_state(quality_surfaces="http,other:grpc", checklist_done=["grpc"]))
 check("checklist_gate: done -> reseal_gate", u["_next"] == "reseal_gate")
-u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findings=["1. use deadlines\n2. propagate metadata\n"]))
-check("checklist_round: items -> escalation checklist_accept", u["_next"] == "escalate_gate" and len(u["escalation"]["options"]) == 2 and u["checklist_done"] == ["grpc"])
+u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findings=["1. use deadlines\n2. propagate metadata\n3. retry calls\n"]))
+check("checklist_round: items -> one accept/drop multiple choice per item, accept recommended",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "checklist_accept" and u["escalation"]["data"]["multiple_choice"]
+      and [o["text"] for o in u["escalation"]["options"]] == [gates.CHECKLIST_ACCEPT, gates.CHECKLIST_DROP]
+      and u["escalation"]["options"][0]["recommended"] and not u["escalation"]["options"][1]["recommended"]
+      and [q["item"] for q in u["choice_queue"]] == ["[grpc] use deadlines", "[grpc] propagate metadata", "[grpc] retry calls"]
+      and "use deadlines" in u["escalation"]["question"] and u["checklist_done"] == ["grpc"], u)
+CL = base_state(**{k: v for k, v in u.items() if k != "_next"})
+
+
+def checklist_walk(replies):
+    s = dict(CL)
+    for reply in replies:
+        s.update(gates.apply_answer({**s, "last_answer": reply}))
+        s.update(gates.checklist_round(s))
+    return s
+
+
+s = checklist_walk(["1", "Drop", "yes, the platform team owns it"])
+check("checklist walk: accept, drop and an Other answer -> amend_plan with the accepted items, the Other one in the user's wording",
+      s["_next"] == "amend_plan" and "- [grpc] use deadlines\n" in s["pending_amendments"][0]
+      and "- [grpc] retry calls (owner: yes, the platform team owns it)" in s["pending_amendments"][0]
+      and "propagate metadata" not in s["pending_amendments"][0] and s["choice_kind"] == "", s.get("pending_amendments"))
+s = checklist_walk(["2", "drop", "Drop"])
+check("checklist walk: every item dropped -> checklist_gate, nothing to amend", s["_next"] == "checklist_gate"
+      and "pending_amendments" not in s and s["choice_queue"] == [], s)
+s = checklist_walk(["1"])
+s.update(gates.choice_park({**s, "last_answer_text": "who would own the metadata?"}))
+check("choice_park: a checklist item parks like a design question", s["_next"] == "end_discussion"
+      and s["discussion"]["kind"] == "checklist_accept" and s["discussion"]["number"] == 2 and s["discussion"]["total"] == 3, s)
+u = gates.choice_resume(s)
+u2 = gates.checklist_round({**s, **u})
+check("choice_resume: a parked checklist item resumed without an answer -> checklist_round asks the same item again",
+      u["_next"] == "checklist_round" and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 1
+      and "propagate metadata" in u2["escalation"]["question"], (u, u2))
+s.update(settled_answer="drop")
+s.update(gates.choice_resume(s))
+s.update(gates.checklist_round(s))
+check("choice_resume: a parked checklist item settled as 'drop' -> recorded as Drop, the next item asked",
+      s["choice_answers"][-1]["answer"] == gates.CHECKLIST_DROP and s["_next"] == "escalate_gate"
+      and s["escalation"]["data"]["index"] == 2, s)
+check("choice kind gates: resumed without an answer, every kind returns to the gate that asks its own queue",
+      gates.CHOICE_KIND_GATES == {"design_round": "open_questions_gate", "quality_bar": "quality_bar_gate",
+                                  "checklist_accept": "checklist_round"}
+      and all(gates.choice_resume(base_state(choice_kind=k, escalation=escalation(k, "q")))["_next"] == g
+              for k, g in gates.CHOICE_KIND_GATES.items()))
 u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findings=["PIPELINE-FAULT: x"]))
 check("checklist_round: no items -> reseal_gate (declared)", u["_next"] == "reseal_gate")
 
@@ -1314,6 +1387,11 @@ check("intake: a message that is not a continue with the carried key -> a fresh 
 s = {"initial_prompt": "continue", **STORE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: 'continue' with no carried key -> a fresh run as before", not s.get("resume_mode") and s["run_id"] != PARK_ID, s)
+for prompt, settled in (("continue, option 2", "option 2"), ("continue - use pg", "use pg"), ("resume; ...", "")):
+    s = {"initial_prompt": prompt, "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+    s.update(gates.intake(s))
+    check(f"intake: {prompt!r} -> the settled answer {settled!r}, leading punctuation stripped",
+          s.get("resume_mode") is True and s["settled_answer"] == settled, s.get("settled_answer"))
 s = base_state(**{**PARK, "choice_parks": {}}, reply_kind="", last_script_error="llm node 'classify_reply' failed: x")
 s.update(gates.choice_reply_route(s))
 s.update(gates.choice_park(s))
@@ -1377,13 +1455,14 @@ check("design round walk: an option pick then a typed answer -> one amendment ca
 u = gates.consult_route(base_state(escalation=E_DQ, consult_result="CONSULT: ANSWER 3"))
 check("consult_route: a navigator answer on a design question -> the option's text -> apply_answer",
       u["_next"] == "apply_answer" and u["last_answer"] == "redis", u)
-u = AA("quality_bar", "rigor=prototype, surfaces=http,other:grpc", esc=escalation("quality_bar", "q", data={"rigor": "production", "surfaces": "x"}))
-check("apply_answer: quality_bar -> record_quality_bar with the chosen values", u["_next"] == "record_quality_bar" and u["quality_rigor"] == "prototype" and u["quality_surfaces"] == "http,other:grpc")
-u = AA("quality_bar", "rigor=poc, surfaces=(as proposed)", esc=escalation("quality_bar", "q", data={"rigor": "production", "surfaces": "http"}))
-check("apply_answer: quality_bar '(as proposed)' keeps the proposal's surfaces", u["quality_surfaces"] == "http" and u["quality_rigor"] == "poc")
-u = AA("checklist_accept", "1,3", esc=escalation("checklist_accept", "q", data={"items": ["a", "b", "c"]}))
-check("apply_answer: checklist_accept numbers -> amend_plan with the accepted items", u["_next"] == "amend_plan" and "- a" in u["pending_amendments"][0] and "- c" in u["pending_amendments"][0] and "- b" not in u["pending_amendments"][0])
-check("apply_answer: checklist_accept none -> checklist_gate", AA("checklist_accept", "none", esc=escalation("checklist_accept", "q", data={"items": ["a"]}))["_next"] == "checklist_gate")
+check("quality bar answer: an explicit rigor=, a bare rigor word, surfaces= and '(as proposed)' each parse; the proposal fills the rest",
+      gates._quality_bar_answer("rigor=prototype, surfaces=http,other:grpc", "production", "x") == ("prototype", "http,other:grpc")
+      and gates._quality_bar_answer("rigor=poc, surfaces=(as proposed)", "production", "http") == ("poc", "http")
+      and gates._quality_bar_answer("go with poc", "production", "http") == ("poc", "http"))
+u = AA("quality_bar", "rigor=poc", esc=escalation("quality_bar", "q", data={"multiple_choice": True, "index": 0}))
+check("apply_answer: quality_bar -> recorded through the queue -> quality_bar_gate", u["_next"] == "quality_bar_gate" and u["choice_index"] == 1)
+u = AA("checklist_accept", "Drop", esc=escalation("checklist_accept", "q", data={"multiple_choice": True, "index": 0}))
+check("apply_answer: checklist_accept -> recorded through the queue -> checklist_round", u["_next"] == "checklist_round" and u["choice_index"] == 1)
 check("apply_answer: amend_cap stop -> end_blocked", AA("amend_cap", "Stop and report")["_next"] == "end_blocked")
 u = AA("amend_cap", "Allow one more amendment cycle")
 check("apply_answer: amend_cap allow -> one more cycle then gate1", u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1)

@@ -88,7 +88,7 @@ HARD_TRIGGER_RE = re.compile(
     re.I,
 )
 RESUME_RE = re.compile(r"Architect run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8}(?:-[0-9]+)?)")
-CONTINUE_RE = re.compile(r"(?is)^(?:continue|resume)\b[\s:]*(.*)$")
+CONTINUE_RE = re.compile(r"(?is)^(?:continue|resume)\b[\s:,;.-]*(.*)$")
 SISYPHUS_RUN_RE = re.compile(r"Sisyphus run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
 TASK_ID_RE = re.compile(r"\bTASK-\d{3,}\b")
 SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
