@@ -278,20 +278,23 @@ impl Drop for Pty {
         use std::io::Read;
         use std::os::fd::AsRawFd;
 
-        let _ = self.child.kill();
         let child_pgrp = self.child.id() as i32;
         // Under the job-control wrapper the binary runs in its own
         // foreground group, which the wrapper's death would orphan. The
-        // group is only killed while it still belongs to the child's
-        // session (the child is its leader, so the session id is its
-        // pid): a stale id may already name an unrelated process group.
+        // foreground group and its session are read BEFORE the child is
+        // killed: once the session leader is gone the tty has no
+        // foreground group to report and getsid has nothing to answer.
+        // The group is only killed while it still belongs to the child's
+        // session (the child is its leader, so the session id is its pid):
+        // a stale id may already name an unrelated process group.
         // SAFETY: tcgetpgrp reads one int from the tty behind an open fd;
         // getsid takes a pid and touches no memory.
         let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        if foreground > 1
+        let foreground_is_ours = foreground > 1
             && foreground != child_pgrp
-            && unsafe { libc::getsid(foreground) } == child_pgrp
-        {
+            && unsafe { libc::getsid(foreground) } == child_pgrp;
+        let _ = self.child.kill();
+        if foreground_is_ours {
             // SAFETY: kill takes a pid and a signal number and touches no memory.
             unsafe { libc::kill(-foreground, libc::SIGKILL) };
         }
