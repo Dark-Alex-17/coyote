@@ -305,6 +305,33 @@ fn under_the_tui_bash_password_without_channel_fails_closed() {
     assert_password_refused_cleanly(&transcript, "Secret?");
 }
 
+/// `range` reads the cursor row and keys in subshells; its refusal has to
+/// come from the function itself, or an `exit` inside a subshell ends the
+/// subshell alone and the key loop spins on the refusal forever. Under
+/// the UI it ends at once: one refusal line, no value, nothing painted.
+#[test]
+fn under_the_tui_bash_range_without_channel_fails_closed_at_once() {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; source \"{HELPER}\"; v=\"$(range \"Count? tui-range-sh-r8\" 1 3 9)\"; rc=$?; \
+             echo \"range-rc=$rc len=${{#v}}\"; \
+             echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done"
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let started = Instant::now();
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10), "{transcript}");
+    assert_fails_closed_under_the_tui(&transcript, "range-rc=1 len=0");
+    assert_password_refused_cleanly(&transcript, "Count?");
+}
+
 /// The Python helper's `password` has its own terminal path (getpass, not
 /// `_tty_line`), so it is pinned on its own: exit 1, no value, no
 /// `Secret?` painted, echo left on.

@@ -544,6 +544,10 @@ with_validate() {
 }
 
 range() {
+  # Refused here, not only inside the cursor and key subshells below: an
+  # exit from a subshell ends the subshell alone and the loop would spin
+  # on the refusal forever.
+  _coyote_refuse_terminal_under_tui
   declare min="$2"
   declare current="$3"
   declare max="$4"
