@@ -4797,6 +4797,7 @@ mod peer_text_prefix_tests {
     fn a_share_file_refused_at_load_is_quoted_byte_for_byte() {
         let refusal = "shares.yaml line 2: `.vault` is a protected path; run .mesh shares";
         let text = shown_under_slash(refused_at_load(refusal, " Nothing was sent."));
+        assert!(text.starts_with("Error: `/mesh grant` failed"), "{text}");
         assert!(
             text.ends_with(&format!("    {refusal} Nothing was sent.")),
             "{text}"

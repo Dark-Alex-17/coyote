@@ -157,6 +157,37 @@ mod tests {
             }
         }
 
+        fn quoting() -> anyhow::Error {
+            QuotingError::wrap(
+                NoticeText::default()
+                    .frame("No share rule has the pattern `")
+                    .peer(".vault")
+                    .frame("`; `.mesh shares` lists them."),
+            )
+        }
+
+        #[test]
+        fn a_quoting_error_raised_bare_keeps_its_quote_and_slashes_its_hint() {
+            let text = command_error_text(&MeshVerbError::wrap(quoting()), CommandPrefix::Slash);
+            assert!(
+                text.ends_with("No share rule has the pattern `.vault`; `/mesh shares` lists them."),
+                "{text}"
+            );
+            assert!(!text.contains("/vault"), "{text}");
+        }
+
+        #[test]
+        fn a_quoting_error_under_context_keeps_its_quote_and_slashes_both_hints() {
+            let err = MeshVerbError::wrap(quoting().context("`.mesh unshare` failed"));
+            let text = command_error_text(&err, CommandPrefix::Slash);
+            assert!(text.starts_with("Error: `/mesh unshare` failed"), "{text}");
+            assert!(
+                text.ends_with("No share rule has the pattern `.vault`; `/mesh shares` lists them."),
+                "{text}"
+            );
+            assert!(!text.contains("/vault"), "{text}");
+        }
+
         #[test]
         fn the_mesh_marker_leaves_the_rendered_chain_unchanged() {
             let inner = || {

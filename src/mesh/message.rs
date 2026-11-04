@@ -2964,6 +2964,27 @@ mod tests {
         );
     }
 
+    mod summary_prefix_tests {
+        use super::*;
+        use crate::config::CommandPrefix;
+
+        #[test]
+        fn the_peers_name_and_words_keep_their_dots_while_the_pointer_slashes() {
+            let message = PeerMessage::new(RawPeerMessage {
+                content: format!(".session list {}", "w".repeat(PEER_LINE_MAX_CHARS)),
+                ..raw("")
+            });
+            let line = message
+                .summary_line_with_tail(Some(".info"), "; run .mesh reply")
+                .render(CommandPrefix::Slash);
+            assert!(line.starts_with(".info says: .session list"), "{line}");
+            assert!(
+                line.ends_with("...; run /mesh reply (full text: /mesh inbox)"),
+                "{line}"
+            );
+        }
+    }
+
     mod sentence_cut_tests {
         use super::*;
 
