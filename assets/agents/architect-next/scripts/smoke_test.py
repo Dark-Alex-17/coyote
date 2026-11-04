@@ -1226,9 +1226,23 @@ u = gates.choice_reply_route(base_state(escalation=E_DQ, last_answer_text="hmm",
 check("choice_reply_route: classifier fault (no verdict) -> choice_reask, fault ledgered",
       u["_next"] == "choice_reask" and any(d.startswith("fallback: classify_reply") for d in u["decisions"]), u)
 u = gates.choice_reask(base_state(escalation=E_DQ, last_answer_text="what does pg cost us?", ask_question="stale"))
-check("choice_reask: the same question on its ask_choice prompt with a one-line note first",
-      u["_next"] == "ask_choice_3" and u["ask_question"].split("\n\n", 1)[1] == _lib.render_question(E_DQ)
-      and "what does pg cost us?" in u["ask_question"].split("\n", 1)[0], u)
+check("choice_reask: the same question back through ask_dispatch with a one-line note first",
+      u["_next"] == "ask_dispatch" and u["ask_question"].split("\n\n", 1)[1] == _lib.render_question(E_DQ)
+      and "what does pg cost us?" in u["ask_question"].split("\n", 1)[0] and u["escalation"]["options"] == E_DQ["options"], u)
+u2 = gates.choice_reask(base_state(escalation=u["escalation"], last_answer_text="and redis?"))
+check("choice_reask: a second re-ask replaces the note instead of stacking it",
+      u2["escalation"]["question"].split("\n\n", 1)[1] == E_DQ["question"] and "and redis?" in u2["escalation"]["question"]
+      and "what does pg cost us?" not in u2["escalation"]["question"], u2["escalation"]["question"])
+u2 = gates.ask_dispatch(base_state(escalation=u["escalation"], top_level=True, owner_away=True))
+check("choice_reask -> ask_dispatch: an away owner gets the re-ask remotely, else the ask_choice prompt",
+      u2["_next"] == ("ask_owner_poll" if gates.OWNER_REMOTE_INPUT else "ask_choice_3"), u2)
+E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
+check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index",
+      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_kinds=["design_round#0"]))["_next"] == "ladder_judge"
+      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_kinds=["design_round#0"]))["_next"] == "ask_dispatch")
+u2 = gates.ladder_route(base_state(escalation=E_DQ, ladder_resolution="recommended", ladder_choice=""))
+check("ladder_route: a multiple-choice question records its kind and index as ruled autonomously",
+      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2["autonomous_kinds"] == ["design_round#0"], u2)
 
 # ---------------------------------------------------------------- apply_answer (every kind)
 def AA(kind, answer, **over):

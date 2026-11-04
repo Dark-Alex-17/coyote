@@ -2292,13 +2292,21 @@ def batch_close(state):
 
 
 # ====================================================================== 2.8 escalation ladder
+def _autonomy_key(esc):
+    """What the resolve-autonomously-once rule counts: the kind, or the kind and question index of a multiple choice."""
+    data = as_dict(esc.get("data"))
+    if data.get("multiple_choice"):
+        return f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}"
+    return esc.get("kind", "unknown")
+
+
 def escalate_gate(state):
     u = {}
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "unknown")
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
-    failed_once = kind in as_list(state.get("autonomous_kinds"))
+    failed_once = _autonomy_key(esc) in as_list(state.get("autonomous_kinds"))
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
         rulings = ""
         path = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "standing-rulings.md")
@@ -2330,7 +2338,7 @@ def ladder_route(state):
             basis = state.get("ladder_basis") or res
             line = f"{esc.get('kind')}: {choice} (basis: {basis})"
             u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line],
-                      "autonomous_kinds": list(as_list(state.get("autonomous_kinds"))) + [esc.get("kind")],
+                      "autonomous_kinds": list(as_list(state.get("autonomous_kinds"))) + [_autonomy_key(esc)],
                       "last_answer": choice, "last_answer_text": choice})
             ledger(state, u, f"autonomous: {line}")
             u["_next"] = "apply_answer"
@@ -2489,10 +2497,15 @@ def choice_reply_route(state):
 def choice_reask(state):
     u = {}
     esc = as_dict(state.get("escalation"))
+    data = as_dict(esc.get("data"))
+    asked = data.get("asked") or esc.get("question", "")
     reply = tail((state.get("last_answer_text") or "").strip(), 200)
-    u["ask_question"] = (f"Your reply ({reply!r}) reads as a question or a discussion, not an answer: pick an option or "
-                         "type your answer.\n\n" + render_question(esc))
-    u["_next"] = _terminal_prompt(esc)
+    # the note goes into the escalation itself so a remote owner sees it too and ask_owner sends a fresh question
+    u["escalation"] = {**esc, "data": {**data, "asked": asked},
+                       "question": f"Your reply ({reply!r}) reads as a question or a discussion, not an answer: pick an "
+                                   f"option or type your answer.\n\n{asked}"}
+    u["ask_question"] = render_question(u["escalation"])
+    u["_next"] = "ask_dispatch"
     return u
 
 
