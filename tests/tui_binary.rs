@@ -530,6 +530,28 @@ fn is_rgb_sgr(params: &[u16]) -> bool {
         .any(|w| (w[0] == 38 || w[0] == 48 || w[0] == 58) && w[1] == 2)
 }
 
+/// Whether an SGR parameter list switches conceal on: an `8` standing on
+/// its own. The arguments of an extended colour are stepped over, so a
+/// palette index or channel value of 8 (`38;5;8`, `48;2;8;8;8`) is not
+/// mistaken for the attribute.
+fn is_conceal_sgr(params: &[u16]) -> bool {
+    let mut i = 0;
+    while i < params.len() {
+        match params[i] {
+            38 | 48 | 58 => {
+                i += match params.get(i + 1) {
+                    Some(5) => 3,
+                    Some(2) => 5,
+                    _ => 1,
+                };
+            }
+            8 => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// The alternate screen is entered once and left exactly once on Ctrl+D;
 /// bracketed paste comes on after it and goes off before it is left;
 /// keyboard-enhancement flags, when the terminal takes them, are pushed
@@ -3461,6 +3483,21 @@ fn a_truncated_escape_at_the_end_does_not_panic() {
     assert_eq!(strip_ansi("tail\x1b("), "tail");
 }
 
+/// The conceal oracle reads `8` only as its own parameter: the palette
+/// index or channel value 8 inside an extended colour is colour.
+#[test]
+fn the_conceal_oracle_steps_over_extended_colour_arguments() {
+    assert!(is_conceal_sgr(&[8]));
+    assert!(is_conceal_sgr(&[1, 8]));
+    assert!(is_conceal_sgr(&[38, 5, 8, 8]));
+    assert!(is_conceal_sgr(&[48, 2, 8, 8, 8, 8]));
+    assert!(!is_conceal_sgr(&[38, 5, 8]));
+    assert!(!is_conceal_sgr(&[48, 5, 8, 1]));
+    assert!(!is_conceal_sgr(&[58, 2, 8, 8, 8]));
+    assert!(!is_conceal_sgr(&[0]));
+    assert!(!is_conceal_sgr(&[28]));
+}
+
 fn has_cloexec(fd: std::os::fd::RawFd) -> bool {
     // SAFETY: fcntl with F_GETFD takes no pointers; -1 reads as "not set".
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -4653,7 +4690,7 @@ fn a_reply_with_concealed_text_shows_it_and_sends_no_conceal_to_the_tty() {
     );
     let concealing: Vec<_> = sgr_params(&raw[submitted_at..])
         .into_iter()
-        .filter(|p| p.contains(&8))
+        .filter(|p| is_conceal_sgr(p))
         .collect();
     assert!(
         concealing.is_empty(),
@@ -5541,7 +5578,7 @@ fn a_reply_concealed_with_a_leading_zero_shows_it_and_sends_no_conceal_to_the_tt
     );
     let concealing: Vec<_> = sgr_params(&raw[submitted_at..])
         .into_iter()
-        .filter(|p| p.contains(&8))
+        .filter(|p| is_conceal_sgr(p))
         .collect();
     assert!(
         concealing.is_empty(),
@@ -5580,7 +5617,7 @@ fn a_reply_concealed_with_a_leading_zero_shows_it_and_sends_no_conceal_to_the_tt
     );
     let concealing_after: Vec<_> = sgr_params(after_leave)
         .into_iter()
-        .filter(|p| p.contains(&8))
+        .filter(|p| is_conceal_sgr(p))
         .collect();
     assert!(
         concealing_after.is_empty(),
