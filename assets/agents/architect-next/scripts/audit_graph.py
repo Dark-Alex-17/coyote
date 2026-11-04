@@ -48,6 +48,7 @@ BOUNDED = {
     "ask_owner_route": "B21 owner_polls<=2",
     "parse_answer": "B22 reask_rounds<=3",
     "choice_reask": "user-driven: every pass waits on the owner's next reply",
+    "choice_park": "DISCUSSION_PARKS_MAX=3 discussion parks per question (choice_parks); each park ends the run",
     "wave_integrate": "wave_index list-bounded",
     "task_done_route": "batch closed once (batch_state.passed)",
     "checklist_gate": "checklist_done list-bounded",

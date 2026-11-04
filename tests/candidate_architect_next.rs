@@ -900,6 +900,76 @@ fn route_instructions_send_a_bare_go_ahead_to_run() {
     }
 }
 
+/// A run parked on a design discussion hands the question to the chat lane,
+/// so the attachment block must say how to use it and how the user resumes.
+#[test]
+fn engineer_architect_block_states_the_discussion_contract() {
+    let text = fs::read_to_string(agents_dir().join("engineer/instructions.md")).unwrap();
+    let open = "<!-- when:chat_agent_for=architect -->";
+    let start = text.find(open).expect("no architect-attachment block") + open.len();
+    let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "When the last run's exposed `discussion` is set",
+        "the recommended one is marked",
+        "the answers so far and the plan path",
+        "Do not edit the plan and do not answer for the user",
+        "`continue: <settled answer>`",
+        "(or `continue` to be asked again)",
+        "the run resumes at that question",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the architect-attachment block does not state {needle:?}:\n{block}"
+        );
+    }
+}
+
+/// The chat lane only sees what the graph exposes, and the resume only finds
+/// the parked run through the carried id.
+#[test]
+fn graph_exposes_the_discussion_and_carries_its_run_id() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let expose = doc["session"]["expose"]
+        .as_sequence()
+        .expect("graph.yaml has session.expose");
+    assert!(
+        expose.iter().any(|k| k.as_str() == Some("discussion")),
+        "session.expose does not list discussion: {expose:?}"
+    );
+    let carry: Vec<&str> = doc["carry"]
+        .as_sequence()
+        .expect("graph.yaml has carry")
+        .iter()
+        .filter_map(|k| k.as_str())
+        .collect();
+    assert_eq!(carry, ["discussion_run_id"]);
+    assert_eq!(doc["initial_state"]["discussion_run_id"].as_str(), Some(""));
+}
+
+/// "continue" after a discussion park is a resume, not a conversation, so the
+/// session router must send it to RUN.
+#[test]
+fn route_instructions_send_a_discussion_continue_to_run() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let route = doc["session"]["route"]["instructions"]
+        .as_str()
+        .expect("graph.yaml has session.route.instructions");
+    let flat = route.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "After the last run parked on a design discussion",
+        "\"continue\" or \"continue: <answer>\" routes RUN",
+        "the run resumes at the parked question",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the route instructions do not state {needle:?}:\n{route}"
+        );
+    }
+}
+
 /// Opt-in: the walk runs all 48 mode combinations through the real gates
 /// inside scratch repos and takes three to five minutes, so it is ignored by
 /// default and run with `cargo test --test candidate_architect_next -- --ignored`.
@@ -4370,6 +4440,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("CI_WALL_SECS", "", "14400", 14400),
     ("CONFLICT_CYCLES_MAX", "", "2", 2),
     ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
+    ("DISCUSSION_PARKS_MAX", "", "3", 3),
     ("DRAFT_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
     ("GH_CALL_SECS", "", "90", 90),
     ("GH_LOOP_SECS", "", "180", 180),

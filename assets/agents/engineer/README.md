@@ -53,3 +53,10 @@ A run started with no doc path offers the newest ready seed for its project
 whose `vehicle` is `architect` (a seed with no `vehicle` key counts as
 `architect`), and marks the one it uses `status: consumed` once the run has
 oriented on it.
+
+A run that parks on a design question for discussion exposes it as
+`discussion` in its last-run record: the question, its options with the
+recommended one marked, the answers so far and the plan path. The engineer
+discusses it without editing the plan or answering for the user, then tells
+the user to say `continue: <settled answer>` (or `continue` to be asked again)
+so the run resumes at that question.

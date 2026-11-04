@@ -457,7 +457,8 @@ check("intake: re-entry loads the prior run state + tasks.json (A2)", st2["_next
       and st2["tasks"] and st2["tasks"][0]["id"] == "TASK-101" and st2["sealed"] is True)
 st3 = gates.intake({"initial_prompt": f"go {DESIGN}\nArchitect run id: 20200101T000000-deadbeef", **STORE.variables(DESIGN, TMP)})
 check("intake: unknown run id -> fresh run, declared", not st3.get("resume_mode") and "no durable state" in st3["resume_note"])
-for phase, parked, exp in [("task TASK-101 done", "", "select_tasks"), ("phase_f", "", "phase_f_gate"), ("sealed", "", "reseal_gate"), ("x", "design_round", "escalate_gate")]:
+for phase, parked, exp in [("task TASK-101 done", "", "select_tasks"), ("phase_f", "", "phase_f_gate"), ("sealed", "", "reseal_gate"), ("x", "design_round", "escalate_gate"),
+                           ("choice_discussion", "choice_discussion", "choice_resume")]:
     u = gates.resume_route(base_state(resume_phase=phase, parked=parked, sealed=False, tasks=[]))
     check(f"resume_route: phase {phase!r} parked={parked!r} -> {exp}", u["_next"] == exp)
 u = gates.orient_fault(base_state(last_script_error="boom"))
@@ -1220,15 +1221,17 @@ check("choice_reply_route: answer -> the typed text to apply_answer; parked clea
       u["_next"] == "apply_answer" and u["last_answer"] == "use mysql" and u["parked"] == "" and u["reply_kind"] == ""
       and any(d.startswith("decision: design_round: use mysql") for d in u["decisions"]) and u["anomalies_log"] == ["classify_reply: hm"], u)
 u = gates.choice_reply_route(base_state(escalation=E_DQ, last_answer_text="what does pg cost us?", reply_kind="discussion", parked="design_round"))
-check("choice_reply_route: discussion -> choice_reask, still parked, nothing recorded",
-      u["_next"] == "choice_reask" and "last_answer" not in u and "parked" not in u and "choice_answers" not in u, u)
+check("choice_reply_route: discussion -> choice_park, still parked, nothing recorded",
+      u["_next"] == "choice_park" and "last_answer" not in u and "parked" not in u and "choice_answers" not in u, u)
 u = gates.choice_reply_route(base_state(escalation=E_DQ, last_answer_text="hmm", reply_kind="", last_script_error="llm node 'classify_reply' failed: x"))
-check("choice_reply_route: classifier fault (no verdict) -> choice_reask, fault ledgered",
-      u["_next"] == "choice_reask" and any(d.startswith("fallback: classify_reply") for d in u["decisions"]), u)
+check("choice_reply_route: classifier fault (no verdict) -> choice_park, fault ledgered",
+      u["_next"] == "choice_park" and any(d.startswith("fallback: classify_reply") for d in u["decisions"]), u)
 u = gates.choice_reask(base_state(escalation=E_DQ, last_answer_text="what does pg cost us?", ask_question="stale"))
-check("choice_reask: the same question back through ask_dispatch with a one-line note first",
+check("choice_reask: at the park cap the same question back through ask_dispatch with a one-line note naming the cap",
       u["_next"] == "ask_dispatch" and u["ask_question"].split("\n\n", 1)[1] == _lib.render_question(E_DQ)
-      and "what does pg cost us?" in u["ask_question"].split("\n", 1)[0] and u["escalation"]["options"] == E_DQ["options"], u)
+      and "what does pg cost us?" in u["ask_question"].split("\n", 1)[0]
+      and f"parked for discussion {_lib.DISCUSSION_PARKS_MAX} times" in u["ask_question"].split("\n", 1)[0]
+      and u["escalation"]["options"] == E_DQ["options"], u)
 u2 = gates.choice_reask(base_state(escalation=u["escalation"], last_answer_text="and redis?"))
 check("choice_reask: a second re-ask replaces the note instead of stacking it",
       u2["escalation"]["question"].split("\n\n", 1)[1] == E_DQ["question"] and "and redis?" in u2["escalation"]["question"]
@@ -1236,6 +1239,103 @@ check("choice_reask: a second re-ask replaces the note instead of stacking it",
 u2 = gates.ask_dispatch(base_state(escalation=u["escalation"], top_level=True, owner_away=True))
 check("choice_reask -> ask_dispatch: an away owner gets the re-ask remotely, else the ask_choice prompt",
       u2["_next"] == ("ask_owner_poll" if gates.OWNER_REMOTE_INPUT else "ask_choice_3"), u2)
+
+# discussion park and resume
+E_PORT = gates.open_questions_gate(base_state(design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=1))["escalation"]
+PARK_ID = _lib.new_run_id("discussion park")
+PARK_ANSWERS = [{"question": "Which store?", "answer": "pg", "via": "option"}]
+PARK = dict(run_id=PARK_ID, run_dir=_lib.run_dir_for(PARK_ID), escalation=E_PORT, design_rounds=1, choice_kind="design_round",
+            choice_queue=E_QUEUE, choice_index=1, choice_answers=PARK_ANSWERS, choice_parks={}, parked="design_round",
+            last_answer_text="what does 9090 collide with?")
+u = gates.choice_park(base_state(**PARK))
+d = u.get("discussion") or {}
+check("choice_park: discussion below the cap -> parked choice_discussion, the run id carried, the park counted, end_discussion",
+      u["_next"] == "end_discussion" and u["parked"] == "choice_discussion" and u["discussion_run_id"] == PARK_ID
+      and u["choice_parks"] == {"1": 1} and "choice_forced" not in u, u)
+check("choice_park: the exposed discussion holds the run, plan, question, marked options, reply, answers, position and resume text",
+      d.get("run_id") == PARK_ID and d.get("plan_path") == PLAN and d.get("kind") == "design_round" and d.get("question") == "Which port?"
+      and [(o["label"], o["text"], o["recommended"]) for o in d.get("options", [])]
+      == [("Option 1 (recommended)", "8080", True), ("Option 2", "9090", False)]
+      and d.get("reply") == "what does 9090 collide with?" and d.get("answers") == PARK_ANSWERS
+      and (d.get("number"), d.get("total")) == (2, 2)
+      and '"continue"' in d.get("resume", "") and '"continue: <your answer>"' in d.get("resume", ""), d)
+snap = json.loads(read_file(os.path.join(PARK["run_dir"], "state.json")) or "{}")
+check("choice_park: state.json keeps the queue, the answers, the escalation, the park count and the round, phase choice_discussion",
+      snap.get("phase") == "choice_discussion" and snap.get("parked") == "choice_discussion" and snap.get("choice_queue") == E_QUEUE
+      and snap.get("choice_index") == 1 and snap.get("choice_answers") == PARK_ANSWERS and snap.get("escalation") == E_PORT
+      and snap.get("choice_parks") == {"1": 1} and snap.get("design_rounds") == 1, snap)
+msg = u.get("discussion_message", "")
+check("choice_park: the ASCII final message names the question, the marked recommended option, the reply, the answers and both resume forms",
+      msg.startswith("ARCHITECT_AWAITING_DISCUSSION\nDesign question 2 of 2 is open for discussion:\nWhich port?\n")
+      and "Options:\n  Option 1 (recommended): 8080\n  Option 2: 9090\n" in msg and "Your reply: what does 9090 collide with?" in msg
+      and "Answered so far:\n  1. Which store? -> pg\n" in msg and '"continue"' in msg and '"continue: <your answer>"' in msg
+      and msg.isascii() and _lib.RESUME_RE.search(msg).group(1) == PARK_ID, msg)
+s = {"initial_prompt": "continue: 9091", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: 'continue: <answer>' with the carried discussion_run_id -> re-entry into that run, answer stashed, carried key cleared",
+      s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["resume_mode"] is True and s["settled_answer"] == "9091"
+      and s["discussion_run_id"] == "" and s["parked"] == "choice_discussion" and s["choice_index"] == 1, s)
+s.update(gates.resume_route(s))
+check("resume_route: a run parked on a discussion -> choice_resume", s["_next"] == "choice_resume", s["_next"])
+s.update(gates.choice_resume(s))
+check("choice_resume: a settled answer is recorded for the parked question (via settled); discussion and settled answer cleared",
+      s["_next"] == "open_questions_gate" and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "9091", "via": "settled"}]
+      and s["choice_index"] == 2 and s["discussion"] == {} and s["settled_answer"] == "" and s["parked"] == "", s)
+s.update(gates.open_questions_gate(s))
+check("choice_resume -> open_questions_gate: the last question settled -> the round's amendment carries every answer",
+      s["_next"] == "amend_plan" and "1. Which store?\n   Answer: pg\n2. Which port?\n   Answer: 9091" in s["pending_amendments"][0],
+      s.get("pending_amendments"))
+s = base_state(escalation=E_DQ, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[],
+               settled_answer="Option 2", parked="choice_discussion", discussion={"run_id": "x"})
+u = gates.choice_resume(s)
+u2 = gates.open_questions_gate({**s, **u})
+check("choice_resume: 'continue: Option 2' on the first question -> its option text recorded, the next question asked",
+      u["choice_answers"] == [{"question": "Which store?", "answer": "sqlite", "via": "settled"}]
+      and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 1 and "Which port?" in u2["escalation"]["question"], (u, u2))
+for prompt, carried in (("Continue", PARK_ID), ("resume.", PARK_ID), (f"Architect run id: {PARK_ID}\ncontinue", "")):
+    s = {"initial_prompt": prompt, "discussion_run_id": carried, **STORE.variables(DESIGN, TMP)}
+    s.update(gates.intake(s))
+    s.update(gates.resume_route(s))
+    s.update(gates.choice_resume(s))
+    s.update(gates.open_questions_gate(s))
+    check(f"intake -> choice_resume: {prompt!r} without an answer -> the same question asked again, answers and park count kept",
+          s["run_id"] == PARK_ID and s["escalation"]["kind"] == "design_round" and s["escalation"]["data"]["index"] == 1
+          and s["_next"] == "escalate_gate" and s["choice_answers"] == PARK_ANSWERS and s["choice_parks"] == {"1": 1}
+          and s["discussion"] == {} and s["settled_answer"] == "", s)
+s = {"initial_prompt": f"Architect run id: {PARK_ID}\ncontinue: Option 2", **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: an explicit run id with 'continue: <answer>' -> re-entry with the answer stashed, no carried key needed",
+      s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["settled_answer"] == "Option 2", s)
+s = {"initial_prompt": f"Implement the design at {DESIGN}", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: a message that is not a continue with the carried key -> a fresh run, the key cleared, the left discussion ledgered",
+      not s.get("resume_mode") and s["run_id"] != PARK_ID and s["discussion_run_id"] == "" and s["_next"] == "orient_read"
+      and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
+s = {"initial_prompt": "continue", **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: 'continue' with no carried key -> a fresh run as before", not s.get("resume_mode") and s["run_id"] != PARK_ID, s)
+s = base_state(**{**PARK, "choice_parks": {}}, reply_kind="", last_script_error="llm node 'classify_reply' failed: x")
+s.update(gates.choice_reply_route(s))
+s.update(gates.choice_park(s))
+check("choice_reply_route -> choice_park: a classifier fault parks the run like a discussion",
+      s["_next"] == "end_discussion" and s["parked"] == "choice_discussion" and s["discussion"]["reply"] == "what does 9090 collide with?", s)
+u = gates.choice_park(base_state(**{**PARK, "choice_parks": {"1": _lib.DISCUSSION_PARKS_MAX - 1}}))
+check("choice_park: the last park below the cap still parks and counts it",
+      u["_next"] == "end_discussion" and u["choice_parks"] == {"1": _lib.DISCUSSION_PARKS_MAX}, u)
+u = gates.choice_park(base_state(**{**PARK, "choice_parks": {"0": 1, "1": _lib.DISCUSSION_PARKS_MAX}}))
+check("choice_park: a question parked DISCUSSION_PARKS_MAX times -> no park, choice_reask, its next typed reply forced",
+      u["_next"] == "choice_reask" and u["choice_forced"] is True and "parked" not in u and "discussion" not in u
+      and "discussion_run_id" not in u and "choice_parks" not in u, u)
+u = gates.parse_answer(base_state(escalation=E_PORT, last_answer_text="what about 9091?", choice_forced=True))
+check("parse_answer: a forced question's typed reply -> recorded as the answer without the classifier, ledgered",
+      u["_next"] == "apply_answer" and u["last_answer"] == "what about 9091?"
+      and any("without the classifier" in d for d in u["decisions"]), u)
+u = gates.apply_answer(base_state(escalation=E_PORT, last_answer="what about 9091?", choice_kind="design_round", choice_queue=E_QUEUE,
+                                  choice_index=1, choice_answers=PARK_ANSWERS, choice_forced=True))
+check("apply_answer: the forced reply recorded (via other) and the force lifted for the next question",
+      u["choice_answers"][-1] == {"question": "Which port?", "answer": "what about 9091?", "via": "other"} and u["choice_forced"] is False, u)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, choice_forced=True))
+check("parse_answer: a non-design escalation ignores the force and still re-asks", u["_next"] == "ask_user" and u["reask_rounds"] == 1, u)
 E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
 check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index",
       gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_kinds=["design_round#0"]))["_next"] == "ladder_judge"
@@ -1743,11 +1843,11 @@ check("graph: draft_edit returns to draft_brief, which routes to draft_route and
 check("graph: draft_brief's prompt carries the earlier turns, the previous draft and the requested changes",
       all(f"{{{{{k}}}}}" in NODES.get("draft_brief", {}).get("prompt", "") for k in ("previous_turns", "draft_text", "draft_feedback")))
 CHOICE_COUNTS = range(_lib.CHOICE_OPTIONS_MIN, _lib.CHOICE_OPTIONS_MAX + 1)
-check("graph: ask_choice_<n> offers exactly the n labels render_question uses, each routed to parse_answer, Other to classify_reply",
+check("graph: ask_choice_<n> offers exactly the n labels render_question uses, each routed to parse_answer, Other too",
       all(NODES.get(f"ask_choice_{n}", {}).get("type") == "approval"
           and NODES.get(f"ask_choice_{n}", {}).get("options") == [_lib.choice_label(i) for i in range(n)]
           and NODES.get(f"ask_choice_{n}", {}).get("routes") == {_lib.choice_label(i): "parse_answer" for i in range(n)}
-          and NODES.get(f"ask_choice_{n}", {}).get("on_other") == "classify_reply"
+          and NODES.get(f"ask_choice_{n}", {}).get("on_other") == "parse_answer"
           and NODES.get(f"ask_choice_{n}", {}).get("question", "").strip() == "{{ask_question}}"
           and NODES.get(f"ask_choice_{n}", {}).get("state_updates") == {"last_answer": "{{choice}}", "last_answer_text": "{{choice}}"}
           for n in CHOICE_COUNTS), {n: NODES.get(f"ask_choice_{n}") for n in CHOICE_COUNTS})
@@ -1765,10 +1865,26 @@ check("graph: frame_questions returns author_plan's open_questions item shape an
       and FQ.get("next") == FQ.get("fallback") == "frame_questions_route" and "{{choice_invalid}}" in FQ.get("prompt", ""), FQ)
 check("graph: author_plan asks for exactly one recommended option, listed first",
       "exactly one" in AP.get("instructions", "") and "listed first" in AP.get("instructions", ""))
-CHOICE_KEYS = ("choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed")
+CHOICE_KEYS = ("choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed", "choice_parks", "choice_forced")
 check("graph: initial_state seeds the choice queue and STATE_KEYS snapshots it",
-      [SEEDS.get(k) for k in CHOICE_KEYS] == ["", [], 0, [], False] and all(k in _lib.STATE_KEYS for k in CHOICE_KEYS),
+      [SEEDS.get(k) for k in CHOICE_KEYS] == ["", [], 0, [], False, {}, False] and all(k in _lib.STATE_KEYS for k in CHOICE_KEYS),
       {k: SEEDS.get(k) for k in CHOICE_KEYS})
+check("graph: end_discussion is an end node whose output is the script-composed discussion message",
+      NODES.get("end_discussion", {}).get("type") == "end" and NODES.get("end_discussion", {}).get("output", "").strip() == "{{discussion_message}}",
+      NODES.get("end_discussion"))
+check("graph: choice_park and choice_resume are script nodes failing to end_failure",
+      all(NODES.get(n, {}).get("type") == "script" and NODES.get(n, {}).get("script") == f"scripts/{n}.py"
+          and NODES.get(n, {}).get("fallback") == "end_failure" for n in ("choice_park", "choice_resume")))
+check("graph: carry is exactly discussion_run_id, seeded empty, and never snapshotted",
+      GRAPH.get("carry") == ["discussion_run_id"] and SEEDS.get("discussion_run_id") == "" and "discussion_run_id" not in _lib.STATE_KEYS,
+      GRAPH.get("carry"))
+check("graph: session.expose shows the discussion to the chat lane; the discussion keys are seeded empty",
+      "discussion" in ((GRAPH.get("session") or {}).get("expose") or [])
+      and [SEEDS.get(k) for k in ("discussion", "discussion_message", "settled_answer")] == [{}, "", ""],
+      (GRAPH.get("session") or {}).get("expose"))
+_route = " ".join((((GRAPH.get("session") or {}).get("route") or {}).get("instructions") or "").split())
+check("graph: route instructions send continue / continue: <answer> after a design discussion park to RUN",
+      '"continue" or "continue: <answer>" routes RUN' in _route and "resumes at the parked question" in _route, _route)
 
 _real_run, _real_gh_timeout, gh_timeouts = subprocess.run, gates.GH_CALL_SECS, []
 subprocess.run = lambda *a, **kw: (gh_timeouts.append(kw.get("timeout")), _real_run(*a, **kw))[1]

@@ -30,6 +30,7 @@ AMEND_CYCLES_MAX = 3      # A1: amendment cycles per run
 DESIGN_ROUNDS_MAX = STRIKE_LIMIT
 CHOICE_OPTIONS_MIN = 2    # a multiple-choice question offers 2-4 options, one recommended
 CHOICE_OPTIONS_MAX = 4
+DISCUSSION_PARKS_MAX = 3  # times one multiple-choice question may park the run for a discussion
 DRAFT_ROUNDS_MAX = STRIKE_LIMIT  # redrafts of an LLM-drafted brief before asking for a design doc
 CONFLICT_CYCLES_MAX = 2   # Phase E parallel integration: "two failed conflict cycles -> STOP"
 WAVE_CAP = 3              # Phase E parallel eligibility: "cap concurrent code tasks at 3"
@@ -87,6 +88,7 @@ HARD_TRIGGER_RE = re.compile(
     re.I,
 )
 RESUME_RE = re.compile(r"Architect run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8}(?:-[0-9]+)?)")
+CONTINUE_RE = re.compile(r"(?is)^(?:continue|resume)\b[\s:]*(.*)$")
 SISYPHUS_RUN_RE = re.compile(r"Sisyphus run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
 TASK_ID_RE = re.compile(r"\bTASK-\d{3,}\b")
 SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
@@ -289,7 +291,8 @@ STATE_KEYS = (
     "autonomous_digest", "decisions", "follow_ups", "rejected_findings", "deferred_findings", "skipped_reviews",
     "design_decisions", "hygiene_items", "anomalies_log", "closeout_scope", "verification_commands",
     "quality_rigor", "quality_surfaces", "round_log",
-    "choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed",
+    "design_rounds", "choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed", "choice_parks",
+    "choice_forced",
 )
 
 

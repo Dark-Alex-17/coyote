@@ -22,14 +22,15 @@ import _lib  # noqa: E402
 from _lib import (  # noqa: E402
     AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
     CI_POLL_FAILS, CI_POLL_SLEEP,
-    CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, DRAFT_ROUNDS_MAX,
+    CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONTINUE_RE, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
+    DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX,
     GATE1_HOUSE_LINE, GH_CALL_SECS, GH_LOOP_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
     PERM_LOOKUPS_PER_POLL, PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TAIL_CHARS, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
-    append_artifact, as_dict, as_int, as_list, commit_planning, context_pack, core_tool, emit,
+    append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, emit,
     ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section,
@@ -202,17 +203,23 @@ def intake(state):
             git(u["plans_root"], "pull", "--quiet", "--ff-only")
         u["tasks_root"] = os.path.join(u["plans_root"], "tasks")
 
-    # Re-entry (A2).
+    # Re-entry (A2): the run id named in the prompt, or a continue after the last run parked on a discussion.
+    # The carried id is consumed here either way, so a run that does not park again carries nothing forward.
+    parked_run = str(state.get("discussion_run_id") or "").strip()
+    u["discussion_run_id"] = ""
     m = RESUME_RE.search(brief)
+    cont = CONTINUE_RE.match((RESUME_RE.sub("", brief) if m else brief).strip())
+    resume_id = m.group(1) if m else (parked_run if parked_run and cont else "")
+    left = f"discussion: the parked discussion of run {parked_run} was left" if parked_run and resume_id != parked_run else ""
     prior = {}
-    if m:
-        raw = read_artifact(run_dir_for(m.group(1)), "state.json")
+    if resume_id:
+        raw = read_artifact(run_dir_for(resume_id), "state.json")
         try:
             prior = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             prior = {}
     if prior:
-        run_id = m.group(1)
+        run_id = resume_id
         u.update({"run_id": run_id, "run_dir": ensure_run_dir(run_id), "resume_mode": True})
         for k, v in prior.items():
             if k in ("phase", "updated_at") or v is None:
@@ -222,6 +229,8 @@ def intake(state):
                 continue  # recomputed from the live variables
             u[k] = v
         u["resume_phase"] = prior.get("phase", "")
+        settled = cont.group(1).strip() if cont else ""
+        u["settled_answer"] = settled if re.search(r"\w", settled) else ""
         raw_tasks = read_artifact(u["run_dir"], "tasks.json")
         try:
             u["tasks"] = json.loads(raw_tasks) if raw_tasks else []
@@ -229,14 +238,18 @@ def intake(state):
             u["tasks"] = []
         append_artifact(u["run_dir"], "brief.md", f"\n\n## Re-entry {now_iso()}\n\n{brief}")
         ledger(state, u, f"run: re-entry into {run_id} at phase {u['resume_phase']!r}")
+        if left:
+            ledger(state, u, left)
         u["_next"] = "resume_route"
     else:
-        if m:
-            u["resume_note"] = f"The prompt names run {m.group(1)} but no durable state exists for it; treated as a fresh run."
+        if resume_id:
+            u["resume_note"] = f"The prompt names run {resume_id} but no durable state exists for it; treated as a fresh run."
         run_id = state.get("run_id") or new_run_id(brief)
         u.update({"run_id": run_id, "run_dir": ensure_run_dir(run_id)})
         write_artifact(u["run_dir"], "brief.md", brief)
         ledger(state, u, f"run: {run_id} mode[{u['mode_line']}] code={code} plans={u['plans_root']}")
+        if left:
+            ledger(state, u, f"{left}; this is a fresh run")
         if u.get("owner_note"):
             ledger(state, u, u["owner_note"])
         if bad:
@@ -272,7 +285,9 @@ def intake(state):
 def resume_route(state):
     u = {}
     phase = state.get("resume_phase") or ""
-    if state.get("parked"):
+    if state.get("parked") == DISCUSSION_PARKED:
+        u["_next"] = "choice_resume"
+    elif state.get("parked"):
         u["_next"] = "escalate_gate"
     elif phase.startswith("phase_f") or phase.startswith("ci") or phase.startswith("pr"):
         u["_next"] = "phase_f_gate"
@@ -464,12 +479,17 @@ def normalize_choices(state, u, item):
     return {**item, "options": opts}
 
 
+DISCUSSION_PARKED = "choice_discussion"
+
+
 def _start_choices(u, kind, queue):
-    u.update({"choice_kind": kind, "choice_queue": queue, "choice_index": 0, "choice_answers": []})
+    u.update({"choice_kind": kind, "choice_queue": queue, "choice_index": 0, "choice_answers": [], "choice_parks": {},
+              "choice_forced": False})
 
 
 def _end_choices(u):
-    u.update({"choice_kind": "", "choice_queue": [], "choice_index": 0, "choice_answers": [], "choice_reframed": False})
+    u.update({"choice_kind": "", "choice_queue": [], "choice_index": 0, "choice_answers": [], "choice_reframed": False,
+              "choice_parks": {}, "choice_forced": False})
 
 
 def _ask_choice(state, u, heading):
@@ -488,15 +508,16 @@ def _choice_pick(text, options):
     return match_option(m.group(1) if m else text, options)
 
 
-def _record_choice(state, u, answer):
-    """Record the answer to the queue's current question and advance the queue."""
+def _record_choice(state, u, answer, via=""):
+    """Record the answer to the queue's current question and advance the queue; `via` overrides option/other."""
     esc = as_dict(state.get("escalation"))
     queue, idx = as_list(state.get("choice_queue")), as_int(state.get("choice_index"))
     question = queue[idx]["question"] if idx < len(queue) else as_dict(esc.get("data")).get("question", "")
     picked = _choice_pick(answer, esc.get("options") or [])
-    entry = {"question": question, "answer": picked or answer.strip(), "via": "option" if picked else "other"}
+    entry = {"question": question, "answer": picked or answer.strip(), "via": via or ("option" if picked else "other")}
     u["choice_answers"] = list(as_list(state.get("choice_answers"))) + [entry]
     u["choice_index"] = idx + 1
+    u["choice_forced"] = False
     ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} answered ({entry['via']}): "
                      f"{tail(entry['answer'], 200)}")
 
@@ -2454,7 +2475,11 @@ def parse_answer(state):
         choice = text
     elif as_dict(esc.get("data")).get("multiple_choice"):
         choice = _choice_pick(text, options)
-        if choice is None and text:
+        if choice is None and text and truthy(state.get("choice_forced")):
+            choice = text
+            ledger(state, u, f"choice: {esc.get('kind')}: typed reply recorded as the answer without the classifier "
+                             f"(the question reached its {DISCUSSION_PARKS_MAX} discussion parks)")
+        elif choice is None and text:
             u["_next"] = "classify_reply"
             return u
     else:
@@ -2489,8 +2514,71 @@ def choice_reply_route(state):
         u["_next"] = "apply_answer"
         return u
     verdict = "a discussion" if kind == "discussion" else "unclassified (the classifier gave no verdict)"
-    ledger(state, u, f"choice: {esc.get('kind')}: typed reply is {verdict}: {reason} -> re-ask")
-    u["_next"] = "choice_reask"
+    ledger(state, u, f"choice: {esc.get('kind')}: typed reply is {verdict}: {reason} -> park for discussion")
+    u["_next"] = "choice_park"
+    return u
+
+
+def _discussion_message(d):
+    """The parked run's final message: the question, its options, the reply, the answers so far and how to resume."""
+    title = "Design question" if d["kind"] == "design_round" else "Question"
+    lines = ["ARCHITECT_AWAITING_DISCUSSION", f"{title} {d['number']} of {d['total']} is open for discussion:", d["question"],
+             "", "Options:"]
+    lines += [f"  {o['label']}: {o['text']}" for o in d["options"]]
+    lines += ["", f"Your reply: {d['reply']}", "", "Answered so far:"]
+    lines += [f"  {i}. {a.get('question')} -> {a.get('answer')}" for i, a in enumerate(d["answers"], 1)] or ["  (none yet)"]
+    lines += ["", f"Plan: {d['plan_path']}", "", d["resume"], "", f"Architect run id: {d['run_id']}"]
+    return "\n".join(lines)
+
+
+def choice_park(state):
+    """End the run parked on the current multiple-choice question so the user can discuss it in the chat lane.
+
+    A question parked DISCUSSION_PARKS_MAX times is asked again instead, and its next typed reply is taken as the answer.
+    """
+    u = {}
+    esc = as_dict(state.get("escalation"))
+    queue, idx = as_list(state.get("choice_queue")), as_int(state.get("choice_index"))
+    parks = dict(as_dict(state.get("choice_parks")))
+    count = as_int(parks.get(str(idx)))
+    if count >= DISCUSSION_PARKS_MAX:
+        u["choice_forced"] = True
+        ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1} already parked {count} time(s) for discussion "
+                         f"(cap {DISCUSSION_PARKS_MAX}) -> re-ask; its next typed reply is recorded as the answer")
+        u["_next"] = "choice_reask"
+        return u
+    parks[str(idx)] = count + 1
+    run_id = state.get("run_id") or ""
+    u["discussion"] = {
+        "run_id": run_id, "plan_path": state.get("plan_path") or "", "kind": esc.get("kind", ""),
+        "question": as_dict(esc.get("data")).get("question") or esc.get("question", ""),
+        "options": [{"label": choice_label(i), "text": o.get("text", ""), "recommended": truthy(o.get("recommended")),
+                     "evidence": o.get("evidence", "")} for i, o in enumerate(esc.get("options") or [])],
+        "reply": (state.get("last_answer_text") or "").strip(), "answers": as_list(state.get("choice_answers")),
+        "number": idx + 1, "total": len(queue),
+        "resume": ('Discuss it here. When it is settled, say "continue" to be asked this question again, or '
+                   '"continue: <your answer>" to record that answer and go on to the remaining questions.'),
+    }
+    u.update({"choice_parks": parks, "parked": DISCUSSION_PARKED, "discussion_run_id": run_id,
+              "discussion_message": _discussion_message(u["discussion"])})
+    ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} parked for discussion "
+                     f"({count + 1}/{DISCUSSION_PARKS_MAX})")
+    snapshot(state, u, DISCUSSION_PARKED)
+    u["_next"] = "end_discussion"
+    return u
+
+
+def choice_resume(state):
+    """Resume a run parked on a discussion: record the settled answer, or ask the parked question again."""
+    u = {"discussion": {}, "settled_answer": "", "parked": ""}
+    esc = as_dict(state.get("escalation"))
+    settled = str(state.get("settled_answer") or "").strip()
+    if settled:
+        _record_choice(state, u, settled, via="settled")
+    else:
+        ledger(state, u, f"choice: {esc.get('kind')}: resumed without a settled answer -> question "
+                         f"{as_int(state.get('choice_index')) + 1} asked again")
+    u["_next"] = "open_questions_gate"
     return u
 
 
@@ -2502,8 +2590,9 @@ def choice_reask(state):
     reply = tail((state.get("last_answer_text") or "").strip(), 200)
     # the note goes into the escalation itself so a remote owner sees it too and ask_owner sends a fresh question
     u["escalation"] = {**esc, "data": {**data, "asked": asked},
-                       "question": f"Your reply ({reply!r}) reads as a question or a discussion, not an answer: pick an "
-                                   f"option or type your answer.\n\n{asked}"}
+                       "question": f"Your reply ({reply!r}) reads as a question or a discussion, but this question has "
+                                   f"already been parked for discussion {DISCUSSION_PARKS_MAX} times, the most allowed: "
+                                   f"pick an option or type your answer, which is recorded as given.\n\n{asked}"}
     u["ask_question"] = render_question(u["escalation"])
     u["_next"] = "ask_dispatch"
     return u
@@ -4240,7 +4329,8 @@ GATES = {
     "batch_gauntlet_build": batch_gauntlet_build, "batch_fix_route": batch_fix_route, "batch_close": batch_close,
     "escalate_gate": escalate_gate, "ladder_route": ladder_route, "consult_route": consult_route, "ask_dispatch": ask_dispatch,
     "ask_owner_poll": ask_owner_poll, "ask_owner_route": ask_owner_route, "parse_answer": parse_answer, "apply_answer": apply_answer,
-    "choice_reply_route": choice_reply_route, "choice_reask": choice_reask,
+    "choice_reply_route": choice_reply_route, "choice_reask": choice_reask, "choice_park": choice_park,
+    "choice_resume": choice_resume,
     "phase_f_gate": phase_f_gate, "integration_check": integration_check, "integrate_route": integrate_route,
     "hygiene_create": hygiene_create, "stack_gate_final": stack_gate_final, "pr_body": pr_body, "open_pr": open_pr,
     "pr_round_comments": pr_round_comments, "ci_poll": ci_poll, "ci_route": ci_route, "ci_evidence": ci_evidence, "ci_apply": ci_apply,

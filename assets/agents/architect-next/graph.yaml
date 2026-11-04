@@ -105,6 +105,7 @@ session:
     - pr_url
     - ci_status
     - report
+    - discussion
   route:
     instructions: |
       Route RUN when the message asks for WORK to be executed: run a plan or
@@ -126,10 +127,17 @@ session:
       conversation discussed work to implement routes RUN; the run picks up the
       engineer's ready seed or drafts a brief from the conversation and confirms
       it with the user before any write to the repos.
+      After the last run parked on a design discussion, "continue" or
+      "continue: <answer>" routes RUN: the run resumes at the parked question,
+      recording the answer when one is given and asking the question again when
+      not.
   chat:
     agent: engineer
     variables:
       chat_agent_for: architect
+
+carry:
+  - discussion_run_id
 
 initial_state:
   # --- run identity / A2 artifacts / normalized fork vocabulary ---
@@ -197,6 +205,8 @@ initial_state:
   choice_index: 0
   choice_answers: []
   choice_reframed: false
+  choice_parks: {}
+  choice_forced: false
   choice_invalid: []
   framed_questions: []
   author_retries: 0
@@ -324,6 +334,10 @@ initial_state:
   reask_rounds: 0
   reply_kind: ''
   reply_reason: ''
+  discussion: {}
+  discussion_run_id: ''
+  discussion_message: ''
+  settled_answer: ''
   autonomous_digest: []
   autonomous_kinds: []
   # --- phase F ---
@@ -1986,7 +2000,8 @@ nodes:
     description: >-
       Terminal prompt for a multiple-choice escalation with two options, picked by
       _terminal_prompt from the option count; ask_question lists each option's text
-      under its label. The engine's own "Other (custom)" choice goes to classify_reply.
+      under its label. The engine's own "Other (custom)" choice goes to parse_answer,
+      which sends typed text that names no option to classify_reply.
     question: |
       {{ask_question}}
     options:
@@ -1995,7 +2010,7 @@ nodes:
     routes:
       'Option 1 (recommended)': parse_answer
       'Option 2': parse_answer
-    on_other: classify_reply
+    on_other: parse_answer
     state_updates:
       last_answer: '{{choice}}'
       last_answer_text: '{{choice}}'
@@ -2006,7 +2021,8 @@ nodes:
     description: >-
       Terminal prompt for a multiple-choice escalation with three options, picked by
       _terminal_prompt from the option count; ask_question lists each option's text
-      under its label. The engine's own "Other (custom)" choice goes to classify_reply.
+      under its label. The engine's own "Other (custom)" choice goes to parse_answer,
+      which sends typed text that names no option to classify_reply.
     question: |
       {{ask_question}}
     options:
@@ -2017,7 +2033,7 @@ nodes:
       'Option 1 (recommended)': parse_answer
       'Option 2': parse_answer
       'Option 3': parse_answer
-    on_other: classify_reply
+    on_other: parse_answer
     state_updates:
       last_answer: '{{choice}}'
       last_answer_text: '{{choice}}'
@@ -2028,7 +2044,8 @@ nodes:
     description: >-
       Terminal prompt for a multiple-choice escalation with four options, picked by
       _terminal_prompt from the option count; ask_question lists each option's text
-      under its label. The engine's own "Other (custom)" choice goes to classify_reply.
+      under its label. The engine's own "Other (custom)" choice goes to parse_answer,
+      which sends typed text that names no option to classify_reply.
     question: |
       {{ask_question}}
     options:
@@ -2041,7 +2058,7 @@ nodes:
       'Option 2': parse_answer
       'Option 3': parse_answer
       'Option 4': parse_answer
-    on_other: classify_reply
+    on_other: parse_answer
     state_updates:
       last_answer: '{{choice}}'
       last_answer_text: '{{choice}}'
@@ -2087,14 +2104,35 @@ nodes:
   choice_reply_route:
     id: choice_reply_route
     type: script
-    description: An answer is recorded through apply_answer; a discussion, an unclear reply or a classifier fault re-asks the question.
+    description: An answer is recorded through apply_answer; a discussion, an unclear reply or a classifier fault goes to choice_park.
     script: scripts/choice_reply_route.py
+    fallback: end_failure
+
+  choice_park:
+    id: choice_park
+    type: script
+    description: >-
+      Park the run on the current question for a discussion in the chat lane: the
+      exposed discussion, the carried discussion_run_id and a snapshot, then
+      end_discussion. A question already parked DISCUSSION_PARKS_MAX times goes to
+      choice_reask instead, and its next typed reply is recorded without the classifier.
+    script: scripts/choice_park.py
+    fallback: end_failure
+
+  choice_resume:
+    id: choice_resume
+    type: script
+    description: >-
+      Re-entry into a run parked on a discussion: a settled answer is recorded for
+      the parked question, otherwise the question is asked again; both continue at
+      open_questions_gate with the earlier answers kept.
+    script: scripts/choice_resume.py
     fallback: end_failure
 
   choice_reask:
     id: choice_reask
     type: script
-    description: Re-ask the same multiple-choice question with a one-line note that the reply read as a discussion.
+    description: Re-ask the same multiple-choice question with a one-line note that it reached its discussion park cap.
     script: scripts/choice_reask.py
     fallback: end_failure
 
@@ -2584,3 +2622,9 @@ nodes:
       {{last_script_error}}
 
       Architect run id: {{run_id}}
+
+  end_discussion:
+    id: end_discussion
+    type: end
+    output: |
+      {{discussion_message}}
