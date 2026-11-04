@@ -5312,3 +5312,369 @@ fn a_signal_killed_file_loader_is_reported_as_a_failure_not_ingested() {
 fn a_signal_killed_stdout_loader_is_reported_as_a_failure_not_ingested() {
     a_signal_killed_loader_is_a_failure("killed-stdout-loader", false);
 }
+
+// ---------------------------------------------------------------------------
+// Esc on the incorporate question, `.rag` with no name and a seeded temp
+// rag, a stdout loader that reads stdin outside the UI, conceal with a
+// leading zero, and a tool whose background job keeps writing after its
+// turn.
+// ---------------------------------------------------------------------------
+
+/// Esc on the incorporate question cancels it: no session opens (the
+/// footer still says `no session` after a full repaint, the modal is gone,
+/// nothing is written under the config dir), the UI keeps taking keys, and
+/// `.session <name>` asked again and answered with `n` seats the session
+/// empty.
+#[test]
+#[serial]
+fn esc_on_the_incorporate_question_opens_no_session_and_the_next_n_seats_it_empty() {
+    let dir = fresh_config_dir("session-after-turn-esc");
+    let _guard = TempDirGuard(dir.clone());
+    let name = "after-turn-esc3";
+    let (mut pty, _fake) = open_session_after_a_turn(&dir, name);
+    let files_before = walk(&dir);
+
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    // A different size from the one `answer_and_expect_session` grows to,
+    // so both repaints are forced.
+    pty.resize(60, 110).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(
+        squeezed(&since).contains("nosession"),
+        "the footer does not say `no session` after Esc on the incorporate question:\n{since}"
+    );
+    assert!(
+        !squeezed(&since).contains("Esc=cancel"),
+        "the modal is still up after Esc:\n{since}"
+    );
+    // The command echo `> .session <name>` sits in the transcript; the
+    // footer is the last row, and the name must not be painted there.
+    let on_footer: Vec<_> = painted_at(pty.raw(), name.as_bytes(), pressed_at)
+        .into_iter()
+        .filter(|(row, _)| *row == 60)
+        .collect();
+    assert!(
+        on_footer.is_empty(),
+        "the footer names `{name}` after Esc on the incorporate question:\n{since}"
+    );
+    let written = new_files_named(&dir, &files_before, name);
+    assert!(
+        written.is_empty(),
+        "Esc on the incorporate question still wrote {written:?}:\n{since}"
+    );
+
+    // Asked again, the question comes back (the exchange is still there
+    // and no session took it), and `n` seats the session empty.
+    let asked_at = pty.raw().len();
+    pty.send(format!(".session {name}\r").as_bytes()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+        assert!(
+            !since.contains(PROMPT_REFUSAL),
+            "`.session` after Esc was refused instead of asking again:\n{since}"
+        );
+        if squeezed(&since).contains("incorporatesthelastquestionandanswer") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`.session` after Esc did not ask about the last exchange again within 10s:\n{since}"
+        );
+    }
+    pty.read_for(HOTKEY_GAP);
+    answer_and_expect_session(pty, b"n", name, true);
+}
+
+/// `.rag` with no name recreates the temporary rag in the REPL, removing
+/// the previous one and then asking which embedding model and documents
+/// to use; under the UI the gate refuses it before the removal, so a
+/// temp rag that already exists survives untouched, the terminal is never
+/// released, and the UI keeps taking keys and leaves clean.
+#[test]
+#[serial]
+fn dot_rag_without_a_name_is_refused_before_the_temp_rag_is_removed() {
+    let dir = fresh_config_dir("gate-rag-temp");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let rags = dir.join("rags");
+    fs::create_dir_all(&rags).unwrap();
+    let temp_rag = rags.join("temp.yaml");
+    let seeded = "embedding_model: dryrun:dry-embed-a\nchunk_size: 1000\nchunk_overlap: 50\ndocument_paths: []\nfiles: []\nmarker: temp-rag-survives-t3g\n";
+    fs::write(&temp_rag, seeded).unwrap();
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let before = pty.raw().len();
+    let sent = std::time::Instant::now();
+    pty.send(b".rag\r").unwrap();
+    let since = pty
+        .wait_for_after(PROMPT_REFUSAL, before, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "`.rag` was not refused with {PROMPT_REFUSAL:?}; the turn is waiting on a \
+                 keyboard prompt the UI cannot show, or went past the gate: {e:?}\n{}",
+                strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+            )
+        });
+    let took = sent.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "the refusal of `.rag` took {took:?}; the gate did not run first:\n{since}"
+    );
+    pty.read_for(Duration::from_millis(500));
+    assert!(
+        temp_rag.exists(),
+        "the refused `.rag` removed the temp rag {}:\n{since}",
+        temp_rag.display()
+    );
+    assert_eq!(
+        fs::read_to_string(&temp_rag).unwrap(),
+        seeded,
+        "the refused `.rag` rewrote the temp rag:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the refused `.rag` released the terminal:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("`.info` after the refused `.rag` never rendered");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        temp_rag.exists(),
+        "the temp rag was gone by the time the UI left:\n{transcript}"
+    );
+}
+
+/// A stdout-branch loader (`cmd $1`) never inherits the terminal on its
+/// stdin, outside the UI as much as under it: in the plain command mode
+/// on a tty, `cat "$1" -` returns once the file is read instead of
+/// waiting on the keyboard, the document reaches the model, the reply is
+/// printed and the command exits 0.
+#[test]
+#[serial]
+fn a_stdout_loader_reading_stdin_returns_in_command_mode_on_a_tty() {
+    let dir = fresh_config_dir("loader-stdin-cmd");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text("loaded document reply s7d".to_string())]);
+    write_fake_llm_config_with(
+        &dir,
+        &fake,
+        "document_loaders:\n\x20 catstdin: 'cat \"$1\" -'\n",
+    );
+    let document = dir.join("doc.catstdin");
+    fs::write(&document, "document body s7d-body\n").unwrap();
+    let wrapper = format!(
+        "'{{coyote}}' -f '{}' 'summarize' <{{stdin}} & cpid=$!; echo \"cpid=$cpid\"; \
+         wait $cpid; rc=$?; {{report}}",
+        document.display()
+    );
+    let started = std::time::Instant::now();
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        &wrapper,
+        "/dev/tty",
+    );
+    let transcript = pty
+        .wait_for("tty-probe-done", PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "the command never finished: the loader is waiting on the terminal's stdin: \
+                 {e:?}\n{}",
+                strip_ansi(&String::from_utf8_lossy(pty.raw()))
+            )
+        });
+    let took = started.elapsed();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_eq!(
+        fake.served(),
+        1,
+        "the document never reached the model:\n{transcript}"
+    );
+    assert!(
+        squeezed(&transcript).contains("loadeddocumentreplys7d"),
+        "the reply was not printed:\n{transcript}"
+    );
+    assert!(
+        took < Duration::from_secs(15),
+        "the loader took {took:?} to come back"
+    );
+    assert_tty_restored(&transcript);
+}
+
+/// Conceal written with a leading zero (`ESC[08m`) is still SGR 8: the
+/// word is painted, no conceal parameter reaches the tty, the sequence is
+/// never painted as text, a full repaint keeps the word, and nothing of
+/// it reaches the normal screen after Ctrl+D.
+#[test]
+#[serial]
+fn a_reply_concealed_with_a_leading_zero_shows_it_and_sends_no_conceal_to_the_tty() {
+    let dir = fresh_config_dir("conceal-zero-visible");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text(
+        "before c9a \x1b[08mhidden-word-c9b\x1b[0m after c9c".to_string(),
+    )]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let submitted_at = pty.raw().len();
+    pty.send(b"conceal please\r").unwrap();
+    let transcript = wait_for_squeezed(&mut pty, "after c9c", "the reply's tail");
+    assert_eq!(fake.served(), 1, "{transcript}");
+    pty.read_for(Duration::from_millis(600));
+
+    let raw = pty.raw();
+    let visible = strip_ansi(&String::from_utf8_lossy(&raw[submitted_at..]));
+    assert!(
+        squeezed(&visible).contains("hidden-word-c9b"),
+        "the word concealed with ESC[08m was not painted:\n{visible}"
+    );
+    assert!(
+        !visible.contains("[08m") && !visible.contains("[8m") && !visible.contains("[0m"),
+        "the conceal sequence was painted as text:\n{visible}"
+    );
+    let concealing: Vec<_> = sgr_params(&raw[submitted_at..])
+        .into_iter()
+        .filter(|p| p.contains(&8))
+        .collect();
+    assert!(
+        concealing.is_empty(),
+        "a conceal SGR reached the tty: {concealing:?}\n{visible}"
+    );
+
+    let repaint_at = raw.len();
+    pty.resize(30, 90).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let repainted = loop {
+        pty.read_for(Duration::from_millis(200));
+        let repainted = strip_ansi(&String::from_utf8_lossy(&pty.raw()[repaint_at..]));
+        if squeezed(&repainted).contains("afterc9c") {
+            break repainted;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reply was not repainted after the resize:\n{repainted}"
+        );
+    };
+    assert!(
+        squeezed(&repainted).contains("hidden-word-c9b"),
+        "the concealed word vanished on repaint:\n{repainted}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let left_at = find(pty.raw(), LEAVE_ALT, 0).expect("the UI never left the alternate screen");
+    let after_leave = &pty.raw()[left_at..];
+    let visible_after = strip_ansi(&String::from_utf8_lossy(after_leave));
+    assert!(
+        !visible_after.contains("[08m") && !visible_after.contains("[8m"),
+        "the conceal sequence reached the normal screen as text:\n{visible_after}"
+    );
+    let concealing_after: Vec<_> = sgr_params(after_leave)
+        .into_iter()
+        .filter(|p| p.contains(&8))
+        .collect();
+    assert!(
+        concealing_after.is_empty(),
+        "a conceal SGR reached the normal screen: {concealing_after:?}\n{visible_after}"
+    );
+}
+
+/// A tool that leaves a background job writing to its stdout after the
+/// tool itself (and its turn) finished.
+const LINGERING_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Finish at once, leaving a job that prints later.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   ( sleep 4; echo 'late-line-one-k7a'; sleep 0.3; echo 'late-line-two-k7b'; sleep 0.3; echo 'late-line-three-k7c' ) &\n\
+    \x20   echo 'fixture lingering started k7s' >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// A tool whose background job keeps writing after the turn ended does
+/// not disturb the UI: the turn completes, the UI stays live and leaves
+/// clean. The job's writes arrive after the tool's output pump was
+/// detached (the drain grace is two seconds), so the binary drops them
+/// rather than attributing them to a finished tool; should any of them
+/// be shown, they share one trailing cell (adjacent rows, no blank cell
+/// gap between the lines) rather than a cell per pipe read, as the
+/// `out_of_turn_tool_output_shares_one_bounded_cell` unit test pins
+/// in-process.
+#[test]
+#[serial]
+fn a_tool_leaving_a_background_writer_behind_keeps_the_ui_live_and_folds_its_output() {
+    let dir = fresh_config_dir("tool-late-output");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_lingering".to_string(),
+            arguments: "{}".to_string(),
+        },
+        Reply::Text("fixture done after lingering k7d".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_lingering.sh", LINGERING_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let submitted_at = pty.raw().len();
+    pty.send(b"call the lingering tool\r").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "fixture done after lingering k7d",
+        "the reply after the tool",
+    );
+    assert_eq!(fake.served(), 2);
+    // Outlive the job's writes, pumping the pty.
+    pty.read_for(Duration::from_millis(6000));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[submitted_at..]));
+    let one = painted_at(pty.raw(), b"late-line-one-k7a", submitted_at);
+    let two = painted_at(pty.raw(), b"late-line-two-k7b", submitted_at);
+    let three = painted_at(pty.raw(), b"late-line-three-k7c", submitted_at);
+    eprintln!("late output positions: {one:?} / {two:?} / {three:?}");
+    if let (Some(&(row_one, col_one)), Some(&(row_two, col_two))) = (one.last(), two.last()) {
+        assert_eq!(
+            (row_two, col_two),
+            (row_one + 1, col_one),
+            "the late lines did not share one cell:\n{since}"
+        );
+    }
+    if let (Some(&(row_two, col_two)), Some(&(row_three, col_three))) = (two.last(), three.last()) {
+        assert_eq!(
+            (row_three, col_three),
+            (row_two + 1, col_two),
+            "the late lines did not share one cell:\n{since}"
+        );
+    }
+    assert!(
+        !since.contains("exit="),
+        "the lingering job's output quit the UI:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the lingering tool");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
