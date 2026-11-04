@@ -23635,6 +23635,7 @@ mod tests {
                     shadowed(&["project_dir"]),
                     unreachable(&[
                         "analyze_request",
+                        "baseline_tests",
                         "end_rejected",
                         "end_success",
                         "fix_loop_gate",
@@ -32153,7 +32154,8 @@ print(json.dumps({
     // skipping it; step-runner's revise_from_choice re-asks for the
     // revision through get_revision), and a fail-open scan whose downstream
     // node still runs on the failure default (step-runner's debt_scan into
-    // edge_case_sweep).
+    // edge_case_sweep; coder's baseline_tests into implement with no
+    // baseline).
     #[test]
     fn routing_gate_script_crashes_fail_closed() {
         use crate::graph::{GraphParser, NodeType, SCRIPT_FALLBACK_ERROR_KEY};
@@ -32175,6 +32177,12 @@ print(json.dumps({
                 "route_complexity",
                 "gate_approval",
                 "fails toward the human instead of skipping approval",
+            ),
+            (
+                "coder",
+                "baseline_tests",
+                "implement",
+                "no baseline: verify_tests keeps its plain exit-code verdict",
             ),
             (
                 "step-runner",

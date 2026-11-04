@@ -100,6 +100,12 @@ initial_state:
   review_notes: ''
   design_notes: ''
   design_trail: ''
+  baseline_status: none
+  baseline_exit_code: 0
+  baseline_failures: []
+  baseline_failure_hash: ''
+  baseline_note: No baseline was recorded.
+  baseline_report: ''
 
 start: resolve_paths
 
@@ -216,9 +222,17 @@ nodes:
       - 'yes'
       - 'no'
     routes:
-      'yes': implement
+      'yes': baseline_tests
       'no': end_rejected
     on_other: end_rejected
+
+  baseline_tests:
+    id: baseline_tests
+    type: script
+    description: Run the test command once on the untouched tree, killed at test_timeout, and record which tests already fail (baseline_failures, baseline_failure_hash, baseline_exit_code) so verify_tests can tell pre-existing failures from new ones. Runs once per run, never after edits; always routes to implement, and a crash means no baseline.
+    script: scripts/baseline_tests.sh
+    timeout: 3600
+    fallback: implement
 
   implement:
     id: implement
@@ -390,6 +404,10 @@ nodes:
           `Design: ASK` line) on every pass: a fix-loop re-entry writes a
           fresh summary, and the self-review reads the latest one first and
           the earlier passes after it.
+      12. Tests listed under "Tests that already failed before this run"
+          were red before you started: do not "fix" them unless the request
+          asks you to, and never write a new test that encodes the
+          behaviour a known-failing test rejects.
 
       Project directory: {{project_dir}}
     prompt: |
@@ -405,6 +423,9 @@ nodes:
 
       ## Original request from the orchestrator
       {{initial_prompt}}
+
+      ## Tests that already failed before this run
+      {{baseline_note}}
 
       ## Fix loop status
       {{fix_instructions}}
@@ -434,7 +455,7 @@ nodes:
   verify_tests:
     id: verify_tests
     type: script
-    description: Run test_command (or the detected test command) in project_dir, killed at test_timeout. Routes to self_review on pass, fix_loop_gate on failure, end_failure on a timeout.
+    description: Run test_command (or the detected test command) in project_dir, killed at test_timeout. Routes to self_review on pass, fix_loop_gate on failure, end_failure on a timeout. Against a red baseline a nonzero run passes when its exit code matches the baseline's and its failing tests are a subset of baseline_failures (or, when no test could be identified in either run, its failure output hashes alike); unidentified failures against an identified baseline fail.
     script: scripts/verify_tests.sh
     timeout: 3600
     fallback: fix_loop_gate
@@ -571,7 +592,7 @@ nodes:
       Files modified: {{files_to_modify}}
       Files created: {{files_to_create}}
       Build: passed
-      Tests: passed
+      Tests: passed{{baseline_report}}
       Design: {{design_notes}}
 
   end_rejected:

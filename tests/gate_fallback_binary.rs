@@ -398,7 +398,7 @@ fn coder_route_review_result_clean_review_ends_success_without_a_marker() {
 }
 
 const COMPLEXITY_SCRIPT: &str = "coder/scripts/route_complexity.sh";
-const COMPLEXITY_ROUTES: &[&str] = &["gate_approval", "implement"];
+const COMPLEXITY_ROUTES: &[&str] = &["gate_approval", "baseline_tests"];
 
 /// The one gate that fails toward the human: a route_complexity script that
 /// dies (jq fails under it; a malformed score alone does not crash the
@@ -448,7 +448,7 @@ fn coder_route_complexity_crash_asks_for_approval_and_is_traced_as_a_fallback() 
 
     for (label, score, route) in [
         ("coder-complexity-high", 9, "gate_approval"),
-        ("coder-complexity-low", 2, "implement"),
+        ("coder-complexity-low", 2, "baseline_tests"),
     ] {
         let (stdout, stderr) = run_gate(
             label,
@@ -621,8 +621,8 @@ fn remaining_routing_gates_fail_closed_when_jq_dies_under_them() {
 /// flag is honoured inside the script, after it has already asked jq for
 /// the score, so a dead jq crashes the gate before the flag is read and
 /// the fallback still asks the human. With a working jq the same flag
-/// sends a high score straight to implement, so the two runs tell the
-/// bypass apart from the crash.
+/// sends a high score past the gate to baseline_tests (which runs before
+/// implement), so the two runs tell the bypass apart from the crash.
 #[test]
 #[serial]
 fn coder_autoapprove_bypasses_the_gate_but_not_a_route_complexity_crash() {
@@ -648,11 +648,11 @@ fn coder_autoapprove_bypasses_the_gate_but_not_a_route_complexity_crash() {
     );
     assert_eq!(
         stdout.trim(),
-        "PROBE_ROUTE=implement",
+        "PROBE_ROUTE=baseline_tests",
         "CODER_AUTOAPPROVE=1 must bypass the gate for a high score: {stderr}"
     );
     let line = done_line(&stderr, "route_complexity");
-    assert!(line.ends_with(" -> implement"), "{line}");
+    assert!(line.ends_with(" -> baseline_tests"), "{line}");
     assert!(!stderr.contains("(fallback)"), "{stderr}");
 
     let dir = fresh_dir("coder-autoapprove-crash");

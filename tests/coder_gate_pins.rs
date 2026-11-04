@@ -2,7 +2,9 @@
 //! directory they run in when the caller left `project_dir` unset, the
 //! `test_command` variable, and the `build_timeout` / `test_timeout`
 //! deadlines whose expiry is reported apart from a red run (by the gate
-//! itself, or by fix_loop_gate when the engine killed the node). On unix
+//! itself, or by fix_loop_gate when the engine killed the node), and the
+//! baseline of tests that already failed before `implement`, against which
+//! verify_tests tells pre-existing failures from new ones. On unix
 //! `bash`, `jq` and `git` must be on PATH (asserted, so a missing tool cannot
 //! hide the pins); elsewhere the script pins skip without them.
 
@@ -123,6 +125,7 @@ fn run_script(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Va
         .current_dir(dir)
         .env("GRAPH_STATE_FILE", &state_file)
         .env_remove("GRAPH_STATE")
+        .env_remove("CODER_AUTOAPPROVE")
         .env_remove("COYOTE_GATE_OUTPUT_MAX_BYTES")
         .env_remove("BUILD_CMD")
         .env_remove("TEST_CMD")
@@ -249,6 +252,7 @@ fn verify_gates_run_in_the_planned_work_tree_when_project_dir_defaulted() {
             );
             assert!(output.contains("\nRan in: "), "{}: {output}", gate.rel);
         }
+        assert_baseline_ran_in(&root.0, &state, &[("TEST_CMD", WHERE_FAILS)], expected);
     }
 }
 
@@ -327,11 +331,16 @@ fn verify_gates_resolve_planned_paths_and_project_dir_before_comparing() {
                 gate.rel
             );
         }
+        let mut envs = vec![("TEST_CMD", WHERE_FAILS)];
+        if !cfg!(windows) {
+            envs.push(("PATH", path_env.as_str()));
+        }
+        assert_baseline_ran_in(&root.0, &state, &envs, expected);
     }
 }
 
-/// The test_command variable is the command verify_tests runs, ahead of
-/// TEST_CMD and detection.
+/// The test_command variable is the command verify_tests and baseline_tests
+/// run, ahead of TEST_CMD and detection.
 #[test]
 fn verify_tests_runs_the_test_command_variable_first() {
     if tools_missing() {
@@ -353,6 +362,18 @@ fn verify_tests_runs_the_test_command_variable_first() {
     let output = str_field(&out, "tests_output");
     assert!(output.starts_with("Ran: echo from-variable\n"), "{output}");
     assert!(output.ends_with("from-variable"), "{output}");
+    assert_baseline_ran_in(
+        &dir.0,
+        &state,
+        &[
+            (
+                "LLM_AGENT_VAR_TEST_COMMAND",
+                "printf 'test from-variable ... FAILED\\n'; exit 101",
+            ),
+            ("TEST_CMD", "printf 'test from-env ... FAILED\\n'; exit 101"),
+        ],
+        "from-variable",
+    );
 }
 
 /// A gate that outlives its deadline is killed with its whole process group
@@ -405,6 +426,24 @@ fn verify_gates_report_a_deadline_kill_apart_from_a_red_run() {
         );
         assert!(!output.contains("Exit code:"), "{}: {output}", gate.rel);
     }
+    let started = Instant::now();
+    let out = run_script(
+        BASELINE,
+        &dir.0,
+        &state,
+        &[("TEST_CMD", cmd), ("LLM_AGENT_VAR_TEST_TIMEOUT", "1")],
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{BASELINE}: the deadline did not cut the gate short ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(str_field(&out, "baseline_status"), "timed_out", "{out}");
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    assert!(
+        str_field(&out, "baseline_note").contains("timed out after 1 s"),
+        "{out}"
+    );
     thread::sleep(Duration::from_secs(5));
     assert!(
         !late.exists(),
@@ -545,4 +584,1118 @@ fn coder_graph_declares_deadlines_below_the_gate_node_timeouts() {
         graph["initial_state"]["project_dir_defaulted"],
         serde_yaml::Value::Bool(false)
     );
+}
+
+const BASELINE: &str = "coder/scripts/baseline_tests.sh";
+const VERIFY_TESTS: &str = "coder/scripts/verify_tests.sh";
+
+/// The keys baseline_tests may write: ids, hash and note, never a transcript
+/// and never the implementer's `last_node_output`.
+const BASELINE_KEYS: [&str; 6] = [
+    "_next",
+    "baseline_exit_code",
+    "baseline_failure_hash",
+    "baseline_failures",
+    "baseline_note",
+    "baseline_status",
+];
+
+/// Runs `rel` with a TEST_CMD that prints `transcript` and exits `rc`.
+fn run_transcript(rel: &str, dir: &Path, state: &Value, transcript: &str, rc: i32) -> Value {
+    fs::write(dir.join("transcript.txt"), transcript).unwrap();
+    let cmd = format!("cat transcript.txt; exit {rc}");
+    run_script(rel, dir, state, &[("TEST_CMD", cmd.as_str())])
+}
+
+fn project_state(dir: &Path) -> Value {
+    serde_json::json!({ "project_dir": dir.to_string_lossy() })
+}
+
+fn assert_baseline_shape(out: &Value) {
+    let mut keys: Vec<&str> = out
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, BASELINE_KEYS, "{out}");
+    assert_eq!(str_field(out, "_next"), "implement", "{out}");
+}
+
+fn baseline_ids(out: &Value) -> Vec<&str> {
+    out["baseline_failures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("baseline_failures must be an array: {out}"))
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect()
+}
+
+/// A test command whose one failing cargo test id is the `where.txt` of the
+/// directory it ran in: baseline_tests keeps no transcript, so the id is
+/// what shows where it ran.
+const WHERE_FAILS: &str = "printf 'test %s ... FAILED\\n' \"$(cat where.txt)\"; exit 101";
+
+fn assert_baseline_ran_in(dir: &Path, state: &Value, envs: &[(&str, &str)], expected: &str) {
+    let out = run_script(BASELINE, dir, state, envs);
+    assert_eq!(str_field(&out, "baseline_status"), "red", "{out}");
+    assert_eq!(baseline_ids(&out), [expected], "{out}");
+}
+
+/// Verify state carrying a red baseline of `ids` at exit code `rc`.
+fn red_baseline(dir: &Path, ids: &[&str], rc: i32, hash: &str) -> Value {
+    serde_json::json!({
+        "project_dir": dir.to_string_lossy(),
+        "baseline_status": "red",
+        "baseline_exit_code": rc,
+        "baseline_failures": ids,
+        "baseline_failure_hash": hash,
+    })
+}
+
+/// A pytest short summary failing `ids`.
+fn pytest_failing(ids: &[&str]) -> String {
+    let mut text = String::from("==== short test summary info ====\n");
+    for id in ids {
+        text.push_str(&format!("FAILED {id} - AssertionError: assert 1 == 2\n"));
+    }
+    text.push_str(&format!("==== {} failed in 0.12s ====\n", ids.len()));
+    text
+}
+
+/// Without a test command there is nothing to run: no baseline, the run
+/// goes on to implement, and verify_tests keeps its plain verdict. A
+/// test_timeout that is not whole seconds records no baseline either.
+#[test]
+fn baseline_tests_without_a_test_command_records_no_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("baseline-none");
+    project(&dir.0, "here");
+    let out = run_script(BASELINE, &dir.0, &project_state(&dir.0), &[]);
+    assert_baseline_shape(&out);
+    assert_eq!(str_field(&out, "baseline_status"), "none", "{out}");
+    assert!(baseline_ids(&out).is_empty(), "{out}");
+
+    let out = run_script(
+        BASELINE,
+        &dir.0,
+        &project_state(&dir.0),
+        &[
+            ("TEST_CMD", "touch ran.txt"),
+            ("LLM_AGENT_VAR_TEST_TIMEOUT", "ten"),
+        ],
+    );
+    assert_baseline_shape(&out);
+    assert_eq!(str_field(&out, "baseline_status"), "none", "{out}");
+    assert!(
+        str_field(&out, "baseline_note").contains("test_timeout"),
+        "{out}"
+    );
+    assert!(!dir.0.join("ran.txt").exists(), "ran with a bad deadline");
+}
+
+/// A red baseline records the exit code, the sorted unique failing test
+/// ids each supported runner prints (ANSI colour and CRLF stripped), a
+/// failure hash and a note naming the ids.
+#[test]
+fn baseline_tests_records_the_failing_test_ids_per_runner() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("baseline-ids");
+    project(&dir.0, "here");
+    let jest = "\u{25cf}";
+    let sep = "\u{203a}";
+    let cases: Vec<(&str, String, Vec<&str>)> = vec![
+        (
+            "unittest",
+            "\x1b[31mFAIL: test_tier_boundary_is_inclusive (tests.test_invoicer.TotalsTests.test_tier_boundary_is_inclusive)\x1b[0m\r\n\
+             ----------------------------------------------------------------------\r\n\
+             Traceback (most recent call last):\r\n\
+             AssertionError: 10 != 11\r\n\
+             ERROR: test_old (tests.test_legacy.LegacyTests)\r\n\
+             Ran 2 tests in 0.003s\r\n\
+             \r\n\
+             FAILED (failures=1, errors=1)\r\n"
+                .to_string(),
+            vec![
+                "tests.test_invoicer.TotalsTests.test_tier_boundary_is_inclusive",
+                "tests.test_legacy.LegacyTests.test_old",
+            ],
+        ),
+        (
+            "pytest",
+            "==== short test summary info ====\n\
+             FAILED tests/test_a.py::test_one - AssertionError: assert 1 == 2\n\
+             FAILED tests/test_a.py::TestK::test_two[param-1]\n\
+             ERROR tests/test_b.py::test_three - RuntimeError: boom\n\
+             FAILED tests/test_a.py::test_one - AssertionError: assert 1 == 2\n\
+             ==== 2 failed, 1 error in 0.12s ====\n"
+                .to_string(),
+            vec![
+                "tests/test_a.py::TestK::test_two[param-1]",
+                "tests/test_a.py::test_one",
+                "tests/test_b.py::test_three",
+            ],
+        ),
+        (
+            "cargo",
+            "running 3 tests\n\
+             test parser::tests::ok ... ok\n\
+             test parser::tests::bad_input ... FAILED\n\
+             test cli::it_runs ... FAILED\n\
+             \n\
+             failures:\n\
+             ---- parser::tests::bad_input stdout ----\n\
+             thread 'parser::tests::bad_input' panicked at src/parser.rs:10:5:\n\
+             failures:\n    cli::it_runs\n    parser::tests::bad_input\n\
+             \n\
+             test result: FAILED. 1 passed; 2 failed; 0 ignored; finished in 0.01s\n"
+                .to_string(),
+            vec!["cli::it_runs", "parser::tests::bad_input"],
+        ),
+        (
+            "go",
+            "=== RUN   TestAdd\n\
+             --- FAIL: TestAdd (0.00s)\n\
+             \x20   math_test.go:9: got 3 want 4\n\
+             === RUN   TestSub/negative\n\
+             \x20   --- FAIL: TestSub/negative (0.00s)\n\
+             FAIL\n\
+             FAIL\texample.com/m/math\t0.002s\n\
+             FAIL\texample.com/m/broken [build failed]\n\
+             FAIL\n"
+                .to_string(),
+            vec![
+                "TestAdd",
+                "TestSub/negative",
+                "pkg:example.com/m/broken",
+                "pkg:example.com/m/math",
+            ],
+        ),
+        (
+            "jest",
+            format!(
+                " FAIL  src/cart.test.js\n\
+                 \x20 Cart\n\
+                 \x20   x adds items (5 ms)\n\
+                 \x20 {jest} Cart {sep} adds items\n\
+                 \n\
+                 \x20   expect(received).toBe(expected)\n\
+                 \n\
+                 \x20 {jest} Cart {sep} totals {sep} rounds down\n\
+                 \n\
+                 \x20 {jest} Console\n\
+                 \n\
+                 \x20   console.log\n"
+            ),
+            vec![
+                "src/cart.test.js > Cart \u{203a} adds items",
+                "src/cart.test.js > Cart \u{203a} totals \u{203a} rounds down",
+            ],
+        ),
+        (
+            "vitest",
+            "\x1b[31m FAIL \x1b[39m src/a.test.ts > math > adds\n\
+             \x20FAIL  src/b.test.ts\n\
+             AssertionError: expected 1 to be 2\n\
+             \x20FAIL  src/a.test.ts > math > nested > subtracts\n"
+                .to_string(),
+            vec![
+                "src/a.test.ts > math > adds",
+                "src/a.test.ts > math > nested > subtracts",
+                "src/b.test.ts",
+            ],
+        ),
+    ];
+    for (runner, transcript, expected) in &cases {
+        let out = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), transcript, 1);
+        assert_baseline_shape(&out);
+        assert_eq!(str_field(&out, "baseline_status"), "red", "{runner}: {out}");
+        assert_eq!(out["baseline_exit_code"], Value::from(1), "{runner}: {out}");
+        assert_eq!(&baseline_ids(&out), expected, "{runner}: {out}");
+        assert!(
+            !str_field(&out, "baseline_failure_hash").is_empty(),
+            "{runner}: {out}"
+        );
+        let note = str_field(&out, "baseline_note");
+        assert!(note.contains("(exit 1)"), "{runner}: {note}");
+        for id in expected {
+            assert!(note.lines().any(|l| l == *id), "{runner}: {note}");
+        }
+    }
+}
+
+/// A green baseline records no failures; a baseline killed at test_timeout
+/// records none either and still hands over to implement.
+#[test]
+fn baseline_tests_records_green_and_timed_out_runs_without_failures() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("baseline-green");
+    project(&dir.0, "here");
+    let out = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), "ok\n", 0);
+    assert_baseline_shape(&out);
+    assert_eq!(str_field(&out, "baseline_status"), "green", "{out}");
+    assert!(baseline_ids(&out).is_empty(), "{out}");
+
+    let started = Instant::now();
+    let out = run_script(
+        BASELINE,
+        &dir.0,
+        &project_state(&dir.0),
+        &[("TEST_CMD", "sleep 5"), ("LLM_AGENT_VAR_TEST_TIMEOUT", "1")],
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "deadline ignored"
+    );
+    assert_baseline_shape(&out);
+    assert_eq!(str_field(&out, "baseline_status"), "timed_out", "{out}");
+    assert!(baseline_ids(&out).is_empty(), "{out}");
+}
+
+/// Failures that are a subset of the baseline at the baseline's exit code
+/// pass straight to self_review (no fix attempt) and are reported as
+/// pre-existing, ahead of the transcript.
+#[test]
+fn verify_tests_passes_a_run_whose_failures_are_all_in_the_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-subset");
+    project(&dir.0, "here");
+    let a = "tests/test_a.py::test_one";
+    let state = red_baseline(&dir.0, &[a], 1, "");
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&[a]), 1);
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(str_field(&out, "_next"), "self_review", "{out}");
+    let report = str_field(&out, "baseline_report");
+    assert_eq!(report, format!("\nPre-existing failures: {a}"), "{out}");
+    assert!(
+        str_field(&out, "tests_output")
+            .starts_with(&format!("Pre-existing failures: {a}\n\nRan: ")),
+        "{out}"
+    );
+}
+
+/// A failure the baseline did not have fails the run, and the transcript
+/// names which failures are new and which were there before.
+#[test]
+fn verify_tests_fails_a_new_failure_on_top_of_the_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-new");
+    project(&dir.0, "here");
+    let (a, c) = ("tests/test_a.py::test_one", "tests/test_c.py::test_new");
+    let state = red_baseline(&dir.0, &[a], 1, "");
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&[a, c]), 1);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{out}");
+    let output = str_field(&out, "tests_output");
+    assert!(output.contains("\nExit code: 1\n"), "{output}");
+    assert!(
+        output.contains(&format!("\nNew failures: {c}\n")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!("\nPre-existing failures: {a}\n")),
+        "{output}"
+    );
+}
+
+/// Output with no identifiable test ids is matched by its failure hash:
+/// the same failures (timings and addresses aside) pass with the
+/// unidentified report line, different ones fail.
+#[test]
+fn verify_tests_matches_unidentified_failures_by_their_hash() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-hash");
+    project(&dir.0, "here");
+    let before = "compiling\nerror: linker failed at 0x7ffd1234 after 0.52s\nsomething else\n";
+    let base = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), before, 1);
+    assert_eq!(str_field(&base, "baseline_status"), "red", "{base}");
+    assert!(baseline_ids(&base).is_empty(), "{base}");
+    let state = red_baseline(&dir.0, &[], 1, str_field(&base, "baseline_failure_hash"));
+
+    let same = "error: linker failed at 0x7ffe9999 after 1.03s\nother noise\n";
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, same, 1);
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(str_field(&out, "_next"), "self_review", "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        "\nPre-existing failures: unidentified (no test ids could be parsed), output matches the baseline (exit 1)",
+        "{out}"
+    );
+
+    let changed = "error: linker failed: missing symbol foo\n";
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, changed, 1);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{out}");
+}
+
+/// Baseline failures that now pass are reported as fixed: all of them on a
+/// green run, and on a run that still fails a subset the ones it shows
+/// passing. One that is merely absent from a red run is only no longer
+/// reported failing.
+#[test]
+fn verify_tests_reports_baseline_failures_that_now_pass_as_fixed() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-fixed");
+    project(&dir.0, "here");
+    let (a, b) = ("tests/test_a.py::test_one", "tests/test_b.py::test_two");
+    let out = run_transcript(
+        VERIFY_TESTS,
+        &dir.0,
+        &red_baseline(&dir.0, &[a], 1, ""),
+        "all good\n",
+        0,
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        format!("\nFixed pre-existing failures: {a}"),
+        "{out}"
+    );
+
+    let out = run_transcript(
+        VERIFY_TESTS,
+        &dir.0,
+        &red_baseline(&dir.0, &[], 1, "unmatched"),
+        "all good\n",
+        0,
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        "\nFixed pre-existing failures: unidentified, the suite now passes",
+        "{out}"
+    );
+
+    let out = run_transcript(
+        VERIFY_TESTS,
+        &dir.0,
+        &red_baseline(&dir.0, &[a, b], 1, ""),
+        &pytest_failing(&[a]),
+        1,
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(str_field(&out, "_next"), "self_review", "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        format!("\nPre-existing failures: {a}\nNo longer reported failing: {b}"),
+        "{out}"
+    );
+
+    let shown_passing = format!("{b} PASSED [ 50%]\n{}", pytest_failing(&[a]));
+    let out = run_transcript(
+        VERIFY_TESTS,
+        &dir.0,
+        &red_baseline(&dir.0, &[a, b], 1, ""),
+        &shown_passing,
+        1,
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        format!("\nPre-existing failures: {a}\nFixed pre-existing failures: {b}"),
+        "{out}"
+    );
+}
+
+/// The same ids at a different exit code are not the baseline's failures
+/// (a crash on top of them, say): the run fails.
+#[test]
+fn verify_tests_fails_when_the_exit_code_differs_from_the_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-exit");
+    project(&dir.0, "here");
+    let a = "tests/test_a.py::test_one";
+    let state = red_baseline(&dir.0, &[a], 1, "");
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&[a]), 2);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{out}");
+    assert!(
+        str_field(&out, "tests_output").contains("\nBaseline exit code: 1"),
+        "{out}"
+    );
+}
+
+/// A baseline with known ids never passes a run whose failures cannot be
+/// identified: unknown means fail.
+#[test]
+fn verify_tests_fails_an_unidentified_run_against_an_identified_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-unknown");
+    project(&dir.0, "here");
+    let state = red_baseline(&dir.0, &["tests/test_a.py::test_one"], 1, "");
+    let compile_error = "error[E0425]: cannot find value `x` in this scope\n";
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, compile_error, 1);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{out}");
+    assert!(
+        str_field(&out, "tests_output").contains("No failing test could be identified"),
+        "{out}"
+    );
+}
+
+/// On a red test run the fix instructions name the baseline failures as
+/// pre-existing, and say nothing of a baseline when there is none.
+#[test]
+fn fix_loop_gate_lists_pre_existing_failures_in_fix_instructions() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("fix-baseline");
+    let mut state = serde_json::json!({
+        "fix_attempts": 0,
+        "max_fix_attempts": 5,
+        "build_ok": true,
+        "tests_ok": false,
+        "tests_output": "Exit code: 1",
+        "baseline_failures": ["tests/a.py::one", "tests/b.py::two"],
+    });
+    let out = run_script("coder/scripts/fix_loop_gate.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    let instructions = str_field(&out, "fix_instructions");
+    assert!(
+        instructions
+            .contains("already failing before you started: tests/a.py::one, tests/b.py::two."),
+        "{instructions}"
+    );
+
+    state["baseline_failures"] = serde_json::json!([]);
+    let out = run_script("coder/scripts/fix_loop_gate.sh", &dir.0, &state, &[]);
+    let instructions = str_field(&out, "fix_instructions");
+    assert!(
+        !instructions.contains("before you started"),
+        "{instructions}"
+    );
+
+    let many: Vec<String> = (1..=23).map(|n| format!("t{n:02}")).collect();
+    state["baseline_failures"] = serde_json::json!(many);
+    let out = run_script("coder/scripts/fix_loop_gate.sh", &dir.0, &state, &[]);
+    let instructions = str_field(&out, "fix_instructions");
+    assert!(
+        instructions.contains("t19, t20, (+3 more)."),
+        "{instructions}"
+    );
+    assert!(!instructions.contains("t21"), "{instructions}");
+}
+
+/// route_complexity sends every plan that skips approval to the baseline.
+#[test]
+fn route_complexity_routes_into_the_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("baseline-wiring");
+    for (score, autoapprove, expected) in [
+        (2, "0", "baseline_tests"),
+        (9, "1", "baseline_tests"),
+        (9, "0", "gate_approval"),
+    ] {
+        let state = serde_json::json!({ "complexity_score": score });
+        let out = run_script(
+            "coder/scripts/route_complexity.sh",
+            &dir.0,
+            &state,
+            &[("CODER_AUTOAPPROVE", autoapprove)],
+        );
+        assert_eq!(str_field(&out, "_next"), expected, "score {score}");
+    }
+}
+
+/// The baseline runs once, between approval and implement: every route
+/// into implement from the planning side goes through it, a crash of it
+/// falls through to implement, and its outputs reach the prompts.
+#[test]
+fn coder_graph_runs_the_baseline_once_before_implement() {
+    let graph = graph();
+    let nodes = &graph["nodes"];
+    assert_eq!(
+        nodes["gate_approval"]["routes"]["yes"].as_str(),
+        Some("baseline_tests")
+    );
+    let node = &nodes["baseline_tests"];
+    assert_eq!(node["type"].as_str(), Some("script"));
+    assert_eq!(node["script"].as_str(), Some("scripts/baseline_tests.sh"));
+    assert_eq!(node["fallback"].as_str(), Some("implement"));
+    assert_eq!(
+        node["timeout"].as_u64(),
+        nodes["verify_tests"]["timeout"].as_u64()
+    );
+    assert!(
+        nodes["implement"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("{{baseline_note}}")
+    );
+    assert!(
+        nodes["end_success"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("Tests: passed{{baseline_report}}\nDesign: ")
+    );
+    for key in [
+        "baseline_status",
+        "baseline_exit_code",
+        "baseline_failures",
+        "baseline_failure_hash",
+        "baseline_note",
+        "baseline_report",
+    ] {
+        assert!(
+            !graph["initial_state"][key].is_null(),
+            "initial_state lacks {key}"
+        );
+    }
+    assert_eq!(
+        graph["initial_state"]["baseline_note"].as_str(),
+        Some("No baseline was recorded.")
+    );
+}
+
+/// Only gate_approval (by its routes) and route_complexity (by the `_next`
+/// it prints) lead into baseline_tests, and baseline_tests declares no
+/// `next` or `routes` of its own: it runs once, before implement.
+#[test]
+fn only_the_approval_side_routes_into_the_baseline() {
+    let graph = graph();
+    let mut into = Vec::new();
+    for (name, node) in graph["nodes"].as_mapping().unwrap() {
+        let mut targets: Vec<&serde_yaml::Value> = ["next", "fallback", "on_other"]
+            .iter()
+            .map(|key| &node[*key])
+            .collect();
+        if let Some(routes) = node["routes"].as_mapping() {
+            targets.extend(routes.values());
+        }
+        if targets.iter().any(|t| t.as_str() == Some("baseline_tests")) {
+            into.push(name.as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(into, ["gate_approval"]);
+
+    let mut scripts = Vec::new();
+    for entry in fs::read_dir(asset("coder/scripts")).unwrap() {
+        let path = entry.unwrap().path();
+        let text: String = fs::read_to_string(&path)
+            .unwrap()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if text.contains("\"_next\":\"baseline_tests\"") {
+            scripts.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    assert_eq!(scripts, ["route_complexity.sh"]);
+
+    let node = &graph["nodes"]["baseline_tests"];
+    assert!(node["next"].is_null(), "baseline_tests declares a next");
+    assert!(node["routes"].is_null(), "baseline_tests declares routes");
+}
+
+/// With no report the end_success output keeps its old layout; a report
+/// lands on its own lines right after `Tests: passed`.
+#[test]
+fn end_success_renders_the_baseline_report_after_tests_passed() {
+    let template = graph()["nodes"]["end_success"]["output"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain = template.replace("{{baseline_report}}", "");
+    assert!(
+        plain.contains("Build: passed\nTests: passed\nDesign: "),
+        "{plain}"
+    );
+    let reported = template.replace(
+        "{{baseline_report}}",
+        "\nPre-existing failures: tests/a.py::one",
+    );
+    assert!(
+        reported.contains("Tests: passed\nPre-existing failures: tests/a.py::one\nDesign: "),
+        "{reported}"
+    );
+}
+
+/// Without a red baseline verify_tests reports nothing, so end_success
+/// renders exactly the layout it had before baselines existed.
+#[test]
+fn verify_tests_reports_nothing_without_a_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-no-baseline");
+    project(&dir.0, "here");
+    for (cmd, ok) in [("echo fine", true), ("echo boom; exit 1", false)] {
+        let out = run_script(
+            VERIFY_TESTS,
+            &dir.0,
+            &project_state(&dir.0),
+            &[("TEST_CMD", cmd)],
+        );
+        assert_eq!(out["tests_ok"], Value::Bool(ok), "{cmd}: {out}");
+        if ok {
+            assert_eq!(str_field(&out, "baseline_report"), "", "{cmd}: {out}");
+            assert!(
+                str_field(&out, "tests_output").starts_with("Ran: "),
+                "{out}"
+            );
+        } else {
+            assert!(out.get("baseline_report").is_none(), "{cmd}: {out}");
+        }
+    }
+}
+
+/// A crash of baseline_tests is not a verify gate crash: with a red test run
+/// fix_loop_gate still spends a fix attempt, and with both gates green it
+/// takes the same "no error recorded" retry it takes without any error.
+#[test]
+fn fix_loop_gate_does_not_treat_a_baseline_tests_crash_as_a_gate_crash() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("fix-baseline-crash");
+    let mut state = serde_json::json!({
+        "fix_attempts": 0,
+        "max_fix_attempts": 5,
+        "build_ok": true,
+        "tests_ok": false,
+        "tests_output": "Exit code: 1",
+        "gate_retries": 0,
+        "last_script_error": "script 'baseline_tests' failed: boom",
+    });
+    let out = run_script("coder/scripts/fix_loop_gate.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    assert_eq!(out["fix_attempts"], Value::from(1), "{out}");
+    assert_eq!(str_field(&out, "gate_error"), "", "{out}");
+    assert_eq!(out["gate_retries"], Value::from(0), "{out}");
+
+    state["tests_ok"] = Value::Bool(true);
+    let out = run_script("coder/scripts/fix_loop_gate.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "verify_build", "{out}");
+    assert_eq!(
+        str_field(&out, "gate_error"),
+        "no error recorded in state",
+        "{out}"
+    );
+    assert_eq!(out["gate_retries"], Value::from(1), "{out}");
+}
+
+/// Cargo ids carry their target (backslashes as `/`), jest ids their file,
+/// a jest or vitest file that failed without a failing test of its own is
+/// recorded by name, and pytest ids keep their spaces up to the ` - `
+/// message.
+#[test]
+fn baseline_tests_qualifies_ids_by_target_and_file() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("baseline-qualified");
+    project(&dir.0, "here");
+    let jest = "\u{25cf}";
+    let sep = "\u{203a}";
+    let cases: Vec<(&str, String, Vec<&str>)> = vec![
+        (
+            "cargo",
+            "Running unittests src/lib.rs (target/debug/deps/x-1)\n\
+             test a::bad ... FAILED\n\
+             test result: FAILED. 0 passed; 1 failed; 0 ignored\n\
+             Running tests\\foo.rs (target\\debug\\deps\\foo-2)\n\
+             test bad ... FAILED\n\
+             test result: FAILED. 0 passed; 1 failed; 0 ignored\n\
+             Doc-tests x\n\
+             test src/lib.rs - f (line 3) ... FAILED\n\
+             test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+                .to_string(),
+            vec![
+                "Doc-tests x::src/lib.rs - f (line 3)",
+                "tests/foo.rs::bad",
+                "unittests src/lib.rs::a::bad",
+            ],
+        ),
+        (
+            "jest",
+            format!(
+                " FAIL  src/a.test.js (5.2 s)\n\
+                 \x20 {jest} suite {sep} breaks\n\
+                 \x20FAIL  src/b.test.js\n\
+                 \x20 {jest} Test suite failed to run\n\
+                 Test Suites: 2 failed, 2 total\n\
+                 Tests:       1 failed, 1 total\n"
+            ),
+            vec!["src/a.test.js > suite \u{203a} breaks", "src/b.test.js"],
+        ),
+        (
+            "vitest",
+            " FAIL  src/a.test.ts > m > adds\n\
+             \x20FAIL  src/a.test.ts [ src/a.test.ts ]\n\
+             \x20FAIL  src/c.test.ts [ src/c.test.ts ]\n\
+             \x20Test Files  2 failed | 1 passed (3)\n\
+             \x20     Tests  1 failed | 4 passed (5)\n"
+                .to_string(),
+            vec!["src/a.test.ts > m > adds", "src/c.test.ts"],
+        ),
+        (
+            "pytest",
+            "FAILED tests/t.py::test_x[a b] - assert 1 == 2\n\
+             FAILED tests/t.py::test_z[x y]\n\
+             ==== 2 failed in 0.10s ====\n"
+                .to_string(),
+            vec!["tests/t.py::test_x[a b]", "tests/t.py::test_z[x y]"],
+        ),
+    ];
+    for (runner, transcript, expected) in &cases {
+        let out = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), transcript, 1);
+        assert_eq!(str_field(&out, "baseline_status"), "red", "{runner}: {out}");
+        assert_eq!(&baseline_ids(&out), expected, "{runner}: {out}");
+    }
+}
+
+/// A cargo test target killed by a signal (its remaining tests never ran).
+const SIGNAL_CRASH: &str = "Running tests/foo.rs (target/debug/deps/foo-1)\n\
+     test a ... FAILED\n\
+     error: test failed, to rerun pass `--test foo`\n\
+     \n\
+     Caused by:\n\
+     \x20 process didn't exit successfully: `/x/foo-1` (signal: 6, SIGABRT: process abort signal)\n";
+
+/// Failures are unidentified, with the reason in the note, when no id was
+/// read, when the runner's own failure total exceeds the ids read, and
+/// when a test target was killed by a signal. Only the hash is kept.
+#[test]
+fn baseline_tests_records_why_failures_are_unidentified() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("baseline-unidentified");
+    project(&dir.0, "here");
+    let short = "the runner reported 2 failures but only 1 ids were parsed";
+    let cases: [(&str, &str, &str); 9] = [
+        ("none", "boom error\n", "no test ids could be parsed"),
+        (
+            "pytest",
+            "FAILED tests/t.py::a - x\n==== 2 failed in 0.10s ====\n",
+            short,
+        ),
+        (
+            "cargo",
+            "test a ... FAILED\n\
+             test result: FAILED. 0 passed; 1 failed;\n\
+             test result: FAILED. 0 passed; 1 failed;\n",
+            short,
+        ),
+        (
+            "jest",
+            " FAIL  src/a.test.js\n  \u{25cf} a\nTests:       2 failed, 2 total\n",
+            short,
+        ),
+        (
+            "jest suites",
+            " FAIL  src/a.test.js\n  \u{25cf} a\nTest Suites: 2 failed, 2 total\n",
+            short,
+        ),
+        (
+            "vitest",
+            " FAIL  src/a.test.ts > m > adds\n      Tests  2 failed | 1 passed (3)\n",
+            short,
+        ),
+        (
+            "vitest files",
+            " FAIL  src/a.test.ts > m > adds\n Test Files  2 failed | 1 passed (3)\n",
+            short,
+        ),
+        (
+            "unittest",
+            "FAIL: test_a (tests.T)\nFAILED (failures=2)\n",
+            short,
+        ),
+        (
+            "signal",
+            SIGNAL_CRASH,
+            "a test target was killed by a signal",
+        ),
+    ];
+    for (runner, transcript, reason) in cases {
+        let out = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), transcript, 1);
+        assert_eq!(str_field(&out, "baseline_status"), "red", "{runner}: {out}");
+        assert!(baseline_ids(&out).is_empty(), "{runner}: {out}");
+        assert!(
+            !str_field(&out, "baseline_failure_hash").is_empty(),
+            "{runner}: {out}"
+        );
+        assert!(
+            str_field(&out, "baseline_note")
+                .contains(&format!("could not be identified ({reason})")),
+            "{runner}: {out}"
+        );
+    }
+}
+
+/// A run in which a test target was killed by a signal never passes, even
+/// when every failure it printed was in the baseline. Without a baseline it
+/// fails on its exit code alone, with no sentence about the baseline.
+#[test]
+fn verify_tests_never_passes_a_test_target_killed_by_a_signal() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-signal");
+    project(&dir.0, "here");
+    let state = red_baseline(&dir.0, &["tests/foo.rs::a"], 101, "");
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, SIGNAL_CRASH, 101);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{out}");
+    assert!(
+        str_field(&out, "tests_output").contains("\nA test target was killed by a signal"),
+        "{out}"
+    );
+    let out = run_transcript(
+        VERIFY_TESTS,
+        &dir.0,
+        &project_state(&dir.0),
+        SIGNAL_CRASH,
+        101,
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert!(
+        !str_field(&out, "tests_output").contains("A test target was killed by a signal"),
+        "{out}"
+    );
+}
+
+/// Both gates run every `cargo test` and `cargo t` with --no-fail-fast
+/// before any `--`, so later targets still run after one fails; the `Ran:`
+/// line and the transcript show the command as run, and a command that has
+/// the flag already, or another subcommand such as `testx`, is unchanged.
+#[test]
+fn test_gates_run_cargo_test_with_no_fail_fast() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("no-fail-fast");
+    project(&dir.0, "here");
+    let fake = "cargo() { printf 'test %s ... FAILED\\n' \"$*\"; return 101; }; ";
+    let cases: [(&str, &str, &[&str]); 6] = [
+        (
+            "cargo test -p a -- --nocapture",
+            "cargo test --no-fail-fast -p a -- --nocapture",
+            &["test --no-fail-fast -p a -- --nocapture"],
+        ),
+        (
+            "cargo +nightly test",
+            "cargo +nightly test --no-fail-fast",
+            &["+nightly test --no-fail-fast"],
+        ),
+        (
+            "cargo test --no-fail-fast",
+            "cargo test --no-fail-fast",
+            &["test --no-fail-fast"],
+        ),
+        ("cargo t", "cargo t --no-fail-fast", &["t --no-fail-fast"]),
+        ("cargo testx", "cargo testx", &["testx"]),
+        (
+            "cargo test -p a; cargo test -p b",
+            "cargo test --no-fail-fast -p a; cargo test --no-fail-fast -p b",
+            &["test --no-fail-fast -p a", "test --no-fail-fast -p b"],
+        ),
+    ];
+    for (cmd, ran, ids) in cases {
+        let full = format!("{fake}{cmd}");
+        let envs = [("TEST_CMD", full.as_str())];
+        let out = run_script(BASELINE, &dir.0, &project_state(&dir.0), &envs);
+        assert_eq!(baseline_ids(&out), ids, "{cmd}: {out}");
+        let out = run_script(VERIFY_TESTS, &dir.0, &project_state(&dir.0), &envs);
+        let output = str_field(&out, "tests_output");
+        assert!(
+            output.starts_with(&format!("Ran: {fake}{ran}\n")),
+            "{cmd}: {out}"
+        );
+        for id in ids {
+            let line = format!("test {id} ... FAILED");
+            assert!(output.lines().any(|l| l == line), "{cmd}: {out}");
+        }
+    }
+}
+
+/// A cargo test target that failed under fail-fast: cargo printed its rerun
+/// hint and stopped, so later targets never ran.
+const CARGO_FAIL_FAST: &str = "     Running tests/a.rs (target/debug/deps/a-123)\n\
+     test a1 ... FAILED\n\
+     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+     error: test failed, to rerun pass `--test a`\n";
+
+/// A wrapper that runs fail-fast cargo hides it from the --no-fail-fast
+/// rewrite, so a transcript showing cargo stopped at its first failing
+/// target is unidentified in both gates. With the closing `1 target failed:`
+/// summary that --no-fail-fast prints, the same failure is identified.
+#[test]
+fn test_gates_treat_cargo_stopped_at_the_first_failing_target_as_unidentified() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("cargo-fail-fast");
+    project(&dir.0, "here");
+    let out = run_transcript(
+        BASELINE,
+        &dir.0,
+        &project_state(&dir.0),
+        CARGO_FAIL_FAST,
+        101,
+    );
+    assert_eq!(str_field(&out, "baseline_status"), "red", "{out}");
+    assert!(baseline_ids(&out).is_empty(), "{out}");
+    assert!(
+        str_field(&out, "baseline_note")
+            .contains("could not be identified (cargo stopped at the first failing target)"),
+        "{out}"
+    );
+
+    let no_fail_fast = format!("{CARGO_FAIL_FAST}error: 1 target failed:\n    `--test a`\n");
+    let out = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), &no_fail_fast, 101);
+    assert_eq!(baseline_ids(&out), ["tests/a.rs::a1"], "{out}");
+
+    let state = red_baseline(&dir.0, &["tests/a.rs::a1"], 101, "");
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, CARGO_FAIL_FAST, 101);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert!(
+        str_field(&out, "tests_output").contains("cargo stopped at the first failing target"),
+        "{out}"
+    );
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &no_fail_fast, 101);
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+}
+
+/// With no test command neither gate runs anything: baseline_tests records
+/// no baseline, and verify_tests emits only its GATE NOT RUN verdict, with
+/// no baseline report.
+#[test]
+fn test_gates_without_a_test_command_run_nothing() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("no-test-command");
+    project(&dir.0, "here");
+    let out = run_script(BASELINE, &dir.0, &project_state(&dir.0), &[]);
+    assert_baseline_shape(&out);
+    assert_eq!(str_field(&out, "baseline_status"), "none", "{out}");
+    assert!(baseline_ids(&out).is_empty(), "{out}");
+    assert_eq!(str_field(&out, "baseline_failure_hash"), "", "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_note"),
+        "No test command was configured or detected, so no baseline was recorded.",
+        "{out}"
+    );
+
+    let out = run_script(VERIFY_TESTS, &dir.0, &project_state(&dir.0), &[]);
+    let mut keys: Vec<&str> = out
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["_next", "tests_ok", "tests_output"], "{out}");
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(str_field(&out, "_next"), "self_review", "{out}");
+    assert!(
+        str_field(&out, "tests_output")
+            .starts_with("(GATE NOT RUN: no test command configured or detected."),
+        "{out}"
+    );
+}
+
+/// A cargo baseline failure that a red run shows passing in the same target
+/// is reported fixed under its target-qualified id.
+#[test]
+fn verify_tests_reports_a_target_qualified_cargo_failure_as_fixed() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-cargo-fixed");
+    project(&dir.0, "here");
+    let state = red_baseline(&dir.0, &["tests/foo.rs::a", "tests/foo.rs::b"], 101, "");
+    let transcript = "     Running tests/foo.rs (target/debug/deps/foo-1)\n\
+         test a ... FAILED\n\
+         test b ... ok\n\
+         test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\
+         error: test failed, to rerun pass `--test foo`\n\
+         error: 1 target failed:\n\
+         \x20   `--test foo`\n";
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, transcript, 101);
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        "\nPre-existing failures: tests/foo.rs::a\nFixed pre-existing failures: tests/foo.rs::b",
+        "{out}"
+    );
+}
+
+/// Output without a failure line hashes to nothing, and nothing matches
+/// nothing: two unrelated failing runs are not the same failure.
+#[test]
+fn verify_tests_never_matches_an_empty_failure_hash() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-empty-hash");
+    project(&dir.0, "here");
+    let base = run_script(
+        BASELINE,
+        &dir.0,
+        &project_state(&dir.0),
+        &[("TEST_CMD", "echo boom; exit 1")],
+    );
+    assert_eq!(str_field(&base, "baseline_failure_hash"), "", "{base}");
+    let state = red_baseline(&dir.0, &[], 1, "");
+    let out = run_script(
+        VERIFY_TESTS,
+        &dir.0,
+        &state,
+        &[("TEST_CMD", "echo other; exit 1")],
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{out}");
+}
+
+/// A baseline whose failures could not be identified never passes a run
+/// whose failures can: it can only match by hash.
+#[test]
+fn verify_tests_fails_an_identified_run_against_an_unidentified_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-unknown-base");
+    project(&dir.0, "here");
+    let a = "tests/test_a.py::test_one";
+    let transcript = pytest_failing(&[a]);
+    let base = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), &transcript, 1);
+    let hash = str_field(&base, "baseline_failure_hash");
+    assert!(!hash.is_empty(), "{base}");
+    // Same exit code and same hash: only the identified ids can fail it.
+    let state = red_baseline(&dir.0, &[], 1, hash);
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &transcript, 1);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    let output = str_field(&out, "tests_output");
+    assert!(
+        output.contains(&format!(
+            "\nFailing tests (the baseline's failures could not be identified, so none can be compared): {a}\n"
+        )),
+        "{out}"
+    );
+    assert!(!output.contains("New failures:"), "{out}");
 }

@@ -138,7 +138,7 @@ fn coder_prompt_pins_structure_rule() {
             "  design_notes: ''",
             "  design_trail: ''",
             "        design_notes:\n          type: string\n          description: \"Patterns the diff introduces that the repo did not already use, one per line: pattern, files, call sites touched, reconciled against the implementer's `Design:` heading. Empty when none: an empty string, never null.\"\n      required: [review_clean, review_notes, design_notes]",
-            "      Tests: passed\n      Design: {{design_notes}}",
+            "      Tests: passed{{baseline_report}}\n      Design: {{design_notes}}",
         ],
     );
     assert_anchors(
