@@ -1602,10 +1602,10 @@ fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> Notic
     ) {
         text = text.frame("reason: \"").peer(reason.text).frame("\"; ");
     }
-    text.frame(format!(
-        "grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}",
-        id = request.id,
-    ))
+    text.frame("grant: .mesh grant ")
+        .peer(request.id.as_str())
+        .frame(" [--standing] | refuse: .mesh refuse ")
+        .peer(request.id.as_str())
 }
 
 #[cfg(test)]
@@ -1636,6 +1636,23 @@ mod peer_text_prefix_tests {
         assert_eq!(
             rendered.render_notification_lines(CommandPrefix::Dot),
             rendered.lines()
+        );
+    }
+
+    #[test]
+    fn a_peer_chosen_id_keeps_its_dot_in_the_grant_and_refuse_hints() {
+        let request = ValidAccess {
+            id: ".session".to_string(),
+            paths: vec!["docs/a.md".to_string()],
+            reason: String::new(),
+        };
+        let rendered = Notification::new(Source::Access, access_text("Bea", &request, None)).render();
+        let lines = rendered.render_notification_lines(CommandPrefix::Slash);
+        assert!(
+            lines.last().is_some_and(|line| line.ends_with(
+                "grant: /mesh grant .session [--standing] | refuse: /mesh refuse .session"
+            )),
+            "{lines:?}"
         );
     }
 }
@@ -2035,6 +2052,20 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ");
             assert_paths_kept_and_hints_slashed(&bodies);
+        }
+
+        #[test]
+        fn an_expired_rows_peer_chosen_id_keeps_its_dot() {
+            let fixture = bare_slot("access-prefix-expired-id");
+            fixture.slot.announce_expired([question_record(".session")]);
+            let note = fixture.idle.0.lock().pop().expect("one expiry line");
+            assert_eq!(
+                note.text.render(CommandPrefix::Slash),
+                format!(
+                    "question .session from {} expired unanswered",
+                    short(&destination())
+                )
+            );
         }
     }
 

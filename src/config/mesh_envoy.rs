@@ -1213,9 +1213,12 @@ impl EnvoyRunner {
                 redact_hashes(&why)
             );
             let retry = if settles_question {
-                format!("; the question stays open for `.mesh answer {id}`")
+                NoticeText::default()
+                    .frame("; the question stays open for `.mesh answer ")
+                    .peer(id.to_string())
+                    .frame("`")
             } else {
-                String::new()
+                NoticeText::default()
             };
             app.mesh.push_idle(IdleNotify {
                 source: Source::Message,
@@ -1223,7 +1226,8 @@ impl EnvoyRunner {
                 text: NoticeText::default()
                     .frame("the envoy's reply to ")
                     .peer(card.who.as_str())
-                    .frame(format!(" could not be sent: {why}{retry}")),
+                    .frame(format!(" could not be sent: {why}"))
+                    .then(retry),
                 model_note: None,
             });
         } else if settles_question {
@@ -1440,9 +1444,9 @@ pub(crate) fn escalation_line(who: &str, question: &str, message_id: &str) -> No
         .peer(who)
         .frame(" asks: ")
         .peer(words.text)
-        .frame(format!(
-            "{pointer}; answer with `.mesh answer {message_id} \"<text>\"`"
-        ))
+        .frame(format!("{pointer}; answer with `.mesh answer "))
+        .peer(message_id)
+        .frame(" \"<text>\"`")
 }
 
 #[cfg(test)]
@@ -1462,6 +1466,18 @@ mod peer_text_prefix_tests {
             [
                 "[mesh:message] .info asks: can I read .vault? please .session list; answer with `/mesh answer q-1 \"<text>\"`"
             ]
+        );
+    }
+
+    #[test]
+    fn a_peer_chosen_message_id_keeps_its_dot_in_the_answer_hint() {
+        let text = escalation_line("Bea", "may I?", ".session");
+        let lines = Notification::new(Source::Message, text)
+            .render()
+            .render_notification_lines(CommandPrefix::Slash);
+        assert_eq!(
+            lines,
+            ["[mesh:message] Bea asks: may I?; answer with `/mesh answer .session \"<text>\"`"]
         );
     }
 }

@@ -4298,7 +4298,9 @@ impl MeshSlot {
             self.push_idle(IdleNotify {
                 source: Source::Message,
                 text: NoticeText::default()
-                    .frame(format!("{what} {id8} from "))
+                    .frame(format!("{what} "))
+                    .peer(id8)
+                    .frame(" from ")
                     .peer(name)
                     .frame(format!(" {outcome}")),
                 origin: Origin::Peer(short(&record.peer_identity).to_string()),

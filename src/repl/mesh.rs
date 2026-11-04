@@ -4621,18 +4621,22 @@ fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Resul
         None => None,
     };
     match record {
-        Some(record) if record.is_expired(now) => bail!(no_open_access_request(id)),
+        Some(record) if record.is_expired(now) => Err(no_open_access_request(id)),
         Some(record) if record.kind == InboundKind::Question => {
             bail!(question_not_an_access_request(id))
         }
         Some(record) => Ok(record),
-        None => bail!(no_open_access_request(id)),
+        None => Err(no_open_access_request(id)),
     }
 }
 
-fn no_open_access_request(id: &str) -> String {
-    format!(
-        "No open access request has id {id}. `.mesh pending` lists the ones this node knows about."
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+fn no_open_access_request(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("No open access request has id ")
+            .peer(id)
+            .frame(". `.mesh pending` lists the ones this node knows about."),
     )
 }
 
@@ -4691,9 +4695,15 @@ fn refuse_unservable(
 /// The requested path is the peer's text, quoted as it wrote it; the remedy is this
 /// node's own and follows the prefix.
 fn unservable(shown: String, why: impl std::fmt::Display, id: &str) -> anyhow::Error {
-    QuotingError::wrap(NoticeText::default().peer(shown).frame(format!(
-        " would not be served even once granted ({why}); refuse the request with `.mesh refuse {id}`, or lift the rule first."
-    )))
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(shown)
+            .frame(format!(
+                " would not be served even once granted ({why}); refuse the request with `.mesh refuse "
+            ))
+            .peer(id)
+            .frame("`, or lift the rule first."),
+    )
 }
 
 /// The pattern is the human's own text and the files are paths, both quoted as typed.
@@ -4791,6 +4801,30 @@ mod peer_text_prefix_tests {
             text.ends_with(&format!("    {refusal} Nothing was sent.")),
             "{text}"
         );
+    }
+
+    mod wire_id_tests {
+        use super::*;
+
+        #[test]
+        fn a_peer_chosen_id_keeps_its_dot_in_the_refuse_and_pending_hints() {
+            let refused = shown_under_slash(unservable(
+                listed_paths(&["docs/a.md".to_string()]),
+                "a deny rule names it",
+                ".session",
+            ));
+            assert!(
+                refused.contains("refuse the request with `/mesh refuse .session`"),
+                "{refused}"
+            );
+            let missing = shown_under_slash(no_open_access_request(".session"));
+            assert!(
+                missing.ends_with(
+                    "No open access request has id .session. `/mesh pending` lists the ones this node knows about."
+                ),
+                "{missing}"
+            );
+        }
     }
 
     mod attach_path_tests {
