@@ -178,6 +178,31 @@ pub(crate) struct Applied {
     pub changed: bool,
 }
 
+/// A share-list write refused over text a share file or the human wrote, kept apart from
+/// the sentence around it so a caller can quote that text as it stands.
+#[derive(Debug)]
+pub(crate) enum ShareWriteError {
+    /// The list was refused at load, or the target file when read again under the lock.
+    Refused(String),
+    /// The target file, read again under the lock, holds no entry with the pattern.
+    NoSuchPattern { file: PathBuf, pattern: String },
+}
+
+impl std::fmt::Display for ShareWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => write!(f, "{refusal} Nothing was written."),
+            Self::NoSuchPattern { file, pattern } => write!(
+                f,
+                "No share entry in '{}' has the pattern `{pattern}`; nothing was changed.",
+                file.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShareWriteError {}
+
 /// Both hashes canonical lowercase 32-hex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PeerRef<'a> {
@@ -821,7 +846,7 @@ impl ShareSet {
     /// file that is refused when read again is left alone, with its refusal.
     pub(crate) fn apply(&mut self, mutation: Mutation, scope: WriteScope) -> Result<Applied> {
         if let Some(refusal) = &self.poisoned {
-            bail!("{refusal} Nothing was written.");
+            return Err(ShareWriteError::Refused(refusal.clone()).into());
         }
         let layer = self.write_target(scope);
         let (path, file) = match layer {
@@ -833,12 +858,8 @@ impl ShareSet {
             "mesh share list",
             EXCLUSIVE_LOCK_WAIT,
         )?;
-        let on_disk = read_shares_file(path).map_err(|err| {
-            anyhow!(
-                "{} Nothing was written.",
-                redact_hashes(&format!("{err:#}"))
-            )
-        })?;
+        let on_disk = read_shares_file(path)
+            .map_err(|err| ShareWriteError::Refused(redact_hashes(&format!("{err:#}"))))?;
         let existed = on_disk.is_some();
         let mut next = on_disk.unwrap_or_default();
         let changed = mutate(&mut next, path, &mutation)?;
@@ -1704,10 +1725,11 @@ fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<boo
             file.deny.retain(|entry| entry.pattern != *pattern);
             file.overrides.retain(|entry| entry.path != *pattern);
             if (file.allow.len(), file.deny.len(), file.overrides.len()) == before {
-                bail!(
-                    "No share entry in '{}' has the pattern `{pattern}`; nothing was changed.",
-                    path.display()
-                );
+                return Err(ShareWriteError::NoSuchPattern {
+                    file: path.to_path_buf(),
+                    pattern: pattern.clone(),
+                }
+                .into());
             }
             Ok(true)
         }

@@ -33,9 +33,9 @@ use crate::mesh::pending::{
 };
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
-    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
-    WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
-    validate_override, validate_pattern,
+    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, ShareWriteError,
+    Verdict as ShareVerdict, WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer,
+    protected_segment, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule, ServedBy,
@@ -4093,7 +4093,8 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 peer,
             },
             target.write_scope(),
-        )?
+        )
+        .map_err(quoted_share_write)?
         .changed;
     if force {
         changed |= set
@@ -4102,7 +4103,8 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     path: pattern.clone(),
                 },
                 target.write_scope(),
-            )?
+            )
+            .map_err(quoted_share_write)?
             .changed;
     }
     if !changed {
@@ -4203,12 +4205,14 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         set = loaded_for_writing(ctx)?.1;
     }
-    let applied = set.apply(
-        Mutation::Deny {
-            pattern: pattern.clone(),
-        },
-        target.write_scope(),
-    )?;
+    let applied = set
+        .apply(
+            Mutation::Deny {
+                pattern: pattern.clone(),
+            },
+            target.write_scope(),
+        )
+        .map_err(quoted_share_write)?;
     if applied.changed {
         out_path_text(&format!(
             "Denied `{pattern}` to every peer; written to {}.",
@@ -4379,7 +4383,8 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 pattern: pattern.clone(),
             },
             scope,
-        )?;
+        )
+        .map_err(quoted_share_write)?;
         out_path_text(&format!(
             "Removed the {} for `{pattern}` from {}.",
             kind_list(held),
@@ -4734,6 +4739,35 @@ mod peer_text_prefix_tests {
         );
     }
 
+    mod share_write_tests {
+        use super::*;
+
+        #[test]
+        fn a_refused_write_quotes_the_share_file_and_the_pattern_as_they_stand() {
+            let refused = shown_under_slash(quoted_share_write(
+                ShareWriteError::Refused("`.vault` is not a pattern; run .mesh shares".into())
+                    .into(),
+            ));
+            assert!(
+                refused.ends_with("    `.vault` is not a pattern; run .mesh shares Nothing was written."),
+                "{refused}"
+            );
+            let missing = shown_under_slash(quoted_share_write(
+                ShareWriteError::NoSuchPattern {
+                    file: PathBuf::from(".coyote/shares.yaml"),
+                    pattern: ".vault".into(),
+                }
+                .into(),
+            ));
+            assert!(
+                missing.ends_with(
+                    "No share entry in '.coyote/shares.yaml' has the pattern `.vault`; nothing was changed."
+                ),
+                "{missing}"
+            );
+        }
+    }
+
     mod held_elsewhere_tests {
         use super::*;
 
@@ -4964,6 +4998,25 @@ fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
             .peer(shown_refusal(refusal))
             .frame(tail),
     )
+}
+
+/// A refused share-list write with the share file's words and the human's pattern quoted
+/// as they stand; any other error is passed on unchanged.
+fn quoted_share_write(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<ShareWriteError>() {
+        Ok(ShareWriteError::Refused(refusal)) => {
+            refused_at_load(&refusal, " Nothing was written.")
+        }
+        Ok(ShareWriteError::NoSuchPattern { file, pattern }) => QuotingError::wrap(
+            NoticeText::default()
+                .frame("No share entry in '")
+                .peer(file.display().to_string())
+                .frame("' has the pattern `")
+                .peer(pattern)
+                .frame("`; nothing was changed."),
+        ),
+        Err(err) => err,
+    }
 }
 
 struct ShareArgs {
