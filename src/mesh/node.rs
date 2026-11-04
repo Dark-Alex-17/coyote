@@ -11932,6 +11932,44 @@ mod tests {
             pair.stop().await;
         }
 
+        /// The grant B's start seeds for its own identity covers every destination, but
+        /// only of B's own identity, so it is no reason to ask for a foreign one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_under_only_the_own_identitys_grant_is_refused_without_asking() {
+            let pair = LateJoiner::start("first-contact-own-grant").await;
+            let own = pair
+                .b
+                .runtime
+                .transport_identity
+                .address_hash()
+                .to_hex_string();
+            let records = pair.b.runtime.trust().records();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| (record.hash.as_str(), record.all_destinations))
+                    .collect::<Vec<_>>(),
+                vec![(own.as_str(), true)],
+                "B's trust list holds only its own seeded grant"
+            );
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+
+            let asked = Instant::now();
+            let outcome = pair.b.runtime.send_peer(&pair.to_a, &message).await;
+            assert!(
+                matches!(outcome, Err(SendError::NotTrusted { .. })),
+                "{outcome:?}"
+            );
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
+            pair.assert_b_lacks_a().await;
+            pair.stop().await;
+        }
+
         /// A row swept after `PEER_TTL` leaves the transport's path standing. Asking for
         /// the destination still sends a path request, and A's answer files the row
         /// again; the held path alone would file nothing.

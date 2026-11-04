@@ -10035,6 +10035,45 @@ mod tests {
                 relay.stop().await;
             }
 
+            /// B's start seeds a grant of every destination to its own identity; that
+            /// grant cannot cover A, so every tool is refused at once and nothing is asked.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn the_own_identitys_grant_alone_sends_no_path_request_for_a_live_unheard_instance()
+             {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-own-grant");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-own-grant").await;
+                let to_a = a.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let own = current_identity(&mesh_paths(&b.tmp).identity_path)
+                    .unwrap()
+                    .address_hash()
+                    .to_hex_string();
+                assert_eq!(
+                    b.runtime
+                        .trust()
+                        .records()
+                        .iter()
+                        .map(|record| (record.hash.clone(), record.all_destinations))
+                        .collect::<Vec<_>>(),
+                    vec![(own, true)],
+                    "B's trust list holds only its own seeded grant"
+                );
+
+                let announces = b.announces().await;
+                refused_at_once(&mut ctx, &to_a, "own grant only").await;
+                assert_a_was_never_asked_for(&b, announces, &to_a).await;
+                assert_eq!(slot_a.peer_inbox().len(), 0, "nothing reached A");
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
+
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
             #[serial]
             async fn an_unheard_destination_no_grant_could_allow_is_refused_before_any_path_request()

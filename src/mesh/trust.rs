@@ -835,6 +835,10 @@ struct State {
     last_reload_failure: Option<String>,
     session_identities: BTreeMap<String, IdentityEntry>,
     session_destinations: BTreeMap<String, DestinationEntry>,
+    /// This node's own identity, as last passed to `seed_self_trust`. Its grant covers
+    /// only the node's own instances, so it is no reason to ask the network for a
+    /// destination nothing has announced.
+    own_identity: Option<String>,
     seen: BTreeMap<String, SystemTime>,
     /// Per instance the presence rung has refused someone for, its memo, with insertion
     /// order for eviction; and `(name hash, holder)` for every presence collision whose
@@ -1414,8 +1418,9 @@ impl TrustStore {
     /// Whether a tool may ask the network for a destination it has not heard, before its
     /// identity is known: never for a denied destination, nor for one whose trust record
     /// is bound to a blocked identity. Otherwise a trust record for the destination
-    /// suffices, and with none, any identity trusted for all destinations might own it.
-    /// The answer's identity still goes through `authorize`.
+    /// suffices, and with none, any identity trusted for all destinations might own it,
+    /// save this node's own: its seeded grant would otherwise make every node ask for
+    /// every destination. The answer's identity still goes through `authorize`.
     pub(crate) fn may_be_asked_for(&self, destination_hash: &str) -> bool {
         self.loaded()
             .may_be_asked_for(&destination_hash.to_ascii_lowercase())
@@ -2148,6 +2153,7 @@ impl TrustStore {
     ) -> Result<bool> {
         let identity = valid_hash("identity", identity_hash)?;
         let mut state = self.writing()?;
+        state.own_identity = Some(identity.clone());
         if state.file.self_trust_seeded && !minted {
             return Ok(false);
         }
@@ -2846,6 +2852,14 @@ impl State {
         })
     }
 
+    fn any_other_identity_trusted_for_all(&self) -> bool {
+        self.file.identities.iter().any(|(identity, entry)| {
+            entry.all_destinations
+                && !self.file.blocked_identities.contains_key(identity)
+                && self.own_identity.as_ref() != Some(identity)
+        })
+    }
+
     /// `destination` is canonical lower hex; see `TrustStore::may_be_asked_for`.
     fn may_be_asked_for(&self, destination: &str) -> bool {
         if self.file.denied_destinations.contains_key(destination) {
@@ -2858,7 +2872,7 @@ impl State {
             .or_else(|| self.session_destinations.get(destination));
         match bound {
             Some(entry) => self.authorize(&entry.identity, destination).decision == Decision::Allow,
-            None => self.any_trusted_for_all(),
+            None => self.any_other_identity_trusted_for_all(),
         }
     }
 
@@ -5634,6 +5648,22 @@ mod tests {
             fx.trust_identity(&fake_hash(0x82), t(2_000));
 
             assert!(fx.store.may_be_asked_for(&unrecorded));
+        }
+
+        #[test]
+        fn the_own_identitys_grant_alone_is_no_reason_to_ask_for_an_unrecorded_destination() {
+            let fx = Fixture::new("trust-ask-own-identity");
+            let (own, unrecorded) = (fake_hash(0x83), fake_hash(0x84));
+            assert!(fx.store.seed_self_trust(&own, true, t(2_000)).unwrap());
+
+            assert!(!fx.store.may_be_asked_for(&unrecorded));
+
+            fx.trust_identity(&fake_hash(0x85), t(3_000));
+
+            assert!(
+                fx.store.may_be_asked_for(&unrecorded),
+                "a foreign identity trusted for all may own the destination"
+            );
         }
 
         /// An identity listed as trusted for all destinations but also blocked, which
