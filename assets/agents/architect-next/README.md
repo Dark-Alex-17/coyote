@@ -336,6 +336,33 @@ get started") after a conversation that discussed work to RUN, where the seed pi
 drafted brief takes over. `sisyphus-next` needs no equivalent: its `intake` takes the brief
 from the message itself and has no design-doc stop.
 
+Design questions: the design escalations `design_round` (the open questions of a design
+frontier round), `quality_bar` (rigor and surfaces), `checklist_accept` (accept or drop each
+best-practice checklist item) and `leak_question` (each Gate 1 question the code and docs
+cannot answer) are asked one question per multiple-choice prompt. The prompt body lists each
+option's text and evidence under a static label, `Option 1 (recommended)` through `Option 4`,
+the recommended option always first, and the engine adds its own `Other (custom)` choice. A
+question without 2-4 options and exactly one recommended gets one re-frame through
+`frame_questions`; a scope-changing question that still is not askable ends the run blocked,
+and any other one is carried (a design question as a plan Open question, a Gate 1 question as
+an open `Gate 1 leak:` amendment line for the next gatekeeper pass). A reply that names an
+option is recorded as that option; typed text goes to the `classify_reply` llm node, which
+decides whether it answers the question (recorded as given) or opens a discussion (unclear
+counts as a discussion). A discussion parks the run: `choice_park` keeps the queue and the
+answers so far, snapshots state.json, sets the exposed `discussion` state key (the question,
+its options with the recommended one marked, the reply, the answers so far and the plan path)
+for the engineer chat lane, carries `discussion_run_id` into the next run, and ends at
+`end_discussion` with an `ARCHITECT_AWAITING_DISCUSSION` message. The next message
+`continue` asks the parked question again, and `continue: <answer>` records that answer and
+goes on to the remaining questions; any other message starts a fresh run and leaves the
+parked one. A question parks at most `DISCUSSION_PARKS_MAX` (3) times; after that it is asked
+again with a note, and its next typed reply is recorded as the answer without the
+classifier. These kinds stay free text, because their answer is not a pick from a list:
+`need_design_doc` (a design doc path), `clarify` (a corrected design doc path),
+`gate1_stuck` (the owner's typed answers to the gatekeeper's questions, after "I will
+answer") and the `draft_edit` input node (the changes to make to a drafted brief). Every
+escalation outside the design phase is unchanged.
+
 Two tests are ignored and run with `-- --ignored`: the mode-matrix run and the intake
 sabotage tail (`intake_smoke_rows_go_red_under_the_recorded_sabotages`), which keeps the
 default sabotage pin near two minutes.
