@@ -215,19 +215,23 @@ async fn chat_completions_streaming(
 
     // Converse sends the usage after `messageStop`, so a refusal is returned only once
     // the stream has ended and the billed tokens are on record. A stream that breaks
-    // after the refusal still reports the refusal, the answer the model gave.
-    let mut refusal: Option<ProviderRefusal> = None;
-    let streamed = read_event_stream(res, handler, &mut refusal).await;
-    match refusal {
-        Some(refusal) => Err(refusal.into()),
-        None => streamed,
+    // after the refusal still ends on the refusal, the answer the model gave.
+    let mut refused = false;
+    let streamed = read_event_stream(res, handler, &mut refused).await;
+    if !refused {
+        return streamed;
     }
+    if handler.has_received_visible_output() {
+        debug!("stream ended with a provider refusal after partial output");
+        return Ok(());
+    }
+    Err(ProviderRefusal::default().into())
 }
 
 async fn read_event_stream(
     res: reqwest::Response,
     handler: &mut SseHandler,
-    refusal: &mut Option<ProviderRefusal>,
+    refused: &mut bool,
 ) -> Result<()> {
     let mut function_name = String::new();
     let mut function_arguments = String::new();
@@ -329,10 +333,7 @@ async fn read_event_stream(
                             }
                         }
                         "messageStop" if is_refusal_stop(&data["stopReason"]) => {
-                            *refusal = Some(ProviderRefusal {
-                                partial_output: handler.has_received_visible_output(),
-                                ..ProviderRefusal::default()
-                            });
+                            *refused = true;
                         }
                         _ => {}
                     }
@@ -770,9 +771,10 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         }
     }
 
+    let refusal = is_refusal_stop(&data["stopReason"]).then(ProviderRefusal::default);
     if text.is_empty() && tool_calls.is_empty() {
-        if is_refusal_stop(&data["stopReason"]) {
-            return Err(ProviderRefusal::default().into());
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
         }
         bail!("Invalid response data: {data}");
     }
@@ -782,6 +784,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         tool_calls,
         thinking,
         usage: bedrock_parse_usage(&data["usage"]),
+        refusal,
     };
     Ok(output)
 }
@@ -1624,21 +1627,19 @@ mod refusal_tests {
         }
 
         #[tokio::test]
-        async fn a_refusal_after_streamed_text_is_flagged_partial_and_keeps_the_text() {
+        async fn a_refusal_after_streamed_text_keeps_the_text() {
             let url = serve_events(text_then(Some("content_filtered"))).await;
 
             let (res, handler) = stream_from(url).await;
 
-            let err = res.unwrap_err();
-            let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
-            assert!(refusal.partial_output, "{err:#}");
+            res.unwrap();
             let (text, _, _, _) = handler.take();
             assert_eq!(text, "partial");
         }
 
         #[tokio::test]
-        async fn a_refusal_before_any_text_is_not_flagged_partial() {
-            let url = serve_events(event(
+        async fn a_stream_that_breaks_after_a_refusal_returns_the_refusal() {
+            let url = serve_truncated(event(
                 "messageStop",
                 json!({"stopReason": "content_filtered"}),
             ))
@@ -1647,17 +1648,18 @@ mod refusal_tests {
             let (res, _) = stream_from(url).await;
 
             let err = res.unwrap_err();
-            assert!(!err.downcast_ref::<ProviderRefusal>().unwrap().partial_output);
+            assert!(err.downcast_ref::<ProviderRefusal>().is_some(), "{err:#}");
         }
 
         #[tokio::test]
-        async fn a_stream_that_breaks_after_a_refusal_returns_the_refusal() {
+        async fn a_stream_that_breaks_after_text_and_a_refusal_keeps_the_text() {
             let url = serve_truncated(text_then(Some("content_filtered"))).await;
 
-            let (res, _) = stream_from(url).await;
+            let (res, handler) = stream_from(url).await;
 
-            let err = res.unwrap_err();
-            assert!(err.downcast_ref::<ProviderRefusal>().is_some(), "{err:#}");
+            res.unwrap();
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "partial");
         }
 
         #[tokio::test]
@@ -1668,6 +1670,33 @@ mod refusal_tests {
 
             let err = res.unwrap_err();
             assert!(err.downcast_ref::<ProviderRefusal>().is_none(), "{err:#}");
+        }
+    }
+
+    mod non_stream_refusal_tests {
+        use super::*;
+
+        fn text_reply(stop_reason: &str) -> Value {
+            json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "partial"}]}},
+                "stopReason": stop_reason,
+                "usage": {"inputTokens": 10, "outputTokens": 3, "totalTokens": 13}
+            })
+        }
+
+        #[test]
+        fn a_refusal_after_text_keeps_the_text_and_carries_the_refusal() {
+            let output = extract_chat_completions(&text_reply("content_filtered")).unwrap();
+
+            assert_eq!(output.text, "partial");
+            assert!(output.refusal.is_some());
+        }
+
+        #[test]
+        fn an_ordinary_stop_after_text_carries_no_refusal() {
+            let output = extract_chat_completions(&text_reply("end_turn")).unwrap();
+
+            assert!(output.refusal.is_none());
         }
     }
 }

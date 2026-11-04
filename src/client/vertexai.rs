@@ -250,12 +250,10 @@ pub async fn gemini_chat_completions_streaming(
                 }
             }
             if let Some(category) = gemini_refusal_category(&data) {
-                return Err(ProviderRefusal {
-                    category: Some(category.to_string()),
-                    explanation: None,
-                    partial_output: handler.has_received_visible_output(),
+                if !handler.has_received_visible_output() {
+                    return Err(gemini_refusal(category).into());
                 }
-                .into());
+                debug!("stream ended with a provider refusal after partial output");
             }
             Ok(())
         };
@@ -321,19 +319,17 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     }
 
     let text = text_parts.join("\n\n");
+    let refusal = gemini_refusal_category(data).map(gemini_refusal);
     if text.is_empty() && tool_calls.is_empty() {
-        if let Some(category) = gemini_refusal_category(data) {
-            return Err(ProviderRefusal {
-                category: Some(category.to_string()),
-                ..ProviderRefusal::default()
-            }
-            .into());
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
         }
         bail!("Invalid response data: {data}");
     }
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        refusal,
         ..Default::default()
     };
     Ok(output)
@@ -348,6 +344,13 @@ fn gemini_refusal_category(data: &Value) -> Option<&str> {
             .as_str()
             .filter(|reason| *reason == "SAFETY")
     })
+}
+
+fn gemini_refusal(category: &str) -> ProviderRefusal {
+    ProviderRefusal {
+        category: Some(category.to_string()),
+        explanation: None,
+    }
 }
 
 pub fn gemini_build_chat_completions_body(
@@ -731,26 +734,54 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_streamed_block_before_any_text_is_a_refusal_without_partial_output() {
+        async fn a_streamed_block_before_any_text_is_a_refusal() {
             let (res, _) = stream(json!([{"promptFeedback": {"blockReason": "SAFETY"}}])).await;
 
             let err = res.unwrap_err();
             assert_eq!(refusal_category(&err), Some("SAFETY"));
-            assert!(!err.downcast_ref::<ProviderRefusal>().unwrap().partial_output);
         }
 
         #[tokio::test]
-        async fn a_streamed_safety_stop_after_text_is_flagged_partial_and_keeps_the_text() {
+        async fn a_streamed_safety_stop_after_text_keeps_the_text() {
             let (res, handler) = stream(json!([
                 {"candidates": [{"content": {"parts": [{"text": "partial"}]}}]},
                 {"candidates": [{"finishReason": "SAFETY"}]}
             ]))
             .await;
 
-            let err = res.unwrap_err();
-            assert!(err.downcast_ref::<ProviderRefusal>().unwrap().partial_output);
+            res.unwrap();
             let (text, _, _, _) = handler.take();
             assert_eq!(text, "partial");
+        }
+    }
+
+    mod non_stream_refusal_tests {
+        use super::*;
+
+        #[test]
+        fn a_safety_stop_after_text_keeps_the_text_and_carries_the_refusal() {
+            let data = json!({"candidates": [{
+                "content": {"parts": [{"text": "partial"}]},
+                "finishReason": "SAFETY"
+            }]});
+
+            let output = gemini_extract_chat_completions_text(&data).unwrap();
+
+            assert_eq!(output.text, "partial");
+            let refusal = output.refusal.expect("the refusal rides with the text");
+            assert_eq!(refusal.category.as_deref(), Some("SAFETY"));
+        }
+
+        #[test]
+        fn an_ordinary_stop_after_text_carries_no_refusal() {
+            let data = json!({"candidates": [{
+                "content": {"parts": [{"text": "done"}]},
+                "finishReason": "STOP"
+            }]});
+
+            let output = gemini_extract_chat_completions_text(&data).unwrap();
+
+            assert!(output.refusal.is_none());
         }
     }
 }

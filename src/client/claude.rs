@@ -324,11 +324,13 @@ pub async fn claude_chat_completions_streaming(
                         handler.usage(usage);
                     }
                     if data["delta"]["stop_reason"].as_str() == Some("refusal") {
-                        return Err(ProviderRefusal {
-                            partial_output: handler.has_received_visible_output(),
-                            ..ProviderRefusal::from_stop_details(&data["delta"]["stop_details"])
+                        if !handler.has_received_visible_output() {
+                            return Err(ProviderRefusal::from_stop_details(
+                                &data["delta"]["stop_details"],
+                            )
+                            .into());
                         }
-                        .into());
+                        debug!("stream ended with a provider refusal after partial output");
                     }
                 }
                 _ => {}
@@ -717,9 +719,11 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
             }
         }
     }
+    let refusal = (data["stop_reason"].as_str() == Some("refusal"))
+        .then(|| ProviderRefusal::from_stop_details(&data["stop_details"]));
     if text.is_empty() && tool_calls.is_empty() {
-        if data["stop_reason"].as_str() == Some("refusal") {
-            return Err(ProviderRefusal::from_stop_details(&data["stop_details"]).into());
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
         }
         bail!("Invalid response data: {data}");
     }
@@ -729,6 +733,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         tool_calls,
         thinking,
         usage: claude_parse_usage(&data["usage"]),
+        refusal,
     };
     Ok(output)
 }
@@ -1726,14 +1731,13 @@ mod refusal_tests {
         let err = res.unwrap_err();
         let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
         assert_eq!(refusal.category.as_deref(), Some("cyber"));
-        assert!(!refusal.partial_output);
         assert!(!format!("{err:#}").contains('{'));
         let (_, _, _, usage) = handler.take();
         assert_eq!(usage.unwrap().output_tokens, Some(0));
     }
 
     #[tokio::test]
-    async fn streaming_refusal_after_text_is_flagged_partial_and_keeps_the_text() {
+    async fn streaming_refusal_after_text_keeps_the_text() {
         let body = concat!(
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"partial\"}}\n\n",
@@ -1743,10 +1747,39 @@ mod refusal_tests {
 
         let (res, handler) = stream(body).await;
 
-        let err = res.unwrap_err();
-        let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
-        assert!(refusal.partial_output, "{err:#}");
+        res.unwrap();
         let (text, _, _, _) = handler.take();
         assert_eq!(text, "partial");
+    }
+
+    mod non_stream_refusal_tests {
+        use super::*;
+
+        #[test]
+        fn a_refusal_after_text_keeps_the_text_and_carries_the_refusal() {
+            let data = json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": "refusal",
+                "stop_details": {"category": "cyber"}
+            });
+
+            let output = claude_extract_chat_completions(&data).unwrap();
+
+            assert_eq!(output.text, "partial");
+            let refusal = output.refusal.expect("the refusal rides with the text");
+            assert_eq!(refusal.category.as_deref(), Some("cyber"));
+        }
+
+        #[test]
+        fn an_ordinary_stop_after_text_carries_no_refusal() {
+            let data = json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn"
+            });
+
+            let output = claude_extract_chat_completions(&data).unwrap();
+
+            assert!(output.refusal.is_none());
+        }
     }
 }
