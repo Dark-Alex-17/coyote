@@ -23,6 +23,7 @@ use crate::mesh::grants::GrantStore;
 use crate::mesh::identity::IdentityLock;
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::inbox::InboxStaging;
+use crate::mesh::instances::{self, InstanceRow};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
     KnockFallback, KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia,
@@ -643,6 +644,9 @@ pub(crate) struct MeshRuntime {
     /// rekey replaces that whole value and the identity does not change with it.
     identity_lock: parking_lot::Mutex<Option<IdentityLock>>,
     ids: RwLock<CurrentIds>,
+    /// This node's row in the instance registry, as filed under the current instance id:
+    /// `rekey` moves it to the fork's id and destination and `shutdown` removes it.
+    instance_row: parking_lot::Mutex<InstanceRow>,
     peers: Arc<PeerTable>,
     propagation_nodes: Arc<PropagationNodeTable>,
     trust: Arc<TrustStore>,
@@ -873,6 +877,12 @@ impl MeshRuntime {
             short(&fingerprint),
             short(&hash.to_hex_string())
         );
+        let instance_row = InstanceRow::started_now(
+            hash.to_hex_string(),
+            session.name().to_string(),
+            options.agent.clone(),
+        );
+        instances::register(&paths.cache_dir, &instance_id, instance_row.clone());
 
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
         let knock_gate = Arc::new(KnockGate::new(
@@ -918,6 +928,7 @@ impl MeshRuntime {
                 instance_id,
                 destination_hash: hash.to_hex_string(),
             }),
+            instance_row: parking_lot::Mutex::new(instance_row),
             peers,
             propagation_nodes,
             trust,
@@ -990,6 +1001,23 @@ impl MeshRuntime {
     /// `destination_hash` without the wait, from the cache `start` fills and `rekey` moves.
     pub(crate) fn current_destination_hash(&self) -> String {
         self.ids.read().destination_hash.clone()
+    }
+
+    /// The sessions of yours running on this cache dir, this one included, by the
+    /// destination each serves, as the instance registry lists them.
+    pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
+        instances::live(&self.cache_dir)
+            .into_iter()
+            .map(|(destination, row)| (destination, row.session))
+            .collect()
+    }
+
+    /// Files this node's registry row under `session`, the name the context now serves
+    /// it for: a fork's name differs from the session the node started for.
+    pub(crate) fn rename_session(&self, session: &str) {
+        let mut row = self.instance_row.lock();
+        row.session = session.to_string();
+        instances::register(&self.cache_dir, &self.current_instance_id(), row.clone());
     }
 
     /// A peer's `NoAccess` as every request path reports it: the peer by the name the
@@ -1783,6 +1811,7 @@ impl MeshRuntime {
             rekey.fork_instance_id,
             short(&hash.to_hex_string())
         );
+        let original_instance_id = std::mem::take(&mut state.instance_id);
         *state = DestinationState {
             dest,
             hash,
@@ -1795,6 +1824,12 @@ impl MeshRuntime {
             instance_id: state.instance_id.clone(),
             destination_hash: hash.to_hex_string(),
         };
+        {
+            let mut row = self.instance_row.lock();
+            row.destination = hash.to_hex_string();
+            instances::unregister(&self.cache_dir, &original_instance_id);
+            instances::register(&self.cache_dir, &state.instance_id, row.clone());
+        }
         if self.announce {
             // With `last_announce` still `None`, the next heartbeat tick announces the fork.
             match timeout_at(deadline, self.send_announce(&mut state, &transport)).await {
@@ -1850,6 +1885,7 @@ impl MeshRuntime {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         let deadline = stop_transport(transport, interfaces, deadline).await;
         drain_request_handlers(&self.request_handler, deadline).await;
+        instances::unregister(&self.cache_dir, &state.instance_id);
         state.lock = None;
         *self.identity_lock.lock() = None;
         if let Err(err) = self.peers.persist_if_dirty() {
@@ -5051,6 +5087,20 @@ impl MeshSlot {
         self.display_name_at(destination)
             .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
             .unwrap_or_else(|| short(destination).to_string())
+    }
+
+    /// `MeshRuntime::own_sessions`, empty while the mesh is off.
+    pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
+        self.get()
+            .map(|runtime| runtime.own_sessions())
+            .unwrap_or_default()
+    }
+
+    /// `MeshRuntime::rename_session`; a no-op while the mesh is off.
+    pub(crate) fn rename_session(&self, session: &str) {
+        if let Some(runtime) = self.get() {
+            runtime.rename_session(session);
+        }
     }
 
     /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
@@ -16205,6 +16255,86 @@ mod tests {
             let second = start_in(&tmp, addr.port()).await;
             assert!(!second.self_trust_seeded_on_upgrade());
             second.shutdown().await.unwrap();
+            relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    mod own_session_rows_tests {
+        use super::*;
+
+        async fn start_as(name: &str, tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            let mut session = Session::default();
+            session.set_name(name.to_string());
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                NodeOptions {
+                    agent: Some("coder".to_string()),
+                    ..NodeOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Two sessions on one cache dir each file their row at start, each sees the
+        /// other's session by its destination, a re-key moves the row to the fork's id
+        /// and destination, and a stop removes only the stopped node's row.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_files_the_row_rekey_moves_it_and_stop_removes_it() {
+            let (addr, relay_handle, _) = loopback_relay().await;
+            let tmp = TempDir::new("node-own-session-rows");
+            let a = start_as("a", &tmp, addr.port()).await;
+            let temp = start_as("temp", &tmp, addr.port()).await;
+            let temp_slot = Arc::new(MeshSlot::default());
+            temp_slot.install(temp.clone()).unwrap();
+            let (a_dest, temp_dest) = (
+                a.current_destination_hash(),
+                temp.current_destination_hash(),
+            );
+
+            let rows = instances::live(&a.cache_dir);
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_eq!(rows[&temp_dest].session, "temp");
+            assert_eq!(rows[&temp_dest].agent.as_deref(), Some("coder"));
+            assert_eq!(rows[&temp_dest].pid, std::process::id());
+            assert_eq!(
+                a.own_sessions().get(&temp_dest).map(String::as_str),
+                Some("temp")
+            );
+            assert_eq!(
+                temp.own_sessions().get(&a_dest).map(String::as_str),
+                Some("a")
+            );
+
+            temp_slot
+                .rekey(ForkRekey {
+                    original_instance_id: Some(temp.current_instance_id()),
+                    fork_instance_id: fresh_instance_id(),
+                })
+                .await
+                .unwrap();
+            let fork_dest = temp.current_destination_hash();
+            assert_ne!(fork_dest, temp_dest);
+            let rows = a.own_sessions();
+            assert!(!rows.contains_key(&temp_dest), "{rows:?}");
+            assert_eq!(rows.get(&fork_dest).map(String::as_str), Some("temp"));
+            temp_slot.rename_session("temp-fork");
+            assert_eq!(
+                a.own_sessions().get(&fork_dest).map(String::as_str),
+                Some("temp-fork")
+            );
+
+            assert!(temp_slot.stop().await.unwrap());
+            let rows = a.own_sessions();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows.get(&a_dest).map(String::as_str), Some("a"));
+
+            a.shutdown().await.unwrap();
+            assert!(instances::live(&tmp.path.join("cache")).is_empty());
             relay_handle.abort();
         }
     }

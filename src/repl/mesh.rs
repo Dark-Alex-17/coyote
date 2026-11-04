@@ -519,11 +519,13 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
     let now = SystemTime::now();
     let mut records = runtime.peers().snapshot();
     records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+    let own_sessions = runtime.own_sessions();
     let mut facts = Vec::with_capacity(records.len());
     for peer in &records {
         facts.push(HeardFacts {
             no_route: !runtime.path_known(&peer.destination_hash).await,
             is_you: peer.identity_hash == runtime.fingerprint(),
+            own_session: own_sessions.get(&peer.destination_hash).cloned(),
         });
     }
     let trust = runtime.trust();
@@ -1112,7 +1114,11 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     live(ctx)?;
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
-    let name_at = |destination: &str| ctx.app.mesh.peer_name_at(destination);
+    let own_sessions = ctx.app.mesh.own_sessions();
+    let name_at = |destination: &str| match own_sessions.get(destination) {
+        Some(session) => own_session_name(session),
+        None => ctx.app.mesh.peer_name_at(destination),
+    };
     let asked: Vec<QuestionRow> = ctx
         .app
         .mesh
@@ -6799,11 +6805,19 @@ enum PeerRow {
 
 /// What this node knows about a heard row beyond its record: whether the transport holds
 /// no path to it, from the cached path table alone, and whether it announces this node's
-/// own identity, as another session on the same config dir does.
-#[derive(Debug, Default, Clone, Copy)]
+/// own identity, as another session on the same config dir does, with the session's name
+/// when the instance registry lists the row's destination as running here.
+#[derive(Debug, Default, Clone)]
 struct HeardFacts {
     no_route: bool,
     is_you: bool,
+    own_session: Option<String>,
+}
+
+/// How `.mesh peers` and `.mesh pending` name an instance that is one of your own running
+/// sessions.
+fn own_session_name(session: &str) -> String {
+    format!("(you: {session})")
 }
 
 /// A trust record's key-change mark with, when the peer table has heard it, the destination
@@ -6898,10 +6912,10 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                     None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),
                     _ => row_state(peer, successor, now),
                 };
-                let name = if facts.is_you {
-                    "(you)".to_string()
-                } else {
-                    name_label(peer.display_name.as_deref())
+                let name = match &facts.own_session {
+                    Some(session) => own_session_name(session),
+                    None if facts.is_you => "(you)".to_string(),
+                    None => name_label(peer.display_name.as_deref()),
                 };
                 let state = [marker, peer.compatibility_line()];
                 [
@@ -6969,6 +6983,7 @@ mod peers_route_tests {
     const NO_PATH: HeardFacts = HeardFacts {
         no_route: true,
         is_you: false,
+        own_session: None,
     };
 
     fn heard(peer: PeerRecord, facts: HeardFacts) -> PeerRow {
@@ -7047,9 +7062,10 @@ mod peers_you_tests {
         let you = HeardFacts {
             no_route: false,
             is_you: true,
+            own_session: None,
         };
         let rows = vec![
-            PeerRow::Heard(peer(Some("Laptop"), 5, now), "trusted", None, you),
+            PeerRow::Heard(peer(Some("Laptop"), 5, now), "trusted", None, you.clone()),
             PeerRow::Heard(
                 PeerRecord {
                     destination_hash: "12".repeat(16),
@@ -7129,10 +7145,10 @@ fn trust_legend() -> &'static str {
     "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>"
 }
 
-/// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` name.
+/// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you) = another session of yours on this config dir",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -9449,7 +9465,7 @@ mod tests {
             [
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you) = another session of yours on this config dir",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here",
             ],
             "{text}"
         );
@@ -9507,6 +9523,7 @@ mod tests {
                 HeardFacts {
                     no_route: false,
                     is_you: true,
+                    own_session: None,
                 },
             ),
             PeerRow::Heard(
@@ -9530,6 +9547,7 @@ mod tests {
                 HeardFacts {
                     no_route: true,
                     is_you: false,
+                    own_session: None,
                 },
             ),
             PeerRow::Heard(
@@ -9570,7 +9588,7 @@ mod tests {
 1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
 5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you) = another session of yours on this config dir"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here"#;
 
     /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
     #[test]
@@ -15255,6 +15273,111 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         started.relay_handle.abort();
+                    });
+                }
+            }
+
+            mod own_session_rows_tests {
+                use super::*;
+                use crate::mesh::pending::InboundKind;
+
+                async fn start_as(name: &str, tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+                    let mut session = Session::default();
+                    session.set_name(name.to_string());
+                    MeshRuntime::start(
+                        &private_config(port),
+                        true,
+                        &mut session,
+                        mesh_paths(tmp),
+                        NodeOptions::default(),
+                    )
+                    .await
+                    .unwrap()
+                }
+
+                /// Heard as `runtime`'s own identity at `destination`, as another session
+                /// on the same config dir is.
+                fn heard_as_you(runtime: &MeshRuntime, destination: &str) {
+                    runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: destination.to_string(),
+                            identity_hash: runtime.fingerprint().to_string(),
+                            name_hash: String::new(),
+                            public_key: None,
+                            display_name: Some("Laptop".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        SystemTime::now(),
+                    );
+                }
+
+                /// With sessions `a` and `temp` running on one cache dir, `a` names temp's
+                /// row `(you: temp)` in `.mesh peers` and in `.mesh pending`, while an own
+                /// identity row no running session serves stays `(you)`.
+                #[test]
+                #[serial]
+                fn a_running_own_session_is_named_by_its_session() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-own-session-rows");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let tmp = TempDir::new("repl-mesh-own-session-rows");
+                        let a = start_as("a", &tmp, addr.port()).await;
+                        let temp = start_as("temp", &tmp, addr.port()).await;
+                        let temp_slot = Arc::new(MeshSlot::default());
+                        temp_slot.install(temp.clone()).unwrap();
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(a.clone()).unwrap();
+                        let temp_dest = temp.current_destination_hash();
+                        let gone_session = hex_lower(&[0x4e; 16]);
+                        heard_as_you(&a, &temp_dest);
+                        heard_as_you(&a, &gone_session);
+
+                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let rows = table_rows(&out);
+                        let row = |destination: &str| {
+                            rows.iter()
+                                .find(|row| row[1] == short(destination))
+                                .unwrap_or_else(|| panic!("no row for {destination} in {out}"))
+                        };
+                        assert_eq!(row(&temp_dest)[0], "(you: temp)", "{out}");
+                        assert_eq!(row(&gone_session)[0], "(you)", "{out}");
+                        assert!(
+                            out.contains("(you: <session>) = your session of that name"),
+                            "{out}"
+                        );
+
+                        let now = SystemTime::now();
+                        ctx.app
+                            .mesh
+                            .inbound_store()
+                            .expect("install attaches a store")
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: "q-1".to_string(),
+                                    peer_destination: temp_dest.clone(),
+                                    peer_identity: a.fingerprint().to_string(),
+                                    thread: "q-1".to_string(),
+                                    question: "Which branch?".to_string(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind: InboundKind::Question,
+                                    paths: Vec::new(),
+                                    reason: String::new(),
+                                    session_thread: String::new(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                        let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                        assert!(out.contains("(you: temp)"), "{out}");
+                        assert!(!out.contains("Laptop"), "{out}");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        assert!(temp_slot.stop().await.unwrap());
+                        relay_handle.abort();
                     });
                 }
             }

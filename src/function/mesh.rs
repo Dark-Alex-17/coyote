@@ -122,7 +122,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                  display name, trust standing (`trusted`, `known`, `untrusted`, `blocked (instance)`, \
                  `blocked (identity)`), protocol compatibility \
                  (`compatible`, or `incompatible` with a `compatibility_note`), when each was last seen and \
-                 whether a path to it is known right now. The table itself is NOT a status: it says \
+                 whether a path to it is known right now. A row with a `session` field is one of your \
+                 own sessions running on this computer, named so you can tell them apart; the other \
+                 tools still take its destination hash. The table itself is NOT a status: it says \
                  who is out there, not what they are doing. Their /status cards are fetched only with \
                  `with_status: true`, and only for trusted peers with a known path. A card's free text \
                  (`objective`, `about`, `repo` and `todo goal`) arrives in one fenced `text` block as \
@@ -856,6 +858,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     let mut peers = Vec::with_capacity(records.len());
     let mut status_lookups = Vec::new();
     let trust = runtime.trust();
+    let own_sessions = runtime.own_sessions();
     for (index, peer) in records.iter().enumerate() {
         let grant = trust.authorize(&peer.identity_hash, &peer.destination_hash);
         let standing = trust.identity_standing(&peer.identity_hash);
@@ -877,6 +880,9 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         });
         if let Some(note) = peer.compatibility_line() {
             row["compatibility_note"] = json!(note);
+        }
+        if let Some(session) = own_sessions.get(&peer.destination_hash) {
+            row["session"] = json!(session);
         }
         peers.push(row);
         if with_status
@@ -6763,6 +6769,84 @@ mod tests {
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             started.relay_handle.abort();
+        }
+
+        mod peers_session_tests {
+            use super::*;
+            use crate::config::Session;
+            use crate::mesh::test_support::{TempDir, loopback_relay, mesh_paths, private_config};
+            use crate::mesh::{MeshRuntime, MeshSlot, NodeOptions};
+
+            async fn start_as(name: &str, tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+                let mut session = Session::default();
+                session.set_name(name.to_string());
+                MeshRuntime::start(
+                    &private_config(port),
+                    true,
+                    &mut session,
+                    mesh_paths(tmp),
+                    NodeOptions::default(),
+                )
+                .await
+                .unwrap()
+            }
+
+            /// With sessions `a` and `temp` running on one cache dir, `a`'s `mesh__peers`
+            /// row for temp's destination carries `"session": "temp"`, and a foreign peer's
+            /// row has no `session` key.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn an_own_running_session_row_names_its_session() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-peers-session");
+                let (addr, relay_handle, _) = loopback_relay().await;
+                let tmp = TempDir::new("mesh-tool-peers-session");
+                let a = start_as("a", &tmp, addr.port()).await;
+                let temp = start_as("temp", &tmp, addr.port()).await;
+                let temp_slot = Arc::new(MeshSlot::default());
+                temp_slot.install(temp.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(a.clone()).unwrap();
+                let now = SystemTime::now();
+                let temp_dest = temp.current_destination_hash();
+                let foreign = hex_lower(&[0x11; 16]);
+                let sighting = |destination: &str, identity: String| PeerSighting {
+                    destination_hash: destination.to_string(),
+                    identity_hash: identity,
+                    name_hash: String::new(),
+                    public_key: None,
+                    display_name: None,
+                    protocol_version: 1,
+                    hops: 1,
+                };
+                a.peers()
+                    .observe(sighting(&temp_dest, a.fingerprint().to_string()), now);
+                a.peers()
+                    .observe(sighting(&foreign, hex_lower(&[0x12; 16])), now);
+
+                let result = handle_mesh_tool(
+                    &mut ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}peers"),
+                    &json!({}),
+                )
+                .await
+                .unwrap();
+
+                let rows = result["peers"].as_array().unwrap();
+                let row = |destination: &str| {
+                    rows.iter()
+                        .find(|row| row["destination"] == destination)
+                        .unwrap_or_else(|| panic!("{destination} missing from {result}"))
+                };
+                assert_eq!(row(&temp_dest)["session"], "temp", "{result}");
+                assert!(
+                    !row(&foreign).as_object().unwrap().contains_key("session"),
+                    "{result}"
+                );
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                assert!(temp_slot.stop().await.unwrap());
+                relay_handle.abort();
+            }
         }
 
         #[derive(Default)]

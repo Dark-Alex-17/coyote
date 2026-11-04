@@ -16,6 +16,7 @@ pub(crate) mod grants;
 pub(crate) mod identity;
 pub(crate) mod idle;
 pub(crate) mod inbox;
+mod instances;
 pub(crate) mod knock;
 pub(crate) mod knocks;
 pub(crate) mod limits;
