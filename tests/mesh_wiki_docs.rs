@@ -6418,13 +6418,13 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
 /// node's own led by `->`), the quoted question and `envoy asks:` indented under them;
 /// the prose names the entry shapes, the titles and the outbound state words. The `.mesh
 /// answer` section says the block is printed first, that an id may be given by prefix,
-/// quotes the prompt, the nothing-sent
-/// line, the refusal a non-terminal gets and the completion row shape with its cut
-/// length, and no longer quotes the retired `Nothing sent.`. The Mesh page's envoy
-/// section says escalations reach the human only through the REPL, and no Mesh page
-/// still quotes the retired one-line pending shape. The code side (the state words,
-/// labels, titles, footer and header literals, the prompt, the nothing-sent line, the
-/// refusal, and the order `fn answer` does things in) is checked on every run.
+/// quotes the prompt, the nothing-sent line, the refusal a non-terminal gets and the
+/// completion row shape with its cut length, and no longer quotes the retired
+/// `Nothing sent.`. The Mesh page's envoy section says escalations reach the human only
+/// through the REPL, and no Mesh page still quotes the retired one-line pending shape.
+/// The code side (the state words, labels, titles, footer and header literals, the
+/// prompt, the nothing-sent line, the refusal, and the order `fn answer` does things in)
+/// is checked on every run.
 #[test]
 fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
@@ -6447,7 +6447,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let access = string_literals(&method_body("src/repl/mesh.rs", "access"));
     assert_eq!(
         access,
-        ["access request", "asked", "", "path", "paths",],
+        ["access request", "asked", "", "path", "paths"],
         "QuestionRow::access's state word, label and path count moved"
     );
     assert_eq!(
@@ -6500,8 +6500,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .collect();
     let entry_literals = string_literals(&fn_body("src/repl/mesh.rs", "pending_entry"));
     for needle in [
-        "-> {peer} {age} . {} . id {}",
-        "{peer} asked {age}{expires} . id {}",
+        "-> {peer} {age} . {} . id {id}",
+        "{peer} {} {age}{expires} . id {id}",
         " . expires in {}",
         "  {number}. ",
         "\"{body}\"",
@@ -6594,6 +6594,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         sections.len(),
         "the `.mesh pending` sample shows one header per section:\n{sample}"
     );
+    let mut counts = Vec::new();
     for (header, (title, commands)) in headers.iter().zip(&sections) {
         let rest = header.strip_prefix(title).unwrap_or_else(|| {
             panic!(
@@ -6610,6 +6611,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()),
             "the sample header {header:?} counts its entries"
         );
+        counts.push(count.parse::<usize>().unwrap());
         assert_eq!(
             after.trim_start(),
             *commands,
@@ -6617,7 +6619,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         );
     }
     let mut section_index = 0;
-    let mut entries = 0;
+    let mut entries = vec![0; headers.len()];
     for line in &lines {
         if headers.contains(line) {
             section_index = headers.iter().position(|header| header == line).unwrap();
@@ -6633,7 +6635,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             .unwrap_or_else(|| {
                 panic!("a `.mesh pending` sample line is neither a header, a numbered entry nor indented under one: {line:?}")
             });
-        entries += 1;
+        entries[section_index] += 1;
         let id8 = head.rsplit(" . id ").next().unwrap();
         assert!(
             head.contains(" . id ") && id8.len() == 8 && id8.chars().all(|c| c.is_ascii_hexdigit()),
@@ -6663,8 +6665,12 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         );
     }
     assert!(
-        entries >= 3,
+        entries.iter().all(|&count| count >= 1),
         "the `.mesh pending` sample has an entry in every section:\n{sample}"
+    );
+    assert_eq!(
+        entries, counts,
+        "each `.mesh pending` sample header counts the entries under it:\n{sample}"
     );
     assert!(
         lines
@@ -6707,6 +6713,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     for needle in [
         "`.mesh answer <id>` first prints the question's block".to_string(),
         "any 8 or more of its first characters, as long as they begin only one pending id"
+            .to_string(),
+        "'<prefix>' matches <N> pending ids: <id>..., <id>...; give one of these (or enough of its characters to tell it apart)."
             .to_string(),
         format!("the prompt `{prompt}`"),
         format!(
@@ -6834,10 +6842,10 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         all_source.contains(r#"plural(count, "asker", "askers")"#),
         "dismiss_all's progress line no longer counts with the plural helper:\n{all_source}"
     );
-    let own = string_literals(&fn_body("src/repl/mesh.rs", "open_escalated_question"))
+    let own = string_literals(&fn_body("src/repl/mesh.rs", "asked_by_this_node"))
         .into_iter()
         .find(|literal| literal.contains("this node asked"))
-        .expect("open_escalated_question refuses this node's own question with one literal");
+        .expect("asked_by_this_node words this node's own question with one literal");
     assert_eq!(
         own,
         "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
@@ -7051,6 +7059,20 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         assert!(
             !prose.contains("already decided"),
             "the `{verb}` prose still words the race as `already decided`:\n{prose}"
+        );
+    }
+    let grant = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh grant` and `.mesh refuse`",
+    ));
+    for needle in [
+        "whole or as any 8 or more of its first characters, as `.mesh answer` takes it",
+        "An id of a question this node asked is refused with the line `.mesh dismiss` gives it.",
+    ] {
+        assert!(
+            grant.contains(needle),
+            "the `.mesh grant` and `.mesh refuse` prose does not carry {needle:?}:\n{grant}"
         );
     }
     let answer = flat(&section("Mesh-Commands.md", &page, "### `.mesh answer`"));
