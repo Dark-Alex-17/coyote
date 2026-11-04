@@ -12798,10 +12798,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
 
         fn held_as(token: &str, ids: &[&str], kind: Option<InboundKind>) -> Result<String> {
-            resolve_pending_id(
-                token,
-                ids.iter().map(|id| (id.to_string(), kind)).collect(),
-            )
+            resolve_pending_id(token, ids.iter().map(|id| (id.to_string(), kind)).collect())
         }
 
         fn resolve(token: &str) -> Result<String> {
@@ -12836,14 +12833,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn a_prefix_of_a_peer_chosen_id_resolves_to_the_held_id() {
             let held = ["req-2026-11-0001", OTHER];
-            assert_eq!(
-                pick("req-2026", &held).unwrap(),
-                "req-2026-11-0001"
-            );
-            assert_eq!(
-                pick("REQ-2026-11", &held).unwrap(),
-                "req-2026-11-0001"
-            );
+            assert_eq!(pick("req-2026", &held).unwrap(), "req-2026-11-0001");
+            assert_eq!(pick("REQ-2026-11", &held).unwrap(), "req-2026-11-0001");
             assert_eq!(
                 pick("req-20", &held).unwrap_err().to_string(),
                 "'req-20' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them."
@@ -12892,9 +12883,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`."
             );
             assert_eq!(
-                held_as("ab12cd34", &["ab12cd34", "AB12CD34"], Some(InboundKind::Access))
-                    .unwrap_err()
-                    .to_string(),
+                held_as(
+                    "ab12cd34",
+                    &["ab12cd34", "AB12CD34"],
+                    Some(InboundKind::Access)
+                )
+                .unwrap_err()
+                .to_string(),
                 "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
             );
         }
