@@ -1781,19 +1781,23 @@ pub(crate) fn attachment(
     let shown = shown_pattern(path_text);
     if Path::new(path_text).is_absolute() || path_text.starts_with('/') || path_text.contains('\\')
     {
-        bail!(
-            "`--attach` takes a path relative to {}, as `.mesh allow` does; '{shown}' is not one.",
-            root.display()
-        );
+        return Err(QuotingError::wrap(
+            NoticeText::default()
+                .frame("`--attach` takes a path relative to ")
+                .peer(root.display().to_string())
+                .frame(", as `.mesh allow` does; '")
+                .peer(shown)
+                .frame("' is not one."),
+        ));
     }
     if let Err(invalid) = WirePath::parse(path_text) {
-        bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "`{shown}` is not a path the mesh carries (rule `{}`), so it cannot travel as a file part; rename or move the file and attach it again.",
+        return Err(attach_path_error(
+            &shown,
+            format!(
+                " is not a path the mesh carries (rule `{}`), so it cannot travel as a file part; rename or move the file and attach it again.",
                 invalid.rule
-            ))
-        );
+            ),
+        ));
     }
     let (set, _warning) = ShareSet::load_quietly(locations);
     if let Some(head) = set.protected_head(path_text) {
@@ -1803,10 +1807,13 @@ pub(crate) fn attachment(
     let metadata = match fs::symlink_metadata(&file_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "`{shown}` is not under {}; nothing was sent.",
-                root.display()
-            )
+            return Err(attach_path_error(
+                &shown,
+                NoticeText::default()
+                    .frame(" is not under ")
+                    .peer(root.display().to_string())
+                    .frame("; nothing was sent."),
+            ));
         }
         Err(err) => {
             return Err(err)
@@ -1814,17 +1821,22 @@ pub(crate) fn attachment(
         }
     };
     if metadata.file_type().is_symlink() {
-        bail!("'{shown}' is a symlink; attach the file it points to instead.");
+        return Err(QuotingError::wrap(
+            NoticeText::default()
+                .frame("'")
+                .peer(shown)
+                .frame("' is a symlink; attach the file it points to instead."),
+        ));
     }
     if metadata.is_dir() {
-        bail!("`{shown}` is a directory; attach one file.");
+        return Err(attach_path_error(&shown, " is a directory; attach one file."));
     }
     if !metadata.is_file() {
-        bail!("`{shown}` is not a regular file.");
+        return Err(attach_path_error(&shown, " is not a regular file."));
     }
     let (file, metadata) = open_attachment(&file_path)?;
     if !metadata.is_file() {
-        bail!("`{shown}` is not a regular file.");
+        return Err(attach_path_error(&shown, " is not a regular file."));
     }
     let canonical = canonicalize(&root)
         .and_then(|canonical_root| {
@@ -1834,42 +1846,66 @@ pub(crate) fn attachment(
         .ok()
         .flatten();
     let Some(canonical) = canonical else {
-        bail!(
-            "`{shown}` lies outside {} once its links are followed; nothing was sent.",
-            root.display()
-        );
+        return Err(attach_path_error(
+            &shown,
+            NoticeText::default()
+                .frame(" lies outside ")
+                .peer(root.display().to_string())
+                .frame(" once its links are followed; nothing was sent."),
+        ));
     };
     if !opened_the_judged_file(&metadata, &canonical) {
-        bail!("`{shown}` changed under this node while it was being read; nothing was sent.");
+        return Err(attach_path_error(
+            &shown,
+            " changed under this node while it was being read; nothing was sent.",
+        ));
     }
     let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
     match (set.builtin_denies(path_text, case_insensitive)?, force) {
-        (Some(BuiltinHit::ByText), false) => bail!(
-            "`{shown}` is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it."
-        ),
+        (Some(BuiltinHit::ByText), false) => {
+            return Err(attach_path_error(
+                &shown,
+                " is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it.",
+            ));
+        }
         (Some(BuiltinHit::ByText), true) | (None, false) => {}
         (Some(BuiltinHit::ByResolution { resolved }), _) => {
-            let resolved = shown_pattern(&resolved);
-            bail!(
-                "`{shown}` resolves to `{resolved}`, which the built-in deny names; attach that file by its own name with `--force` if you mean it."
-            )
+            return Err(attach_path_error(
+                &shown,
+                NoticeText::default()
+                    .frame(" resolves to `")
+                    .peer(shown_pattern(&resolved))
+                    .frame("`, which the built-in deny names; attach that file by its own name with `--force` if you mean it."),
+            ));
         }
         (Some(BuiltinHit::LinkNamedLikeASecret { resolved }), _) => {
             let resolved = shown_pattern(&resolved);
-            bail!(
-                "`{shown}` is a link to `{resolved}`, which the built-in deny does not name; attach `{resolved}` by that name; nothing was sent."
-            )
+            return Err(attach_path_error(
+                &shown,
+                NoticeText::default()
+                    .frame(" is a link to `")
+                    .peer(resolved.clone())
+                    .frame("`, which the built-in deny does not name; attach `")
+                    .peer(resolved)
+                    .frame("` by that name; nothing was sent."),
+            ));
         }
-        (Some(BuiltinHit::UnresolvableLink), _) => bail!(
-            "`{shown}` is reached through a link to nothing, so it cannot be sent; nothing was sent."
-        ),
-        (None, true) => bail!(
-            "`{shown}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
-        ),
+        (Some(BuiltinHit::UnresolvableLink), _) => {
+            return Err(attach_path_error(
+                &shown,
+                " is reached through a link to nothing, so it cannot be sent; nothing was sent.",
+            ));
+        }
+        (None, true) => {
+            return Err(attach_path_error(
+                &shown,
+                " is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`.",
+            ));
+        }
     }
     let size = metadata.len();
     if size == 0 {
-        bail!("`{shown}` is empty; nothing to attach.");
+        return Err(attach_path_error(&shown, " is empty; nothing to attach."));
     }
     let name = path_text.to_string();
     if size <= limits.inline_max_bytes {
@@ -1892,10 +1928,13 @@ pub(crate) fn attachment(
         });
     }
     if size > serving_limit {
-        bail!(
-            "`{shown}` is {} and this node serves at most {serving_limit} bytes by reference; nothing was sent.",
-            human_size(size)
-        );
+        return Err(attach_path_error(
+            &shown,
+            format!(
+                " is {} and this node serves at most {serving_limit} bytes by reference; nothing was sent.",
+                human_size(size)
+            ),
+        ));
     }
     if let Some(refusal) = set.refusal() {
         return Err(refused_at_load(refusal, " Nothing was sent."));
@@ -1904,9 +1943,12 @@ pub(crate) fn attachment(
         .verdict_for(&PeerRef::unscoped(), path_text, case_insensitive)?
         .and_then(|(verdict, _)| unserved_reason(verdict))
     {
-        bail!(
-            "`{shown}` would travel as a reference, which this node would not serve ({reason}); lift the rule first; nothing was sent."
-        );
+        return Err(attach_path_error(
+            &shown,
+            format!(
+                " would travel as a reference, which this node would not serve ({reason}); lift the rule first; nothing was sent."
+            ),
+        ));
     }
     let mut hasher = Sha256::new();
     std::io::copy(&mut std::io::BufReader::new(file), &mut hasher)
@@ -1923,6 +1965,18 @@ pub(crate) fn attachment(
         size,
         form: AttachForm::Reference,
     })
+}
+
+/// An `--attach` error that opens with the path the human typed, quoted as typed; the
+/// rest follows the prefix but for any quoted runs of its own.
+fn attach_path_error(shown: &str, rest: impl Into<NoticeText>) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("`")
+            .peer(shown)
+            .frame("`")
+            .then(rest.into()),
+    )
 }
 
 /// `path` opened for reading, with the metadata of that very handle, so what is sized,
@@ -4737,6 +4791,30 @@ mod peer_text_prefix_tests {
             text.ends_with(&format!("    {refusal} Nothing was sent.")),
             "{text}"
         );
+    }
+
+    mod attach_path_tests {
+        use super::*;
+
+        #[test]
+        fn an_attached_bare_vault_keeps_its_dot_while_the_hint_slashes() {
+            let directory = shown_under_slash(attach_path_error(
+                ".vault",
+                " is a directory; attach one file.",
+            ));
+            assert!(
+                directory.ends_with("`.vault` is a directory; attach one file."),
+                "{directory}"
+            );
+            let carried = shown_under_slash(attach_path_error(
+                ".vault",
+                " is not a path the mesh carries; see `.mesh help`.",
+            ));
+            assert!(
+                carried.ends_with("`.vault` is not a path the mesh carries; see `/mesh help`."),
+                "{carried}"
+            );
+        }
     }
 
     mod share_write_tests {
