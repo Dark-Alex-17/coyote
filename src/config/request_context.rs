@@ -37334,7 +37334,8 @@ mod tests {
     /// destination under a label; Cal, merely heard; Dov, whose identity is blocked; Eve,
     /// an instance refused under her identity trusted for all; Fay, recorded before name
     /// hashes were kept), a knocker with a name hash and one from before name hashes were
-    /// kept, and an identity trusted for all its destinations that was never heard.
+    /// kept, an identity trusted for all its destinations that was never heard, and the
+    /// node's own identity, which the start grants every destination as `this node`.
     #[cfg(unix)]
     struct MeshCompletionFixture {
         started: crate::mesh::test_support::StartedRuntime,
@@ -37353,6 +37354,7 @@ mod tests {
         legacy_knock: KnockRecord,
         blocked_knock: KnockRecord,
         trusted_identity: String,
+        own_identity: String,
     }
 
     #[cfg(unix)]
@@ -37494,6 +37496,7 @@ mod tests {
             Some(refused_peer_identity.as_str())
         );
         assert!(refused.record_removed);
+        let own_identity = started.runtime.fingerprint().to_string();
 
         MeshCompletionFixture {
             started,
@@ -37512,6 +37515,7 @@ mod tests {
             legacy_knock,
             blocked_knock,
             trusted_identity,
+            own_identity,
         }
     }
 
@@ -38087,7 +38091,8 @@ mod tests {
         let forget = fixture.complete(&["forget", "--identity", ""]);
         // `forget --identity` takes every identity-tier record: Bea's binding-only entry
         // (her destination's grant recorded her identity without all-destinations), the
-        // identity trusted outright and Eve's, whose only instance the block took.
+        // identity trusted outright, Eve's, whose only instance the block took, and the
+        // node's own.
         let identity_rows = forget.len() - 1;
         let mut every_identity = completion_values(&forget[..identity_rows]);
         every_identity.sort_unstable();
@@ -38095,6 +38100,7 @@ mod tests {
             fixture.trusted_peer_identity.as_str(),
             fixture.trusted_identity.as_str(),
             fixture.refused_peer_identity.as_str(),
+            fixture.own_identity.as_str(),
         ];
         all_records.sort_unstable();
         assert_eq!(
@@ -38115,14 +38121,15 @@ mod tests {
         // refused by the verb and therefore not offered.
         let mut values = completion_values(&identities);
         values.sort_unstable();
-        let mut expected = [
+        let unlabelled = [
             fixture.trusted_identity.as_str(),
             fixture.refused_peer_identity.as_str(),
         ];
+        let mut expected = [unlabelled.as_slice(), &[fixture.own_identity.as_str()]].concat();
         expected.sort_unstable();
         assert_eq!(
             values, expected,
-            "the granting identity and the one with no instance left, nothing else"
+            "the granting identities and the one with no instance left, nothing else"
         );
         assert!(
             !identities
@@ -38130,7 +38137,7 @@ mod tests {
                 .any(|(value, _)| *value == fixture.trusted_peer_identity),
             "a binding-only identity whose instance stands has no grant to withdraw"
         );
-        for identity in expected {
+        for identity in unlabelled {
             let description = completion_description(&identities, identity);
             assert!(
                 description.starts_with(&format!(
@@ -38141,6 +38148,14 @@ mod tests {
                 "an unlabelled identity record falls back to its short hash twice: {description}"
             );
         }
+        let own = completion_description(&identities, &fixture.own_identity);
+        assert!(
+            own.starts_with(&format!(
+                "this node . {} . trusted ",
+                short(&fixture.own_identity)
+            )),
+            "the node's own grant carries the label its start gave it: {own}"
+        );
         assert!(
             !identities
                 .iter()
@@ -38461,6 +38476,7 @@ mod tests {
             fixture.trusted_peer_identity.as_str(),
             fixture.trusted_identity.as_str(),
             fixture.refused_peer_identity.as_str(),
+            fixture.own_identity.as_str(),
         ];
         let is_hash =
             |value: &str| value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit());
@@ -39591,6 +39607,7 @@ mod tests {
             fixture.trusted_peer_identity.as_str(),
             fixture.trusted_identity.as_str(),
             fixture.refused_peer_identity.as_str(),
+            fixture.own_identity.as_str(),
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -41261,21 +41278,28 @@ mod tests {
         );
         let mut trusted_values = completion_values(trusted);
         trusted_values.sort_unstable();
-        let mut expected_trusted = [
+        let unlabelled = [
             fixture.trusted_identity.as_str(),
             fixture.refused_peer_identity.as_str(),
         ];
+        let mut expected_trusted =
+            [unlabelled.as_slice(), &[fixture.own_identity.as_str()]].concat();
         expected_trusted.sort_unstable();
         assert_eq!(
             trusted_values, expected_trusted,
             "every trust-known identity not already listed, less the blocked: {values:?}"
         );
-        for identity in expected_trusted {
+        for identity in unlabelled {
             assert_eq!(
                 completion_description(&values, identity),
                 format!("{} . nothing remembered", short(identity))
             );
         }
+        assert_eq!(
+            completion_description(&values, &fixture.own_identity),
+            "this node . nothing remembered",
+            "the node's own identity is named by the label its start gave it"
+        );
         assert!(
             !values
                 .iter()
