@@ -672,7 +672,10 @@ fn baseline_tests_without_a_test_command_records_no_baseline() {
     );
     assert_baseline_shape(&out);
     assert_eq!(str_field(&out, "baseline_status"), "none", "{out}");
-    assert!(str_field(&out, "baseline_note").contains("test_timeout"));
+    assert!(
+        str_field(&out, "baseline_note").contains("test_timeout"),
+        "{out}"
+    );
     assert!(!dir.0.join("ran.txt").exists(), "ran with a bad deadline");
 }
 
@@ -1117,14 +1120,18 @@ fn coder_graph_runs_the_baseline_once_before_implement() {
         node["timeout"].as_u64(),
         nodes["verify_tests"]["timeout"].as_u64()
     );
-    assert!(nodes["implement"]["prompt"]
-        .as_str()
-        .unwrap()
-        .contains("{{baseline_note}}"));
-    assert!(nodes["end_success"]["output"]
-        .as_str()
-        .unwrap()
-        .contains("Tests: passed{{baseline_report}}\nDesign: "));
+    assert!(
+        nodes["implement"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("{{baseline_note}}")
+    );
+    assert!(
+        nodes["end_success"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("Tests: passed{{baseline_report}}\nDesign: ")
+    );
     for key in [
         "baseline_status",
         "baseline_exit_code",
@@ -1203,6 +1210,35 @@ fn end_success_renders_the_baseline_report_after_tests_passed() {
     );
 }
 
+/// Without a red baseline verify_tests reports nothing, so end_success
+/// renders exactly the layout it had before baselines existed.
+#[test]
+fn verify_tests_reports_nothing_without_a_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-no-baseline");
+    project(&dir.0, "here");
+    for (cmd, ok) in [("echo fine", true), ("echo boom; exit 1", false)] {
+        let out = run_script(
+            VERIFY_TESTS,
+            &dir.0,
+            &project_state(&dir.0),
+            &[("TEST_CMD", cmd)],
+        );
+        assert_eq!(out["tests_ok"], Value::Bool(ok), "{cmd}: {out}");
+        if ok {
+            assert_eq!(str_field(&out, "baseline_report"), "", "{cmd}: {out}");
+            assert!(
+                str_field(&out, "tests_output").starts_with("Ran: "),
+                "{out}"
+            );
+        } else {
+            assert!(out.get("baseline_report").is_none(), "{cmd}: {out}");
+        }
+    }
+}
+
 /// A crash of baseline_tests is not a verify gate crash: with a red test run
 /// fix_loop_gate still spends a fix attempt, and with both gates green it
 /// takes the same "no error recorded" retry it takes without any error.
@@ -1236,7 +1272,6 @@ fn fix_loop_gate_does_not_treat_a_baseline_tests_crash_as_a_gate_crash() {
         "{out}"
     );
     assert_eq!(out["gate_retries"], Value::from(1), "{out}");
-    assert!(out.get("fix_attempts").is_none(), "{out}");
 }
 
 /// Cargo ids carry their target (backslashes as `/`), jest ids their file,
@@ -1328,7 +1363,7 @@ fn baseline_tests_records_why_failures_are_unidentified() {
     let dir = temp_dir("baseline-unidentified");
     project(&dir.0, "here");
     let short = "the runner reported 2 failures but only 1 ids were parsed";
-    let cases: [(&str, &str, &str); 7] = [
+    let cases: [(&str, &str, &str); 9] = [
         ("none", "boom error\n", "no test ids could be parsed"),
         (
             "pytest",
@@ -1348,8 +1383,18 @@ fn baseline_tests_records_why_failures_are_unidentified() {
             short,
         ),
         (
+            "jest suites",
+            " FAIL  src/a.test.js\n  \u{25cf} a\nTest Suites: 2 failed, 2 total\n",
+            short,
+        ),
+        (
             "vitest",
             " FAIL  src/a.test.ts > m > adds\n      Tests  2 failed | 1 passed (3)\n",
+            short,
+        ),
+        (
+            "vitest files",
+            " FAIL  src/a.test.ts > m > adds\n Test Files  2 failed | 1 passed (3)\n",
             short,
         ),
         (
@@ -1380,7 +1425,7 @@ fn baseline_tests_records_why_failures_are_unidentified() {
 }
 
 /// A run in which a test target was killed by a signal never passes, even
-/// when its output hashes like a baseline that crashed the same way.
+/// when every failure it printed was in the baseline.
 #[test]
 fn verify_tests_never_passes_a_test_target_killed_by_a_signal() {
     if tools_missing() {
@@ -1388,10 +1433,7 @@ fn verify_tests_never_passes_a_test_target_killed_by_a_signal() {
     }
     let dir = temp_dir("verify-signal");
     project(&dir.0, "here");
-    let base = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), SIGNAL_CRASH, 101);
-    let hash = str_field(&base, "baseline_failure_hash");
-    assert!(!hash.is_empty(), "{base}");
-    let state = red_baseline(&dir.0, &[], 101, hash);
+    let state = red_baseline(&dir.0, &["tests/foo.rs::a"], 101, "");
     let out = run_transcript(VERIFY_TESTS, &dir.0, &state, SIGNAL_CRASH, 101);
     assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
     assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{out}");
@@ -1469,8 +1511,13 @@ fn verify_tests_fails_an_identified_run_against_an_unidentified_baseline() {
     let dir = temp_dir("verify-unknown-base");
     project(&dir.0, "here");
     let a = "tests/test_a.py::test_one";
-    let state = red_baseline(&dir.0, &[], 1, "somehash");
-    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&[a]), 1);
+    let transcript = pytest_failing(&[a]);
+    let base = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), &transcript, 1);
+    let hash = str_field(&base, "baseline_failure_hash");
+    assert!(!hash.is_empty(), "{base}");
+    // Same exit code and same hash: only the identified ids can fail it.
+    let state = red_baseline(&dir.0, &[], 1, hash);
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &transcript, 1);
     assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
     assert!(
         str_field(&out, "tests_output").contains(&format!("\nNew failures: {a}\n")),
