@@ -469,7 +469,7 @@ pub(crate) mod network {
     };
     use crate::mesh::trust::{
         IdentityStanding, InstancePresence, Rule, ServedBy, TRUST_FILE_VERSION, TrustChange,
-        TrustOptions,
+        TrustOptions, TrustRecord,
     };
     use crate::mesh::{destination_address, hex_lower, mesh_config_dir, rfc3339_utc, short};
     use crate::supervisor::mailbox::EnvelopePayload;
@@ -1494,6 +1494,17 @@ pub(crate) mod network {
                     .any(|peer| peer.destination_hash == b_hash)
             })
             .await;
+        }
+
+        /// Node A's trust records less the grant its start seeds for its own identity.
+        fn trust_records_of_others(&self) -> Vec<TrustRecord> {
+            let own = self.node_a.fingerprint();
+            self.node_a
+                .trust()
+                .records()
+                .into_iter()
+                .filter(|record| record.hash != own)
+                .collect()
         }
 
         /// Node B asks node A for its status card as `identity`, sending `body`.
@@ -4978,7 +4989,7 @@ pub(crate) mod network {
 
         assert_eq!(err, timed_out(STATUS_PATH));
         assert_eq!(pair.recorder_a.seen_count(), 0);
-        assert!(pair.node_a.trust().records().is_empty());
+        assert!(pair.trust_records_of_others().is_empty());
         let from = format!(
             "from {} on link",
             &stranger.as_identity().address_hash.to_hex_string()[..8]
@@ -6112,7 +6123,7 @@ pub(crate) mod network {
         assert_eq!(gate.forget_identity(&b_identity).unwrap(), 1);
         assert_eq!(cached_knocks(&pair), 0);
         assert!(gate.tracked_identities().is_empty());
-        assert!(trust.records().is_empty());
+        assert!(pair.trust_records_of_others().is_empty());
 
         let err = b_knocks_a(&pair).await.unwrap_err();
 
@@ -6161,7 +6172,7 @@ pub(crate) mod network {
                 rule: Rule::DefaultClosed,
             }
         );
-        let records = trust.records();
+        let records = pair.trust_records_of_others();
         assert_eq!(records.len(), 1, "{records:#?}");
         assert_eq!(records[0].hash, b_identity);
         assert!(!records[0].all_destinations);
@@ -6254,7 +6265,8 @@ pub(crate) mod network {
             .untrust_identity(slot.as_ref(), &b_identity, false)
             .unwrap();
         assert_eq!(standing, 0);
-        assert!(trust.records().is_empty(), "{:#?}", trust.records());
+        let records = pair.trust_records_of_others();
+        assert!(records.is_empty(), "{records:#?}");
         assert_eq!(
             trust.identity_standing(&b_identity),
             IdentityStanding::Unknown
@@ -6538,7 +6550,8 @@ pub(crate) mod network {
             IdentityStanding::Unknown,
             "lifting the identity block trusts nothing"
         );
-        assert!(trust.records().is_empty(), "{:#?}", trust.records());
+        let records = pair.trust_records_of_others();
+        assert!(records.is_empty(), "{records:#?}");
         assert_eq!(status().await.unwrap_err(), timed_out(STATUS_PATH));
         assert_debug_logged_from(&b_identity[..8], "dropped: unknown identity");
         assert_eq!(cached_knocks(&pair), 0);
