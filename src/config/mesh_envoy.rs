@@ -1069,7 +1069,9 @@ impl EnvoyRunner {
             text: NoticeText::default()
                 .frame("the envoy could not tell ")
                 .peer(card.who.as_str())
-                .frame(format!(" its question was escalated: {why}")),
+                .frame(format!(
+                    " its question was escalated: {why}; `.mesh pending` still lists it for you to answer"
+                )),
             model_note: None,
         });
     }
@@ -6624,7 +6626,9 @@ mod tests {
         assert_eq!(record.id, "live-untold");
         assert!(
             idle.texts().iter().any(|text| {
-                text.contains("could not tell") && text.contains("its question was escalated")
+                text.contains("could not tell")
+                    && text.contains("its question was escalated")
+                    && text.ends_with("; `.mesh pending` still lists it for you to answer")
             }),
             "{:?}",
             idle.texts()
