@@ -940,8 +940,9 @@ mod tests {
 
         /// The functions that put mesh text on the terminal or render it for one, by file:
         /// the free sinks in `src/repl/mesh.rs`, the prompt printer, the stderr fallback
-        /// of `MeshSlot::notify`, the line renderer both of those call, and the REPL's
-        /// two error printers. Each must call a renderer unless it is an unrendered sink.
+        /// of `MeshSlot::notify`, the span renderer every line those two print goes
+        /// through, and the REPL's two error printers. Each must call a renderer unless it
+        /// is an unrendered sink.
         const SINKS: [(&str, &str); 9] = [
             ("src/repl/mesh.rs", "out_text"),
             ("src/repl/mesh.rs", "err_text"),
@@ -949,7 +950,7 @@ mod tests {
             ("src/repl/mesh.rs", "err_path_text"),
             ("src/repl/printer.rs", "notify"),
             ("src/mesh/node.rs", "notify"),
-            ("src/mesh/notify.rs", "render_notification_lines"),
+            ("src/mesh/notify.rs", "render_span"),
             ("src/render/mod.rs", "render_error"),
             ("src/render/mod.rs", "render_command_error"),
         ];

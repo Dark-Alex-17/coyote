@@ -77,7 +77,7 @@ impl NoticeSpan {
         }
     }
 
-    fn render(&self, prefix: CommandPrefix) -> Cow<'_, str> {
+    fn render_span(&self, prefix: CommandPrefix) -> Cow<'_, str> {
         match self {
             Self::Frame(text) => prefix.render_hints(text),
             Self::Peer(text) => Cow::Borrowed(text),
@@ -113,7 +113,7 @@ impl NoticeText {
 
     /// The text with only its frame runs spelled in `prefix`.
     pub(crate) fn render(&self, prefix: CommandPrefix) -> String {
-        self.0.iter().map(|span| span.render(prefix)).collect()
+        self.0.iter().map(|span| span.render_span(prefix)).collect()
     }
 
     fn lines(&self) -> Vec<Vec<NoticeSpan>> {
@@ -280,7 +280,7 @@ impl RenderedNotification {
     pub(crate) fn render_notification_lines(&self, prefix: CommandPrefix) -> Vec<String> {
         self.lines
             .iter()
-            .map(|line| line.iter().map(|span| span.render(prefix)).collect())
+            .map(|line| line.iter().map(|span| span.render_span(prefix)).collect())
             .collect()
     }
 }
