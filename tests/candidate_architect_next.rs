@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 657;
+const SMOKE_FLOOR: usize = 668;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -2536,10 +2536,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![44, 2861, 2870],
+        vec![44, 2910, 2919],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2861, 2870] {
+    for line in [2910, 2919] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -5546,7 +5546,7 @@ fn census_files(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// The README's recorded census is a live `diff -u` against the staging
+/// The README's recorded census is a live `diff --minimal -u` against the staging
 /// tree: the same set of differing files, each with the hunk count it
 /// states. A file only the candidate has is diffed against `/dev/null`, so it
 /// must be listed too; a staging file the candidate lacks fails. The staging
@@ -5582,15 +5582,16 @@ fn readme_census_matches_a_live_diff_against_the_staging_tree() {
         };
         let out = output_with_timeout(
             Command::new("diff")
+                .arg("--minimal")
                 .arg("-u")
                 .arg(base)
                 .arg(candidate_dir().join(rel)),
             GATE_LIMIT,
-            "diff -u",
+            "diff --minimal -u",
         );
         assert!(
             matches!(out.status.code(), Some(0 | 1)),
-            "diff -u {rel}: {}",
+            "diff --minimal -u {rel}: {}",
             transcript(&out)
         );
         let hunks = String::from_utf8_lossy(&out.stdout)
