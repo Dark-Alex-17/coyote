@@ -8640,7 +8640,7 @@ mod broadcast_row_tests {
             ],
         };
 
-        let text = render_broadcast(&outcome);
+        let text = render_broadcast(&outcome).plain();
 
         let expected = format!(
             "  (no name) (aaaaaaaa): delivered\n  (no name) (bbbbbbbb): throttled, not stored: bbbbbbbb refused it: busy. Try again in a minute.\n  (no name) (cccccccc): not stored: The message could not be sent: slow. Try again in a minute\nBulletin {}: 1 delivered, 0 store-and-forward, 0 unreachable, 0 refused, 1 throttled, 1 to retry.",
