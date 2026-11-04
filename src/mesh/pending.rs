@@ -343,7 +343,7 @@ pub(crate) struct InboundRecord {
     pub reason: String,
     /// The envoy memory session the run that escalated this question wrote to, so a
     /// late answer lands there. Empty when memory was off or the record predates it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_thread: String,
 }
 
@@ -351,6 +351,49 @@ impl InboundRecord {
     /// Whether the record is `PENDING_TTL` or more old at `now`.
     pub(crate) fn is_expired(&self, now: SystemTime) -> bool {
         is_stale(&self.received_at, now)
+    }
+}
+
+#[cfg(test)]
+mod session_thread_serde_tests {
+    use super::*;
+
+    fn record(session_thread: &str) -> InboundRecord {
+        InboundRecord {
+            version: 3,
+            id: "m-1".to_string(),
+            peer_destination: "aa".repeat(16),
+            peer_identity: "bb".repeat(16),
+            thread: "t-1".to_string(),
+            question: "may I?".to_string(),
+            envoy_question: String::new(),
+            received_at: "2026-11-02T00:00:00Z".to_string(),
+            kind: InboundKind::default(),
+            paths: Vec::new(),
+            reason: String::new(),
+            session_thread: session_thread.to_string(),
+        }
+    }
+
+    /// A record with no envoy session writes no `session_thread` key, so its line reads
+    /// as it did before the field existed, and both shapes load back unchanged.
+    #[test]
+    fn an_empty_session_thread_is_left_out_of_the_line() {
+        let without = record("");
+        let line = serde_json::to_string(&without).unwrap();
+        assert!(!line.contains("session_thread"), "{line}");
+        assert_eq!(
+            serde_json::from_str::<InboundRecord>(&line).unwrap(),
+            without
+        );
+
+        let with = record("envoy-session-1");
+        let line = serde_json::to_string(&with).unwrap();
+        assert!(
+            line.contains(r#""session_thread":"envoy-session-1""#),
+            "{line}"
+        );
+        assert_eq!(serde_json::from_str::<InboundRecord>(&line).unwrap(), with);
     }
 }
 
@@ -2009,7 +2052,11 @@ mod tests {
         let store = InboundStore::new(&tmp.path, "inst");
         let mut question = serde_json::to_value(inbound("q", t(1_000))).unwrap();
         let fields = question.as_object_mut().unwrap();
-        for placeholder in ["kind", "paths", "reason", "session_thread"] {
+        assert!(
+            !fields.contains_key("session_thread"),
+            "an empty session_thread is not written"
+        );
+        for placeholder in ["kind", "paths", "reason"] {
             assert!(fields.remove(placeholder).is_some());
         }
         assert_eq!(
