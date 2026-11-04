@@ -20,7 +20,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _lib  # noqa: E402
 from _lib import (  # noqa: E402
-    AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP,
+    AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
+    CI_POLL_FAILS, CI_POLL_SLEEP,
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, DRAFT_ROUNDS_MAX,
     GATE1_HOUSE_LINE, GH_CALL_SECS, GH_LOOP_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
@@ -32,7 +33,7 @@ from _lib import (  # noqa: E402
     ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section,
-    raise_escalation, read_artifact, read_file, run_dir_for, save_tasks, set_frontmatter,
+    raise_escalation, read_artifact, read_file, render_question, run_dir_for, save_tasks, set_frontmatter,
     set_task_status, sh, snapshot, tail, task_by_id, task_dir_for, task_section, today, truthy, var,
     write_artifact, write_file,
 )
@@ -437,8 +438,84 @@ def plan_route(state):
     return u
 
 
+def normalize_choices(state, u, item):
+    """`item` with its options cut to an askable multiple choice, the recommended one first; None when it is not askable.
+
+    Several recommended options keep the first; more than CHOICE_OPTIONS_MAX keep the recommended one plus the first
+    others. No recommended option or fewer than CHOICE_OPTIONS_MIN options leaves nothing to ask.
+    """
+    opts = [{"text": str(o.get("text")).strip(), "recommended": truthy(o.get("recommended")),
+             "evidence": str(o.get("evidence") or "").strip()}
+            for o in as_list(item.get("options")) if isinstance(o, dict) and str(o.get("text") or "").strip()]
+    recommended = [i for i, o in enumerate(opts) if o["recommended"]]
+    if len(recommended) > 1:
+        for i in recommended[1:]:
+            opts[i]["recommended"] = False
+        ledger(state, u, f"choice: {len(recommended)} recommended options on {tail(item.get('question', ''), 120)!r}; "
+                         f"kept the first: {opts[recommended[0]]['text']}")
+    if recommended:
+        opts.insert(0, opts.pop(recommended[0]))
+    if len(opts) > CHOICE_OPTIONS_MAX:
+        ledger(state, u, f"choice: {len(opts)} options on {tail(item.get('question', ''), 120)!r}; kept the recommended "
+                         f"one and the first {CHOICE_OPTIONS_MAX - 1} others")
+        opts = opts[:CHOICE_OPTIONS_MAX]
+    if not recommended or len(opts) < CHOICE_OPTIONS_MIN:
+        return None
+    return {**item, "options": opts}
+
+
+def _start_choices(u, kind, queue):
+    u.update({"choice_kind": kind, "choice_queue": queue, "choice_index": 0, "choice_answers": []})
+
+
+def _end_choices(u):
+    u.update({"choice_kind": "", "choice_queue": [], "choice_index": 0, "choice_answers": [], "choice_reframed": False})
+
+
+def _ask_choice(state, u, heading):
+    """Raise the queue's current question as a multiple-choice escalation of the queue's kind."""
+    s = {**state, **u}
+    queue, idx = as_list(s.get("choice_queue")), as_int(s.get("choice_index"))
+    item = queue[idx]
+    return raise_escalation(state, u, escalation(
+        s.get("choice_kind"), f"{heading} {idx + 1} of {len(queue)}: {item['question']}", item["options"],
+        data={"multiple_choice": True, "question": item["question"], "index": idx}))
+
+
+def _choice_pick(text, options):
+    """The option text a reply names ("Option 2", "2", or the option's text), or None."""
+    m = re.match(r"(?i)^\s*option\s+(\d+)\b", text or "")
+    return match_option(m.group(1) if m else text, options)
+
+
+def _record_choice(state, u, answer):
+    """Record the answer to the queue's current question and advance the queue."""
+    esc = as_dict(state.get("escalation"))
+    queue, idx = as_list(state.get("choice_queue")), as_int(state.get("choice_index"))
+    question = queue[idx]["question"] if idx < len(queue) else as_dict(esc.get("data")).get("question", "")
+    picked = _choice_pick(answer, esc.get("options") or [])
+    entry = {"question": question, "answer": picked or answer.strip(), "via": "option" if picked else "other"}
+    u["choice_answers"] = list(as_list(state.get("choice_answers"))) + [entry]
+    u["choice_index"] = idx + 1
+    ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} answered ({entry['via']}): "
+                     f"{tail(entry['answer'], 200)}")
+
+
 def open_questions_gate(state):
     u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "design_round" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, f"Design frontier round {as_int(state.get('design_rounds'))}, question")
+        answers = as_list(state.get("choice_answers"))
+        u["pending_amendments"] = ["Design round answers (apply each to the plan, resolving its Open question):\n"
+                                   + "\n".join(f"{i}. {a.get('question')}\n   Answer: {a.get('answer')}"
+                                               for i, a in enumerate(answers, 1))]
+        u["open_questions"] = []
+        _end_choices(u)
+        ledger(state, u, f"design: round {as_int(state.get('design_rounds'))} answered ({len(answers)} question(s)) -> amend_plan")
+        u["_next"] = "amend_plan"
+        return u
     qs = [q for q in as_list(state.get("open_questions")) if isinstance(q, dict) and q.get("question")]
     if not qs:
         u["_next"] = "quality_bar_gate"
@@ -456,19 +533,55 @@ def open_questions_gate(state):
         u["open_questions"] = []
         u["_next"] = "quality_bar_gate"
         return u
-    lines, opts = [], []
-    for i, q in enumerate(qs, 1):
-        lines.append(f"{i}. {q['question']}")
-        for o in as_list(q.get("options")):
-            if isinstance(o, dict):
-                mark = " (recommended)" if o.get("recommended") else ""
-                ev = f" -- {o.get('evidence')}" if o.get("evidence") else ""
-                lines.append(f"   - {o.get('text', '')}{mark}{ev}")
+    askable, invalid = [], []
+    for q in qs:
+        n = normalize_choices(state, u, q)
+        (askable if n else invalid).append(n or q)
+    if invalid and not truthy(state.get("choice_reframed")):
+        u.update({"choice_reframed": True, "choice_invalid": invalid, "framed_questions": []})
+        ledger(state, u, f"design: {len(invalid)} question(s) lack {CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} options with "
+                         "exactly one recommended -> one re-frame")
+        u["_next"] = "frame_questions"
+        return u
+    scope = [q for q in invalid if truthy(q.get("changes_scope"))]
+    if scope:
+        u["failure_reason"] = ("an open design question changes scope and could not be framed as a multiple choice "
+                               f"({CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} options, exactly one recommended) even after a "
+                               f"re-frame: {scope[0]['question']}")
+        ledger(state, u, u["failure_reason"])
+        u["_next"] = "end_blocked"
+        return u
+    if invalid:
+        ledger(state, u, f"design: {len(invalid)} non-scope question(s) not askable as a multiple choice after a re-frame; "
+                         "carried as plan Open questions")
+    if not askable:
+        u["open_questions"] = []
+        _end_choices(u)
+        u["_next"] = "quality_bar_gate"
+        return u
     u["design_rounds"] = rounds + 1
-    return raise_escalation(state, u, escalation(
-        "design_round",
-        f"Design frontier round {rounds + 1}: answer each numbered question (a number alone takes its recommended option).\n"
-        + "\n".join(lines), [], evidence="", data={"questions": qs}))
+    _start_choices(u, "design_round", askable)
+    return _ask_choice(state, u, f"Design frontier round {rounds + 1}, question")
+
+
+def frame_questions_route(state):
+    u = {}
+    harvest_anomalies(state, u, "frame_questions")
+    note_script_error(state, u, "frame_questions")
+    invalid = as_list(state.get("choice_invalid"))
+    framed = [q for q in as_list(state.get("framed_questions")) if isinstance(q, dict) and q.get("question")]
+    if len(framed) == len(invalid):
+        # the re-frame may not drop a scope flag, or a scope-changing question would slip past the hard stop
+        framed = [{**f, "changes_scope": truthy(f.get("changes_scope")) or truthy(o.get("changes_scope"))}
+                  for f, o in zip(framed, invalid)]
+        ledger(state, u, f"design: re-framed {len(framed)} question(s)")
+    else:
+        ledger(state, u, f"design: the re-frame returned {len(framed)} question(s) for {len(invalid)}; kept the originals")
+        framed = invalid
+    kept = [q for q in as_list(state.get("open_questions")) if q not in invalid]
+    u.update({"open_questions": kept + framed, "choice_invalid": [], "framed_questions": []})
+    u["_next"] = "open_questions_gate"
+    return u
 
 
 def quality_bar_gate(state):
@@ -2247,10 +2360,13 @@ def consult_route(state):
     return u
 
 
-_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed", "draft_confirm": "confirm_draft"}
+_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed", "draft_confirm": "confirm_draft",
+                     "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
 
 
 def _terminal_prompt(esc):
+    if as_dict(esc.get("data")).get("multiple_choice"):
+        return _TERMINAL_PROMPTS.get(f"choice_{len(esc.get('options') or [])}", "ask_user")
     return _TERMINAL_PROMPTS.get(esc.get("kind"), "ask_user")
 
 
@@ -2322,12 +2438,17 @@ def parse_answer(state):
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
-    free_text_kinds = ("design_round", "leak_question", "checklist_accept", "need_design_doc")
+    free_text_kinds = ("leak_question", "checklist_accept", "need_design_doc")
     if esc.get("kind") == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
     elif esc.get("kind") == "seed_confirm" and _typed_doc_path(text):
         choice = text
+    elif as_dict(esc.get("data")).get("multiple_choice"):
+        choice = _choice_pick(text, options)
+        if choice is None and text:
+            u["_next"] = "classify_reply"
+            return u
     else:
         choice = text if esc.get("kind") in free_text_kinds else match_option(text, options)
     if choice is None:
@@ -2342,6 +2463,36 @@ def parse_answer(state):
     u.update({"last_answer": choice, "last_answer_text": text, "parked": ""})
     ledger(state, u, f"decision: {esc.get('kind')}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
+    return u
+
+
+def choice_reply_route(state):
+    u = {}
+    harvest_anomalies(state, u, "classify_reply")
+    note_script_error(state, u, "classify_reply")
+    esc = as_dict(state.get("escalation"))
+    text = (state.get("last_answer_text") or "").strip()
+    kind = state.get("reply_kind") or ""
+    reason = tail(state.get("reply_reason") or "", 200)
+    u.update({"reply_kind": "", "reply_reason": ""})
+    if kind == "answer" and text:
+        u.update({"last_answer": text, "last_answer_text": text, "parked": ""})
+        ledger(state, u, f"decision: {esc.get('kind')}: {tail(text, 300)} (typed reply classified as an answer: {reason})")
+        u["_next"] = "apply_answer"
+        return u
+    verdict = "a discussion" if kind == "discussion" else "unclassified (the classifier gave no verdict)"
+    ledger(state, u, f"choice: {esc.get('kind')}: typed reply is {verdict}: {reason} -> re-ask")
+    u["_next"] = "choice_reask"
+    return u
+
+
+def choice_reask(state):
+    u = {}
+    esc = as_dict(state.get("escalation"))
+    reply = tail((state.get("last_answer_text") or "").strip(), 200)
+    u["ask_question"] = (f"Your reply ({reply!r}) reads as a question or a discussion, not an answer: pick an option or "
+                         "type your answer.\n\n" + render_question(esc))
+    u["_next"] = _terminal_prompt(esc)
     return u
 
 
@@ -2445,11 +2596,8 @@ def apply_answer(state):
             u["design_doc_path"] = os.path.abspath(p)
         u["_next"] = "orient_read"
     elif kind == "design_round":
-        qs = as_list(as_dict(esc.get("data")).get("questions"))
-        u["pending_amendments"] = [f"Design round answers (apply each to the plan, resolving its Open question):\nQuestions:\n"
-                                   + "\n".join(f"{i}. {q.get('question')}" for i, q in enumerate(qs, 1)) + f"\nAnswers:\n{answer}"]
-        u["open_questions"] = []
-        u["_next"] = "amend_plan"
+        _record_choice(state, u, answer)
+        u["_next"] = "open_questions_gate"
     elif kind == "quality_bar":
         d = as_dict(esc.get("data"))
         rigor = (re.search(r"rigor\s*=\s*([\w-]+)", answer) or [None, d.get("rigor", "production")])[1]
@@ -4064,6 +4212,7 @@ GATES = {
     "research_dispatch": research_dispatch, "explore_fault": explore_fault, "archivist_fault": archivist_fault,
     "librarian_fault": librarian_fault, "checklist_fault": checklist_fault, "plan_route": plan_route,
     "open_questions_gate": open_questions_gate, "quality_bar_gate": quality_bar_gate, "record_quality_bar": record_quality_bar,
+    "frame_questions_route": frame_questions_route,
     "checklist_gate": checklist_gate, "checklist_round": checklist_round,
     "reseal_gate": reseal_gate, "gate1_build": gate1_build, "gate1_route": gate1_route, "leak_route": leak_route,
     "gate2_build": gate2_build, "gate2_route": gate2_route, "autonomy_gate": autonomy_gate, "reseal_return": reseal_return,
@@ -4078,6 +4227,7 @@ GATES = {
     "batch_gauntlet_build": batch_gauntlet_build, "batch_fix_route": batch_fix_route, "batch_close": batch_close,
     "escalate_gate": escalate_gate, "ladder_route": ladder_route, "consult_route": consult_route, "ask_dispatch": ask_dispatch,
     "ask_owner_poll": ask_owner_poll, "ask_owner_route": ask_owner_route, "parse_answer": parse_answer, "apply_answer": apply_answer,
+    "choice_reply_route": choice_reply_route, "choice_reask": choice_reask,
     "phase_f_gate": phase_f_gate, "integration_check": integration_check, "integrate_route": integrate_route,
     "hygiene_create": hygiene_create, "stack_gate_final": stack_gate_final, "pr_body": pr_body, "open_pr": open_pr,
     "pr_round_comments": pr_round_comments, "ci_poll": ci_poll, "ci_route": ci_route, "ci_evidence": ci_evidence, "ci_apply": ci_apply,

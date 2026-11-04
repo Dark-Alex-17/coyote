@@ -4223,8 +4223,8 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 
 /// Every integer field of every node in the shipped baseline (`timeout`,
 /// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
-/// plus the frozen budgets row, the review watch nodes and `draft_brief`; a
-/// node absent here declares none.
+/// plus the frozen budgets row, the review watch nodes, `draft_brief`,
+/// `classify_reply` and `frame_questions`; a node absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -4249,6 +4249,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("ci_evidence", "timeout", 390),
     ("ci_poll", "timeout", 180),
     ("claim_task", "timeout", 600),
+    ("classify_reply", "timeout", 120),
     ("compose_delegation", "timeout", 60),
     ("consult_navigator", "max_attempts", 1),
     ("consult_navigator", "timeout", 1800),
@@ -4264,6 +4265,8 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("final_report", "timeout", 300),
     ("finish_plan", "timeout", 600),
     ("flip_ready", "timeout", 390),
+    ("frame_questions", "max_iterations", 10),
+    ("frame_questions", "timeout", 600),
     ("gate1", "max_attempts", 2),
     ("gate1", "timeout", 3600),
     ("gate2", "max_attempts", 2),
@@ -4328,6 +4331,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "amend_cycles",
     "author_retries",
     "body_fix_rounds",
+    "choice_index",
     "ci_poll_fails",
     "ci_polls",
     "ci_polls_run",
@@ -4357,6 +4361,8 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// value the module computes from it.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("AMEND_CYCLES_MAX", "", "3", 3),
+    ("CHOICE_OPTIONS_MAX", "", "4", 4),
+    ("CHOICE_OPTIONS_MIN", "", "2", 2),
     ("CI_FLAKE_RERUNS", "", "2", 2),
     ("CI_MAX_ROUNDS", "", "CI_WALL_SECS // CI_POLL_SLEEP", 240),
     ("CI_POLL_FAILS", "", "3", 3),
@@ -4698,9 +4704,9 @@ fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
 }
 
 /// How each llm node's output schema carries the `anomalies` channel in the
-/// staging baseline plus `review_triage` and `draft_brief`: `Plain` is the
-/// optional string-array property, `NoSchema` is a node with no
-/// `output_schema` at all.
+/// staging baseline plus `review_triage`, `draft_brief`, `classify_reply` and
+/// `frame_questions`: `Plain` is the optional string-array property,
+/// `NoSchema` is a node with no `output_schema` at all.
 #[derive(Clone, Copy, Debug)]
 enum AnomaliesChannel {
     Plain,
@@ -4713,7 +4719,9 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("author_plan", AnomaliesChannel::Plain),
     ("batch_triage", AnomaliesChannel::Plain),
     ("ci_diagnose", AnomaliesChannel::Plain),
+    ("classify_reply", AnomaliesChannel::Plain),
     ("draft_brief", AnomaliesChannel::Plain),
+    ("frame_questions", AnomaliesChannel::Plain),
     ("integrate_findings", AnomaliesChannel::Plain),
     ("ladder_judge", AnomaliesChannel::Plain),
     ("orient_read", AnomaliesChannel::Plain),

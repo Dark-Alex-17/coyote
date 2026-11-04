@@ -28,6 +28,8 @@ STRIKE_LIMIT = 3          # 3-strike family (B1, B5, B14, B16, B18, B22)
 RERUN_ONCE = 1            # re-run-once family (B3 retry, B4, B6, B9-B13, B17, B23)
 AMEND_CYCLES_MAX = 3      # A1: amendment cycles per run
 DESIGN_ROUNDS_MAX = STRIKE_LIMIT
+CHOICE_OPTIONS_MIN = 2    # a multiple-choice question offers 2-4 options, one recommended
+CHOICE_OPTIONS_MAX = 4
 DRAFT_ROUNDS_MAX = STRIKE_LIMIT  # redrafts of an LLM-drafted brief before asking for a design doc
 CONFLICT_CYCLES_MAX = 2   # Phase E parallel integration: "two failed conflict cycles -> STOP"
 WAVE_CAP = 3              # Phase E parallel eligibility: "cap concurrent code tasks at 3"
@@ -287,6 +289,7 @@ STATE_KEYS = (
     "autonomous_digest", "decisions", "follow_ups", "rejected_findings", "deferred_findings", "skipped_reviews",
     "design_decisions", "hygiene_items", "anomalies_log", "closeout_scope", "verification_commands",
     "quality_rigor", "quality_surfaces", "round_log",
+    "choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed",
 )
 
 
@@ -379,7 +382,15 @@ def render_question(esc):
     if esc.get("evidence"):
         lines += ["", "Evidence:", esc["evidence"].strip()]
     opts = esc.get("options") or []
-    if opts:
+    if opts and as_dict(esc.get("data")).get("multiple_choice"):
+        lines.append("")
+        for i, o in enumerate(opts):
+            lines.append(f"{choice_label(i)}: {o.get('text', '')}")
+            if o.get("evidence"):
+                lines.append(f"    Evidence: {o['evidence']}")
+        lines += ["", 'Pick an option, or choose "Other (custom)" to type your own answer or to start a discussion '
+                      "about this question."]
+    elif opts:
         lines += ["", "Options:"]
         for i, o in enumerate(opts, 1):
             mark = " (recommended)" if o.get("recommended") else ""
@@ -387,6 +398,11 @@ def render_question(esc):
             lines.append(f"  {i}) {o.get('text', '')}{mark}{ev}")
         lines += ["", "Reply with a number or free text."]
     return "\n".join(lines).strip()
+
+
+def choice_label(index):
+    """The static approval-node label of a multiple-choice option; the recommended one is always first."""
+    return "Option 1 (recommended)" if index == 0 else f"Option {index + 1}"
 
 
 def raise_escalation(state, updates, esc):

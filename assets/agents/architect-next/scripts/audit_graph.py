@@ -26,7 +26,7 @@ AGENT_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(o
 # Node -> bound id(s) (the named loop bounds). A cycle is legal
 # only if it passes through at least one of these nodes.
 BOUNDED = {
-    "open_questions_gate": "B1 design_rounds<=3",
+    "open_questions_gate": "B1 design_rounds<=3 / re-frame once per round (choice_reframed) / choice_index list-bounded",
     "reseal_gate": "B2 amend_cycles<=3 (A1)",
     "gate1_route": "B3 same-leak retry once (A1) / FRICTION seal",
     "plan_route": "B4 author_retries<=1",
@@ -47,6 +47,7 @@ BOUNDED = {
     "review_apply": "review fix rounds<=3 per PR",
     "ask_owner_route": "B21 owner_polls<=2",
     "parse_answer": "B22 reask_rounds<=3",
+    "choice_reask": "user-driven: every pass waits on the owner's next reply",
     "wave_integrate": "wave_index list-bounded",
     "task_done_route": "batch closed once (batch_state.passed)",
     "checklist_gate": "checklist_done list-bounded",

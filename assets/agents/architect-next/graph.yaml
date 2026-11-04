@@ -192,6 +192,13 @@ initial_state:
   acceptance_criteria: []
   open_questions: []
   design_rounds: 0
+  choice_kind: ''
+  choice_queue: []
+  choice_index: 0
+  choice_answers: []
+  choice_reframed: false
+  choice_invalid: []
+  framed_questions: []
   author_retries: 0
   author_defects: ''
   rigor_proposal: ''
@@ -315,6 +322,8 @@ initial_state:
   owner_poll_result: ''
   owner_polls: 0
   reask_rounds: 0
+  reply_kind: ''
+  reply_reason: ''
   autonomous_digest: []
   autonomous_kinds: []
   # --- phase F ---
@@ -869,9 +878,11 @@ nodes:
       - acceptance_criteria: every acceptance criterion you wrote (flat list; in
         micro mode each must be an executable command).
       - open_questions: the design's genuinely open questions you could NOT settle
-        from the doc or the findings, each with 2-4 options, exactly one
-        recommended with its evidence, and changes_scope=true when the answer
-        changes the plan's scope (grilling frontier-round shape).
+        from the doc or the findings, each with 2-4 options of which exactly one
+        is recommended (recommended=true, listed first, with its evidence), and
+        changes_scope=true when the answer changes the plan's scope (grilling
+        frontier-round shape). Each question is asked on its own as a multiple
+        choice; a question without exactly one recommended option is re-framed.
       - rigor_proposal (poc|prototype|production) + surfaces_proposal (comma list;
         `other:<label>` for surfaces needing a best-practice checklist) +
         quality_evidence: the design doc signals behind the proposal.
@@ -952,8 +963,76 @@ nodes:
   open_questions_gate:
     id: open_questions_gate
     type: script
-    description: Grilling frontier rounds as ONE escalation per round (B1 - 3 rounds); an unresolved scope-changing question is a hard stop.
+    description: >-
+      Grilling frontier rounds (B1 - 3 rounds), each a queue of multiple-choice
+      escalations, one per question, recommended option first; questions that are not
+      askable get one re-frame per round; the answered queue becomes one amendment;
+      an unresolved scope-changing question is a hard stop.
     script: scripts/open_questions_gate.py
+    fallback: end_failure
+
+  frame_questions:
+    id: frame_questions
+    type: llm
+    description: Re-frame open questions that are not askable as a multiple choice (2-4 options, exactly one recommended), once per round.
+    instructions: |
+      Each design question below cannot be asked as a multiple choice yet: a
+      question needs 2-4 options, and exactly one of them recommended. Read the
+      plan (and the design doc where it helps) and re-frame each question:
+      - Keep the question text, its meaning and its changes_scope flag.
+      - Give 2-4 concrete options a user can pick from.
+      - Mark exactly one option recommended=true, list it first, and give its
+        evidence (the plan, the design doc or the code); give evidence for the
+        others where you have it.
+      Return framed_questions: every question below, in the same order. You read;
+      you never edit files. anomalies: anything outside this step's job someone
+      should know; empty is the normal case.
+    prompt: |
+      ## Plan
+      {{plan_path}}
+
+      ## Design doc
+      {{design_doc_path}}
+
+      ## Questions to re-frame
+      {{choice_invalid}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls]
+    max_iterations: 10
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        framed_questions:
+          type: array
+          items:
+            type: object
+            properties:
+              question: { type: string }
+              options:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    text: { type: string }
+                    recommended: { type: boolean }
+                    evidence: { type: string }
+                  required: [text]
+              changes_scope: { type: boolean }
+            required: [question]
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [framed_questions]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: frame_questions_route
+    next: frame_questions_route
+
+  frame_questions_route:
+    id: frame_questions_route
+    type: script
+    description: Put the re-framed questions back into open_questions (the originals when the re-frame failed or dropped one); back to the gate.
+    script: scripts/frame_questions_route.py
     fallback: end_failure
 
   quality_bar_gate:
@@ -1900,6 +1979,124 @@ nodes:
     state_updates:
       last_answer: '{{choice}}'
       last_answer_text: '{{choice}}'
+
+  ask_choice_2:
+    id: ask_choice_2
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with two options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label. The engine's own "Other (custom)" choice goes to classify_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+    on_other: classify_reply
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  ask_choice_3:
+    id: ask_choice_3
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with three options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label. The engine's own "Other (custom)" choice goes to classify_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+      - 'Option 3'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+      'Option 3': parse_answer
+    on_other: classify_reply
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  ask_choice_4:
+    id: ask_choice_4
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with four options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label. The engine's own "Other (custom)" choice goes to classify_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+      - 'Option 3'
+      - 'Option 4'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+      'Option 3': parse_answer
+      'Option 4': parse_answer
+    on_other: classify_reply
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  classify_reply:
+    id: classify_reply
+    type: llm
+    description: Decide whether text typed at a multiple-choice prompt answers the question or opens a discussion; unclear is a discussion.
+    instructions: |
+      A user was asked one multiple-choice question and typed their own text
+      instead of picking an option. Decide what the text is:
+      - answer: the text settles the question. It may pick or adapt one of the
+        options, or give a different answer outright.
+      - discussion: the text asks a question, asks for context, wants to talk
+        the options through, is unsure, or is anything else.
+      When in doubt, it is a discussion. Never answer the question yourself.
+      Output reply_kind, reply_reason (one line), and anomalies (anything
+      outside this step's job someone should know; empty is the normal case).
+    prompt: |
+      ## Question and options
+      {{ask_question}}
+
+      ## The user's text
+      {{last_answer_text}}
+    tools: []
+    timeout: 120
+    output_schema:
+      type: object
+      properties:
+        reply_kind:
+          type: string
+          enum: [answer, discussion]
+        reply_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [reply_kind]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: choice_reply_route
+    next: choice_reply_route
+
+  choice_reply_route:
+    id: choice_reply_route
+    type: script
+    description: An answer is recorded through apply_answer; a discussion, an unclear reply or a classifier fault re-asks the question.
+    script: scripts/choice_reply_route.py
+    fallback: end_failure
+
+  choice_reask:
+    id: choice_reask
+    type: script
+    description: Re-ask the same multiple-choice question with a one-line note that the reply read as a discussion.
+    script: scripts/choice_reask.py
+    fallback: end_failure
 
   parse_answer:
     id: parse_answer
