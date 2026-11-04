@@ -2061,7 +2061,7 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let out = OutboundPeer::new(PeerKind::Bulletin, outgoing.text, None, None, None)?;
     let outcome = runtime.broadcast(&out).await?;
-    out_text(&render_broadcast(&outcome));
+    out_path_text(&render_broadcast(&outcome).render(live_prefix()));
     Ok(())
 }
 
@@ -8014,50 +8014,52 @@ fn render_pending(
     sections.join("\n\n")
 }
 
-fn render_broadcast(outcome: &BroadcastOutcome) -> String {
+/// The peers' names and their owners' remedies are quoted as they stand; the counts and
+/// this node's own hints follow the prefix.
+fn render_broadcast(outcome: &BroadcastOutcome) -> NoticeText {
     if outcome.recipients.is_empty() {
-        return "No trusted peer has a known path right now; nothing was sent. `.mesh peers` lists what this node has heard from.".to_string();
+        return "No trusted peer has a known path right now; nothing was sent. `.mesh peers` lists what this node has heard from.".into();
     }
     let (mut delivered, mut stored, mut unreachable, mut refused) = (0, 0, 0, 0);
-    let mut lines = Vec::with_capacity(outcome.recipients.len() + 1);
+    let mut report = NoticeText::default();
     for recipient in &outcome.recipients {
         let status = match &recipient.outcome {
             RecipientOutcome::Delivered => {
                 delivered += 1;
-                "delivered".to_string()
+                NoticeText::from("delivered")
             }
             RecipientOutcome::StoreAndForward => {
                 stored += 1;
-                "store-and-forward".to_string()
+                NoticeText::from("store-and-forward")
             }
             RecipientOutcome::Unreachable { reason } => {
                 unreachable += 1;
-                format!("unreachable: {reason}")
+                NoticeText::from(format!("unreachable: {reason}"))
             }
             RecipientOutcome::Refused { reason } => {
                 refused += 1;
-                format!("refused: {reason}")
+                NoticeText::from(format!("refused: {reason}"))
             }
             RecipientOutcome::NotTrustedByPeer(refusal) => {
                 refused += 1;
-                refusal.to_string()
+                NoticeText::default().peer(refusal.to_string())
             }
             RecipientOutcome::NoAnswer(no_answer) => {
                 refused += 1;
-                no_answer.to_string()
+                NoticeText::default().peer(no_answer.to_string())
             }
         };
-        lines.push(format!(
-            "  {} ({}): {status}",
-            name_label(recipient.display_name.as_deref()),
-            short(&recipient.destination)
-        ));
+        report = report
+            .frame("  ")
+            .peer(name_label(recipient.display_name.as_deref()))
+            .frame(format!(" ({}): ", short(&recipient.destination)))
+            .then(status)
+            .frame("\n");
     }
-    lines.push(format!(
+    report.frame(format!(
         "Bulletin {}: {delivered} delivered, {stored} store-and-forward, {unreachable} unreachable, {refused} refused.",
         short(&outcome.id)
-    ));
-    lines.join("\n")
+    ))
 }
 
 #[cfg(test)]
@@ -12240,7 +12242,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             id: "b1".repeat(16),
             recipients: vec![],
         };
-        assert!(render_broadcast(&nobody).starts_with("No trusted peer has a known path"));
+        assert!(
+            render_broadcast(&nobody)
+                .plain()
+                .starts_with("No trusted peer has a known path")
+        );
 
         let outcome = BroadcastOutcome {
             id: "b1".repeat(16),
@@ -12270,7 +12276,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 ),
             ],
         };
-        let text = render_broadcast(&outcome);
+        let text = render_broadcast(&outcome).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 7, "{text}");
         assert_eq!(lines[0], format!("  Ann ({}): delivered", "ab".repeat(4)));
@@ -12295,6 +12301,48 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "b1".repeat(4)
             )
         );
+    }
+
+    mod broadcast_prefix_tests {
+        use super::*;
+        use crate::mesh::request::NoAnswer;
+
+        #[test]
+        fn peer_names_and_their_owners_remedies_keep_their_dots_under_slash() {
+            let own = "0a".repeat(16);
+            let refusal = RemoteRefusal::new(&"ab".repeat(16), Some(".info Bea"), own.clone());
+            let no_answer = NoAnswer::new(&"cd".repeat(16), own.clone());
+            let outcome = BroadcastOutcome {
+                id: "b1".repeat(16),
+                recipients: vec![
+                    recipient(
+                        Some(".info Bea"),
+                        RecipientOutcome::NotTrustedByPeer(refusal.clone()),
+                    ),
+                    recipient(Some(".session"), RecipientOutcome::NoAnswer(no_answer.clone())),
+                ],
+            };
+            let text = render_broadcast(&outcome).render(CommandPrefix::Slash);
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(
+                lines[0].starts_with(&format!("  .info Bea (abababab): {refusal}")),
+                "{text}"
+            );
+            assert!(lines[0].contains(&format!("run .mesh trust {own}")), "{text}");
+            assert!(
+                lines[1].starts_with(&format!("  .session (abababab): {no_answer}")),
+                "{text}"
+            );
+            let nobody = BroadcastOutcome {
+                id: "b1".repeat(16),
+                recipients: vec![],
+            };
+            assert!(
+                render_broadcast(&nobody)
+                    .render(CommandPrefix::Slash)
+                    .contains("`/mesh peers` lists"),
+            );
+        }
     }
 
     #[test]
