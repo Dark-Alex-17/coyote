@@ -7020,11 +7020,7 @@ pub(crate) mod network {
             assert_eq!(notes.len(), 1, "{notes:#?}");
             let text = notes[0].text.plain();
             assert!(text.starts_with("error: "), "{text}");
-            assert!(
-                text.contains("is refused when it asks"),
-                "{}",
-                notes[0].text
-            );
+            assert!(text.contains("is refused when it asks"), "{text}");
         }
         let marked = pair
             .node_a
