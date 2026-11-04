@@ -1624,3 +1624,140 @@ fn collect(rx: mpsc::Receiver<Vec<u8>>) -> (Vec<u8>, bool) {
         Err(mpsc::RecvTimeoutError::Disconnected) => panic!("drain thread died before EOF"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The bash helpers refused as a tool's FIRST act under the UI, in the shape
+// a host captures a tool in: stdout and stderr are files (pipes), stdin is
+// closed, and the controlling terminal is the UI's own screen.
+// ---------------------------------------------------------------------------
+
+/// Runs a `set -e` bash tool whose body is `body` under `COYOTE_UI=tui`
+/// with no reply channel, stdout and stderr captured to files, from `dir`
+/// as the working directory. Returns the wrapper's transcript (which ends
+/// with the captured stderr) and the raw terminal bytes, after asserting
+/// the tool ended non-zero within a few seconds with nothing on stdout
+/// and exactly one stderr line, the refusal.
+fn run_tool_refused_as_its_first_act(scenario: &str, body: &str) -> (String, Vec<u8>) {
+    let dir = fresh_config_dir(scenario);
+    let _guard = TempDirGuard(dir.clone());
+    let tool = dir.join("tool.sh");
+    fs::write(
+        &tool,
+        format!(
+            "#!/usr/bin/env bash\nset -e\nsource \"{HELPER}\"\n{body}\necho \"tool-finished\"\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "cd '{dir}'; exec </dev/null; '{tool}' >out 2>err; rc=$?; \
+             echo \"tool-rc=$rc stdout-bytes=$(wc -c <out | tr -d ' ') stderr-lines=$(wc -l <err | tr -d ' ')\"; \
+             echo \"stderr: $(cat err)\"; \
+             echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done",
+            dir = dir.display(),
+            tool = tool.display()
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let started = Instant::now();
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty
+        .wait_for("tty-probe-done", PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!("the tool never came back (spinning or reading the tty?): {e:?}")
+        });
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the refusal took {took:?}:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("tool-rc=1 stdout-bytes=0 stderr-lines=1"),
+        "not a one-line refusal with a non-zero exit and empty stdout:\n{transcript}"
+    );
+    assert!(
+        transcript.contains(&format!("stderr: {TUI_NO_CHANNEL}")),
+        "the one stderr line is not the refusal:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("tool-finished"),
+        "the tool ran on past the refused helper:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("(y/N)"),
+        "the terminal was asked:\n{transcript}"
+    );
+    assert!(!transcript.contains("coyote_prompt"), "{transcript}");
+    let raw = pty.raw().to_vec();
+    assert!(
+        !raw.windows(4).any(|w| w == b"\x1b[6n"),
+        "the helper queried the cursor on the UI's terminal:\n{transcript}"
+    );
+    (transcript, raw)
+}
+
+/// A tool whose first act is `range` (the helper with a cursor query and a
+/// key loop in subshells) ends at once under the UI: exit 1, one stderr
+/// line, empty stdout, no question painted, no cursor query, no spin.
+#[test]
+fn under_the_tui_a_tool_whose_first_act_is_range_ends_at_once_with_one_stderr_line() {
+    let (transcript, _) = run_tool_refused_as_its_first_act(
+        "tool-range",
+        "v=\"$(range \"Count? tui-range-tool-r9\" 1 3 9)\"\necho \"value=$v\"",
+    );
+    assert!(
+        !transcript.contains("Count?"),
+        "the range question was painted on the terminal:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("value="),
+        "range handed the tool a value:\n{transcript}"
+    );
+}
+
+/// `guard_operation` called directly (not in a command substitution) as
+/// the tool's first act: the tool ends with exit 1 before any `(y/N)`
+/// could reach the UI's screen, and the guarded operation never runs.
+#[test]
+fn under_the_tui_a_tool_whose_first_act_is_guard_operation_refuses_with_one_stderr_line() {
+    let (transcript, _) = run_tool_refused_as_its_first_act(
+        "tool-guard-op",
+        "guard_operation \"Really wipe it? tui-guard-op-r9\"\necho \"continued\"",
+    );
+    assert!(
+        !transcript.contains("Really wipe it?"),
+        "the guard's question was painted on the terminal:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("continued"),
+        "the guard let the operation through:\n{transcript}"
+    );
+}
+
+/// `guard_path` on a path outside the working directory, the case that
+/// asks: under the UI it refuses as its first act, exit 1, one stderr
+/// line, no question on the screen, and the operation never runs.
+#[test]
+fn under_the_tui_a_tool_whose_first_act_is_guard_path_refuses_with_one_stderr_line() {
+    let (transcript, _) = run_tool_refused_as_its_first_act(
+        "tool-guard-path",
+        "guard_path /etc/hosts \"Touch hosts? tui-guard-path-r9\"\necho \"continued\"",
+    );
+    assert!(
+        !transcript.contains("Touch hosts?"),
+        "the guard's question was painted on the terminal:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("continued"),
+        "the guard let the operation through:\n{transcript}"
+    );
+}

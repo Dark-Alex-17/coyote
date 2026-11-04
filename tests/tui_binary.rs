@@ -6205,3 +6205,383 @@ fn headless_install_with_a_conflicting_mcp_server_is_refused_naming_a_terminal()
     );
     assert_tty_restored(&transcript);
 }
+
+// ---------------------------------------------------------------------------
+// A file-writing loader that reads stdin under the plain REPL, escapes
+// and format characters in a typed line and in an error notice, and late
+// output arriving once the exit has begun.
+// ---------------------------------------------------------------------------
+
+/// A `$2` loader (the file-writing branch) that copies `$1` to `$2` and
+/// then reads its stdin to the end, the way a filter that is handed a
+/// closed stdin returns at once and one handed the terminal waits for a
+/// key the user never types.
+fn file_loader_reading_stdin(dir: &Path) -> PathBuf {
+    let script = dir.join("file-loader-stdin.sh");
+    fs::write(&script, "#!/usr/bin/env bash\ncat \"$1\" > \"$2\"\ncat -\n").unwrap();
+    script
+}
+
+/// `.file <doc>` in the plain REPL on a tty, through a `$2` loader whose
+/// process reads stdin after writing its output: the loader is spawned
+/// with stdin closed on this branch too, so the command returns at once
+/// (no key is typed), the document reaches the model and the reply is
+/// printed; `.exit` then leaves the tty cooked.
+#[test]
+#[serial]
+fn dot_file_through_a_file_loader_reading_stdin_returns_at_once_in_the_plain_repl() {
+    let dir = fresh_config_dir("file-loader-stdin-repl");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text("loaded document reply r9f".to_string())]);
+    let script = file_loader_reading_stdin(&dir);
+    write_fake_llm_config_with(
+        &dir,
+        &fake,
+        &format!(
+            "document_loaders:\n\x20 catstdinfile: 'bash {} $1 $2'\n",
+            script.display()
+        ),
+    );
+    let document = dir.join("doc.catstdinfile");
+    fs::write(&document, "document body r9f-body\n").unwrap();
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    // Type only once the line editor owns the terminal: input ahead of
+    // the prompt is cooked-mode typeahead the editor discards.
+    pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    pty.send(format!(".file '{}' -- summarize\r", document.display()).as_bytes())
+        .unwrap();
+    let transcript = wait_for_squeezed(
+        &mut pty,
+        "loaded document reply r9f",
+        "the reply after the file loader (is the loader waiting on the terminal's stdin?)",
+    );
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(15),
+        "the loader took {took:?} to come back:\n{transcript}"
+    );
+    assert_eq!(
+        fake.served(),
+        1,
+        "the document never reached the model:\n{transcript}"
+    );
+    // Let the reply finish printing and the prompt come back before
+    // typing the next command.
+    pty.wait_for_after(
+        "fake-model)>",
+        pty.raw().len().saturating_sub(64),
+        PTY_DEADLINE,
+    )
+    .expect("the prompt did not come back after the reply");
+    pty.read_for(Duration::from_millis(300));
+    let exit_started = std::time::Instant::now();
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty
+        .wait_for("tty-probe-done", PTY_DEADLINE * 2)
+        .unwrap_or_else(|e| {
+            panic!(
+                "the REPL did not exit (after {:?}): {e:?}",
+                exit_started.elapsed()
+            )
+        });
+    eprintln!("repl exit took {:?}", exit_started.elapsed());
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A line carrying a colour SGR, a zero-width space and an OSC 8
+/// hyperlink, as pasted text would.
+const ESCAPED_WORDS: &[u8] =
+    b"see \x1b[31mred\x1b[0m \xe2\x80\x8bzw \x1b]8;;http://x.invalid\x1b\\link\x1b]8;;\x1b\\ end-q3u";
+
+/// The same words joined into one path component (no spaces, which
+/// `.file` would read as separate paths).
+const ESCAPED_PATH: &[u8] =
+    b"see-\x1b[31mred\x1b[0m-\xe2\x80\x8bzw-\x1b]8;;http://x.invalid\x1b\\link\x1b]8;;\x1b\\-end-q3u";
+
+/// Nothing of the raw sequences or the format character may be painted
+/// as text after `from`, and the words must be painted in order with
+/// nothing between them (`plain` is the squeezed form expected).
+fn assert_escaped_words_drawn_plain(pty: &Pty, from: usize, plain: &str, what: &str) {
+    let since_raw = &pty.raw()[from..];
+    let since = strip_ansi(&String::from_utf8_lossy(since_raw));
+    for leaked in ["[31m", "[0m", "]8;;", "x.invalid"] {
+        assert!(
+            !since.contains(leaked),
+            "{what}: `{leaked}` was painted as text:\n{since}"
+        );
+    }
+    assert_eq!(
+        count(since_raw, "\u{200B}".as_bytes()),
+        0,
+        "{what}: the zero-width space reached the terminal:\n{since}"
+    );
+    assert!(
+        squeezed(&since).contains(plain),
+        "{what}: the words were not drawn plain and in order:\n{since}"
+    );
+}
+
+/// A pasted User line carrying a colour SGR, a zero-width space and an
+/// OSC 8 hyperlink is drawn as its plain words once submitted: no `[31m`
+/// or `]8;;` painted as text, the zero-width space never reaches the
+/// terminal, and the words sit in order. The dry-run echo of the same
+/// line is drawn plain as well, and the UI leaves clean.
+#[test]
+#[serial]
+fn a_pasted_user_line_with_escapes_and_a_zero_width_space_is_drawn_as_plain_words() {
+    let dir = fresh_config_dir("scrub-user-line");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend_from_slice(ESCAPED_WORDS);
+    paste.extend_from_slice(b"\x1b[201~");
+    pty.send(&paste).unwrap();
+    pty.wait_for("end-q3u", PTY_DEADLINE)
+        .expect("the pasted text never reached the composer");
+    pty.read_for(Duration::from_millis(500));
+    let submitted_at = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    wait_for_squeezed(&mut pty, "Working", "the turn");
+    // The dry-run reply echoes the line; let it land after the working
+    // row so both the User cell and the reply are on screen.
+    pty.read_for(Duration::from_millis(2500));
+    assert_escaped_words_drawn_plain(&pty, submitted_at, "seeredzwlinkend-q3u", "the user line");
+    assert!(
+        count(&pty.raw()[submitted_at..], b"end-q3u") >= 2,
+        "the line was not drawn as both the User cell and the dry-run echo:\n{}",
+        strip_ansi(&String::from_utf8_lossy(&pty.raw()[submitted_at..]))
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A command line and the error notice that echoes it (`.file` on a path
+/// that does not exist names the path) are drawn as plain words when the
+/// path carries a colour SGR, a zero-width space and an OSC 8 hyperlink:
+/// nothing of the sequences painted as text in the `> .file ...` header
+/// or in the error, the format character never sent, the UI keeps taking
+/// keys and leaves clean.
+#[test]
+#[serial]
+fn an_error_notice_echoing_escapes_and_a_zero_width_space_is_drawn_as_plain_words() {
+    let dir = fresh_config_dir("scrub-error-notice");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let mut paste = b"\x1b[200~.file /nonexistent-r9/".to_vec();
+    paste.extend_from_slice(ESCAPED_PATH);
+    paste.extend_from_slice(b"\x1b[201~");
+    pty.send(&paste).unwrap();
+    pty.wait_for("end-q3u", PTY_DEADLINE)
+        .expect("the pasted text never reached the composer");
+    pty.read_for(Duration::from_millis(500));
+    let submitted_at = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    pty.wait_for_after("Not found", submitted_at, PTY_DEADLINE)
+        .expect("no error notice for the missing path");
+    pty.read_for(Duration::from_millis(800));
+    let since_raw = &pty.raw()[submitted_at..];
+    let since = strip_ansi(&String::from_utf8_lossy(since_raw));
+    // The error names the path after `Not found '`; the command header
+    // is everything painted before the error. Each is judged on its own
+    // so a failure names the cell.
+    let error_at = since.find("Not found '").unwrap();
+    let (header, error) = since.split_at(error_at);
+    let header_squeezed = squeezed(header);
+    let error_squeezed = squeezed(error);
+    let mut failures = Vec::new();
+    for (what, text) in [
+        ("the command header", &header_squeezed),
+        ("the error notice", &error_squeezed),
+    ] {
+        for leaked in ["[31m", "[0m", "]8;;", "x.invalid"] {
+            if text.contains(leaked) {
+                failures.push(format!("{what}: `{leaked}` was painted as text"));
+            }
+        }
+        if text.contains('\u{200B}') {
+            failures.push(format!("{what}: the zero-width space was painted"));
+        }
+        if !text.contains("/nonexistent-r9/see-red-zw-link-end-q3u") {
+            failures.push(format!(
+                "{what}: the path was not drawn plain and whole (got {text:?})"
+            ));
+        }
+    }
+    assert_eq!(
+        count(since_raw, "\u{200B}".as_bytes()),
+        0,
+        "the zero-width space reached the terminal:\n{since}"
+    );
+    let error_raw_at = find(since_raw, b"Not found", 0).unwrap();
+    let error_raw = String::from_utf8_lossy(
+        &since_raw[error_raw_at..(error_raw_at + 240).min(since_raw.len())],
+    );
+    assert!(
+        failures.is_empty(),
+        "{}\n--- header ---\n{header}\n--- error ---\n{error}\n--- error, raw bytes ---\n{:?}",
+        failures.join("\n"),
+        error_raw
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE)
+        .expect("keys were not handled after the error notice");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The REPL's confirmation line once a session was written by name.
+const SAVED_LINE: &[u8] = b"Saved the session to";
+
+/// `.exit session` on a dirty temp session, answered `y` and named: the
+/// exit path's own output (the REPL's `Saved the session to '<path>'`
+/// confirmation) lands in the transcript inside the alternate screen, on
+/// a row below the `.exit session` command, the footer goes back to "no
+/// session", the UI keeps taking keys, and nothing of the line leaks to
+/// the normal screen after Ctrl+D.
+#[test]
+#[serial]
+fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
+    let dir = fresh_config_dir("exit-session-saved-line");
+    let _guard = TempDirGuard(dir.clone());
+    write_config(&dir, "");
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    open_and_dirty_a_session(&mut pty);
+    let command_at = pty.raw().len();
+    pty.send(b".exit session\r").unwrap();
+    pty.wait_for_after("Save session?", command_at, PTY_DEADLINE)
+        .unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    pty.wait_for("ession name", PTY_DEADLINE).unwrap();
+    let named_at = pty.raw().len();
+    pty.send(b"probe-r9-session\r").unwrap();
+    // The painter skips cells that were already blank, so the words of a
+    // line can reach the stream without the spaces between them.
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let since = loop {
+        let text = strip_ansi(&String::from_utf8_lossy(&pty.raw()[named_at..]));
+        if squeezed(&text).contains("Savedthesessionto") {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the save confirmation never reached the transcript:\n{text}"
+        );
+        pty.read_for(Duration::from_millis(200));
+    };
+    pty.wait_for_after("no session", named_at, PTY_DEADLINE)
+        .expect("the footer did not go back to `no session` after the session exit");
+    assert!(
+        find(pty.raw(), LEAVE_ALT, 0).is_none(),
+        "the session exit left the alternate screen:\n{since}"
+    );
+    let command_rows = painted_at(pty.raw(), b".exit session", command_at);
+    let saved_rows = painted_at(pty.raw(), b"Saved", named_at);
+    let (Some(&(command_row, _)), Some(&(saved_row, _))) =
+        (command_rows.first(), saved_rows.last())
+    else {
+        panic!("the command or its confirmation was not positioned on screen:\n{since}");
+    };
+    assert!(
+        saved_row > command_row,
+        "the confirmation was drawn above its command ({command_row} / {saved_row}):\n{since}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", named_at, PTY_DEADLINE)
+        .expect("keys were not handled after the session exit");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let left_at = rfind(pty.raw(), LEAVE_ALT).expect("no leave sequence");
+    assert!(
+        find(pty.raw(), SAVED_LINE, left_at).is_none(),
+        "the confirmation reached the normal screen after the UI left:\n{transcript}"
+    );
+    assert!(
+        walk(&dir)
+            .into_iter()
+            .any(|p| p.file_name().is_some_and(|n| n == "probe-r9-session.yaml")),
+        "no probe-r9-session.yaml was written under {dir:?}:\n{transcript}"
+    );
+}
+
+/// `.exit` on a dirty temp session, answered `y` and named: the exit
+/// work's own output (the same `Saved the session to '<path>'` line) is
+/// not lost with the alternate screen; it is carried to the normal screen
+/// after the UI left, exactly once, before the shell gets the terminal
+/// back (above the wrapper's report), with the tty cooked and the file
+/// written.
+#[test]
+#[serial]
+fn dot_exit_saving_the_session_on_y_carries_the_saved_line_to_the_normal_screen() {
+    let dir = fresh_config_dir("exit-saved-line");
+    let _guard = TempDirGuard(dir.clone());
+    write_config(&dir, "");
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    open_and_dirty_a_session(&mut pty);
+    let exit_at = pty.raw().len();
+    pty.send(b".exit\r").unwrap();
+    pty.wait_for_after("Save session?", exit_at, PTY_DEADLINE)
+        .expect(".exit on a dirty session did not ask to save it");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    pty.wait_for("ession name", PTY_DEADLINE).unwrap();
+    let named_at = pty.raw().len();
+    pty.send(b"probe-r9-exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    let left_at = rfind(pty.raw(), LEAVE_ALT).expect("no leave sequence");
+    let saved_at = find(pty.raw(), SAVED_LINE, named_at)
+        .unwrap_or_else(|| panic!("the save confirmation was lost with the screen:\n{transcript}"));
+    assert!(
+        saved_at > left_at,
+        "the confirmation was drawn inside the alternate screen only, not carried out:\n{transcript}"
+    );
+    let report_at = find(pty.raw(), b"exit=", left_at).expect("no exit= line");
+    assert!(
+        saved_at < report_at,
+        "the confirmation came after the shell took the terminal back:\n{transcript}"
+    );
+    assert_eq!(
+        count(&pty.raw()[named_at..], SAVED_LINE),
+        1,
+        "the confirmation was printed more than once:\n{transcript}"
+    );
+    let after_leave = strip_ansi(&String::from_utf8_lossy(&pty.raw()[left_at..]));
+    assert!(
+        after_leave.contains("probe-r9-exit.yaml"),
+        "the confirmation does not name the written file:\n{after_leave}"
+    );
+    assert!(
+        walk(&dir)
+            .into_iter()
+            .any(|p| p.file_name().is_some_and(|n| n == "probe-r9-exit.yaml")),
+        "no probe-r9-exit.yaml was written under {dir:?}:\n{transcript}"
+    );
+}
