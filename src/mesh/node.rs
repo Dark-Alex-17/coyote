@@ -23,6 +23,7 @@ use crate::mesh::grants::GrantStore;
 use crate::mesh::identity::IdentityLock;
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::inbox::InboxStaging;
+use crate::mesh::instances::{self, InstanceRow};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
     KnockFallback, KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia,
@@ -596,6 +597,9 @@ struct CurrentIds {
 /// derived from the session's mesh instance id, and the tasks that announce it and track peers.
 pub(crate) struct MeshRuntime {
     fingerprint: String,
+    /// The start gave this node's existing identity its `this node` grant, which the
+    /// caller tells the user about once; a key minted by the start is granted silently.
+    self_trust_seeded_on_upgrade: bool,
     transport_identity: TransportIdentity,
     app_data: Vec<u8>,
     announce: bool,
@@ -640,6 +644,9 @@ pub(crate) struct MeshRuntime {
     /// rekey replaces that whole value and the identity does not change with it.
     identity_lock: parking_lot::Mutex<Option<IdentityLock>>,
     ids: RwLock<CurrentIds>,
+    /// This node's row in the instance registry, as filed under the current instance id:
+    /// `rekey` moves it to the fork's id and destination and `shutdown` removes it.
+    instance_row: parking_lot::Mutex<InstanceRow>,
     peers: Arc<PeerTable>,
     propagation_nodes: Arc<PropagationNodeTable>,
     trust: Arc<TrustStore>,
@@ -698,8 +705,10 @@ impl MeshRuntime {
         let instance_id = session.ensure_mesh_instance_id().to_string();
         let lock = InstanceLock::acquire(&paths.cache_dir, &instance_id)?;
         let identity_lock = IdentityLock::share(&paths.identity_path)?;
+        let minted = !paths.identity_path.exists();
         let core_identity = identity::load_or_mint_identity(&paths.identity_path)?;
         let fingerprint = identity::fingerprint(&core_identity);
+        let self_trust_granted = trust.seed_self_trust(&fingerprint, minted, SystemTime::now())?;
         let transport_identity = to_transport_private_identity(&core_identity);
         let peers = Arc::new(PeerTable::load(
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
@@ -868,6 +877,12 @@ impl MeshRuntime {
             short(&fingerprint),
             short(&hash.to_hex_string())
         );
+        let instance_row = InstanceRow::started_now(
+            hash.to_hex_string(),
+            session.name().to_string(),
+            options.agent.clone(),
+        );
+        instances::register(&paths.cache_dir, &instance_id, instance_row.clone());
 
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
         let knock_gate = Arc::new(KnockGate::new(
@@ -878,6 +893,7 @@ impl MeshRuntime {
         ));
         let runtime = Arc::new(Self {
             fingerprint,
+            self_trust_seeded_on_upgrade: self_trust_granted && !minted,
             transport_identity,
             app_data,
             announce: config.announce,
@@ -912,6 +928,7 @@ impl MeshRuntime {
                 instance_id,
                 destination_hash: hash.to_hex_string(),
             }),
+            instance_row: parking_lot::Mutex::new(instance_row),
             peers,
             propagation_nodes,
             trust,
@@ -984,6 +1001,23 @@ impl MeshRuntime {
     /// `destination_hash` without the wait, from the cache `start` fills and `rekey` moves.
     pub(crate) fn current_destination_hash(&self) -> String {
         self.ids.read().destination_hash.clone()
+    }
+
+    /// The sessions of yours running on this cache dir, this one included, by the
+    /// destination each serves, as the instance registry lists them.
+    pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
+        instances::live(&self.cache_dir)
+            .into_iter()
+            .map(|(destination, row)| (destination, row.session))
+            .collect()
+    }
+
+    /// Files this node's registry row under `session`, the name the context now serves
+    /// it for: a fork's name differs from the session the node started for.
+    pub(crate) fn rename_session(&self, session: &str) {
+        let mut row = self.instance_row.lock();
+        row.session = session.to_string();
+        instances::register(&self.cache_dir, &self.current_instance_id(), row.clone());
     }
 
     /// A peer's `NoAccess` as every request path reports it: the peer by the name the
@@ -1076,6 +1110,10 @@ impl MeshRuntime {
 
     pub(crate) fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    pub(crate) fn self_trust_seeded_on_upgrade(&self) -> bool {
+        self.self_trust_seeded_on_upgrade
     }
 
     /// The configured display name, as the status card carries it to trusted peers.
@@ -1773,6 +1811,7 @@ impl MeshRuntime {
             rekey.fork_instance_id,
             short(&hash.to_hex_string())
         );
+        let original_instance_id = std::mem::take(&mut state.instance_id);
         *state = DestinationState {
             dest,
             hash,
@@ -1785,6 +1824,12 @@ impl MeshRuntime {
             instance_id: state.instance_id.clone(),
             destination_hash: hash.to_hex_string(),
         };
+        {
+            let mut row = self.instance_row.lock();
+            row.destination = hash.to_hex_string();
+            instances::unregister(&self.cache_dir, &original_instance_id);
+            instances::register(&self.cache_dir, &state.instance_id, row.clone());
+        }
         if self.announce {
             // With `last_announce` still `None`, the next heartbeat tick announces the fork.
             match timeout_at(deadline, self.send_announce(&mut state, &transport)).await {
@@ -1840,6 +1885,7 @@ impl MeshRuntime {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         let deadline = stop_transport(transport, interfaces, deadline).await;
         drain_request_handlers(&self.request_handler, deadline).await;
+        instances::unregister(&self.cache_dir, &state.instance_id);
         state.lock = None;
         *self.identity_lock.lock() = None;
         if let Err(err) = self.peers.persist_if_dirty() {
@@ -5041,6 +5087,20 @@ impl MeshSlot {
         self.display_name_at(destination)
             .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
             .unwrap_or_else(|| short(destination).to_string())
+    }
+
+    /// `MeshRuntime::own_sessions`, empty while the mesh is off.
+    pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
+        self.get()
+            .map(|runtime| runtime.own_sessions())
+            .unwrap_or_default()
+    }
+
+    /// `MeshRuntime::rename_session`; a no-op while the mesh is off.
+    pub(crate) fn rename_session(&self, session: &str) {
+        if let Some(runtime) = self.get() {
+            runtime.rename_session(session);
+        }
     }
 
     /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
@@ -11453,7 +11513,8 @@ mod tests {
 
     /// A trusted peer the table knows but nothing on the network can route to: the send
     /// asks for a path once, waits out `PATH_REQUEST_TIMEOUT` and no longer, and the
-    /// refusal says so in plain words with the number the constant renders.
+    /// refusal says so in plain words with the number the constant renders. The peer
+    /// announced just now, so the refusal adds that it may have left the mesh.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_destination_is_refused_within_the_path_request_timeout_with_the_new_wording()
@@ -11489,6 +11550,7 @@ mod tests {
             err,
             SendError::UnknownDestination {
                 destination: destination.clone(),
+                recently_seen: true,
             }
         );
         assert!(
@@ -11499,7 +11561,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
             )
         );
         slot.stop().await.unwrap();
@@ -16065,6 +16127,216 @@ mod tests {
         let _rotation = IdentityLock::exclusive(&identity_path)
             .expect("rotation is possible once every node has stopped");
         relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod self_trust_tests {
+        use super::*;
+        use crate::mesh::card::{StatusCard, StatusError};
+        use crate::mesh::test_support::wait_for_peer;
+        use crate::mesh::trust::{IdentityStanding, SELF_TRUST_LABEL};
+        use std::fs;
+
+        async fn start_in(tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut Session::default(),
+                mesh_paths(tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        fn installed(runtime: &Arc<MeshRuntime>) -> Arc<MeshSlot> {
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            slot
+        }
+
+        async fn status_of(
+            asker: &MeshRuntime,
+            answerer: &MeshRuntime,
+        ) -> Result<StatusCard, StatusError> {
+            let desc = asker
+                .resolve_destination(&answerer.current_destination_hash())
+                .await
+                .expect("the answerer's destination resolves from its announce");
+            asker.request_status(&desc).await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn two_sessions_on_a_fresh_config_dir_answer_each_other_with_no_trust_command() {
+            let relay = TransportRelay::start().await;
+            let tmp = TempDir::new("node-self-trust-fresh");
+            let a = start_in(&tmp, relay.port).await;
+            let b = start_in(&tmp, relay.port).await;
+            let (slot_a, slot_b) = (installed(&a), installed(&b));
+            assert_eq!(a.fingerprint(), b.fingerprint());
+            assert!(!a.self_trust_seeded_on_upgrade());
+            assert!(!b.self_trust_seeded_on_upgrade());
+            wait_for_peer(&a, &b.current_destination_hash()).await;
+            wait_for_peer(&b, &a.current_destination_hash()).await;
+
+            status_of(&a, &b).await.expect("b answers a");
+            status_of(&b, &a).await.expect("a answers b");
+
+            let text = fs::read_to_string(a.trust().path()).unwrap();
+            assert!(
+                text.contains(&format!("label: {SELF_TRUST_LABEL}\n")),
+                "{text}"
+            );
+            assert!(text.contains("\nself_trust_seeded: true\n"), "{text}");
+            let own: Vec<_> = a
+                .trust()
+                .records()
+                .into_iter()
+                .filter(|record| record.hash == a.fingerprint())
+                .collect();
+            assert_eq!(own.len(), 1, "{own:?}");
+            assert!(own[0].all_destinations);
+            assert!(slot_a.stop().await.unwrap());
+            assert!(slot_b.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn blocking_one_own_instance_refuses_it_while_the_other_is_served() {
+            let relay = TransportRelay::start().await;
+            let tmp = TempDir::new("node-self-trust-block");
+            let a = start_in(&tmp, relay.port).await;
+            let b = start_in(&tmp, relay.port).await;
+            let (slot_a, slot_b) = (installed(&a), installed(&b));
+            wait_for_peer(&a, &b.current_destination_hash()).await;
+            wait_for_peer(&b, &a.current_destination_hash()).await;
+
+            b.trust()
+                .deny_destination(
+                    slot_b.as_ref(),
+                    &a.current_destination_hash(),
+                    None,
+                    SystemTime::now(),
+                    false,
+                )
+                .unwrap();
+
+            let refused = status_of(&a, &b).await;
+            assert!(
+                matches!(refused, Err(StatusError::NotTrustedByPeer(_))),
+                "{refused:?}"
+            );
+            status_of(&b, &a)
+                .await
+                .expect("the instance that is not blocked is still served");
+            assert!(slot_a.stop().await.unwrap());
+            assert!(slot_b.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_existing_key_is_seeded_on_the_first_start_only() {
+            let (addr, relay_handle, _) = loopback_relay().await;
+            let tmp = TempDir::new("node-self-trust-upgrade");
+            let identity = identity::load_or_mint_identity(&mesh_paths(&tmp).identity_path)
+                .map(|key| identity::fingerprint(&key))
+                .unwrap();
+
+            let first = start_in(&tmp, addr.port()).await;
+            assert!(first.self_trust_seeded_on_upgrade());
+            assert_eq!(
+                first.trust().identity_standing(&identity),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            );
+            first.shutdown().await.unwrap();
+
+            let second = start_in(&tmp, addr.port()).await;
+            assert!(!second.self_trust_seeded_on_upgrade());
+            second.shutdown().await.unwrap();
+            relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    mod own_session_rows_tests {
+        use super::*;
+
+        async fn start_as(name: &str, tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            let mut session = Session::default();
+            session.set_name(name.to_string());
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                NodeOptions {
+                    agent: Some("coder".to_string()),
+                    ..NodeOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Two sessions on one cache dir each file their row at start, each sees the
+        /// other's session by its destination, a re-key moves the row to the fork's id
+        /// and destination, and a stop removes only the stopped node's row.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_files_the_row_rekey_moves_it_and_stop_removes_it() {
+            let (addr, relay_handle, _) = loopback_relay().await;
+            let tmp = TempDir::new("node-own-session-rows");
+            let a = start_as("a", &tmp, addr.port()).await;
+            let temp = start_as("temp", &tmp, addr.port()).await;
+            let temp_slot = Arc::new(MeshSlot::default());
+            temp_slot.install(temp.clone()).unwrap();
+            let (a_dest, temp_dest) = (
+                a.current_destination_hash(),
+                temp.current_destination_hash(),
+            );
+
+            let rows = instances::live(&a.cache_dir);
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_eq!(rows[&temp_dest].session, "temp");
+            assert_eq!(rows[&temp_dest].agent.as_deref(), Some("coder"));
+            assert_eq!(rows[&temp_dest].pid, std::process::id());
+            assert_eq!(
+                a.own_sessions().get(&temp_dest).map(String::as_str),
+                Some("temp")
+            );
+            assert_eq!(
+                temp.own_sessions().get(&a_dest).map(String::as_str),
+                Some("a")
+            );
+
+            temp_slot
+                .rekey(ForkRekey {
+                    original_instance_id: Some(temp.current_instance_id()),
+                    fork_instance_id: fresh_instance_id(),
+                })
+                .await
+                .unwrap();
+            let fork_dest = temp.current_destination_hash();
+            assert_ne!(fork_dest, temp_dest);
+            let rows = a.own_sessions();
+            assert!(!rows.contains_key(&temp_dest), "{rows:?}");
+            assert_eq!(rows.get(&fork_dest).map(String::as_str), Some("temp"));
+            temp_slot.rename_session("temp-fork");
+            assert_eq!(
+                a.own_sessions().get(&fork_dest).map(String::as_str),
+                Some("temp-fork")
+            );
+
+            assert!(temp_slot.stop().await.unwrap());
+            let rows = a.own_sessions();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows.get(&a_dest).map(String::as_str), Some("a"));
+
+            a.shutdown().await.unwrap();
+            assert!(instances::live(&tmp.path.join("cache")).is_empty());
+            relay_handle.abort();
+        }
     }
 
     const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";

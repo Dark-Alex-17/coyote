@@ -1465,6 +1465,7 @@ pub async fn run_repl_command_with_prefix(
                 match ctx.app.mesh.rekey(pending.rekey.clone()).await {
                     Ok(()) => {
                         let forked = ctx.commit_fork(pending);
+                        ctx.app.mesh.rename_session(&forked.to);
                         println!("Forked '{}' into '{}'", forked.from, forked.to);
                     }
                     Err(err) => {

@@ -1941,6 +1941,8 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
 /// identity (and the same name) at another destination, while the stale row has no such
 /// successor and the live rows carry no marker. A sample that showed a superseded row
 /// with no successor in view, or marked a row still announcing, would teach the rule wrong.
+/// The no-route marker is `NO_ROUTE_STATE` as the code holds it, in place of stale on a
+/// row of any age, and a row with a successor in view is superseded instead.
 /// A key-changed row keeps its `state` cell free of the remedy: that is a plain line
 /// between the table and the `N peer(s)` line, led by the `dest` of a row in the table,
 /// and the three legend lines still close the sample.
@@ -1991,6 +1993,21 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     );
     let superseded_pieces: Vec<&str> = superseded_template.split("{}").collect();
     assert_eq!(superseded_pieces.len(), 2, "{superseded_template:?}");
+    let repl = read(repo_root().join("src/repl/mesh.rs"));
+    let no_route_marker = repl
+        .split_once("const NO_ROUTE_STATE: &str =")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .and_then(|(value, _)| string_literals(value).into_iter().next())
+        .expect("src/repl/mesh.rs defines NO_ROUTE_STATE as one string literal");
+    assert!(
+        no_route_marker.starts_with("(no route: "),
+        "NO_ROUTE_STATE no longer opens the way this test reads it: {no_route_marker:?}"
+    );
+    assert!(
+        fn_body("src/repl/mesh.rs", "render_peers")
+            .contains("None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),"),
+        "render_peers no longer puts the no-route marker in place of stale, below superseded"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
@@ -2140,6 +2157,12 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
                     "a superseded row is a stale one ({stale_heartbeats} heartbeats): {sample}"
                 );
             }
+            Some(marker) if marker == no_route_marker => {
+                assert!(
+                    successor.is_none(),
+                    "a no-route row with a successor in view would be superseded: {sample}"
+                );
+            }
             Some(marker) => {
                 assert_eq!(
                     marker, stale_marker,
@@ -2169,7 +2192,10 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
             && rows.iter().any(|row| row
                 .marker
                 .as_ref()
-                .is_some_and(|m| m.starts_with("(stale: "))),
+                .is_some_and(|m| m.starts_with("(stale: ")))
+            && rows
+                .iter()
+                .any(|row| row.marker.is_some_and(|m| m == no_route_marker)),
         "the sample shows one row of each marker:\n{sample}"
     );
 }
@@ -5361,17 +5387,36 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     let status_tail = "A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";
     let knock_tail = "Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.";
     let fetch_tail = "A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";
-    for (path, source, tail) in [
-        ("src/mesh/message.rs", &message_rs, send_tail),
-        ("src/repl/mesh.rs", &repl, status_tail),
-        ("src/repl/mesh.rs", &repl, knock_tail),
-        ("src/repl/mesh.rs", &repl, fetch_tail),
+    for (path, source, tail, hint_fn) in [
+        (
+            "src/mesh/message.rs",
+            &message_rs,
+            send_tail,
+            "left_mesh_hint_when(",
+        ),
+        ("src/repl/mesh.rs", &repl, status_tail, "left_mesh_hint("),
+        ("src/repl/mesh.rs", &repl, knock_tail, "left_mesh_hint("),
+        ("src/repl/mesh.rs", &repl, fetch_tail, "left_mesh_hint("),
     ] {
+        let literal = format!("\"{{}}{{}} {tail}\"");
+        let (_, args) = source.split_once(&literal).unwrap_or_else(|| {
+            panic!(
+                "{path} no longer appends {tail:?} to unreachable_head and the left-the-mesh hint"
+            )
+        });
+        let args = args.split('"').next().unwrap_or_default();
+        let head_arg = args.find("unreachable_head(");
+        let hint_arg = args.find(hint_fn);
         assert!(
-            source.contains(&format!("\"{{}} {tail}\"")),
-            "{path} no longer appends {tail:?} to unreachable_head"
+            matches!((head_arg, hint_arg), (Some(head), Some(hint)) if head < hint),
+            "{path} no longer feeds unreachable_head then {hint_fn}) into {literal}: {args:?}"
         );
     }
+    let hint = string_literals(&fn_body("src/mesh/message.rs", "left_mesh_hint_when"))
+        .into_iter()
+        .find(|literal| !literal.is_empty())
+        .expect("left_mesh_hint_when returns one non-empty hint");
+    let hint = hint.trim().to_string();
 
     let commands = read(wiki.join("Mesh-Commands.md"));
     let status = flat(&section(
@@ -5382,6 +5427,11 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     assert!(
         status.contains(&format!("{head} {status_tail}")),
         "Mesh-Commands.md's `.mesh status` entry does not quote the path-request refusal"
+    );
+    assert!(
+        status.contains(&format!("`{hint}` after `cannot reach.`"))
+            && status.contains("`.mesh message`"),
+        "Mesh-Commands.md's `.mesh status` entry does not say the refusals add {hint:?} after `cannot reach.`"
     );
     assert!(
         status.contains(&format!("waits up to {timeout} s for the answer")),

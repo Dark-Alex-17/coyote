@@ -23,7 +23,8 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
     Disposition, FirstContactMiss, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia,
-    RawPart, SendError, SendOutcome, is_wire_id, propagation_remedy, unreachable_cause,
+    RawPart, SendError, SendOutcome, is_wire_id, left_mesh_hint_when, propagation_remedy,
+    unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
@@ -329,7 +330,9 @@ pub(crate) enum AccessError {
     Untrusted,
     /// Trusted, but the transport holds no identity for it and the network did not answer
     /// this node's path request in time, so there is no description to link to.
-    UnknownDestination,
+    UnknownDestination {
+        recently_seen: bool,
+    },
     /// Unheard, but the trust list could allow it, so the network was asked for it and
     /// no row was filed.
     Unheard {
@@ -384,10 +387,11 @@ impl fmt::Display for AccessError {
                 f,
                 "The destination is not trusted for an access request. Trust it first with `.mesh trust <destination>`; `.mesh peers` lists what this Coyote has heard from."
             ),
-            Self::UnknownDestination => write!(
+            Self::UnknownDestination { recently_seen } => write!(
                 f,
-                "The destination {} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
-                unreachable_cause()
+                "The destination {}{} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+                unreachable_cause(),
+                left_mesh_hint_when(*recently_seen)
             ),
             Self::Unheard { destination, miss } => write!(f, "{}", miss.refusal(destination)),
             Self::Invalid(rule) => write!(
@@ -524,7 +528,9 @@ impl MeshSlot {
         let desc = runtime
             .resolve_destination(&destination)
             .await
-            .ok_or(AccessError::UnknownDestination)?;
+            .ok_or_else(|| AccessError::UnknownDestination {
+                recently_seen: !peer.is_stale(SystemTime::now()),
+            })?;
         let now = SystemTime::now();
         self.correlations()
             .open(PendingRecord {
@@ -5608,7 +5614,9 @@ mod tests {
         for err in [
             AccessError::NotRunning,
             AccessError::Untrusted,
-            AccessError::UnknownDestination,
+            AccessError::UnknownDestination {
+                recently_seen: false,
+            },
             AccessError::Invalid("a path is not a wire path"),
             AccessError::NotFiled("the pending store is read-only".to_string()),
             AccessError::Refused(RefusalCode::InvalidData),
@@ -5636,9 +5644,11 @@ mod tests {
         }
         assert!(AccessError::Untrusted.to_string().contains(".mesh trust"));
         assert!(
-            AccessError::UnknownDestination
-                .to_string()
-                .contains(".mesh peers")
+            AccessError::UnknownDestination {
+                recently_seen: false
+            }
+            .to_string()
+            .contains(".mesh peers")
         );
         assert!(
             AccessError::UnknownStatus
@@ -6076,7 +6086,12 @@ mod tests {
             .await
             .unwrap_err();
         let waited = asked.elapsed();
-        assert_eq!(unannounced, AccessError::UnknownDestination);
+        assert_eq!(
+            unannounced,
+            AccessError::UnknownDestination {
+                recently_seen: true
+            }
+        );
         assert!(
             waited >= crate::mesh::announce::PATH_REQUEST_TIMEOUT
                 && waited < crate::mesh::announce::PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
@@ -6085,7 +6100,7 @@ mod tests {
         let text = unannounced.to_string();
         assert_eq!(
             text,
-            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
+            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
         );
         assert!(
             !text.contains("since this node started") && !text.contains("sync"),
