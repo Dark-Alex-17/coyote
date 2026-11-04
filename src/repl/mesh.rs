@@ -4282,34 +4282,31 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 _ => Layer::Global,
             };
             if !targets.iter().any(|(held, _)| *held == picked) {
-                bail!(
-                    "{}",
-                    ctx.render_hints(&format!(
-                        "`{pattern}` is held by {} ({}), not by {}. Run `.mesh unshare {pattern} {}` to remove it from {}.",
-                        path_of(first_layer),
-                        kind_list(&first_held),
-                        path_of(picked),
-                        flag_of(first_layer),
-                        path_of(first_layer)
-                    ))
-                );
+                return Err(held_elsewhere(
+                    &pattern,
+                    &path_of(first_layer).to_string(),
+                    &kind_list(&first_held),
+                    NoticeText::default()
+                        .frame(", not by ")
+                        .peer(path_of(picked).to_string()),
+                    flag_of(first_layer),
+                ));
             }
             targets.retain(|(held, _)| *held == picked);
         }
         WriteScope::Auto => {
             let reach = set.write_target(WriteScope::Auto);
             if !targets.iter().any(|(held, _)| *held == reach) {
-                bail!(
-                    "{}",
-                    ctx.render_hints(&format!(
-                        "`{pattern}` is held by {} ({}); without a flag `.mesh unshare` edits {}, which does not hold it. Run `.mesh unshare {pattern} {}` to remove it from {}.",
-                        path_of(first_layer),
-                        kind_list(&first_held),
-                        path_of(reach),
-                        flag_of(first_layer),
-                        path_of(first_layer)
-                    ))
-                );
+                return Err(held_elsewhere(
+                    &pattern,
+                    &path_of(first_layer).to_string(),
+                    &kind_list(&first_held),
+                    NoticeText::default()
+                        .frame("; without a flag `.mesh unshare` edits ")
+                        .peer(path_of(reach).to_string())
+                        .frame(", which does not hold it"),
+                    flag_of(first_layer),
+                ));
             }
         }
     }
@@ -4658,6 +4655,31 @@ fn no_share_rule(
     )
 }
 
+/// A pattern held only by the file `.mesh unshare` was not pointed at. The pattern and
+/// the files are quoted as typed; the sentence and the command follow the prefix.
+fn held_elsewhere(
+    pattern: &str,
+    holder: &str,
+    kinds: &str,
+    not_here: NoticeText,
+    flag: &str,
+) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("`")
+            .peer(pattern)
+            .frame("` is held by ")
+            .peer(holder)
+            .frame(format!(" ({kinds})"))
+            .then(not_here)
+            .frame(". Run `.mesh unshare ")
+            .peer(pattern)
+            .frame(format!(" {flag}` to remove it from "))
+            .peer(holder)
+            .frame("."),
+    )
+}
+
 #[cfg(test)]
 mod peer_text_prefix_tests {
     use super::*;
@@ -4710,6 +4732,47 @@ mod peer_text_prefix_tests {
             text.ends_with(&format!("    {refusal} Nothing was sent.")),
             "{text}"
         );
+    }
+
+    mod held_elsewhere_tests {
+        use super::*;
+
+        #[test]
+        fn a_flag_pointed_at_the_wrong_file_keeps_the_pattern_and_paths() {
+            let text = shown_under_slash(held_elsewhere(
+                ".vault",
+                ".coyote/shares.yaml",
+                "deny",
+                NoticeText::default().frame(", not by ").peer(".shares"),
+                "--global",
+            ));
+            assert!(
+                text.ends_with(
+                    "`.vault` is held by .coyote/shares.yaml (deny), not by .shares. Run `/mesh unshare .vault --global` to remove it from .coyote/shares.yaml."
+                ),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn no_flag_keeps_the_pattern_and_paths_and_slashes_both_commands() {
+            let text = shown_under_slash(held_elsewhere(
+                ".vault",
+                ".coyote/shares.yaml",
+                "allow",
+                NoticeText::default()
+                    .frame("; without a flag `.mesh unshare` edits ")
+                    .peer(".shares")
+                    .frame(", which does not hold it"),
+                "--global",
+            ));
+            assert!(
+                text.ends_with(
+                    "`.vault` is held by .coyote/shares.yaml (allow); without a flag `/mesh unshare` edits .shares, which does not hold it. Run `/mesh unshare .vault --global` to remove it from .coyote/shares.yaml."
+                ),
+                "{text}"
+            );
+        }
     }
 }
 
