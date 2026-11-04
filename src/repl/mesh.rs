@@ -5969,9 +5969,11 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
 
 /// The fewest leading characters, never under `HASH_PREFIX_MIN_CHARS`, at which every hash
 /// in `hashes` reads differently from the others. A peer-chosen pending id may be shorter
-/// than that, and then reads whole.
+/// than that, and then reads whole, or longer than a hash, and then the search runs to
+/// the longest one.
 fn distinguishing_len(hashes: &[String]) -> usize {
-    (HASH_PREFIX_MIN_CHARS..32)
+    let longest = hashes.iter().map(String::len).max().unwrap_or(0).max(32);
+    (HASH_PREFIX_MIN_CHARS..longest)
         .find(|&len| {
             let heads: std::collections::BTreeSet<&str> = hashes
                 .iter()
@@ -5979,7 +5981,7 @@ fn distinguishing_len(hashes: &[String]) -> usize {
                 .collect();
             heads.len() == hashes.len()
         })
-        .unwrap_or(32)
+        .unwrap_or(longest)
 }
 
 /// Every hash of `kind` this node knows, from the peer table, the knock cache, the trust
@@ -12701,6 +12703,36 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             !questions_only.contains("answer: .mesh answer p1"),
             "the commands sit on the section header, not under each entry: {questions_only}"
         );
+    }
+
+    mod pending_long_id_tests {
+        use super::*;
+
+        /// Peer-chosen ids may run past a hash's 32 characters and share all of them.
+        #[test]
+        fn ids_sharing_their_first_33_characters_are_shown_apart_and_resolve_back() {
+            let shared = "5".repeat(33);
+            let ids = [format!("{shared}aaaaaaa"), format!("{shared}bbbbbbb")];
+            let escalated: Vec<QuestionRow> = ids.iter().map(|id| escalated_row(id, "")).collect();
+
+            let text = render_pending(&[], &escalated, &[], pending_now(), 200, false);
+
+            let shown: Vec<&str> = text
+                .lines()
+                .filter_map(|line| line.rsplit_once(" . id "))
+                .map(|(_, id)| id)
+                .collect();
+            assert_eq!(shown.len(), 2, "{text}");
+            assert_ne!(shown[0], shown[1], "{text}");
+            let held: Vec<(String, Option<InboundKind>)> = ids
+                .iter()
+                .map(|id| (id.clone(), Some(InboundKind::Question)))
+                .collect();
+            for (shown, id) in shown.iter().zip(&ids) {
+                assert!(shown.len() > shared.len(), "{text}");
+                assert_eq!(resolve_pending_id(shown, held.clone()).unwrap(), *id);
+            }
+        }
     }
 
     mod pending_layout_tests {
