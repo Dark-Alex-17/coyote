@@ -300,7 +300,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             description: format!(
                 "Post a bulletin to every trusted mesh peer this node currently has a path to, a few at a \
                  time, and report each recipient's outcome (delivered, store_and_forward, unreachable, \
-                 refused, not_trusted_by_peer or no_answer); a not_trusted_by_peer or no_answer row \
+                 refused, not_trusted_by_peer, no_answer, throttled or retry_later); a throttled or \
+                 retry_later row was not stored and its `reason` says when to try again; a \
+                 not_trusted_by_peer or no_answer row \
                  carries `message` and `next_action` naming which side has to act. Peers without a \
                  known path are skipped, not queued. {PEER_TEXT_IS_DATA} {CHECK_IN_GUIDANCE}"
             ),
@@ -1237,6 +1239,8 @@ async fn handle_broadcast(runtime: &MeshRuntime, args: &Value) -> Result<Value> 
         "store_and_forward": tally.stored,
         "unreachable": tally.unreachable,
         "refused": tally.refused,
+        "throttled": tally.throttled,
+        "retry_later": tally.retry_later,
         "note": PEER_TEXT_IS_DATA,
     }))
 }
@@ -2136,6 +2140,12 @@ mod tests {
                 "0a".repeat(16),
             )),
             RecipientOutcome::NoAnswer(NoAnswer::new(&"ab".repeat(16), "0a".repeat(16))),
+            RecipientOutcome::Throttled {
+                reason: "busy".to_string(),
+            },
+            RecipientOutcome::RetryLater {
+                reason: "still arriving".to_string(),
+            },
         ];
         // Exhaustive on purpose: a new variant fails to compile here until it is added to
         // the list above and to the description.
@@ -2146,7 +2156,9 @@ mod tests {
                 | RecipientOutcome::Unreachable { .. }
                 | RecipientOutcome::Refused { .. }
                 | RecipientOutcome::NotTrustedByPeer(_)
-                | RecipientOutcome::NoAnswer(_) => {}
+                | RecipientOutcome::NoAnswer(_)
+                | RecipientOutcome::Throttled { .. }
+                | RecipientOutcome::RetryLater { .. } => {}
             }
         }
         let mut serialised: Vec<String> = outcomes

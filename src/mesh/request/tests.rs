@@ -10934,6 +10934,53 @@ pub(crate) mod network {
         responder_c.stop().await;
     }
 
+    mod broadcast_throttle_tests {
+        use super::*;
+
+        /// A peer answering `Throttled` reads the same in a broadcast as in a single send:
+        /// its own row carrying the single send's sentence, counted throttled and never
+        /// refused or unreachable.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_throttled_peer_is_its_own_broadcast_row_as_in_a_single_send() {
+            let pair =
+                NodePair::start_with("request-broadcast-throttled", |_| {}, trusting_b).await;
+            pair.introduce_b_to_a().await;
+            let b_instance = pair.responder.desc.address_hash.to_hex_string();
+            let message =
+                OutboundPeer::new(PeerKind::Bulletin, "all hands", None, None, None).unwrap();
+            pair.recorder_b
+                .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
+            let single = pair
+                .node_a
+                .send_peer_with(&b_instance, &message, peer_send_options())
+                .await
+                .unwrap_err();
+            assert!(matches!(single, SendError::Throttled { .. }), "{single:?}");
+            pair.recorder_b
+                .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
+
+            let outcome = pair
+                .node_a
+                .broadcast_with(&message, peer_send_options())
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.recipients.len(), 1, "{:?}", outcome.recipients);
+            assert_eq!(
+                outcome.recipients[0].outcome,
+                RecipientOutcome::Throttled {
+                    reason: single.to_string()
+                }
+            );
+            let tally = outcome.tally();
+            assert_eq!(
+                (tally.throttled, tally.refused, tally.unreachable),
+                (1, 0, 0)
+            );
+            pair.stop_node_a().await;
+        }
+    }
+
     /// An envoy that takes everything and counts what it was offered.
     #[derive(Default)]
     struct CountingEnvoy(AtomicUsize);

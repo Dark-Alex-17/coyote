@@ -1638,6 +1638,16 @@ pub(crate) enum RecipientOutcome {
     /// The link came up and the peer said nothing, which is how a peer that has not
     /// trusted this instance answers; the remedy is on its side, as for a refusal.
     NoAnswer(NoAnswer),
+    /// The peer answered `Throttled`: it is still busy with a message from this identity,
+    /// so nothing was stored and a later broadcast reaches it.
+    Throttled {
+        reason: String,
+    },
+    /// A wait ran out short of the peer's silence (this node's own side, the request or
+    /// the answer still in transfer), so nothing was stored and a retry is the step.
+    RetryLater {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1661,6 +1671,8 @@ pub(crate) struct BulletinTally {
     pub stored: usize,
     pub unreachable: usize,
     pub refused: usize,
+    pub throttled: usize,
+    pub retry_later: usize,
 }
 
 impl BroadcastOutcome {
@@ -1677,9 +1689,102 @@ impl BroadcastOutcome {
                 RecipientOutcome::Refused { .. }
                 | RecipientOutcome::NotTrustedByPeer(_)
                 | RecipientOutcome::NoAnswer(_) => tally.refused += 1,
+                RecipientOutcome::Throttled { .. } => tally.throttled += 1,
+                RecipientOutcome::RetryLater { .. } => tally.retry_later += 1,
             }
         }
         tally
+    }
+}
+
+/// One recipient's row, read from the send a single `.mesh send` would report: a throttle
+/// and a wait short of the peer's silence each keep their own row, so neither reads as
+/// unreachable, and each carries the sentence the single send would print.
+fn recipient_outcome(sent: Result<SendOutcome, SendError>) -> RecipientOutcome {
+    match sent {
+        Ok(SendOutcome {
+            via: PeerVia::Direct,
+            ..
+        }) => RecipientOutcome::Delivered,
+        Ok(SendOutcome {
+            via: PeerVia::StoreAndForward,
+            ..
+        }) => RecipientOutcome::StoreAndForward,
+        Err(SendError::NotTrustedByPeer(refusal)) => RecipientOutcome::NotTrustedByPeer(refusal),
+        Err(SendError::NoAnswer(no_answer)) => RecipientOutcome::NoAnswer(no_answer),
+        Err(err @ SendError::Throttled { .. }) => RecipientOutcome::Throttled {
+            reason: err.to_string(),
+        },
+        Err(SendError::Direct(wait)) if wait.is_retryable_wait() => RecipientOutcome::RetryLater {
+            reason: SendError::Direct(wait).to_string(),
+        },
+        Err(err @ (SendError::Refused(_) | SendError::IncompatibleVersion { .. })) => {
+            RecipientOutcome::Refused {
+                reason: err.to_string(),
+            }
+        }
+        Err(err) => RecipientOutcome::Unreachable {
+            reason: err.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod recipient_outcome_tests {
+    use super::*;
+
+    /// Every wait that ran out short of the peer's silence is the retry in a broadcast row
+    /// too, with the single send's sentence, and is never counted unreachable.
+    #[test]
+    fn a_wait_short_of_silence_is_a_retry_row_with_the_single_send_text() {
+        let (path, after) = ("/message".to_string(), Duration::from_secs(15));
+        for wait in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete {
+                path: path.clone(),
+                after,
+            },
+            RequestError::RequestIncomplete {
+                path: path.clone(),
+                after,
+            },
+        ] {
+            let single = SendError::Direct(wait.clone()).to_string();
+
+            let row = recipient_outcome(Err(SendError::Direct(wait)));
+
+            assert_eq!(row, RecipientOutcome::RetryLater { reason: single });
+        }
+    }
+
+    #[test]
+    fn a_throttled_peer_is_its_own_row_with_the_single_send_text() {
+        let err = SendError::Throttled {
+            destination: "ab".repeat(16),
+        };
+        let single = err.to_string();
+
+        let row = recipient_outcome(Err(err));
+
+        assert_eq!(row, RecipientOutcome::Throttled { reason: single });
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["outcome"],
+            serde_json::json!("throttled")
+        );
+        assert_eq!(
+            serde_json::to_value(RecipientOutcome::RetryLater {
+                reason: String::new()
+            })
+            .unwrap()["outcome"],
+            serde_json::json!("retry_later")
+        );
     }
 }
 
@@ -1951,33 +2056,10 @@ impl MeshRuntime {
         message: &OutboundPeer,
         options: PeerSendOptions,
     ) -> RecipientReport {
-        let outcome = match self
-            .send_peer_with(&peer.destination_hash, message, options)
-            .await
-        {
-            Ok(SendOutcome {
-                via: PeerVia::Direct,
-                ..
-            }) => RecipientOutcome::Delivered,
-            Ok(SendOutcome {
-                via: PeerVia::StoreAndForward,
-                ..
-            }) => RecipientOutcome::StoreAndForward,
-            Err(SendError::NotTrustedByPeer(refusal)) => {
-                RecipientOutcome::NotTrustedByPeer(refusal)
-            }
-            Err(SendError::NoAnswer(no_answer)) => RecipientOutcome::NoAnswer(no_answer),
-            Err(
-                err @ (SendError::Refused(_)
-                | SendError::Throttled { .. }
-                | SendError::IncompatibleVersion { .. }),
-            ) => RecipientOutcome::Refused {
-                reason: err.to_string(),
-            },
-            Err(err) => RecipientOutcome::Unreachable {
-                reason: err.to_string(),
-            },
-        };
+        let outcome = recipient_outcome(
+            self.send_peer_with(&peer.destination_hash, message, options)
+                .await,
+        );
         RecipientReport {
             destination: peer.destination_hash,
             display_name: peer
@@ -4124,6 +4206,18 @@ mod tests {
                         reason: "no access".to_string(),
                     },
                 ),
+                report(
+                    "six",
+                    RecipientOutcome::Throttled {
+                        reason: "busy".to_string(),
+                    },
+                ),
+                report(
+                    "seven",
+                    RecipientOutcome::RetryLater {
+                        reason: "still arriving".to_string(),
+                    },
+                ),
             ],
         };
 
@@ -4132,11 +4226,13 @@ mod tests {
         assert_eq!(
             tally,
             BulletinTally {
-                recipients: 5,
+                recipients: 7,
                 delivered: 1,
                 stored: 2,
                 unreachable: 1,
                 refused: 1,
+                throttled: 1,
+                retry_later: 1,
             }
         );
         let envs = MeshEvent::BulletinSent {
@@ -4145,11 +4241,13 @@ mod tests {
         }
         .envs();
         assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("b-1"));
-        assert_eq!(env_value(&envs, "COYOTE_MESH_RECIPIENTS"), Some("5"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_RECIPIENTS"), Some("7"));
         assert_eq!(env_value(&envs, "COYOTE_MESH_DELIVERED"), Some("1"));
         assert_eq!(env_value(&envs, "COYOTE_MESH_STORED"), Some("2"));
         assert_eq!(env_value(&envs, "COYOTE_MESH_UNREACHABLE"), Some("1"));
         assert_eq!(env_value(&envs, "COYOTE_MESH_REFUSED"), Some("1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_THROTTLED"), Some("1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_RETRY_LATER"), Some("1"));
     }
 
     #[test]
