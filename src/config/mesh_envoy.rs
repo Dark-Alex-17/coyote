@@ -222,14 +222,12 @@ fn envoy_parts_summary(message: &PeerMessage) -> String {
                 size,
                 staged: Some(staged),
                 ..
-            } => Some(
-                match inbox_relative(staged, &message.source_destination) {
-                    Some(relative) => {
-                        format!("attached: {name} ({size} B), staged in the inbox at {relative}")
-                    }
-                    None => format!("attached: {name} ({size} B), staged in the inbox"),
-                },
-            ),
+            } => Some(match inbox_relative(staged, &message.source_destination) {
+                Some(relative) => {
+                    format!("attached: {name} ({size} B), staged in the inbox at {relative}")
+                }
+                None => format!("attached: {name} ({size} B), staged in the inbox"),
+            }),
             File {
                 size,
                 reference: Some(reference),
