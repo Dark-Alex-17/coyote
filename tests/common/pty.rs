@@ -419,7 +419,9 @@ pub fn strip_ansi(text: &str) -> String {
                 }
                 i += 1;
             }
-            Some(']') => {
+            // OSC, DCS, APC, PM and SOS strings run to ST or BEL; their
+            // payload is not screen text.
+            Some(']' | 'P' | '_' | '^' | 'X') => {
                 i += 2;
                 loop {
                     match chars.get(i) {

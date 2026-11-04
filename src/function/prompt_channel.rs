@@ -1693,6 +1693,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 .current_dir(dir)
                 .env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove("COYOTE_UI")
                 .env_remove(OUT_FD_ENV)
                 .env(REPLY_ENV, server.env_value())
                 .env("PROMPT_UTILS", HELPER)
@@ -3372,6 +3373,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let mut server = Server::open().unwrap();
             cmd.env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove("COYOTE_UI")
                 .env_remove(OUT_FD_ENV)
                 .envs(env.iter().copied())
                 .env(REPLY_ENV, server.env_value())
@@ -3424,6 +3426,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         fn drive_without_channel(mut cmd: Command) -> Run {
             cmd.env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove("COYOTE_UI")
                 .env_remove(OUT_FD_ENV)
                 .env_remove(REPLY_ENV)
                 .stdin(Stdio::null())
@@ -3771,6 +3774,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let mut server = Server::open().unwrap();
             cmd.env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove("COYOTE_UI")
                 .env_remove(OUT_FD_ENV)
                 .env(REPLY_ENV, server.env_value())
                 .stdin(Stdio::null())
@@ -3827,6 +3831,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         fn drive_with_reserved_fd(mut cmd: Command) -> Run {
             cmd.env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove("COYOTE_UI")
                 .env_remove(OUT_FD_ENV)
                 .env(REPLY_ENV, "/dev/fd/9")
                 .stdin(Stdio::null())
@@ -3939,6 +3944,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let mut server = Server::open().unwrap();
             cmd.env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove("COYOTE_UI")
                 .env_remove(OUT_FD_ENV)
                 .env(REPLY_ENV, server.env_value())
                 .stdin(Stdio::null())
@@ -3987,6 +3993,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         fn drive_with_dead_reply(mut cmd: Command, reply: &str) -> Run {
             cmd.env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove("COYOTE_UI")
                 .env_remove(OUT_FD_ENV)
                 .env(REPLY_ENV, reply)
                 .stdin(Stdio::null())

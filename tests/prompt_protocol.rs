@@ -56,6 +56,7 @@ fn confirm_without_channel_reads_the_controlling_terminal() {
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     pty.wait_for("(y/N)", PTY_DEADLINE).unwrap();
@@ -93,6 +94,7 @@ fn python_confirm_without_channel_reads_the_controlling_terminal() {
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     pty.wait_for("(y/N)", PTY_DEADLINE).unwrap();
@@ -134,6 +136,7 @@ fn typescript_confirm_without_channel_reads_the_controlling_terminal() {
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     pty.wait_for("(y/N)", PTY_DEADLINE).unwrap();
@@ -475,6 +478,7 @@ fn python_select_without_channel_reads_the_controlling_terminal() {
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     let listing = pty.wait_for("2) b", PTY_DEADLINE).unwrap();
@@ -516,6 +520,7 @@ fn typescript_select_without_channel_reads_the_controlling_terminal() {
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     let listing = pty.wait_for("2) b", PTY_DEADLINE).unwrap();
@@ -554,6 +559,7 @@ fn python_password_without_channel_hides_the_typed_text() {
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     pty.wait_for("pw-py-x7x", PTY_DEADLINE).unwrap();
@@ -600,6 +606,7 @@ fn typescript_password_without_channel_hides_the_typed_text() {
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     pty.wait_for("pw-ts-x7x", PTY_DEADLINE).unwrap();
@@ -1064,6 +1071,7 @@ fn run_password_in_pty_with(
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     pty.wait_for(marker, PTY_DEADLINE).unwrap();

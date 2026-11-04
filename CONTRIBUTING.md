@@ -59,7 +59,8 @@ cz commit
 ### Snapshot tests
 The TUI's frame tests are [insta](https://insta.rs) snapshots under `src/tui/snapshots/`. A changed frame fails the
 test and writes a `*.snap.new` beside the old file (git ignores it): compare the two, and when the change is intended
-re-run that test with `INSTA_UPDATE=always` (or use `cargo insta review`) and commit the updated `.snap`. Never commit
+re-run that test with `INSTA_UPDATE=always` (or install the reviewer once with `cargo install cargo-insta` and use
+`cargo insta review`) and commit the updated `.snap`. Never commit
 a `.snap.new`.
 
 ### CI/CD Testing with Act

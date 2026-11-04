@@ -3484,6 +3484,17 @@ fn a_truncated_escape_at_the_end_does_not_panic() {
     assert_eq!(strip_ansi("tail\x1b("), "tail");
 }
 
+/// Control strings other than OSC are consumed whole as well: a DCS, APC,
+/// PM or SOS payload is not screen text.
+#[test]
+fn control_string_payloads_are_not_screen_text() {
+    assert_eq!(strip_ansi("a\x1bPq#0;2;0;0;0\x1b\\b"), "ab");
+    assert_eq!(strip_ansi("a\x1b_Gf=100\x1b\\b"), "ab");
+    assert_eq!(strip_ansi("a\x1b^privacy\x07b"), "ab");
+    assert_eq!(strip_ansi("a\x1bXstart\x1b\\b"), "ab");
+    assert_eq!(strip_ansi("tail\x1bP"), "tail");
+}
+
 /// The conceal oracle reads `8` only as its own parameter: the palette
 /// index or channel value 8 inside an extended colour is colour.
 #[test]
