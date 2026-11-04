@@ -16422,6 +16422,46 @@ mod tests {
             assert!(instances::live(&tmp.path.join("cache")).is_empty());
             relay_handle.abort();
         }
+
+        mod save_session_registry_tests {
+            use super::*;
+            use crate::config::{AppState, RequestContext, WorkingMode};
+            use crate::testing::EnvVarGuard;
+            use crate::utils::get_env_name;
+
+            /// `.save session <name>` switches the context to the new name while the
+            /// node keeps serving it, as a fork does.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial_test::serial]
+            async fn saving_under_a_new_name_files_the_row_under_it() {
+                let sessions = TempDir::new("node-save-session-sessions");
+                let _sessions_dir = EnvVarGuard::set(get_env_name("sessions_dir"), &sessions.path);
+                let (addr, relay_handle, _) = loopback_relay().await;
+                let tmp = TempDir::new("node-save-session-rows");
+                let node = start_as("orig", &tmp, addr.port()).await;
+                let mut ctx =
+                    RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+                ctx.app.mesh.install(node.clone()).unwrap();
+                let mut session = Session::default();
+                session.set_name("orig".to_string());
+                ctx.session = Some(session);
+                let destination = node.current_destination_hash();
+
+                ctx.save_session(None, None).unwrap();
+                assert_eq!(
+                    instances::live(&node.cache_dir)[&destination].session,
+                    "orig"
+                );
+                ctx.save_session(Some("renamed"), None).unwrap();
+
+                assert_eq!(
+                    instances::live(&node.cache_dir)[&destination].session,
+                    "renamed"
+                );
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                relay_handle.abort();
+            }
+        }
     }
 
     const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";
