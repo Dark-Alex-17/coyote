@@ -3128,6 +3128,18 @@ fn fn_body(path: &str, name: &str) -> String {
     source[start..end].to_string()
 }
 
+/// Asserts every piece occurs in `source`, each after the one before it: the order a
+/// span-level builder chains its runs in is the order the line reads.
+fn assert_in_source_order(label: &str, source: &str, pieces: &[&str]) {
+    let mut from = 0;
+    for piece in pieces {
+        let at = source[from..].find(piece).unwrap_or_else(|| {
+            panic!("{label} has no {piece:?} after the pieces before it in {pieces:?}:\n{source}")
+        });
+        from += at + piece.len();
+    }
+}
+
 /// The source of the method `name` in `path`, declared one level inside an `impl`: from
 /// the first `fn name(` indented by exactly four spaces, declared as `pub(crate) fn`,
 /// `pub fn` or bare `fn`, `async` or not, to the next `}` indented the same way on its
@@ -3687,17 +3699,47 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     let capped = fn_body("src/mesh/mod.rs", "capped_peer_text");
     assert!(capped.contains("CUT_MARKER"), "{capped}");
     let escalation = fn_body("src/config/mesh_envoy.rs", "escalation_line");
-    let pointer_at = escalation
-        .find("PENDING_FULL_TEXT_POINTER")
-        .unwrap_or_else(|| panic!("the escalation line carries no pending pointer:\n{escalation}"));
-    let command_at = escalation
-        .find(".mesh answer {message_id} \\\"<text>\\\"")
-        .unwrap_or_else(|| {
-            panic!("the escalation line carries no whole answer command:\n{escalation}")
-        });
+    assert_in_source_order(
+        "escalation_line",
+        &escalation,
+        &[
+            "PENDING_FULL_TEXT_POINTER",
+            ".peer(who)",
+            r#"" asks: ""#,
+            ".peer(words.text)",
+            "`.mesh answer \"",
+            ".peer(message_id)",
+            r#"" \"<text>\"`""#,
+        ],
+    );
+    let frames = string_literals(&escalation);
     assert!(
-        pointer_at < command_at,
-        "the pending pointer sits before the answer command:\n{escalation}"
+        frames
+            .iter()
+            .any(|frame| frame == " {PENDING_FULL_TEXT_POINTER}"),
+        "the escalation line carries no pending pointer: {frames:?}"
+    );
+    let answer_at = frames
+        .iter()
+        .position(|frame| frame.ends_with("`.mesh answer "))
+        .unwrap_or_else(|| panic!("the escalation line opens no answer command: {frames:?}"));
+    assert!(
+        frames[..answer_at].iter().any(|frame| frame == " asks: "),
+        "the question does not come before the answer command: {frames:?}"
+    );
+    assert!(
+        frames[answer_at].starts_with("{pointer}; answer with `"),
+        "the pending pointer does not sit before the answer command: {frames:?}"
+    );
+    let opened = &frames[answer_at][frames[answer_at].find(".mesh answer ").unwrap()..];
+    let closed = frames
+        .get(answer_at + 1)
+        .and_then(|frame| frame.strip_suffix('`'))
+        .unwrap_or_else(|| panic!("the answer command's code span is not closed: {frames:?}"));
+    assert_eq!(
+        format!("{opened}{{message_id}}{closed}"),
+        ".mesh answer {message_id} \"<text>\"",
+        "the escalation line no longer carries the whole answer command"
     );
     let paint = method_body("src/repl/printer.rs", "paint_prefix");
     assert!(
@@ -6908,15 +6950,50 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         sweep_source.contains("self.announce_expired(expired)"),
         "sweep_expired_pending no longer announces what it pruned through announce_expired:\n{sweep_source}"
     );
-    let announced = string_literals(&method_body("src/mesh/node.rs", "announce_expired"));
-    let expired_question = "question {id8} from {name} expired unanswered";
-    let expired_access = "access request {id8} from {name} expired";
-    for needle in [expired_question, expired_access] {
-        assert!(
-            announced.iter().any(|literal| literal == needle),
-            "announce_expired no longer pushes {needle:?}: {announced:?}"
-        );
-    }
+    let announce = method_body("src/mesh/node.rs", "announce_expired");
+    let announced = string_literals(&announce);
+    assert_eq!(
+        announced,
+        [
+            "question",
+            "expired unanswered",
+            "access request",
+            "expired",
+            "{what} ",
+            " from ",
+            " {outcome}",
+        ],
+        "announce_expired no longer words the two kinds and the line they share"
+    );
+    assert_in_source_order(
+        "announce_expired",
+        &announce,
+        &[
+            "InboundKind::Question",
+            "InboundKind::Access",
+            r#""{what} ""#,
+            ".peer(id8)",
+            r#"" from ""#,
+            ".peer(name)",
+            r#"" {outcome}""#,
+        ],
+    );
+    let template = format!(
+        "{}{{id8}}{}{{name}}{}",
+        announced[4], announced[5], announced[6]
+    );
+    let expired_line = |what: &str, outcome: &str| {
+        template
+            .replace("{what}", what)
+            .replace("{outcome}", outcome)
+    };
+    let expired_question = expired_line(&announced[0], &announced[1]);
+    let expired_access = expired_line(&announced[2], &announced[3]);
+    assert_eq!(
+        expired_question,
+        "question {id8} from {name} expired unanswered"
+    );
+    assert_eq!(expired_access, "access request {id8} from {name} expired");
     assert_eq!(
         const_secs("src/mesh/pending.rs", "PENDING_TTL"),
         7 * 24 * 3600,
@@ -7070,8 +7147,8 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         "`expires in <span>`".to_string(),
         "once an hour".to_string(),
         format!("(a store already holding its {cap}-row cap lets the oldest rows go unannounced)"),
-        format!("`[mesh:message] {}`", placeholders(expired_question)),
-        format!("`[mesh:message] {}`", placeholders(expired_access)),
+        format!("`[mesh:message] {}`", placeholders(&expired_question)),
+        format!("`[mesh:message] {}`", placeholders(&expired_access)),
         "`.mesh dismiss <id>` closes one earlier".to_string(),
     ] {
         assert!(
@@ -8333,10 +8410,38 @@ fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
         .replace("{peer}", "<dest8>")
         .replace("{shown}", "docs/guide.md")
         .replace("{limit}", "<limit>");
-    let grant_side = string_literals(&fn_body("src/repl/mesh.rs", "refuse_unservable"))
+    let refuse = fn_body("src/repl/mesh.rs", "refuse_unservable");
+    assert_in_source_order(
+        "refuse_unservable",
+        &refuse,
+        &[
+            "if size > limit",
+            "unservable(",
+            "shown,",
+            "this node serves at most",
+        ],
+    );
+    let size_reason = string_literals(&refuse)
         .into_iter()
         .find(|literal| literal.contains("this node serves at most {limit} bytes"))
-        .expect("refuse_unservable formats the size pre-flight naming this node's limit")
+        .expect("refuse_unservable formats the size pre-flight naming this node's limit");
+    let unservable = fn_body("src/repl/mesh.rs", "unservable");
+    assert_in_source_order(
+        "unservable",
+        &unservable,
+        &[
+            ".peer(shown)",
+            "({why})",
+            ".peer(id)",
+            "lift the rule first.",
+        ],
+    );
+    let unservable_frames = string_literals(&unservable);
+    let [reason_frame, closing_frame] = unservable_frames.as_slice() else {
+        panic!("unservable no longer frames its sentence in two runs: {unservable_frames:?}");
+    };
+    let grant_side = format!("{{shown}}{reason_frame}{{id}}{closing_frame}")
+        .replace("{why}", &size_reason)
         .replace("{shown}", "`docs/big.bin`")
         .replace("{}", "<size>")
         .replace("{limit}", "<limit>")
