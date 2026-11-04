@@ -1464,12 +1464,11 @@ fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> 
     std::process::exit(0)
 }
 
-/// Edits `text` in `editor` (resolved the way the REPL resolves its buffer
+/// Hands `text` to `editor` (resolved the way the REPL resolves its buffer
 /// editor) through a private, freshly created temp file, so no other user
-/// can pre-plant a file or symlink at the path.
-/// Hands `text` to `editor` through a private temp file and returns what
-/// came back. An editor that exits non-zero (or is killed) leaves the text
-/// as it was; the temp file is removed on every path.
+/// can pre-plant a file or symlink at the path, and returns what came
+/// back. An editor that exits non-zero (or is killed) leaves the text as
+/// it was; the temp file is removed on every path.
 fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     let path = crate::utils::temp_file("-tui-", ".md");
     let mut options = std::fs::OpenOptions::new();

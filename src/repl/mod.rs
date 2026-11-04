@@ -964,8 +964,10 @@ pub async fn run_repl_command_with_prefix(
                             .arguments
                             .unwrap_or_default();
                         let (mut arguments, missing) = resolve_prompt_args(&declared, provided);
-                        for key in missing {
+                        if !missing.is_empty() {
                             ensure_prompts_available()?;
+                        }
+                        for key in missing {
                             let value = Text::new(&prompt_arg_inquire_label(server, name, &key))
                                 .prompt()
                                 .with_context(|| {

@@ -2655,8 +2655,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             // and a guard aborts with its usual message, and nothing blocks.
             // The outer shell keeps the real channel so a request that does
             // escape is still answered rather than deadlocking the harness.
+            // Descriptor 97 is closed first: a test process with many files
+            // open may well have it, and then the path would be live.
             let body = format!(
-                "{}; \
+                "exec 97>&-; {}; \
                  COYOTE_PROMPT_REPLY=/dev/fd/97 timeout 10 bash -c '{}'; echo \"outer rc=$?\"; \
                  COYOTE_PROMPT_REPLY=/dev/fd/97 timeout 10 bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
                 capture("confirm \"Warm up?\""),

@@ -143,9 +143,10 @@ impl UiSink for TuiSink {
 }
 
 fn hook_tool_name(envs: &[(String, String)]) -> Option<String> {
+    // The name is drawn on the status row; a tool's env is its own text.
     envs.iter()
         .find(|(key, _)| key == "COYOTE_TOOL_NAME")
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| super::render::plain_text(value))
 }
 
 /// Only the root turn's own tools drive the status row; a child agent's

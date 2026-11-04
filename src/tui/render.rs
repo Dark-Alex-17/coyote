@@ -39,7 +39,7 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
     while i < chars.len() {
         let c = chars[i];
         if c != ESC {
-            if c == '\n' || c == '\t' || (!c.is_control() && c != '\u{7f}') {
+            if c == '\n' || c == '\t' || !c.is_control() {
                 out.push(c);
             }
             i += 1;
