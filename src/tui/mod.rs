@@ -67,6 +67,11 @@ const STUBBORN_TURN_ENV: &str = "COYOTE_TUI_STUBBORN_TURN";
 /// counts as a modal answer, so a keystroke meant for the composer never
 /// confirms a prompt that appeared under it.
 const HOTKEY_IDLE: Duration = Duration::from_secs(1);
+/// How long the UI waits on the exit work. The work itself waits
+/// `EXIT_CANCEL_WAIT` on background tasks before it saves the session and
+/// runs the finished hook, so the wait on it has to outlast that or a
+/// task that ignores cancellation would cost the user the save.
+const EXIT_TEARDOWN_WAIT: Duration = EXIT_CANCEL_WAIT.saturating_add(EXIT_HOOK_DRAIN_TIMEOUT);
 const TOOL_OUTPUT_TAIL: usize = 20;
 /// Most text one cell of late command output holds; a leftover child that
 /// keeps writing sees its oldest lines dropped rather than the transcript grow.
@@ -1583,7 +1588,8 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         // gives it; a teardown that never returns ends the process the
         // way an outlived task does instead of hanging a bare terminal.
         Leave::Abandoned(ctx) => {
-            match join_unattended(spawn_exit(*ctx, abort.clone()), &mut rx, EXIT_CANCEL_WAIT).await
+            match join_unattended(spawn_exit(*ctx, abort.clone()), &mut rx, EXIT_TEARDOWN_WAIT)
+                .await
             {
                 Join::Finished((_, result, captured)) => {
                     write_to_terminal(&render::sanitize_ansi(&captured));
@@ -1678,7 +1684,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         }
                     }
                     Some(Task::Exit(handle)) => {
-                        match join_unattended(handle, rx, EXIT_CANCEL_WAIT).await {
+                        match join_unattended(handle, rx, EXIT_TEARDOWN_WAIT).await {
                             Join::Finished((_, result, captured)) => {
                                 Leave::Finished(result, captured)
                             }
@@ -2670,6 +2676,80 @@ mod tests {
         assert!(err.is_panic(), "{err}");
         let payload = err.into_panic();
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom-j4p"));
+    }
+
+    /// A supervised agent that never finishes. The exit work waits
+    /// `EXIT_CANCEL_WAIT` on it before it saves the session.
+    fn register_stuck_agent(ctx: &mut RequestContext) {
+        use crate::supervisor::{AgentHandle, AgentResult, Supervisor};
+        let join_handle = tokio::spawn(std::future::pending::<Result<AgentResult>>());
+        let supervisor = Arc::new(parking_lot::RwLock::new(Supervisor::new(4, 3)));
+        supervisor
+            .write()
+            .register(AgentHandle {
+                id: "stuck-e6w".to_string(),
+                agent_name: "explore".to_string(),
+                depth: 1,
+                inbox: Arc::new(crate::supervisor::mailbox::Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+                session_id: None,
+            })
+            .unwrap();
+        ctx.supervisor = Some(supervisor);
+    }
+
+    /// A background agent that ignores cancellation costs the exit its
+    /// `EXIT_CANCEL_WAIT`, not the session save: the wait on the exit
+    /// work outlasts the wait inside it, so `exit_session` still runs and
+    /// the session reaches disk. Under a wait equal to the inner one the
+    /// save would be lost to the bounded exit.
+    #[test]
+    #[serial]
+    fn a_stuck_background_agent_does_not_cost_the_exit_its_session_save() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-exit-save");
+            std::fs::create_dir_all(crate::config::paths::local_dir("sessions")).unwrap();
+            let abort = create_abort_signal();
+            let mut saved_under_equal_wait = None;
+            // The roomy wait first: the equal wait leaves its exit work
+            // running past the test, under a session name of its own.
+            for (name, wait, expect_saved) in [
+                ("exit-save-roomy-e6w", EXIT_TEARDOWN_WAIT, true),
+                ("exit-save-equal-e6w", EXIT_CANCEL_WAIT, false),
+            ] {
+                let mut ctx = chat_ctx();
+                let app = Arc::clone(&ctx.app.config);
+                ctx.use_session(&app, Some(name), abort.clone())
+                    .await
+                    .unwrap();
+                ctx.set_save_session_this_time().unwrap();
+                ctx.init_todo_list("persist me e6w");
+                let session_files = [
+                    ctx.session_file_for(name, crate::config::SessionScope::Global),
+                    ctx.session_file_for(name, crate::config::SessionScope::Workspace),
+                ];
+                assert!(session_files.iter().all(|file| !file.exists()));
+                register_stuck_agent(&mut ctx);
+                let (_tx, mut rx) = unbounded_channel();
+                let joined = join_unattended(spawn_exit(ctx, abort.clone()), &mut rx, wait).await;
+                let saved = session_files.iter().any(|file| {
+                    std::fs::read_to_string(file).is_ok_and(|text| text.contains("persist me e6w"))
+                });
+                match expect_saved {
+                    true => {
+                        assert!(matches!(joined, Join::Finished((_, Ok(()), _))));
+                        assert!(saved, "the session was not saved before the exit returned");
+                    }
+                    false => {
+                        saved_under_equal_wait = Some((matches!(joined, Join::TimedOut), saved))
+                    }
+                }
+            }
+            // The equal wait is the shape the bug had: it gives up first.
+            assert_eq!(saved_under_equal_wait, Some((true, false)));
+        });
     }
 
     /// A SIGTERM latched while the terminal was released survives the
