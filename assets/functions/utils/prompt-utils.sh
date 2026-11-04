@@ -532,7 +532,10 @@ editor() {
 with_validate() {
   while true; do
     declare val
-    val="$(eval "$1")"
+    # A prompt that fails (refused under the UI, cancelled on the channel)
+    # ends the loop with its status; the subshell's exit would otherwise
+    # leave an empty value for the validator to reject forever.
+    val="$(eval "$1")" || return 1
 
     if ($2 "$val" >/dev/null); then
       echo "$val"
