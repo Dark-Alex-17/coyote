@@ -228,7 +228,10 @@ fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
         && std::thread::current().name() == Some("main")
         && let Some(mut tty) = static_tty()
     {
-        let _ = writeln!(tty, "thread 'main' {info}");
+        // The payload is whatever the panicking code formatted; it goes
+        // to the restored terminal stripped of anything it could do there.
+        let message = super::render::plain_text(&info.to_string());
+        let _ = writeln!(tty, "thread 'main' {message}");
     }
 }
 
