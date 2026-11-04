@@ -486,26 +486,23 @@ mod tests {
         );
     }
 
-    /// The descriptor number the dead-reply-path cases point at. A test
-    /// process with many files open may well have it, and a live
-    /// descriptor would turn the "unopenable" path into a working channel
-    /// and the case into a false pass: every driver closes it in the child
-    /// before exec, whatever the parent holds.
-    const DEAD_REPLY_FD: RawFd = 97;
-
-    /// `/dev/fd/<DEAD_REPLY_FD>`; the bash driver checks the number is not
-    /// the channel it opened (closing that one in the child would take the
-    /// real channel away).
+    /// A reply path no child can open: `/dev/fd/<n>` where `n` is the
+    /// process's descriptor limit, one past the highest number any
+    /// descriptor can have. A fixed small number would not do: a test
+    /// process with many files open may hold it, or the test's own channel
+    /// may land on it, and either turns the "unopenable" path into a
+    /// working one and the case into a false pass.
     fn dead_reply_path() -> String {
-        format!("/dev/fd/{DEAD_REPLY_FD}")
-    }
-
-    /// Closes the dead reply descriptor in a child between fork and exec,
-    /// in case the number was opened by another thread after the check.
-    fn close_dead_reply_fd() -> std::io::Result<()> {
-        // SAFETY: close is async-signal-safe; EBADF (already closed) is fine.
-        unsafe { libc::close(DEAD_REPLY_FD) };
-        Ok(())
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit fills the struct behind a valid pointer.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        assert_eq!(rc, 0, "getrlimit failed");
+        // An unlimited process still cannot hold a descriptor this high.
+        let dead: u64 = limit.rlim_cur.min(1 << 20);
+        format!("/dev/fd/{dead}")
     }
 
     /// Installs a bash tool that sources the shipped helper on the
@@ -1683,10 +1680,6 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             stray: Stray,
         ) -> Run {
             let mut server = Server::open().unwrap();
-            assert_ne!(
-                server.child_fd, DEAD_REPLY_FD,
-                "the dead reply descriptor collides with the test's own channel"
-            );
             let mut cmd = Command::new(bash_program().unwrap());
             cmd.arg("-c")
                 .arg(format!("source \"$PROMPT_UTILS\"; {body}"))
@@ -1701,16 +1694,16 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             server.configure(&mut cmd);
-            // SAFETY: close and setsid are async-signal-safe and touch no
-            // shared state.
-            unsafe {
-                cmd.pre_exec(move || {
-                    close_dead_reply_fd()?;
-                    if detach && libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+            if detach {
+                // SAFETY: setsid is async-signal-safe and touches no shared state.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
             }
             let mut child = cmd.spawn().expect("spawn bash");
             server.spawned();
@@ -3999,11 +3992,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            // SAFETY: close and setsid are async-signal-safe and touch no
-            // shared state.
+            // SAFETY: setsid is async-signal-safe and touches no shared state.
             unsafe {
                 cmd.pre_exec(|| {
-                    close_dead_reply_fd()?;
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
