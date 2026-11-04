@@ -21714,6 +21714,22 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let own = started.runtime.fingerprint().to_string();
                         let sentence = "This is your own identity: your other sessions on this config dir can now message this one.";
 
+                        let withdrawn = out_of(
+                            &mut ctx,
+                            &format!(
+                                ".mesh untrust --identity {own} --confirm untrust-{}",
+                                short(&own)
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(withdrawn.contains("Untrusted identity"), "{withdrawn}");
+                        assert_eq!(trust.identity_standing(&own), IdentityStanding::Unknown);
+                        assert!(
+                            !fs::read_to_string(trust.path()).unwrap().contains(&own),
+                            "the start-up grant is gone from trust.yaml"
+                        );
+
                         let first = out_of(&mut ctx, &format!(".mesh trust --identity {own}"))
                             .await
                             .unwrap();
