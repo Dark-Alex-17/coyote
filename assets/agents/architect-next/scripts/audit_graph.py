@@ -30,6 +30,7 @@ BOUNDED = {
     "open_questions_gate": "B1 design_rounds<=3 / re-frame once per round (choice_reframed) / choice_index list-bounded",
     "reseal_gate": "B2 amend_cycles<=3 (A1)",
     "gate1_route": "B3 same-leak retry once (A1) / FRICTION seal",
+    "leak_route": "re-frame once per leak round (choice_reframed) / choice_index list-bounded",
     "plan_route": "B4 author_retries<=1",
     "gate2_route": "B5 oracle_rejects<=3",
     "promote_verify": "B6 promote_retries<=1",

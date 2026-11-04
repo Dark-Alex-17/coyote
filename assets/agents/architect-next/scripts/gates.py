@@ -482,9 +482,8 @@ def normalize_choices(state, u, item):
 DISCUSSION_PARKED = "choice_discussion"
 
 # The gate that asks each choice kind's queue: it asks the current question, or closes the queue once all are answered.
-# leak_question is not asked through the queue yet; it gets an entry here when it is.
 CHOICE_KIND_GATES = {"design_round": "open_questions_gate", "quality_bar": "quality_bar_gate",
-                     "checklist_accept": "checklist_round"}
+                     "checklist_accept": "checklist_round", "leak_question": "leak_route"}
 CHECKLIST_ACCEPT = "Accept: add it as a criterion"
 CHECKLIST_DROP = "Drop"
 
@@ -606,8 +605,9 @@ def frame_questions_route(state):
     else:
         ledger(state, u, f"design: the re-frame returned {len(framed)} question(s) for {len(invalid)}; kept the originals")
         framed = invalid
-    kept = [q for q in as_list(state.get("open_questions")) if q not in invalid]
-    u.update({"open_questions": kept + framed, "choice_invalid": [], "framed_questions": []})
+    source = "leak_unanswerable" if state.get("choice_kind") == "leak_question" else "open_questions"
+    kept = [q for q in as_list(state.get(source)) if q not in invalid]
+    u.update({source: kept + framed, "choice_invalid": [], "framed_questions": []})
     u["_next"] = CHOICE_KIND_GATES[state.get("choice_kind") or "design_round"]
     return u
 
@@ -828,24 +828,80 @@ def gate1_route(state):
     return u
 
 
-def leak_route(state):
-    u = {}
-    harvest_anomalies(state, u, "answer_leaks")
-    note_script_error(state, u, "answer_leaks")
-    answers = [a for a in as_list(state.get("leak_answers")) if isinstance(a, dict) and a.get("answer")]
-    unanswerable = [q for q in as_list(state.get("leak_unanswerable")) if isinstance(q, str) and q.strip()]
-    if not answers and not unanswerable:
-        unanswerable = as_list(state.get("leak_questions")) or ["the gatekeeper's questions (see the verdict)"]
-    if unanswerable:
-        u["leak_pending_answers"] = answers
-        return raise_escalation(state, u, escalation(
-            "leak_question", "Gate 1 questions that cannot be answered from code or docs (business rules / priority calls). "
-                             "Answer each; the plan is amended with your answers and re-sealed.\n"
-                             + "\n".join(f"{i}. {q}" for i, q in enumerate(unanswerable, 1)), [],
-            evidence=tail(state.get("gate1_result", ""), 1500), data={"questions": unanswerable}))
-    u["pending_amendments"] = [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in answers]
+LEAK_CARRIED = "(open, could not be framed; carried for the gatekeeper)"
+LEAK_HEADING = "Gate 1 question (not answerable from code or docs)"
+
+
+def _leak_item(q):
+    """A gatekeeper question as an open-question item; a plain string becomes an item with no options."""
+    if isinstance(q, str):
+        return {"question": q.strip()} if q.strip() else None
+    return q if isinstance(q, dict) and str(q.get("question") or "").strip() else None
+
+
+def _leak_amend(state, u, asked):
+    """Close the leak round: the held answers and the asked ones become the amendment."""
+    held = [a for a in as_list({**state, **u}.get("leak_pending_answers")) if isinstance(a, dict) and a.get("answer")]
+    u["pending_amendments"] = [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in held + asked]
+    u["leak_pending_answers"] = []
+    _end_choices(u)
+    ledger(state, u, f"gate1: {len(held)} held and {len(asked)} asked answer(s) -> amend_plan")
     u["_next"] = "amend_plan"
     return u
+
+
+def leak_route(state):
+    u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "leak_question" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, LEAK_HEADING)
+        return _leak_amend(state, u, [a for a in as_list(state.get("choice_answers")) if isinstance(a, dict)])
+    reframed = state.get("choice_kind") == "leak_question" and truthy(state.get("choice_reframed"))
+    items = [i for i in map(_leak_item, as_list(state.get("leak_unanswerable"))) if i]
+    if not reframed:
+        harvest_anomalies(state, u, "answer_leaks")
+        note_script_error(state, u, "answer_leaks")
+        answers = [a for a in as_list(state.get("leak_answers")) if isinstance(a, dict) and a.get("answer")]
+        if not answers and not items:
+            items = [{"question": q} for q in as_list(state.get("leak_questions"))
+                     or ["the gatekeeper's questions (see the verdict)"]]
+        u["leak_pending_answers"] = answers
+        if not items:
+            return _leak_amend(state, u, [])
+    askable, invalid, seen = [], [], set()
+    for item in items:
+        key = re.sub(r"\W+", " ", item["question"].lower()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        n = normalize_choices(state, u, item)
+        (askable if n else invalid).append(n or item)
+    if invalid and not reframed:
+        u.update({"choice_kind": "leak_question", "choice_queue": [], "choice_reframed": True, "choice_invalid": invalid,
+                  "framed_questions": [], "leak_unanswerable": askable + invalid})
+        ledger(state, u, f"gate1: {len(invalid)} unanswerable question(s) lack {CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} "
+                         "options with exactly one recommended -> one re-frame")
+        u["_next"] = "frame_questions"
+        return u
+    scope = [q for q in invalid if truthy(q.get("changes_scope"))]
+    if scope:
+        u["failure_reason"] = ("a Gate 1 question changes scope and could not be framed as a multiple choice "
+                               f"({CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} options, exactly one recommended) even after a "
+                               f"re-frame: {scope[0]['question']}")
+        ledger(state, u, u["failure_reason"])
+        u["_next"] = "end_blocked"
+        return u
+    if invalid:
+        # a gatekeeper question is never dropped: it reaches the next gatekeeper pass as an open amendment line
+        held = as_list({**state, **u}.get("leak_pending_answers"))
+        u["leak_pending_answers"] = held + [{"question": q["question"], "answer": LEAK_CARRIED} for q in invalid]
+        ledger(state, u, f"gate1: {len(invalid)} question(s) not askable as a multiple choice after a re-frame; "
+                         "carried for the gatekeeper")
+    if not askable:
+        return _leak_amend(state, u, [])
+    _start_choices(u, "leak_question", askable)
+    return _ask_choice(state, u, LEAK_HEADING)
 
 
 def gate2_build(state):
@@ -2521,7 +2577,6 @@ def parse_answer(state):
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
-    free_text_kinds = ("leak_question", "need_design_doc")
     if esc.get("kind") == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
@@ -2537,7 +2592,7 @@ def parse_answer(state):
             u["_next"] = "classify_reply"
             return u
     else:
-        choice = text if esc.get("kind") in free_text_kinds else match_option(text, options)
+        choice = text if esc.get("kind") == "need_design_doc" else match_option(text, options)
     if choice is None:
         rounds = as_int(state.get("reask_rounds"))
         if rounds < STRIKE_LIMIT:
@@ -2771,11 +2826,6 @@ def apply_answer(state):
             u["pending_amendments"] = [f"Owner's answers to the gatekeeper's open questions:\n{answer}"]
             u["leak_fingerprints"] = []
             u["_next"] = "amend_plan"
-    elif kind == "leak_question":
-        pend = [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in as_list(state.get("leak_pending_answers")) if isinstance(a, dict) and a.get("answer")]
-        u["pending_amendments"] = pend + [f"Owner's answers to the unanswerable Gate 1 questions:\n{answer}"]
-        u["leak_pending_answers"] = []
-        u["_next"] = "amend_plan"
     elif kind == "gate2_stuck":
         if stop or abort:
             u["failure_reason"] = "stopped: the oracle still rejects the plan after 3 rounds"

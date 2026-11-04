@@ -990,7 +990,7 @@ nodes:
     type: llm
     description: Re-frame open questions that are not askable as a multiple choice (2-4 options, exactly one recommended), once per round.
     instructions: |
-      Each design question below cannot be asked as a multiple choice yet: a
+      Each question below cannot be asked as a multiple choice yet: a
       question needs 2-4 options, and exactly one of them recommended. Read the
       plan (and the design doc where it helps) and re-frame each question:
       - Keep the question text, its meaning and its changes_scope flag.
@@ -1208,6 +1208,11 @@ nodes:
       docs with fs_read. Return leak_answers (question -> answer with its verified
       pointer or inline text) and leak_unanswerable: ONLY questions that genuinely
       cannot be answered from code or docs (business rules, priority calls).
+      Give each unanswerable question 2-4 options of which exactly one is
+      recommended (recommended=true, listed first, with its evidence: what in the
+      code, docs or verdict points to it), and changes_scope=true when the answer
+      changes the plan's scope. Each is asked on its own as a multiple choice; a
+      question without exactly one recommended option is re-framed once.
       Never edit the plan here; the amend step applies your answers.
     prompt: |
       ## Gatekeeper verdict (verbatim)
@@ -1239,7 +1244,23 @@ nodes:
             required: [question, answer]
         leak_unanswerable:
           type: array
-          items: { type: string }
+          items:
+            anyOf:
+              - type: string
+              - type: object
+                properties:
+                  question: { type: string }
+                  options:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        text: { type: string }
+                        recommended: { type: boolean }
+                        evidence: { type: string }
+                      required: [text]
+                  changes_scope: { type: boolean }
+                required: [question]
         anomalies:
           type: array
           items: { type: string }
@@ -1252,7 +1273,10 @@ nodes:
   leak_route:
     id: leak_route
     type: script
-    description: Unanswerable questions -> the owner (one round); answers -> amend_plan (-> re-seal).
+    description: >-
+      Unanswerable questions -> the owner, one multiple-choice escalation per question
+      (one re-frame for those not askable; a scope-changing one that still is not is a
+      hard stop, the others are carried as open amendment lines); answers -> amend_plan (-> re-seal).
     script: scripts/leak_route.py
     fallback: end_failure
 

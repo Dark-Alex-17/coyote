@@ -636,7 +636,7 @@ check("choice_resume: a parked checklist item settled as 'drop' -> recorded as D
       and s["escalation"]["data"]["index"] == 2, s)
 check("choice kind gates: resumed without an answer, every kind returns to the gate that asks its own queue",
       gates.CHOICE_KIND_GATES == {"design_round": "open_questions_gate", "quality_bar": "quality_bar_gate",
-                                  "checklist_accept": "checklist_round"}
+                                  "checklist_accept": "checklist_round", "leak_question": "leak_route"}
       and all(gates.choice_resume(base_state(choice_kind=k, escalation=escalation(k, "q")))["_next"] == g
               for k, g in gates.CHOICE_KIND_GATES.items()))
 u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findings=["PIPELINE-FAULT: x"]))
@@ -669,10 +669,78 @@ u = gates.gate1_route(base_state(gate1_result="Agent node failed: timeout"))
 check("gate1_route: agent fault -> escalation gate_fault (never a verdict)", u["escalation"]["kind"] == "gate_fault")
 u = gates.leak_route(base_state(leak_answers=[{"question": "infra?", "answer": "infra/ per CLAUDE.md:12"}], leak_unanswerable=[]))
 check("leak_route: answers -> amend_plan with pending amendments", u["_next"] == "amend_plan" and u["pending_amendments"] and "infra/" in u["pending_amendments"][0])
-u = gates.leak_route(base_state(leak_answers=[{"question": "a", "answer": "b"}], leak_unanswerable=["priority of X vs Y?"]))
-check("leak_route: unanswerable -> escalation leak_question (answers held)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "leak_question" and u["leak_pending_answers"])
+LEAK_Q = {"question": "priority of X vs Y?", "options": [{"text": "X first"}, {"text": "Y first", "recommended": True, "evidence": "the verdict"}]}
+LEAK_Q2 = {"question": "who signs off?", "options": [{"text": "the owner", "recommended": True}, {"text": "the team"}]}
+s = base_state(leak_answers=[{"question": "a", "answer": "b"}], leak_unanswerable=[LEAK_Q, {**LEAK_Q, "question": "Priority of X vs Y"}, LEAK_Q2])
+s.update(gates.leak_route(s))
+check("leak_route: framed unanswerable questions -> one multiple choice per question, recommended first, duplicates removed, answers held",
+      s["_next"] == "escalate_gate" and s["escalation"]["kind"] == "leak_question" and s["escalation"]["data"]["multiple_choice"]
+      and s["escalation"]["options"][0]["text"] == "Y first" and s["escalation"]["options"][0]["recommended"]
+      and "1 of 2: priority of X vs Y?" in s["escalation"]["question"] and len(s["choice_queue"]) == 2
+      and s["leak_pending_answers"] == [{"question": "a", "answer": "b"}], s)
+leak_asked = dict(s)
+s.update(gates.apply_answer({**s, "last_answer": "X first"}))
+check("apply_answer: leak_question -> recorded through the queue -> leak_route", s["_next"] == "leak_route" and s["choice_index"] == 1)
+s.update(gates.leak_route(s))
+check("leak_route: the next unanswerable question is asked on its own", s["_next"] == "escalate_gate"
+      and "2 of 2: who signs off?" in s["escalation"]["question"], s)
+s.update(gates.apply_answer({**s, "last_answer": "a lawyer"}))
+s.update(gates.leak_route(s))
+check("leak_route: queue done -> held answers + one line per asked question -> amend_plan, held answers cleared",
+      s["_next"] == "amend_plan" and s["pending_amendments"] == [
+          "Gate 1 leak: a -> b", "Gate 1 leak: priority of X vs Y? -> X first", "Gate 1 leak: who signs off? -> a lawyer"]
+      and s["leak_pending_answers"] == [] and s["choice_kind"] == "" and s["choice_queue"] == [], s.get("pending_amendments"))
+s = dict(leak_asked)
+s.update(gates.choice_park({**s, "last_answer_text": "depends on the contract?"}))
+check("choice_park: a Gate 1 question parks like a design question", s["_next"] == "end_discussion"
+      and s["parked"] == gates.DISCUSSION_PARKED and s["discussion"]["kind"] == "leak_question" and s["discussion"]["number"] == 1, s)
+u = gates.choice_resume(s)
+u2 = gates.leak_route({**s, **u})
+check("choice_resume: a parked Gate 1 question resumed without an answer -> leak_route asks it again",
+      u["_next"] == "leak_route" and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 0, (u, u2))
+s.update(settled_answer="Y first")
+s.update(gates.choice_resume(s))
+s.update(gates.leak_route(s))
+check("choice_resume: a parked Gate 1 question settled -> recorded, the next question asked",
+      s["choice_answers"][0]["answer"] == "Y first" and s["choice_answers"][0]["via"] == "settled"
+      and "2 of 2: who signs off?" in s["escalation"]["question"], s)
+s = base_state(leak_answers=[], leak_unanswerable=["what is the refund window?"])
+s.update(gates.leak_route(s))
+check("leak_route: a plain string question -> one re-frame", s["_next"] == "frame_questions" and s["choice_kind"] == "leak_question"
+      and s["choice_invalid"] == [{"question": "what is the refund window?"}], s)
+leak_reframe = dict(s)
+s.update(gates.frame_questions_route({**s, "framed_questions": [{"question": "what is the refund window?", "options": [
+    {"text": "30 days", "recommended": True, "evidence": "docs/billing.md"}, {"text": "14 days"}]}]}))
+check("frame_questions_route: a re-framed Gate 1 question -> back to leak_route", s["_next"] == "leak_route"
+      and s["leak_unanswerable"][0]["options"][0]["text"] == "30 days", s)
+s.update(gates.leak_route(s))
+check("leak_route: the re-framed question is asked as a multiple choice", s["_next"] == "escalate_gate"
+      and s["escalation"]["options"][0]["text"] == "30 days" and s["choice_kind"] == "leak_question", s)
+s = dict(leak_reframe)
+s.update(gates.frame_questions_route({**s, "framed_questions": []}))
+s.update(gates.leak_route(s))
+check("leak_route: still not askable after the re-frame -> carried as an open amendment line, ledgered",
+      s["_next"] == "amend_plan" and s["pending_amendments"] == [
+          f"Gate 1 leak: what is the refund window? -> {gates.LEAK_CARRIED}"]
+      and any("carried for the gatekeeper" in d for d in s["decisions"]) and s["choice_reframed"] is False, s)
+s = base_state(leak_answers=[], leak_unanswerable=[LEAK_Q, "what is the refund window?"])
+s.update(gates.leak_route(s))
+s.update(gates.frame_questions_route({**s, "framed_questions": [{"question": "what is the refund window?"}]}))
+s.update(gates.leak_route(s))
+s.update(gates.apply_answer({**s, "last_answer": "1"}))
+s.update(gates.leak_route(s))
+check("leak_route: an askable question is asked while a carried one waits; both reach the amendment",
+      s["_next"] == "amend_plan" and s["pending_amendments"] == [
+          f"Gate 1 leak: what is the refund window? -> {gates.LEAK_CARRIED}", "Gate 1 leak: priority of X vs Y? -> Y first"], s)
+s = base_state(leak_answers=[], leak_unanswerable=[{"question": "drop the API?", "changes_scope": True}])
+s.update(gates.leak_route(s))
+s.update(gates.frame_questions_route({**s, "framed_questions": []}))
+u = gates.leak_route(s)
+check("leak_route: a scope-changing Gate 1 question not framed after the re-frame -> end_blocked",
+      u["_next"] == "end_blocked" and "drop the API?" in u["failure_reason"], u)
 u = gates.leak_route(base_state(leak_answers=[], leak_unanswerable=[], leak_questions=["q?"], last_node_output="llm node failed"))
-check("leak_route: dead answer_leaks -> every question to the owner (fail-open)", u["_next"] == "escalate_gate")
+check("leak_route: dead answer_leaks -> every question to the owner through the re-frame (fail-open)",
+      u["_next"] == "frame_questions" and u["choice_invalid"] == [{"question": "q?"}], u)
 u = gates.gate2_build(base_state(task_granularity="micro"))
 check("gate2_build: micro sizing sentence", "Micro-grain" in u["gate2_prompt"] and "PLAN_REVIEW" in u["gate2_prompt"])
 u = gates.gate2_route(base_state(gate2_result="PLAN_REVIEW: OKAY"))
@@ -1273,7 +1341,7 @@ u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask
 check("parse_answer: unparseable -> re-ask (B22 side 1)", u["_next"] == "ask_user" and u["reask_rounds"] == 1)
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=STRIKE_LIMIT))
 check("parse_answer: B22 exhausted -> free text stands", u["_next"] == "apply_answer" and u["last_answer"] == "banana")
-u = gates.parse_answer(base_state(escalation=escalation("leak_question", "q"), last_answer_text="1: pg; 2: no"))
+u = gates.parse_answer(base_state(escalation=escalation("need_design_doc", "q"), last_answer_text="/tmp/x.md please"))
 check("parse_answer: free-text kinds never re-ask", u["_next"] == "apply_answer")
 for reply, want in (("Option 1 (recommended)", "pg"), ("Option 3", "redis"), ("2", "sqlite"), ("sqlite", "sqlite")):
     u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text=reply))
@@ -1474,8 +1542,6 @@ check("apply_answer: amend_cap allow -> one more cycle then gate1", u["_next"] =
 check("apply_answer: gate1_stuck stop -> end_blocked", AA("gate1_stuck", "Stop and report")["_next"] == "end_blocked")
 u = AA("gate1_stuck", "infra goes in infra/; DB is pg")
 check("apply_answer: gate1_stuck answers -> amend_plan (fingerprints reset)", u["_next"] == "amend_plan" and u["leak_fingerprints"] == [])
-u = AA("leak_question", "priority: X first", leak_pending_answers=[{"question": "a", "answer": "b"}])
-check("apply_answer: leak_question -> held answers + owner's answers amended", u["_next"] == "amend_plan" and len(u["pending_amendments"]) == 2)
 check("apply_answer: gate2_stuck stop -> end_blocked", AA("gate2_stuck", "Stop and report")["_next"] == "end_blocked")
 check("apply_answer: gate2_stuck override -> reseal_return (recorded)", AA("gate2_stuck", "Override: promote the plan as reviewed (recorded)")["_next"] == "reseal_return")
 u = AA("gate_fault", "Retry the gatekeeper", esc=escalation("gate_fault", "q", data={"gate": "gate1"}), gate_fault_retries=0)
