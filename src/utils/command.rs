@@ -364,14 +364,15 @@ fn get_history_file(shell: &str) -> Option<PathBuf> {
     }
 }
 
-#[cfg(test)]
+// Every case spawns a unix shell; the module is unix-only so its imports
+// do not go unused under another target.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serial_test::serial;
 
     /// A loader killed by a signal reports a non-zero status, so its
     /// partial output is never read as success.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_signal_killed_loader_is_not_a_success() {
         let status = wait_for_status_interruptible("sh", &["-c", "kill -9 $$"], Stdio::null())
@@ -386,7 +387,6 @@ mod tests {
     /// and then sleeps for half a minute) under the TUI, aborts once the
     /// pid is on disk, and checks the caller gets the abort promptly and
     /// the loader process is gone, not left behind to finish on its own.
-    #[cfg(unix)]
     async fn assert_aborted_loader_is_reaped(loader: &str, pid_file: &Path) {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let abort_signal = create_abort_signal();
@@ -436,7 +436,6 @@ mod tests {
     }
 
     /// A file-writing loader (`$2`) is polled, so an abort kills it.
-    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn an_aborted_loader_returns_promptly_and_its_child_is_reaped() {
@@ -450,7 +449,6 @@ mod tests {
 
     /// A stdout loader (no `$2`) waits on the runtime too, so an abort
     /// kills it instead of blocking on its output.
-    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn an_aborted_stdout_loader_returns_promptly_and_its_child_is_reaped() {
@@ -465,7 +463,6 @@ mod tests {
     /// A stdout loader never inherits the terminal's stdin, in the REPL
     /// as well as under the UI: a loader that reads `-` after its file
     /// sees EOF at once instead of waiting on the keyboard.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_stdout_loader_reads_eof_from_stdin() {
         let input = temp_file("-loader-input-", ".txt");
@@ -488,7 +485,6 @@ mod tests {
     /// The file-writing branch closes stdin too, in the REPL and under the
     /// UI alike: a loader that copies stdin into `$2` writes an empty file
     /// at once instead of waiting on the keyboard.
-    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn a_file_loader_reads_eof_from_stdin_under_every_ui() {
@@ -505,7 +501,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_status_with_a_code_keeps_it() {
         let status = Command::new("sh").args(["-c", "exit 3"]).status().unwrap();
