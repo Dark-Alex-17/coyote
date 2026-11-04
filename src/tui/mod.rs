@@ -246,9 +246,12 @@ pub(crate) fn spawn_turn(
 fn spawn_exit(
     mut ctx: RequestContext,
     abort: AbortSignal,
+    ui: UnboundedSender<UiMsg>,
 ) -> JoinHandle<(RequestContext, Result<()>, String)> {
     spawn_work(async move {
-        let guard = FdRedirect::begin(|_| {}).ok();
+        // Late output (a panic's message among it) reaches the UI the way
+        // a turn's does instead of dying in a discarded pipe.
+        let guard = FdRedirect::begin(late_output(ui)).ok();
         ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
         let result = ctx.exit_session();
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort));
@@ -583,6 +586,9 @@ pub(crate) struct App {
     /// The teardown task owns the context: nothing new can be submitted,
     /// interrupted or quit until it reports back.
     exiting: bool,
+    /// Index of the first cell the exit work may add; what came after it
+    /// is the exit's late output.
+    exit_first_cell: usize,
     footer: FooterInfo,
     usage: String,
     last_keystroke: Option<Instant>,
@@ -613,6 +619,7 @@ impl App {
             prompts: VecDeque::new(),
             turn: None,
             exiting: false,
+            exit_first_cell: 0,
             footer,
             usage: String::new(),
             last_keystroke: None,
@@ -715,6 +722,7 @@ impl App {
 
     pub(crate) fn begin_exit(&mut self) {
         self.exiting = true;
+        self.exit_first_cell = self.cells.len();
         self.schedule_frame();
     }
 
@@ -956,11 +964,19 @@ impl App {
             return;
         }
         text.truncate(text.trim_end_matches('\n').len());
-        if let Some(Cell::Notice {
-            kind: NoticeKind::Routing,
-            text: tail,
-            cache,
-        }) = self.cells.last_mut()
+        // The exit's output never folds into a cell from before it, so it
+        // stays readable as the exit's own.
+        let merge_from = if self.exiting {
+            self.exit_first_cell
+        } else {
+            0
+        };
+        if self.cells.len() > merge_from
+            && let Some(Cell::Notice {
+                kind: NoticeKind::Routing,
+                text: tail,
+                cache,
+            }) = self.cells.last_mut()
         {
             if !tail.is_empty() && !text.is_empty() {
                 tail.push('\n');
@@ -1057,7 +1073,16 @@ impl App {
         let Some(turn) = &self.turn else {
             return Vec::new();
         };
-        self.cells[turn.first_cell..]
+        self.late_output_since(turn.first_cell)
+    }
+
+    /// The exit work's late output: every routing notice since `begin_exit`.
+    fn exit_late_output(&self) -> Vec<String> {
+        self.late_output_since(self.exit_first_cell)
+    }
+
+    fn late_output_since(&self, first_cell: usize) -> Vec<String> {
+        self.cells[first_cell.min(self.cells.len())..]
             .iter()
             .filter_map(|cell| match cell {
                 Cell::Notice {
@@ -1564,6 +1589,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
 
     let leave = run_loop(&mut shell, ctx).await;
     let mut rx = shell.rx;
+    let tx = shell.tx;
     // The event reader would otherwise keep swallowing keystrokes from
     // the cooked terminal while the teardown below prints and waits.
     drop(shell.stream);
@@ -1587,14 +1613,28 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         // gives it; a teardown that never returns ends the process the
         // way an outlived task does instead of hanging a bare terminal.
         Leave::Abandoned(ctx) => {
-            match join_unattended(spawn_exit(*ctx, abort.clone()), &mut rx, EXIT_TEARDOWN_WAIT)
-                .await
+            match join_unattended(
+                spawn_exit(*ctx, abort.clone(), tx.clone()),
+                &mut rx,
+                EXIT_TEARDOWN_WAIT,
+            )
+            .await
             {
                 Join::Finished((_, result, captured)) => {
                     write_to_terminal(&render::sanitize_ansi(&captured));
                     result
                 }
-                Join::Panicked(err) => Err(err.into()),
+                Join::Panicked(err) => {
+                    // The panic's message came through the capture as late
+                    // output; it goes to the restored terminal like a lost
+                    // turn's does.
+                    let mut late = Vec::new();
+                    settle_late_notices(&mut rx, &mut late).await;
+                    for text in late {
+                        write_to_stderr(&format!("{}\n", render::plain_text(&text)));
+                    }
+                    Err(err.into())
+                }
                 Join::TimedOut => {
                     crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
                     exit_leaving_the_task_behind(&mut screen, Unfinished::Exit)
@@ -1687,7 +1727,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             Join::Finished((_, result, captured)) => {
                                 Leave::Finished(result, captured)
                             }
-                            Join::Panicked(err) => Leave::Lost(err, Vec::new()),
+                            Join::Panicked(err) => Leave::Lost(err, app.exit_late_output()),
                             Join::TimedOut => Leave::Outlived(Unfinished::Exit),
                         }
                     }
@@ -1813,7 +1853,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             && let Some(ctx) = ctx.take()
         {
             app.begin_exit();
-            task = Some(Task::Exit(spawn_exit(ctx, abort.clone())));
+            task = Some(Task::Exit(spawn_exit(ctx, abort.clone(), tx.clone())));
         }
     }
 }
@@ -2731,8 +2771,9 @@ mod tests {
                 ];
                 assert!(session_files.iter().all(|file| !file.exists()));
                 register_stuck_agent(&mut ctx);
-                let (_tx, mut rx) = unbounded_channel();
-                let joined = join_unattended(spawn_exit(ctx, abort.clone()), &mut rx, wait).await;
+                let (tx, mut rx) = unbounded_channel();
+                let joined =
+                    join_unattended(spawn_exit(ctx, abort.clone(), tx), &mut rx, wait).await;
                 let saved = session_files.iter().any(|file| {
                     std::fs::read_to_string(file).is_ok_and(|text| text.contains("persist me e6w"))
                 });
@@ -2855,6 +2896,28 @@ mod tests {
             !lines.iter().any(|line| line.contains("q7k")),
             "the oldest lines were kept"
         );
+    }
+
+    /// What the exit work prints after `begin_exit` (a panic's message
+    /// among it) is the exit's late output, read from the same notices
+    /// a turn's would be, and never confused with a turn's.
+    #[test]
+    fn the_exit_work_has_late_output_of_its_own() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hi", false);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let (tx, mut rx) = unbounded_channel();
+        let late = late_output(tx);
+        late("before the exit b2x".to_string());
+        harness.app.handle_msg(rx.try_recv().unwrap());
+        harness.app.begin_exit();
+        late("thread 'main' panicked at exit e2x".to_string());
+        harness.app.handle_msg(rx.try_recv().unwrap());
+        assert_eq!(
+            harness.app.exit_late_output(),
+            ["thread 'main' panicked at exit e2x"]
+        );
+        assert!(harness.app.turn_late_output().is_empty());
     }
 
     /// A leftover writer's chunks fold into one cell that keeps its
