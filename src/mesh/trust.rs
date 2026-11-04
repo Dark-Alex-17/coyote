@@ -2856,7 +2856,10 @@ impl State {
         self.file.identities.iter().any(|(identity, entry)| {
             entry.all_destinations
                 && !self.file.blocked_identities.contains_key(identity)
-                && self.own_identity.as_ref() != Some(identity)
+                && !self
+                    .own_identity
+                    .as_deref()
+                    .is_some_and(|own| same_hash(own, identity))
         })
     }
 
