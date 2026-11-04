@@ -715,6 +715,7 @@ fn engineer_architect_block_states_the_seed_contract() {
     let start = text.find(open).expect("no architect-attachment block") + open.len();
     let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
     for needle in [
+        "When the user describes something to implement",
         "plans/engineer-handoffs/",
         "status: ready",
         "project:",
