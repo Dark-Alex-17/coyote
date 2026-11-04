@@ -19,8 +19,7 @@ pub(crate) use dispatch::{
     MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
 pub(crate) use error::{
-    NoAnswer, RefusalCode, RemoteRefusal, RequestError, is_peer_side_remedy, refusal_remedy,
-    request_remedy,
+    NoAnswer, RefusalCode, RemoteRefusal, RequestError, refusal_remedy, request_remedy,
 };
 pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName};
 #[cfg(test)]

@@ -294,20 +294,11 @@ impl RemoteRefusal {
     /// identity's key change, filed none, and the wire does not say which it was.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "{PEER_SIDE_REMEDY_LEAD}unblocks it: ask the person at {} to run .mesh trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh knocks on their side).",
+            "Nothing on this node unblocks it: ask the person at {} to run .mesh trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh knocks on their side).",
             short(&self.destination),
             self.own_destination
         )
     }
-}
-
-/// Opens every `next_action` whose command the peer runs, never this node.
-const PEER_SIDE_REMEDY_LEAD: &str = "Nothing on this node ";
-
-/// A `RemoteRefusal` or `NoAnswer` remedy names commands the peer's owner types in the
-/// peer's own prefix, so this node's prefix must never respell them.
-pub(crate) fn is_peer_side_remedy(next_action: &str) -> bool {
-    next_action.starts_with(PEER_SIDE_REMEDY_LEAD)
 }
 
 /// As a tool result carries it: the `kind` a tool gives any refusal, the sentence, and
@@ -362,7 +353,7 @@ impl NoAnswer {
     /// that stays silent filed no knock, so unlike a refusal nothing reached its owner.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "{PEER_SIDE_REMEDY_LEAD}lifts it: ask the person at {} to run .mesh trust {} (or .mesh unblock {} if they blocked this instance); the peer did not answer, so nothing reached them.",
+            "Nothing on this node lifts it: ask the person at {} to run .mesh trust {} (or .mesh unblock {} if they blocked this instance); the peer did not answer, so nothing reached them.",
             short(&self.destination),
             self.own_destination,
             self.own_destination
