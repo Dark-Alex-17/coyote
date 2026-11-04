@@ -16382,7 +16382,10 @@ mod tests {
             assert_eq!(rows.len(), 2, "{rows:?}");
             assert_eq!(rows[&temp_dest].session, "temp");
             assert_eq!(rows[&temp_dest].agent.as_deref(), Some("coder"));
-            assert_eq!(rows[&temp_dest].pid, std::process::id());
+            assert_eq!(
+                rows[&temp_dest].process,
+                crate::utils::process::ProcessStamp::current()
+            );
             assert_eq!(
                 a.own_sessions().get(&temp_dest).map(String::as_str),
                 Some("temp")

@@ -65,7 +65,7 @@ impl ProcessStamp {
             return HashSet::new();
         }
         #[cfg(test)]
-        ALIVE_SET_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ALIVE_SET_CALLS.with(|calls| calls.set(calls.get() + 1));
         let pids: HashSet<Pid> = stamps
             .iter()
             .map(|stamp| Pid::from_u32(stamp.pid))
@@ -89,11 +89,19 @@ impl ProcessStamp {
     }
 }
 
-/// How many process-table refreshes `alive_set` has spent in this process,
-/// so a test can pin how many one caller costs.
 #[cfg(test)]
-pub(crate) static ALIVE_SET_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// How many process-table refreshes `alive_set` has spent on this thread,
+    /// so a test can pin how many one caller costs. Counted per thread because
+    /// the mesh instance registry refreshes on every read, and tests running
+    /// beside the one counting read it.
+    static ALIVE_SET_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn alive_set_calls() -> usize {
+    ALIVE_SET_CALLS.with(std::cell::Cell::get)
+}
 
 fn lookup_start_time(pid: u32) -> Option<u64> {
     let pid = Pid::from_u32(pid);

@@ -24,14 +24,15 @@ pub(crate) struct InstancesFile {
 }
 
 /// One node running on this cache dir: the destination it serves, the session and agent
-/// it serves them for, and the process that started it.
+/// it serves them for, and the process that started it, by pid and start time so a pid
+/// the kernel handed to another process does not keep the row alive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InstanceRow {
     pub destination: String,
     pub session: String,
     pub agent: Option<String>,
-    pub pid: u32,
+    pub process: ProcessStamp,
     pub started: SystemTime,
 }
 
@@ -42,7 +43,7 @@ impl InstanceRow {
             destination,
             session,
             agent,
-            pid: std::process::id(),
+            process: ProcessStamp::current(),
             started: SystemTime::now(),
         }
     }
@@ -156,7 +157,8 @@ enum RegistryRead {
     },
 }
 
-/// The rows at `path` whose pid is still in use; a missing file has none.
+/// The rows at `path` whose process is still running, judged on one process-table
+/// refresh; a missing file has none.
 fn read_live_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, RegistryRead> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -169,7 +171,9 @@ fn read_live_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, Registry
         }
     };
     let mut rows = parse_instances(&bytes)?.instances;
-    rows.retain(|_, row| ProcessStamp::pid_exists(row.pid));
+    let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
+    let alive = ProcessStamp::alive_set(&stamps);
+    rows.retain(|_, row| alive.contains(&row.process));
     Ok(rows)
 }
 
@@ -298,7 +302,10 @@ mod tests {
         );
         let tmp = TempDir::new("instances-dead-pid");
         let dead = InstanceRow {
-            pid: DEAD_PID,
+            process: ProcessStamp {
+                pid: DEAD_PID,
+                start: 0,
+            },
             ..row(&"dd".repeat(16), "gone")
         };
         let file = InstancesFile {
@@ -318,6 +325,46 @@ mod tests {
         let instances = written(&tmp).instances;
         assert!(!instances.contains_key(ID_B), "{:?}", instances.keys());
         assert!(instances.contains_key(ID_A));
+    }
+
+    mod instances_stamp_tests {
+        use super::*;
+        use crate::utils::process::alive_set_calls;
+
+        /// The pid is this test's own, so it is in use; only the start time says the
+        /// row was filed by an earlier process that held it.
+        #[test]
+        fn a_live_pid_with_another_start_time_is_pruned() {
+            let current = ProcessStamp::current();
+            let tmp = TempDir::new("instances-recycled-pid");
+            let recycled = InstanceRow {
+                process: ProcessStamp {
+                    pid: current.pid,
+                    start: current.start + 1,
+                },
+                ..row(&"dd".repeat(16), "recycled")
+            };
+            let file = InstancesFile {
+                version: INSTANCES_VERSION,
+                instances: BTreeMap::from([(ID_B.to_string(), recycled)]),
+            };
+            write_raw(&tmp, &serde_json::to_vec(&file).unwrap());
+
+            assert!(live(&tmp.path).is_empty());
+        }
+
+        #[test]
+        fn one_read_looks_the_process_table_up_once() {
+            let tmp = TempDir::new("instances-one-lookup");
+            register(&tmp.path, ID_A, row(&"aa".repeat(16), "a"));
+            register(&tmp.path, ID_B, row(&"bb".repeat(16), "b"));
+
+            let before = alive_set_calls();
+            let rows = live(&tmp.path);
+
+            assert_eq!(alive_set_calls() - before, 1);
+            assert_eq!(rows.len(), 2);
+        }
     }
 
     #[test]
