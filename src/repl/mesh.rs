@@ -12920,8 +12920,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn a_prefix_that_is_no_whole_id_keeps_the_shared_prefix_sentence() {
             assert_eq!(
-                pick("q1", &["q10", "q11"]).unwrap_err().to_string(),
-                "'q1' matches 2 pending ids: q10, q11; give one of these (or enough of its characters to tell it apart)."
+                pick("req-2026", &["req-2026-a", "req-2026-b"])
+                    .unwrap_err()
+                    .to_string(),
+                "'req-2026' matches 2 pending ids: req-2026-a, req-2026-b; give one of these (or enough of its characters to tell it apart)."
             );
         }
 
