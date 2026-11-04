@@ -627,7 +627,7 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
     let now = SystemTime::now();
     let records = runtime.knock_gate().cache().list(now)?;
     let dropped = runtime.knock_gate().dropped_knocks(Instant::now());
-    out_text(&render_knocks(&records, now, &dropped));
+    out_path_text(&render_knocks(&records, now, &dropped).render(live_prefix()));
     Ok(())
 }
 
@@ -707,14 +707,10 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
         store.authorize(&identity, &destination),
         store.identity_standing(&identity),
     );
-    out_text(&render_peer_detail(
-        &destination,
-        peer.as_ref(),
-        successor,
-        &knock,
-        trust,
-        now,
-    ));
+    out_path_text(
+        &render_peer_detail(&destination, peer.as_ref(), successor, &knock, trust, now)
+            .render(live_prefix()),
+    );
     if matches!(knock, KnockLookup::Unreadable) {
         err_text(
             "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh knocks` reports the error.",
@@ -7821,11 +7817,18 @@ fn key_change_line(
 /// `KNOCK_DROPS_REMEMBERED` drops per identity, so a count at that cap reads `N+`. Each
 /// drop line ends with what serves the identity: trusting one of its cached knocks, or
 /// the fact that none is on file. The intro column is rendered at the length the cache
-/// keeps an intro, never shorter.
-fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKnocks]) -> String {
+/// keeps an intro, never shorter. The table holds the peers' names and intros, so it is
+/// quoted as it stands; the sentences around it follow the prefix.
+fn render_knocks(
+    records: &[KnockRecord],
+    now: SystemTime,
+    dropped: &[DroppedKnocks],
+) -> NoticeText {
     let mut lines = Vec::new();
     if records.is_empty() {
-        lines.push("No knocks. An untrusted node that wants in appears here.".to_string());
+        lines.push(NoticeText::from(
+            "No knocks. An untrusted node that wants in appears here.",
+        ));
     } else {
         let mut table = mesh_table(&["name", "identity", "dest", "age", "intro"]);
         for knock in records {
@@ -7841,11 +7844,11 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKno
                     .unwrap_or_else(|| "(no intro)".to_string()),
             ]);
         }
-        lines.push(table.to_string());
-        lines.push(format!(
+        lines.push(NoticeText::default().peer(table.to_string()));
+        lines.push(NoticeText::from(format!(
             "{} knock(s). Names and intros are peer-supplied text.",
             records.len()
-        ));
+        )));
     }
     for drop in dropped {
         let next = if drop.next_token_in.is_zero() {
@@ -7871,14 +7874,14 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKno
             ),
             None => "; none of its knocks is on file".to_string(),
         };
-        lines.push(format!(
+        lines.push(NoticeText::from(format!(
             "{} knock(s) from {} dropped in the last {} (rate limit; {next}){serve}",
             count,
             short(&drop.identity_hash),
             period_text(KNOCK_BUCKET_REFILL_INTERVAL),
-        ));
+        )));
     }
-    lines.join("\n")
+    joined_text(lines, "\n")
 }
 
 /// The bare `.mesh info` card: the settings, then the node's own rows, as one key/value
@@ -8062,53 +8065,47 @@ fn render_peer_detail(
     knock: &KnockLookup,
     trust: &str,
     now: SystemTime,
-) -> String {
-    let mut lines = vec![format!("destination: {destination}")];
+) -> NoticeText {
+    let mut lines = vec![NoticeText::from(format!("destination: {destination}"))];
+    let name_row = |name: Option<&str>| NoticeText::from("name: ").peer(name_label(name));
     if let Some(peer) = peer {
-        lines.push(format!("identity: {}", peer.identity_hash));
-        lines.push(format!(
-            "name: {}",
-            name_label(peer.display_name.as_deref())
-        ));
-        lines.push(format!("trust: {trust}"));
-        lines.push(format!("protocol: {}", peer.protocol_version));
+        lines.push(format!("identity: {}", peer.identity_hash).into());
+        lines.push(name_row(peer.display_name.as_deref()));
+        lines.push(format!("trust: {trust}").into());
+        lines.push(format!("protocol: {}", peer.protocol_version).into());
         if let Some(line) = peer.compatibility_line() {
-            lines.push(line);
+            lines.push(line.into());
         }
-        lines.push(format!("hops: {}", peer.hops));
+        lines.push(format!("hops: {}", peer.hops).into());
         let mut line = format!("last seen: {}", age_text(now, peer.last_seen));
         if let Some(state) = row_state(peer, successor, now) {
             line.push(' ');
             line.push_str(&state);
         }
-        lines.push(line);
+        lines.push(line.into());
     }
     match knock {
         KnockLookup::Knocked(knock) => {
             if peer.is_none() {
-                lines.push(format!("identity: {}", knock.identity_hash));
-                lines.push(format!(
-                    "name: {}",
-                    name_label(knock.display_name.as_deref())
-                ));
-                lines.push(format!("trust: {trust} (seen only in its knock)"));
+                lines.push(format!("identity: {}", knock.identity_hash).into());
+                lines.push(name_row(knock.display_name.as_deref()));
+                lines.push(format!("trust: {trust} (seen only in its knock)").into());
             }
             let age = parse_rfc3339(&knock.received_at)
                 .map(|then| age_text(now, then))
                 .unwrap_or_else(|| "unknown".to_string());
-            lines.push(format!(
-                "knocked: {age}, intro: {}",
-                peer_line(knock.intro.as_deref(), KNOCK_INTRO_MAX_CHARS)
-                    .unwrap_or_else(|| "(none)".to_string())
-            ));
+            lines.push(
+                NoticeText::from(format!("knocked: {age}, intro: ")).peer(
+                    peer_line(knock.intro.as_deref(), KNOCK_INTRO_MAX_CHARS)
+                        .unwrap_or_else(|| "(none)".to_string()),
+                ),
+            );
         }
-        KnockLookup::NotKnocked => lines.push("knocked: no".to_string()),
-        KnockLookup::Unreadable => {
-            lines.push("knocked: unknown (knock cache unreadable)".to_string())
-        }
+        KnockLookup::NotKnocked => lines.push("knocked: no".into()),
+        KnockLookup::Unreadable => lines.push("knocked: unknown (knock cache unreadable)".into()),
     }
-    lines.push("Names and intros are peer-supplied text.".to_string());
-    lines.join("\n")
+    lines.push("Names and intros are peer-supplied text.".into());
+    joined_text(lines, "\n")
 }
 
 /// One `.mesh inbox` block: a peer message, who put it in the inbox and when it landed.
@@ -10244,7 +10241,8 @@ mod tests {
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             detail.contains(&format!("\nlast seen: 2h ago {stale}\n")),
             "{detail}"
@@ -10367,7 +10365,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             count: 2,
             next_token_in: Duration::from_secs(6 * 60),
         }];
-        assert_eq!(render_knocks(&records, now, &dropped), KNOCKS_SNAPSHOT);
+        assert_eq!(
+            render_knocks(&records, now, &dropped).plain(),
+            KNOCKS_SNAPSHOT
+        );
     }
 
     const KNOCKS_SNAPSHOT: &str = r#"┌───────┬──────────┬──────────┬─────────┬────────────────┐
@@ -10783,7 +10784,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             detail.contains(&format!("\nlast seen: 2h ago {superseded}\n")),
             "{detail}"
@@ -10796,7 +10798,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             detail.contains("\nlast seen: 40s ago\n"),
             "no successor, no marker: {detail}"
@@ -11318,12 +11321,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn knock_listing_shows_label_identity_age_and_intro() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
-        assert!(render_knocks(&[], now, &[]).starts_with("No knocks"));
+        assert!(
+            render_knocks(&[], now, &[])
+                .plain()
+                .starts_with("No knocks")
+        );
         let records = vec![
             knock(Some("Bea"), Some("hello there"), "2026-09-21T14:13:20Z"),
             knock(None, None, "not a time"),
         ];
-        let text = render_knocks(&records, now, &[]);
+        let text = render_knocks(&records, now, &[]).plain();
         assert_eq!(
             table_header(&text),
             ["name", "identity", "dest", "age", "intro"],
@@ -11352,7 +11359,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
         let intro = "z".repeat(KNOCK_INTRO_MAX_CHARS);
         let knocker = knock(Some("Bea"), Some(&intro), "2026-09-21T14:13:20Z");
-        let text = render_knocks(std::slice::from_ref(&knocker), now, &[]);
+        let text = render_knocks(std::slice::from_ref(&knocker), now, &[]).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][4].replace('\n', ""), intro, "{text}");
@@ -11364,7 +11371,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::Knocked(knocker),
             "untrusted",
             now,
-        );
+        )
+        .plain();
         assert!(text.contains(&format!(", intro: {intro}\n")), "{text}");
     }
 
@@ -11397,7 +11405,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 next_token_in: Duration::ZERO,
             },
         ];
-        let text = render_knocks(&records, now, &dropped);
+        let text = render_knocks(&records, now, &dropped).plain();
         assert_eq!(table_rows(&text).len(), 2, "{text}");
         let footer = table_footer(&text);
         assert_eq!(footer.len(), 4, "{text}");
@@ -11434,7 +11442,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             next_token_in: Duration::from_secs(30),
         }];
         assert_eq!(
-            render_knocks(&[], now, &dropped),
+            render_knocks(&[], now, &dropped).plain(),
             "No knocks. An untrusted node that wants in appears here.\n2 knock(s) from abababab dropped in the last 10 min (rate limit; next accepted in 1m); none of its knocks is on file"
         );
     }
@@ -11451,7 +11459,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             text.starts_with(&format!("destination: {destination}\n")),
             "{text}"
@@ -11466,7 +11475,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::Unreadable,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             text.contains("knocked: unknown (knock cache unreadable)"),
             "{text}"
@@ -11488,7 +11498,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 &KnockLookup::Knocked(knocker.clone()),
                 label,
                 now,
-            );
+            )
+            .plain();
             assert!(
                 text.contains(&format!("trust: {label} (seen only in its knock)")),
                 "{text}"
@@ -11507,13 +11518,94 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::Knocked(knocker),
             "untrusted",
             now,
-        );
+        )
+        .plain();
         assert_eq!(text.matches("identity:").count(), 1, "{text}");
         assert!(text.contains("name: Ann"), "{text}");
         assert!(
             text.contains("knocked:") && text.contains("intro: hi"),
             "{text}"
         );
+    }
+
+    mod knock_listing_quoting_tests {
+        use super::*;
+
+        #[test]
+        fn knock_names_and_intros_keep_their_dots_while_the_drop_hint_slashes() {
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
+            let records = [knock(
+                Some(".session"),
+                Some(".mesh trust x"),
+                "2026-09-21T14:13:20Z",
+            )];
+            let dropped = [DroppedKnocks {
+                identity_hash: "ef".repeat(16),
+                count: 1,
+                next_token_in: Duration::ZERO,
+            }];
+            let listing = render_knocks(&records, now, &dropped);
+            let dot = listing.render(CommandPrefix::Dot);
+            let table = table_rows(&dot);
+            assert_eq!(table[0][0], ".session", "{dot}");
+            assert_eq!(table[0][4], ".mesh trust x", "{dot}");
+            let drop_line = format!(
+                "1 knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                "12".repeat(16)
+            );
+            assert!(dot.ends_with(&format!("\n{drop_line}")), "{dot}");
+            assert_eq!(dot, listing.plain());
+
+            let slash = listing.render(CommandPrefix::Slash);
+            assert_eq!(table_rows(&slash), table, "{slash}");
+            assert!(
+                slash.ends_with(&format!(
+                    "\n{}",
+                    drop_line.replace(".mesh trust", "/mesh trust")
+                )),
+                "{slash}"
+            );
+        }
+
+        #[test]
+        fn peer_detail_keeps_the_name_and_intro_as_the_peer_wrote_them() {
+            let now = SystemTime::now();
+            let destination = "12".repeat(16);
+            let knocker = knock(
+                Some(".session"),
+                Some(".mesh trust x"),
+                "2026-09-21T14:13:20Z",
+            );
+            let detail = render_peer_detail(
+                &destination,
+                None,
+                None,
+                &KnockLookup::Knocked(knocker),
+                "untrusted",
+                now,
+            );
+            let dot = detail.render(CommandPrefix::Dot);
+            let age = age_text(now, parse_rfc3339("2026-09-21T14:13:20Z").unwrap());
+            assert_eq!(
+                dot,
+                format!(
+                    "destination: {destination}\nidentity: {}\nname: .session\ntrust: untrusted (seen only in its knock)\nknocked: {age}, intro: .mesh trust x\nNames and intros are peer-supplied text.",
+                    "ef".repeat(16)
+                )
+            );
+            assert_eq!(detail.render(CommandPrefix::Slash), dot);
+
+            let named = render_peer_detail(
+                &"ab".repeat(16),
+                Some(&peer(Some(".vault"), 5, now)),
+                None,
+                &KnockLookup::NotKnocked,
+                "trusted",
+                now,
+            )
+            .render(CommandPrefix::Slash);
+            assert!(named.contains("\nname: .vault\n"), "{named}");
+        }
     }
 
     #[test]
@@ -13639,7 +13731,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             Some(hostile),
             "2026-09-21T14:13:20Z",
         )];
-        let text = render_knocks(&records, now, &[]);
+        let text = render_knocks(&records, now, &[]).plain();
         for c in forbidden {
             assert!(
                 !text.contains(c),
@@ -13664,7 +13756,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         // empty column that could be mistaken for a blank name or intro.
         let blank = "\u{1b}[2J\u{7}\r\n";
         let records = vec![knock(Some(blank), Some(blank), "2026-09-21T14:13:20Z")];
-        let text = render_knocks(&records, now, &[]);
+        let text = render_knocks(&records, now, &[]).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][0], "(no name)", "{text}");
