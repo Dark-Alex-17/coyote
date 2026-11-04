@@ -1522,12 +1522,24 @@ fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> 
 }
 
 /// Hands `text` to `editor` (resolved the way the REPL resolves its buffer
-/// editor) through a private, freshly created temp file, so no other user
-/// can pre-plant a file or symlink at the path, and returns what came
-/// back. An editor that exits non-zero (or is killed) leaves the text as
-/// it was; the temp file is removed on every path.
+/// editor) through a private temp file inside a freshly created private
+/// directory, and returns what came back. The directory, not only the
+/// file, is private (0700): an editor that saves by writing a new file
+/// and renaming it over the old one creates that file with its own mode,
+/// and the directory keeps it from other users all the same. No other
+/// user can pre-plant a file or symlink at the path. An editor that
+/// exits non-zero (or is killed) leaves the text as it was; the directory
+/// and whatever the editor left in it are removed on every path.
 fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
-    let path = crate::utils::temp_file("-tui-", ".md");
+    let dir = crate::utils::temp_file("-tui-edit-", "");
+    let mut dir_options = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        dir_options.mode(0o700);
+    }
+    dir_options.create(&dir)?;
+    let path = dir.join("buffer.md");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1540,12 +1552,12 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
         options.open(&path)?.write_all(text.as_bytes())
     })();
     if let Err(err) = written {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
         return Err(err);
     }
     let status = std::process::Command::new(editor).arg(&path).status();
     let edited = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
     if !status?.success() {
         return Ok(text.to_string());
     }
@@ -3404,10 +3416,10 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// Temp files `edit_in_editor` made for this process.
+    /// Temp directories `edit_in_editor` made for this process.
     #[cfg(unix)]
-    fn editor_temp_files() -> Vec<std::path::PathBuf> {
-        let marker = format!("-{}-tui-", std::process::id());
+    fn editor_temp_dirs() -> Vec<std::path::PathBuf> {
+        let marker = format!("-{}-tui-edit-", std::process::id());
         std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .filter_map(Result::ok)
@@ -3415,30 +3427,63 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(&marker) && name.ends_with(".md"))
+                    .is_some_and(|name| name.contains(&marker))
             })
             .collect()
     }
 
     /// An editor that exits non-zero has not finished the edit: the text
-    /// stays as it was, and the temp file is gone either way.
+    /// stays as it was, and the temp directory is gone either way, even
+    /// when the editor left files of its own in it.
     #[test]
     #[cfg(unix)]
     fn a_failing_editor_leaves_the_text_as_it_was() {
         use std::os::unix::fs::PermissionsExt;
         let script = crate::utils::temp_file("-editor-", ".sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf changed > \"$1\"\nexit 3\n").unwrap();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf changed > \"$1\"\ntouch \"$1.swp\"\nexit 3\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let before = editor_temp_files();
+        let before = editor_temp_dirs();
 
         let edited = edit_in_editor(script.to_str().unwrap(), "draft").unwrap();
-        let after = editor_temp_files();
+        let after = editor_temp_dirs();
         std::fs::remove_file(&script).unwrap();
 
         assert_eq!(edited, "draft");
-        assert_eq!(after, before, "the editor's temp file was left behind");
+        // Another case's live directory may show up in either list; what
+        // matters is that this call left none of its own.
+        let left: Vec<_> = after.iter().filter(|dir| !before.contains(dir)).collect();
+        assert!(
+            left.is_empty(),
+            "the editor's temp directory was left behind: {left:?}"
+        );
         let gone = edit_in_editor("true", "kept\n").unwrap();
         assert_eq!(gone, "kept");
+    }
+
+    /// The buffer lives in a private directory and is private itself, so
+    /// an editor that saves by write-then-rename (its new file in its own
+    /// mode) still leaves nothing another user can read.
+    #[test]
+    #[cfg(unix)]
+    fn the_editor_buffer_sits_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = crate::utils::temp_file("-editor-", ".sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nstat -f '%Lp %Lp' \"$(dirname \"$1\")\" \"$1\" >\"$1.modes\" 2>/dev/null \
+             || stat -c '%a' \"$(dirname \"$1\")\" \"$1\" | tr '\\n' ' ' >\"$1.modes\"\n\
+             cat \"$1.modes\" > \"$1\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let modes = edit_in_editor(script.to_str().unwrap(), "x").unwrap();
+        std::fs::remove_file(&script).unwrap();
+        let modes: Vec<&str> = modes.split_whitespace().collect();
+        assert_eq!(modes, ["700", "600"], "{modes:?}");
     }
 
     /// Emitters paint notices for the REPL (`error_text`, a leading
