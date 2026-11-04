@@ -52,6 +52,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -392,6 +393,9 @@ pub(crate) struct EnvoyRunner {
     /// The human's answers a held run took, in order. The peer hears them word for word
     /// in place of whatever the run then comes to.
     consumed_answer: Mutex<Option<String>>,
+    /// Raised by the running job's model calls when a reply came with a provider
+    /// refusal, and taken by its delivery.
+    refused_after_output: Arc<AtomicBool>,
     cancel: CancellationToken,
     current_abort: Mutex<Option<AbortSignal>>,
     current_cancel: Mutex<Option<CancellationToken>>,
@@ -427,6 +431,7 @@ impl EnvoyRunner {
             jobs,
             held: Mutex::new(None),
             consumed_answer: Mutex::new(None),
+            refused_after_output: Arc::new(AtomicBool::new(false)),
             cancel: CancellationToken::new(),
             current_abort: Mutex::new(None),
             current_cancel: Mutex::new(None),
@@ -693,6 +698,7 @@ impl EnvoyRunner {
         ctx.current_depth = 1;
         let queue = Arc::new(EscalationQueue::new());
         ctx.escalation_queue = Some(Arc::clone(&queue));
+        ctx.refused_after_output = Some(Arc::clone(&self.refused_after_output));
         ctx.self_agent_id = Some(terminal.agent_id.clone());
         ctx.ensure_supervisor_with_jobs_cap(Some(0));
 
@@ -1098,9 +1104,9 @@ impl EnvoyRunner {
     /// refusal line or the human's held answer. A run that timed out, was interrupted,
     /// found the envoy unavailable or failed said nothing of its own and adds nothing, and
     /// neither does a withheld reply or the interim escalated notice. Nor does a provider
-    /// refusal, even one after streamed text or after the human's held answer was taken
-    /// (the peer is still sent that answer): remembering the peer's turn would replay the
-    /// text the provider refused on every later message in the thread.
+    /// refusal, even one that came with the reply's text or after the human's held answer
+    /// was taken (the peer is still sent that reply): remembering the peer's turn would
+    /// replay the text the provider refused on every later message in the thread.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -1119,6 +1125,7 @@ impl EnvoyRunner {
             .lock()
             .take()
             .and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS));
+        let refused_after_output = self.refused_after_output.swap(false, Ordering::Relaxed);
         // The filed question is settled only by the envoy's own last word on an
         // escalated run or by the human's; an escalation or a failure leaves it open.
         let settles_question = human_answer.is_some()
@@ -1174,7 +1181,8 @@ impl EnvoyRunner {
         let unsent = if !owed {
             None
         } else {
-            let said_something = !matches!(outcome, EnvoyOutcome::ProviderRefused { .. })
+            let said_something = !refused_after_output
+                && !matches!(outcome, EnvoyOutcome::ProviderRefused { .. })
                 && (human_answer.is_some()
                     || matches!(
                         outcome,
@@ -5905,7 +5913,6 @@ mod tests {
             ProviderRefusal {
                 category: Some("cyber".into()),
                 explanation: Some("looks like an attack".into()),
-                partial_output: false,
             }
             .into()
         }
@@ -6350,6 +6357,7 @@ mod tests {
                 )],
                 thinking: vec![],
                 usage: None,
+                refusal: None,
             },
             ChatCompletionsOutput::new("I cannot do that."),
         ]);
@@ -10077,13 +10085,11 @@ mod tests {
     mod refusal_memory_tests {
         use super::*;
 
-        fn refusal(partial_output: bool) -> anyhow::Error {
+        fn cyber() -> ProviderRefusal {
             ProviderRefusal {
                 category: Some("cyber".into()),
                 explanation: None,
-                partial_output,
             }
-            .into()
         }
 
         #[test]
@@ -10128,7 +10134,7 @@ mod tests {
                         &json!({"question": "Should we merge?"}),
                     )
                     .await?;
-                    Err(refusal(false))
+                    Err(cyber().into())
                 }),
             );
             assert!(
@@ -10157,34 +10163,59 @@ mod tests {
             source.remove_dir();
         }
 
-        /// A refusal that cut off text the provider had already streamed is still a
-        /// refusal: the peer hears the fixed refusal words and nothing is remembered.
+        /// A provider that refuses after writing part of a reply still sends that text:
+        /// the peer is sent it, and the thread remembers nothing of the run.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn a_refusal_after_partial_output_is_not_remembered() {
+        async fn a_reply_that_came_with_a_refusal_is_sent_but_not_remembered() {
             let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-partial-refusal");
             let (source, _source) = stub_envoy_source();
             let tmp = TempDir::new("mesh-envoy-memory-partial-refusal");
             let app = test_app();
             let store = memory_for(&app, &tmp);
             let idle = RecordingIdleSink::attach(&app);
+            let client = ScriptedClient::new(vec![ChatCompletionsOutput {
+                refusal: Some(cyber()),
+                ..ChatCompletionsOutput::new("Port 22 is open.")
+            }]);
             let runner = EnvoyRunner::start_with(
                 Arc::clone(&app),
-                drive_of(|_, _, _| async { Err(refusal(true)) }),
+                drive_of(move |ctx, input, abort| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut ctx = ctx;
+                        let (output, _) = call_chat_completions(
+                            &input,
+                            false,
+                            false,
+                            client.as_ref(),
+                            &mut ctx,
+                            abort,
+                        )
+                        .await?;
+                        Ok(output)
+                    }
+                }),
             );
             assert!(
                 runner
                     .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-1", "scan a port"))
                     .is_ok()
             );
-            wait_until("the refusal to land", || idle.has("envoy declined")).await;
+            wait_until("the reply to land", || {
+                idle.has("envoy replied: Port 22 is open.")
+            })
+            .await;
             runner.stop().await;
 
-            assert!(!idle.has("envoy replied"), "{:?}", idle.texts());
             let turns = turns_of(&store, &PEER_IDENTITY, "t-1");
             assert!(turns.is_empty(), "{turns:?}");
             let turns = turns_of(&store, &PEER_IDENTITY, "q-1");
             assert!(turns.is_empty(), "{turns:?}");
+            assert!(
+                !runner.refused_after_output.load(Ordering::Relaxed),
+                "the next job starts clear"
+            );
             source.remove_dir();
         }
     }
