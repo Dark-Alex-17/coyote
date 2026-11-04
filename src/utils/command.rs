@@ -249,15 +249,12 @@ pub async fn run_loader_command(
         }
         Ok(stdout)
     } else {
-        // A file-writing loader keeps the REPL's inherited stdin; under
-        // the TUI it runs with stdin closed rather than inheriting the
-        // raw tty the event stream is reading.
-        let stdin = if crate::tui::active() {
-            Stdio::null()
-        } else {
-            Stdio::inherit()
-        };
-        let status = wait_for_status_interruptible(cmd, args, stdin)
+        // A file-writing loader's input is the file in `$1`; its stdin is
+        // closed on every path. In the REPL the spinner drains the
+        // terminal while the wait yields, so an inherited stdin would be
+        // contended, and under the UI it would be the raw tty the event
+        // stream reads.
+        let status = wait_for_status_interruptible(cmd, args, Stdio::null())
             .await
             .with_context(|| {
                 format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
@@ -486,6 +483,26 @@ mod tests {
         .unwrap();
         let _ = std::fs::remove_file(&input);
         assert_eq!(loaded, "from the file q2m\n");
+    }
+
+    /// The file-writing branch closes stdin too, in the REPL and under the
+    /// UI alike: a loader that copies stdin into `$2` writes an empty file
+    /// at once instead of waiting on the keyboard.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_file_loader_reads_eof_from_stdin_under_every_ui() {
+        for tui in [false, true] {
+            let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, tui);
+            let loaded = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_loader_command("unused", "txt", "sh -c 'cat - > \"$2\"' loader"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the loader waited on stdin (tui={tui})"))
+            .unwrap();
+            assert_eq!(loaded, "", "tui={tui}");
+        }
     }
 
     #[cfg(unix)]
