@@ -12710,7 +12710,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let mut ctx = off_ctx();
                 let live = ctx.app.mesh.command_prefix().clone();
                 let _prefix = live_prefix_override::install(live.clone());
-                let printer = PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live);
+                let printer =
+                    PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live).with_width(80);
                 let attached = printer.attach();
                 let knock = || Notification::new(Source::Knock, "`.mesh trust 1a2b`").render();
                 let _capture = capture::install();

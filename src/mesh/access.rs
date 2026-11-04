@@ -2017,16 +2017,14 @@ mod tests {
 
         /// With no idle driver the line goes through `push_idle`'s fallback to the
         /// installed printer, which wraps after rendering; the row bodies are rejoined so
-        /// the check holds at any terminal width.
+        /// the check reads the words, not where the rows broke.
         #[test]
         fn the_printer_keeps_the_paths_and_slashes_the_hints() {
             let live = LivePrefix::default();
             live.store(CommandPrefix::Slash);
-            let printer = Arc::new(PromptPrinter::with_colour(
-                PROMPT_PRINTER_CAPACITY,
-                false,
-                live,
-            ));
+            let printer = Arc::new(
+                PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live).with_width(80),
+            );
             let attached = printer.attach();
             let slot = MeshSlot::default();
             slot.set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);

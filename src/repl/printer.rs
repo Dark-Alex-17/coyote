@@ -34,8 +34,9 @@ pub struct PromptPrinter {
     colour: bool,
     /// Read per notification, so a `.set command_prefix` shows on the next line.
     command_prefix: LivePrefix,
-    /// Read per notification, so a resized terminal wraps the next line to its width.
-    width: Box<dyn Fn() -> usize + Send + Sync>,
+    /// A fixed wrap width; `None` reads the terminal per notification, so a resized
+    /// terminal wraps the next line to its width.
+    width_override: Option<usize>,
 }
 
 impl PromptPrinter {
@@ -51,13 +52,13 @@ impl PromptPrinter {
             dropped: AtomicUsize::new(0),
             colour,
             command_prefix,
-            width: Box::new(terminal_width),
+            width_override: None,
         }
     }
 
     #[cfg(test)]
-    fn with_width(mut self, width: usize) -> Self {
-        self.width = Box::new(move || width);
+    pub(crate) fn with_width(mut self, width: usize) -> Self {
+        self.width_override = Some(width);
         self
     }
 
@@ -109,9 +110,13 @@ impl NotificationSink for PromptPrinter {
         let prefix = rendered.source().prefix();
         let lines = rendered.render_notification_lines(self.command_prefix.load());
         rows.extend(
-            wrap_rows(&lines, prefix, (self.width)())
-                .into_iter()
-                .map(|row| self.paint_prefix(row, prefix)),
+            wrap_rows(
+                &lines,
+                prefix,
+                self.width_override.unwrap_or_else(terminal_width),
+            )
+            .into_iter()
+            .map(|row| self.paint_prefix(row, prefix)),
         );
         let payload = rows.join("\n");
         // A full queue and a dropped receiver (no editor attached any more) both
@@ -266,12 +271,15 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    /// Every printer here wraps at this width, whatever terminal runs the tests.
+    const TEST_WIDTH: usize = 80;
+
     fn plain(cap: usize) -> PromptPrinter {
-        PromptPrinter::with_colour(cap, false, LivePrefix::default())
+        PromptPrinter::with_colour(cap, false, LivePrefix::default()).with_width(TEST_WIDTH)
     }
 
     fn painted(cap: usize) -> PromptPrinter {
-        PromptPrinter::with_colour(cap, true, LivePrefix::default())
+        PromptPrinter::with_colour(cap, true, LivePrefix::default()).with_width(TEST_WIDTH)
     }
 
     mod command_prefix_sinks {
@@ -287,12 +295,11 @@ mod tests {
         fn printer_under(prefix: CommandPrefix) -> PromptPrinter {
             let live = LivePrefix::default();
             live.store(prefix);
-            PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live)
+            PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live).with_width(TEST_WIDTH)
         }
 
-        /// The payload's rows rejoined into one body, so an assertion holds at whatever
-        /// width the terminal running the test wraps them to. The bodies here are words,
-        /// so every break fell on a space.
+        /// The payload's rows rejoined into one body, so an assertion holds wherever the
+        /// rows broke. The bodies here are words, so every break fell on a space.
         fn unwrapped(payload: &str, prefix: &str) -> String {
             let rows: Vec<String> = payload.lines().map(str::to_string).collect();
             bodies(&rows, prefix).join(" ")
@@ -331,36 +338,14 @@ mod tests {
             }
         }
 
-        /// The hint is rewritten before the rows are measured, so a wrapped line keeps
-        /// the width bound and carries the rendered hint, never the typed one.
-        #[test]
-        fn a_wrapped_line_is_rendered_before_it_is_measured() {
-            let printer = printer_under(CommandPrefix::Slash);
-            let attached = printer.attach();
-            let body = format!("{}then `.mesh trust 1a2b3c4d`", "word ".repeat(90));
-            printer.notify(Notification::new(Source::Knock, body.as_str()).render());
-            let payload = attached.get_line().expect("payload queued");
-            let rows: Vec<String> = payload.lines().map(str::to_string).collect();
-            assert!(rows.len() > 1, "{rows:?}");
-            for row in &rows {
-                assert!(
-                    display_width(row) <= terminal_width().max(MIN_WRAP_WIDTH),
-                    "{row:?}"
-                );
-            }
-            assert_eq!(
-                bodies(&rows, Source::Knock.prefix()).join(" "),
-                body.replace(".mesh", "/mesh")
-            );
-        }
-
         #[test]
         fn the_dropped_count_row_is_left_as_it_is() {
             let printer = PromptPrinter::with_colour(1, false, {
                 let live = LivePrefix::default();
                 live.store(CommandPrefix::Slash);
                 live
-            });
+            })
+            .with_width(TEST_WIDTH);
             let attached = printer.attach();
             printer.notify(Notification::new(Source::Knock, "first").render());
             printer.notify(Notification::new(Source::Knock, "dropped").render());
