@@ -936,6 +936,13 @@ fn mode_matrix_walks_every_combination() {
         "the matrix shrank below {MATRIX_FLOOR} checks: {total}\n{report}"
     );
     assert_no_bytecode_under_candidate();
+    // Echo the battery's own summary lines so `-- --nocapture` shows the
+    // measured N/N and region count the README records.
+    for line in stdout.lines() {
+        if line.ends_with("checks passed") || line.contains("live regions") {
+            println!("mode matrix: {line}");
+        }
+    }
 }
 
 /// The matrix has no stub branch left: when the repo asset `.shared/utils.sh`
