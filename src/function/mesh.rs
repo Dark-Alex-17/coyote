@@ -2403,6 +2403,33 @@ mod tests {
         );
     }
 
+    mod thread_schema_tests {
+        use super::*;
+
+        /// The `thread` argument `mesh__send` and `mesh__ask` share, word for word, so
+        /// no clause of it changes without this test and the Mesh page's twin moving.
+        #[test]
+        fn the_thread_argument_says_exactly_how_a_thread_is_started_and_continued() {
+            let declarations = mesh_function_declarations();
+            for action in ["send", "ask"] {
+                let declaration = declarations
+                    .iter()
+                    .find(|declaration| {
+                        declaration.name == format!("{MESH_FUNCTION_PREFIX}{action}")
+                    })
+                    .unwrap();
+                let thread = &declaration.parameters.properties.as_ref().unwrap()["thread"];
+                assert_eq!(
+                    thread.description.as_deref(),
+                    Some(
+                        "Omit for a new conversation; reuse the thread that came back in the reply to continue. A thread shown on a received message continues it too; any other value is refused. A reply without it inherits the answered message's thread."
+                    ),
+                    "{action}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn send_with_in_reply_to_builds_a_reply() {
         let reply = outbound_from_args(
