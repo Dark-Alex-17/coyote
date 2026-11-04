@@ -676,6 +676,9 @@ guard_operation() {
 		if _coyote_prompt_enabled; then
 			ans="$(confirm "${1:-Are you sure you want to continue?}")" || ans=""
 		else
+			# Refused before the redirection below: under the full-screen UI
+			# /dev/tty is the UI's own screen.
+			_coyote_refuse_terminal_under_tui
 			# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
 			# can't leak into tool_call_error JSON when the wrapped command fails.
 			ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)" || ans=""
@@ -941,6 +944,7 @@ guard_path() {
 		if _coyote_prompt_enabled; then
 			ans="$(confirm "$confirmation_prompt")" || ans=""
 		else
+			_coyote_refuse_terminal_under_tui
 			# 2>/dev/tty: see guard_operation; prevents prompt text leaking via captured stderr.
 			ans="$(confirm "$confirmation_prompt" 2>/dev/tty)" || ans=""
 		fi

@@ -332,6 +332,38 @@ fn under_the_tui_bash_range_without_channel_fails_closed_at_once() {
     assert_password_refused_cleanly(&transcript, "Count?");
 }
 
+/// `guard_operation` without a channel falls back to a terminal confirm
+/// written to /dev/tty; under the UI that tty is the UI's own screen, so
+/// the guard refuses before the redirection and aborts the operation.
+#[test]
+fn under_the_tui_bash_guard_without_channel_refuses_before_touching_the_tty() {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; source \"{HELPER}\"; \
+             (guard_operation \"Really? tui-guard-sh-r8\" && echo continued); rc=$?; echo \"guard-rc=$rc\"; \
+             echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done"
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("COYOTE_UI", "tui")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert!(transcript.contains("guard-rc=1"), "{transcript}");
+    assert!(
+        !transcript.contains("continued"),
+        "the guard let the operation through:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("(y/N)"),
+        "the terminal was asked:\n{transcript}"
+    );
+    assert_password_refused_cleanly(&transcript, "Really?");
+}
+
 /// The Python helper's `password` has its own terminal path (getpass, not
 /// `_tty_line`), so it is pinned on its own: exit 1, no value, no
 /// `Secret?` painted, echo left on.
