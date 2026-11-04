@@ -1829,7 +1829,10 @@ pub(crate) fn attachment(
         ));
     }
     if metadata.is_dir() {
-        return Err(attach_path_error(&shown, " is a directory; attach one file."));
+        return Err(attach_path_error(
+            &shown,
+            " is a directory; attach one file.",
+        ));
     }
     if !metadata.is_file() {
         return Err(attach_path_error(&shown, " is not a regular file."));
@@ -4862,7 +4865,9 @@ mod peer_text_prefix_tests {
                     .into(),
             ));
             assert!(
-                refused.ends_with("    `.vault` is not a pattern; run .mesh shares Nothing was written."),
+                refused.ends_with(
+                    "    `.vault` is not a pattern; run .mesh shares Nothing was written."
+                ),
                 "{refused}"
             );
             let missing = shown_under_slash(quoted_share_write(
@@ -5117,9 +5122,7 @@ fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
 /// as they stand; any other error is passed on unchanged.
 fn quoted_share_write(err: anyhow::Error) -> anyhow::Error {
     match err.downcast::<ShareWriteError>() {
-        Ok(ShareWriteError::Refused(refusal)) => {
-            refused_at_load(&refusal, " Nothing was written.")
-        }
+        Ok(ShareWriteError::Refused(refusal)) => refused_at_load(&refusal, " Nothing was written."),
         Ok(ShareWriteError::NoSuchPattern { file, pattern }) => QuotingError::wrap(
             NoticeText::default()
                 .frame("No share entry in '")
@@ -12354,7 +12357,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         Some(".info Bea"),
                         RecipientOutcome::NotTrustedByPeer(refusal.clone()),
                     ),
-                    recipient(Some(".session"), RecipientOutcome::NoAnswer(no_answer.clone())),
+                    recipient(
+                        Some(".session"),
+                        RecipientOutcome::NoAnswer(no_answer.clone()),
+                    ),
                 ],
             };
             let text = render_broadcast(&outcome).render(CommandPrefix::Slash);
@@ -12363,7 +12369,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 lines[0].starts_with(&format!("  .info Bea (abababab): {refusal}")),
                 "{text}"
             );
-            assert!(lines[0].contains(&format!("run .mesh trust {own}")), "{text}");
+            assert!(
+                lines[0].contains(&format!("run .mesh trust {own}")),
+                "{text}"
+            );
             assert!(
                 lines[1].starts_with(&format!("  .session (abababab): {no_answer}")),
                 "{text}"

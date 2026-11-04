@@ -1646,7 +1646,8 @@ mod peer_text_prefix_tests {
             paths: vec!["docs/a.md".to_string()],
             reason: String::new(),
         };
-        let rendered = Notification::new(Source::Access, access_text("Bea", &request, None)).render();
+        let rendered =
+            Notification::new(Source::Access, access_text("Bea", &request, None)).render();
         let lines = rendered.render_notification_lines(CommandPrefix::Slash);
         assert!(
             lines.last().is_some_and(|line| line.ends_with(

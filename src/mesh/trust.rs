@@ -3345,7 +3345,7 @@ fn key_change_text(
         KeyChangeOutcome::Served => (
             "warning: instance ",
             format!(
-            " is bound to identity {bound} but was presented under \
+                " is bound to identity {bound} but was presented under \
              identity {seen}, which is trusted for all destinations and is served while it \
              asks; the record is marked and {standing}. If the peer rotated, confirm with its \
              holder out of band and run .mesh trust {new_destination} to clear the mark; \
@@ -3355,7 +3355,7 @@ fn key_change_text(
         KeyChangeOutcome::Refused => (
             "error: instance ",
             format!(
-            " is bound to identity {bound} but was presented under \
+                " is bound to identity {bound} but was presented under \
              identity {seen} and is refused when it asks; {standing} and the new key is a \
              stranger. Confirm with the identity's holder out of band before granting anything: \
              if the peer rotated, run .mesh trust {new_destination} to trust the new key and \
@@ -3381,8 +3381,8 @@ mod key_change_prefix_tests {
             denied: false,
         };
         for outcome in [KeyChangeOutcome::Served, KeyChangeOutcome::Refused] {
-            let text = key_change_text(&change, &"12".repeat(16), outcome)
-                .render(CommandPrefix::Slash);
+            let text =
+                key_change_text(&change, &"12".repeat(16), outcome).render(CommandPrefix::Slash);
             assert!(text.contains("instance .info is bound"), "{text}");
             assert!(text.contains("run /mesh trust "), "{text}");
             assert!(!text.contains("/info"), "{text}");

@@ -170,7 +170,9 @@ mod tests {
         fn a_quoting_error_raised_bare_keeps_its_quote_and_slashes_its_hint() {
             let text = command_error_text(&MeshVerbError::wrap(quoting()), CommandPrefix::Slash);
             assert!(
-                text.ends_with("No share rule has the pattern `.vault`; `/mesh shares` lists them."),
+                text.ends_with(
+                    "No share rule has the pattern `.vault`; `/mesh shares` lists them."
+                ),
                 "{text}"
             );
             assert!(!text.contains("/vault"), "{text}");
@@ -182,7 +184,9 @@ mod tests {
             let text = command_error_text(&err, CommandPrefix::Slash);
             assert!(text.starts_with("Error: `/mesh unshare` failed"), "{text}");
             assert!(
-                text.ends_with("No share rule has the pattern `.vault`; `/mesh shares` lists them."),
+                text.ends_with(
+                    "No share rule has the pattern `.vault`; `/mesh shares` lists them."
+                ),
                 "{text}"
             );
             assert!(!text.contains("/vault"), "{text}");

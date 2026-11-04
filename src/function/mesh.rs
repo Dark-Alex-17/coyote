@@ -565,7 +565,10 @@ mod peer_text_prefix_tests {
         let message = silent["message"].as_str().unwrap_or_default();
         assert!(message.starts_with(&no_answer.to_string()), "{message}");
         assert!(message.contains(&format!(".mesh trust {own}")), "{message}");
-        assert!(message.ends_with("`/mesh peers` lists the nodes this Coyote has heard from."), "{message}");
+        assert!(
+            message.ends_with("`/mesh peers` lists the nodes this Coyote has heard from."),
+            "{message}"
+        );
     }
 }
 
