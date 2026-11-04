@@ -255,12 +255,13 @@ check("intake draft: a blank message with earlier turns still drafts", u["_next"
 u = gates.intake({"initial_prompt": "  ", "previous_turns": " \n", **STORE.variables("", TMP)})
 check("intake draft: a blank message and blank earlier turns -> escalation need_design_doc, nothing drafted",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "draft_rounds" not in u, u.get("_next"))
-SEEDS = os.path.join(PLANS, "engineer-handoffs")
+SEED_DIR = os.path.join(PLANS, "engineer-handoffs")
 
 
-def seed(name, created, status="ready", project=CODE, fm=True):
-    path = os.path.join(SEEDS, name)
-    head = f"---\nstatus: {status}\nproject: {project}\ncreated: {created}\ntitle: Seed {name}\n---\n\n" if fm else ""
+def seed(name, created, status="ready", project=CODE, fm=True, vehicle=None):
+    path = os.path.join(SEED_DIR, name)
+    extra = f"vehicle: {vehicle}\n" if vehicle else ""
+    head = f"---\nstatus: {status}\nproject: {project}\ncreated: {created}\ntitle: Seed {name}\n{extra}---\n\n" if fm else ""
     write(path, head + f"# Seed {name}\n\nBuild the widget.\n")
     return path
 
@@ -290,8 +291,10 @@ check("intake seed: seed_path survives in state.json", json.loads(read_file(os.p
 os.remove(SEED_OLD)
 _groups = gates.MULTI_IS_GROUPS
 gates.MULTI_IS_GROUPS = False
-u = gates.intake({"initial_prompt": "do it", **STORE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
-gates.MULTI_IS_GROUPS = _groups
+try:
+    u = gates.intake({"initial_prompt": "do it", **STORE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
+finally:
+    gates.MULTI_IS_GROUPS = _groups
 check("intake seed: the review-watch follow-up is recorded once before the seed_confirm escalation",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "seed_confirm"
       and len([f for f in u.get("follow_ups", []) if f.startswith("review-watch: not started")]) == 1, u.get("follow_ups"))
@@ -306,6 +309,11 @@ check("_terminal_prompt: review_incomplete and an unknown kind keep their prompt
       gates._terminal_prompt({"kind": "review_incomplete"}) == "ask_review_incomplete" and gates._terminal_prompt({"kind": "banana"}) == "ask_user")
 u = gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="2"))
 check("parse_answer: seed_confirm number -> the option text", u["last_answer"] == "Draft a brief from this conversation instead")
+u = gates.parse_answer(base_state(escalation=E_SEED, last_answer_text=f"{DESIGN} is the doc"))
+check("parse_answer: seed_confirm typed path to an existing file -> the text verbatim, never a re-ask",
+      u["last_answer"] == f"{DESIGN} is the doc" and u["_next"] == "apply_answer", u)
+check("parse_answer: seed_confirm unmatched text that is not a path -> re-ask",
+      gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="banana"))["_next"] == "confirm_seed")
 for answer, row in (("Abort the run", "abort -> end_aborted"), ("Give a doc path instead", "doc path -> need_design_doc"),
                     ("Draft a brief from this conversation instead", "draft -> draft_brief"), ("banana", "unmatched -> need_design_doc")):
     u = gates.apply_answer(base_state(escalation=E_SEED, last_answer=answer, seed_path=SEED))
@@ -318,21 +326,53 @@ u = gates.apply_answer(base_state(escalation=E_SEED, last_answer="Draft a brief 
                                   draft_rounds=2, draft_feedback="old", draft_text="old"))
 check("apply_answer: seed_confirm draft resets the draft counters",
       (u.get("draft_rounds"), u.get("draft_feedback"), u.get("draft_text")) == (0, "", ""), u)
+u = gates.apply_answer(base_state(escalation=E_SEED, last_answer=f"{DESIGN} is the doc", seed_path=SEED))
+check("apply_answer: seed_confirm typed path -> design doc is that file, orient_read, seed still ready",
+      u["_next"] == "orient_read" and u["design_doc_path"] == DESIGN and seed_status(SEED) == "ready", u)
+u = gates.apply_answer(base_state(escalation={**E_SEED, "data": {"seed_path": os.path.join(SEED_DIR, "gone.md")}}, last_answer="Use this seed"))
+check("apply_answer: seed_confirm use with the seed file gone -> need_design_doc",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "design_doc_path" not in u, u)
 u = gates.apply_answer(base_state(escalation=E_SEED, last_answer="Use this seed", seed_path=SEED, run_id="seed-run"))
+check("apply_answer: seed_confirm use -> design doc is the seed, orient_read, seed still ready",
+      u["_next"] == "orient_read" and u["design_doc_path"] == SEED and seed_status(SEED) == "ready" and "follow_ups" not in u, u)
+gates.research_dispatch(base_state(design_doc_path=SEED, run_id="seed-run", explore_slices=["a"]))
 fm_seed = gates.frontmatter(read_file(SEED))[0]
-check("apply_answer: seed_confirm use -> design doc is the seed, orient_read, seed consumed",
-      u["_next"] == "orient_read" and u["design_doc_path"] == SEED and fm_seed.get("status") == "consumed"
-      and fm_seed.get("consumed_by") == "seed-run" and fm_seed.get("consumed_at") and "follow_ups" not in u, fm_seed)
+check("research_dispatch: a confirmed seed is consumed once orientation succeeded",
+      fm_seed.get("status") == "consumed" and fm_seed.get("consumed_by") == "seed-run" and fm_seed.get("consumed_at"), fm_seed)
+NOT_SEED = os.path.join(TMP, "not-a-seed.md")
+write(NOT_SEED, f"---\nstatus: ready\nproject: {CODE}\n---\n\n# Not a seed\n")
+_not_seed_before = read_file(NOT_SEED)
+gates.research_dispatch(base_state(design_doc_path=NOT_SEED, run_id="other-run", explore_slices=["a"]))
+gates.research_dispatch(base_state(design_doc_path=SEED, run_id="other-run", explore_slices=["a"]))
+check("research_dispatch: a non-seed design doc is untouched and an already consumed seed keeps its consumer",
+      read_file(NOT_SEED) == _not_seed_before and gates.frontmatter(read_file(SEED))[0] == fm_seed, gates.frontmatter(read_file(SEED))[0])
+os.remove(NOT_SEED)
 u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
 check("intake seed: a consumed seed is not picked again -> drafts a brief",
       u["_next"] == "draft_brief" and not u.get("seed_path"), u.get("seed_path"))
+SEED_EXPLICIT = seed("explicit.md", "2026-02-15T00:00:00Z")
+u = gates.intake({"initial_prompt": f"Implement the design at {SEED_EXPLICIT}", **STORE.variables(SEED_EXPLICIT, TMP)})
+_explicit = [u["_next"], u.get("design_doc_path")]
+gates.research_dispatch(base_state(design_doc_path=u.get("design_doc_path") or "", run_id=u["run_id"], explore_slices=["a"]))
+_explicit.append(seed_status(SEED_EXPLICIT))
+u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+check("intake seed: an explicit path to a ready seed -> consumed at research_dispatch -> a later go-ahead drafts instead",
+      _explicit == ["orient_read", SEED_EXPLICIT, "consumed"] and u["_next"] == "draft_brief" and not u.get("seed_path"), (_explicit, u.get("_next")))
+SEED_SISYPHUS = seed("sisyphus.md", "2026-02-20T00:00:00Z", vehicle="sisyphus")
+u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+check("intake seed: vehicle sisyphus -> not a seed, drafts a brief",
+      u["_next"] == "draft_brief" and not u.get("seed_path") and seed_status(SEED_SISYPHUS) == "ready", u.get("seed_path"))
+SEED_NO_VEHICLE = seed("no-vehicle.md", "2026-02-10T00:00:00Z")
+u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+check("intake seed: no vehicle key -> treated as architect, offered",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "seed_confirm" and u.get("seed_path") == SEED_NO_VEHICLE, u.get("seed_path"))
 seed("late.md", "2026-03-01T00:00:00Z")
 u = gates.intake({"initial_prompt": "go ahead", **STORE.variables(os.path.join(TMP, "missing-design.md"), TMP)})
 check("intake draft: an explicit unreadable doc path with a ready seed present -> need_design_doc, unchanged question, no seed, no draft",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc"
       and u["escalation"]["question"] == gates._need_design_doc_escalation()["question"] and not u.get("seed_path") and "draft_rounds" not in u,
       u.get("_next"))
-shutil.rmtree(SEEDS)
+shutil.rmtree(SEED_DIR)
 
 # ---------------------------------------------------------------- drafted brief (no design doc, no seed)
 DRAFT_MD = "## Problem\n\nThe sync command has no dry run.\n\n## Acceptance criteria\n\n- `sync --dry-run` writes nothing\n"
@@ -346,6 +386,10 @@ check("draft_route: an empty draft -> need_design_doc", u["_next"] == "escalate_
 u = gates.draft_route(base_state(draft_possible=False, draft_reason="nothing to implement", draft_markdown=DRAFT_MD))
 check("draft_route: draft_possible false with markdown present -> need_design_doc, no draft written",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "draft_path" not in u, u.get("escalation"))
+u = gates.draft_route(base_state(run_dir="", draft_possible=True, draft_title="Dry run for sync", draft_markdown=DRAFT_MD))
+check("draft_route: no run_dir -> draft_fault, nothing written",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "draft_path" not in u
+      and not os.path.exists("design-draft.md") and any(d.startswith("draft: the drafting step failed") for d in u["decisions"]), u)
 u = gates.draft_route(base_state(draft_possible=True, draft_title="Dry run for sync", draft_markdown=DRAFT_MD, anomalies=["stale README"]))
 E_DRAFT = u.get("escalation") or {}
 DRAFT_PATH = os.path.join(base_state()["run_dir"], "design-draft.md")
@@ -377,6 +421,9 @@ check("apply_answer: draft_confirm use -> design doc is the draft, orient_read",
       u["_next"] == "orient_read" and u["design_doc_path"] == DRAFT_PATH and any("confirmed as the design doc" in d for d in u["decisions"]), u)
 u = gates.apply_answer(base_state(escalation=E_DRAFT, last_answer="Abort the run", draft_rounds=0))
 check("apply_answer: draft_confirm abort -> end_aborted", u["_next"] == "end_aborted" and "draft_confirm" in u["failure_reason"], u)
+u = gates.apply_answer(base_state(escalation=E_DRAFT, last_answer=f"{DESIGN} instead", draft_rounds=0))
+check("apply_answer: draft_confirm typed path -> design doc is that file, orient_read, no redraft",
+      u["_next"] == "orient_read" and u["design_doc_path"] == DESIGN and "draft_rounds" not in u and "draft_feedback" not in u, u)
 u = gates.apply_answer(base_state(escalation=E_DRAFT, last_answer="do not abort, add a --dry-run flag", draft_rounds=0))
 check("apply_answer: draft_confirm free-text edit mentioning abort -> draft_brief with the feedback, round 1",
       u["_next"] == "draft_brief" and u["draft_feedback"] == "do not abort, add a --dry-run flag" and u["draft_rounds"] == 1, u)

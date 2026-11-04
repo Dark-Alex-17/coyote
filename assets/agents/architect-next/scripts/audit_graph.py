@@ -34,7 +34,7 @@ BOUNDED = {
     "promote_verify": "B6 promote_retries<=1",
     "select_tasks": "B7 list-bounded tasks + fix queue",
     "route_verdict": "B9 adopt<=1 / B10 conformance re-run once / B11 debris<=1",
-    "apply_answer": "B8 retry<=1 / B12 design ask<=1 / B23 gate fault<=1 / draft rounds<=3 (DRAFT_ROUNDS_MAX) / user-driven choices",
+    "apply_answer": "B8 retry<=1 / B12 design ask<=1 / B23 gate fault<=1 / draft rounds<=DRAFT_ROUNDS_MAX / user-driven choices",
     "design_ask_gate": "B12 asks list-bounded",
     "wave_route": "B13 wave_fix_rounds<=1",
     "integration_test": "B14 integration_strikes<=3 / B15 conflict_cycles<=2",

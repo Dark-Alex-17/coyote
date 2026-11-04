@@ -86,6 +86,15 @@ def _start_draft(state, u, line):
 _DRAFT_OUTPUT_RESET = {"draft_possible": False, "draft_title": "", "draft_markdown": "", "draft_reason": ""}
 
 
+def _seed_time(created, mtime):
+    """A seed's `created` as epoch seconds (naive means UTC), or its mtime when that does not parse."""
+    try:
+        dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except ValueError:
+        return mtime
+    return (dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)).timestamp()
+
+
 def _find_seed(u):
     """The newest ready engineer seed for this project, or ""."""
     projects = {os.path.realpath(p) for p in (u["code_repo_path"], u.get("git_root")) if p}
@@ -95,17 +104,39 @@ def _find_seed(u):
         dirs.setdefault(os.path.realpath(d), d)
     found = []
     for d in dirs.values():
-        for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        try:
+            names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+        except OSError:
+            continue
+        for name in names:
             path = os.path.join(d, name)
             if not name.endswith(".md") or not os.path.isfile(path):
                 continue
-            fm, _ = frontmatter(read_file(path))
+            try:
+                fm, _ = frontmatter(read_file(path))
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
             if fm.get("status") != "ready":
                 continue
             if not fm.get("project") or os.path.realpath(os.path.expanduser(fm["project"])) not in projects:
                 continue
-            found.append((fm.get("created", ""), os.path.getmtime(path), path))
+            # seeds written before the vehicle key existed were all for the architect
+            if fm.get("vehicle", "architect") != "architect":
+                continue
+            found.append((_seed_time(fm.get("created", ""), mtime), mtime, path))
     return max(found)[2] if found else ""
+
+
+def _consume_seed(state, u):
+    """Mark the design doc consumed if it is an engineer seed still ready; runs once orientation has succeeded."""
+    path = state.get("design_doc_path") or ""
+    if not path or os.path.basename(os.path.dirname(os.path.realpath(path))) != "engineer-handoffs" or not os.path.isfile(path):
+        return
+    if frontmatter(read_file(path))[0].get("status") == "ready":
+        for k, v in (("status", "consumed"), ("consumed_by", state.get("run_id", "")), ("consumed_at", now_iso())):
+            set_frontmatter(path, k, v)
+        ledger(state, u, f"seed: {path} consumed as the design doc")
 
 
 def _seed_question(path):
@@ -278,6 +309,9 @@ def draft_route(state):
     if title and not re.search(r"(?m)^# ", markdown):
         markdown = f"# {title}\n\n{markdown}"
     run_dir = state.get("run_dir") or ""
+    if not run_dir:
+        ledger(state, u, "draft: no run_dir to write the draft into")
+        return {**u, **draft_fault({**state, **u})}
     write_artifact(run_dir, "design-draft.md", markdown)
     path = os.path.abspath(os.path.join(run_dir, "design-draft.md"))
     u.update({"draft_path": path, "draft_text": markdown})
@@ -301,6 +335,7 @@ def draft_fault(state):
 # ====================================================================== 2.2 design
 def research_dispatch(state):
     u = {}
+    _consume_seed(state, u)
     harvest_anomalies(state, u, "orient_read")
     harvest_anomalies(state, u, "plan_research")
     note_script_error(state, u, "plan_research")
@@ -2291,6 +2326,8 @@ def parse_answer(state):
     if esc.get("kind") == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
+    elif esc.get("kind") == "seed_confirm" and _typed_doc_path(text):
+        choice = text
     else:
         choice = text if esc.get("kind") in free_text_kinds else match_option(text, options)
     if choice is None:
@@ -2314,6 +2351,12 @@ def _answered(state, choices, default=None):
         if any(ans.startswith(w) or w in ans for w in words):
             return key
     return default
+
+
+def _typed_doc_path(answer):
+    """The absolute path of an existing file named by the reply's first token, or ""."""
+    p = os.path.expanduser(answer.strip().split()[0]) if answer.strip() else ""
+    return os.path.abspath(p) if p and os.path.isfile(p) else ""
 
 
 def _leave_in_draft(state, u):
@@ -2347,6 +2390,10 @@ def apply_answer(state):
         elif picked == "Use this draft":
             ledger(state, u, f"draft: {draft or '(no path)'} no longer exists; asking for a design doc")
             raise_escalation(state, u, _need_design_doc_escalation(f"The drafted brief at {draft or '(no path)'} no longer exists."))
+        elif typed := _typed_doc_path(answer):
+            u["design_doc_path"] = typed
+            ledger(state, u, f"draft: {draft} set aside; using the typed path {typed} as the design doc")
+            u["_next"] = "orient_read"
         elif rounds > DRAFT_ROUNDS_MAX:
             ledger(state, u, f"draft: not accepted after {DRAFT_ROUNDS_MAX} redrafts; asking for a design doc")
             raise_escalation(state, u, _need_design_doc_escalation(
@@ -2383,9 +2430,11 @@ def apply_answer(state):
             _start_draft(state, u, f"seed: {seed} left ready; drafting a brief from the message and the earlier turns")
         elif a == "use" and os.path.isfile(seed):
             u["design_doc_path"] = os.path.abspath(seed)
-            for k, v in (("status", "consumed"), ("consumed_by", state.get("run_id", "")), ("consumed_at", now_iso())):
-                set_frontmatter(seed, k, v)
-            ledger(state, u, f"seed: {seed} consumed as the design doc")
+            ledger(state, u, f"seed: {seed} confirmed as the design doc; consumed once orientation succeeds")
+            u["_next"] = "orient_read"
+        elif typed := _typed_doc_path(answer):
+            u["design_doc_path"] = typed
+            ledger(state, u, f"seed: {seed} left ready; using the typed path {typed} as the design doc")
             u["_next"] = "orient_read"
         else:
             ledger(state, u, f"seed: {seed} left ready ({a or 'unmatched'}: {tail(answer, 120)}); asking for a design doc")

@@ -125,7 +125,7 @@ session:
       A bare go-ahead ("okay, go ahead and get started", "do it") after the
       conversation discussed work to implement routes RUN; the run picks up the
       engineer's ready seed or drafts a brief from the conversation and confirms
-      it with the user before any write.
+      it with the user before any write to the repos.
   chat:
     agent: engineer
     variables:

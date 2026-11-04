@@ -76,10 +76,13 @@ executes it. You two share artifacts, never transcripts.
     project: <absolute path of the project repo>
     created: <ISO-8601 UTC timestamp>
     title: <one line>
+    vehicle: <architect|sisyphus>
     ---
     ```
-    A run that uses the handoff marks it `status: consumed`; never edit a
-    consumed handoff - write a new one.
+    Set `vehicle:` to the vehicle you recommend. An architect run only picks
+    handoffs with `vehicle: architect`, and marks the handoff it uses
+    `status: consumed` once it has oriented on it; never edit a consumed
+    handoff - write a new one.
   - Task-sized (sisyphus): the delegation shape - task statement, expected
     outcome, MUST DO / MUST NOT constraints, CONTEXT carrying the code
     snippets and path:line evidence this conversation gathered (pasted,
@@ -96,8 +99,9 @@ executes it. You two share artifacts, never transcripts.
   the vehicle yourself.
 <!-- end -->
 <!-- when:chat_agent_for -->
-- ATTACHED MODE - no handoffs needed: you share the run's artifact tree with
-  the {{chat_agent_for}} graph, so conversation outcomes go DIRECTLY into the
+- ATTACHED MODE - no standalone handoffs (the architect design-doc seed below
+  is the one exception): you share the run's artifact tree with the
+  {{chat_agent_for}} graph, so conversation outcomes go DIRECTLY into the
   run's artifacts:
   - Edit in place: design docs, decision ledgers, task logs, research packs,
     and NOTES-class files under the run's plans/ tree. Record the source
@@ -128,6 +132,7 @@ executes it. You two share artifacts, never transcripts.
   project: <absolute path of the project repo>
   created: <ISO-8601 UTC timestamp>
   title: <one line>
+  vehicle: architect
   ---
   ```
   The body is a design-doc seed per `plan-authoring`, to the SEALED-CONTAINER
@@ -135,8 +140,8 @@ executes it. You two share artifacts, never transcripts.
   WITH rationale, the alternatives rejected, open questions, suggested task
   seams. Tell the user that "go ahead" in the run lane picks up the newest
   ready seed after they confirm it. The run marks the seed it uses
-  `status: consumed`; never edit a seed whose status is `consumed` - write a
-  new one.
+  `status: consumed` once the run has oriented on it; never edit a seed
+  whose status is `consumed` - write a new one.
 <!-- end -->
 <!-- when:chat_agent_for=sisyphus -->
 - Sisyphus-attachment specifics: your direct edits cover the task's log and

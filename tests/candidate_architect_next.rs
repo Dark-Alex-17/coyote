@@ -714,17 +714,46 @@ fn engineer_architect_block_states_the_seed_contract() {
     let open = "<!-- when:chat_agent_for=architect -->";
     let start = text.find(open).expect("no architect-attachment block") + open.len();
     let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
         "When the user describes something to implement",
         "plans/engineer-handoffs/",
         "status: ready",
         "project:",
         "created:",
+        "vehicle: architect",
+        "once the run has oriented on it",
         "never edit a seed whose status is `consumed`",
     ] {
         assert!(
-            block.contains(needle),
+            flat.contains(needle),
             "the architect-attachment block does not state {needle:?}:\n{block}"
+        );
+    }
+}
+
+/// An architect run started without a design doc picks up standalone
+/// handoffs, so the standalone block must state the frontmatter it filters on.
+#[test]
+fn engineer_standalone_block_states_the_handoff_contract() {
+    let text = fs::read_to_string(agents_dir().join("engineer/instructions.md")).unwrap();
+    let open = "<!-- when:!chat_agent_for -->";
+    let start = text.find(open).expect("no standalone block") + open.len();
+    let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "plans/engineer-handoffs/",
+        "status: ready",
+        "project:",
+        "created:",
+        "vehicle:",
+        "An architect run only picks handoffs with `vehicle: architect`",
+        "once it has oriented on it",
+        "never edit a consumed handoff",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the standalone block does not state {needle:?}:\n{block}"
         );
     }
 }
@@ -744,7 +773,7 @@ fn route_instructions_send_a_bare_go_ahead_to_run() {
         "A bare go-ahead (\"okay, go ahead and get started\", \"do it\")",
         "routes RUN",
         "the run picks up the engineer's ready seed or drafts a brief",
-        "confirms it with the user before any write",
+        "confirms it with the user before any write to the repos",
     ] {
         assert!(
             flat.contains(needle),
