@@ -3045,6 +3045,9 @@ mod tests {
     }
 
     #[test]
+    // The hint it asserts follows the UI flag, which the serial tests of
+    // this binary flip.
+    #[serial]
     fn merge_non_tty_conflict_aborts_without_force() {
         if *IS_STDOUT_TERMINAL {
             eprintln!(
