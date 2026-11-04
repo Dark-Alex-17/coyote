@@ -3,7 +3,7 @@ use super::bundles::{
     hash_file,
 };
 use crate::config::builtin_manifest::is_builtin_manifest_name;
-use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
+use crate::config::conflict::{self, ConflictAction, NonInteractive, StickyMode, resolve_conflict};
 use crate::config::{
     AssetCategory, BUNDLE_MANIFEST_FILE, CommandPrefix, InstallFilter, paths,
     set_executable_bit_if_script,
@@ -2214,11 +2214,12 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
         return Ok(McpConflictAction::KeepLocal);
     }
     // The full-screen UI cannot show the menu either; the refusal names
-    // the same ways out as the non-tty one.
+    // the same flags as the non-tty one and where else it can be answered.
     if !*IS_STDOUT_TERMINAL || crate::tui::active() {
         bail!(
-            "MCP server '{name}' already exists locally. Refusing to merge without a menu. \
-             Re-run in the plain REPL, with --install-force (installs), or with --yes (updates)."
+            "MCP server '{name}' already exists locally. Refusing to merge non-interactively. \
+             {}, with --install-force (installs), or with --yes (updates).",
+            conflict::rerun_hint()
         );
     }
     ensure_prompts_available()?;
@@ -3071,8 +3072,54 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            err.to_string().contains("Refusing to merge without a menu"),
+            err.to_string()
+                .contains("Refusing to merge non-interactively. Re-run in a terminal"),
             "got: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Under the full-screen UI the same conflict is refused whatever
+    /// stdout is, and the way out it names is the plain REPL.
+    #[test]
+    #[serial]
+    fn merge_conflict_under_the_tui_points_at_the_plain_repl() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = fresh_temp_dir("merge-tui-");
+        let remote = dir.join("remote.json");
+        let target = dir.join("target.json");
+        write_mcp(
+            &target,
+            r#"{"mcpServers": {"alpha": {"type": "stdio", "command": "LOCAL"}}}"#,
+        );
+        write_mcp(&remote, FIXTURE_REMOTE);
+
+        let err = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+        )
+        .unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains("Refusing to merge non-interactively. Re-run in the plain REPL"),
+            "got: {err}"
+        );
+        assert!(
+            text.contains("--install-force") && text.contains("--yes"),
+            "got: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .matches("LOCAL")
+                .count(),
+            1,
+            "the local server was rewritten"
         );
         let _ = fs::remove_dir_all(&dir);
     }

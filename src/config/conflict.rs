@@ -79,10 +79,11 @@ pub(crate) fn resolve_conflict(
         match non_interactive {
             NonInteractive::Keep => return Ok(ConflictAction::Keep),
             NonInteractive::Bail => bail!(
-                "Refusing to overwrite local file {} without a menu. \
-                 Re-run in the plain REPL, with --install-force (installs), \
+                "Refusing to overwrite local file {} non-interactively. \
+                 {}, with --install-force (installs), \
                  or with --yes (updates).",
-                dst.display()
+                dst.display(),
+                rerun_hint()
             ),
         }
     }
@@ -107,13 +108,27 @@ pub(crate) fn resolve_conflict(
 }
 
 fn is_interactive() -> bool {
+    // Under the full-screen UI stdout is a tty the menu cannot use, so
+    // every caller takes its non-interactive answer instead of bailing;
+    // that holds whatever a test forces the tty to be.
+    if crate::tui::active() {
+        return false;
+    }
     #[cfg(test)]
     if let Some(forced) = prompt_script::forced_tty() {
         return forced;
     }
-    // Under the full-screen UI stdout is a tty the menu cannot use, so
-    // every caller takes its non-interactive answer instead of bailing.
-    *IS_STDOUT_TERMINAL && !crate::tui::active()
+    *IS_STDOUT_TERMINAL
+}
+
+/// Where a refused menu can be answered instead: the plain REPL when the
+/// full-screen UI is what stands in the way, a terminal otherwise.
+pub(crate) fn rerun_hint() -> &'static str {
+    if crate::tui::active() {
+        "Re-run in the plain REPL"
+    } else {
+        "Re-run in a terminal"
+    }
 }
 
 fn select_choice(prompt: &str) -> Result<String> {
@@ -272,6 +287,11 @@ mod tests {
             err.to_string().contains("Refusing to overwrite local file"),
             "got: {err}"
         );
+        assert!(
+            err.to_string()
+                .contains("non-interactively. Re-run in a terminal"),
+            "got: {err}"
+        );
         assert!(err.to_string().contains("example.yaml"), "got: {err}");
         assert_eq!(prompt_script::prompts_asked(), 0);
     }
@@ -286,6 +306,30 @@ mod tests {
 
         assert!(matches!(action, ConflictAction::Keep));
         assert_eq!(sticky, StickyMode::None);
+        assert_eq!(prompt_script::prompts_asked(), 0);
+    }
+
+    /// The full-screen UI wins over a forced tty: the menu is never
+    /// built, a Keep caller keeps, and a Bail caller is sent to the plain
+    /// REPL rather than "a terminal".
+    #[test]
+    #[serial]
+    fn under_the_tui_a_forced_tty_still_takes_the_non_interactive_answer() {
+        let _script = prompt_script::install(&["replace"]);
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = StickyMode::None;
+
+        let action = resolve_conflict(&dst(), "hooks", &mut sticky, NonInteractive::Keep).unwrap();
+        assert!(matches!(action, ConflictAction::Keep));
+        assert_eq!(prompt_script::prompts_asked(), 0);
+
+        let err =
+            resolve_conflict(&dst(), "macros", &mut sticky, NonInteractive::Bail).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("non-interactively. Re-run in the plain REPL"),
+            "got: {err}"
+        );
         assert_eq!(prompt_script::prompts_asked(), 0);
     }
 
