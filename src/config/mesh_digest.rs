@@ -327,8 +327,9 @@ impl SessionFingerprint {
 /// must not slip past the fence. `last_todo` is the task list as it stood at the last
 /// attempt, so a changed list is worth a digest even when the transcript has barely grown.
 /// `in_turn_covered` is the message count of the last attempt when a progress point made
-/// it, so the boundary that ends that turn is not held back by the interval when the turn
-/// went on to add messages that attempt never saw.
+/// it, so the boundary that ends that turn is held back by neither the interval nor the
+/// growth threshold when the turn went on to add messages that attempt never saw: a turn
+/// ends by adding only two or three.
 pub(crate) struct MeshDigestDriver {
     in_flight: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
@@ -514,13 +515,13 @@ impl MeshDigestDriver {
         if shrunk {
             self.clear(&app.mesh);
         }
-        if !grew && !shrunk && !todo_changed {
-            return None;
-        }
         let outgrew_in_turn_attempt = at_boundary
             && self
                 .in_turn_covered
                 .is_some_and(|attempted| len > attempted);
+        if !grew && !shrunk && !todo_changed && !outgrew_in_turn_attempt {
+            return None;
+        }
         if !outgrew_in_turn_attempt
             && self
                 .last_attempt
@@ -564,6 +565,7 @@ impl MeshDigestDriver {
             task.abort();
         }
         self.pending_covered = None;
+        self.in_turn_covered = None;
         self.in_flight = Arc::new(AtomicBool::new(false));
     }
 
@@ -1391,6 +1393,124 @@ mod tests {
         wait_for_task(&mut driver).await;
         assert_eq!(model.calls(), 2);
         assert_eq!(ctx.read().app.mesh.digest().unwrap().covered_messages, 16);
+    }
+
+    mod in_turn_boundary_tests {
+        use super::*;
+        use crate::function::{ToolCall, ToolResult};
+
+        /// A driver whose last attempt was a progress point that digested a todo change,
+        /// with the transcript still at the length that attempt covered.
+        struct AfterInTurnAttempt {
+            ctx: Arc<RwLock<RequestContext>>,
+            model: Arc<FakeModel>,
+            driver: MeshDigestDriver,
+            at: Instant,
+            covered: usize,
+        }
+
+        async fn after_an_in_turn_attempt() -> AfterInTurnAttempt {
+            let mut ctx = test_ctx(MeshBrief::Auto);
+            add_n_turns(&mut ctx, 4);
+            let ctx = shared(ctx);
+            let model = Arc::new(FakeModel::default());
+            let mut driver = MeshDigestDriver::without_node_gate();
+            let start = Instant::now();
+            driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
+            wait_for_task(&mut driver).await;
+            let at = start + MESH_DIGEST_MIN_INTERVAL + Duration::from_secs(1);
+            {
+                let mut turn = ctx.write();
+                turn.todo_list.add("write the seam");
+                driver.maybe_refresh_in_turn(&turn, at, model.fetch(FIXED_DIGEST));
+            }
+            wait_for_task(&mut driver).await;
+            assert_eq!(model.calls(), 2, "the progress point digested the todo");
+            let covered = ctx.read().app.mesh.digest().unwrap().covered_messages;
+            AfterInTurnAttempt {
+                ctx,
+                model,
+                driver,
+                at,
+                covered,
+            }
+        }
+
+        /// The end of one turn as `Session::add_message` records it: the user's message
+        /// and the reply, with the tool round between them when the turn called a tool.
+        fn end_turn(ctx: &mut RequestContext, with_tool: bool) {
+            let mut input =
+                Input::from_str(ctx, "finish the seam", Some(Role::new("", ""))).unwrap();
+            if with_tool {
+                let call = ToolCall::new("t".into(), serde_json::json!({}), Some("id-1".into()));
+                input = input.merge_tool_results(
+                    "calling".into(),
+                    vec![ToolResult::new(call, serde_json::json!("ok"))],
+                );
+            }
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, "done")
+                .unwrap();
+        }
+
+        async fn the_boundary_digests_a_turn_end(with_tool: bool, added: usize) {
+            let mut attempt = after_an_in_turn_attempt().await;
+            end_turn(&mut attempt.ctx.write(), with_tool);
+            let len = digest_message_count(attempt.ctx.read().session.as_ref().unwrap());
+            assert_eq!(len, attempt.covered + added);
+
+            attempt.driver.maybe_refresh_with(
+                &attempt.ctx,
+                attempt.at + Duration::from_secs(1),
+                attempt.model.fetch(FIXED_DIGEST),
+            );
+            wait_for_task(&mut attempt.driver).await;
+
+            assert_eq!(
+                attempt.model.calls(),
+                3,
+                "the boundary digested the turn's end"
+            );
+            assert_eq!(
+                attempt
+                    .ctx
+                    .read()
+                    .app
+                    .mesh
+                    .digest()
+                    .unwrap()
+                    .covered_messages,
+                len
+            );
+        }
+
+        /// Fewer new messages than the growth threshold, and the todo list as the
+        /// progress point saw it: the boundary still digests what that point never saw.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_turn_ending_in_two_messages_is_digested_at_its_boundary() {
+            the_boundary_digests_a_turn_end(false, 2).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_turn_ending_in_a_tool_round_is_digested_at_its_boundary() {
+            the_boundary_digests_a_turn_end(true, 3).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_boundary_with_nothing_new_since_the_in_turn_attempt_does_not_digest() {
+            let mut attempt = after_an_in_turn_attempt().await;
+
+            attempt.driver.maybe_refresh_with(
+                &attempt.ctx,
+                attempt.at + Duration::from_secs(1),
+                attempt.model.fetch(FIXED_DIGEST),
+            );
+
+            assert!(attempt.driver.task.is_none());
+            assert_eq!(attempt.model.calls(), 2);
+        }
     }
 
     mod in_turn_digest_tests {
