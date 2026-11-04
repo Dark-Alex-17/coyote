@@ -343,6 +343,9 @@ check("draft_route: draft_possible false -> need_design_doc with the reason in t
       and any(d == "draft: not possible: the message asks a question, not for work" for d in u["decisions"]), u.get("escalation"))
 u = gates.draft_route(base_state(draft_possible=True, draft_title="Dry run", draft_markdown="  \n"))
 check("draft_route: an empty draft -> need_design_doc", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc", u.get("escalation"))
+u = gates.draft_route(base_state(draft_possible=False, draft_reason="nothing to implement", draft_markdown=DRAFT_MD))
+check("draft_route: draft_possible false with markdown present -> need_design_doc, no draft written",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "draft_path" not in u, u.get("escalation"))
 u = gates.draft_route(base_state(draft_possible=True, draft_title="Dry run for sync", draft_markdown=DRAFT_MD, anomalies=["stale README"]))
 E_DRAFT = u.get("escalation") or {}
 DRAFT_PATH = os.path.join(base_state()["run_dir"], "design-draft.md")

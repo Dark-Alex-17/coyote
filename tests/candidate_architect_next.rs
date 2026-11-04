@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 626;
+const SMOKE_FLOOR: usize = 657;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -535,8 +535,13 @@ fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
 /// target `fix_done` returns to, the overflow stop in `review_poll`, the
 /// `>=` that stops `review_poll` at `POLL_VISIT_BUDGET`, the PR head check
 /// before `review_update` resolves anything, the trusted author of an own
-/// comment and the failed-read exclusion that keeps `_poll_permissions`
-/// from re-reading the same failing logins every poll.
+/// comment, the failed-read exclusion that keeps `_poll_permissions` from
+/// re-reading the same failing logins every poll, the ready-seed filter, the
+/// `status: consumed` write on a used seed, the hard trigger that keeps
+/// `seed_confirm` and `draft_confirm` off the autonomous ladder, the
+/// `confirm_draft` terminal prompt, the `draft_confirm` branch that reads an
+/// edit mentioning abort before the generic abort check, and the confirmed
+/// draft becoming the design doc.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
@@ -598,13 +603,46 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "seed-ready",
             "            if fm.get(\"status\") != \"ready\":\n",
             "            if False:\n",
-            "intake seed: another project / consumed / no frontmatter -> ignored, need_design_doc",
+            "intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
         ),
         (
             "seed-consumed",
             "                set_frontmatter(seed, k, v)\n",
             "                pass\n",
             "apply_answer: seed_confirm use -> design doc is the seed, orient_read, seed consumed",
+        ),
+        (
+            "seed-hard-trigger",
+            "hard_trigger=True, tier3_ok=False, data={\"seed_path\": seed}",
+            "hard_trigger=False, tier3_ok=False, data={\"seed_path\": seed}",
+            "escalate_gate: seed_confirm skips the ladder under escalation_policy=autonomous",
+        ),
+        (
+            "draft-hard-trigger",
+            "hard_trigger=True, tier3_ok=False, data={\"draft_path\": path}",
+            "hard_trigger=False, tier3_ok=False, data={\"draft_path\": path}",
+            "draft_route: a good draft -> design-draft.md in the run dir with the title heading \
+             prefixed, hard-trigger draft_confirm holding the draft",
+        ),
+        (
+            "draft-prompt",
+            ", \"draft_confirm\": \"confirm_draft\"}",
+            "}",
+            "ask_dispatch: draft_confirm -> confirm_draft",
+        ),
+        (
+            "draft-abort-order",
+            "    if kind == \"draft_confirm\":\n",
+            "    if kind == \"draft_confirm\" and abort:\n        u[\"failure_reason\"] = kind\n        \
+             u[\"_next\"] = \"end_aborted\"\n    elif kind == \"draft_confirm\":\n",
+            "apply_answer: draft_confirm free-text edit mentioning abort -> draft_brief with the \
+             feedback, round 1",
+        ),
+        (
+            "draft-use",
+            "            u[\"design_doc_path\"] = os.path.abspath(draft)\n",
+            "            u[\"design_doc_path\"] = \"\"\n",
+            "apply_answer: draft_confirm use -> design doc is the draft, orient_read",
         ),
     ];
     for (label, old, new, row) in sabotages {
@@ -686,6 +724,30 @@ fn engineer_architect_block_states_the_seed_contract() {
         assert!(
             block.contains(needle),
             "the architect-attachment block does not state {needle:?}:\n{block}"
+        );
+    }
+}
+
+/// A bare go-ahead after a design discussion is what starts a run without a
+/// doc path, so the session router must send it to RUN, where the seed pickup
+/// or the drafted brief takes over.
+#[test]
+fn route_instructions_send_a_bare_go_ahead_to_run() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let route = doc["session"]["route"]["instructions"]
+        .as_str()
+        .expect("graph.yaml has session.route.instructions");
+    let flat = route.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "A bare go-ahead (\"okay, go ahead and get started\", \"do it\")",
+        "routes RUN",
+        "the run picks up the engineer's ready seed or drafts a brief",
+        "confirms it with the user before any write",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the route instructions do not state {needle:?}:\n{route}"
         );
     }
 }
@@ -2326,10 +2388,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![44, 2779, 2788],
+        vec![44, 2861, 2870],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2779, 2788] {
+    for line in [2861, 2870] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4006,8 +4068,8 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 
 /// Every integer field of every node in the shipped baseline (`timeout`,
 /// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
-/// plus the frozen budgets row and the review watch nodes; a node absent here
-/// declares none.
+/// plus the frozen budgets row, the review watch nodes and `draft_brief`; a
+/// node absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -4038,6 +4100,8 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("debt_assign", "timeout", 300),
     ("delegate", "max_attempts", 1),
     ("delegate", "timeout", 0),
+    ("draft_brief", "max_iterations", 10),
+    ("draft_brief", "timeout", 600),
     ("explore_slice_solo", "max_attempts", 2),
     ("explore_slice_solo", "timeout", 1800),
     ("explore_slice_team", "max_attempts", 2),
@@ -4115,6 +4179,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "ci_rounds",
     "ci_started_at",
     "design_rounds",
+    "draft_rounds",
     "final_integration_strikes",
     "gate_fault_retries",
     "group_index",
@@ -4144,6 +4209,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("CI_WALL_SECS", "", "14400", 14400),
     ("CONFLICT_CYCLES_MAX", "", "2", 2),
     ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
+    ("DRAFT_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
     ("GH_CALL_SECS", "", "90", 90),
     ("GH_LOOP_SECS", "", "180", 180),
     ("OWNER_POLL_MAX", "", "2", 2),
@@ -4477,8 +4543,9 @@ fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
 }
 
 /// How each llm node's output schema carries the `anomalies` channel in the
-/// staging baseline plus `review_triage`: `Plain` is the optional
-/// string-array property, `NoSchema` is a node with no `output_schema` at all.
+/// staging baseline plus `review_triage` and `draft_brief`: `Plain` is the
+/// optional string-array property, `NoSchema` is a node with no
+/// `output_schema` at all.
 #[derive(Clone, Copy, Debug)]
 enum AnomaliesChannel {
     Plain,
@@ -4491,6 +4558,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("author_plan", AnomaliesChannel::Plain),
     ("batch_triage", AnomaliesChannel::Plain),
     ("ci_diagnose", AnomaliesChannel::Plain),
+    ("draft_brief", AnomaliesChannel::Plain),
     ("integrate_findings", AnomaliesChannel::Plain),
     ("ladder_judge", AnomaliesChannel::Plain),
     ("orient_read", AnomaliesChannel::Plain),
