@@ -3322,6 +3322,31 @@ mod tests {
         assert!(!frame.contains("[31m"), "{frame}");
     }
 
+    /// Cells drawn as plain lines are scrubbed at the draw whatever path
+    /// fed them: a user line, an error and a notice pushed straight into
+    /// the transcript show their words and no escape or format bytes.
+    #[test]
+    fn plain_cells_are_scrubbed_when_drawn() {
+        let mut harness = Harness::standalone(60, 12);
+        harness.app.begin_turn("hi\x1b[2Jthere\u{200b}u7p", false);
+        harness.app.cells.push(Cell::Error {
+            text: "\x1b[31mbroken\x1b[0m e7p".to_string(),
+            cache: LineCache::default(),
+        });
+        harness.app.cells.push(Cell::notice(
+            NoticeKind::Routing,
+            "\x1b]8;;x\x07note\x1b]8;;\x07 n7p".to_string(),
+        ));
+        let frame = harness.draw();
+        for word in ["> hithereu7p", "broken e7p", "note n7p"] {
+            assert!(frame.contains(word), "{word:?} missing:\n{frame}");
+        }
+        assert!(
+            !frame.contains('\x1b') && !frame.contains('\u{200b}'),
+            "{frame}"
+        );
+    }
+
     /// The final text of a reply is authoritative: it replaces whatever
     /// the stream had accumulated and closes the cell.
     #[test]

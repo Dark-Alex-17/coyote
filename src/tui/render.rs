@@ -204,9 +204,11 @@ fn wrap_lines(text: &str, width: u16) -> String {
     out
 }
 
-/// Plain text wrapped to `width`, every span in `style`.
+/// Plain text wrapped to `width`, every span in `style`. The text is
+/// scrubbed first: whatever is drawn this way (a user line, a notice, an
+/// error, a question) carries no escape or format character to the cell.
 pub(crate) fn plain_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
-    wrap_lines(text, width)
+    wrap_lines(&plain_text(text), width)
         .split('\n')
         .map(|line| Line::from(Span::styled(line.to_string(), style)))
         .collect()
