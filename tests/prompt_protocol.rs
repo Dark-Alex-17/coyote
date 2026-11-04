@@ -258,7 +258,7 @@ const PASSWORD_REPORT: &str = "echo \"password-rc=$rc len=${#v}\"; \
 /// The refusal is the whole of what the helper says: the one-line message
 /// exactly once, the question never painted (so nothing was read from the
 /// terminal either), and echo still on afterwards.
-fn assert_password_refused_cleanly(transcript: &str, question_marker: &str) {
+fn assert_refused_cleanly_on_the_tty(transcript: &str, question_marker: &str) {
     assert_eq!(
         transcript.matches(TUI_NO_CHANNEL).count(),
         1,
@@ -266,11 +266,7 @@ fn assert_password_refused_cleanly(transcript: &str, question_marker: &str) {
     );
     assert!(
         !transcript.contains(question_marker),
-        "the password question was painted on the terminal:\n{transcript}"
-    );
-    assert!(
-        !transcript.contains("password-length="),
-        "the helper returned a value instead of failing:\n{transcript}"
+        "the question was painted on the terminal:\n{transcript}"
     );
     let flags = transcript
         .lines()
@@ -281,7 +277,7 @@ fn assert_password_refused_cleanly(transcript: &str, question_marker: &str) {
         .collect();
     assert!(
         tokens.contains(&"echo") && !tokens.contains(&"-echo"),
-        "the refused password left echo off:\n{transcript}"
+        "the refusal left echo off:\n{transcript}"
     );
 }
 
@@ -305,7 +301,11 @@ fn under_the_tui_bash_password_without_channel_fails_closed() {
     let mut pty = Pty::spawn(cmd).unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_fails_closed_under_the_tui(&transcript, "password-rc=1 len=0");
-    assert_password_refused_cleanly(&transcript, "Secret?");
+    assert_refused_cleanly_on_the_tty(&transcript, "Secret?");
+    assert!(
+        !transcript.contains("password-length="),
+        "the helper returned a value instead of failing:\n{transcript}"
+    );
 }
 
 /// `range` reads the cursor row and keys in subshells; its refusal has to
@@ -332,7 +332,7 @@ fn under_the_tui_bash_range_without_channel_fails_closed_at_once() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert!(started.elapsed() < Duration::from_secs(10), "{transcript}");
     assert_fails_closed_under_the_tui(&transcript, "range-rc=1 len=0");
-    assert_password_refused_cleanly(&transcript, "Count?");
+    assert_refused_cleanly_on_the_tty(&transcript, "Count?");
 }
 
 /// `with_validate` evaluates its prompt in a subshell and re-asks until
@@ -360,7 +360,7 @@ fn under_the_tui_bash_with_validate_without_channel_fails_closed_at_once() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert!(started.elapsed() < Duration::from_secs(10), "{transcript}");
     assert_fails_closed_under_the_tui(&transcript, "validate-rc=1 len=0");
-    assert_password_refused_cleanly(&transcript, "Name?");
+    assert_refused_cleanly_on_the_tty(&transcript, "Name?");
 }
 
 /// `guard_operation` without a channel falls back to a terminal confirm
@@ -392,7 +392,7 @@ fn under_the_tui_bash_guard_without_channel_refuses_before_touching_the_tty() {
         !transcript.contains("(y/N)"),
         "the terminal was asked:\n{transcript}"
     );
-    assert_password_refused_cleanly(&transcript, "Really?");
+    assert_refused_cleanly_on_the_tty(&transcript, "Really?");
 }
 
 /// The Python helper's `password` has its own terminal path (getpass, not
@@ -420,7 +420,11 @@ fn under_the_tui_python_password_without_channel_fails_closed() {
     let mut pty = Pty::spawn(cmd).unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_fails_closed_under_the_tui(&transcript, "password-rc=1 len=0");
-    assert_password_refused_cleanly(&transcript, "Secret?");
+    assert_refused_cleanly_on_the_tty(&transcript, "Secret?");
+    assert!(
+        !transcript.contains("password-length="),
+        "the helper returned a value instead of failing:\n{transcript}"
+    );
 }
 
 /// The TypeScript helper's `password` (the hidden `ttyLine`), same shape.
@@ -451,7 +455,11 @@ fn under_the_tui_typescript_password_without_channel_fails_closed() {
     let mut pty = Pty::spawn(cmd).unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_fails_closed_under_the_tui(&transcript, "password-rc=1 len=0");
-    assert_password_refused_cleanly(&transcript, "Secret?");
+    assert_refused_cleanly_on_the_tty(&transcript, "Secret?");
+    assert!(
+        !transcript.contains("password-length="),
+        "the helper returned a value instead of failing:\n{transcript}"
+    );
 }
 
 /// The gate is the TUI's, not every host's: the same `COYOTE_UI` value

@@ -258,7 +258,16 @@ fn spawn_exit(
     spawn_work(async move {
         // Late output (a panic's message among it) reaches the UI the way
         // a turn's does instead of dying in a discarded pipe.
-        let guard = FdRedirect::begin(late_output(ui)).ok();
+        let guard = match FdRedirect::begin(late_output(ui.clone())) {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                let _ = ui.send(UiMsg::Notice {
+                    kind: NoticeKind::ToolWarning,
+                    text: format!("Leaving without output capture: {err}"),
+                });
+                None
+            }
+        };
         #[cfg(debug_assertions)]
         if std::env::var(PANIC_AT_EXIT_ENV).as_deref() == Ok("1") {
             panic!("{PANIC_AT_EXIT_ENV} requested a panic inside the exit work");
@@ -1405,6 +1414,14 @@ enum Unfinished {
 }
 
 impl Unfinished {
+    /// How long the UI waited on the task before leaving it behind.
+    fn waited(self) -> Duration {
+        match self {
+            Self::Turn => EXIT_CANCEL_WAIT,
+            Self::Exit => EXIT_TEARDOWN_WAIT,
+        }
+    }
+
     fn describe(self) -> &'static str {
         match self {
             Self::Turn => "The running turn",
@@ -1516,7 +1533,7 @@ fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> 
     let _ = screen.print_line(&format!(
         "{} did not stop within {} s; leaving it behind",
         unfinished.describe(),
-        EXIT_CANCEL_WAIT.as_secs()
+        unfinished.waited().as_secs()
     ));
     std::process::exit(0)
 }

@@ -2675,8 +2675,6 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             // and a guard aborts with its usual message, and nothing blocks.
             // The outer shell keeps the real channel so a request that does
             // escape is still answered rather than deadlocking the harness.
-            // Descriptor 97 is closed first: a test process with many files
-            // open may well have it, and then the path would be live.
             let dead = dead_reply_path();
             let body = format!(
                 "{}; \
@@ -4072,7 +4070,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 );
             }
 
-            let dead_out = [(OUT_FD_ENV, "97")];
+            // The request descriptor the test points at is dead the same
+            // way the reply one is: a number past the process limit.
+            let dead_out_fd = dead_reply_path().rsplit('/').next().unwrap().to_string();
+            let dead_out = [(OUT_FD_ENV, dead_out_fd.as_str())];
             let run = drive_env(command("confirm(\"Go?\")"), Some(&[]), false, &dead_out);
             assert_eq!(run.requests, 0, "request sent over a dead request fd");
             assert_eq!(run.code, 0, "{}", run.stderr);

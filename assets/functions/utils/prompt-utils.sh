@@ -29,11 +29,11 @@
 #
 # COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
 # nobody can; tools may branch on it before asking. Under "tui" only the
-# channel-backed helpers are safe: range, editor and any /dev/tty fallback
-# draw straight over the full-screen UI. That safety holds only while the
-# channel is up: when it is not (COYOTE_PROMPT_REPLY unset), guard_operation
-# and guard_path fall back to `confirm ... 2>/dev/tty`, which paints over the
-# UI like any other terminal prompt.
+# channel-backed helpers are usable: range, editor and any terminal prompt
+# would draw straight over the full-screen UI, so under "tui" every helper
+# without a channel (COYOTE_PROMPT_REPLY unset) fails closed instead, exit 1
+# with one line on stderr; guard_operation and guard_path then abort the
+# operation they guard.
 #
 # - guard_operation   Prompt for permission to run an operation
 # - guard_path        Prompt for permission to perform path operations
