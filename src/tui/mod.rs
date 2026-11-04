@@ -63,6 +63,13 @@ const PANIC_AT_START_ENV: &str = "COYOTE_TUI_PANIC_AT_START";
 #[cfg(debug_assertions)]
 const STUBBORN_TURN_ENV: &str = "COYOTE_TUI_STUBBORN_TURN";
 
+/// Test-only harness hook: when set to `1`, the exit work panics once its
+/// output is captured, so a pty test can check the panic's message
+/// reaches the restored terminal. Debug builds only; a release binary
+/// ignores it.
+#[cfg(debug_assertions)]
+const PANIC_AT_EXIT_ENV: &str = "COYOTE_TUI_PANIC_AT_EXIT";
+
 /// How long the composer must have been untouched before a bare hotkey
 /// counts as a modal answer, so a keystroke meant for the composer never
 /// confirms a prompt that appeared under it.
@@ -252,6 +259,10 @@ fn spawn_exit(
         // Late output (a panic's message among it) reaches the UI the way
         // a turn's does instead of dying in a discarded pipe.
         let guard = FdRedirect::begin(late_output(ui)).ok();
+        #[cfg(debug_assertions)]
+        if std::env::var(PANIC_AT_EXIT_ENV).as_deref() == Ok("1") {
+            panic!("{PANIC_AT_EXIT_ENV} requested a panic inside the exit work");
+        }
         ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
         let result = ctx.exit_session();
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort));
@@ -724,8 +735,13 @@ impl App {
     }
 
     pub(crate) fn begin_exit(&mut self) {
-        self.exiting = true;
-        self.exit_first_cell = self.cells.len();
+        // Called again (a signal while the exit work already runs) it
+        // keeps the first call's start, or the exit's late output so far
+        // would fall before it.
+        if !self.exiting {
+            self.exiting = true;
+            self.exit_first_cell = self.cells.len();
+        }
         self.schedule_frame();
     }
 
@@ -1413,38 +1429,51 @@ struct Shell<'a> {
 
 /// Answers a question raised once nobody is left to see it; any other
 /// message has no screen left to go to.
-fn answer_unattended(msg: UiMsg) {
-    if let UiMsg::Prompt { req, reply } = msg {
-        let _ = reply.send(unattended_answer(&req));
+/// Answers a prompt nobody is left to answer and keeps a notice (late
+/// output, a panic's message among it) for the caller; anything else the
+/// UI would have drawn is dropped, there being no screen for it.
+fn answer_unattended(msg: UiMsg, late: &mut Vec<String>) {
+    match msg {
+        UiMsg::Prompt { req, reply } => {
+            let _ = reply.send(unattended_answer(&req));
+        }
+        UiMsg::Notice { text, .. } => late.push(text),
+        _ => {}
     }
 }
 
 /// Waits up to `deadline` for a work task after the UI gave up, answering
 /// every prompt it raises meanwhile so the asker never sits on the reply
-/// until the deadline.
+/// until the deadline. The notices that arrive during the wait come back
+/// with the outcome so a panic's message is not lost with the screen.
 async fn join_unattended<T>(
     handle: JoinHandle<T>,
     rx: &mut UnboundedReceiver<UiMsg>,
     deadline: Duration,
-) -> Join<T> {
+) -> (Join<T>, Vec<String>) {
+    let mut late = Vec::new();
     while let Ok(msg) = rx.try_recv() {
-        answer_unattended(msg);
+        answer_unattended(msg, &mut late);
     }
     tokio::pin!(handle);
     let joined = tokio::time::timeout(deadline, async {
         loop {
             tokio::select! {
+                // The channel first: a notice sent just ahead of the task's
+                // end is read before the end is, so it is never left behind.
+                biased;
+                Some(msg) = rx.recv() => answer_unattended(msg, &mut late),
                 joined = &mut handle => return joined,
-                Some(msg) = rx.recv() => answer_unattended(msg),
             }
         }
     })
     .await;
-    match joined {
+    let joined = match joined {
         Ok(Ok(value)) => Join::Finished(value),
         Ok(Err(err)) => Join::Panicked(err),
         Err(_) => Join::TimedOut,
-    }
+    };
+    (joined, late)
 }
 
 /// How the wait on a work task ended.
@@ -1616,13 +1645,13 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         // gives it; a teardown that never returns ends the process the
         // way an outlived task does instead of hanging a bare terminal.
         Leave::Abandoned(ctx) => {
-            match join_unattended(
+            let (joined, mut late) = join_unattended(
                 spawn_exit(*ctx, abort.clone(), tx.clone()),
                 &mut rx,
                 EXIT_TEARDOWN_WAIT,
             )
-            .await
-            {
+            .await;
+            match joined {
                 Join::Finished((_, result, captured)) => {
                     write_to_terminal(&render::sanitize_ansi(&captured));
                     result
@@ -1631,7 +1660,6 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
                     // The panic's message came through the capture as late
                     // output; it goes to the restored terminal like a lost
                     // turn's does.
-                    let mut late = Vec::new();
                     settle_late_notices(&mut rx, &mut late).await;
                     for text in late {
                         write_to_stderr(&format!("{}\n", render::plain_text(&text)));
@@ -1664,6 +1692,14 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
 /// drain thread hands the pipe's contents over after the guard went
 /// down, so the queue gets the same bounded quiet-gap settle a finished
 /// turn's capture gets before it is read.
+/// The late output the UI drew followed by what arrived during the wait
+/// on the task, without a notice counted twice: the wait's notices were
+/// never drawn, so none of them is in the drawn list.
+fn with_late(mut drawn: Vec<String>, waited: Vec<String>) -> Vec<String> {
+    drawn.extend(waited);
+    drawn
+}
+
 async fn settle_late_notices(rx: &mut UnboundedReceiver<UiMsg>, late: &mut Vec<String>) {
     let started = Instant::now();
     let mut last = started;
@@ -1719,18 +1755,24 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 return match task.take() {
                     Some(Task::Turn { handle, .. }) => {
                         abort.set_ctrlc();
-                        match join_unattended(handle, rx, EXIT_CANCEL_WAIT).await {
+                        let (joined, late) = join_unattended(handle, rx, EXIT_CANCEL_WAIT).await;
+                        match joined {
                             Join::Finished((returned, _)) => Leave::Abandoned(Box::new(returned)),
-                            Join::Panicked(err) => Leave::Lost(err, app.turn_late_output()),
+                            Join::Panicked(err) => {
+                                Leave::Lost(err, with_late(app.turn_late_output(), late))
+                            }
                             Join::TimedOut => Leave::Outlived(Unfinished::Turn),
                         }
                     }
                     Some(Task::Exit(handle)) => {
-                        match join_unattended(handle, rx, EXIT_TEARDOWN_WAIT).await {
+                        let (joined, late) = join_unattended(handle, rx, EXIT_TEARDOWN_WAIT).await;
+                        match joined {
                             Join::Finished((_, result, captured)) => {
                                 Leave::Finished(result, captured)
                             }
-                            Join::Panicked(err) => Leave::Lost(err, app.exit_late_output()),
+                            Join::Panicked(err) => {
+                                Leave::Lost(err, with_late(app.exit_late_output(), late))
+                            }
                             Join::TimedOut => Leave::Outlived(Unfinished::Exit),
                         }
                     }
@@ -1846,7 +1888,15 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     app.abandon_prompts();
                     return match joined {
                         Ok((_, result, captured)) => Leave::Finished(result, captured),
-                        Err(err) => Leave::Lost(err, Vec::new()),
+                        Err(err) => {
+                            // The panic's message may still sit in the
+                            // channel next to the join that won the select.
+                            let mut late = Vec::new();
+                            while let Ok(msg) = rx.try_recv() {
+                                answer_unattended(msg, &mut late);
+                            }
+                            Leave::Lost(err, with_late(app.exit_late_output(), late))
+                        }
                     };
                 }
             },
@@ -2678,7 +2728,7 @@ mod tests {
             (answer, early_answer)
         });
         let started = Instant::now();
-        let Join::Finished((late_answer, early_answer)) =
+        let (Join::Finished((late_answer, early_answer)), _) =
             join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT).await
         else {
             panic!("the work task finished well inside the deadline");
@@ -2700,7 +2750,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert!(matches!(
             join_unattended(handle, &mut rx, deadline).await,
-            Join::TimedOut
+            (Join::TimedOut, _)
         ));
         assert!(started.elapsed() >= deadline);
     }
@@ -2712,12 +2762,35 @@ mod tests {
     async fn join_unattended_reports_a_panicking_task_as_panicked() {
         let (_tx, mut rx) = unbounded_channel();
         let handle = tokio::task::spawn_blocking(|| -> () { panic!("boom-j4p") });
-        let Join::Panicked(err) = join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT).await else {
+        let (Join::Panicked(err), _) = join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT).await
+        else {
             panic!("the panic was not reported as one");
         };
         assert!(err.is_panic(), "{err}");
         let payload = err.into_panic();
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom-j4p"));
+    }
+
+    /// A notice sent right before the task ends (the shape of a panic's
+    /// message through the capture) comes back with the outcome: the
+    /// channel is read ahead of the task, so nothing lands between the
+    /// two is lost, and a prompt raised meanwhile is still answered.
+    #[tokio::test]
+    async fn join_unattended_keeps_the_notices_that_arrive_during_the_wait() {
+        let (tx, mut rx) = unbounded_channel();
+        let early = late_output(tx.clone());
+        early("already queued n1j".to_string());
+        let handle = tokio::task::spawn_blocking(move || {
+            let notice = late_output(tx);
+            notice("thread 'main' panicked at exit n2j".to_string());
+            panic!("boom-n3j")
+        });
+        let (joined, late) = join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT).await;
+        assert!(matches!(joined, Join::Panicked(_)));
+        assert_eq!(
+            late,
+            ["already queued n1j", "thread 'main' panicked at exit n2j"]
+        );
     }
 
     /// A supervised agent that never finishes. The exit work waits
@@ -2775,7 +2848,7 @@ mod tests {
                 assert!(session_files.iter().all(|file| !file.exists()));
                 register_stuck_agent(&mut ctx);
                 let (tx, mut rx) = unbounded_channel();
-                let joined =
+                let (joined, _) =
                     join_unattended(spawn_exit(ctx, abort.clone(), tx), &mut rx, wait).await;
                 let saved = session_files.iter().any(|file| {
                     std::fs::read_to_string(file).is_ok_and(|text| text.contains("persist me e6w"))

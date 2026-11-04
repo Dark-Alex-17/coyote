@@ -354,6 +354,49 @@ fn a_panic_after_entering_the_alternate_screen_still_restores_the_tty() {
     );
 }
 
+/// A panic inside the exit work (after Ctrl+D) is not lost with the
+/// screen: its message, captured as the exit's late output, is printed
+/// on the restored terminal after the alternate screen is left, and the
+/// process exits non-zero with the terminal restored.
+#[test]
+#[serial]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the exit-panic hook is compiled out of release builds"
+)]
+fn a_panic_inside_the_exit_work_prints_its_message_on_the_restored_terminal() {
+    let dir = fresh_config_dir("panic-at-exit");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[("COYOTE_TUI_PANIC_AT_EXIT", "1")]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_ne!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let raw = pty.raw();
+    let entered = find(raw, ENTER_ALT, 0).expect("the alternate screen was never entered");
+    let left = find(raw, LEAVE_ALT, entered).expect("the alternate screen was never left");
+    let message = find(raw, b"COYOTE_TUI_PANIC_AT_EXIT requested a panic", entered)
+        .expect("the exit panic's message never reached the terminal");
+    assert!(
+        left < message,
+        "the panic message was printed while still on the alternate screen \
+         (leave at {left}, message at {message}):\n{transcript}"
+    );
+    // The captured panic line is printed once; the task error the exit
+    // returns names the payload again on its own line, as any error would.
+    let panic_line = b"panicked at src/tui/mod.rs";
+    assert_eq!(
+        count(&raw[left..], panic_line),
+        1,
+        "the captured panic line was not printed exactly once:\n{transcript}"
+    );
+}
+
 /// Without a tty on stdin the TUI refuses to start, says why on the
 /// terminal it does have, and exits 1.
 #[test]
