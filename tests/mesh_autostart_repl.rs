@@ -4307,7 +4307,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     let left = command_prints(
         &mut session,
         ".mesh pending",
-        &literally(access_header),
+        "Asked by this node: none",
         SESSION_PROMPT,
     );
     let lines = transcript_lines(&left);
