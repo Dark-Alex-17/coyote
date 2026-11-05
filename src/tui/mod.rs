@@ -3496,6 +3496,25 @@ mod tests {
         ));
     }
 
+    /// A child agent's tool output stays out of the root transcript, as
+    /// the REPL keeps it off the terminal; the root's own still lands.
+    #[test]
+    fn only_root_tool_output_reaches_the_transcript() {
+        use crate::events::OutputStream;
+        use crate::turn::UiSink;
+        let (tx, mut rx) = unbounded_channel();
+        let sink = TuiSink::new(tx);
+        sink.tool_output(Some("child-c3t"), OutputStream::Stdout, 1, b"child line\n");
+        sink.tool_output(None, OutputStream::Stderr, 2, b"grandchild line\n");
+        assert!(rx.try_recv().is_err(), "a child's output reached the UI");
+        sink.tool_output(Some("root-c3t"), OutputStream::Stdout, 0, b"root line\n");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiMsg::ToolOutput { call_id: Some(id), bytes })
+                if id == "root-c3t" && bytes == b"root line\n"
+        ));
+    }
+
     /// Thinking events reach the status row through the sink, the same
     /// way the tool hooks do.
     #[test]

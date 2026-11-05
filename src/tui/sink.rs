@@ -124,9 +124,15 @@ impl UiSink for TuiSink {
         &self,
         call_id: Option<&str>,
         _stream: OutputStream,
-        _depth: usize,
+        depth: usize,
         chunk: &[u8],
     ) {
+        // A child agent's tool output stays out of the root transcript, as
+        // it stays off the REPL's terminal; its cell would otherwise split
+        // the live reply.
+        if depth > 0 {
+            return;
+        }
         self.send(UiMsg::ToolOutput {
             call_id: call_id.map(str::to_string),
             bytes: chunk.to_vec(),
