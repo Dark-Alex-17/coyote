@@ -793,7 +793,7 @@ impl KnockGate {
         self.state.lock().identities.keys().cloned().collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn surfaced_instances(&self, identity: &str) -> Vec<String> {
         self.state
             .lock()

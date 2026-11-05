@@ -14992,6 +14992,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         use super::{INFO_SNAPSHOT, key_change_line_of};
         use super::{table_footer, table_header, table_rows};
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
+        #[cfg(unix)]
         use crate::mesh::message::{answered_not_as_coyote, unanswered_path_request};
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;

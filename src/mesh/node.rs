@@ -1248,7 +1248,7 @@ impl MeshRuntime {
     }
 
     /// The name this node's announces carry, label included, as a peer decodes it.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn announced_name(&self) -> Option<String> {
         AnnounceAppData::decode(&self.app_data)?.display_name
     }
@@ -16776,6 +16776,7 @@ mod tests {
 
     mod own_grant_seed_tests {
         use super::*;
+        #[cfg(unix)]
         use crate::mesh::trust::SELF_TRUST_LABEL;
 
         const OWN: &str = "00112233445566778899aabbccddeeff";
