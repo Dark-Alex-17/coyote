@@ -243,8 +243,13 @@ The wrapper's live test groups:
   `-- --ignored`: only the first recommended option kept and moved first, an unmatched typed
   reply sent to the classifier, a discussion verdict parking the run, `resume_route` sending
   a discussion park to `choice_resume`, the settled answer recorded, the
-  `DISCUSSION_PARKS_MAX` `>=`, the carried `discussion_run_id` cleared at intake, and the
-  Gate 1 carried fallback);
+  `DISCUSSION_PARKS_MAX` `>=`, the carried `discussion_run_id` cleared at intake, the
+  Gate 1 carried fallback, the scope flag kept by `frame_questions_route`, the
+  multiple-choice branch of `_terminal_prompt`, a forced reply skipping the classifier, the
+  duplicate-option drop in `normalize_choices`, a settled answer read only after
+  `continue:` or `resume:`, the held Gate 1 answers and finished checklist labels restored
+  on resume, "Option 2, but ..." falling through to the classifier, and a checklist Other
+  answer passed as an owner ruling);
 - run dir: run-dir precedence from a fresh process, and an empty `ARCHITECT_RUNS_ROOT`
   falling back to the cache-dir tier;
 - graph and gates: `build_lock` position, the variable mirror (the candidate's variables,

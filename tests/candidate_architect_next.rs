@@ -766,9 +766,15 @@ fn intake_smoke_rows_go_red_under_the_recorded_sabotages() {
 /// a discussion goes to `choice_resume`, which records the settled answer, the
 /// `>=` that stops parking at `DISCUSSION_PARKS_MAX`, the carried
 /// `discussion_run_id` cleared at intake, and a Gate 1 question that cannot be
-/// framed carried as an open amendment line.
+/// framed carried as an open amendment line. The rest guard the reply and
+/// resume edges: the re-frame keeps a question's scope flag, a multiple-choice
+/// escalation gets an `ask_choice_<n>` prompt, a forced question's typed reply
+/// skips the classifier, duplicate options collapse, a settled answer is read
+/// only after `continue:` or `resume:`, a resumed run keeps its held Gate 1
+/// answers and finished checklist labels, "Option 2, but ..." is no pick, and
+/// a checklist Other answer is an owner ruling, never an accepted item.
 #[test]
-#[ignore = "nine smoke battery runs take about a minute and a half; run with -- --ignored"]
+#[ignore = "seventeen smoke battery runs take about three minutes; run with -- --ignored"]
 fn choice_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
@@ -836,6 +842,65 @@ fn choice_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "\"answer\": LEAK_CARRIED} for q in []]\n",
                 "leak_route: still not askable after the re-frame -> carried as an open amendment line, \
              ledgered",
+            ),
+            (
+                "choice-scope-flag-kept",
+                "truthy(f.get(\"changes_scope\")) or truthy(o.get(\"changes_scope\"))",
+                "truthy(f.get(\"changes_scope\"))",
+                "frame_questions_route: the re-framed question replaces the invalid one, keeps its \
+             scope flag -> open_questions_gate",
+            ),
+            (
+                "choice-terminal-prompt",
+                "    if as_dict(esc.get(\"data\")).get(\"multiple_choice\"):\n        return \
+             _TERMINAL_PROMPTS",
+                "    if False:\n        return _TERMINAL_PROMPTS",
+                "ask_dispatch / ask_owner_route: a multiple-choice escalation picks ask_choice_<option \
+             count>",
+            ),
+            (
+                "choice-forced-bypass",
+                "        if choice is None and text and truthy(state.get(\"choice_forced\")):\n",
+                "        if False:\n",
+                "parse_answer: a forced question's typed reply -> recorded as the answer without the \
+             classifier, ledgered",
+            ),
+            (
+                "choice-duplicate-drop",
+                "        opts = list(distinct.values())\n",
+                "        pass\n",
+                "normalize_choices: case-insensitive duplicate texts -> one option, the recommended \
+             copy kept, ledgered; two copies are not askable",
+            ),
+            (
+                "continue-colon-only",
+                "    cont = CONTINUE_RE.match(",
+                "    cont = re.compile(r\"(?is)^(?:continue|resume)\\W*(.*)$\").match(",
+                "intake: 'continue please' is prose, not a continue -> a fresh run, no answer \
+             recorded, the key cleared, the left discussion ledgered",
+            ),
+            (
+                "resume-state-keys",
+                "            if k in (\"phase\", \"updated_at\") or v is None:\n",
+                "            if k in (\"phase\", \"updated_at\", \"leak_pending_answers\", \
+             \"checklist_done\") or v is None:\n",
+                "resume chain: a parked Gate 1 question settled -> leak_route closes the round with \
+             the held, earlier and settled answers",
+            ),
+            (
+                "choice-qualified-pick",
+                "[\\W_]*$\", text or \"\")",
+                "\", text or \"\")",
+                "parse_answer -> classify_reply -> apply_answer: 'Option 2, but ...' is no pick; as \
+             an answer it is recorded in full, via other",
+            ),
+            (
+                "checklist-other-ruling",
+                "rulings.append(f\"Owner ruling on {item['item']}: {answer}; apply only if it accepts \
+             the item\")",
+                "accepted.append(f\"{item['item']} (owner: {answer})\")",
+                "checklist walk: a declining Other answer -> an owner ruling line, not an accepted \
+             item",
             ),
         ],
     );
