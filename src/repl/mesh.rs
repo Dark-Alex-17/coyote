@@ -1265,7 +1265,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 }
                 None => ctx.app.mesh.answer_inbound(id, &text).await?,
             }
-            out_text(&format!("Answered {}.", short(id)));
+            out_path_text(&answered_line(id).render(live_prefix()));
         }
         Answering::OwnQuestion(correlation) => {
             let destination = &correlation.record.peer_destination;
@@ -1282,17 +1282,34 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             )?;
             let outcome = runtime
                 .send_peer_lending_reference(destination, &out)
-                .await?;
-            out_text(&format!(
-                "Sent {} to {} as a reply to {} (via {}).",
-                short(&outcome.id),
-                short(destination),
-                short(id),
-                via_text(outcome.via)
-            ));
+                .await
+                .map_err(quoted_send_failure)?;
+            out_path_text(
+                &reply_sent_line(&outcome.id, destination, id, via_text(outcome.via))
+                    .render(live_prefix()),
+            );
         }
     }
     Ok(())
+}
+
+/// The id a peer chose for its question is quoted as it stands.
+fn answered_line(id: &str) -> NoticeText {
+    NoticeText::from_template("Answered {id}.", &[], &[("id", short(id))])
+}
+
+/// The line a reply into one of this node's own questions ends with, the question's id
+/// quoted as `.mesh pending` lists it.
+fn reply_sent_line(sent: &str, destination: &str, id: &str, via: &str) -> NoticeText {
+    NoticeText::from_template(
+        "Sent {sent} to {destination} as a reply to {id} (via {via}).",
+        &[
+            ("sent", short(sent)),
+            ("destination", short(destination)),
+            ("via", via),
+        ],
+        &[("id", short(id))],
+    )
 }
 
 /// The human's reply into one of this node's own open questions, in that question's
@@ -1379,20 +1396,31 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     );
     if silent {
         ctx.app.mesh.dismiss_inbound(id, true).await?;
-        out_text(&format!(
-            "Dismissed {} without telling {name}. .mesh pending shows what is still open.",
-            short(id)
-        ));
+        out_path_text(&dismissed_line(id, &name, silent).render(live_prefix()));
         return Ok(());
     }
-    out_text(&declining_notice(&record.peer_destination));
+    out_path_text(
+        &NoticeText::from(declining_notice(&record.peer_destination)).render(live_prefix()),
+    );
     result_follows();
     ctx.app.mesh.dismiss_inbound(id, false).await?;
-    out_text(&format!(
-        "Dismissed {}; {name} hears that {HUMAN_DECLINED}. .mesh pending shows what is still open.",
-        short(id)
-    ));
+    out_path_text(&dismissed_line(id, &name, silent).render(live_prefix()));
     Ok(())
+}
+
+/// The line a dismissed question ends with. The id and the asker's name are quoted as
+/// they stand, since a peer chose them.
+fn dismissed_line(id: &str, name: &str, silent: bool) -> NoticeText {
+    let template = if silent {
+        "Dismissed {id} without telling {name}. .mesh pending shows what is still open."
+    } else {
+        "Dismissed {id}; {name} hears that {declined}. .mesh pending shows what is still open."
+    };
+    NoticeText::from_template(
+        template,
+        &[("declined", HUMAN_DECLINED)],
+        &[("id", short(id)), ("name", name)],
+    )
 }
 
 /// Every open escalated question is listed first, one row each, so the person sees what
@@ -1415,30 +1443,35 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     .filter(|record| record.kind == InboundKind::Question)
     .collect();
     if questions.is_empty() {
-        out_text("No open questions to dismiss; `.mesh pending` lists what this node knows about.");
+        out_path_text(
+            &NoticeText::from(
+                "No open questions to dismiss; `.mesh pending` lists what this node knows about.",
+            )
+            .render(live_prefix()),
+        );
         return Ok(());
     }
-    let mut lines: Vec<String> = questions
+    let mut lines: Vec<NoticeText> = questions
         .iter()
         .map(|record| {
             let asked = match parse_rfc3339(&record.received_at) {
                 Some(when) => age_text(now, when),
                 None => "at an unknown time".to_string(),
             };
-            format!(
-                "  {} . {} ({}) . asked {asked}",
-                record.id,
-                ctx.app.mesh.peer_name_at(&record.peer_destination),
-                short(&record.peer_destination)
+            dismiss_all_row(
+                &record.id,
+                &ctx.app.mesh.peer_name_at(&record.peer_destination),
+                &record.peer_destination,
+                &asked,
             )
         })
         .collect();
     if dry_run {
-        lines.push(DRY_RUN_NOTHING_CHANGED.to_string());
-        out_text(&lines.join("\n"));
+        lines.push(NoticeText::from(DRY_RUN_NOTHING_CHANGED));
+        out_path_text(&joined_text(lines, "\n").render(live_prefix()));
         return Ok(());
     }
-    out_text(&lines.join("\n"));
+    out_path_text(&joined_text(lines, "\n").render(live_prefix()));
     let count = questions.len();
     let open_questions = plural(count, "open question", "open questions");
     let question = if silent {
@@ -1447,14 +1480,17 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
         format!("Dismiss {open_questions}? Each asker hears that {HUMAN_DECLINED}.")
     };
     if !confirm_or_flag(&question, "--yes", yes)? {
-        out_text(NOTHING_CHANGED);
+        out_path_text(&NoticeText::from(NOTHING_CHANGED).render(live_prefix()));
         return Ok(());
     }
     if !silent {
-        out_text(&format!(
-            "Telling {} that you declined over the mesh...",
-            plural(count, "asker", "askers")
-        ));
+        out_path_text(
+            &NoticeText::from(format!(
+                "Telling {} that you declined over the mesh...",
+                plural(count, "asker", "askers")
+            ))
+            .render(live_prefix()),
+        );
         result_follows();
     }
     let mut dismissed = 0;
@@ -1476,8 +1512,18 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
             }
         }
     }
-    out_text(&dismiss_all_summary(dismissed, &held, &stayed, silent));
+    out_path_text(&dismiss_all_summary(dismissed, &held, &stayed, silent).render(live_prefix()));
     Ok(())
+}
+
+/// One question `--all` lists before it asks, carrying the full id `.mesh dismiss <id>`
+/// takes. The id and the asker's name are quoted as they stand, since a peer chose them.
+fn dismiss_all_row(id: &str, name: &str, destination: &str, asked: &str) -> NoticeText {
+    NoticeText::from_template(
+        "  {id} . {name} ({destination}) . asked {asked}",
+        &[("destination", short(destination)), ("asked", asked)],
+        &[("id", id), ("name", name)],
+    )
 }
 
 /// The line `--all` prints for a question it could not dismiss, with the ids the error
@@ -1489,38 +1535,112 @@ fn dismiss_failure_line(err: &anyhow::Error, prefix: CommandPrefix) -> String {
 /// The `--all` summary: the count dismissed, then a clause for the questions the envoy
 /// held and one for those that stayed because their asker could not be told (worded
 /// with the retry, or with the silent retry when nothing was being sent), each naming
-/// its ids. Each clause ends in an instruction, so the one full stop is the line's.
+/// its ids, quoted as they stand. Each clause ends in an instruction, so the one full
+/// stop is the line's.
 fn dismiss_all_summary(
     dismissed: usize,
     held: &[String],
     stayed: &[String],
     silent: bool,
-) -> String {
-    let mut summary = format!("Dismissed {dismissed}; .mesh pending shows what is still open");
+) -> NoticeText {
+    let ids = |ids: &[String]| {
+        joined_text(
+            ids.iter().map(|id| NoticeText::default().peer(id.as_str())),
+            ", ",
+        )
+    };
+    let mut summary = NoticeText::from(format!(
+        "Dismissed {dismissed}; .mesh pending shows what is still open"
+    ));
     if !held.is_empty() {
-        summary.push_str(&format!(
-            "; {} still being answered by the envoy: {}. Dismiss each with .mesh dismiss <id> once its hold lapses",
-            held.len(),
-            held.join(", ")
-        ));
+        summary = summary
+            .frame(format!(
+                "; {} still being answered by the envoy: ",
+                held.len()
+            ))
+            .then(ids(held))
+            .frame(". Dismiss each with .mesh dismiss <id> once its hold lapses");
     }
     if !stayed.is_empty() {
-        summary.push_str(&if silent {
-            format!(
-                "; {} stay pending: {}. Retry with .mesh dismiss --all --silent",
-                stayed.len(),
-                stayed.join(", ")
-            )
+        let (head, tail) = if silent {
+            ("stay pending", "Retry with .mesh dismiss --all --silent")
         } else {
-            format!(
-                "; {} could not be told and stay pending: {}. Retry, or .mesh dismiss --all --silent",
-                stayed.len(),
-                stayed.join(", ")
+            (
+                "could not be told and stay pending",
+                "Retry, or .mesh dismiss --all --silent",
             )
-        });
+        };
+        summary = summary
+            .frame(format!("; {} {head}: ", stayed.len()))
+            .then(ids(stayed))
+            .frame(format!(". {tail}"));
     }
-    summary.push('.');
-    summary
+    summary.frame(".")
+}
+
+#[cfg(test)]
+mod dismiss_and_answer_line_tests {
+    use super::*;
+
+    const DESTINATION: &str = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d";
+
+    /// Each line with a peer's `.vault` id and `.session` name, its dot text, and its
+    /// slash text.
+    fn lines() -> Vec<(NoticeText, &'static str, &'static str)> {
+        let (held, stayed) = ([".vault".to_string()], [".session".to_string()]);
+        vec![
+            (
+                dismissed_line(".vault", ".session", true),
+                "Dismissed .vault without telling .session. .mesh pending shows what is still open.",
+                "Dismissed .vault without telling .session. /mesh pending shows what is still open.",
+            ),
+            (
+                dismissed_line(".vault", ".session", false),
+                "Dismissed .vault; .session hears that the human declined to answer. .mesh pending shows what is still open.",
+                "Dismissed .vault; .session hears that the human declined to answer. /mesh pending shows what is still open.",
+            ),
+            (
+                dismiss_all_row(".vault", ".session", DESTINATION, "5m ago"),
+                "  .vault . .session (1a2b3c4d) . asked 5m ago",
+                "  .vault . .session (1a2b3c4d) . asked 5m ago",
+            ),
+            (
+                dismiss_all_summary(1, &held, &stayed, false),
+                "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: .vault. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: .session. Retry, or .mesh dismiss --all --silent.",
+                "Dismissed 1; /mesh pending shows what is still open; 1 still being answered by the envoy: .vault. Dismiss each with /mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: .session. Retry, or /mesh dismiss --all --silent.",
+            ),
+            (
+                dismiss_all_summary(0, &[], &stayed, true),
+                "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: .session. Retry with .mesh dismiss --all --silent.",
+                "Dismissed 0; /mesh pending shows what is still open; 1 stay pending: .session. Retry with /mesh dismiss --all --silent.",
+            ),
+            (
+                answered_line(".vault"),
+                "Answered .vault.",
+                "Answered .vault.",
+            ),
+            (
+                reply_sent_line("abcdef0123456789", DESTINATION, ".vault", "direct"),
+                "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via direct).",
+                "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via direct).",
+            ),
+        ]
+    }
+
+    #[test]
+    fn under_dot_each_line_reads_as_it_did() {
+        for (text, dot, _) in lines() {
+            assert_eq!(text.plain(), dot);
+            assert_eq!(text.render(CommandPrefix::Dot), dot);
+        }
+    }
+
+    #[test]
+    fn under_slash_each_line_keeps_the_peer_text_and_slashes_its_hints() {
+        for (text, _, slash) in lines() {
+            assert_eq!(text.render(CommandPrefix::Slash), slash);
+        }
+    }
 }
 
 /// The escalated question `id` names, whole or by prefix, or the sentence for a missing
@@ -2380,7 +2500,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     match outcome {
         Ok(outcome) => out_text(&knock_report(short(&destination), &outcome)),
-        Err(err) => bail!(err.to_string()),
+        Err(err) => return Err(QuotingError::wrap(err.notice())),
     }
     Ok(())
 }
@@ -2755,18 +2875,10 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             )));
         }
         Ok(Fetched::InvalidPath { rule }) => {
-            return Err(QuotingError::wrap(NoticeText::from_template(
-                "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it.",
-                &[("rule", &rule), ("peer", peer)],
-                &[("shown", &shown)],
-            )));
+            return Err(invalid_path_refusal(peer, &shown, &rule));
         }
         Ok(Fetched::TooLarge { limit }) => {
-            return Err(QuotingError::wrap(NoticeText::from_template(
-                "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way.",
-                &[("peer", peer), ("limit", &limit.to_string())],
-                &[("shown", &shown)],
-            )));
+            return Err(too_large_refusal(peer, &shown, limit));
         }
         Err(FileFetchError::NotServed) => {
             return Err(QuotingError::wrap(not_shared_sentence(
@@ -2784,15 +2896,92 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             | FileFetchError::Corrupt
             | FileFetchError::UnknownStatus),
         ) => {
-            return Err(QuotingError::wrap(NoticeText::from_template(
-                "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {path}` again; if it repeats, the peer may run a different Coyote.",
-                &[("peer", peer), ("err", &err.to_string())],
-                &[("shown", &shown), ("path", &args.path)],
-            )));
+            return Err(undelivered_refusal(peer, &shown, &args.path, &err));
         }
         Err(err) => return Err(quoted_fetch_failure(err)),
     }
     Ok(())
+}
+
+/// The fetched path is quoted as it stands in each fetch refusal, since a `.vault` is a
+/// file name there and not a command.
+fn invalid_path_refusal(peer: &str, shown: &str, rule: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it.",
+        &[("rule", rule), ("peer", peer)],
+        &[("shown", shown)],
+    ))
+}
+
+fn too_large_refusal(peer: &str, shown: &str, limit: u64) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way.",
+        &[("peer", peer), ("limit", &limit.to_string())],
+        &[("shown", shown)],
+    ))
+}
+
+fn undelivered_refusal(peer: &str, shown: &str, path: &str, err: &FileFetchError) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {path}` again; if it repeats, the peer may run a different Coyote.",
+        &[("peer", peer), ("err", &err.to_string())],
+        &[("shown", shown), ("path", path)],
+    ))
+}
+
+#[cfg(test)]
+mod fetch_path_refusal_tests {
+    use super::*;
+    use crate::render::{MeshVerbError, command_error_text};
+
+    fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
+        command_error_text(&MeshVerbError::wrap(err), prefix)
+    }
+
+    /// Each refusal for the path `.vault/key` from the peer `1a2b3c4d`, with its dot text.
+    fn refusals() -> Vec<(anyhow::Error, String)> {
+        let (peer, path) = ("1a2b3c4d", ".vault/key");
+        let mut cases = vec![
+            (
+                invalid_path_refusal(peer, path, "dot_segment"),
+                "`.vault/key` is not a path the mesh carries (rule `dot_segment`); pass the path exactly as `.mesh shares --peer 1a2b3c4d` or mesh__list shows it.".to_string(),
+            ),
+            (
+                too_large_refusal(peer, path, 1024),
+                "1a2b3c4d serves files of at most 1024 bytes and `.vault/key` is larger. Ask 1a2b3c4d's human for a smaller copy, or for the file another way.".to_string(),
+            ),
+        ];
+        for err in [
+            FileFetchError::Malformed("sha256"),
+            FileFetchError::Corrupt,
+            FileFetchError::UnknownStatus,
+        ] {
+            let fault = err.to_string();
+            cases.push((
+                undelivered_refusal(peer, path, path, &err),
+                format!(
+                    "1a2b3c4d did not deliver `.vault/key`: {fault}. Try `.mesh fetch 1a2b3c4d .vault/key` again; if it repeats, the peer may run a different Coyote."
+                ),
+            ));
+        }
+        cases
+    }
+
+    #[test]
+    fn under_dot_each_fetch_refusal_reads_as_it_did() {
+        for (err, dot) in refusals() {
+            assert_eq!(shown_as(err, CommandPrefix::Dot), format!("Error: {dot}"));
+        }
+    }
+
+    #[test]
+    fn under_slash_each_fetch_refusal_keeps_the_path_and_slashes_its_hints() {
+        for (err, dot) in refusals() {
+            let slash = shown_as(err, CommandPrefix::Slash);
+            assert_eq!(slash, format!("Error: {}", dot.replace(".mesh ", "/mesh ")));
+            assert!(slash.contains("`.vault/key`"), "{slash}");
+        }
+    }
 }
 
 /// The refusal for a path the peer did not serve, read against what this node knows,
@@ -6052,12 +6241,14 @@ where
     }
     let noun = kind.noun();
     if !is_hash_prefix(token) {
-        bail!(
-            "'{token}' is not {} {noun} hash: expected {} {noun} hash or a unique prefix of one {} ({HASH_PREFIX_MIN_CHARS} or more characters).",
-            kind.article(),
-            kind.article(),
-            kind.listing()
-        );
+        return Err(QuotingError::wrap(
+            NoticeText::default().frame("'").peer(token).frame(format!(
+                "' is not {} {noun} hash: expected {} {noun} hash or a unique prefix of one {} ({HASH_PREFIX_MIN_CHARS} or more characters).",
+                kind.article(),
+                kind.article(),
+                kind.listing()
+            )),
+        ));
     }
     let prefix = token.to_ascii_lowercase();
     let mut matches: Vec<String> = known
@@ -31608,6 +31799,56 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
             }
 
+            mod typed_token_refusals {
+                use super::*;
+                use crate::config::{CommandPrefix, live_prefix_override};
+                use crate::render::command_error_text;
+
+                /// `.mesh info .vault` and `.mesh knock .vault` refuse the token as the
+                /// human typed it under either prefix, while the listing hint after it
+                /// follows the prefix.
+                #[test]
+                #[serial]
+                fn info_and_knock_keep_a_typed_vault_under_either_prefix() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-typed-vault");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-typed-vault").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let live = ctx.app.mesh.command_prefix().clone();
+                        let _prefix = live_prefix_override::install(live.clone());
+
+                        for (prefix, sigil) in
+                            [(CommandPrefix::Dot, '.'), (CommandPrefix::Slash, '/')]
+                        {
+                            let typed = ctx.command_prefix().display();
+                            run(&mut ctx, &format!("{typed}set command_prefix {prefix}"))
+                                .await
+                                .unwrap();
+                            for verb in ["info", "knock"] {
+                                let err = run(&mut ctx, &format!("{sigil}mesh {verb} .vault"))
+                                    .await
+                                    .unwrap_err();
+                                let text = command_error_text(&err, live.load());
+                                assert!(
+                                    text.contains("'.vault' is not a destination hash"),
+                                    "{prefix} {verb}: {text}"
+                                );
+                                assert!(
+                                    text.contains(&format!("`{sigil}mesh peers` lists")),
+                                    "{prefix} {verb}: {text}"
+                                );
+                                assert!(!text.contains("/vault"), "{prefix} {verb}: {text}");
+                            }
+                        }
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+            }
+
             /// A well-formed trust file of the layout this program wrote before the SCOPE
             /// rename (`version: 1`; the current trust file is `2`), as an operator upgrading
             /// in place would have on disk. The literal `1` is deliberate: a fixture built
@@ -42974,23 +43215,23 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ids.iter().map(|id| id.to_string()).collect()
                     };
                     assert_eq!(
-                        dismiss_all_summary(2, &[], &[], false),
+                        dismiss_all_summary(2, &[], &[], false).plain(),
                         "Dismissed 2; .mesh pending shows what is still open."
                     );
                     assert_eq!(
-                        dismiss_all_summary(1, &ids(&["p1"]), &[], true),
+                        dismiss_all_summary(1, &ids(&["p1"]), &[], true).plain(),
                         "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses."
                     );
                     assert_eq!(
-                        dismiss_all_summary(1, &[], &ids(&["s1", "s2"]), false),
+                        dismiss_all_summary(1, &[], &ids(&["s1", "s2"]), false).plain(),
                         "Dismissed 1; .mesh pending shows what is still open; 2 could not be told and stay pending: s1, s2. Retry, or .mesh dismiss --all --silent."
                     );
                     assert_eq!(
-                        dismiss_all_summary(0, &[], &ids(&["s1"]), true),
+                        dismiss_all_summary(0, &[], &ids(&["s1"]), true).plain(),
                         "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: s1. Retry with .mesh dismiss --all --silent."
                     );
                     assert_eq!(
-                        dismiss_all_summary(1, &ids(&["p1"]), &ids(&["s1"]), false),
+                        dismiss_all_summary(1, &ids(&["p1"]), &ids(&["s1"]), false).plain(),
                         "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: s1. Retry, or .mesh dismiss --all --silent."
                     );
                 }
@@ -44210,16 +44451,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         &ids(&["p1aaaaaa", "p2bbbbbb"]),
                         &ids(&["s1cccccc"]),
                         true,
-                    );
+                    )
+                    .plain();
                     assert_eq!(
                         line,
                         "Dismissed 2; .mesh pending shows what is still open; 2 still being answered by the envoy: p1aaaaaa, p2bbbbbb. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 stay pending: s1cccccc. Retry with .mesh dismiss --all --silent."
                     );
                     for shape in [
-                        dismiss_all_summary(0, &[], &[], false),
-                        dismiss_all_summary(0, &[], &[], true),
-                        dismiss_all_summary(3, &ids(&["h1"]), &[], false),
-                        dismiss_all_summary(3, &[], &ids(&["s1"]), true),
+                        dismiss_all_summary(0, &[], &[], false).plain(),
+                        dismiss_all_summary(0, &[], &[], true).plain(),
+                        dismiss_all_summary(3, &ids(&["h1"]), &[], false).plain(),
+                        dismiss_all_summary(3, &[], &ids(&["s1"]), true).plain(),
                         line.clone(),
                     ] {
                         assert!(shape.is_ascii(), "{shape}");
@@ -45983,7 +46225,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .app
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
-                        let expected = "`q-1` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse.";
+                        let expected = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer q-1 --attach <path>.";
 
                         for line in [
                             ".mesh answer q-1 \"x\" --attach big.bin",
@@ -46382,7 +46624,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .app
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
-                        let hold = "`q-1` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse.";
+                        let hold = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer q-1 --attach <path>.";
 
                         for line in [
                             ".mesh answer q-1 \"x\" --attach big.bin",

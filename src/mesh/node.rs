@@ -72,7 +72,7 @@ use crate::mesh::{
     PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
     mesh_cache_dir,
 };
-use crate::render::QuotingError;
+use crate::render::{QuotingError, error_notice};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -4941,10 +4941,10 @@ impl MeshSlot {
         // give it up) is worded as a retry; one that found it already gone is not.
         match sent {
             Ok(_) => Ok(()),
-            Err(err) if matches!(store.get(id), Ok(Some(_))) => Err(anyhow!(
-                "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent.",
-                self.peer_name_at(&record.peer_destination),
-                short(id)
+            Err(err) if matches!(store.get(id), Ok(Some(_))) => Err(decline_not_told(
+                &self.peer_name_at(&record.peer_destination),
+                id,
+                &err,
             )),
             Err(err) => Err(err),
         }
@@ -4963,9 +4963,7 @@ impl MeshSlot {
     /// so a verb can say so before it prints what it would have sent.
     pub(crate) fn refuse_held_by_envoy(&self, id: &str) -> Result<()> {
         if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
-            bail!(
-                "`{id}` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse."
-            );
+            return Err(answer_held_by_envoy(id));
         }
         Ok(())
     }
@@ -5404,6 +5402,34 @@ pub(crate) fn already_closed(id: &str) -> AlreadyClosed {
     ))
 }
 
+/// An answer with a file refused while the envoy holds `id`, quoting the id as
+/// `dismiss_held_by_envoy` does.
+fn answer_held_by_envoy(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{id}` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer {id} --attach <path>.",
+        &[],
+        &[("id", id)],
+    ))
+}
+
+/// A decline the asker did not hear, `err` saying why. The asker's name and the id are
+/// quoted as they stand, since a peer chose them, and so are the parts `err` quotes.
+fn decline_not_told(name: &str, id: &str, err: &anyhow::Error) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::from_template(
+            "Could not tell {name} that you declined (",
+            &[],
+            &[("name", name)],
+        )
+        .then(error_notice(err))
+        .then(NoticeText::from_template(
+            "); {short} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent.",
+            &[],
+            &[("short", short(id)), ("id", id)],
+        )),
+    )
+}
+
 /// A dismiss refused while the envoy holds `id`; the id is quoted as it stands, since a
 /// peer chose it.
 pub(crate) fn dismiss_held_by_envoy(id: &str) -> anyhow::Error {
@@ -5412,6 +5438,71 @@ pub(crate) fn dismiss_held_by_envoy(id: &str) -> anyhow::Error {
         &[],
         &[("id", id)],
     ))
+}
+
+#[cfg(test)]
+mod held_and_declined_quoting_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::render::{MeshVerbError, command_error_text};
+
+    fn shown(err: anyhow::Error, prefix: CommandPrefix) -> String {
+        command_error_text(&MeshVerbError::wrap(err), prefix)
+    }
+
+    /// A send that failed with a sentence quoting the peer's `.vault`.
+    fn send_failure() -> anyhow::Error {
+        QuotingError::wrap(
+            NoticeText::default()
+                .frame("No path to ")
+                .peer(".vault")
+                .frame(" is known; `.mesh peers` lists what this node has heard from"),
+        )
+    }
+
+    #[test]
+    fn under_dot_the_hold_and_decline_errors_read_as_they_did() {
+        assert_eq!(
+            shown(answer_held_by_envoy(".vault"), CommandPrefix::Dot),
+            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer .vault --attach <path>."
+        );
+        let declined = decline_not_told(".session", ".vault", &send_failure());
+        assert_eq!(
+            declined.to_string(),
+            "Could not tell .session that you declined (No path to .vault is known; `.mesh peers` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with .mesh dismiss .vault --silent."
+        );
+        assert_eq!(
+            shown(declined, CommandPrefix::Dot),
+            format!(
+                "Error: {}",
+                decline_not_told(".session", ".vault", &send_failure())
+            )
+        );
+    }
+
+    #[test]
+    fn under_slash_the_hold_and_decline_errors_keep_peer_text_and_slash_their_hints() {
+        assert_eq!(
+            shown(answer_held_by_envoy(".vault"), CommandPrefix::Slash),
+            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then /mesh answer .vault --attach <path>."
+        );
+        assert_eq!(
+            shown(
+                decline_not_told(".session", ".vault", &send_failure()),
+                CommandPrefix::Slash
+            ),
+            "Error: Could not tell .session that you declined (No path to .vault is known; `/mesh peers` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with /mesh dismiss .vault --silent."
+        );
+    }
+
+    #[test]
+    fn a_decline_keeps_each_link_of_an_unquoted_send_failure() {
+        let err = anyhow!("`.mesh peers` shows when it was last heard").context("The link failed");
+        assert_eq!(
+            shown(decline_not_told("Tia", "p1", &err), CommandPrefix::Slash),
+            "Error: Could not tell Tia that you declined (The link failed: `/mesh peers` shows when it was last heard); p1 stays pending. Retry, or remove it without a message with /mesh dismiss p1 --silent."
+        );
+    }
 }
 
 fn non_blank(value: Option<String>) -> Option<Arc<String>> {
@@ -8879,7 +8970,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "`a-1` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse."
+            "`a-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer a-1 --attach <path>."
         );
         assert!(
             envoy.answers.lock().is_empty(),

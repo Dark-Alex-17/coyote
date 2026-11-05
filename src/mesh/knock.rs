@@ -291,6 +291,103 @@ impl fmt::Display for KnockError {
 
 impl std::error::Error for KnockError {}
 
+impl KnockError {
+    /// The sentence as runs, the reason a link or transport fault carries quoted as it
+    /// stands: it is not this node's wording and may echo what a peer sent, so a `.vault`
+    /// in it keeps its dot while the hints around it follow the prefix.
+    pub(crate) fn notice(&self) -> NoticeText {
+        let whole = self.to_string();
+        let request = match self {
+            Self::Direct(request)
+            | Self::Propagation {
+                err: PropagationError::Link(request),
+                ..
+            } => request,
+            _ => return NoticeText::from(whole),
+        };
+        let reason = match request {
+            RequestError::LinkFailed(reason)
+            | RequestError::Decode(reason)
+            | RequestError::Send(reason) => reason,
+            _ => return NoticeText::from(whole),
+        };
+        let inner = request.to_string();
+        match whole.find(&inner) {
+            Some(at) if !reason.is_empty() => {
+                let end = at + inner.len();
+                let start = end - reason.len();
+                NoticeText::from(&whole[..start])
+                    .peer(reason.as_str())
+                    .frame(&whole[end..])
+            }
+            _ => NoticeText::from(whole),
+        }
+    }
+}
+
+#[cfg(test)]
+mod knock_error_quoting_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::render::{MeshVerbError, QuotingError, command_error_text};
+
+    fn shown_as(err: &KnockError, prefix: CommandPrefix) -> String {
+        command_error_text(
+            &MeshVerbError::wrap(QuotingError::wrap(err.notice())),
+            prefix,
+        )
+    }
+
+    /// The failures whose reason came from outside this node, each naming `.vault`.
+    fn outside_reasons() -> [KnockError; 2] {
+        [
+            KnockError::Direct(RequestError::LinkFailed("no route to .vault".into())),
+            KnockError::Propagation {
+                fallback: KnockFallback::Unreachable,
+                err: PropagationError::Link(RequestError::Decode("field .vault".into())),
+            },
+        ]
+    }
+
+    #[test]
+    fn under_dot_a_knock_failure_reads_as_its_sentence() {
+        for err in outside_reasons()
+            .into_iter()
+            .chain([KnockError::NoPropagationNode])
+        {
+            assert_eq!(err.notice().plain(), err.to_string());
+            assert_eq!(shown_as(&err, CommandPrefix::Dot), format!("Error: {err}"));
+        }
+    }
+
+    #[test]
+    fn under_slash_a_knock_failure_keeps_its_reason_and_slashes_its_hints() {
+        let [direct, stored] = outside_reasons();
+        let slash = shown_as(&direct, CommandPrefix::Slash);
+        assert_eq!(
+            slash,
+            format!(
+                "Error: {}",
+                direct.to_string().replace("`.mesh peers`", "`/mesh peers`")
+            )
+        );
+        assert!(slash.contains("no route to .vault"), "{slash}");
+        assert!(slash.contains("`/mesh peers`"), "{slash}");
+        let slash = shown_as(&stored, CommandPrefix::Slash);
+        assert!(slash.contains("field .vault"), "{slash}");
+        assert!(!slash.contains("/vault"), "{slash}");
+        assert_eq!(
+            shown_as(&KnockError::NoPropagationNode, CommandPrefix::Slash),
+            format!(
+                "Error: {}",
+                KnockError::NoPropagationNode
+                    .to_string()
+                    .replace("`.mesh peers`", "`/mesh peers`")
+            )
+        );
+    }
+}
+
 /// The dispatcher's knock sink: a bounded channel the drain task reads. `knock` runs on the
 /// server's request path, so it never waits; a full queue counts the knock and drops it.
 /// Each knock is noted in the debug log as it is queued, since the gate's verdict lands
