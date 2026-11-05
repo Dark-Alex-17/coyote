@@ -12,6 +12,19 @@ impl UiKind {
     /// reads it at startup, where `tui` selects the full-screen UI.
     pub(crate) const ENV: &'static str = "COYOTE_UI";
 
+    /// The surface of this process right now: no human means headless,
+    /// otherwise whichever UI owns the terminal. Every child-process env
+    /// builder exports this under `ENV`.
+    pub(crate) fn current() -> Self {
+        if !crate::prompt::human_present() {
+            Self::Headless
+        } else if crate::tui::active() {
+            Self::Tui
+        } else {
+            Self::Repl
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Repl => "repl",

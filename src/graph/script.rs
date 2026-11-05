@@ -2,7 +2,7 @@ use super::state::{StateManager, StateRepresentation};
 use super::types::ScriptNode;
 use super::wall_clock;
 use super::{GRAPH_STATE_ENV, GRAPH_STATE_FILE_ENV};
-use crate::config::paths;
+use crate::config::{UiKind, paths};
 use crate::function::Language;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -58,6 +58,12 @@ impl ScriptExecutor {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
         cmd.envs(&self.extra_envs);
+        // Read at run time like the tool and job builders do: the surface
+        // is a process-wide fact, and an explicit entry in the extra envs
+        // still wins.
+        if !self.extra_envs.contains_key(UiKind::ENV) {
+            cmd.env(UiKind::ENV, UiKind::current().as_str());
+        }
         cmd.env("AUTO_CONFIRM", "true");
         // A graph run nested inside another graph's script node inherits that
         // node's GRAPH_STATE*; scripts prefer the file form, so the parent's
@@ -305,6 +311,63 @@ mod tests {
                 envs.get(key).map(String::as_str),
                 Some(utils.join(file).to_str().unwrap()),
                 "{key}"
+            );
+        }
+    }
+
+    /// A script node is told which surface runs it like a tool or a job
+    /// is: `COYOTE_UI` says `tui` while the full-screen UI owns the
+    /// terminal, and an explicit extra env still wins over the live value.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn script_env_says_tui_while_the_full_screen_ui_owns_the_terminal() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let _acp_off = crate::testing::AtomicFlagGuard::set(&crate::utils::ACP_SERVER, false);
+        let _headless_off = crate::testing::AtomicFlagGuard::set(&crate::utils::HEADLESS, false);
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (dir, path) = write_script(
+            r#"#!/bin/bash
+printf '{"ui": "%s"}' "$COYOTE_UI"
+"#,
+            "sh",
+        );
+        let node = node_for(path.file_name().unwrap().to_str().unwrap(), 30);
+
+        let mut state = StateManager::new(HashMap::new());
+        let _ = ScriptExecutor::new(&dir)
+            .execute(&node, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(state.state().get("ui"), Some(&json!("tui")));
+
+        let mut state = StateManager::new(HashMap::new());
+        let mut pinned = HashMap::new();
+        pinned.insert(UiKind::ENV.to_string(), "repl".to_string());
+        let _ = ScriptExecutor::new(&dir)
+            .with_envs(pinned)
+            .execute(&node, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(state.state().get("ui"), Some(&json!("repl")));
+        cleanup(&dir);
+    }
+
+    /// The three child-process env builders (tools, jobs, script nodes)
+    /// all export the surface under the one key.
+    #[test]
+    fn every_child_env_builder_exports_the_ui_kind() {
+        for (file, source) in [
+            ("src/function/mod.rs", include_str!("../function/mod.rs")),
+            ("src/function/jobs.rs", include_str!("../function/jobs.rs")),
+            ("src/graph/script.rs", include_str!("script.rs")),
+        ] {
+            let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(
+                production.contains("UiKind::ENV"),
+                "{file} does not export the UI kind"
             );
         }
     }

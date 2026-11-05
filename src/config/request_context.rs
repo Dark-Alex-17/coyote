@@ -1070,13 +1070,7 @@ impl RequestContext {
     /// `COYOTE_UI`: headless when no human is present, the full-screen UI
     /// while it owns the terminal, the REPL otherwise.
     pub(crate) fn ui_kind(&self) -> UiKind {
-        if !human_present() {
-            UiKind::Headless
-        } else if crate::tui::active() {
-            UiKind::Tui
-        } else {
-            UiKind::Repl
-        }
+        UiKind::current()
     }
 
     pub fn render_hints<'a>(&self, text: &'a str) -> Cow<'a, str> {
@@ -4168,11 +4162,11 @@ impl RequestContext {
     }
 
     pub fn edit_session(&mut self, app: &AppConfig) -> Result<()> {
-        ensure_editor_available()?;
         let (name, scope) = match &self.session {
             Some(session) => (session.name().to_string(), session.scope()),
             None => bail!("No session"),
         };
+        ensure_editor_available()?;
         let session_path = self.session_file_for(&name, scope);
         self.save_session(Some(&name), None)?;
         let editor = app.editor()?;
@@ -4195,11 +4189,11 @@ impl RequestContext {
     }
 
     pub fn edit_agent_config(&self, app: &AppConfig) -> Result<()> {
-        ensure_editor_available()?;
         let agent_name = match &self.agent {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
         };
+        ensure_editor_available()?;
         let config_path = paths::agent_config_file(agent_name);
         let graph_path = paths::agent_graph_file(agent_name);
         let target_path = if !config_path.exists() && graph_path.exists() {
