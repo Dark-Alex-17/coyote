@@ -2686,6 +2686,11 @@ def parse_answer(state):
             return u
     else:
         choice = text if esc.get("kind") == "need_design_doc" else match_option(text, options)
+        if choice is None and text and not truthy(state.get("reply_interpreted")):
+            # the first typed reply that names no option is interpreted once, never re-asked blind
+            u["reply_accepts"] = _accepts_text(esc.get("kind", ""))
+            u["_next"] = "interpret_reply"
+            return u
     if choice is None:
         rounds = as_int(state.get("reask_rounds"))
         if rounds < STRIKE_LIMIT:
@@ -2700,9 +2705,119 @@ def parse_answer(state):
                              f"option: {tail(choice, 200)}")
         else:
             choice = text
-    u.update({"last_answer": choice, "last_answer_text": text, "parked": ""})
+    u.update({"last_answer": choice, "last_answer_text": text, "parked": "", "reply_interpreted": False})
     ledger(state, u, f"decision: {esc.get('kind')}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
+    return u
+
+
+RETRY_BRANCH = "Retry the branch setup"
+# The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
+ACCEPTED_INSTRUCTIONS = {
+    "git_setup_failed": ("base_branch", "branch_name", "reuse_worktree"),
+    "need_design_doc": ("path",),
+    "seed_confirm": ("path",),
+    "clarify": ("path",),
+    "approve_breakdown": ("revision",),
+    "gate1_stuck": ("answers",),
+    "task_failed": ("rescope",),
+    "probe_gap": ("recipe",),
+    "mode_invalid": ("mode_values",),
+}
+INSTRUCTION_HELP = {
+    "base_branch": "cut the run branch from a different base branch; value: that branch name",
+    "branch_name": "use a different run branch name; value: that branch name",
+    "reuse_worktree": "use an existing worktree as the code dir; value: its path, or empty for the worktree the question names",
+    "path": "use the document at a path; value: the path",
+    "revision": "revise the task breakdown as described; value: the change",
+    "answers": "answer the open questions; value: the answers",
+    "rescope": "re-scope the failed task as described; value: the new scope",
+    "recipe": "supply the local-run recipe for the probe; value: the recipe",
+    "mode_values": "set run mode values; value: key=value pairs",
+}
+# How an applied text instruction reads as an answer, in the words apply_answer keys on.
+INSTRUCTION_ANSWERS = {"revision": "Revise the breakdown: {}", "answers": "{}", "rescope": "Re-scope: {}",
+                       "recipe": "Supply the recipe: {}", "mode_values": "{}"}
+
+
+def _accepts_text(kind):
+    shapes = ACCEPTED_INSTRUCTIONS.get(kind, ())
+    return "\n".join(f"- {s}: {INSTRUCTION_HELP[s]}" for s in shapes) or "(none: this question accepts no instructions)"
+
+
+def _apply_instruction(state, u, esc, shape, value):
+    """Carry out an accepted instruction; the answer apply_answer then acts on, or "" when it cannot be applied."""
+    value = value.strip()
+    if shape in ("base_branch", "branch_name"):
+        name = value.split()[0] if value else ""
+        if not name or git(state.get("code_repo_path") or ".", "check-ref-format", "--branch", name)[0] != 0:
+            return ""
+        if shape == "base_branch":
+            u["base_branch_name"] = u["base_branch_override"] = name
+        else:
+            u["run_branch_override"] = name
+        return RETRY_BRANCH
+    if shape == "reuse_worktree":
+        return RETRY_BRANCH if _use_code_dir(state, u, value or as_dict(esc.get("data")).get("worktree") or "") else ""
+    if shape == "path":
+        return _typed_doc_path(value)
+    return INSTRUCTION_ANSWERS[shape].format(value) if value and shape in INSTRUCTION_ANSWERS else ""
+
+
+def interpret_route(state):
+    """Act on the interpreter's reading of a typed reply: an option, an accepted instruction, a discussion, or unclear."""
+    u = {}
+    harvest_anomalies(state, u, "interpret_reply")
+    note_script_error(state, u, "interpret_reply")
+    esc = as_dict(state.get("escalation"))
+    kind = esc.get("kind", "")
+    text = (state.get("last_answer_text") or "").strip()
+    said = tail(text, 200)
+    verdict = str(state.get("reply_verdict") or "").strip().lower()
+    reason = tail(str(state.get("reply_reason") or ""), 200)
+    shape = str(state.get("reply_instruction") or "").strip()
+    u.update({"reply_verdict": "", "reply_option": "", "reply_instruction": "", "reply_value": "", "reply_clarify": "",
+              "reply_reason": "", "reply_interpreted": True})
+
+    def decide(answer, how):
+        u.update({"last_answer": answer, "last_answer_text": text, "parked": "", "reply_interpreted": False})
+        ledger(state, u, f"interpret: {kind}: {said!r} -> {how} ({reason or 'no reason given'})")
+        ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
+        u["_next"] = "apply_answer"
+        return u
+
+    if verdict == "option":
+        choice = match_option(str(state.get("reply_option") or ""), esc.get("options") or [])
+        if choice:
+            return decide(choice, f"the option {choice!r}")
+        ledger(state, u, f"interpret: {kind}: {said!r} named no offered option ({state.get('reply_option')!r}); unclear")
+        verdict = "unclear"
+    elif verdict == "instruction":
+        value = str(state.get("reply_value") or "")
+        if shape not in ACCEPTED_INSTRUCTIONS.get(kind, ()):
+            ledger(state, u, f"interpret: {kind}: {said!r} reads as the instruction {shape or '(unnamed)'}, which this "
+                             f"question does not accept; unclear")
+        elif answer := _apply_instruction(state, u, esc, shape, value):
+            return decide(answer, f"the instruction {shape}={tail(value, 120)!r}, applied as {answer!r}")
+        else:
+            ledger(state, u, f"interpret: {kind}: the instruction {shape}={tail(value, 120)!r} could not be applied; unclear")
+        verdict = "unclear"
+    if verdict == "discussion":
+        ledger(state, u, f"interpret: {kind}: {said!r} is a discussion ({reason or 'no reason given'}) -> park for discussion")
+        u["_next"] = "choice_park"
+        return u
+    if verdict == "unclear":
+        data = as_dict(esc.get("data"))
+        asked = data.get("asked") or esc.get("question", "")
+        clarify = str(state.get("reply_clarify") or "").strip() or "Which option do you mean, or what should happen instead?"
+        # the question goes into the escalation itself so a remote owner sees it too
+        u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"You wrote: {said!r}. {clarify}\n\n{asked}"}
+        u["ask_question"] = render_question(u["escalation"])
+        ledger(state, u, f"interpret: {kind}: {said!r} is unclear -> one clarifying question: {tail(clarify, 200)}")
+        u["_next"] = "ask_dispatch"
+        return u
+    ledger(state, u, f"interpret: {kind}: no verdict for {said!r} (interpreter fault) -> re-ask")
+    u["_next"] = "parse_answer"
     return u
 
 
@@ -2729,8 +2844,9 @@ def choice_reply_route(state):
 def _discussion_message(d):
     """The parked run's final message: the question, its options, the reply, the answers so far and how to resume."""
     title = "Design question" if d["kind"] == "design_round" else "Question"
-    lines = ["ARCHITECT_AWAITING_DISCUSSION", f"{title} {d['number']} of {d['total']} is open for discussion:", d["question"],
-             "", "Options:"]
+    head = f"{title} {d['number']} of {d['total']} is open for discussion:" if d.get("total") else \
+        f"A {d['kind']} question is open for discussion:"
+    lines = ["ARCHITECT_AWAITING_DISCUSSION", head, d["question"], "", "Options:"]
     lines += [f"  {o['label']}: {o['text']}" for o in d["options"]]
     lines += ["", f"Your reply: {d['reply']}", "", "Answered so far:"]
     lines += [f"  {i}. {a.get('question')} -> {a.get('answer')}" for i, a in enumerate(d["answers"], 1)] or ["  (none yet)"]
@@ -2739,54 +2855,76 @@ def _discussion_message(d):
 
 
 def choice_park(state):
-    """End the run parked on the current multiple-choice question so the user can discuss it in the chat lane.
+    """End the run parked on the current question so the user can discuss it in the chat lane.
 
-    A question parked DISCUSSION_PARKS_MAX times is asked again instead, and its next typed reply is taken as the answer.
+    A question parked DISCUSSION_PARKS_MAX times is asked again instead: a multiple-choice question then takes its next
+    typed reply as the answer, any other question matches it to an option without interpreting it again.
     """
     u = {}
     esc = as_dict(state.get("escalation"))
-    queue, idx = as_list(state.get("choice_queue")), as_int(state.get("choice_index"))
+    data = as_dict(esc.get("data"))
+    mc = bool(data.get("multiple_choice"))
+    queue, idx = (as_list(state.get("choice_queue")), as_int(state.get("choice_index"))) if mc else ([], 0)
+    key = str(idx) if mc else esc.get("kind", "")
+    where = f"question {idx + 1}/{len(queue)}" if mc else "the question"
     parks = dict(as_dict(state.get("choice_parks")))
-    count = as_int(parks.get(str(idx)))
+    count = as_int(parks.get(key))
     if count >= DISCUSSION_PARKS_MAX:
-        u["choice_forced"] = True
-        ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1} already parked {count} time(s) for discussion "
-                         f"(cap {DISCUSSION_PARKS_MAX}) -> re-ask; its next typed reply is recorded as the answer")
+        if mc:
+            u["choice_forced"] = True
+        else:
+            u["reply_interpreted"] = True
+        ledger(state, u, f"choice: {esc.get('kind')}: {where} already parked {count} time(s) for discussion "
+                         f"(cap {DISCUSSION_PARKS_MAX}) -> re-ask; its next typed reply is "
+                         + ("recorded as the answer" if mc else "matched to an option without interpreting it"))
         u["_next"] = "choice_reask"
         return u
-    parks[str(idx)] = count + 1
+    parks[key] = count + 1
     run_id = state.get("run_id") or ""
+    answer_form = ("record that answer and go on to the remaining questions" if mc else "answer it with that text")
     u["discussion"] = {
         "run_id": run_id, "plan_path": state.get("plan_path") or "", "kind": esc.get("kind", ""),
-        "question": as_dict(esc.get("data")).get("question") or esc.get("question", ""),
+        "question": data.get("question") or data.get("asked") or esc.get("question", ""),
         "options": [{"label": choice_label(i), "text": o.get("text", ""), "recommended": truthy(o.get("recommended")),
                      "evidence": o.get("evidence", "")} for i, o in enumerate(esc.get("options") or [])],
         "reply": (state.get("last_answer_text") or "").strip(), "answers": as_list(state.get("choice_answers")),
-        "number": idx + 1, "total": len(queue),
+        "number": idx + 1 if mc else 0, "total": len(queue),
         "resume": ('Discuss it here. When it is settled, say "continue" to be asked this question again, or '
-                   '"continue: <your answer>" to record that answer and go on to the remaining questions. '
+                   f'"continue: <your answer>" to {answer_form}. '
                    '"resume" works the same as "continue".'),
     }
     u.update({"choice_parks": parks, "parked": DISCUSSION_PARKED, "discussion_run_id": run_id,
               "discussion_message": _discussion_message(u["discussion"])})
-    ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} parked for discussion "
-                     f"({count + 1}/{DISCUSSION_PARKS_MAX})")
+    ledger(state, u, f"choice: {esc.get('kind')}: {where} parked for discussion ({count + 1}/{DISCUSSION_PARKS_MAX})")
     snapshot(state, u, DISCUSSION_PARKED)
     u["_next"] = "end_discussion"
     return u
 
 
 def choice_resume(state):
-    """Resume a run parked on a discussion: record the settled answer, or ask the parked question again."""
-    u = {"discussion": {}, "settled_answer": "", "parked": ""}
+    """Resume a run parked on a discussion: record the settled answer, or ask the parked question again.
+
+    A question that is not multiple choice takes the settled answer through parse_answer like a fresh typed reply.
+    """
+    u = {"discussion": {}, "settled_answer": "", "parked": "", "reply_interpreted": False}
     esc = as_dict(state.get("escalation"))
+    settled = str(state.get("settled_answer") or "").strip()
+    if not as_dict(esc.get("data")).get("multiple_choice") and esc.get("kind") not in CHOICE_KIND_GATES:
+        if settled:
+            u.update({"last_answer_text": settled, "reask_rounds": 0})
+            ledger(state, u, f"discussion: {esc.get('kind')}: resumed with the settled answer {tail(settled, 200)!r}")
+            u["_next"] = "parse_answer"
+        else:
+            u["ask_question"] = render_question(esc)
+            ledger(state, u, f"discussion: {esc.get('kind')}: resumed without a settled answer -> asked again")
+            u["_next"] = "escalate_gate"
+        return u
     kind = state.get("choice_kind") or esc.get("kind")
     gate = CHOICE_KIND_GATES.get(kind)
     if not gate:
         ledger(state, u, f"choice: resumed a discussion parked on an unknown kind {kind!r} -> escalate_gate asks it again")
         u["_next"] = "escalate_gate"
         return u
-    settled = str(state.get("settled_answer") or "").strip()
     if settled:
         _record_choice(state, u, settled, via="settled")
     else:
@@ -2802,20 +2940,26 @@ def choice_reask(state):
     data = as_dict(esc.get("data"))
     asked = data.get("asked") or esc.get("question", "")
     reply = tail((state.get("last_answer_text") or "").strip(), 200)
+    then = ("pick an option or type your answer, which is recorded as given" if data.get("multiple_choice") else
+            "pick an option by its number or its text")
     # the note goes into the escalation itself so a remote owner sees it too and ask_owner sends a fresh question
     u["escalation"] = {**esc, "data": {**data, "asked": asked},
                        "question": f"Your reply ({reply!r}) reads as a question or a discussion, but this question has "
                                    f"already been parked for discussion {DISCUSSION_PARKS_MAX} times, the most allowed: "
-                                   f"pick an option or type your answer, which is recorded as given.\n\n{asked}"}
+                                   f"{then}.\n\n{asked}"}
     u["ask_question"] = render_question(u["escalation"])
     u["_next"] = "ask_dispatch"
     return u
 
 
 def _answered(state, choices, default=None):
+    """The key whose words the answer starts with, else the first key whose words it contains, else default."""
     ans = (state.get("last_answer") or "").strip().lower()
     for key, words in choices.items():
-        if any(ans.startswith(w) or w in ans for w in words):
+        if any(ans.startswith(w) for w in words):
+            return key
+    for key, words in choices.items():
+        if any(w in ans for w in words):
             return key
     return default
 
@@ -4530,7 +4674,7 @@ GATES = {
     "escalate_gate": escalate_gate, "ladder_route": ladder_route, "consult_route": consult_route, "ask_dispatch": ask_dispatch,
     "ask_owner_poll": ask_owner_poll, "ask_owner_route": ask_owner_route, "parse_answer": parse_answer, "apply_answer": apply_answer,
     "choice_reply_route": choice_reply_route, "choice_reask": choice_reask, "choice_park": choice_park,
-    "choice_resume": choice_resume,
+    "choice_resume": choice_resume, "interpret_route": interpret_route,
     "phase_f_gate": phase_f_gate, "integration_check": integration_check, "integrate_route": integrate_route,
     "hygiene_create": hygiene_create, "stack_gate_final": stack_gate_final, "pr_body": pr_body, "open_pr": open_pr,
     "pr_round_comments": pr_round_comments, "ci_poll": ci_poll, "ci_route": ci_route, "ci_evidence": ci_evidence, "ci_apply": ci_apply,

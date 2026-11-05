@@ -335,6 +335,13 @@ initial_state:
   reask_rounds: 0
   reply_kind: ''
   reply_reason: ''
+  reply_verdict: ''
+  reply_option: ''
+  reply_instruction: ''
+  reply_value: ''
+  reply_clarify: ''
+  reply_accepts: ''
+  reply_interpreted: false
   discussion: {}
   discussion_run_id: ''
   discussion_message: ''
@@ -2160,14 +2167,81 @@ nodes:
   choice_reask:
     id: choice_reask
     type: script
-    description: Re-ask the same multiple-choice question with a one-line note that it reached its discussion park cap.
+    description: Re-ask the same question with a one-line note that it reached its discussion park cap.
     script: scripts/choice_reask.py
+    fallback: end_failure
+
+  interpret_reply:
+    id: interpret_reply
+    type: llm
+    description: >-
+      Read a typed reply to an escalation that names none of its options: one of
+      the options, an instruction the question accepts, a discussion, or unclear.
+    instructions: |
+      A user was asked a question with fixed options and typed their own text
+      instead of picking one. Decide what the text is:
+      - option: the text means one of the offered options. Set reply_option to
+        that option's exact text.
+      - instruction: the text asks for something this question accepts (listed
+        under "Accepted instructions"). Set reply_instruction to that shape's
+        name and reply_value to its value, taken from the user's words.
+      - discussion: the text asks a question, asks for context, or wants to talk
+        the options through.
+      - unclear: none of the above, or you cannot tell. Set reply_clarify to ONE
+        short question that would settle it.
+      Never invent an instruction shape that is not listed, never pick an
+      option the text does not mean, and never answer the question yourself.
+      Output reply_verdict, the fields that verdict needs, reply_reason (one
+      line), and anomalies (anything outside this step's job someone should
+      know; empty is the normal case).
+    prompt: |
+      ## Question and options
+      {{ask_question}}
+
+      ## Accepted instructions
+      {{reply_accepts}}
+
+      ## The user's text
+      {{last_answer_text}}
+    tools: []
+    timeout: 120
+    output_schema:
+      type: object
+      properties:
+        reply_verdict:
+          type: string
+          enum: [option, instruction, discussion, unclear]
+        reply_option: { type: string }
+        reply_instruction: { type: string }
+        reply_value: { type: string }
+        reply_clarify: { type: string }
+        reply_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [reply_verdict]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: interpret_route
+    next: interpret_route
+
+  interpret_route:
+    id: interpret_route
+    type: script
+    description: >-
+      An option or an accepted instruction is applied through apply_answer, a
+      discussion goes to choice_park, an unclear reply gets one clarifying
+      question, and an interpreter fault falls back to parse_answer's re-ask.
+    script: scripts/interpret_route.py
     fallback: end_failure
 
   parse_answer:
     id: parse_answer
     type: script
-    description: Number or text -> option; unparseable re-asks (B22) then the free text stands; clears the parked marker; ledgers the decision.
+    description: >-
+      Number or text -> option; the first typed reply that names no option goes to
+      interpret_reply; after that, unparseable re-asks (B22) then the free text
+      stands; clears the parked marker; ledgers the decision.
     script: scripts/parse_answer.py
     fallback: end_failure
 

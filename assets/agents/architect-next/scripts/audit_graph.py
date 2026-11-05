@@ -49,6 +49,7 @@ BOUNDED = {
     "review_apply": "review fix rounds<=3 per PR",
     "ask_owner_route": "B21 owner_polls<=2",
     "parse_answer": "B22 reask_rounds<=3",
+    "interpret_route": "one interpretation per reply (reply_interpreted), then parse_answer's B22",
     "choice_reask": "user-driven: every pass waits on the owner's next reply",
     "choice_park": "DISCUSSION_PARKS_MAX=3 parks per question (choice_parks); each park ends the run",
     "wave_integrate": "wave_index list-bounded",
