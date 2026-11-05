@@ -4697,6 +4697,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "review_polls_run",
     "review_rounds",
     "review_started_at",
+    "run_branch_override_group",
     "wave_fix_rounds",
     "wave_index",
 ];
