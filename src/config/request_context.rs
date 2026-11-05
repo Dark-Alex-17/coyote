@@ -54,7 +54,7 @@ use crate::mesh::knocks::KnockRecord;
 use crate::mesh::pending::{InboundKind, InboundRecord};
 use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{
-    Decision, IdentityStanding, OverlayRecord, Rule, Tier, TrustRecord, Verdict,
+    Decision, IdentityStanding, OverlayRecord, Rule, Tier, TrustRecord, Verdict, same_hash,
 };
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
@@ -465,8 +465,9 @@ fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>)
     (value, Some(description))
 }
 
-/// The name a row for `destination` offers in place of its hash: your session running
-/// there, else the label `.mesh peers` shows for it. A name is offered only when it is
+/// The name a row for `destination`, heard under `identity`, offers in place of its hash:
+/// your session running there when the row is under that session's identity, else the
+/// label `.mesh peers` shows for it. A name is offered only when it is
 /// one word that displays as spelled, is not itself a whole hash (which the verbs would
 /// take as given), and every name spelled the same stands for this destination, which is
 /// when the verbs resolve it here. Without `identity_labels` no name an identity label
@@ -475,6 +476,7 @@ fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>)
 fn typed_name(
     names: &[AddressName],
     destination: &str,
+    identity: &str,
     identity_labels: bool,
 ) -> Option<TypedName> {
     let resolves_here = |name: &str| {
@@ -492,9 +494,11 @@ fn typed_name(
                 })
     };
     let session = names.iter().find(|name| {
-        matches!(name.target, NameTarget::Session { .. })
-            && name.target.destination() == Some(destination)
-            && resolves_here(&name.name)
+        matches!(
+            &name.target,
+            NameTarget::Session { destination: at, identity: own }
+                if at == destination && same_hash(own, identity)
+        ) && resolves_here(&name.name)
     });
     match session {
         Some(session) => Some(TypedName::Session(session.name.clone())),
@@ -684,6 +688,7 @@ fn collect_destination_rows(
             candidate.typed = typed_name(
                 &names,
                 &candidate.destination,
+                &candidate.identity,
                 filter.offers_identity_labels(),
             );
             candidate
@@ -7159,16 +7164,19 @@ impl RequestContext {
     }
 
     /// One question's completion row: `{short id} . {name} ({short peer}) . {age} .
-    /// "{question}"`, the question cut on a word past `ANSWER_COMPLETION_QUESTION_CHARS`.
+    /// "{question}"`, the peer named as `.mesh pending` names it, the question cut on a
+    /// word past `ANSWER_COMPLETION_QUESTION_CHARS`.
     fn describe_question(
         &self,
         now: SystemTime,
         id: &str,
         destination: &str,
+        identity: &str,
         stamp: &str,
         question: &str,
     ) -> String {
-        let name = self.app.mesh.peer_name_at(destination);
+        let name =
+            crate::repl::mesh::name_at(self, &self.app.mesh.address_names(), destination, identity);
         let age = parse_rfc3339(stamp)
             .map(|then| age_text(now, then))
             .unwrap_or_default();
@@ -7198,6 +7206,7 @@ impl RequestContext {
                     now,
                     &record.id,
                     &record.peer_destination,
+                    &record.peer_identity,
                     &record.received_at,
                     &record.question,
                 );
@@ -7223,6 +7232,7 @@ impl RequestContext {
                         now,
                         &record.id,
                         &record.peer_destination,
+                        &record.peer_identity,
                         &record.sent_at,
                         &record.question,
                     );
@@ -36934,12 +36944,17 @@ mod tests {
             crate::mesh::hex_lower(&[byte; 16])
         }
 
+        /// The identity every session of this node, and every test candidate, is heard under.
+        fn me() -> String {
+            hash(0xa1)
+        }
+
         fn session(name: &str, destination: &str) -> AddressName {
             AddressName {
                 name: name.to_string(),
                 target: NameTarget::Session {
                     destination: destination.to_string(),
-                    identity: hash(0xee),
+                    identity: me(),
                 },
             }
         }
@@ -36962,7 +36977,7 @@ mod tests {
             DestinationCandidate {
                 source: DestinationSource::Peer,
                 destination: destination.to_string(),
-                identity: hash(0xa1),
+                identity: me(),
                 name: name.map(str::to_string),
                 heard: Some((1, "3m ago".to_string())),
                 extra: None,
@@ -36976,7 +36991,7 @@ mod tests {
                     all_destinations: false,
                 },
                 record_standing: None,
-                typed: typed_name(names, destination, true),
+                typed: typed_name(names, destination, &me(), true),
             }
         }
 
@@ -37014,22 +37029,36 @@ mod tests {
         #[test]
         fn a_name_that_would_not_resolve_here_is_not_offered() {
             let (a, b) = (hash(0x11), hash(0x22));
+            let me = me();
             let shared = vec![session("maki", &a), label("Maki", &b)];
-            assert_eq!(typed_name(&shared, &a, true), None);
-            assert_eq!(typed_name(&shared, &b, true), None);
-            assert_eq!(typed_name(&[label("two words", &a)], &a, true), None);
-            assert_eq!(typed_name(&[label(&b, &a)], &a, true), None);
+            assert_eq!(typed_name(&shared, &a, &me, true), None);
+            assert_eq!(typed_name(&shared, &b, &me, true), None);
+            assert_eq!(typed_name(&[label("two words", &a)], &a, &me, true), None);
+            assert_eq!(typed_name(&[label(&b, &a)], &a, &me, true), None);
             assert_eq!(
-                typed_name(&[session("temp", &a), label("mine", &a)], &a, true),
+                typed_name(&[session("temp", &a), label("mine", &a)], &a, &me, true),
                 Some(TypedName::Session("temp".to_string())),
                 "a session beats a label on the same destination"
             );
             let long = "l".repeat(DISPLAY_NAME_MAX_CHARS + 1);
             assert_eq!(
-                typed_name(&[label(&long, &a)], &a, true),
+                typed_name(&[label(&long, &a)], &a, &me, true),
                 None,
                 "a label the row would show cut is not offered"
             );
+        }
+
+        /// A row forged at one of your sessions' destinations under another identity is
+        /// not your session, so completion does not offer the session's name for it.
+        #[test]
+        fn a_forged_row_at_your_sessions_destination_is_not_offered_its_name() {
+            let temp = hash(0x11);
+            let names = vec![session("temp", &temp)];
+            assert_eq!(
+                typed_name(&names, &temp, &me(), true),
+                Some(TypedName::Session("temp".to_string()))
+            );
+            assert_eq!(typed_name(&names, &temp, &hash(0xbb), true), None);
         }
 
         /// An instance under both an identity label and a destination label offers the
@@ -37049,21 +37078,22 @@ mod tests {
             let both = vec![identity_label("maki"), label("maki-laptop", &laptop)];
             for identity_labels in [true, false] {
                 assert_eq!(
-                    typed_name(&both, &laptop, identity_labels),
+                    typed_name(&both, &laptop, &maki, identity_labels),
                     Some(TypedName::Label("maki-laptop".to_string())),
                     "{identity_labels}"
                 );
             }
             let only_identity = vec![identity_label("maki")];
             assert_eq!(
-                typed_name(&only_identity, &laptop, true),
+                typed_name(&only_identity, &laptop, &maki, true),
                 Some(TypedName::Label("maki".to_string()))
             );
-            assert_eq!(typed_name(&only_identity, &laptop, false), None);
+            assert_eq!(typed_name(&only_identity, &laptop, &maki, false), None);
             assert_eq!(
                 typed_name(
                     &[identity_label("maki-laptop"), label("maki-laptop", &laptop)],
                     &laptop,
+                    &maki,
                     false
                 ),
                 None,

@@ -66,7 +66,8 @@ use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
-    Decision, InstancePresence, KeyChangeOutcome, Tier, TrustStore, decode_name_hash, parse_hash,
+    Decision, InstancePresence, KeyChangeOutcome, SELF_TRUST_LABEL, Tier, TrustStore,
+    decode_name_hash, parse_hash,
 };
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
@@ -639,7 +640,8 @@ impl NameTarget {
 }
 
 /// The label you gave `destination` in the trust list: the one on its own grant, else
-/// the one on the grant of the identity the peer table hears it under.
+/// the one on the grant of the identity the peer table hears it under. The grant this
+/// node gives its own identity carries a label you did not give, so it names nothing.
 pub(crate) fn owner_label<'a>(
     names: &'a [AddressName],
     destination: &str,
@@ -650,7 +652,9 @@ pub(crate) fn owner_label<'a>(
                 destination: at, ..
             } => own_grant && at == destination,
             NameTarget::IdentityLabel { instances, .. } => {
-                !own_grant && instances.iter().any(|at| at == destination)
+                !own_grant
+                    && name.name != SELF_TRUST_LABEL
+                    && instances.iter().any(|at| at == destination)
             }
             NameTarget::Session { .. } => false,
         })

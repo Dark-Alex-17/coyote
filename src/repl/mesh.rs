@@ -1387,7 +1387,12 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     let record = open_escalated_question(ctx, id, now)?;
     let id = &record.id;
     ctx.app.mesh.refuse_dismiss_held_by_envoy(id)?;
-    let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
+    let name = name_at(
+        ctx,
+        &ctx.app.mesh.address_names(),
+        &record.peer_destination,
+        &record.peer_identity,
+    );
     out_path_text(
         &render_question_block(
             &QuestionRow::inbound(&record, name.clone(), now),
@@ -1720,6 +1725,7 @@ async fn message(
         &runtime.address_names(),
         &destination,
         &peer.identity_hash,
+        Some(runtime.fingerprint()),
         peer.display_name.as_deref(),
     )
     .unwrap_or_else(|| name_label(peer.display_name.as_deref()));
@@ -2467,9 +2473,17 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         bail!(refusal);
     }
     let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
+    let name = given_name(
+        &runtime.address_names(),
+        &destination,
+        &peer.identity_hash,
+        Some(runtime.fingerprint()),
+        peer.display_name.as_deref(),
+    )
+    .unwrap_or_else(|| name_label(peer.display_name.as_deref()));
     out_path_text(
         &knock_confirmation(
-            peer.display_name.as_deref(),
+            &name,
             &destination,
             trust_label(verdict, standing),
             intro.as_str(),
@@ -2516,14 +2530,9 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     Ok(())
 }
 
-/// The line `.mesh knock` shows before it asks to knock. The name the peer announced
-/// and the intro the human typed are quoted as they stand.
-fn knock_confirmation(
-    name: Option<&str>,
-    destination: &str,
-    trust: &str,
-    intro: &str,
-) -> NoticeText {
+/// The line `.mesh knock` shows before it asks to knock, naming the peer as `.mesh
+/// message` does. The name and the intro the human typed are quoted as they stand.
+fn knock_confirmation(name: &str, destination: &str, trust: &str, intro: &str) -> NoticeText {
     let intro_label = if intro.is_empty() {
         NoticeText::from("without an intro")
     } else {
@@ -2531,7 +2540,7 @@ fn knock_confirmation(
     };
     NoticeText::default()
         .frame("This knocks on ")
-        .peer(name_label(name))
+        .peer(name)
         .frame(format!(
             " ({}, trust: {trust}) so it can trust this instance, ",
             short(destination)
@@ -7135,16 +7144,45 @@ mod name_addressing_tests {
     #[test]
     fn the_name_you_gave_an_instance_reads_as_in_peers() {
         let names = names();
+        let own = Some(ME);
         assert_eq!(
-            given_name(&names, TEMP, ME, Some("Coyote")).as_deref(),
+            given_name(&names, TEMP, ME, own, Some("Coyote")).as_deref(),
             Some("(you: temp)")
         );
-        assert_eq!(given_name(&names, TEMP, MAKI, Some("Coyote")), None);
+        assert_eq!(given_name(&names, TEMP, MAKI, own, Some("Coyote")), None);
         assert_eq!(
-            given_name(&names, LAPTOP, MAKI, Some("maki")).as_deref(),
+            given_name(&names, LAPTOP, MAKI, own, Some("maki")).as_deref(),
             Some("maki-laptop (maki)")
         );
-        assert_eq!(given_name(&names, MAKI_DESK, MAKI, Some("desk")), None);
+        assert_eq!(given_name(&names, MAKI_DESK, MAKI, own, Some("desk")), None);
+    }
+
+    /// An instance under this node's own identity that no running session serves is
+    /// `(you)` before any label, the identity's `this node` grant included, as `.mesh
+    /// peers` names it; with the mesh off no identity is this node's.
+    #[test]
+    fn an_instance_under_your_own_identity_is_you_before_any_label() {
+        let own_grant = AddressName {
+            name: SELF_TRUST_LABEL.to_string(),
+            target: NameTarget::IdentityLabel {
+                identity: ME.to_string(),
+                instances: vec![MAKI_DESK.to_string()],
+            },
+        };
+        let names = vec![destination_label("desk", MAKI_DESK), own_grant.clone()];
+        assert_eq!(
+            given_name(&names, MAKI_DESK, ME, Some(ME), Some("Coyote")).as_deref(),
+            Some("(you)")
+        );
+        assert_eq!(
+            given_name(&names, MAKI_DESK, ME, None, Some("Coyote")).as_deref(),
+            Some("desk (Coyote)")
+        );
+        assert_eq!(
+            owner_label(&[own_grant], MAKI_DESK),
+            None,
+            "the self-trust grant is not a label you gave"
+        );
     }
 
     /// A label is quoted as you spelled it in a `.mesh pending` entry and a `.mesh answer`
@@ -7154,7 +7192,7 @@ mod name_addressing_tests {
         let names = vec![destination_label(".info", LAPTOP)];
         let row = QuestionRow {
             state: "awaiting your answer",
-            name: given_name(&names, LAPTOP, MAKI, Some("maki")).unwrap(),
+            name: given_name(&names, LAPTOP, MAKI, Some(ME), Some("maki")).unwrap(),
             destination: LAPTOP.to_string(),
             when_label: "asked",
             when: None,
@@ -8541,13 +8579,15 @@ fn labelled_name(label: &str, display_name: Option<&str>) -> String {
 }
 
 /// The name you gave the instance at `destination`, heard under `identity`, `announced`
-/// being the name it gives itself: one of your sessions when the identity is this node's,
-/// else your label with that name after it; `None` for an instance you have not named,
-/// which each verb then names its own way.
+/// being the name it gives itself: one of your sessions when the identity is this node's
+/// (`own_identity`, `None` while the mesh is off), else `(you)` for any other instance
+/// under it, else your label with that name after it; `None` for an instance you have
+/// not named, which each verb then names its own way.
 fn given_name(
     names: &[AddressName],
     destination: &str,
     identity: &str,
+    own_identity: Option<&str>,
     announced: Option<&str>,
 ) -> Option<String> {
     let session = names.iter().find(|name| {
@@ -8559,23 +8599,28 @@ fn given_name(
     });
     match session {
         Some(session) => Some(own_session_name(&session.name)),
+        None if own_identity.is_some_and(|own| same_hash(identity, own)) => {
+            Some("(you)".to_string())
+        }
         None => owner_label(names, destination).map(|label| labelled_name(&label.name, announced)),
     }
 }
 
 /// How `.mesh pending` and `.mesh answer` name the peer at `destination`: `given_name`,
 /// else the name the peer table holds, else its short hash.
-fn name_at(
+pub(crate) fn name_at(
     ctx: &RequestContext,
     names: &[AddressName],
     destination: &str,
     identity: &str,
 ) -> String {
     let mesh = &ctx.app.mesh;
+    let runtime = mesh.get();
     given_name(
         names,
         destination,
         identity,
+        runtime.as_ref().map(|runtime| runtime.fingerprint()),
         mesh.display_name_at(destination).as_deref(),
     )
     .unwrap_or_else(|| mesh.peer_name_at(destination))
@@ -14537,12 +14582,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "This sends your text to (no name) (1a2b3c4d, trust: known) over the mesh."
             );
             assert_eq!(
-                knock_confirmation(Some(".session"), DESTINATION, "known", ".mesh trust x")
+                knock_confirmation(".session", DESTINATION, "known", ".mesh trust x")
                     .render(CommandPrefix::Dot),
                 "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
             );
             assert_eq!(
-                knock_confirmation(None, DESTINATION, "known", "").render(CommandPrefix::Dot),
+                knock_confirmation(&name_label(None), DESTINATION, "known", "")
+                    .render(CommandPrefix::Dot),
                 "This knocks on (no name) (1a2b3c4d, trust: known) so it can trust this instance, without an intro; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
             );
         }
@@ -14554,7 +14600,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "This sends your text to .session (1a2b3c4d, trust: trusted) over the mesh."
             );
             assert_eq!(
-                knock_confirmation(Some(".session"), DESTINATION, "known", ".mesh trust x")
+                knock_confirmation(".session", DESTINATION, "known", ".mesh trust x")
                     .render(CommandPrefix::Slash),
                 "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `/mesh trust` on both sides."
             );
@@ -18389,6 +18435,97 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(temp_slot.stop().await.unwrap());
                         relay_handle.abort();
                     });
+                }
+
+                mod own_identity_naming_tests {
+                    use super::*;
+
+                    /// A row forged at a running session's destination under another
+                    /// identity is not that session in `.mesh peers` or `.mesh pending`,
+                    /// and a question from an own-identity instance no session serves
+                    /// names it `(you)`, never by the self-trust grant's label.
+                    #[test]
+                    #[serial]
+                    fn only_this_nodes_identity_makes_a_row_your_session() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-own-identity-naming");
+                        let _capture = capture::install();
+                        run_async(async {
+                            let (addr, relay_handle, _) = loopback_relay().await;
+                            let tmp = TempDir::new("repl-mesh-own-identity-naming");
+                            let a = start_as("a", &tmp, addr.port()).await;
+                            let temp = start_as("temp", &tmp, addr.port()).await;
+                            let temp_slot = Arc::new(MeshSlot::default());
+                            temp_slot.install(temp.clone()).unwrap();
+                            let mut ctx = ctx_with(MeshConfig::default(), true);
+                            ctx.app.mesh.install(a.clone()).unwrap();
+                            let temp_dest = temp.current_destination_hash();
+                            let forger = hex_lower(&[0x7a; 16]);
+                            a.peers().observe(
+                                PeerSighting {
+                                    destination_hash: temp_dest.clone(),
+                                    identity_hash: forger.clone(),
+                                    name_hash: String::new(),
+                                    public_key: None,
+                                    display_name: Some("Forged".to_string()),
+                                    protocol_version: 1,
+                                    hops: 1,
+                                },
+                                SystemTime::now(),
+                            );
+                            let gone_session = hex_lower(&[0x4e; 16]);
+                            heard_as_you(&a, &gone_session);
+
+                            let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                            let rows = table_rows(&out);
+                            let row = |destination: &str| {
+                                rows.iter()
+                                    .find(|row| row[1] == short(destination))
+                                    .unwrap_or_else(|| panic!("no row for {destination} in {out}"))
+                            };
+                            assert_eq!(row(&temp_dest)[0], "Forged", "{out}");
+                            assert_eq!(row(&gone_session)[0], "(you)", "{out}");
+
+                            let now = SystemTime::now();
+                            let store = ctx
+                                .app
+                                .mesh
+                                .inbound_store()
+                                .expect("install attaches a store");
+                            for (id, destination, identity) in [
+                                ("q-forged", &temp_dest, &forger),
+                                ("q-own", &gone_session, &a.fingerprint().to_string()),
+                            ] {
+                                store
+                                    .upsert(
+                                        InboundRecord {
+                                            version: INBOUND_RECORD_VERSION,
+                                            id: id.to_string(),
+                                            peer_destination: destination.clone(),
+                                            peer_identity: identity.clone(),
+                                            thread: id.to_string(),
+                                            question: "Which branch?".to_string(),
+                                            envoy_question: String::new(),
+                                            received_at: rfc3339_utc(now),
+                                            kind: InboundKind::Question,
+                                            paths: Vec::new(),
+                                            reason: String::new(),
+                                            session_thread: String::new(),
+                                        },
+                                        now,
+                                    )
+                                    .unwrap();
+                            }
+                            let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                            assert!(!out.contains("(you: temp)"), "{out}");
+                            assert!(out.contains("Forged"), "{out}");
+                            assert!(out.contains("(you)"), "{out}");
+                            assert!(!out.contains(&format!("{SELF_TRUST_LABEL} (")), "{out}");
+
+                            assert!(ctx.app.mesh.stop().await.unwrap());
+                            assert!(temp_slot.stop().await.unwrap());
+                            relay_handle.abort();
+                        });
+                    }
                 }
             }
 
