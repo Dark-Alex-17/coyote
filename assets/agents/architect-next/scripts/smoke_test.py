@@ -312,8 +312,9 @@ check("parse_answer: seed_confirm number -> the option text", u["last_answer"] =
 u = gates.parse_answer(base_state(escalation=E_SEED, last_answer_text=f"{DESIGN} is the doc"))
 check("parse_answer: seed_confirm typed path to an existing file -> the text verbatim, never a re-ask",
       u["last_answer"] == f"{DESIGN} is the doc" and u["_next"] == "apply_answer", u)
-check("parse_answer: seed_confirm unmatched text that is not a path -> re-ask",
-      gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="banana"))["_next"] == "confirm_seed")
+check("parse_answer: seed_confirm unmatched text that is not a path -> interpret_reply first, a re-ask once interpreted",
+      gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="banana"))["_next"] == "interpret_reply"
+      and gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="banana", reply_interpreted=True))["_next"] == "confirm_seed")
 for answer, row in (("Abort the run", "abort -> end_aborted"), ("Give a doc path instead", "doc path -> need_design_doc"),
                     ("Draft a brief from this conversation instead", "draft -> draft_brief"), ("banana", "unmatched -> need_design_doc")):
     u = gates.apply_answer(base_state(escalation=E_SEED, last_answer=answer, seed_path=SEED))
@@ -823,6 +824,88 @@ if MULTI_IS_GROUPS:
     check("branch_setup: group 2 after group 1 was skipped is cut from the base branch",
           u["run_branch"] == "feat/PLAN-widgets-g2" and u["unit_base_branch"] == "main", str(u.get("unit_base_branch")))
     git(CODE, "checkout", "-q", "feat/PLAN-widgets-g1")
+
+# branch_setup never checks out the base: a worktree that holds main keeps it, the primary checkout is never moved to main
+WT_CODE = os.path.join(TMP, "wt-code")
+make_repo(WT_CODE, {"README.md": "# wt\n"})
+git(WT_CODE, "checkout", "-q", "-b", "work")
+WT_MAIN = os.path.join(TMP, "wt-main")
+git(WT_CODE, "worktree", "add", "-q", WT_MAIN, "main")
+WT_PUSHER = os.path.join(TMP, "wt-pusher")
+subprocess.run(["git", "clone", "-q", "-b", "main", WT_CODE + ".git", WT_PUSHER], check=True, capture_output=True)
+git(WT_PUSHER, "commit", "-q", "--allow-empty", "-m", "upstream moved")
+git(WT_PUSHER, "push", "-q", "origin", "main")
+WT_UPSTREAM = git(WT_PUSHER, "rev-parse", "HEAD")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="wt", **PS))
+check("branch_setup: base main held by another worktree -> the run branch is cut from the fetched origin/main, no checkout of main",
+      u["_next"] == "select_tasks" and git(WT_CODE, "branch", "--show-current") == "feat/PLAN-wt"
+      and git(WT_MAIN, "branch", "--show-current") == "main" and u["unit_base_sha"] == WT_UPSTREAM
+      and git(WT_CODE, "rev-parse", "--verify", "origin/feat/PLAN-wt") == WT_UPSTREAM, u)
+check("branch_setup: the new run branch tracks its own pushed branch, never origin/main",
+      git(WT_CODE, "rev-parse", "--abbrev-ref", "feat/PLAN-wt@{upstream}") == "origin/feat/PLAN-wt")
+git(WT_CODE, "checkout", "-q", "work")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="wt", **PS))
+check("branch_setup: existing run branch with an upstream -> checked out and pulled; main stays in its worktree",
+      u["_next"] == "select_tasks" and git(WT_CODE, "branch", "--show-current") == "feat/PLAN-wt"
+      and git(WT_MAIN, "branch", "--show-current") == "main" and any("existing" in d for d in u["decisions"]), u)
+git(WT_MAIN, "merge", "-q", "--ff-only", "origin/main")
+git(WT_MAIN, "commit", "-q", "--allow-empty", "-m", "local only")
+WT_AHEAD = git(WT_MAIN, "rev-parse", "HEAD")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="ahead", **PS))
+check("branch_setup: a local main ahead of origin/main keeps its unpushed commits in the new run branch",
+      u["_next"] == "select_tasks" and u["unit_base_sha"] == WT_AHEAD and git(WT_MAIN, "branch", "--show-current") == "main", u)
+git(WT_PUSHER, "commit", "-q", "--allow-empty", "-m", "origin only")
+git(WT_PUSHER, "push", "-q", "origin", "main")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="split", **PS))
+check("branch_setup: a local main diverged from origin/main -> git_setup_failed naming the divergence, no branch cut",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "git_setup_failed" and "diverged" in u["escalation"]["evidence"]
+      and not git(WT_CODE, "rev-parse", "--verify", "--quiet", "refs/heads/feat/PLAN-split", check_=False), u)
+WT_LOCAL = os.path.join(TMP, "wt-local")
+os.makedirs(WT_LOCAL)
+git(WT_LOCAL, "init", "-q", "-b", "main")
+git(WT_LOCAL, "commit", "-q", "--allow-empty", "-m", "init")
+WT_LOCAL_MAIN = git(WT_LOCAL, "rev-parse", "HEAD")
+git(WT_LOCAL, "checkout", "-q", "-b", "work")
+git(WT_LOCAL, "worktree", "add", "-q", os.path.join(TMP, "wt-local-main"), "main")
+u = gates.branch_setup(base_state(code_repo_path=WT_LOCAL, plan_slug="loc", **PS))
+check("branch_setup: no remote -> the run branch is cut from the local main, nothing fetched or pushed",
+      u["_next"] == "select_tasks" and git(WT_LOCAL, "branch", "--show-current") == "feat/PLAN-loc"
+      and u["unit_base_sha"] == WT_LOCAL_MAIN and git(os.path.join(TMP, "wt-local-main"), "branch", "--show-current") == "main", u)
+git(WT_LOCAL, "checkout", "-q", "work")
+u = gates.branch_setup(base_state(code_repo_path=WT_LOCAL, plan_slug="loc", **PS))
+check("branch_setup: existing run branch with no upstream -> checked out, the pull skipped and ledgered",
+      u["_next"] == "select_tasks" and git(WT_LOCAL, "branch", "--show-current") == "feat/PLAN-loc"
+      and any("no upstream" in d for d in u["decisions"]), u)
+WT_HELD = os.path.join(TMP, "wt-held")
+git(WT_LOCAL, "checkout", "-q", "work")
+git(WT_LOCAL, "worktree", "add", "-q", "-b", "feat/PLAN-held", WT_HELD, "main")
+u = gates.branch_setup(base_state(code_repo_path=WT_LOCAL, plan_slug="held", **PS))
+E_HELD = u.get("escalation") or {}
+check("branch_setup: the run branch held by another worktree -> git_setup_failed naming that worktree, with fitting options",
+      u["_next"] == "escalate_gate" and E_HELD.get("kind") == "git_setup_failed"
+      and os.path.realpath(E_HELD.get("data", {}).get("worktree") or "/nonexistent") == os.path.realpath(WT_HELD)
+      and [o["text"] for o in E_HELD["options"]] == ["Use that worktree as the code dir", "Pick a different branch name", "Abort the run"]
+      and git(WT_LOCAL, "branch", "--show-current") == "work", u)
+s = base_state(code_repo_path=WT_LOCAL, plan_slug="held", escalation=E_HELD, last_answer="Use that worktree as the code dir", **PS)
+s.update(gates.apply_answer(s))
+s.update(gates.branch_setup(s))
+check("apply_answer: git_setup_failed 'Use that worktree' -> the code dir is that worktree, branch_setup succeeds there",
+      s["_next"] == "select_tasks" and os.path.realpath(s["code_repo_path"]) == os.path.realpath(WT_HELD)
+      and s["code_dir_override"] == s["code_repo_path"] and git(WT_LOCAL, "branch", "--show-current") == "work", s)
+s = base_state(code_repo_path=WT_LOCAL, plan_slug="held", escalation=E_HELD, last_answer="Pick a different branch name", **PS)
+s.update(gates.apply_answer(s))
+E_NAME = s.get("escalation") or {}
+s.update(last_answer="bad..name")
+u = gates.apply_answer(s)
+s.update(last_answer="feat/held-two")
+s.update(gates.apply_answer(s))
+s.update(gates.branch_setup(s))
+check("apply_answer: 'Pick a different branch name' -> asks for a name; an invalid one is asked again, a valid one is the run branch",
+      E_NAME.get("kind") == "branch_name" and u["escalation"]["kind"] == "branch_name" and "not a valid" in u["escalation"]["question"]
+      and s["run_branch_override"] == "feat/held-two" and s["_next"] == "select_tasks" and s["run_branch"] == "feat/held-two"
+      and git(WT_LOCAL, "branch", "--show-current") == "feat/held-two", s)
+check("snapshot: the owner's branch, base and code dir overrides are durable state",
+      {"run_branch_override", "base_branch_override", "code_dir_override"} <= set(_lib.STATE_KEYS))
 
 # ---------------------------------------------------------------- select_tasks (B7) / eligibility / waves
 import copy  # noqa: E402
@@ -1370,9 +1453,127 @@ os.environ["ARCHITECT_ASK_OWNER_BIN"] = os.path.join(TMP, "missing-bin")
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="2"))
 check("parse_answer: number -> option; parked cleared; decision ledgered", u["_next"] == "apply_answer" and u["last_answer"] == "One more round" and u["parked"] == "" and any(d.startswith("decision:") for d in u["decisions"]))
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0))
+check("parse_answer: the first unmatched typed reply -> interpret_reply with the kind's accepted instructions, never a blind re-ask",
+      u["_next"] == "interpret_reply" and "reask_rounds" not in u and "last_answer" not in u
+      and u["reply_accepts"] == "(none: this question accepts no instructions)", u)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, reply_interpreted=True))
 check("parse_answer: unparseable -> re-ask (B22 side 1)", u["_next"] == "ask_user" and u["reask_rounds"] == 1)
-u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=STRIKE_LIMIT))
+u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=STRIKE_LIMIT, reply_interpreted=True))
 check("parse_answer: B22 exhausted -> free text stands", u["_next"] == "apply_answer" and u["last_answer"] == "banana")
+
+# typed replies that name no option: interpreted once, for every escalation kind
+E_GIT = escalation("git_setup_failed", "Could not set up the branch. Retry, or abort?",
+                   [option("Retry the branch setup", True), option("Abort the run")], data={"branch": "feat/PLAN-held", "base": "main"})
+REPLY_RESET = {"reply_verdict": "", "reply_option": "", "reply_instruction": "", "reply_value": "", "reply_clarify": "", "reply_reason": ""}
+
+
+def interpreted(esc, text, **reading):
+    s = base_state(escalation=esc, last_answer_text=text, ask_question=_lib.render_question(esc), **reading.pop("state", {}))
+    s.update(gates.parse_answer(s))
+    first = s["_next"]
+    s.update(reading)
+    s.update(gates.interpret_route(s))
+    return first, s
+
+
+u = gates.parse_answer(base_state(escalation=E_GIT, last_answer_text="Use a different branch"))
+check("parse_answer: git_setup_failed 'Use a different branch' -> interpret_reply on the first try, the branch shapes offered",
+      u["_next"] == "interpret_reply" and "- base_branch:" in u["reply_accepts"] and "- branch_name:" in u["reply_accepts"]
+      and "- reuse_worktree:" in u["reply_accepts"] and "reask_rounds" not in u, u)
+first, s = interpreted(E, "let's give it another go", reply_verdict="option", reply_option="One more round", reply_reason="asks to retry")
+check("interpret_route: option -> that option to apply_answer; the reading and the decision ledgered; verdict fields reset",
+      first == "interpret_reply" and s["_next"] == "apply_answer" and s["last_answer"] == "One more round" and s["parked"] == ""
+      and s["reply_interpreted"] is False and all(s[k] == v for k, v in REPLY_RESET.items())
+      and any(d.startswith("interpret: conformance_stuck: \"let's give it another go\" -> the option 'One more round'") for d in s["decisions"])
+      and any(d == "decision: conformance_stuck: One more round" for d in s["decisions"]), s)
+first, s = interpreted(E_GIT, "Use a different branch, call it feat/typed", reply_verdict="instruction", reply_instruction="branch_name",
+                       reply_value="feat/typed", state={"code_repo_path": WT_LOCAL, "plan_slug": "held", **PS})
+s.update(gates.apply_answer(s))
+s.update(gates.branch_setup(s))
+check("interpret_route -> apply_answer -> branch_setup: an accepted branch_name instruction is the run branch, ledgered",
+      s["run_branch_override"] == "feat/typed" and s["_next"] == "select_tasks" and s["run_branch"] == "feat/typed"
+      and git(WT_LOCAL, "branch", "--show-current") == "feat/typed"
+      and any("the instruction branch_name='feat/typed', applied as 'Retry the branch setup'" in d for d in s["decisions"]), s)
+first, s = interpreted(E_GIT, "cut it from release instead", reply_verdict="instruction", reply_instruction="base_branch", reply_value="release")
+check("interpret_route: an accepted base_branch instruction -> the base for this run and a durable override, then retry",
+      s["_next"] == "apply_answer" and s["last_answer"] == gates.RETRY_BRANCH and s["base_branch_name"] == "release"
+      and s["base_branch_override"] == "release", s)
+first, s = interpreted(E_HELD, "just reuse the existing worktree", reply_verdict="instruction", reply_instruction="reuse_worktree",
+                       reply_value="")
+check("interpret_route: reuse_worktree with no value -> the worktree the question names is the code dir",
+      s["_next"] == "apply_answer" and os.path.realpath(s["code_repo_path"]) == os.path.realpath(WT_HELD), s)
+first, s = interpreted(E, "use base dev", reply_verdict="instruction", reply_instruction="base_branch", reply_value="dev")
+check("interpret_route: an instruction the kind does not accept -> unclear, never applied, ledgered",
+      s["_next"] == "ask_dispatch" and "base_branch_override" not in s and s.get("base_branch_name") == "main"
+      and any("which this question does not accept" in d for d in s["decisions"]), s)
+first, s = interpreted(E_GIT, "Use a different branch", reply_verdict="instruction", reply_instruction="branch_name", reply_value="",
+                       reply_clarify="Which branch name should the run use?")
+check("interpret_route: an accepted instruction with nothing to apply -> one clarifying question echoing the user's words",
+      s["_next"] == "ask_dispatch" and s["escalation"]["question"].startswith("You wrote: 'Use a different branch'. Which branch name")
+      and s["escalation"]["data"]["asked"] == E_GIT["question"] and s["ask_question"] == _lib.render_question(s["escalation"])
+      and s["reply_interpreted"] is True and "run_branch_override" not in s, s)
+first, s = interpreted(E, "hmm, not sure", reply_verdict="unclear", reply_clarify="Stop now, or one more round?")
+check("interpret_route: unclear -> ONE clarifying question that echoes the reply, asked through ask_dispatch, ledgered",
+      s["_next"] == "ask_dispatch" and s["escalation"]["question"].startswith("You wrote: 'hmm, not sure'. Stop now, or one more round?")
+      and s["escalation"]["options"] == E["options"] and any("is unclear -> one clarifying question" in d for d in s["decisions"]), s)
+s.update(last_answer_text="maybe later")
+s.update(gates.parse_answer(s))
+check("parse_answer: after the clarifying question an unmatched reply keeps today's re-ask, never a second interpretation",
+      s["_next"] == "ask_user" and s["reask_rounds"] == 1, s)
+first, s = interpreted(E, "eh", reply_verdict="option", reply_option="Ship it anyway")
+check("interpret_route: an option the question does not offer -> unclear, nothing recorded",
+      s["_next"] == "ask_dispatch" and not s.get("last_answer") and any("named no offered option" in d for d in s["decisions"]), s)
+first, s = interpreted(E, "hmm", reply_verdict="", last_script_error="llm node 'interpret_reply' failed: x")
+s.update(gates.parse_answer(s) if s["_next"] == "parse_answer" else {})
+check("interpret_route: an interpreter fault -> parse_answer's re-ask, the fault ledgered; the run never sticks",
+      s["_next"] == "ask_user" and s["reask_rounds"] == 1 and any(d.startswith("fallback: interpret_reply") for d in s["decisions"])
+      and any("interpreter fault" in d for d in s["decisions"]), s)
+NPARK_ID = _lib.new_run_id("escalation discussion park")
+first, s = interpreted(E_GIT, "why did the checkout fail?", reply_verdict="discussion", reply_reason="asks why",
+                       state={"run_id": NPARK_ID, "run_dir": _lib.run_dir_for(NPARK_ID), "choice_kind": "design_round", "choice_parks": {}})
+check("interpret_route: discussion -> choice_park, nothing recorded, ledgered", s["_next"] == "choice_park" and not s.get("last_answer")
+      and any("is a discussion" in d for d in s["decisions"]), s)
+s.update(gates.choice_park(s))
+d = s.get("discussion") or {}
+check("choice_park: a non-choice escalation parks the run resumably, keyed by its kind, with its own resume text",
+      s["_next"] == "end_discussion" and s["parked"] == "choice_discussion" and s["discussion_run_id"] == NPARK_ID
+      and s["choice_parks"] == {"git_setup_failed": 1} and d.get("kind") == "git_setup_failed" and d.get("question") == E_GIT["question"]
+      and s["discussion_message"].startswith("ARCHITECT_AWAITING_DISCUSSION\nA git_setup_failed question is open for discussion:\n")
+      and "answer it with that text" in d.get("resume", "") and s["discussion_message"].isascii(), s)
+r = {"initial_prompt": "continue: use base release", "discussion_run_id": NPARK_ID, **STORE.variables(DESIGN, TMP)}
+r.update(gates.intake(r))
+r.update(gates.resume_route(r))
+r.update(gates.choice_resume(r))
+check("intake -> choice_resume: 'continue: <answer>' on a parked escalation -> the answer to parse_answer as a fresh reply",
+      r["_next"] == "parse_answer" and r["last_answer_text"] == "use base release" and r["reply_interpreted"] is False
+      and r["escalation"]["kind"] == "git_setup_failed" and r["parked"] == "", r)
+r.update(gates.parse_answer(r))
+check("choice_resume -> parse_answer: a settled answer that names no option is interpreted", r["_next"] == "interpret_reply", r)
+r = {"initial_prompt": "continue", "discussion_run_id": NPARK_ID, **STORE.variables(DESIGN, TMP)}
+r.update(gates.intake(r))
+r.update(gates.resume_route(r))
+r.update(gates.choice_resume(r))
+check("intake -> choice_resume: a bare 'continue' on a parked escalation -> the same escalation asked again (stale choice_kind ignored)",
+      r["_next"] == "escalate_gate" and r["ask_question"] == _lib.render_question(E_GIT) and r["escalation"]["kind"] == "git_setup_failed", r)
+u = gates.choice_park(base_state(escalation=E_GIT, last_answer_text="why?", choice_parks={"git_setup_failed": _lib.DISCUSSION_PARKS_MAX}))
+check("choice_park: a non-choice escalation at the park cap -> choice_reask; its next reply is matched, never interpreted or forced",
+      u["_next"] == "choice_reask" and u.get("reply_interpreted") is True and "choice_forced" not in u, u)
+u2 = gates.choice_reask(base_state(escalation=E_GIT, last_answer_text="why?"))
+check("choice_reask: a non-choice escalation is told to pick an option by its number or text",
+      "pick an option by its number or its text" in u2["escalation"]["question"], u2["escalation"]["question"])
+u = _lib.raise_escalation(base_state(reply_interpreted=True), {}, E)
+check("raise_escalation: a new escalation is interpreted afresh", u["reply_interpreted"] is False, u)
+check("interpretation table: every accepted shape has help and an apply path; the branch kind takes base, branch and worktree",
+      all(s_ in gates.INSTRUCTION_HELP and (s_ in gates.INSTRUCTION_ANSWERS or s_ in ("base_branch", "branch_name", "reuse_worktree", "path"))
+          for shapes in gates.ACCEPTED_INSTRUCTIONS.values() for s_ in shapes)
+      and gates.ACCEPTED_INSTRUCTIONS["git_setup_failed"] == ("base_branch", "branch_name", "reuse_worktree"))
+first, s = interpreted(escalation("approve_breakdown", "Approve?", [option("Approve the breakdown", True),
+                                                                     option("Revise the breakdown (describe the change)"), option("Abort the run")]),
+                       "merge the two api tasks, then approve", reply_verdict="instruction", reply_instruction="revision",
+                       reply_value="merge the two api tasks, then approve")
+s.update(gates.apply_answer(s))
+check("interpret_route -> apply_answer: a revision instruction that mentions approve is still a revision (prefix wins)",
+      s["_next"] == "amend_plan" and "merge the two api tasks" in s["pending_amendments"][0], s)
 u = gates.parse_answer(base_state(escalation=escalation("need_design_doc", "q"), last_answer_text="/tmp/x.md please"))
 check("parse_answer: free-text kinds never re-ask", u["_next"] == "apply_answer")
 u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="", reask_rounds=STRIKE_LIMIT - 1))
@@ -1575,7 +1776,8 @@ check("resume chain: the resumed checklist round closes with the items accepted 
       s.get("pending_amendments"))
 u = gates.checklist_gate(s)
 check("resume chain: a label answered before the park is not fanned out again", u["_next"] == "reseal_gate", u)
-u = gates.choice_resume(base_state(choice_kind="mystery", escalation=escalation("mystery", "q"), parked="choice_discussion"))
+u = gates.choice_resume(base_state(choice_kind="mystery", escalation=escalation("mystery", "q", data={"multiple_choice": True}),
+                                   parked="choice_discussion"))
 check("choice_resume: a discussion parked on an unknown kind -> escalate_gate, ledgered, no KeyError",
       u["_next"] == "escalate_gate" and any("unknown kind 'mystery'" in d for d in u["decisions"]), u)
 s = base_state(**{**PARK, "choice_parks": {}}, reply_kind="", last_script_error="llm node 'classify_reply' failed: x")
@@ -1598,7 +1800,7 @@ u = gates.apply_answer(base_state(escalation=E_PORT, last_answer="what about 909
                                   choice_index=1, choice_answers=PARK_ANSWERS, choice_forced=True))
 check("apply_answer: the forced reply recorded (via other) and the force lifted for the next question",
       u["choice_answers"][-1] == {"question": "Which port?", "answer": "what about 9091?", "via": "other"} and u["choice_forced"] is False, u)
-u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, choice_forced=True))
+u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, choice_forced=True, reply_interpreted=True))
 check("parse_answer: a non-design escalation ignores the force and still re-asks", u["_next"] == "ask_user" and u["reask_rounds"] == 1, u)
 E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
 check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index",
@@ -2126,6 +2328,13 @@ check("graph: classify_reply has no tools, a reply_kind enum of answer/discussio
       CR.get("type") == "llm" and CR.get("tools") == [] and CR.get("next") == "choice_reply_route" and CR.get("fallback") == "choice_reply_route"
       and (CR.get("output_schema") or {}).get("properties", {}).get("reply_kind", {}).get("enum") == ["answer", "discussion"]
       and "{{last_answer_text}}" in CR.get("prompt", ""), CR)
+IR = NODES.get("interpret_reply", {})
+check("graph: interpret_reply has no tools, the four-verdict enum, the accepted instructions in its prompt, and its fault routes to interpret_route",
+      IR.get("type") == "llm" and IR.get("tools") == [] and IR.get("next") == "interpret_route" and IR.get("fallback") == "interpret_route"
+      and (IR.get("output_schema") or {}).get("properties", {}).get("reply_verdict", {}).get("enum") == ["option", "instruction", "discussion", "unclear"]
+      and (IR.get("output_schema") or {}).get("required") == ["reply_verdict"]
+      and all(f"{{{{{k}}}}}" in IR.get("prompt", "") for k in ("ask_question", "reply_accepts", "last_answer_text"))
+      and NODES.get("interpret_route", {}).get("script") == "scripts/interpret_route.py", IR)
 FQ, AP = NODES.get("frame_questions", {}), NODES.get("author_plan", {})
 AP_ITEMS = (AP.get("output_schema") or {}).get("properties", {}).get("open_questions")
 check("graph: frame_questions returns author_plan's open_questions item shape and always routes to frame_questions_route",

@@ -228,6 +228,11 @@ def intake(state):
                      "reference_root_path"):
                 continue  # recomputed from the live variables
             u[k] = v
+        # an owner's answer that moved the base or the code dir outlives the live variables
+        if str(prior.get("base_branch_override") or "").strip():
+            u["base_branch_name"] = prior["base_branch_override"].strip()
+        if str(prior.get("code_dir_override") or "").strip() and os.path.isdir(prior["code_dir_override"]):
+            u["code_repo_path"] = prior["code_dir_override"]
         u["resume_phase"] = prior.get("phase", "")
         settled = (cont.group(1) or "").strip() if cont else ""
         u["settled_answer"] = settled if re.search(r"\w", settled) else ""
@@ -1052,10 +1057,61 @@ def _pr_unit(state, task, tasks):
 
 # ====================================================================== 2.5 per-task loop
 def _run_branch(state):
-    return f"feat/PLAN-{state.get('plan_slug')}"
+    return str(state.get("run_branch_override") or "").strip() or f"feat/PLAN-{state.get('plan_slug')}"
+
+
+WORKTREE_HELD_RE = re.compile(r"is already (?:used by worktree|checked out) at '?([^'\n]+?)'?\s*$", re.M)
+
+
+def _branch_start(state, u, code, base):
+    """The ref a new run branch is cut from, never checked out: the freshly fetched origin/<base>, or the local <base>
+    when it has no remote, the fetch fails, or it already holds origin/<base> plus unpushed commits. "" when the two diverged.
+    """
+    if not git_out(code, "remote", "get-url", "origin", default=""):
+        return base
+    rc, out, err = git(code, "fetch", "--quiet", "origin", base)
+    if rc != 0 or not git_out(code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", default=""):
+        ledger(state, u, f"branch: git fetch origin {base} failed ({tail(err or out, 200)}); cutting from the local {base}")
+        return base
+    remote = f"origin/{base}"
+    if not git_out(code, "rev-parse", "--verify", "--quiet", f"refs/heads/{base}", default=""):
+        return remote
+    if git(code, "merge-base", "--is-ancestor", remote, f"refs/heads/{base}")[0] == 0:
+        return base
+    if git(code, "merge-base", "--is-ancestor", f"refs/heads/{base}", remote)[0] == 0:
+        return remote
+    return ""
+
+
+def _git_setup_escalation(state, u, branch, base, code, step, detail):
+    """A failed branch step; a run branch held by another worktree gets the options that fit it."""
+    held = WORKTREE_HELD_RE.search(detail)
+    if held:
+        where = held.group(1).strip()
+        ledger(state, u, f"branch: {branch} is checked out in the worktree at {where}; asking how to go on")
+        return raise_escalation(state, u, escalation(
+            "git_setup_failed", f"The run branch {branch} is already checked out in the worktree at {where}, so it cannot be "
+                                f"checked out in {code}. Use that worktree, pick a different branch name, or abort?",
+            [option("Use that worktree as the code dir", recommended=True, evidence=where), option("Pick a different branch name"),
+             option("Abort the run")], evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base}))
+    return raise_escalation(state, u, escalation(
+        "git_setup_failed", f"Could not set up the branch {branch} from {base} in {code}: git {' '.join(step)} failed. Retry, or abort?",
+        [option("Retry the branch setup", recommended=True), option("Abort the run")], evidence=tail(detail, 1500),
+        data={"branch": branch, "base": base}))
+
+
+def _use_code_dir(state, u, path):
+    """Point the run at another checkout of the same repo (an owner answer); False when the path is no directory."""
+    path = os.path.abspath(os.path.expanduser(path.strip())) if path.strip() else ""
+    if not path or not os.path.isdir(path):
+        return False
+    u["code_repo_path"] = u["code_dir_override"] = path
+    ledger(state, u, f"branch: the code dir is now {path} (owner)")
+    return True
 
 
 def branch_setup(state):
+    """Check out the run branch in the code dir, never the base: a base held by another worktree stays where it is."""
     u = {}
     code = state.get("code_repo_path", "")
     base = state.get("base_branch_name") or "main"
@@ -1081,21 +1137,33 @@ def branch_setup(state):
         exists = git_out(code, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", default="") or \
             git_out(code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", default="")
         if exists:
-            steps = [("checkout", branch), ("pull", "--quiet", "--ff-only")]
+            steps = [("checkout", "--quiet", branch)]
         else:
-            steps = [("checkout", "--quiet", base), ("pull", "--quiet", "--ff-only"), ("checkout", "-b", branch), ("push", "-u", "origin", branch)]
+            start = _branch_start(state, u, code, base)
+            if not start:
+                ledger(state, u, f"branch: the local {base} and origin/{base} have diverged")
+                return _git_setup_escalation(state, u, branch, base, code, ("fetch", "origin", base),
+                                             f"the local {base} and origin/{base} have diverged; reconcile them, or name another base")
+            steps = [("checkout", "--quiet", "--no-track", "-b", branch, start)]
+            if git_out(code, "remote", "get-url", "origin", default=""):
+                steps.append(("push", "-u", "origin", branch))
         for s in steps:
             code_, out, err = git(code, *s)
-            if code_ != 0 and not (s[0] == "pull" and "no tracking" in (out + err).lower()):
+            if code_ != 0:
                 if s[0] == "push":
                     ledger(state, u, f"branch: push -u failed ({tail(err, 200)}); continuing on the local branch")
                     continue
                 ledger(state, u, f"branch: git {' '.join(s)} failed: {tail(err or out, 300)}")
-                return raise_escalation(state, u, escalation(
-                    "git_setup_failed", f"Could not set up the branch {branch} from {base} in {code}: git {' '.join(s)} failed. Retry, or abort?",
-                    [option("Retry the branch setup", recommended=True), option("Abort the run")], evidence=tail(err or out, 1500)))
+                return _git_setup_escalation(state, u, branch, base, code, s, err or out)
+        if exists and git_out(code, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", default=""):
+            code_, out, err = git(code, "pull", "--quiet", "--ff-only")
+            if code_ != 0:
+                ledger(state, u, f"branch: git pull --ff-only failed: {tail(err or out, 300)}")
+                return _git_setup_escalation(state, u, branch, base, code, ("pull", "--quiet", "--ff-only"), err or out)
+        elif exists:
+            ledger(state, u, f"branch: {branch} has no upstream; nothing to pull")
         u["unit_base_sha"] = git_out(code, "rev-parse", "HEAD", default="")
-        ledger(state, u, f"branch: {branch} ready ({'existing' if exists else 'created'} from {base}) @ {u['unit_base_sha']}")
+        ledger(state, u, f"branch: {branch} ready ({'existing' if exists else 'created from ' + start}) @ {u['unit_base_sha']}")
     else:
         u["run_branch"] = ""
         ledger(state, u, "branch: multi (per-task stacked PRs) - Sisyphus cuts each task branch at claim")
@@ -2618,6 +2686,11 @@ def parse_answer(state):
             return u
     else:
         choice = text if esc.get("kind") == "need_design_doc" else match_option(text, options)
+        if choice is None and text and not truthy(state.get("reply_interpreted")):
+            # the first typed reply that names no option is interpreted once, never re-asked blind
+            u["reply_accepts"] = _accepts_text(esc.get("kind", ""))
+            u["_next"] = "interpret_reply"
+            return u
     if choice is None:
         rounds = as_int(state.get("reask_rounds"))
         if rounds < STRIKE_LIMIT:
@@ -2632,9 +2705,119 @@ def parse_answer(state):
                              f"option: {tail(choice, 200)}")
         else:
             choice = text
-    u.update({"last_answer": choice, "last_answer_text": text, "parked": ""})
+    u.update({"last_answer": choice, "last_answer_text": text, "parked": "", "reply_interpreted": False})
     ledger(state, u, f"decision: {esc.get('kind')}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
+    return u
+
+
+RETRY_BRANCH = "Retry the branch setup"
+# The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
+ACCEPTED_INSTRUCTIONS = {
+    "git_setup_failed": ("base_branch", "branch_name", "reuse_worktree"),
+    "need_design_doc": ("path",),
+    "seed_confirm": ("path",),
+    "clarify": ("path",),
+    "approve_breakdown": ("revision",),
+    "gate1_stuck": ("answers",),
+    "task_failed": ("rescope",),
+    "probe_gap": ("recipe",),
+    "mode_invalid": ("mode_values",),
+}
+INSTRUCTION_HELP = {
+    "base_branch": "cut the run branch from a different base branch; value: that branch name",
+    "branch_name": "use a different run branch name; value: that branch name",
+    "reuse_worktree": "use an existing worktree as the code dir; value: its path, or empty for the worktree the question names",
+    "path": "use the document at a path; value: the path",
+    "revision": "revise the task breakdown as described; value: the change",
+    "answers": "answer the open questions; value: the answers",
+    "rescope": "re-scope the failed task as described; value: the new scope",
+    "recipe": "supply the local-run recipe for the probe; value: the recipe",
+    "mode_values": "set run mode values; value: key=value pairs",
+}
+# How an applied text instruction reads as an answer, in the words apply_answer keys on.
+INSTRUCTION_ANSWERS = {"revision": "Revise the breakdown: {}", "answers": "{}", "rescope": "Re-scope: {}",
+                       "recipe": "Supply the recipe: {}", "mode_values": "{}"}
+
+
+def _accepts_text(kind):
+    shapes = ACCEPTED_INSTRUCTIONS.get(kind, ())
+    return "\n".join(f"- {s}: {INSTRUCTION_HELP[s]}" for s in shapes) or "(none: this question accepts no instructions)"
+
+
+def _apply_instruction(state, u, esc, shape, value):
+    """Carry out an accepted instruction; the answer apply_answer then acts on, or "" when it cannot be applied."""
+    value = value.strip()
+    if shape in ("base_branch", "branch_name"):
+        name = value.split()[0] if value else ""
+        if not name or git(state.get("code_repo_path") or ".", "check-ref-format", "--branch", name)[0] != 0:
+            return ""
+        if shape == "base_branch":
+            u["base_branch_name"] = u["base_branch_override"] = name
+        else:
+            u["run_branch_override"] = name
+        return RETRY_BRANCH
+    if shape == "reuse_worktree":
+        return RETRY_BRANCH if _use_code_dir(state, u, value or as_dict(esc.get("data")).get("worktree") or "") else ""
+    if shape == "path":
+        return _typed_doc_path(value)
+    return INSTRUCTION_ANSWERS[shape].format(value) if value and shape in INSTRUCTION_ANSWERS else ""
+
+
+def interpret_route(state):
+    """Act on the interpreter's reading of a typed reply: an option, an accepted instruction, a discussion, or unclear."""
+    u = {}
+    harvest_anomalies(state, u, "interpret_reply")
+    note_script_error(state, u, "interpret_reply")
+    esc = as_dict(state.get("escalation"))
+    kind = esc.get("kind", "")
+    text = (state.get("last_answer_text") or "").strip()
+    said = tail(text, 200)
+    verdict = str(state.get("reply_verdict") or "").strip().lower()
+    reason = tail(str(state.get("reply_reason") or ""), 200)
+    shape = str(state.get("reply_instruction") or "").strip()
+    u.update({"reply_verdict": "", "reply_option": "", "reply_instruction": "", "reply_value": "", "reply_clarify": "",
+              "reply_reason": "", "reply_interpreted": True})
+
+    def decide(answer, how):
+        u.update({"last_answer": answer, "last_answer_text": text, "parked": "", "reply_interpreted": False})
+        ledger(state, u, f"interpret: {kind}: {said!r} -> {how} ({reason or 'no reason given'})")
+        ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
+        u["_next"] = "apply_answer"
+        return u
+
+    if verdict == "option":
+        choice = match_option(str(state.get("reply_option") or ""), esc.get("options") or [])
+        if choice:
+            return decide(choice, f"the option {choice!r}")
+        ledger(state, u, f"interpret: {kind}: {said!r} named no offered option ({state.get('reply_option')!r}); unclear")
+        verdict = "unclear"
+    elif verdict == "instruction":
+        value = str(state.get("reply_value") or "")
+        if shape not in ACCEPTED_INSTRUCTIONS.get(kind, ()):
+            ledger(state, u, f"interpret: {kind}: {said!r} reads as the instruction {shape or '(unnamed)'}, which this "
+                             f"question does not accept; unclear")
+        elif answer := _apply_instruction(state, u, esc, shape, value):
+            return decide(answer, f"the instruction {shape}={tail(value, 120)!r}, applied as {answer!r}")
+        else:
+            ledger(state, u, f"interpret: {kind}: the instruction {shape}={tail(value, 120)!r} could not be applied; unclear")
+        verdict = "unclear"
+    if verdict == "discussion":
+        ledger(state, u, f"interpret: {kind}: {said!r} is a discussion ({reason or 'no reason given'}) -> park for discussion")
+        u["_next"] = "choice_park"
+        return u
+    if verdict == "unclear":
+        data = as_dict(esc.get("data"))
+        asked = data.get("asked") or esc.get("question", "")
+        clarify = str(state.get("reply_clarify") or "").strip() or "Which option do you mean, or what should happen instead?"
+        # the question goes into the escalation itself so a remote owner sees it too
+        u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"You wrote: {said!r}. {clarify}\n\n{asked}"}
+        u["ask_question"] = render_question(u["escalation"])
+        ledger(state, u, f"interpret: {kind}: {said!r} is unclear -> one clarifying question: {tail(clarify, 200)}")
+        u["_next"] = "ask_dispatch"
+        return u
+    ledger(state, u, f"interpret: {kind}: no verdict for {said!r} (interpreter fault) -> re-ask")
+    u["_next"] = "parse_answer"
     return u
 
 
@@ -2661,8 +2844,9 @@ def choice_reply_route(state):
 def _discussion_message(d):
     """The parked run's final message: the question, its options, the reply, the answers so far and how to resume."""
     title = "Design question" if d["kind"] == "design_round" else "Question"
-    lines = ["ARCHITECT_AWAITING_DISCUSSION", f"{title} {d['number']} of {d['total']} is open for discussion:", d["question"],
-             "", "Options:"]
+    head = f"{title} {d['number']} of {d['total']} is open for discussion:" if d.get("total") else \
+        f"A {d['kind']} question is open for discussion:"
+    lines = ["ARCHITECT_AWAITING_DISCUSSION", head, d["question"], "", "Options:"]
     lines += [f"  {o['label']}: {o['text']}" for o in d["options"]]
     lines += ["", f"Your reply: {d['reply']}", "", "Answered so far:"]
     lines += [f"  {i}. {a.get('question')} -> {a.get('answer')}" for i, a in enumerate(d["answers"], 1)] or ["  (none yet)"]
@@ -2671,54 +2855,76 @@ def _discussion_message(d):
 
 
 def choice_park(state):
-    """End the run parked on the current multiple-choice question so the user can discuss it in the chat lane.
+    """End the run parked on the current question so the user can discuss it in the chat lane.
 
-    A question parked DISCUSSION_PARKS_MAX times is asked again instead, and its next typed reply is taken as the answer.
+    A question parked DISCUSSION_PARKS_MAX times is asked again instead: a multiple-choice question then takes its next
+    typed reply as the answer, any other question matches it to an option without interpreting it again.
     """
     u = {}
     esc = as_dict(state.get("escalation"))
-    queue, idx = as_list(state.get("choice_queue")), as_int(state.get("choice_index"))
+    data = as_dict(esc.get("data"))
+    mc = bool(data.get("multiple_choice"))
+    queue, idx = (as_list(state.get("choice_queue")), as_int(state.get("choice_index"))) if mc else ([], 0)
+    key = str(idx) if mc else esc.get("kind", "")
+    where = f"question {idx + 1}/{len(queue)}" if mc else "the question"
     parks = dict(as_dict(state.get("choice_parks")))
-    count = as_int(parks.get(str(idx)))
+    count = as_int(parks.get(key))
     if count >= DISCUSSION_PARKS_MAX:
-        u["choice_forced"] = True
-        ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1} already parked {count} time(s) for discussion "
-                         f"(cap {DISCUSSION_PARKS_MAX}) -> re-ask; its next typed reply is recorded as the answer")
+        if mc:
+            u["choice_forced"] = True
+        else:
+            u["reply_interpreted"] = True
+        ledger(state, u, f"choice: {esc.get('kind')}: {where} already parked {count} time(s) for discussion "
+                         f"(cap {DISCUSSION_PARKS_MAX}) -> re-ask; its next typed reply is "
+                         + ("recorded as the answer" if mc else "matched to an option without interpreting it"))
         u["_next"] = "choice_reask"
         return u
-    parks[str(idx)] = count + 1
+    parks[key] = count + 1
     run_id = state.get("run_id") or ""
+    answer_form = ("record that answer and go on to the remaining questions" if mc else "answer it with that text")
     u["discussion"] = {
         "run_id": run_id, "plan_path": state.get("plan_path") or "", "kind": esc.get("kind", ""),
-        "question": as_dict(esc.get("data")).get("question") or esc.get("question", ""),
+        "question": data.get("question") or data.get("asked") or esc.get("question", ""),
         "options": [{"label": choice_label(i), "text": o.get("text", ""), "recommended": truthy(o.get("recommended")),
                      "evidence": o.get("evidence", "")} for i, o in enumerate(esc.get("options") or [])],
         "reply": (state.get("last_answer_text") or "").strip(), "answers": as_list(state.get("choice_answers")),
-        "number": idx + 1, "total": len(queue),
+        "number": idx + 1 if mc else 0, "total": len(queue),
         "resume": ('Discuss it here. When it is settled, say "continue" to be asked this question again, or '
-                   '"continue: <your answer>" to record that answer and go on to the remaining questions. '
+                   f'"continue: <your answer>" to {answer_form}. '
                    '"resume" works the same as "continue".'),
     }
     u.update({"choice_parks": parks, "parked": DISCUSSION_PARKED, "discussion_run_id": run_id,
               "discussion_message": _discussion_message(u["discussion"])})
-    ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} parked for discussion "
-                     f"({count + 1}/{DISCUSSION_PARKS_MAX})")
+    ledger(state, u, f"choice: {esc.get('kind')}: {where} parked for discussion ({count + 1}/{DISCUSSION_PARKS_MAX})")
     snapshot(state, u, DISCUSSION_PARKED)
     u["_next"] = "end_discussion"
     return u
 
 
 def choice_resume(state):
-    """Resume a run parked on a discussion: record the settled answer, or ask the parked question again."""
-    u = {"discussion": {}, "settled_answer": "", "parked": ""}
+    """Resume a run parked on a discussion: record the settled answer, or ask the parked question again.
+
+    A question that is not multiple choice takes the settled answer through parse_answer like a fresh typed reply.
+    """
+    u = {"discussion": {}, "settled_answer": "", "parked": "", "reply_interpreted": False}
     esc = as_dict(state.get("escalation"))
+    settled = str(state.get("settled_answer") or "").strip()
+    if not as_dict(esc.get("data")).get("multiple_choice") and esc.get("kind") not in CHOICE_KIND_GATES:
+        if settled:
+            u.update({"last_answer_text": settled, "reask_rounds": 0})
+            ledger(state, u, f"discussion: {esc.get('kind')}: resumed with the settled answer {tail(settled, 200)!r}")
+            u["_next"] = "parse_answer"
+        else:
+            u["ask_question"] = render_question(esc)
+            ledger(state, u, f"discussion: {esc.get('kind')}: resumed without a settled answer -> asked again")
+            u["_next"] = "escalate_gate"
+        return u
     kind = state.get("choice_kind") or esc.get("kind")
     gate = CHOICE_KIND_GATES.get(kind)
     if not gate:
         ledger(state, u, f"choice: resumed a discussion parked on an unknown kind {kind!r} -> escalate_gate asks it again")
         u["_next"] = "escalate_gate"
         return u
-    settled = str(state.get("settled_answer") or "").strip()
     if settled:
         _record_choice(state, u, settled, via="settled")
     else:
@@ -2734,20 +2940,26 @@ def choice_reask(state):
     data = as_dict(esc.get("data"))
     asked = data.get("asked") or esc.get("question", "")
     reply = tail((state.get("last_answer_text") or "").strip(), 200)
+    then = ("pick an option or type your answer, which is recorded as given" if data.get("multiple_choice") else
+            "pick an option by its number or its text")
     # the note goes into the escalation itself so a remote owner sees it too and ask_owner sends a fresh question
     u["escalation"] = {**esc, "data": {**data, "asked": asked},
                        "question": f"Your reply ({reply!r}) reads as a question or a discussion, but this question has "
                                    f"already been parked for discussion {DISCUSSION_PARKS_MAX} times, the most allowed: "
-                                   f"pick an option or type your answer, which is recorded as given.\n\n{asked}"}
+                                   f"{then}.\n\n{asked}"}
     u["ask_question"] = render_question(u["escalation"])
     u["_next"] = "ask_dispatch"
     return u
 
 
 def _answered(state, choices, default=None):
+    """The key whose words the answer starts with, else the first key whose words it contains, else default."""
     ans = (state.get("last_answer") or "").strip().lower()
     for key, words in choices.items():
-        if any(ans.startswith(w) or w in ans for w in words):
+        if any(ans.startswith(w) for w in words):
+            return key
+    for key, words in choices.items():
+        if any(w in ans for w in words):
             return key
     return default
 
@@ -2806,7 +3018,7 @@ def apply_answer(state):
                 u["draft_feedback"] = answer
                 u["_next"] = "draft_brief"
     elif kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
-                  "git_setup_failed", "gate_fault") and abort:
+                  "git_setup_failed", "branch_name", "gate_fault") and abort:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
@@ -2904,7 +3116,25 @@ def apply_answer(state):
             u["failure_reason"] = "aborted after a promotion failure"
             u["_next"] = "end_aborted"
     elif kind == "git_setup_failed":
-        u["_next"] = "branch_setup"
+        data = as_dict(esc.get("data"))
+        if answer == "Use that worktree as the code dir" and not _use_code_dir(state, u, data.get("worktree") or ""):
+            ledger(state, u, f"branch: the worktree {data.get('worktree') or '(none named)'} is not a directory; retrying as is")
+        if answer == "Pick a different branch name":
+            raise_escalation(state, u, escalation(
+                "branch_name", f"Which branch name should the run use instead of {data.get('branch') or _run_branch(state)}?",
+                tier3_ok=False, data={"branch": data.get("branch") or ""}))
+        else:
+            u["_next"] = "branch_setup"
+    elif kind == "branch_name":
+        name = answer.strip().split()[0] if answer.strip() else ""
+        if name and git(state.get("code_repo_path") or ".", "check-ref-format", "--branch", name)[0] == 0:
+            u["run_branch_override"] = name
+            ledger(state, u, f"branch: the run branch is now {name} (owner)")
+            u["_next"] = "branch_setup"
+        else:
+            ledger(state, u, f"branch: {name!r} is not a valid branch name; asking again")
+            raise_escalation(state, u, escalation("branch_name", f"{name!r} is not a valid branch name. Which branch name "
+                                                                "should the run use?", tier3_ok=False, data=as_dict(esc.get("data"))))
     elif kind == "tasks_stuck":
         a = _answered(state, {"retry": ["retry"], "skip": ["skip"], "stop": ["stop"]}, "stop")
         if a == "retry":
@@ -4444,7 +4674,7 @@ GATES = {
     "escalate_gate": escalate_gate, "ladder_route": ladder_route, "consult_route": consult_route, "ask_dispatch": ask_dispatch,
     "ask_owner_poll": ask_owner_poll, "ask_owner_route": ask_owner_route, "parse_answer": parse_answer, "apply_answer": apply_answer,
     "choice_reply_route": choice_reply_route, "choice_reask": choice_reask, "choice_park": choice_park,
-    "choice_resume": choice_resume,
+    "choice_resume": choice_resume, "interpret_route": interpret_route,
     "phase_f_gate": phase_f_gate, "integration_check": integration_check, "integrate_route": integrate_route,
     "hygiene_create": hygiene_create, "stack_gate_final": stack_gate_final, "pr_body": pr_body, "open_pr": open_pr,
     "pr_round_comments": pr_round_comments, "ci_poll": ci_poll, "ci_route": ci_route, "ci_evidence": ci_evidence, "ci_apply": ci_apply,
