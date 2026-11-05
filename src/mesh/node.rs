@@ -4817,9 +4817,7 @@ impl MeshSlot {
     /// the refusal once the hold lapsed, so the peer would hear two answers.
     pub(crate) fn refuse_dismiss_held_by_envoy(&self, id: &str) -> Result<()> {
         if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
-            bail!(
-                "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
-            );
+            return Err(dismiss_held_by_envoy(id));
         }
         Ok(())
     }
@@ -5263,6 +5261,16 @@ impl std::error::Error for AlreadyClosed {}
 pub(crate) fn already_closed(id: &str) -> AlreadyClosed {
     AlreadyClosed(NoticeText::from_template(
         "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+        &[],
+        &[("id", id)],
+    ))
+}
+
+/// A dismiss refused while the envoy holds `id`; the id is quoted as it stands, since a
+/// peer chose it.
+pub(crate) fn dismiss_held_by_envoy(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}.",
         &[],
         &[("id", id)],
     ))

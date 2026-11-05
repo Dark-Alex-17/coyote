@@ -1269,13 +1269,7 @@ impl AccessStore<'_> {
             Err(err) => {
                 let err = match grants.revoke(&record.id, &record.peer_destination) {
                     Ok(_) => err,
-                    Err(revoke) => QuotingError::wrap(
-                        error_notice(&err)
-                            .frame("; the grant written for `")
-                            .peer(record.id.as_str())
-                            .frame("` could not be taken back either: ")
-                            .then(error_notice(&revoke)),
-                    ),
+                    Err(revoke) => revoke_failed(&err, &record.id, &revoke),
                 };
                 Err(put_back(self.slot, store, &record, err))
             }
@@ -1338,11 +1332,7 @@ impl AccessStore<'_> {
     /// written through rather than over.
     fn standing_shares(&self, runtime: &MeshRuntime, record: &InboundRecord) -> Result<ShareSet> {
         let Some(root) = ShareSource::share_root(self.slot) else {
-            return Err(QuotingError::wrap(NoticeText::from_template(
-                "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
-                &[],
-                &[("id", &record.id)],
-            )));
+            return Err(no_share_root(&record.id));
         };
         let (shares, warning) = ShareSet::load_quietly(runtime.serving().share_locations(&root));
         if let Some(warning) = warning {
@@ -1453,6 +1443,27 @@ fn standing_write_failed(record: &InboundRecord, err: anyhow::Error) -> anyhow::
         .peer(record.id.as_str())
         .frame(" --standing` again once the share list is writable; the request stays pending until then."),
     )
+}
+
+/// A one-off grant whose decision `err` stopped and whose written grant `revoke` could
+/// not undo; both errors keep their quoted parts and the id is quoted as it stands.
+fn revoke_failed(err: &anyhow::Error, id: &str, revoke: &anyhow::Error) -> anyhow::Error {
+    QuotingError::wrap(
+        error_notice(err)
+            .frame("; the grant written for `")
+            .peer(id)
+            .frame("` could not be taken back either: ")
+            .then(error_notice(revoke)),
+    )
+}
+
+/// The id is quoted as it stands, since a peer chose it.
+fn no_share_root(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
+        &[],
+        &[("id", id)],
+    ))
 }
 
 /// Puts a taken record back after `err` stopped its decision or answer, so it stays
@@ -3603,14 +3614,81 @@ mod tests {
                 short(&destination())
             );
             assert_eq!(
-                command_error_text(&MeshVerbError::wrap(standing_failure()), CommandPrefix::Slash),
+                command_error_text(
+                    &MeshVerbError::wrap(standing_failure()),
+                    CommandPrefix::Slash
+                ),
                 format!("Error: {slashed}")
             );
             assert_eq!(
-                command_error_text(&MeshVerbError::wrap(refused_put_back()), CommandPrefix::Slash),
+                command_error_text(
+                    &MeshVerbError::wrap(refused_put_back()),
+                    CommandPrefix::Slash
+                ),
                 format!(
                     "Error: {slashed}; and `.vault` could not be put back as pending: An inbound access request carries a question, which only a question may; refusing to store it."
                 )
+            );
+        }
+
+        /// A one-off grant the peer never heard, whose grant could not be revoked
+        /// because the share file refused to load.
+        fn unrevoked() -> anyhow::Error {
+            revoke_failed(
+                &anyhow::anyhow!("The peer could not be reached; `.mesh status` shows the link"),
+                ".vault",
+                &refused_at_load(SHARE_FILE_WORDS, " Nothing was written."),
+            )
+        }
+
+        #[test]
+        fn under_dot_the_revoke_chain_and_standing_refusals_read_as_they_did() {
+            assert_eq!(
+                unrevoked().to_string(),
+                format!(
+                    "The peer could not be reached; `.mesh status` shows the link; the grant written for `.vault` could not be taken back either: {SHARE_FILE_WORDS} Nothing was written."
+                )
+            );
+            assert_eq!(
+                no_share_root(".vault").to_string(),
+                "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `.mesh grant .vault` instead"
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(refused_at_load(
+                        SHARE_FILE_WORDS,
+                        " Nothing was written."
+                    )),
+                    CommandPrefix::Dot
+                ),
+                format!("Error: {SHARE_FILE_WORDS} Nothing was written.")
+            );
+        }
+
+        #[test]
+        fn under_slash_the_revoke_chain_and_standing_refusals_keep_ids_and_share_words() {
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(unrevoked()), CommandPrefix::Slash),
+                format!(
+                    "Error: The peer could not be reached; `/mesh status` shows the link; the grant written for `.vault` could not be taken back either: {SHARE_FILE_WORDS} Nothing was written."
+                )
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(no_share_root(".vault")),
+                    CommandPrefix::Slash
+                ),
+                "Error: A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `/mesh grant .vault` instead"
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(refused_at_load(
+                        SHARE_FILE_WORDS,
+                        " Nothing was written."
+                    )),
+                    CommandPrefix::Slash
+                ),
+                format!("Error: {SHARE_FILE_WORDS} Nothing was written.")
             );
         }
     }

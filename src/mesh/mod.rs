@@ -45,6 +45,8 @@ pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TI
 #[cfg(test)]
 pub(crate) use node::MESH_PROGRESS_MIN_INTERVAL;
 #[cfg(test)]
+pub(crate) use node::dismiss_held_by_envoy;
+#[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
     AlreadyClosed, HUMAN_DECLINED, InterfaceState, InterfaceStatus, LocalEndpoint, MESH_ALREADY_ON,

@@ -1437,14 +1437,14 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     let mut stayed: Vec<String> = Vec::new();
     for record in &questions {
         if let Err(err) = ctx.app.mesh.refuse_dismiss_held_by_envoy(&record.id) {
-            out_path_text(&error_notice(&err).render(live_prefix()));
+            out_path_text(&dismiss_failure_line(&err, live_prefix()));
             held.push(record.id.clone());
             continue;
         }
         match ctx.app.mesh.dismiss_inbound(&record.id, silent).await {
             Ok(()) => dismissed += 1,
             Err(err) => {
-                out_path_text(&error_notice(&err).render(live_prefix()));
+                out_path_text(&dismiss_failure_line(&err, live_prefix()));
                 if err.downcast_ref::<AlreadyClosed>().is_none() {
                     stayed.push(record.id.clone());
                 }
@@ -1453,6 +1453,12 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     }
     out_text(&dismiss_all_summary(dismissed, &held, &stayed, silent));
     Ok(())
+}
+
+/// The line `--all` prints for a question it could not dismiss, with the ids the error
+/// quotes kept as they stand.
+fn dismiss_failure_line(err: &anyhow::Error, prefix: CommandPrefix) -> String {
+    error_notice(err).render(prefix)
 }
 
 /// The `--all` summary: the count dismissed, then a clause for the questions the envoy
@@ -13337,6 +13343,45 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     format!("Error: `/mesh answer` failed\n\nCaused by:\n    {slash}")
                 );
             }
+        }
+    }
+
+    mod dismiss_all_quoting_tests {
+        use super::*;
+        use crate::mesh::{already_closed, dismiss_held_by_envoy};
+
+        /// The failures `--all` prints a line for, each for a question a peer filed under
+        /// the id `.vault`: one the envoy holds, one another process closed.
+        fn failures() -> [anyhow::Error; 2] {
+            [
+                dismiss_held_by_envoy(".vault"),
+                anyhow::Error::new(already_closed(".vault")),
+            ]
+        }
+
+        #[test]
+        fn under_dot_each_failure_line_reads_as_it_did() {
+            let dots = [
+                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss .vault.",
+                "`.vault` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+            ];
+            for (err, dot) in failures().into_iter().zip(dots) {
+                assert_eq!(format!("{err:#}"), dot);
+                assert_eq!(dismiss_failure_line(&err, CommandPrefix::Dot), dot);
+            }
+        }
+
+        #[test]
+        fn under_slash_each_failure_line_keeps_the_id_and_slashes_its_hint() {
+            let [held, closed] = failures();
+            assert_eq!(
+                dismiss_failure_line(&held, CommandPrefix::Slash),
+                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then /mesh dismiss .vault."
+            );
+            assert_eq!(
+                dismiss_failure_line(&closed, CommandPrefix::Slash),
+                "`.vault` was already closed by another process, so nothing more was done. /mesh pending shows what is still open."
+            );
         }
     }
 
