@@ -290,7 +290,10 @@ STATE_KEYS = (
     "batch_state", "wave_results", "pr_numbers", "ci_reruns", "ci_fix_strikes", "parked", "escalation",
     "autonomous_digest", "decisions", "follow_ups", "rejected_findings", "deferred_findings", "skipped_reviews",
     "design_decisions", "hygiene_items", "anomalies_log", "closeout_scope", "verification_commands",
-    "quality_rigor", "quality_surfaces", "round_log",
+    "quality_rigor", "quality_surfaces", "round_log", "open_questions", "carried_questions",
+    "rigor_proposal", "surfaces_proposal", "quality_evidence", "quality_recorded",
+    "checklist_labels", "checklist_findings", "checklist_items", "checklist_done",
+    "leak_questions", "leak_unanswerable", "leak_pending_answers",
     "design_rounds", "choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed", "choice_parks",
     "choice_forced",
 )

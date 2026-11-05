@@ -2681,13 +2681,19 @@ def choice_resume(state):
     """Resume a run parked on a discussion: record the settled answer, or ask the parked question again."""
     u = {"discussion": {}, "settled_answer": "", "parked": ""}
     esc = as_dict(state.get("escalation"))
+    kind = state.get("choice_kind") or esc.get("kind")
+    gate = CHOICE_KIND_GATES.get(kind)
+    if not gate:
+        ledger(state, u, f"choice: resumed a discussion parked on an unknown kind {kind!r} -> escalate_gate asks it again")
+        u["_next"] = "escalate_gate"
+        return u
     settled = str(state.get("settled_answer") or "").strip()
     if settled:
         _record_choice(state, u, settled, via="settled")
     else:
         ledger(state, u, f"choice: {esc.get('kind')}: resumed without a settled answer -> question "
                          f"{as_int(state.get('choice_index')) + 1} asked again")
-    u["_next"] = CHOICE_KIND_GATES[state.get("choice_kind") or esc.get("kind")]
+    u["_next"] = gate
     return u
 
 

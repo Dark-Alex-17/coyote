@@ -1460,6 +1460,49 @@ for prompt, settled in (("continue, option 2", "option 2"), ("continue - use pg"
     s.update(gates.intake(s))
     check(f"intake: {prompt!r} -> the settled answer {settled!r}, leading punctuation stripped",
           s.get("resume_mode") is True and s["settled_answer"] == settled, s.get("settled_answer"))
+
+
+def resume_chain(run_id, prompt, gate):
+    """Re-enter a parked run from its state.json the way the graph does; returns the state and the `_next` of each step."""
+    s = {"initial_prompt": prompt, "discussion_run_id": run_id, **STORE.variables(DESIGN, TMP)}
+    steps = []
+    for step in (gates.intake, gates.resume_route, gates.choice_resume, gate):
+        s.update(step(s))
+        steps.append(s["_next"])
+    return s, steps
+
+
+LEAK_ID = _lib.new_run_id("leak park")
+s = {**leak_asked, "run_id": LEAK_ID, "run_dir": _lib.run_dir_for(LEAK_ID)}
+s.update(gates.apply_answer({**s, "last_answer": "X first"}))
+s.update(gates.leak_route(s))
+s.update(gates.choice_park({**s, "last_answer_text": "who is allowed to sign?"}))
+s, steps = resume_chain(LEAK_ID, "continue: the owner", gates.leak_route)
+check("resume chain: a parked Gate 1 question settled -> leak_route closes the round with the held, earlier and settled answers",
+      steps == ["resume_route", "choice_resume", "leak_route", "amend_plan"] and s["pending_amendments"] == [
+          "Gate 1 leak: a -> b", "Gate 1 leak: priority of X vs Y? -> X first", "Gate 1 leak: who signs off? -> the owner"]
+      and s["choice_kind"] == "", (steps, s.get("pending_amendments")))
+CL_ID = _lib.new_run_id("checklist park")
+s = {**CL, "run_id": CL_ID, "run_dir": _lib.run_dir_for(CL_ID), "quality_surfaces": "http,other:grpc"}
+s.update(gates.apply_answer({**s, "last_answer": "1"}))
+s.update(gates.checklist_round(s))
+s.update(gates.choice_park({**s, "last_answer_text": "who would own the metadata?"}))
+s, steps = resume_chain(CL_ID, "continue: drop", gates.checklist_round)
+check("resume chain: a parked checklist item settled -> the next unanswered item asked, the earlier answer kept",
+      steps == ["resume_route", "choice_resume", "checklist_round", "escalate_gate"] and s["escalation"]["data"]["index"] == 2
+      and "retry calls" in s["escalation"]["question"]
+      and [a["answer"] for a in s["choice_answers"]] == [gates.CHECKLIST_ACCEPT, gates.CHECKLIST_DROP], (steps, s))
+s.update(gates.apply_answer({**s, "last_answer": "1"}))
+s.update(gates.checklist_round(s))
+check("resume chain: the resumed checklist round closes with the items accepted before and after the park",
+      s["_next"] == "amend_plan" and "- [grpc] use deadlines\n" in s["pending_amendments"][0]
+      and "- [grpc] retry calls" in s["pending_amendments"][0] and "propagate metadata" not in s["pending_amendments"][0],
+      s.get("pending_amendments"))
+u = gates.checklist_gate(s)
+check("resume chain: a label answered before the park is not fanned out again", u["_next"] == "reseal_gate", u)
+u = gates.choice_resume(base_state(choice_kind="mystery", escalation=escalation("mystery", "q"), parked="choice_discussion"))
+check("choice_resume: a discussion parked on an unknown kind -> escalate_gate, ledgered, no KeyError",
+      u["_next"] == "escalate_gate" and any("unknown kind 'mystery'" in d for d in u["decisions"]), u)
 s = base_state(**{**PARK, "choice_parks": {}}, reply_kind="", last_script_error="llm node 'classify_reply' failed: x")
 s.update(gates.choice_reply_route(s))
 s.update(gates.choice_park(s))
