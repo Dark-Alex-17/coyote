@@ -777,7 +777,7 @@ impl MeshRuntime {
         let minted = !paths.identity_path.exists();
         let core_identity = identity::load_or_mint_identity(&paths.identity_path)?;
         let fingerprint = identity::fingerprint(&core_identity);
-        let self_trust_granted = trust.seed_self_trust(&fingerprint, minted, SystemTime::now())?;
+        trust.set_own_identity(&fingerprint)?;
         let transport_identity = to_transport_private_identity(&core_identity);
         let peers = Arc::new(PeerTable::load(
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
@@ -941,6 +941,7 @@ impl MeshRuntime {
                 }
             }
         }
+        let self_trust_granted = seed_own_grant(&trust, &fingerprint, minted);
         debug!(
             "Started mesh node {} (instance {instance_id}) as destination {}",
             short(&fingerprint),
@@ -2244,6 +2245,24 @@ async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time:
         warn!(
             "Mesh request handlers did not stop within the shutdown window; the node releases its locks with them still running"
         );
+    }
+}
+
+/// Seeds this node's own grant once the start can no longer fail, so a refused start
+/// writes none. A seed that fails leaves the node running without the grant, warned
+/// about with the trust file to fix and the command that gives it, and reads as not
+/// granted. The own hash is logged whole on purpose: the remedy is typed from it.
+fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
+    match trust.seed_self_trust(fingerprint, minted, SystemTime::now()) {
+        Ok(granted) => granted,
+        Err(err) => {
+            warn!(
+                "The mesh is on, but this node's own identity could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity {fingerprint}`.",
+                redact_hashes(&format!("{err:#}")),
+                trust.path().display()
+            );
+            false
+        }
     }
 }
 
@@ -16595,7 +16614,10 @@ mod tests {
             assert_eq!(rows.len(), 2, "{rows:?}");
             assert_eq!(rows[&temp_dest].session, "temp");
             assert_eq!(rows[&temp_dest].agent.as_deref(), Some("coder"));
-            assert_eq!(rows[&temp_dest].pid, std::process::id());
+            assert_eq!(
+                rows[&temp_dest].process,
+                crate::utils::process::ProcessStamp::current()
+            );
             assert_eq!(
                 a.own_sessions().get(&temp_dest).map(String::as_str),
                 Some("temp")
@@ -16631,6 +16653,46 @@ mod tests {
             a.shutdown().await.unwrap();
             assert!(instances::live(&tmp.path.join("cache")).is_empty());
             relay_handle.abort();
+        }
+
+        mod save_session_registry_tests {
+            use super::*;
+            use crate::config::{AppState, RequestContext, WorkingMode};
+            use crate::testing::EnvVarGuard;
+            use crate::utils::get_env_name;
+
+            /// `.save session <name>` switches the context to the new name while the
+            /// node keeps serving it, as a fork does.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial_test::serial]
+            async fn saving_under_a_new_name_files_the_row_under_it() {
+                let sessions = TempDir::new("node-save-session-sessions");
+                let _sessions_dir = EnvVarGuard::set(get_env_name("sessions_dir"), &sessions.path);
+                let (addr, relay_handle, _) = loopback_relay().await;
+                let tmp = TempDir::new("node-save-session-rows");
+                let node = start_as("orig", &tmp, addr.port()).await;
+                let mut ctx =
+                    RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+                ctx.app.mesh.install(node.clone()).unwrap();
+                let mut session = Session::default();
+                session.set_name("orig".to_string());
+                ctx.session = Some(session);
+                let destination = node.current_destination_hash();
+
+                ctx.save_session(None, None).unwrap();
+                assert_eq!(
+                    instances::live(&node.cache_dir)[&destination].session,
+                    "orig"
+                );
+                ctx.save_session(Some("renamed"), None).unwrap();
+
+                assert_eq!(
+                    instances::live(&node.cache_dir)[&destination].session,
+                    "renamed"
+                );
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                relay_handle.abort();
+            }
         }
     }
 
@@ -16749,6 +16811,74 @@ mod tests {
     }
 
     const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";
+
+    mod own_grant_seed_tests {
+        use super::*;
+        use crate::mesh::trust::SELF_TRUST_LABEL;
+
+        const OWN: &str = "00112233445566778899aabbccddeeff";
+
+        #[test]
+        fn a_seed_that_writes_reads_as_granted() {
+            let tmp = TempDir::new("node-seed-own-grant");
+            let trust = TrustStore::open(&tmp.path).unwrap();
+
+            assert!(seed_own_grant(&trust, OWN, true));
+        }
+
+        /// The trust file turns unreadable after the store loaded it, so the seed's
+        /// write is refused while the start has nothing left that can fail.
+        #[test]
+        fn a_seed_that_fails_is_a_warning_naming_the_trust_command() {
+            install_log_collector();
+            let tmp = TempDir::new("node-seed-own-grant-fails");
+            let trust = TrustStore::open(&tmp.path).unwrap();
+            std::fs::create_dir_all(trust.path().parent().unwrap()).unwrap();
+            std::fs::write(trust.path(), "{not yaml").unwrap();
+
+            assert!(!seed_own_grant(&trust, OWN, true));
+
+            let remedy = format!(
+                "make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity {OWN}`",
+                trust.path().display()
+            );
+            let warned = warn_snapshot();
+            assert!(
+                warned
+                    .iter()
+                    .any(|line| line.contains("could not be trusted") && line.contains(&remedy)),
+                "{warned:#?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_start_writes_no_own_grant_and_no_marker() {
+            let port = closed_port().await;
+            let tmp = TempDir::new("node-refused-start-no-seed");
+            let paths = mesh_paths(&tmp);
+            let trust_path = crate::mesh::mesh_config_dir(&paths.config_dir).join("trust.yaml");
+            let mut session = Session::default();
+
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                paths,
+                NodeOptions {
+                    connect_timeout: Duration::from_millis(300),
+                    ..NodeOptions::default()
+                },
+            )
+            .await
+            .err()
+            .expect("a closed relay port must be refused");
+
+            let written = std::fs::read_to_string(&trust_path).unwrap_or_default();
+            assert!(!written.contains("self_trust_seeded"), "{written}");
+            assert!(!written.contains(SELF_TRUST_LABEL), "{written}");
+        }
+    }
 
     fn peer_turns() -> Vec<EnvoyTurn> {
         vec![

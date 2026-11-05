@@ -7632,14 +7632,11 @@ mod tests {
         let live = ProcessStamp::current();
         let alive = seed_sidecar(&root, "live", 2, ChildStatus::Running, live);
         let also_dead = seed_sidecar(&root, "gone", 3, ChildStatus::Running, dead);
-        let calls_before =
-            crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let calls_before = crate::utils::process::alive_set_calls();
 
         let page = list_sessions(&mut ctx, json!({})).unwrap();
 
-        let calls = crate::utils::process::ALIVE_SET_CALLS
-            .load(std::sync::atomic::Ordering::SeqCst)
-            - calls_before;
+        let calls = crate::utils::process::alive_set_calls() - calls_before;
         assert_eq!(calls, 1, "one process-table lookup per page");
         let rows = page["sessions"].as_array().unwrap();
         assert_eq!(rows[0]["session_id"], json!(also_dead));
@@ -7719,14 +7716,11 @@ mod tests {
         seed_sidecar(&root, "hintdead", 1, ChildStatus::Running, dead);
         seed_sidecar(&root, "hintlive", 2, ChildStatus::Running, live);
         seed_sidecar(&root, "hintgone", 3, ChildStatus::Running, dead);
-        let calls_before =
-            crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let calls_before = crate::utils::process::alive_set_calls();
 
         let hint = recent_child_ids_hint(&root);
 
-        let calls = crate::utils::process::ALIVE_SET_CALLS
-            .load(std::sync::atomic::Ordering::SeqCst)
-            - calls_before;
+        let calls = crate::utils::process::alive_set_calls() - calls_before;
         assert_eq!(calls, 1, "one process-table lookup per hint");
         let page = list_sessions(&mut ctx, json!({})).unwrap();
         let expected: Vec<String> = page["sessions"]
@@ -7775,8 +7769,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, root.dir()).unwrap();
         let sessions_dir = child_sessions::sessions_root();
         let before = paths_under(&sessions_dir);
-        let calls_before =
-            crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let calls_before = crate::utils::process::alive_set_calls();
 
         let page = list_sessions(&mut ctx, json!({})).unwrap();
 
@@ -7795,10 +7788,7 @@ mod tests {
         );
         assert_eq!(paths_under(&sessions_dir), before);
         assert!(root.dir().is_symlink());
-        assert_eq!(
-            crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            calls_before
-        );
+        assert_eq!(crate::utils::process::alive_set_calls(), calls_before);
     }
 
     #[cfg(unix)]
@@ -8537,8 +8527,7 @@ mod tests {
         for minute in 3..total {
             seed_sidecar(&root, "done", minute, ChildStatus::Completed, dead);
         }
-        let calls =
-            || crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let calls = crate::utils::process::alive_set_calls;
 
         let before = calls();
         let first = list_sessions(&mut ctx, json!({})).unwrap();

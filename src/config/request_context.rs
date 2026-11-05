@@ -2331,7 +2331,8 @@ impl RequestContext {
     /// id, `mesh_instance_id`, into the copy, so two saved sessions can share a lineage id.
     /// Two processes opening both copies with the mesh on are serialised by `InstanceLock`:
     /// the second acquire is refused, and that process has to run `.mesh on --fresh` to mint
-    /// its own id. Only `.fork` gives the new session a lineage of its own.
+    /// its own id. Only `.fork` gives the new session a lineage of its own. The node keeps
+    /// serving this context, so its instance-registry row is filed under the new name.
     pub fn save_session(&mut self, name: Option<&str>, scope: Option<SessionScope>) -> Result<()> {
         let Some(session) = self.session.as_ref() else {
             bail!("No session");
@@ -2356,6 +2357,7 @@ impl RequestContext {
         let session = self.session.as_mut().unwrap();
         session.save(&session_name, &session_path, is_repl)?;
         session.set_scope(scope);
+        self.app.mesh.rename_session(&session_name);
         let (resolved_path, resolved_scope) = self.resolve_session_file(&session_name);
         if is_repl && resolved_path != session_path {
             println!(

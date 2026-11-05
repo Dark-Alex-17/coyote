@@ -375,6 +375,14 @@ enum TrustMutation {
         identity: String,
         was_granting: bool,
     },
+    /// This node's identity moved from `old` to `new`: `retired` is whether `old`'s grant
+    /// for all destinations was withdrawn, `granted` whether `new` was given one.
+    RotateSelf {
+        old: String,
+        new: String,
+        retired: bool,
+        granted: bool,
+    },
     /// Everything the list held of the identity: its record, the records bound to it
     /// (`removed`, the on-disk ones), their denies and its block.
     ForgetIdentity {
@@ -426,6 +434,9 @@ impl fmt::Display for TrustMutation {
             }
             Self::UntrustIdentity { identity, .. } => {
                 write!(f, "untrust identity {}", short(identity))
+            }
+            Self::RotateSelf { old, new, .. } => {
+                write!(f, "rotate own identity {} to {}", short(old), short(new))
             }
             Self::ForgetIdentity {
                 identity, removed, ..
@@ -509,6 +520,28 @@ impl TrustMutation {
                         None,
                         RevokeReason::Untrust,
                     ));
+                }
+            }
+            Self::RotateSelf {
+                old,
+                new,
+                retired,
+                granted,
+            } => {
+                if retired {
+                    observer.revoked(revoked(
+                        Tier::Identity,
+                        Some(old),
+                        None,
+                        RevokeReason::Untrust,
+                    ));
+                }
+                if granted {
+                    observer.granted(TrustGranted {
+                        tier: Tier::Identity,
+                        identity_hash: new,
+                        destination_hash: None,
+                    });
                 }
             }
             Self::ForgetIdentity {
@@ -650,6 +683,19 @@ pub(crate) struct UntrustOutcome {
     pub identity: String,
     /// A deny stood on the destination and stands still: `undeny_destination` lifts it.
     pub deny_stays: bool,
+}
+
+/// What `rotate_self_trust` did, or for `self_trust_rotation` would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelfTrustRotation {
+    /// The old identity's grant for all destinations was withdrawn.
+    pub retired: bool,
+    /// The new identity was granted every destination as `this node`.
+    pub granted: bool,
+    /// The old identity is blocked, so it held no grant to move.
+    pub blocked_old: bool,
+    /// The new identity is blocked, so it was not granted.
+    pub blocked_new: bool,
 }
 
 /// What `deny_destination` did, or with `dry_run` would do.
@@ -835,8 +881,9 @@ struct State {
     last_reload_failure: Option<String>,
     session_identities: BTreeMap<String, IdentityEntry>,
     session_destinations: BTreeMap<String, DestinationEntry>,
-    /// This node's own identity, as last passed to `seed_self_trust`. Its grant covers
-    /// only the node's own instances, so it is no reason to ask the network for a
+    /// This node's own identity, as last passed to `set_own_identity` or
+    /// `seed_self_trust`, or the new key of `rotate_self_trust`. Its grant covers only
+    /// the node's own instances, so it is no reason to ask the network for a
     /// destination nothing has announced.
     own_identity: Option<String>,
     seen: BTreeMap<String, SystemTime>,
@@ -1280,7 +1327,14 @@ impl TrustStore {
         self.collision_protection.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    /// Records this node's own identity without writing anything, so a node that is
+    /// still starting never takes its own grant for a reason to ask for a destination.
+    pub(crate) fn set_own_identity(&self, identity_hash: &str) -> Result<()> {
+        let identity = valid_hash("identity", identity_hash)?;
+        self.inner.lock().own_identity = Some(identity);
+        Ok(())
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -2185,6 +2239,83 @@ impl TrustStore {
         )?;
         state.session_identities.remove(&identity);
         Ok(granted)
+    }
+
+    /// What `rotate_self_trust` away from `old_hash` would do, for the rotation's dry run.
+    pub(crate) fn self_trust_rotation(&self, old_hash: &str) -> SelfTrustRotation {
+        planned_self_trust_rotation(&self.loaded().file, &old_hash.to_ascii_lowercase())
+    }
+
+    /// Moves this node's own grant from the rotated-away `old_hash` to `new_hash` in one
+    /// write; see `planned_self_trust_rotation` for when each half applies. The old grant
+    /// is withdrawn as `untrust_identity` withdraws it: the record goes, or keeps only its
+    /// binding while destination records name it. The new grant is labelled `this node`,
+    /// and a blocked new identity gets none. The new key becomes the own identity whether
+    /// or not it is granted, so its grant is never a reason to ask for a destination.
+    pub(crate) fn rotate_self_trust(
+        &self,
+        old_hash: &str,
+        new_hash: &str,
+        now: SystemTime,
+    ) -> Result<SelfTrustRotation> {
+        let old = valid_hash("identity", old_hash)?;
+        let new = valid_hash("identity", new_hash)?;
+        let mut state = self.writing()?;
+        let planned = planned_self_trust_rotation(&state.file, &old);
+        let mut file = state.file.clone();
+        file.self_trust_seeded = true;
+        if planned.retired {
+            let bound = file
+                .destinations
+                .values()
+                .any(|entry| same_hash(&entry.identity, &old));
+            match file.identities.get_mut(&old).filter(|_| bound) {
+                Some(entry) => {
+                    entry.all_destinations = false;
+                    if entry.label.as_deref() == Some(SELF_TRUST_LABEL) {
+                        entry.label = None;
+                    }
+                }
+                None => {
+                    file.identities.remove(&old);
+                }
+            }
+        }
+        let blocked_new = file.blocked_identities.contains_key(&new);
+        let granted = if !planned.granted || blocked_new {
+            false
+        } else {
+            match file.identities.get_mut(&new) {
+                Some(entry) => !std::mem::replace(&mut entry.all_destinations, true),
+                None => {
+                    let mut entry = identity_entry(now, now, true);
+                    entry.label = Some(SELF_TRUST_LABEL.to_string());
+                    file.identities.insert(new.clone(), entry);
+                    true
+                }
+            }
+        };
+        let rotation = SelfTrustRotation {
+            retired: planned.retired,
+            granted,
+            blocked_old: planned.blocked_old,
+            blocked_new: planned.granted && blocked_new,
+        };
+        if file != state.file {
+            self.commit(
+                &mut state,
+                file,
+                TrustMutation::RotateSelf {
+                    old,
+                    new: new.clone(),
+                    retired: rotation.retired,
+                    granted,
+                },
+            )?;
+            state.session_identities.remove(&new);
+        }
+        state.own_identity = Some(new);
+        Ok(rotation)
     }
 
     /// Removes one destination record and nothing else: the identity record stays, and
@@ -3234,6 +3365,23 @@ fn identity_entry(now: SystemTime, last_seen: SystemTime, all_destinations: bool
         label: None,
         note: None,
         all_destinations,
+    }
+}
+
+/// The old key's grant for all destinations is useless once its private key is gone, so
+/// it goes; the new key takes it over, or is seeded when no grant was ever seeded. A
+/// user who withdrew the own grant stays opted out. The new key is not known yet, so
+/// whether it is blocked is left to `rotate_self_trust`.
+fn planned_self_trust_rotation(file: &TrustFile, old: &str) -> SelfTrustRotation {
+    let retired = file
+        .identities
+        .get(old)
+        .is_some_and(|entry| entry.all_destinations);
+    SelfTrustRotation {
+        retired,
+        granted: retired || !file.self_trust_seeded,
+        blocked_old: file.blocked_identities.contains_key(old),
+        blocked_new: false,
     }
 }
 
@@ -4909,19 +5057,28 @@ mod tests {
         }
 
         #[test]
-        fn a_new_key_is_seeded_even_once_the_marker_is_set() {
+        fn a_rotation_after_the_own_grant_was_untrusted_seeds_no_new_key() {
             let fx = Fixture::new("trust-self-seed-new-key");
             let old = fake_hash(0x5e);
             let new = fake_hash(0x6f);
             fx.store.seed_self_trust(&old, false, t(2_000)).unwrap();
-
-            assert!(fx.store.seed_self_trust(&new, true, t(3_000)).unwrap());
+            fx.store.untrust_identity(&fx.mesh, &old, false).unwrap();
+            let expected = SelfTrustRotation {
+                retired: false,
+                granted: false,
+                blocked_old: false,
+                blocked_new: false,
+            };
+            assert_eq!(fx.store.self_trust_rotation(&old), expected);
+            let before = fx.file_bytes().unwrap();
 
             assert_eq!(
-                own_record(&fx.store, &new).unwrap().label.as_deref(),
-                Some(SELF_TRUST_LABEL)
+                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                expected
             );
-            assert!(own_record(&fx.store, &old).is_some());
+
+            assert_eq!(fx.store.identity_standing(&new), IdentityStanding::Unknown);
+            assert_eq!(fx.file_bytes().unwrap(), before);
         }
 
         #[test]
@@ -5020,6 +5177,197 @@ mod tests {
             assert_eq!(
                 own_record(&fx.store, &peer.identity_hash).unwrap().label,
                 None
+            );
+        }
+    }
+
+    mod rotate_self_trust_tests {
+        use super::*;
+
+        const MOVED: SelfTrustRotation = SelfTrustRotation {
+            retired: true,
+            granted: true,
+            blocked_old: false,
+            blocked_new: false,
+        };
+
+        #[test]
+        fn the_old_identity_is_unknown_and_the_new_one_is_this_node_with_both_hooks_fired() {
+            let fx = Fixture::new("trust-rotate-self-moves");
+            let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
+            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            let sink = fx.observed();
+            assert_eq!(fx.store.self_trust_rotation(&old), MOVED);
+
+            assert_eq!(
+                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                MOVED
+            );
+
+            let reopened = fx.reopen();
+            assert_eq!(reopened.identity_standing(&old), IdentityStanding::Unknown);
+            assert_eq!(
+                reopened.identity_standing(&new),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            );
+            assert_eq!(
+                record(&reopened, &new).label.as_deref(),
+                Some(SELF_TRUST_LABEL)
+            );
+            let fired = sink.drain();
+            let events: Vec<HookEvent> = fired.iter().map(|(event, _)| *event).collect();
+            assert_eq!(
+                events,
+                [HookEvent::MeshTrustRevoked, HookEvent::MeshTrustGranted]
+            );
+            assert_eq!(
+                env_value(&fired[0].1, "COYOTE_MESH_PEER_IDENTITY"),
+                Some(old.as_str())
+            );
+            assert_eq!(
+                env_value(&fired[1].1, "COYOTE_MESH_PEER_IDENTITY"),
+                Some(new.as_str())
+            );
+        }
+
+        #[test]
+        fn the_first_contact_gate_still_refuses_an_unheard_destination_after_a_rotation() {
+            let fx = Fixture::new("trust-rotate-self-gate");
+            let (old, new, unheard) = (fake_hash(0x5e), fake_hash(0x6f), fake_hash(0x70));
+            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+
+            fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap();
+
+            assert!(!fx.store.may_be_asked_for(&unheard));
+        }
+
+        /// The old key's row is still in the peer table under the instance's name hash, so
+        /// a grant left on the old key would make it the holder the new key collides with.
+        #[test]
+        fn collision_protection_serves_the_new_keys_own_instance_after_a_rotation() {
+            let fx = Fixture::new("trust-rotate-self-collision");
+            fx.store
+                .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+            fx.store.set_collision_protection(true);
+            let old = announced("alpha");
+            fx.announce(&old, t(2_000));
+            fx.store
+                .seed_self_trust(&old.identity_hash, true, t(2_000))
+                .unwrap();
+            let new = announced("alpha");
+            assert_eq!(new.name_hash, old.name_hash);
+            fx.announce(&new, t(4_000));
+
+            fx.store
+                .rotate_self_trust(&old.identity_hash, &new.identity_hash, t(4_000))
+                .unwrap();
+
+            let origin = fx.store.authorize_origin_at(
+                &parse_hash(&new.identity_hash).unwrap(),
+                &decode_name_hash(&new.name_hash).unwrap(),
+                t(4_500),
+            );
+            assert_eq!(
+                origin.verdict,
+                verdict(Decision::Allow, Rule::IdentityTrusted)
+            );
+        }
+
+        #[test]
+        fn an_old_identity_with_bound_destinations_keeps_only_its_binding() {
+            let fx = Fixture::new("trust-rotate-self-bound");
+            let old = announced("alpha");
+            fx.announce(&old, t(1_000));
+            fx.trust_destination(&old, t(1_500));
+            fx.store
+                .seed_self_trust(&old.identity_hash, false, t(2_000))
+                .unwrap();
+
+            assert_eq!(
+                fx.store
+                    .rotate_self_trust(&old.identity_hash, &fake_hash(0x6f), t(3_000))
+                    .unwrap(),
+                MOVED
+            );
+
+            assert_eq!(
+                fx.store.identity_standing(&old.identity_hash),
+                IdentityStanding::Trusted {
+                    all_destinations: false
+                }
+            );
+            assert_eq!(record(&fx.store, &old.identity_hash).label, None);
+        }
+
+        #[test]
+        fn a_blocked_old_identity_moves_no_grant_and_says_why() {
+            let fx = Fixture::new("trust-rotate-self-blocked-old");
+            let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
+            fx.store
+                .block_identity(&fx.mesh, &old, None, t(1_500))
+                .unwrap();
+            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            let expected = SelfTrustRotation {
+                retired: false,
+                granted: false,
+                blocked_old: true,
+                blocked_new: false,
+            };
+            assert_eq!(fx.store.self_trust_rotation(&old), expected);
+
+            assert_eq!(
+                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                expected
+            );
+
+            assert_eq!(fx.store.identity_standing(&new), IdentityStanding::Unknown);
+        }
+
+        #[test]
+        fn a_blocked_new_identity_is_retired_from_but_not_granted() {
+            let fx = Fixture::new("trust-rotate-self-blocked-new");
+            let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
+            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            fx.store
+                .block_identity(&fx.mesh, &new, None, t(2_500))
+                .unwrap();
+
+            assert_eq!(
+                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                SelfTrustRotation {
+                    retired: true,
+                    granted: false,
+                    blocked_old: false,
+                    blocked_new: true,
+                }
+            );
+
+            assert_eq!(fx.store.identity_standing(&old), IdentityStanding::Unknown);
+            assert!(fx.store.blocked().iter().any(|record| record.hash == new));
+        }
+
+        #[test]
+        fn a_list_never_seeded_seeds_the_new_key() {
+            let fx = Fixture::new("trust-rotate-self-unseeded");
+            let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
+
+            assert_eq!(
+                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                SelfTrustRotation {
+                    retired: false,
+                    granted: true,
+                    blocked_old: false,
+                    blocked_new: false,
+                }
+            );
+
+            assert_eq!(
+                fx.store.identity_standing(&new),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
             );
         }
     }
