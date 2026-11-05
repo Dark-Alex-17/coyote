@@ -1437,7 +1437,7 @@ fn ctrl_d_under_an_agent_fires_the_completed_hook_before_exit() {
     fs::write(
         agent_dir.join("config.yaml"),
         "name: probe-agent\n\
-         description: usage probe agent\n\
+         description: a test agent\n\
          version: 0.1.0\n\
          instructions: |\n\
          \x20 You are a probe agent. Reply briefly.\n\

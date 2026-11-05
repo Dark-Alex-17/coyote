@@ -1,6 +1,6 @@
-//! Cases for the full-screen UI written from its documented contract
-//! before the implementation was read. Each case runs
-//! the binary cold on a pseudo-terminal under the same bash wrapper
+//! Interrupt, quit, hotkey-gate and paste cases for the full-screen UI.
+//! Each case runs the binary cold on a pseudo-terminal under the same bash
+//! wrapper
 //! `tui_binary.rs` uses, so the exit code and the tty flags are reported
 //! after every exit path. Unix-only for the same reasons.
 #![cfg(unix)]
@@ -43,7 +43,7 @@ fn fresh_config_dir(scenario: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let dir = env::temp_dir().join(format!(
-        "coyote-tui-probe-r11-{scenario}-{}-{unique}-{sequence}",
+        "coyote-tui-interrupt-{scenario}-{}-{unique}-{sequence}",
         process::id()
     ));
     fs::create_dir_all(dir.join("home")).unwrap();
@@ -136,9 +136,9 @@ const ASKING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20   local out v\n\
     \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
     \x20   : > \"$out.asked\"\n\
-    \x20   v=\"$(confirm \"Really do it? r11-q\")\"\n\
+    \x20   v=\"$(confirm \"Really do it? k4q\")\"\n\
     \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
-    \x20   echo \"fixture confirm: ${v:-cancelled} r11-r\" >> \"$LLM_OUTPUT\"\n\
+    \x20   echo \"fixture confirm: ${v:-cancelled} k4r\" >> \"$LLM_OUTPUT\"\n\
     }\n";
 
 /// Marks `<marker>-started`, then waits (at most eight seconds) for
@@ -158,7 +158,7 @@ const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20       [ -e \"${marker}-release\" ] && break\n\
     \x20       sleep 0.05\n\
     \x20   done\n\
-    \x20   echo \"fixture slept r11s\" >> \"$LLM_OUTPUT\"\n\
+    \x20   echo \"fixture slept k4s\" >> \"$LLM_OUTPUT\"\n\
     }\n";
 
 fn built_binary() -> &'static Path {
@@ -389,9 +389,9 @@ fn an_idle_quit_after_an_esc_interrupted_turn_still_fires_agent_completed() {
     let _guard = TempDirGuard(dir.clone());
     let release = dir.join("never-released");
     let fake = FakeLlm::start(vec![Reply::Streamed(vec![
-        Chunk::Text("partial before esc r11-h".to_string()),
+        Chunk::Text("partial before esc k4h".to_string()),
         Chunk::WaitFor(release),
-        Chunk::Text(" tail never shown r11-t".to_string()),
+        Chunk::Text(" tail never shown k4t".to_string()),
     ])]);
     write_fake_llm_config(&dir, &fake, true);
     let marker = dir.join("agent-completed.log");
@@ -420,7 +420,7 @@ fn an_idle_quit_after_an_esc_interrupted_turn_still_fires_agent_completed() {
     let wrapper = WAIT_WRAPPER.replace("'{coyote}'", "'{coyote}' --agent probe-agent");
     let mut pty = spawn_tui_under(&dir, &[], &wrapper);
 
-    let pressed_at = interrupt_a_held_stream(&mut pty, "partial before esc r11-h");
+    let pressed_at = interrupt_a_held_stream(&mut pty, "partial before esc k4h");
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
     assert!(!since.contains("exit="), "Esc quit the UI:\n{since}");
     assert!(
@@ -472,14 +472,14 @@ fn an_idle_quit_after_an_esc_interrupted_turn_still_asks_to_save_the_session() {
     let _guard = TempDirGuard(dir.clone());
     let release = dir.join("never-released");
     let fake = FakeLlm::start(vec![Reply::Streamed(vec![
-        Chunk::Text("partial before esc r11-s".to_string()),
+        Chunk::Text("partial before esc k4w".to_string()),
         Chunk::WaitFor(release),
-        Chunk::Text(" tail never shown r11-u".to_string()),
+        Chunk::Text(" tail never shown k4u".to_string()),
     ])]);
     write_fake_llm_config(&dir, &fake, false);
     let mut pty = spawn_tui(&dir, &[]);
 
-    interrupt_a_held_stream(&mut pty, "partial before esc r11-s");
+    interrupt_a_held_stream(&mut pty, "partial before esc k4w");
     // Flip a session setting too, so the dirty bit does not hinge on
     // whether the partial text was recorded.
     pty.send(b".set skills_enabled false\r").unwrap();
@@ -507,17 +507,17 @@ fn an_idle_quit_after_an_esc_interrupted_turn_still_asks_to_save_the_session() {
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE)
         .expect("`y` on the save modal did not ask for a session name");
-    pty.send(b"probe-r11-esc\r").unwrap();
+    pty.send(b"esc-session-k4e\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
     let saved = walk(&dir).into_iter().find(|p| {
         p.file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with("probe-r11-esc"))
+            .is_some_and(|n| n.to_string_lossy().starts_with("esc-session-k4e"))
     });
     assert!(
         saved.is_some(),
-        "no probe-r11-esc session file was written under {dir:?}:\n{transcript}"
+        "no esc-session-k4e session file was written under {dir:?}:\n{transcript}"
     );
 }
 
@@ -542,7 +542,7 @@ fn a_hotkey_typed_as_the_confirm_modal_appears_is_dropped_until_it_has_been_up_a
             name: "fixture_confirm_rec".to_string(),
             arguments: format!("{{\"out\": \"{}\"}}", out.display()),
         },
-        Reply::Text("fixture gated done r11-g".to_string()),
+        Reply::Text("fixture gated done k4g".to_string()),
     ]);
     write_fake_llm_config(&dir, &fake, true);
     write_tool(&dir, "fixture_confirm_rec.sh", ASKING_CONFIRM_TOOL);
@@ -554,7 +554,7 @@ fn a_hotkey_typed_as_the_confirm_modal_appears_is_dropped_until_it_has_been_up_a
     // the tool start and the request land, the user has been idle well
     // past the gap, which is exactly the case the gate must still cover.
     let seen = pty
-        .wait_for("r11-q", PTY_DEADLINE)
+        .wait_for("k4q", PTY_DEADLINE)
         .expect("the tool's confirm question never reached the screen");
     let seen_at = Instant::now();
     pty.send(b"y").unwrap();
@@ -584,7 +584,7 @@ fn a_hotkey_typed_as_the_confirm_modal_appears_is_dropped_until_it_has_been_up_a
     wait_for_file(&mut pty, &out, "the tool's recorded answer to the second y");
     let transcript = wait_for_squeezed_after(
         &mut pty,
-        "fixture gated done r11-g",
+        "fixture gated done k4g",
         0,
         "the reply after the answered confirm",
     );
@@ -614,7 +614,7 @@ fn a_hotkey_typed_as_the_confirm_modal_appears_is_dropped_until_it_has_been_up_a
 }
 
 // ---------------------------------------------------------------------
-// Quality bar item 1: `exit()` idempotent, strict enter/leave mirror.
+// `exit()` is idempotent: a second SIGTERM during teardown changes nothing.
 // ---------------------------------------------------------------------
 
 /// A second SIGTERM while the first one's teardown is running changes
@@ -675,7 +675,7 @@ fn ctrl_d_while_a_tool_sleeps_quits_in_bounded_time_and_leaves_the_tty_cooked() 
             name: "fixture_sleep".to_string(),
             arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
         },
-        Reply::Text("fixture done after ctrl-d r11-d".to_string()),
+        Reply::Text("fixture done after ctrl-d k4d".to_string()),
     ]);
     write_fake_llm_config(&dir, &fake, true);
     write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
@@ -698,9 +698,7 @@ fn ctrl_d_while_a_tool_sleeps_quits_in_bounded_time_and_leaves_the_tty_cooked() 
             // Not a quit: the UI must at least still be alive and leave
             // clean once the tool is released; report which it was.
             fs::write(dir.join("tool-release"), "").unwrap();
-            let alive = pty
-                .wait_for_after("r11-d", pressed_at, PTY_DEADLINE)
-                .is_ok();
+            let alive = pty.wait_for_after("k4d", pressed_at, PTY_DEADLINE).is_ok();
             pty.send(b"\x04").unwrap();
             let after = pty
                 .wait_for("tty-probe-done", PTY_DEADLINE)
@@ -746,16 +744,16 @@ fn a_resize_mid_stream_leaves_no_duplicated_reply_rows() {
     let _guard = TempDirGuard(dir.clone());
     let release = dir.join("release");
     let fake = FakeLlm::start(vec![Reply::Streamed(vec![
-        Chunk::Text("head r11-head-a7q of the reply.".to_string()),
+        Chunk::Text("head head-a7q of the reply.".to_string()),
         Chunk::WaitFor(release.clone()),
-        Chunk::Text(" tail r11-tail-b8r of the reply.".to_string()),
+        Chunk::Text(" tail tail-b8r of the reply.".to_string()),
     ])]);
     write_fake_llm_config(&dir, &fake, true);
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b"stream and hold\r").unwrap();
-    wait_for_squeezed_after(&mut pty, "r11-head-a7q", 0, "the first delta");
+    wait_for_squeezed_after(&mut pty, "head-a7q", 0, "the first delta");
     pty.wait_for("Esc to interrupt", PTY_DEADLINE)
         .expect("the status row never offered Esc to interrupt");
 
@@ -763,7 +761,7 @@ fn a_resize_mid_stream_leaves_no_duplicated_reply_rows() {
     pty.resize(40, 60).unwrap();
     pty.read_for(Duration::from_millis(600));
     fs::write(&release, "").unwrap();
-    wait_for_squeezed_after(&mut pty, "r11-tail-b8r", 0, "the tail after the release");
+    wait_for_squeezed_after(&mut pty, "tail-b8r", 0, "the tail after the release");
     pty.read_for(Duration::from_millis(800));
     assert_eq!(fake.served(), 1);
 
@@ -772,7 +770,7 @@ fn a_resize_mid_stream_leaves_no_duplicated_reply_rows() {
     pty.resize(40, 70).unwrap();
     wait_for_squeezed_after(
         &mut pty,
-        "r11-tail-b8r",
+        "tail-b8r",
         repaint_at,
         "the repaint after the second resize",
     );
@@ -781,10 +779,10 @@ fn a_resize_mid_stream_leaves_no_duplicated_reply_rows() {
     // whatever incremental frames followed it.
     let repainted = strip_ansi(&String::from_utf8_lossy(&pty.raw()[repaint_at..]));
     assert!(
-        squeezed(&repainted).contains("r11-head-a7q"),
+        squeezed(&repainted).contains("head-a7q"),
         "the head streamed before the resize is gone from the repainted transcript:\n{repainted}"
     );
-    for token in [b"r11-head-a7q".as_slice(), b"r11-tail-b8r".as_slice()] {
+    for token in [b"head-a7q".as_slice(), b"tail-b8r".as_slice()] {
         let mut rows: Vec<u16> = painted_at(pty.raw(), token, repaint_at)
             .into_iter()
             .map(|(row, _)| row)
@@ -804,7 +802,7 @@ fn a_resize_mid_stream_leaves_no_duplicated_reply_rows() {
     for (n, frame) in frames_since(pty.raw(), repaint_at).iter().enumerate() {
         let flat = squeezed(&strip_ansi(&String::from_utf8_lossy(frame)));
         assert!(
-            flat.matches("r11-tail-b8r").count() <= 1,
+            flat.matches("tail-b8r").count() <= 1,
             "frame {n} after the resize paints the tail more than once:\n{}",
             strip_ansi(&String::from_utf8_lossy(frame))
         );
@@ -834,9 +832,9 @@ fn frames_since(raw: &[u8], from: usize) -> Vec<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------
-// Accepted scope extension: paste CR normalisation. A bracketed paste
-// carrying Windows line ends (`\r\n`) is one line break per pair, not a
-// blank row, nothing is submitted, and Enter then sends both lines.
+// A bracketed paste with Windows line ends (`\r\n`) is one line break per
+// pair, not a blank row; nothing is submitted, and Enter then sends both
+// lines.
 // ---------------------------------------------------------------------
 
 /// Pastes `first<sep>second` into the empty composer and returns the raw
@@ -936,10 +934,9 @@ fn a_crlf_paste_is_one_line_break_and_enter_sends_both_lines() {
 }
 
 // ---------------------------------------------------------------------
-// Recipe walk: `hello` -> echo, then `.undo`. Cell erasure belongs to the
-// transcript task, so only the command turn's liveness is judged here:
-// whatever `.undo` says, the UI keeps taking keys and quits clean. The
-// observed outcome is printed for the record.
+// `hello` -> echo, then `.undo`. Only the command turn's liveness is
+// judged here: whatever `.undo` says, the UI keeps taking keys and quits
+// clean.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -974,11 +971,6 @@ fn dot_undo_after_a_dry_run_turn_keeps_the_ui_live() {
     pty.resize(24, 90).unwrap();
     pty.read_for(Duration::from_millis(1000));
     let after = strip_ansi(&String::from_utf8_lossy(&pty.raw()[undo_at..]));
-    let still_there = squeezed(&after).contains("undo-probe-h3x");
-    eprintln!(
-        "observed: after .undo the exchange is {} on the repainted screen",
-        if still_there { "STILL PRESENT" } else { "gone" }
-    );
     assert!(
         !after.contains("panicked"),
         "the .undo command turn panicked:\n{after}"

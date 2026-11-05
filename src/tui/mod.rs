@@ -4348,12 +4348,24 @@ mod tests {
             concat!("usage-", "probe"),
             concat!("usage-pattern ", "probe"),
             concat!("spec-", "first"),
+            concat!("quality ", "bar"),
+            concat!("scope ", "extension"),
         ]
         .map(str::to_lowercase);
         // Word-bounded needles: the word itself, a letter after `R-`, or
         // the word followed by a digit, with no letter or digit touching
         // either side.
-        let bounded = [concat!("rul", "ing"), concat!("rul", "ings")];
+        let bounded = [
+            concat!("rul", "ing"),
+            concat!("rul", "ings"),
+            concat!("the ", "plan"),
+            concat!("reci", "pe"),
+        ];
+        let numbered_words = [
+            concat!("rou", "nd "),
+            concat!("pha", "se "),
+            concat!("st", "ep "),
+        ];
         let is_boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
         let bounded_hit = |lower: &str, raw: &str| {
             let word = bounded.iter().any(|needle| {
@@ -4368,19 +4380,32 @@ mod tests {
                     && after.is_some_and(|c| c.is_ascii_uppercase())
                     && is_boundary(raw[at + 3..].chars().next())
             });
-            let numbered_round = lower.match_indices(concat!("rou", "nd ")).any(|(at, _)| {
-                is_boundary(lower[..at].chars().next_back())
-                    && lower[at + 6..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_digit())
+            let numbered = numbered_words.iter().any(|needle| {
+                lower.match_indices(needle).any(|(at, _)| {
+                    is_boundary(lower[..at].chars().next_back())
+                        && lower[at + needle.len()..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit())
+                })
             });
-            word || ruling_id || numbered_round
+            word || ruling_id || numbered
         };
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = rust_files(&root.join("src/tui"));
         files.extend(rust_files(&root.join("tests/common")));
-        files.push(root.join("tests/tui_binary.rs"));
+        // Every UI suite: `tui_binary.rs` and each `tui_*.rs` beside it.
+        let mut suites: Vec<_> = rust_files(&root.join("tests"))
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("tui_"))
+            })
+            .collect();
+        suites.sort();
+        assert!(suites.len() >= 4, "{suites:?}");
+        files.extend(suites);
         let mut offenders = Vec::new();
         for path in files {
             let file = path.strip_prefix(root).unwrap().display().to_string();

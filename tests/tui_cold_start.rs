@@ -1,5 +1,4 @@
-//! Cold-start cases for the full-screen UI, written from its documented
-//! contract before the implementation was read. Each case boots the real
+//! Cold-start cases for the full-screen UI. Each case boots the real
 //! binary cold (fresh config and cache dirs, no model) and exercises a
 //! usage pattern the lifecycle suite does not pin:
 //! non-interactive modes under `COYOTE_UI=tui`, malformed input bytes,
@@ -52,8 +51,8 @@ fn fresh_config_dir(scenario: &str) -> PathBuf {
     dir
 }
 
-/// The documented model-free recipe: a dry-run model, streaming on, nothing
-/// that could prompt on exit.
+/// A model-free config: a dry-run model, streaming on, nothing that could
+/// prompt on exit.
 fn write_dry_run_config(dir: &Path) {
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
@@ -255,7 +254,7 @@ fn quit_and_check(mut pty: Pty, what: &str) -> String {
 }
 
 // ---------------------------------------------------------------------
-// Non-interactive modes under the provisional env branch. The plan routes
+// Non-interactive modes under the provisional env branch. `main` routes
 // `COYOTE_UI=tui` to `tui::run` only for the interactive mode; a positional
 // prompt or an inspection flag is the plain command path, which has no
 // business with the alternate screen and must work without a tty.
