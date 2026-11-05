@@ -1502,7 +1502,7 @@ mod tests {
                 faults("f.rs", reverted_bail, "asked_by_this_node", Kind::Error).len(),
                 1
             );
-            let printed = "fn knocks(ctx: &RequestContext) -> Result<()> {\n    out_text(&format!(\"{}\", render_knocks()));\n    Ok(())\n}\n";
+            let printed = "fn knocks(ctx: &Ctx) -> Result<()> {\n    out_text(&format!(\"{}\", render_knocks()));\n    Ok(())\n}\n";
             assert_eq!(faults("f.rs", printed, "knocks", Kind::Text).len(), 1);
             let respelled = "impl Slot {\n    fn pending(&self) -> Result<()> {\n        bail!(\"{}\", live_prefix().render_hints(&text));\n    }\n}\n";
             assert_eq!(faults("f.rs", respelled, "pending", Kind::Error).len(), 2);
@@ -1513,7 +1513,7 @@ mod tests {
 
             let quoted = "fn no_open_question(id: &str) -> anyhow::Error {\n    // out_text( is not called here\n    QuotingError::wrap(NoticeText::default().peer(id))\n}\n";
             assert!(faults("f.rs", quoted, "no_open_question", Kind::Error).is_empty());
-            let printed_path = "fn knocks(ctx: &RequestContext) -> Result<()> {\n    out_path_text(&render_knocks().render(live_prefix()));\n    Ok(())\n}\n";
+            let printed_path = "fn knocks(ctx: &Ctx) -> Result<()> {\n    out_path_text(&render_knocks().render(live_prefix()));\n    Ok(())\n}\n";
             assert!(faults("f.rs", printed_path, "knocks", Kind::Text).is_empty());
             let in_tests = "#[cfg(test)]\nmod tests {\n    fn knocks() {\n        out_text(\"x\");\n    }\n}\n";
             assert_eq!(faults("f.rs", in_tests, "knocks", Kind::Text).len(), 1);
