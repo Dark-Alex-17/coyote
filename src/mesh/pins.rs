@@ -1056,7 +1056,7 @@ mod tests {
             "render_error(",
         ];
 
-        fn at_word_boundary<'a>(
+        pub(super) fn at_word_boundary<'a>(
             code: &'a str,
             needle: &'a str,
         ) -> impl Iterator<Item = usize> + 'a {
@@ -1092,7 +1092,7 @@ mod tests {
         }
 
         /// The name of the function `code` opens, when it opens one with a body.
-        fn fn_name(code: &str) -> Option<&str> {
+        pub(super) fn fn_name(code: &str) -> Option<&str> {
             if code.ends_with(';') {
                 return None;
             }
@@ -1351,6 +1351,188 @@ mod tests {
                 hits.is_empty(),
                 "print mesh text through out_text or err_text, or out_path_text/err_path_text for a path:\n{}",
                 hits.join("\n")
+            );
+        }
+    }
+
+    mod peer_text_sites {
+        use super::mesh_text_sinks::{at_word_boundary, fn_name};
+        use super::*;
+
+        /// What a listed function does with text a peer chose or a human typed.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Kind {
+            /// Builds a line or a listing as runs, which the caller renders and prints.
+            Text,
+            /// Builds an error whose quoted parts keep their bytes when the REPL shows it.
+            Error,
+        }
+
+        /// Each function that puts a peer's name, id, words or path, or the human's own
+        /// words, in front of the human. Under the slash prefix only this node's hints may
+        /// be respelled, so none of them may hand its text to `out_text`, `err_text` or
+        /// `render_hints`, which respell every dotted word; an error builder has to quote
+        /// through `QuotingError::wrap` or `NoticeText` runs.
+        const SITES: &[(&str, &str, Kind)] = &[
+            ("src/repl/mesh.rs", "pending", Kind::Text),
+            ("src/repl/mesh.rs", "knocks", Kind::Text),
+            ("src/repl/mesh.rs", "render_pending", Kind::Text),
+            ("src/repl/mesh.rs", "pending_entry", Kind::Text),
+            ("src/repl/mesh.rs", "render_question_block", Kind::Text),
+            ("src/repl/mesh.rs", "question_header", Kind::Text),
+            ("src/repl/mesh.rs", "quoted_rows", Kind::Text),
+            ("src/repl/mesh.rs", "answer_footer", Kind::Text),
+            ("src/repl/mesh.rs", "nothing_sent", Kind::Text),
+            ("src/repl/mesh.rs", "pending_clear_clause", Kind::Text),
+            ("src/repl/mesh.rs", "render_knocks", Kind::Text),
+            ("src/repl/mesh.rs", "render_peer_detail", Kind::Text),
+            ("src/repl/mesh.rs", "not_shared_refusal", Kind::Text),
+            ("src/repl/mesh.rs", "send_confirmation", Kind::Text),
+            ("src/repl/mesh.rs", "knock_confirmation", Kind::Text),
+            ("src/mesh/fetch.rs", "not_shared_sentence", Kind::Text),
+            ("src/repl/mesh.rs", "resolve_pending_id", Kind::Error),
+            ("src/repl/mesh.rs", "whole_id_refusal", Kind::Error),
+            ("src/repl/mesh.rs", "quoted_peer_side", Kind::Error),
+            ("src/repl/mesh.rs", "quoted_status_failure", Kind::Error),
+            ("src/repl/mesh.rs", "quoted_send_failure", Kind::Error),
+            ("src/repl/mesh.rs", "quoted_access_failure", Kind::Error),
+            ("src/repl/mesh.rs", "quoted_fetch_failure", Kind::Error),
+            ("src/repl/mesh.rs", "no_open_access_request", Kind::Error),
+            ("src/repl/mesh.rs", "no_open_question", Kind::Error),
+            ("src/repl/mesh.rs", "asked_by_this_node", Kind::Error),
+            ("src/mesh/pending.rs", "access_not_a_question", Kind::Error),
+            (
+                "src/mesh/pending.rs",
+                "question_not_an_access_request",
+                Kind::Error,
+            ),
+            ("src/mesh/node.rs", "open_question", Kind::Error),
+            ("src/mesh/node.rs", "runtime_to_answer", Kind::Error),
+            ("src/mesh/node.rs", "already_closed", Kind::Error),
+            ("src/mesh/access.rs", "pending", Kind::Error),
+            ("src/mesh/access.rs", "standing_shares", Kind::Error),
+            ("src/mesh/access.rs", "standing_write_failed", Kind::Error),
+            ("src/mesh/access.rs", "grant_once", Kind::Error),
+            ("src/mesh/access.rs", "put_back", Kind::Error),
+            ("src/mesh/shares.rs", "refused_at_load", Kind::Error),
+            ("src/mesh/shares.rs", "quoted_share_write", Kind::Error),
+        ];
+
+        /// Calls that respell every dotted word in the text they are given.
+        const RESPELLERS: [&str; 3] = ["out_text(", "err_text(", "render_hints("];
+
+        /// The code of every function named `name` in `source` outside its test modules,
+        /// a free function or a method one level into an `impl`, from its opening line to
+        /// its closing brace, comment lines left out.
+        fn bodies(source: &str, name: &str) -> Vec<String> {
+            let mut found = Vec::new();
+            let mut open: Option<(usize, String)> = None;
+            for line in lines_outside_test_modules(source) {
+                let code = line.trim_start();
+                let indent = line.len() - code.len();
+                if code.starts_with("//") {
+                    continue;
+                }
+                match open.as_mut() {
+                    Some((at, body)) => {
+                        body.push_str(code);
+                        body.push('\n');
+                        if indent == *at && code.starts_with('}') {
+                            found.push(std::mem::take(body));
+                            open = None;
+                        }
+                    }
+                    None if (indent == 0 || indent == 4) && fn_name(code) == Some(name) => {
+                        open = Some((indent, format!("{code}\n")));
+                    }
+                    None => {}
+                }
+            }
+            found
+        }
+
+        /// Whether the body of `name` routes its error through another error builder
+        /// listed here, as a dispatcher that picks which refusal to quote does.
+        fn hands_to_an_error_site(body: &str, name: &str) -> bool {
+            SITES.iter().any(|(_, site, kind)| {
+                *kind == Kind::Error
+                    && *site != name
+                    && at_word_boundary(body, &format!("{site}(")).next().is_some()
+            })
+        }
+
+        /// What is wrong with `name` in `source` for its kind, one line per fault.
+        fn faults(path: &str, source: &str, name: &str, kind: Kind) -> Vec<String> {
+            let found = bodies(source, name);
+            if found.is_empty() {
+                return vec![format!(
+                    "{path}: `{name}` is gone; list the function that now builds its text"
+                )];
+            }
+            let mut faults = Vec::new();
+            for body in &found {
+                for call in RESPELLERS {
+                    if at_word_boundary(body, call).next().is_some() {
+                        faults.push(format!(
+                            "{path}: `{name}` calls `{call}`, which respells the peer's words"
+                        ));
+                    }
+                }
+                let quotes = body.contains("QuotingError::wrap")
+                    || body.contains("NoticeText")
+                    || hands_to_an_error_site(body, name);
+                if kind == Kind::Error && !quotes {
+                    faults.push(format!(
+                        "{path}: `{name}` builds its error without QuotingError::wrap or NoticeText runs"
+                    ));
+                }
+            }
+            faults
+        }
+
+        #[test]
+        fn the_site_checker_flags_a_reverted_body_and_a_lost_name() {
+            let reverted_error = "fn no_open_question(id: &str) -> anyhow::Error {\n    anyhow!(format!(\"No open question has id {id}.\"))\n}\n";
+            assert_eq!(
+                faults("f.rs", reverted_error, "no_open_question", Kind::Error).len(),
+                1
+            );
+            let reverted_bail = "fn asked_by_this_node(id: &str) -> Result<()> {\n    bail!(format!(\"{id} was asked by this node.\"))\n}\n";
+            assert_eq!(
+                faults("f.rs", reverted_bail, "asked_by_this_node", Kind::Error).len(),
+                1
+            );
+            let printed = "fn knocks(ctx: &RequestContext) -> Result<()> {\n    out_text(&format!(\"{}\", render_knocks()));\n    Ok(())\n}\n";
+            assert_eq!(faults("f.rs", printed, "knocks", Kind::Text).len(), 1);
+            let respelled = "impl Slot {\n    fn pending(&self) -> Result<()> {\n        bail!(\"{}\", live_prefix().render_hints(&text));\n    }\n}\n";
+            assert_eq!(faults("f.rs", respelled, "pending", Kind::Error).len(), 2);
+            assert_eq!(
+                faults("f.rs", printed, "render_knocks", Kind::Text).len(),
+                1
+            );
+
+            let quoted = "fn no_open_question(id: &str) -> anyhow::Error {\n    // out_text( is not called here\n    QuotingError::wrap(NoticeText::default().peer(id))\n}\n";
+            assert!(faults("f.rs", quoted, "no_open_question", Kind::Error).is_empty());
+            let printed_path = "fn knocks(ctx: &RequestContext) -> Result<()> {\n    out_path_text(&render_knocks().render(live_prefix()));\n    Ok(())\n}\n";
+            assert!(faults("f.rs", printed_path, "knocks", Kind::Text).is_empty());
+            let in_tests = "#[cfg(test)]\nmod tests {\n    fn knocks() {\n        out_text(\"x\");\n    }\n}\n";
+            assert_eq!(faults("f.rs", in_tests, "knocks", Kind::Text).len(), 1);
+        }
+
+        /// A peer's `.vault` or `.mesh trust x` reads as the peer wrote it under every
+        /// prefix, so each listed function keeps building its text as runs.
+        #[test]
+        fn peer_text_never_reaches_a_respelling_call() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let mut faults_found = Vec::new();
+            for (path, name, kind) in SITES {
+                let source = std::fs::read_to_string(root.join(path)).unwrap();
+                faults_found.extend(faults(path, &source, name, *kind));
+            }
+            assert!(
+                faults_found.is_empty(),
+                "build peer text as NoticeText runs and print it with out_path_text(&text.render(live_prefix())):\n{}",
+                faults_found.join("\n")
             );
         }
     }
