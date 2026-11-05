@@ -671,8 +671,8 @@ fn intake_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "draft-prompt",
-                ", \"draft_confirm\": \"confirm_draft\"}",
-                "}",
+                ", \"draft_confirm\": \"confirm_draft\",",
+                ",",
                 "ask_dispatch: draft_confirm -> confirm_draft",
             ),
             (
