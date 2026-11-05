@@ -1085,17 +1085,30 @@ fn run_password_in_pty(
 
 /// `run_password_in_pty` with a shell `prelude` the wrapper runs on the
 /// terminal before starting the tool (for example to change its mode).
+///
+/// The wrapper waits on the tool, but the process that restores echo after
+/// an interrupt may be the tool's own child (the TypeScript helper's `sh`
+/// runs its trap after node is gone), so without a prelude the flags are
+/// read once echo is back or two seconds have passed: a helper that never
+/// restores it still reports `-echo`. A prelude sets the mode the case
+/// expects to see kept, so it reads the flags at once.
 fn run_password_in_pty_with(
     prelude: &str,
     tool: &str,
     marker: &str,
     interact: impl FnOnce(&mut Pty) -> std::io::Result<()>,
 ) -> String {
+    let settle = if prelude.is_empty() {
+        "i=0; while [ $i -lt 20 ] && stty -a </dev/tty | tr -s ' \\n\\t' '\\n' | grep -qx -- -echo; do \
+         sleep 0.1; i=$((i+1)); done;"
+    } else {
+        ""
+    };
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(format!(
             "exec </dev/null; trap ':' INT; {prelude} out=$(mktemp); {tool} >\"$out\" 2>&1; rc=$?; \
-             cat \"$out\"; rm -f \"$out\"; echo \"tool-exit=$rc\"; \
+             cat \"$out\"; rm -f \"$out\"; echo \"tool-exit=$rc\"; {settle} \
              echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done"
         ))
         .env("PYTHONDONTWRITEBYTECODE", "1")
