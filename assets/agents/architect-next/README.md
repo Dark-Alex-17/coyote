@@ -375,9 +375,10 @@ answers so far, snapshots state.json, sets the exposed `discussion` state key (t
 its options with the recommended one marked, the reply, the answers so far and the plan path)
 for the engineer chat lane, carries `discussion_run_id` into the next run, and ends at
 `end_discussion` with an `ARCHITECT_AWAITING_DISCUSSION` message. The next message
-`continue` asks the parked question again, and `continue: <answer>` records that answer and
-goes on to the remaining questions; any other message starts a fresh run and leaves the
-parked one. A question parks at most `DISCUSSION_PARKS_MAX` (3) times; after that it is asked
+`continue` asks the parked question again (trailing punctuation allowed), and
+`continue: <answer>` records that answer and goes on to the remaining questions; `resume` is
+an alias of `continue`. Any other message, including prose such as `continue please`, starts
+a fresh run and leaves the parked one. A question parks at most `DISCUSSION_PARKS_MAX` (3) times; after that it is asked
 again with a note, and its next typed reply is recorded as the answer without the
 classifier. These kinds stay free text, because their answer is not a pick from a list:
 `need_design_doc` (a design doc path), `clarify` (a corrected design doc path),

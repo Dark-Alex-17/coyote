@@ -147,7 +147,8 @@ executes it. You two share artifacts, never transcripts.
   (the recommended one is marked), the answers so far and the plan path. Do
   not edit the plan and do not answer for the user. Once it is settled, tell
   the user to say `continue: <settled answer>` (or `continue` to be asked
-  again) so the run resumes at that question.
+  again) so the run resumes at that question. `resume` works the same as
+  `continue`; the answer only counts after the colon.
 <!-- end -->
 <!-- when:chat_agent_for=sisyphus -->
 - Sisyphus-attachment specifics: your direct edits cover the task's log and

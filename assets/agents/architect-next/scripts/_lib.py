@@ -88,7 +88,8 @@ HARD_TRIGGER_RE = re.compile(
     re.I,
 )
 RESUME_RE = re.compile(r"Architect run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8}(?:-[0-9]+)?)")
-CONTINUE_RE = re.compile(r"(?is)^(?:continue|resume)\b[\s:,;.-]*(.*)$")
+# A settled answer only follows a colon; a bare word with trailing punctuation re-asks, and any other prose is not a continue.
+CONTINUE_RE = re.compile(r"(?is)^(?:continue|resume)(?:\s*:\s*(.+)|\W*)$")
 SISYPHUS_RUN_RE = re.compile(r"Sisyphus run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
 TASK_ID_RE = re.compile(r"\bTASK-\d{3,}\b")
 SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")

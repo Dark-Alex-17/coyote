@@ -229,7 +229,7 @@ def intake(state):
                 continue  # recomputed from the live variables
             u[k] = v
         u["resume_phase"] = prior.get("phase", "")
-        settled = cont.group(1).strip() if cont else ""
+        settled = (cont.group(1) or "").strip() if cont else ""
         u["settled_answer"] = settled if re.search(r"\w", settled) else ""
         raw_tasks = read_artifact(u["run_dir"], "tasks.json")
         try:
@@ -2686,7 +2686,8 @@ def choice_park(state):
         "reply": (state.get("last_answer_text") or "").strip(), "answers": as_list(state.get("choice_answers")),
         "number": idx + 1, "total": len(queue),
         "resume": ('Discuss it here. When it is settled, say "continue" to be asked this question again, or '
-                   '"continue: <your answer>" to record that answer and go on to the remaining questions.'),
+                   '"continue: <your answer>" to record that answer and go on to the remaining questions. '
+                   '"resume" works the same as "continue".'),
     }
     u.update({"choice_parks": parks, "parked": DISCUSSION_PARKED, "discussion_run_id": run_id,
               "discussion_message": _discussion_message(u["discussion"])})

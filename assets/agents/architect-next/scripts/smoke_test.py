@@ -1482,11 +1482,34 @@ check("intake: a message that is not a continue with the carried key -> a fresh 
 s = {"initial_prompt": "continue", **STORE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: 'continue' with no carried key -> a fresh run as before", not s.get("resume_mode") and s["run_id"] != PARK_ID, s)
-for prompt, settled in (("continue, option 2", "option 2"), ("continue - use pg", "use pg"), ("resume; ...", "")):
+s = {"initial_prompt": "continue: use pg", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+s.update(gates.resume_route(s))
+s.update(gates.choice_resume(s))
+check("intake -> choice_resume: 'continue: use pg' -> 'use pg' recorded for the parked question",
+      s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "use pg", "via": "settled"}],
+      s.get("choice_answers"))
+s = {"initial_prompt": "resume: option 2", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+s.update(gates.resume_route(s))
+s.update(gates.choice_resume(s))
+check("intake -> choice_resume: 'resume: option 2' -> option 2 recorded for the parked question",
+      s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "9090", "via": "settled"}],
+      s.get("choice_answers"))
+s = {"initial_prompt": "continue.", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+s.update(gates.resume_route(s))
+s.update(gates.choice_resume(s))
+s.update(gates.open_questions_gate(s))
+check("intake -> choice_resume: bare 'continue.' -> the parked question asked again, no answer recorded",
+      s["run_id"] == PARK_ID and s["_next"] == "escalate_gate" and s["escalation"]["data"]["index"] == 1
+      and s["choice_answers"] == PARK_ANSWERS and s["settled_answer"] == "", s)
+for prompt in ("continue please", "continue, but why X?"):
     s = {"initial_prompt": prompt, "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
     s.update(gates.intake(s))
-    check(f"intake: {prompt!r} -> the settled answer {settled!r}, leading punctuation stripped",
-          s.get("resume_mode") is True and s["settled_answer"] == settled, s.get("settled_answer"))
+    check(f"intake: {prompt!r} is prose, not a continue -> a fresh run, no answer recorded, the key cleared, the left discussion ledgered",
+          not s.get("resume_mode") and s["run_id"] != PARK_ID and not s.get("settled_answer") and s["discussion_run_id"] == ""
+          and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
 
 
 def resume_chain(run_id, prompt, gate):

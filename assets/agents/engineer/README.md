@@ -59,4 +59,5 @@ A run that parks on a design question for discussion exposes it as
 recommended one marked, the answers so far and the plan path. The engineer
 discusses it without editing the plan or answering for the user, then tells
 the user to say `continue: <settled answer>` (or `continue` to be asked again)
-so the run resumes at that question.
+so the run resumes at that question. `resume` works the same as `continue`;
+the answer only counts after the colon.

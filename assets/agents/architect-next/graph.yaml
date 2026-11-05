@@ -130,7 +130,8 @@ session:
       After the last run parked on a design discussion, "continue" or
       "continue: <answer>" routes RUN: the run resumes at the parked question,
       recording the answer when one is given and asking the question again when
-      not.
+      not. "resume" and "resume: <answer>" work the same; other prose that
+      starts with continue or resume starts a fresh run.
   chat:
     agent: engineer
     variables:
