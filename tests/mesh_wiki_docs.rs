@@ -2113,8 +2113,18 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         .unwrap_or_else(|| panic!("the sample has no `N peer(s)` line:\n{sample}"));
     assert_eq!(
         footer.len() - count_at,
-        3,
-        "the count line and the two legends close the sample:\n{sample}"
+        4,
+        "the count line, the name-addressing line and the two legends close the sample:\n{sample}"
+    );
+    let name_line = repl
+        .split_once("const NAME_ADDRESSING_LINE: &str =")
+        .and_then(|(_, rest)| rest.split_once(";\n"))
+        .and_then(|(value, _)| string_literals(value).into_iter().next())
+        .expect("src/repl/mesh.rs defines NAME_ADDRESSING_LINE as one string literal");
+    assert_eq!(
+        footer[count_at + 1],
+        name_line,
+        "the line under the count is the name-addressing line the code prints:\n{sample}"
     );
     for line in &footer[..count_at] {
         let (dest8, _) = line.split_once(" key changed: ").unwrap_or_else(|| {
