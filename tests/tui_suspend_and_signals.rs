@@ -1,7 +1,7 @@
 //! Suspend, signal, resize and keyboard-protocol cases for the full-screen
 //! UI. Each case runs the binary cold on a pseudo-terminal under the same
-//! bash wrappers `tui_binary.rs` uses, so the exit code and the tty flags are reported after every exit
-//! path. Unix-only for the same reasons.
+//! bash wrappers `tui_binary.rs` uses, so the exit code and the tty flags
+//! are reported after every exit path. Unix-only for the same reasons.
 #![cfg(unix)]
 
 mod common;
@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
-use common::fake_llm::{Chunk, FakeLlm, Reply};
+use common::fake_llm::{Chunk, FakeLlm, HOLD_LIMIT, Reply};
 use common::pty::{Pty, strip_ansi};
 use serial_test::serial;
 
@@ -682,7 +682,12 @@ fn ctrl_z_mid_stream_hands_the_terminal_back_and_the_reply_finishes_after_fg() {
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b"stream and hold\r").unwrap();
+    let started = Instant::now();
     wait_for_squeezed_after(&mut pty, "head before suspend r12-h", 0, "the first delta");
+    assert!(
+        started.elapsed() < HOLD_LIMIT,
+        "the first delta appeared only after the fake gave up holding the stream"
+    );
     pty.read_for(Duration::from_millis(300));
     let before_suspend = pty.raw().len();
     let stopped_marker = suspend_and_check_handback(&mut pty, before_suspend);

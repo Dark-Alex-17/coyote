@@ -45,7 +45,7 @@ fn fresh_config_dir(scenario: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let dir = env::temp_dir().join(format!(
-        "coyote-tui-probe-{scenario}-{}-{unique}-{sequence}",
+        "coyote-tui-cold-start-{scenario}-{}-{unique}-{sequence}",
         process::id()
     ));
     fs::create_dir_all(dir.join("home")).unwrap();

@@ -102,7 +102,7 @@ impl UiSink for TuiSink {
         self.send(UiMsg::Notice {
             kind,
             text: super::render::plain_text(text)
-                .trim_start_matches('\n')
+                .trim_matches('\n')
                 .to_string(),
         });
     }

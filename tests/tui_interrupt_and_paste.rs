@@ -1,8 +1,7 @@
 //! Interrupt, quit, hotkey-gate and paste cases for the full-screen UI.
 //! Each case runs the binary cold on a pseudo-terminal under the same bash
-//! wrapper
-//! `tui_binary.rs` uses, so the exit code and the tty flags are reported
-//! after every exit path. Unix-only for the same reasons.
+//! wrapper `tui_binary.rs` uses, so the exit code and the tty flags are
+//! reported after every exit path. Unix-only for the same reasons.
 #![cfg(unix)]
 
 mod common;
@@ -143,8 +142,9 @@ const ASKING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20   echo \"fixture confirm: ${v:-cancelled} k4r\" >> \"$LLM_OUTPUT\"\n\
     }\n";
 
-/// Marks `<marker>-started`, then waits (at most eight seconds) for
-/// `<marker>-release` before finishing.
+/// Marks `<marker>-started`, then waits (at most thirty seconds; longer
+/// than its twins so the 7 s bounded-quit case cannot overlap the tool's
+/// own give-up) for `<marker>-release` before finishing.
 const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Wait until released.\n\
@@ -912,8 +912,7 @@ fn a_crlf_paste_is_one_line_break_and_enter_sends_both_lines() {
     // Enter submits the two-line draft; the dry-run echo carries both.
     let sent_at = pty.raw().len();
     pty.send(b"\r").unwrap();
-    let shown = wait_for_squeezed_after(&mut pty, "Working", sent_at, "the working row");
-    let _ = shown;
+    wait_for_squeezed_after(&mut pty, "Working", sent_at, "the working row");
     let deadline = Instant::now() + PTY_DEADLINE;
     loop {
         pty.read_for(Duration::from_millis(200));

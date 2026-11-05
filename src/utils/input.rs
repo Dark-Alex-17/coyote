@@ -15,10 +15,12 @@ pub fn read_single_key(valid_chars: &[char], default: char, prompt: &str) -> Res
             .rev()
             .find(|line| !line.trim().is_empty())
             .unwrap_or_default()
-            .trim()
-            .chars()
-            .take(80)
-            .collect::<String>();
+            .trim();
+        let truncated = question.chars().count() > 80;
+        let mut question: String = question.chars().take(80).collect();
+        if truncated {
+            question.push_str("...");
+        }
         bail!("Keyboard prompts are not available in the TUI yet; unanswered: {question}"); // TASK-315
     }
     print!("{prompt}");

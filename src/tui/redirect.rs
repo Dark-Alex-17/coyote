@@ -127,13 +127,15 @@ mod unix {
 
         fn restore(&self) {
             flush_std_streams();
-            CAPTURED.store(false, Ordering::SeqCst);
             if let Err(err) = dup2(self.stdout.as_raw_fd(), libc::STDOUT_FILENO) {
                 warn!("Failed to restore stdout after a command turn: {err}");
             }
             if let Err(err) = dup2(self.stderr.as_raw_fd(), libc::STDERR_FILENO) {
                 warn!("Failed to restore stderr after a command turn: {err}");
             }
+            // Cleared once the descriptors are back, the mirror of
+            // `begin_with` setting it once they point at the pipe.
+            CAPTURED.store(false, Ordering::SeqCst);
         }
     }
 
