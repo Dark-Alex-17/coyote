@@ -1056,10 +1056,28 @@ def _pr_unit(state, task, tasks):
 
 
 # ====================================================================== 2.5 per-task loop
-def _run_branch(state):
-    return str(state.get("run_branch_override") or "").strip() or f"feat/PLAN-{state.get('plan_slug')}"
+def _run_branch(state, group=None):
+    """The run branch name: the owner's override from the group it was given in on, else feat/PLAN-<slug>."""
+    override = str(state.get("run_branch_override") or "").strip()
+    if override and (group is None or group >= as_int(state.get("run_branch_override_group"))):
+        return override
+    return f"feat/PLAN-{state.get('plan_slug')}"
 
 
+def _set_run_branch_override(state, u, name):
+    """Record an owner's run branch name; in PR-group mode a typed -g<n> suffix is dropped, the group suffix is ours."""
+    groups = not is_single(state) and MULTI_IS_GROUPS
+    if groups:
+        name = re.sub(r"-g\d+$", "", name) or name
+    u["run_branch_override"] = name
+    u["run_branch_override_group"] = (as_int(state.get("group_index")) or 1) if groups else 0
+    return name
+
+
+RETRY_BRANCH = "Retry the branch setup"
+USE_WORKTREE = "Use that worktree as the code dir"
+PICK_BRANCH = "Pick a different branch name"
+ABORT_RUN = "Abort the run"
 WORKTREE_HELD_RE = re.compile(r"is already (?:used by worktree|checked out) at '?([^'\n]+?)'?\s*$", re.M)
 
 
@@ -1092,18 +1110,28 @@ def _git_setup_escalation(state, u, branch, base, code, step, detail):
         return raise_escalation(state, u, escalation(
             "git_setup_failed", f"The run branch {branch} is already checked out in the worktree at {where}, so it cannot be "
                                 f"checked out in {code}. Use that worktree, pick a different branch name, or abort?",
-            [option("Use that worktree as the code dir", recommended=True, evidence=where), option("Pick a different branch name"),
-             option("Abort the run")], evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base}))
+            [option(USE_WORKTREE, recommended=True, evidence=where), option(PICK_BRANCH), option(ABORT_RUN)],
+            evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base}))
     return raise_escalation(state, u, escalation(
         "git_setup_failed", f"Could not set up the branch {branch} from {base} in {code}: git {' '.join(step)} failed. Retry, or abort?",
-        [option("Retry the branch setup", recommended=True), option("Abort the run")], evidence=tail(detail, 1500),
+        [option(RETRY_BRANCH, recommended=True), option(ABORT_RUN)], evidence=tail(detail, 1500),
         data={"branch": branch, "base": base}))
 
 
+def _git_common_dir(path):
+    out = git_out(path, "rev-parse", "--path-format=absolute", "--git-common-dir", default="")
+    return os.path.realpath(out) if out else ""
+
+
 def _use_code_dir(state, u, path):
-    """Point the run at another checkout of the same repo (an owner answer); False when the path is no directory."""
+    """Point the run at another checkout of the same repo (an owner answer); False, ledgered, for any other path."""
     path = os.path.abspath(os.path.expanduser(path.strip())) if path.strip() else ""
     if not path or not os.path.isdir(path):
+        ledger(state, u, f"branch: {path or '(no path)'} is not a directory; the code dir is unchanged")
+        return False
+    ours = _git_common_dir(state.get("code_repo_path") or "")
+    if not ours or _git_common_dir(path) != ours:
+        ledger(state, u, f"branch: {path} is not a checkout of the code repo {state.get('code_repo_path')}; the code dir is unchanged")
         return False
     u["code_repo_path"] = u["code_dir_override"] = path
     ledger(state, u, f"branch: the code dir is now {path} (owner)")
@@ -1121,14 +1149,14 @@ def branch_setup(state):
         else:
             gi = as_int(state.get("group_index")) or 1
             u["group_index"] = gi
-            branch = f"{_run_branch(state)}-g{gi}"
+            branch = f"{_run_branch(state, gi)}-g{gi}"
             # A skipped group never gets a PR, so the stack continues from the
             # last group that did.
             skipped = {as_int(i) for i in as_list(state.get("skipped_group_indexes"))}
             prev_gi = gi - 1
             while prev_gi in skipped:
                 prev_gi -= 1
-            prev = f"{_run_branch(state)}-g{prev_gi}" if prev_gi >= 1 else ""
+            prev = f"{_run_branch(state, prev_gi)}-g{prev_gi}" if prev_gi >= 1 else ""
             if prev:
                 merged = _pr_merged(state, prev)
                 base = base if merged else prev
@@ -2685,7 +2713,8 @@ def parse_answer(state):
             u["_next"] = "classify_reply"
             return u
     else:
-        choice = text if esc.get("kind") == "need_design_doc" else match_option(text, options)
+        typed_path = esc.get("kind") == "need_design_doc" and _typed_doc_path(text)
+        choice = text if typed_path else match_option(text, options)
         if choice is None and text and not truthy(state.get("reply_interpreted")):
             # the first typed reply that names no option is interpreted once, never re-asked blind
             u["reply_accepts"] = _accepts_text(esc.get("kind", ""))
@@ -2711,7 +2740,6 @@ def parse_answer(state):
     return u
 
 
-RETRY_BRANCH = "Retry the branch setup"
 # The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
 ACCEPTED_INSTRUCTIONS = {
     "git_setup_failed": ("base_branch", "branch_name", "reuse_worktree"),
@@ -2735,9 +2763,11 @@ INSTRUCTION_HELP = {
     "recipe": "supply the local-run recipe for the probe; value: the recipe",
     "mode_values": "set run mode values; value: key=value pairs",
 }
-# How an applied text instruction reads as an answer, in the words apply_answer keys on.
+# How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
+# the owner's own words verbatim; only mode_values takes the interpreter's extracted value.
 INSTRUCTION_ANSWERS = {"revision": "Revise the breakdown: {}", "answers": "{}", "rescope": "Re-scope: {}",
                        "recipe": "Supply the recipe: {}", "mode_values": "{}"}
+FREE_FORM_SHAPES = ("revision", "answers", "rescope", "recipe")
 
 
 def _accepts_text(kind):
@@ -2745,7 +2775,7 @@ def _accepts_text(kind):
     return "\n".join(f"- {s}: {INSTRUCTION_HELP[s]}" for s in shapes) or "(none: this question accepts no instructions)"
 
 
-def _apply_instruction(state, u, esc, shape, value):
+def _apply_instruction(state, u, esc, shape, value, text):
     """Carry out an accepted instruction; the answer apply_answer then acts on, or "" when it cannot be applied."""
     value = value.strip()
     if shape in ("base_branch", "branch_name"):
@@ -2755,13 +2785,24 @@ def _apply_instruction(state, u, esc, shape, value):
         if shape == "base_branch":
             u["base_branch_name"] = u["base_branch_override"] = name
         else:
-            u["run_branch_override"] = name
+            _set_run_branch_override(state, u, name)
         return RETRY_BRANCH
     if shape == "reuse_worktree":
         return RETRY_BRANCH if _use_code_dir(state, u, value or as_dict(esc.get("data")).get("worktree") or "") else ""
     if shape == "path":
         return _typed_doc_path(value)
+    if shape in FREE_FORM_SHAPES:
+        return INSTRUCTION_ANSWERS[shape].format(text.strip()) if text.strip() else ""
     return INSTRUCTION_ANSWERS[shape].format(value) if value and shape in INSTRUCTION_ANSWERS else ""
+
+
+def _exact_option(reply, options):
+    """The option a reply names exactly (case-insensitive) or by its 1-based number; None for anything looser."""
+    reply = reply.strip()
+    if re.fullmatch(r"\d+", reply):
+        i = int(reply)
+        return options[i - 1].get("text") if 1 <= i <= len(options) else None
+    return next((o.get("text") for o in options if o.get("text", "").strip().lower() == reply.lower()), None) if reply else None
 
 
 def interpret_route(state):
@@ -2787,7 +2828,7 @@ def interpret_route(state):
         return u
 
     if verdict == "option":
-        choice = match_option(str(state.get("reply_option") or ""), esc.get("options") or [])
+        choice = _exact_option(str(state.get("reply_option") or ""), esc.get("options") or [])
         if choice:
             return decide(choice, f"the option {choice!r}")
         ledger(state, u, f"interpret: {kind}: {said!r} named no offered option ({state.get('reply_option')!r}); unclear")
@@ -2797,7 +2838,7 @@ def interpret_route(state):
         if shape not in ACCEPTED_INSTRUCTIONS.get(kind, ()):
             ledger(state, u, f"interpret: {kind}: {said!r} reads as the instruction {shape or '(unnamed)'}, which this "
                              f"question does not accept; unclear")
-        elif answer := _apply_instruction(state, u, esc, shape, value):
+        elif answer := _apply_instruction(state, u, esc, shape, value, text):
             return decide(answer, f"the instruction {shape}={tail(value, 120)!r}, applied as {answer!r}")
         else:
             ledger(state, u, f"interpret: {kind}: the instruction {shape}={tail(value, 120)!r} could not be applied; unclear")
@@ -2964,6 +3005,16 @@ def _answered(state, choices, default=None):
     return default
 
 
+STOP_REPLIES = ("stop", "stop and report", "abort", "abort the run")
+
+
+def _whole_reply_stop(answer, options=(), replies=STOP_REPLIES):
+    """A reply that IS a stop or an abort: a stop/abort option it names, or the bare words; never a substring of prose."""
+    bare = re.sub(r"[\W_]+$", "", (answer or "").strip().lower())
+    picked = _exact_option(answer or "", list(options)) if options else None
+    return bare in replies or bool(picked and picked.lower().startswith(("stop", "abort")))
+
+
 def _typed_doc_path(answer):
     """The absolute path of an existing file named by the reply's first token, or ""."""
     p = os.path.expanduser(answer.strip().split()[0]) if answer.strip() else ""
@@ -3018,7 +3069,7 @@ def apply_answer(state):
                 u["draft_feedback"] = answer
                 u["_next"] = "draft_brief"
     elif kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
-                  "git_setup_failed", "branch_name", "gate_fault") and abort:
+                  "git_setup_failed", "gate_fault") and abort:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
@@ -3068,7 +3119,8 @@ def apply_answer(state):
             u["amend_cycles"] = AMEND_CYCLES_MAX - 1
             u["_next"] = "gate1_build"
     elif kind == "gate1_stuck":
-        if stop or abort:
+        # the free-text answers often mention stopping ("stop retrying on 5xx"), so only a stop reply stops
+        if _whole_reply_stop(answer, esc.get("options") or []):
             u["failure_reason"] = "stopped: Gate 1 LEAKY on the same questions after the A1 retry"
             u["_next"] = "end_blocked"
         else:
@@ -3117,9 +3169,9 @@ def apply_answer(state):
             u["_next"] = "end_aborted"
     elif kind == "git_setup_failed":
         data = as_dict(esc.get("data"))
-        if answer == "Use that worktree as the code dir" and not _use_code_dir(state, u, data.get("worktree") or ""):
-            ledger(state, u, f"branch: the worktree {data.get('worktree') or '(none named)'} is not a directory; retrying as is")
-        if answer == "Pick a different branch name":
+        if answer == USE_WORKTREE and not _use_code_dir(state, u, data.get("worktree") or ""):
+            ledger(state, u, f"branch: the worktree {data.get('worktree') or '(none named)'} cannot be used; retrying as is")
+        if answer == PICK_BRANCH:
             raise_escalation(state, u, escalation(
                 "branch_name", f"Which branch name should the run use instead of {data.get('branch') or _run_branch(state)}?",
                 tier3_ok=False, data={"branch": data.get("branch") or ""}))
@@ -3127,8 +3179,11 @@ def apply_answer(state):
             u["_next"] = "branch_setup"
     elif kind == "branch_name":
         name = answer.strip().split()[0] if answer.strip() else ""
-        if name and git(state.get("code_repo_path") or ".", "check-ref-format", "--branch", name)[0] == 0:
-            u["run_branch_override"] = name
+        if _whole_reply_stop(answer, replies=("abort", "abort the run")):
+            u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
+            u["_next"] = "end_aborted"
+        elif name and git(state.get("code_repo_path") or ".", "check-ref-format", "--branch", name)[0] == 0:
+            name = _set_run_branch_override(state, u, name)
             ledger(state, u, f"branch: the run branch is now {name} (owner)")
             u["_next"] = "branch_setup"
         else:

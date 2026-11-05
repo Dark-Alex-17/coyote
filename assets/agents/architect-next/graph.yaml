@@ -348,6 +348,7 @@ initial_state:
   discussion_message: ''
   settled_answer: ''
   run_branch_override: ''
+  run_branch_override_group: 0
   base_branch_override: ''
   code_dir_override: ''
   autonomous_digest: []
