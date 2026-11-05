@@ -2579,6 +2579,7 @@ mod tests {
         let second = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
         assert_eq!(harness.app.prompts.len(), 2);
 
+        harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char('y')), None);
         assert_eq!(
             first.join().unwrap().unwrap(),
@@ -2692,6 +2693,7 @@ mod tests {
         assert_eq!(harness.app.prompt_memory.auto_answer(&req), None);
         let asker = ask_on_a_thread(&mut harness, req.clone());
         assert!(harness.draw().contains("tool: fs_write"));
+        harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char('a')), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
