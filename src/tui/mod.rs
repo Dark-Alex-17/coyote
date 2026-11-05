@@ -822,10 +822,11 @@ impl App {
         let action = keys::map_key(key, &self.key_context());
         // Every key pressed while no question is up re-arms the idle gate,
         // the ignored ones included: an Enter tapped during a turn is a
-        // keystroke the user is still making when the confirm appears.
-        // Hotkeys answering a modal do not count; `answer_front` re-arms
-        // for the next queued question instead.
-        if self.prompts.is_empty() {
+        // keystroke the user is still making when the confirm appears. So
+        // does a key a modal ignores: typing that runs on under a confirm
+        // is not idleness either. Hotkeys answering a modal do not count;
+        // `answer_front` re-arms for the next queued question instead.
+        if self.prompts.is_empty() || action == Action::Nothing {
             self.last_keystroke = Some(self.clock.now());
         }
         let command = match action {
@@ -2177,6 +2178,34 @@ mod tests {
         assert!(!lines[0].contains("head-m3z"), "the oldest text was kept");
     }
 
+    /// Keys a confirm ignores are still typing: five of them at 200 ms
+    /// spacing after the modal appears keep the gate armed, so a `y` at
+    /// 1.2 s (past the modal's own second) is dropped, and the same `y`
+    /// answers once a full idle second has passed since the last key.
+    #[test]
+    fn typing_a_confirm_ignores_keeps_the_hotkey_gate_armed() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.clock.advance(10 * HOTKEY_IDLE);
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        for _ in 0..5 {
+            harness.clock.advance(Duration::from_millis(200));
+            assert_eq!(harness.press(KeyCode::Char('x')), None);
+        }
+        harness.clock.advance(Duration::from_millis(200));
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            harness.app.prompts.len(),
+            1,
+            "a hotkey right after ignored typing answered the modal"
+        );
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+    }
+
     #[test]
     fn text_deltas_grow_the_live_reply_in_place() {
         let mut harness = Harness::standalone(80, 24);
@@ -2576,7 +2605,12 @@ mod tests {
         assert_eq!(harness.press(KeyCode::Char('y')), None);
         assert_eq!(harness.app.prompts.len(), 1);
         assert!(!asker.is_finished());
+        // The dropped `y` was a keystroke too: the idle second counts
+        // from it, not from the draft.
         harness.clock.advance(Duration::from_millis(800));
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(harness.app.prompts.len(), 1);
+        harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char('y')), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
