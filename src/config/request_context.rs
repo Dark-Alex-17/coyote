@@ -21623,6 +21623,52 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// `.save session <name>` switches the context to the new name while the node keeps
+    /// serving it, as a fork does, so the instance registry files the row under it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn save_session_under_a_new_name_files_the_mesh_row_under_it() {
+        use crate::mesh::test_support::{TempDir, loopback_relay, mesh_paths, private_config};
+        use crate::mesh::{MeshRuntime, NodeOptions};
+
+        let sessions = TempDir::new("rc-save-session-sessions");
+        let _sessions_dir = EnvVarGuard::set(get_env_name("sessions_dir"), &sessions.path);
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("rc-save-session-rows");
+        let mut started_for = Session::default();
+        started_for.set_name("orig".to_string());
+        let node = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut started_for,
+            mesh_paths(&tmp),
+            NodeOptions {
+                agent: Some("coder".to_string()),
+                ..NodeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut ctx = RequestContext::new(
+            Arc::new(AppState::test_default()),
+            crate::config::WorkingMode::Cmd,
+        );
+        ctx.app.mesh.install(node.clone()).unwrap();
+        let mut session = Session::default();
+        session.set_name("orig".to_string());
+        ctx.session = Some(session);
+        let destination = node.current_destination_hash();
+
+        ctx.save_session(None, None).unwrap();
+        assert_eq!(node.own_sessions()[&destination], "orig");
+        ctx.save_session(Some("renamed"), None).unwrap();
+
+        assert_eq!(node.own_sessions()[&destination], "renamed");
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        relay_handle.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]

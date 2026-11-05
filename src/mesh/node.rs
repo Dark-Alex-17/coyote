@@ -2251,13 +2251,15 @@ async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time:
 /// Seeds this node's own grant once the start can no longer fail, so a refused start
 /// writes none. A seed that fails leaves the node running without the grant, warned
 /// about with the trust file to fix and the command that gives it, and reads as not
-/// granted. The own hash is logged whole on purpose: the remedy is typed from it.
+/// granted. The own hash is logged short, as every hash in a log line is; the remedy
+/// names where the whole one is shown.
 fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
     match trust.seed_self_trust(fingerprint, minted, SystemTime::now()) {
         Ok(granted) => granted,
         Err(err) => {
             warn!(
-                "The mesh is on, but this node's own identity could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity {fingerprint}`.",
+                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity <hash>` with the identity hash `.mesh info` shows.",
+                short(fingerprint),
                 redact_hashes(&format!("{err:#}")),
                 trust.path().display()
             );
@@ -16653,46 +16655,6 @@ mod tests {
             a.shutdown().await.unwrap();
             assert!(instances::live(&tmp.path.join("cache")).is_empty());
             relay_handle.abort();
-        }
-
-        mod save_session_registry_tests {
-            use super::*;
-            use crate::config::{AppState, RequestContext, WorkingMode};
-            use crate::testing::EnvVarGuard;
-            use crate::utils::get_env_name;
-
-            /// `.save session <name>` switches the context to the new name while the
-            /// node keeps serving it, as a fork does.
-            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-            #[serial_test::serial]
-            async fn saving_under_a_new_name_files_the_row_under_it() {
-                let sessions = TempDir::new("node-save-session-sessions");
-                let _sessions_dir = EnvVarGuard::set(get_env_name("sessions_dir"), &sessions.path);
-                let (addr, relay_handle, _) = loopback_relay().await;
-                let tmp = TempDir::new("node-save-session-rows");
-                let node = start_as("orig", &tmp, addr.port()).await;
-                let mut ctx =
-                    RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
-                ctx.app.mesh.install(node.clone()).unwrap();
-                let mut session = Session::default();
-                session.set_name("orig".to_string());
-                ctx.session = Some(session);
-                let destination = node.current_destination_hash();
-
-                ctx.save_session(None, None).unwrap();
-                assert_eq!(
-                    instances::live(&node.cache_dir)[&destination].session,
-                    "orig"
-                );
-                ctx.save_session(Some("renamed"), None).unwrap();
-
-                assert_eq!(
-                    instances::live(&node.cache_dir)[&destination].session,
-                    "renamed"
-                );
-                assert!(ctx.app.mesh.stop().await.unwrap());
-                relay_handle.abort();
-            }
         }
     }
 
