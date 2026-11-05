@@ -40,7 +40,7 @@ use crate::mesh::shares::{
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule,
     SELF_TRUST_LABEL, ServedBy, Tier, TrustChange, TrustOptions, TrustOutcome, TrustRecord,
-    TrustStore, Verdict, decode_name_hash, nothing_to_untrust_identity, parse_hash,
+    TrustStore, Verdict, decode_name_hash, nothing_to_untrust_identity, parse_hash, same_hash,
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
@@ -526,10 +526,13 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
     let names = runtime.address_names();
     let mut facts = Vec::with_capacity(records.len());
     for peer in &records {
+        let is_you = same_hash(&peer.identity_hash, runtime.fingerprint());
         facts.push(HeardFacts {
             no_route: !runtime.path_known(&peer.destination_hash).await,
-            is_you: peer.identity_hash == runtime.fingerprint(),
-            own_session: own_sessions.get(&peer.destination_hash).cloned(),
+            is_you,
+            own_session: is_you
+                .then(|| own_sessions.get(&peer.destination_hash).cloned())
+                .flatten(),
             label: owner_label(&names, &peer.destination_hash).map(|label| label.name.clone()),
         });
     }
@@ -1135,7 +1138,12 @@ fn pending(ctx: &RequestContext) -> Result<()> {
         .map(|correlation| {
             QuestionRow::outbound(
                 correlation,
-                name_at(ctx, &names, &correlation.record.peer_destination),
+                name_at(
+                    ctx,
+                    &names,
+                    &correlation.record.peer_destination,
+                    &correlation.record.peer_identity,
+                ),
             )
         })
         .collect();
@@ -1145,7 +1153,7 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     };
     let (mut access, mut escalated) = (Vec::new(), Vec::new());
     for record in &inbound {
-        let name = name_at(ctx, &names, &record.peer_destination);
+        let name = name_at(ctx, &names, &record.peer_destination, &record.peer_identity);
         match record.kind {
             InboundKind::Access => access.push(QuestionRow::access(record, name, now)),
             InboundKind::Question => escalated.push(QuestionRow::inbound(record, name, now)),
@@ -1202,7 +1210,12 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if attach.is_some() {
                 ctx.app.mesh.refuse_held_by_envoy(id)?;
             }
-            let name = name_at(ctx, &ctx.app.mesh.address_names(), &record.peer_destination);
+            let name = name_at(
+                ctx,
+                &ctx.app.mesh.address_names(),
+                &record.peer_destination,
+                &record.peer_identity,
+            );
             (
                 QuestionRow::inbound(&record, name, now),
                 Answering::Peer(record.peer_destination),
@@ -1213,6 +1226,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 ctx,
                 &ctx.app.mesh.address_names(),
                 &correlation.record.peer_destination,
+                &correlation.record.peer_identity,
             );
             (
                 QuestionRow::outbound(&correlation, name),
@@ -1567,6 +1581,7 @@ async fn message(
     let name = given_name(
         &runtime.address_names(),
         &destination,
+        &peer.identity_hash,
         peer.display_name.as_deref(),
     )
     .unwrap_or_else(|| name_label(peer.display_name.as_deref()));
@@ -6590,19 +6605,21 @@ mod name_addressing_tests {
 
     /// `.mesh pending`, `.mesh answer` and `.mesh message` name your session and your
     /// labelled peer as `.mesh peers` does, and leave an instance you did not name to
-    /// the verb.
+    /// the verb. A row heard at one of your sessions' destinations under an identity
+    /// that is not this node's is not your session.
     #[test]
     fn the_name_you_gave_an_instance_reads_as_in_peers() {
         let names = names();
         assert_eq!(
-            given_name(&names, TEMP, Some("Coyote")).as_deref(),
+            given_name(&names, TEMP, ME, Some("Coyote")).as_deref(),
             Some("(you: temp)")
         );
+        assert_eq!(given_name(&names, TEMP, MAKI, Some("Coyote")), None);
         assert_eq!(
-            given_name(&names, LAPTOP, Some("maki")).as_deref(),
+            given_name(&names, LAPTOP, MAKI, Some("maki")).as_deref(),
             Some("maki-laptop (maki)")
         );
-        assert_eq!(given_name(&names, MAKI_DESK, Some("desk")), None);
+        assert_eq!(given_name(&names, MAKI_DESK, MAKI, Some("desk")), None);
     }
 
     /// A label is quoted as you spelled it in a `.mesh pending` entry and a `.mesh answer`
@@ -6612,7 +6629,7 @@ mod name_addressing_tests {
         let names = vec![destination_label(".info", LAPTOP)];
         let row = QuestionRow {
             state: "awaiting your answer",
-            name: given_name(&names, LAPTOP, Some("maki")).unwrap(),
+            name: given_name(&names, LAPTOP, MAKI, Some("maki")).unwrap(),
             destination: LAPTOP.to_string(),
             when_label: "asked",
             when: None,
@@ -7995,12 +8012,22 @@ fn labelled_name(label: &str, display_name: Option<&str>) -> String {
     }
 }
 
-/// The name you gave the instance at `destination`, `announced` being the name it gives
-/// itself: one of your sessions, else your label with that name after it; `None` for an
-/// instance you have not named, which each verb then names its own way.
-fn given_name(names: &[AddressName], destination: &str, announced: Option<&str>) -> Option<String> {
+/// The name you gave the instance at `destination`, heard under `identity`, `announced`
+/// being the name it gives itself: one of your sessions when the identity is this node's,
+/// else your label with that name after it; `None` for an instance you have not named,
+/// which each verb then names its own way.
+fn given_name(
+    names: &[AddressName],
+    destination: &str,
+    identity: &str,
+    announced: Option<&str>,
+) -> Option<String> {
     let session = names.iter().find(|name| {
-        matches!(&name.target, NameTarget::Session { destination: at, .. } if at == destination)
+        matches!(
+            &name.target,
+            NameTarget::Session { destination: at, identity: own }
+                if at == destination && same_hash(own, identity)
+        )
     });
     match session {
         Some(session) => Some(own_session_name(&session.name)),
@@ -8010,11 +8037,17 @@ fn given_name(names: &[AddressName], destination: &str, announced: Option<&str>)
 
 /// How `.mesh pending` and `.mesh answer` name the peer at `destination`: `given_name`,
 /// else the name the peer table holds, else its short hash.
-fn name_at(ctx: &RequestContext, names: &[AddressName], destination: &str) -> String {
+fn name_at(
+    ctx: &RequestContext,
+    names: &[AddressName],
+    destination: &str,
+    identity: &str,
+) -> String {
     let mesh = &ctx.app.mesh;
     given_name(
         names,
         destination,
+        identity,
         mesh.display_name_at(destination).as_deref(),
     )
     .unwrap_or_else(|| mesh.peer_name_at(destination))
