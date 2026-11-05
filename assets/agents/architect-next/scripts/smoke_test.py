@@ -1499,7 +1499,7 @@ check("interpret_route: an accepted base_branch instruction -> the base for this
       s["_next"] == "apply_answer" and s["last_answer"] == gates.RETRY_BRANCH and s["base_branch_name"] == "release"
       and s["base_branch_override"] == "release", s)
 first, s = interpreted(E_HELD, "just reuse the existing worktree", reply_verdict="instruction", reply_instruction="reuse_worktree",
-                       reply_value="")
+                       reply_value="", state={"code_repo_path": WT_LOCAL})
 check("interpret_route: reuse_worktree with no value -> the worktree the question names is the code dir",
       s["_next"] == "apply_answer" and os.path.realpath(s["code_repo_path"]) == os.path.realpath(WT_HELD), s)
 first, s = interpreted(E, "use base dev", reply_verdict="instruction", reply_instruction="base_branch", reply_value="dev")
@@ -1574,8 +1574,74 @@ first, s = interpreted(escalation("approve_breakdown", "Approve?", [option("Appr
 s.update(gates.apply_answer(s))
 check("interpret_route -> apply_answer: a revision instruction that mentions approve is still a revision (prefix wins)",
       s["_next"] == "amend_plan" and "merge the two api tasks" in s["pending_amendments"][0], s)
-u = gates.parse_answer(base_state(escalation=escalation("need_design_doc", "q"), last_answer_text="/tmp/x.md please"))
-check("parse_answer: free-text kinds never re-ask", u["_next"] == "apply_answer")
+E_G1 = escalation("gate1_stuck", "Gate 1 is still LEAKY. Answer the questions here, or stop?",
+                  [option("Stop and report", True), option("I will answer: (type the answers)")])
+
+
+def answered(kind, answer, esc, **over):
+    return gates.apply_answer(base_state(escalation=esc, last_answer=answer, **over))
+
+
+G1_TEXT = "The worker should stop retrying on 5xx and abort the job after 3 tries."
+first, s = interpreted(E_G1, G1_TEXT, reply_verdict="instruction", reply_instruction="answers", reply_value="stop retrying on 5xx")
+s.update(gates.apply_answer(s))
+check("interpret_route -> apply_answer: gate1_stuck answers that mention stop and abort are answers, never a stop",
+      first == "interpret_reply" and s["_next"] == "amend_plan" and G1_TEXT in s["pending_amendments"][0], s)
+check("apply_answer: gate1_stuck stops only on a stop reply: the option, its number, or the bare word",
+      all(answered("gate1_stuck", a, E_G1)["_next"] == "end_blocked" for a in ("Stop and report", "1", "stop.", "Abort"))
+      and answered("gate1_stuck", "stop the sync at the boundary", E_G1)["_next"] == "amend_plan")
+E_BN = escalation("branch_name", "Which branch name should the run use?")
+u = answered("branch_name", "fix/abort-handling", E_BN, code_repo_path=WT_LOCAL)
+check("apply_answer: branch_name 'fix/abort-handling' is a branch name; only a whole 'abort' reply aborts",
+      u["_next"] == "branch_setup" and u["run_branch_override"] == "fix/abort-handling"
+      and all(answered("branch_name", a, E_BN, code_repo_path=WT_LOCAL)["_next"] == "end_aborted" for a in ("abort", "Abort the run")), u)
+E_PG = escalation("probe_gap", "The probe could not run. Supply the recipe, or record a follow-up?",
+                  [option("Supply the recipe (describe it)"), option("Record a follow-up", True)])
+RECIPE = "docker compose up -d db && PORT=8081 ./bin/server --seed 'fixtures/a b.json'\n  curl -sf localhost:8081/healthz | jq '.ok'"
+first, s = interpreted(E_PG, RECIPE, reply_verdict="instruction", reply_instruction="recipe",
+                       reply_value="start the db and the server, then check health", state={"tasks": tasks_with(), "current_task": T2})
+s.update(gates.apply_answer(s))
+check("interpret_route -> apply_answer: a recipe of literal commands reaches the amendment byte for byte, never paraphrased",
+      s["_next"] == "amend_plan" and s["pending_amendments"][0].endswith(f"Supply the recipe: {RECIPE}")
+      and "start the db" not in s["pending_amendments"][0], s)
+first, s = interpreted(E_HELD, "reuse the other checkout", reply_verdict="instruction", reply_instruction="reuse_worktree",
+                       reply_value=CODE, state={"code_repo_path": WT_LOCAL})
+check("interpret_route: reuse_worktree naming a checkout of another repo -> rejected, ledgered, one clarifying question",
+      s["_next"] == "ask_dispatch" and s["code_repo_path"] == WT_LOCAL and "code_dir_override" not in s
+      and any("is not a checkout of the code repo" in d for d in s["decisions"]), s)
+first, s = interpreted(E_HELD, "reuse it", reply_verdict="instruction", reply_instruction="reuse_worktree",
+                       reply_value=WT_HELD, state={"code_repo_path": WT_LOCAL})
+check("interpret_route: reuse_worktree naming a real worktree of the code repo -> accepted as the code dir",
+      s["_next"] == "apply_answer" and s["code_dir_override"] == os.path.abspath(WT_HELD), s)
+first, s = interpreted(E, "go again", reply_verdict="option", reply_option="One")
+_, s2 = interpreted(E, "go again", reply_verdict="option", reply_option="2")
+_, s3 = interpreted(E, "go again", reply_verdict="option", reply_option="one more ROUND")
+check("interpret_route: the interpreter's option counts only as an exact (case-insensitive) text or a 1-based number",
+      s["_next"] == "ask_dispatch" and s2["last_answer"] == "One more round" and s3["last_answer"] == "One more round", (s, s2, s3))
+g = base_state(pr_strategy="multi", group_index=2)
+gu = {}
+gates._set_run_branch_override(g, gu, "feat/typed-g2")
+g.update(gu)
+check("run branch override: in PR-group mode a typed -g<n> suffix is dropped and the override applies from its group on",
+      (gu["run_branch_override"], gu["run_branch_override_group"], gates._run_branch(g, 1), gates._run_branch(g, 2), gates._run_branch(g, 3))
+      == (("feat/typed", 2, "feat/PLAN-widgets", "feat/typed", "feat/typed") if MULTI_IS_GROUPS else
+          ("feat/typed-g2", 0, "feat/typed-g2", "feat/typed-g2", "feat/typed-g2")), gu)
+for gone in (False, True):
+    OV_ID = _lib.new_run_id("override resume")
+    ov_dir = os.path.join(TMP, "gone-dir") if gone else WT_HELD
+    _lib.snapshot(base_state(run_id=OV_ID, run_dir=_lib.run_dir_for(OV_ID), base_branch_override="release",
+                             code_dir_override=ov_dir, run_branch_override="feat/typed"), {}, "task_loop")
+    r = {"initial_prompt": f"Architect run id: {OV_ID}", **STORE.variables(DESIGN, TMP)}
+    r.update(gates.intake(r))
+    check(f"intake: re-entry restores the owner's base override and {'drops a code dir that is gone' if gone else 'restores the code dir'}",
+          r["_next"] == "resume_route" and r["base_branch_name"] == "release" and r["run_branch_override"] == "feat/typed"
+          and r["code_repo_path"] == (STORE.variables(DESIGN, TMP).get("project_dir", CODE) if gone else WT_HELD), r)
+E_NDD = gates._need_design_doc_escalation()
+u = gates.parse_answer(base_state(escalation=E_NDD, last_answer_text=f"{DESIGN} please"))
+u2 = gates.parse_answer(base_state(escalation=E_NDD, last_answer_text="the doc is the one we wrote yesterday"))
+check("parse_answer: need_design_doc takes a typed existing path raw; other prose is interpreted first",
+      u["_next"] == "apply_answer" and u["last_answer"] == f"{DESIGN} please" and u2["_next"] == "interpret_reply"
+      and "- path:" in u2["reply_accepts"], (u, u2))
 u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="", reask_rounds=STRIKE_LIMIT - 1))
 check("parse_answer: an empty multiple-choice reply with re-asks left -> re-ask",
       u["_next"] == gates._terminal_prompt(E_DQ) and u["reask_rounds"] == STRIKE_LIMIT and "last_answer" not in u, u)

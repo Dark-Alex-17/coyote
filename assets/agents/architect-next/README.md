@@ -121,21 +121,21 @@ from the brief, never from a hard-coded toolchain):
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
 scripts/_lib.py:602:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
 scripts/gates.py:46:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:3504:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:3513:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:3559:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:3568:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
 scripts/smoke_test.py:1022:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
 scripts/smoke_test.py:1395:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:1895:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:1961:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
 None of these runs a toolchain: `_lib.py:602` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:46` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:3504` and `:3513` are the English verb `make` in prompt prose, and
+lockfile names), `gates.py:3559` and `:3568` are the English verb `make` in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -388,11 +388,12 @@ for the engineer chat lane, carries `discussion_run_id` into the next run, and e
 an alias of `continue`. Any other message, including prose such as `continue please`, starts
 a fresh run and leaves the parked one. A question parks at most `DISCUSSION_PARKS_MAX` (3) times; after that it is asked
 again with a note, and its next typed reply is recorded as the answer without the
-classifier. These kinds stay free text, because their answer is not a pick from a list:
-`need_design_doc` (a design doc path), `clarify` (a corrected design doc path),
-`gate1_stuck` (the owner's typed answers to the gatekeeper's questions, after "I will
-answer") and the `draft_edit` input node (the changes to make to a drafted brief). Every
-other escalation takes typed replies as the next paragraph describes.
+classifier. Only three take raw text, because their answer is not a pick from a list:
+`need_design_doc` (a typed path to an existing design doc), `branch_name` (the run branch
+name) and the `draft_edit` input node (the changes to make to a drafted brief). The
+multiple-choice kinds above and `draft_confirm` (whose unmatched reply is redraft feedback)
+are excluded from interpretation by design. Every other escalation, `clarify` and
+`gate1_stuck` included, takes typed replies as the next paragraph describes.
 
 Typed replies to other escalations: a reply to an escalation that is not multiple choice is
 matched to an option by number or text first. The first reply that names no option goes to
@@ -401,10 +402,15 @@ escalation kind accepts (`ACCEPTED_INSTRUCTIONS` in `gates.py`; `git_setup_faile
 example, accepts a different base branch, a different run branch name, or reusing an
 existing worktree as the code dir). `interpret_route` then acts on its verdict:
 
-- `option`: the named option is recorded and applied;
+- `option`: the option is recorded and applied, but only when the interpreter names it by its
+  exact text (case-insensitive) or its 1-based number; anything looser is unclear;
 - `instruction`: applied only when the kind accepts that shape and it can be carried out (a
-  valid branch name, an existing directory or file), then answered with the option it
-  implies. Otherwise it is treated as unclear;
+  valid branch name, an existing file, a worktree of the same repository: its `git
+  rev-parse --git-common-dir` matches the code repo's), then answered with the option it
+  implies. Otherwise it is ledgered and treated as unclear. The free-form shapes
+  (`revision`, `answers`, `rescope`, `recipe`) carry the owner's reply verbatim; only the
+  structured shapes (`base_branch`, `branch_name`, `reuse_worktree`, `path`, `mode_values`)
+  take the value the interpreter extracted;
 - `discussion`: the run parks through the same `choice_park` as a design question, keyed by
   the escalation kind. `continue` asks the escalation again, and `continue: <answer>` takes
   the answer as a fresh reply;
@@ -414,8 +420,11 @@ existing worktree as the code dir). `interpret_route` then acts on its verdict:
 Each reading and the action taken are ledgered. The interpretation happens once per reply
 (`reply_interpreted`, reset by every new escalation and every resume). After the
 clarifying question, after an interpreter fault, and at the park cap, an unmatched reply
-gets the re-ask and then stands as typed. `draft_confirm`, `need_design_doc`, a typed path
-on `seed_confirm` and the multiple-choice kinds keep the paths above.
+gets up to `STRIKE_LIMIT` (3) re-asks and then stands as typed. A typed existing path on
+`need_design_doc` or `seed_confirm` is taken as given, never interpreted. Stop and abort
+are read from the whole reply or the option it names, never from a word inside prose, so
+a `gate1_stuck` answer such as "the worker should stop retrying" stays an answer and
+`fix/abort-handling` is a valid `branch_name`.
 
 Branch setup: `branch_setup` never checks out the base branch, so a base held by another
 worktree stays where it is. A new run branch is cut with `git checkout --no-track -b <branch>
@@ -430,7 +439,11 @@ An existing run branch is checked out and pulled with `--ff-only` only when it h
 upstream. When another worktree holds the run branch, `git_setup_failed` names that
 worktree and offers "Use that worktree as the code dir", "Pick a different branch name"
 (asked through the free-text `branch_name` escalation) and "Abort the run". The owner's
-branch, base and code dir overrides are durable state, so a resumed run keeps them.
+branch, base and code dir overrides are durable state, so a resumed run keeps them (a code
+dir that no longer exists falls back to the live variable). The worktree option takes the
+named path only when it is a checkout of the same repository. In PR-group mode a typed
+branch name loses any `-g<n>` suffix, since the group suffix is added per group, and the
+override applies from the group it was given in onwards; earlier groups keep their names.
 
 Four tests are ignored and run with `-- --ignored`: the mode-matrix run and the intake,
 choice and interpretation sabotage tails (`intake_smoke_rows_go_red_under_the_recorded_sabotages`,
@@ -456,8 +469,8 @@ keeps every bundled agent from naming this candidate lives in
 `tests/candidate_sisyphus_next.rs` and covers both candidate names.
 
 Measured 2026-11-02 after the adjustments above, from a fresh scratch dir: audit
-`PROBLEMS: none`; smoke `808/808 checks passed` (audit and smoke re-measured 2026-11-05 after
-the free-text escalation replies and branch setup change); mode matrix `53/53 checks passed` (`62 live regions == 62 mapped`) in
+`PROBLEMS: none`; smoke `818/818 checks passed` (audit and smoke re-measured 2026-11-05 after
+the free-text escalation replies and branch setup fix round); mode matrix `53/53 checks passed` (`62 live regions == 62 mapped`) in
 3m21s wall clock; session check last line
 `ok node ids / script paths consistent` (mikefarah yq v4.53.3); no unset-variable failure
 from `architect/tools.sh` under the real `utils.sh`.

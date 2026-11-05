@@ -296,7 +296,7 @@ STATE_KEYS = (
     "checklist_labels", "checklist_findings", "checklist_items", "checklist_done",
     "leak_questions", "leak_unanswerable", "leak_pending_answers",
     "design_rounds", "choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed", "choice_parks",
-    "choice_forced", "run_branch_override", "base_branch_override", "code_dir_override",
+    "choice_forced", "run_branch_override", "run_branch_override_group", "base_branch_override", "code_dir_override",
 )
 
 

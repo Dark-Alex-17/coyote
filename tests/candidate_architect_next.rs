@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 808;
+const SMOKE_FLOOR: usize = 818;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -911,9 +911,11 @@ fn choice_smoke_rows_go_red_under_the_recorded_sabotages() {
 /// with an upstream, a local base ahead of origin kept, the run branch held by a
 /// worktree, the first unmatched reply interpreted, only accepted instructions
 /// applied, a discussion parked, one clarifying question, an interpreter fault
-/// re-asked, and the park cap of a non-choice escalation.
+/// re-asked, the park cap of a non-choice escalation, stop and abort read from
+/// the whole reply, free-form instructions kept verbatim, and a reused worktree
+/// required to belong to the code repo.
 #[test]
-#[ignore = "ten smoke battery runs take about two minutes; run with -- --ignored"]
+#[ignore = "fourteen smoke battery runs take about three minutes; run with -- --ignored"]
 fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
@@ -995,6 +997,35 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "            pass\n",
                 "choice_park: a non-choice escalation at the park cap -> choice_reask; its next reply \
                  is matched, never interpreted or forced",
+            ),
+            (
+                "stop-whole-reply",
+                "    return bare in replies or bool(",
+                "    return any(w in bare for w in replies) or bool(",
+                "interpret_route -> apply_answer: gate1_stuck answers that mention stop and abort are \
+                 answers, never a stop",
+            ),
+            (
+                "branch-name-abort",
+                "\"git_setup_failed\", \"gate_fault\") and abort:\n",
+                "\"git_setup_failed\", \"branch_name\", \"gate_fault\") and abort:\n",
+                "apply_answer: branch_name 'fix/abort-handling' is a branch name; only a whole 'abort' \
+                 reply aborts",
+            ),
+            (
+                "free-form-verbatim",
+                "        return INSTRUCTION_ANSWERS[shape].format(text.strip()) if text.strip() else \
+                 \"\"\n",
+                "        return INSTRUCTION_ANSWERS[shape].format(value) if value else \"\"\n",
+                "interpret_route -> apply_answer: a recipe of literal commands reaches the amendment \
+                 byte for byte, never paraphrased",
+            ),
+            (
+                "worktree-same-repo",
+                "    if not ours or _git_common_dir(path) != ours:\n",
+                "    if False:\n",
+                "interpret_route: reuse_worktree naming a checkout of another repo -> rejected, \
+                 ledgered, one clarifying question",
             ),
         ],
     );
@@ -2856,10 +2887,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![46, 3504, 3513],
+        vec![46, 3559, 3568],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [3504, 3513] {
+    for line in [3559, 3568] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4666,6 +4697,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "review_polls_run",
     "review_rounds",
     "review_started_at",
+    "run_branch_override_group",
     "wave_fix_rounds",
     "wave_index",
 ];
