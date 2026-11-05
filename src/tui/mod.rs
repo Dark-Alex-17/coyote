@@ -4300,6 +4300,10 @@ mod tests {
                 "tests/tui_binary.rs",
                 "the transcript is not yet printed on the normal screen when the UI leaves",
             ),
+            (
+                "tests/tui_suspend_and_signals.rs",
+                "COYOTE_UI is not parsed yet; an unknown value falls through to the plain REPL",
+            ),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
