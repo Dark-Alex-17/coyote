@@ -66,7 +66,7 @@ use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
-    Decision, InstancePresence, KeyChangeOutcome, TrustStore, decode_name_hash, parse_hash,
+    Decision, InstancePresence, KeyChangeOutcome, Tier, TrustStore, decode_name_hash, parse_hash,
 };
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
@@ -593,6 +593,70 @@ struct CurrentIds {
     destination_hash: String,
 }
 
+/// A name the human `.mesh` verbs take in place of a hash: one of your running sessions,
+/// or a label you gave a grant in the trust list. Peers never supply these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddressName {
+    pub name: String,
+    pub target: NameTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameTarget {
+    /// A session the instance registry lists as running here, by the destination it serves.
+    Session {
+        destination: String,
+        identity: String,
+    },
+    /// The label of a destination grant.
+    DestinationLabel {
+        destination: String,
+        identity: Option<String>,
+    },
+    /// The label of an identity grant, with every instance of that identity the peer
+    /// table holds, in hash order.
+    IdentityLabel {
+        identity: String,
+        instances: Vec<String>,
+    },
+}
+
+impl NameTarget {
+    /// The one destination the name stands for: an identity label only stands for one
+    /// when the peer table holds exactly one instance of the identity.
+    pub(crate) fn destination(&self) -> Option<&str> {
+        match self {
+            Self::Session { destination, .. } | Self::DestinationLabel { destination, .. } => {
+                Some(destination)
+            }
+            Self::IdentityLabel { instances, .. } => match instances.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The label you gave `destination` in the trust list: the one on its own grant, else
+/// the one on the grant of the identity the peer table hears it under.
+pub(crate) fn owner_label<'a>(
+    names: &'a [AddressName],
+    destination: &str,
+) -> Option<&'a AddressName> {
+    let find = |own_grant: bool| {
+        names.iter().find(|name| match &name.target {
+            NameTarget::DestinationLabel {
+                destination: at, ..
+            } => own_grant && at == destination,
+            NameTarget::IdentityLabel { instances, .. } => {
+                !own_grant && instances.iter().any(|at| at == destination)
+            }
+            NameTarget::Session { .. } => false,
+        })
+    };
+    find(true).or_else(|| find(false))
+}
+
 /// One in-process Reticulum node: a transport over the configured interfaces, one destination
 /// derived from the session's mesh instance id, and the tasks that announce it and track peers.
 pub(crate) struct MeshRuntime {
@@ -1024,6 +1088,58 @@ impl MeshRuntime {
         let mut row = self.instance_row.lock();
         row.session = session.to_string();
         instances::register(&self.cache_dir, &self.current_instance_id(), row.clone());
+    }
+
+    /// Every name the human verbs resolve: your running sessions in destination order,
+    /// then the labelled grants in the trust list's order. An unnamed session and a blank
+    /// label name nothing.
+    pub(crate) fn address_names(&self) -> Vec<AddressName> {
+        let mut sessions: Vec<(String, String)> = self
+            .own_sessions()
+            .into_iter()
+            .filter(|(_, session)| !session.trim().is_empty())
+            .collect();
+        sessions.sort_unstable();
+        let peers = self.peers().snapshot();
+        let mut names: Vec<AddressName> = sessions
+            .into_iter()
+            .map(|(destination, session)| AddressName {
+                name: session,
+                target: NameTarget::Session {
+                    destination,
+                    identity: self.fingerprint.clone(),
+                },
+            })
+            .collect();
+        for record in self.trust().records() {
+            let Some(label) = record.label.filter(|label| !label.trim().is_empty()) else {
+                continue;
+            };
+            let target = match record.tier {
+                Tier::Destination => NameTarget::DestinationLabel {
+                    destination: record.hash,
+                    identity: record.identity,
+                },
+                Tier::Identity => {
+                    let mut instances: Vec<String> = peers
+                        .iter()
+                        .filter(|peer| peer.identity_hash == record.hash)
+                        .map(|peer| peer.destination_hash.clone())
+                        .collect();
+                    instances.sort_unstable();
+                    instances.dedup();
+                    NameTarget::IdentityLabel {
+                        identity: record.hash,
+                        instances,
+                    }
+                }
+            };
+            names.push(AddressName {
+                name: label,
+                target,
+            });
+        }
+        names
     }
 
     /// A peer's `NoAccess` as every request path reports it: the peer by the name the
@@ -5080,7 +5196,8 @@ impl MeshSlot {
         }
     }
 
-    fn display_name_at(&self, destination: &str) -> Option<String> {
+    /// The display name the peer table filed for `destination`, as the peer announced it.
+    pub(crate) fn display_name_at(&self, destination: &str) -> Option<String> {
         self.get()
             .and_then(|runtime| runtime.peers().get(destination))
             .and_then(|peer| peer.display_name)
@@ -5103,10 +5220,10 @@ impl MeshSlot {
             .unwrap_or_else(|| short(destination).to_string())
     }
 
-    /// `MeshRuntime::own_sessions`, empty while the mesh is off.
-    pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
+    /// `MeshRuntime::address_names`, empty while the mesh is off.
+    pub(crate) fn address_names(&self) -> Vec<AddressName> {
         self.get()
-            .map(|runtime| runtime.own_sessions())
+            .map(|runtime| runtime.address_names())
             .unwrap_or_default()
     }
 
@@ -16418,6 +16535,120 @@ mod tests {
             a.shutdown().await.unwrap();
             assert!(instances::live(&tmp.path.join("cache")).is_empty());
             relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    mod name_addressing_tests {
+        use super::*;
+        use crate::mesh::trust::TrustOptions;
+
+        fn labelled(label: &str) -> TrustOptions {
+            TrustOptions {
+                label: Some(label.to_string()),
+                note: None,
+            }
+        }
+
+        /// Your named sessions come first in destination order, then each label in the
+        /// trust list's order; an identity label carries every instance the peer table
+        /// holds of it, and an unnamed session or a blank label names nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn address_names_lists_sessions_then_labels_with_their_instances() {
+            let started = started_runtime("node-address-names").await;
+            let runtime = started.runtime.clone();
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            let now = SystemTime::now();
+            let (temp, blank) = (hex_lower(&[0x10; 16]), hex_lower(&[0x11; 16]));
+            for (id, destination, session) in
+                [("temp-id", &temp, "temp"), ("blank-id", &blank, "  ")]
+            {
+                instances::register(
+                    &runtime.cache_dir,
+                    id,
+                    InstanceRow::started_now(destination.clone(), session.to_string(), None),
+                );
+            }
+            let identities: Vec<String> = [0x21, 0x22, 0x23]
+                .iter()
+                .map(|byte| hex_lower(&[*byte; 16]))
+                .collect();
+            let mut heard = Vec::new();
+            for (identity, origin) in [
+                (&identities[1], 1u8),
+                (&identities[2], 2),
+                (&identities[2], 3),
+            ] {
+                let origin = [origin; NAME_HASH_LEN];
+                let instance =
+                    destination_address(&origin, &parse_hash(identity).unwrap()).to_hex_string();
+                runtime.peers().observe(
+                    PeerSighting {
+                        destination_hash: instance.clone(),
+                        identity_hash: identity.clone(),
+                        name_hash: hex_lower(&origin),
+                        public_key: None,
+                        display_name: None,
+                        protocol_version: MESH_PROTOCOL_VERSION,
+                        hops: 1,
+                    },
+                    now,
+                );
+                heard.push(instance);
+            }
+            let trust = runtime.trust();
+            for (identity, label) in identities
+                .iter()
+                .zip(["none-heard", "one-heard", "two-heard"])
+            {
+                trust
+                    .trust_identity(slot.as_ref(), identity, labelled(label), now)
+                    .unwrap();
+            }
+            trust
+                .trust_destination(slot.as_ref(), &heard[0], labelled("laptop"), now)
+                .unwrap();
+            trust
+                .trust_destination(slot.as_ref(), &heard[1], labelled("  "), now)
+                .unwrap();
+
+            let names = runtime.address_names();
+            let temp_at = names.iter().position(|name| name.name == "temp").unwrap();
+            let first_label = names
+                .iter()
+                .position(|name| !matches!(name.target, NameTarget::Session { .. }))
+                .unwrap();
+            assert!(temp_at < first_label, "sessions come first: {names:?}");
+            assert_eq!(
+                names[temp_at].target,
+                NameTarget::Session {
+                    destination: temp.clone(),
+                    identity: runtime.fingerprint.clone(),
+                }
+            );
+            assert!(
+                !names.iter().any(|name| name.name.trim().is_empty()),
+                "{names:?}"
+            );
+            let instances_of = |label: &str| match &names
+                .iter()
+                .find(|name| name.name == label)
+                .unwrap_or_else(|| panic!("{label} is missing: {names:?}"))
+                .target
+            {
+                NameTarget::IdentityLabel { instances, .. } => instances.clone(),
+                other => panic!("{label} is {other:?}"),
+            };
+            assert!(instances_of("none-heard").is_empty());
+            assert_eq!(instances_of("one-heard"), [heard[0].clone()]);
+            let mut two = vec![heard[1].clone(), heard[2].clone()];
+            two.sort_unstable();
+            assert_eq!(instances_of("two-heard"), two);
+            let laptop = names.iter().find(|name| name.name == "laptop").unwrap();
+            assert_eq!(laptop.target.destination(), Some(heard[0].as_str()));
+            assert!(slot.stop().await.unwrap());
+            started.relay_handle.abort();
         }
     }
 

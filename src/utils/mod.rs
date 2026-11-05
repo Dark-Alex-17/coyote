@@ -315,12 +315,13 @@ pub fn cyan_bold_text(input: &str) -> String {
 
 /// `cyan_bold_text` without the `NO_COLOR` gate, for a caller that settled colour itself.
 pub(crate) fn tool_name_text_forced(input: &str) -> String {
+    tool_name_style().paint(input).to_string()
+}
+
+/// The style `tool_name_text_forced` paints with.
+pub(crate) fn tool_name_style() -> nu_ansi_term::Style {
     let color = TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73));
-    nu_ansi_term::Style::new()
-        .fg(color)
-        .bold()
-        .paint(input)
-        .to_string()
+    nu_ansi_term::Style::new().fg(color).bold()
 }
 
 pub fn replay_label_text(input: &str) -> String {
