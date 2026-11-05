@@ -489,6 +489,24 @@ fn typed_name(names: &[AddressName], destination: &str) -> Option<TypedName> {
         .or_else(|| pick(false).map(|name| TypedName::Label(name.name.clone())))
 }
 
+/// The destination `token` stands for in the completions that follow it, read the way
+/// the verbs read it: a whole hash as given, else the one destination every name spelled
+/// `token` (case aside) stands for, else the token as typed.
+fn typed_destination(names: &[AddressName], token: &str) -> String {
+    if let Some(hash) = canonical_hash(token) {
+        return hash;
+    }
+    let spelled = token.to_lowercase();
+    let mut destinations = names
+        .iter()
+        .filter(|name| name.name.to_lowercase() == spelled)
+        .map(|name| name.target.destination());
+    match destinations.next() {
+        Some(Some(first)) if destinations.all(|other| other == Some(first)) => first.to_string(),
+        _ => token.to_string(),
+    }
+}
+
 enum Sighting<'a> {
     Peer(&'a PeerRecord),
     Knock(KnockRecord),
@@ -7264,6 +7282,7 @@ impl RequestContext {
     /// expired, both under the identity the peer table holds for the destination, then
     /// the last listing page; then `--if-sha256 `, offered once. A path that would not
     /// display as the peer spelled it is left out, since no `.mesh fetch` could type it.
+    /// A session name or label typed for the peer reads that destination's caches.
     fn mesh_completion_fetch(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
         let Some((_, prior)) = rest.split_last() else {
             return Vec::new();
@@ -7274,13 +7293,14 @@ impl RequestContext {
         if prior.last() == Some(&"--if-sha256") {
             return Vec::new();
         }
+        let names = runtime.address_names();
         match prior {
             [] => self
                 .mesh_completion_destinations(DestinationFilter::TrustedAndHeard)
                 .into_iter()
-                .map(|(hash, description)| {
+                .map(|(value, description)| {
                     let fetches = runtime
-                        .last_card(&hash)
+                        .last_card(&typed_destination(&names, &value))
                         .is_some_and(|card| card.caps.iter().any(|cap| cap == "fetch"));
                     let description = description.map(|description| {
                         if fetches {
@@ -7289,17 +7309,18 @@ impl RequestContext {
                             description
                         }
                     });
-                    (hash, description)
+                    (value, description)
                 })
                 .collect(),
             [peer] => {
                 let now = SystemTime::now();
+                let peer = typed_destination(&names, peer);
                 let claims = runtime
                     .peers()
-                    .get(peer)
-                    .and_then(|record| runtime.memory().claims_of(peer, &record.identity_hash))
+                    .get(&peer)
+                    .and_then(|record| runtime.memory().claims_of(&peer, &record.identity_hash))
                     .unwrap_or_default();
-                let listing = runtime.last_listing(peer);
+                let listing = runtime.last_listing(&peer);
                 let references = claims
                     .references()
                     .filter(|claim| claim.staged.is_none())
@@ -7349,6 +7370,7 @@ impl RequestContext {
     /// `--reason ` and `--yes`, each offered once. Nothing follows `--reason`, whose value
     /// is free text and never counts as the destination or a path. A path that would not
     /// display as the peer spelled it is left out, since no `.mesh request` could type it.
+    /// A session name or label typed for the destination reads that destination's listing.
     fn mesh_completion_request(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
         let Some((_, prior)) = rest.split_last() else {
             return Vec::new();
@@ -7374,7 +7396,8 @@ impl RequestContext {
             return self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard);
         };
         let now = SystemTime::now();
-        let listing = runtime.last_listing(destination);
+        let listing =
+            runtime.last_listing(&typed_destination(&runtime.address_names(), destination));
         let listed = listing.iter().flat_map(|listing| {
             let heard = age_text(now, listing.heard_at);
             listing.entries.iter().map(move |entry| {
@@ -36934,6 +36957,82 @@ mod tests {
                 Some(TypedName::Session("temp".to_string())),
                 "a session beats a label on the same destination"
             );
+        }
+
+        /// After a session name or a label, `fetch` and `request` read the caches of the
+        /// destination it names, and the peer row a label offers keeps its ` . fetch` tag.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn fetch_and_request_complete_the_destination_a_name_stands_for() {
+            use crate::mesh::card::build_card;
+            use crate::mesh::fetch::ListedFile;
+            use crate::mesh::trust::TrustOptions;
+
+            let _guard = HelperConfigDirGuard::new();
+            let fixture = seed_mesh_completion_fixture("rc-mesh-complete-names").await;
+            let runtime = fixture.ctx.app.mesh.get().unwrap();
+            let own = runtime.current_destination_hash();
+            let trusted = fixture.trusted_destination.clone();
+            runtime.rename_session("temp");
+            runtime
+                .trust()
+                .trust_destination(
+                    fixture.ctx.app.mesh.as_ref(),
+                    &trusted,
+                    TrustOptions {
+                        label: Some("bea-lab".to_string()),
+                        note: None,
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            for destination in [&own, &trusted] {
+                runtime.memory().remember_listing_for_tests(
+                    destination,
+                    vec![ListedFile {
+                        path: format!("{}.md", short(destination)),
+                        size: 0,
+                    }],
+                    SystemTime::now(),
+                );
+            }
+            runtime.memory().remember_card(
+                &trusted,
+                build_card(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &["fetch".to_string()],
+                    SystemTime::now(),
+                ),
+            );
+
+            let rows = fixture.complete(&["fetch", ""]);
+            assert_eq!(completion_values(&rows), ["bea-lab"]);
+            assert!(
+                completion_description(&rows, "bea-lab").ends_with(" . fetch"),
+                "{rows:?}"
+            );
+            for (name, destination) in
+                [("temp", &own), ("bea-lab", &trusted), ("BEA-LAB", &trusted)]
+            {
+                let listed = format!("{}.md", short(destination));
+                assert_eq!(
+                    completion_values(&fixture.complete(&["fetch", name, ""])),
+                    [listed.as_str(), "--if-sha256 "],
+                    "{name}"
+                );
+                assert_eq!(
+                    completion_values(&fixture.complete(&["request", name, ""])),
+                    [listed.as_str(), "--reason ", "--yes"],
+                    "{name}"
+                );
+            }
+
+            fixture.stop().await;
         }
     }
 
