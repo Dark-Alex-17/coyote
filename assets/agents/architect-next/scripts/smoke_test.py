@@ -824,6 +824,88 @@ if MULTI_IS_GROUPS:
           u["run_branch"] == "feat/PLAN-widgets-g2" and u["unit_base_branch"] == "main", str(u.get("unit_base_branch")))
     git(CODE, "checkout", "-q", "feat/PLAN-widgets-g1")
 
+# branch_setup never checks out the base: a worktree that holds main keeps it, the primary checkout is never moved to main
+WT_CODE = os.path.join(TMP, "wt-code")
+make_repo(WT_CODE, {"README.md": "# wt\n"})
+git(WT_CODE, "checkout", "-q", "-b", "work")
+WT_MAIN = os.path.join(TMP, "wt-main")
+git(WT_CODE, "worktree", "add", "-q", WT_MAIN, "main")
+WT_PUSHER = os.path.join(TMP, "wt-pusher")
+subprocess.run(["git", "clone", "-q", "-b", "main", WT_CODE + ".git", WT_PUSHER], check=True, capture_output=True)
+git(WT_PUSHER, "commit", "-q", "--allow-empty", "-m", "upstream moved")
+git(WT_PUSHER, "push", "-q", "origin", "main")
+WT_UPSTREAM = git(WT_PUSHER, "rev-parse", "HEAD")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="wt", **PS))
+check("branch_setup: base main held by another worktree -> the run branch is cut from the fetched origin/main, no checkout of main",
+      u["_next"] == "select_tasks" and git(WT_CODE, "branch", "--show-current") == "feat/PLAN-wt"
+      and git(WT_MAIN, "branch", "--show-current") == "main" and u["unit_base_sha"] == WT_UPSTREAM
+      and git(WT_CODE, "rev-parse", "--verify", "origin/feat/PLAN-wt") == WT_UPSTREAM, u)
+check("branch_setup: the new run branch tracks its own pushed branch, never origin/main",
+      git(WT_CODE, "rev-parse", "--abbrev-ref", "feat/PLAN-wt@{upstream}") == "origin/feat/PLAN-wt")
+git(WT_CODE, "checkout", "-q", "work")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="wt", **PS))
+check("branch_setup: existing run branch with an upstream -> checked out and pulled; main stays in its worktree",
+      u["_next"] == "select_tasks" and git(WT_CODE, "branch", "--show-current") == "feat/PLAN-wt"
+      and git(WT_MAIN, "branch", "--show-current") == "main" and any("existing" in d for d in u["decisions"]), u)
+git(WT_MAIN, "merge", "-q", "--ff-only", "origin/main")
+git(WT_MAIN, "commit", "-q", "--allow-empty", "-m", "local only")
+WT_AHEAD = git(WT_MAIN, "rev-parse", "HEAD")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="ahead", **PS))
+check("branch_setup: a local main ahead of origin/main keeps its unpushed commits in the new run branch",
+      u["_next"] == "select_tasks" and u["unit_base_sha"] == WT_AHEAD and git(WT_MAIN, "branch", "--show-current") == "main", u)
+git(WT_PUSHER, "commit", "-q", "--allow-empty", "-m", "origin only")
+git(WT_PUSHER, "push", "-q", "origin", "main")
+u = gates.branch_setup(base_state(code_repo_path=WT_CODE, plan_slug="split", **PS))
+check("branch_setup: a local main diverged from origin/main -> git_setup_failed naming the divergence, no branch cut",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "git_setup_failed" and "diverged" in u["escalation"]["evidence"]
+      and not git(WT_CODE, "rev-parse", "--verify", "--quiet", "refs/heads/feat/PLAN-split", check_=False), u)
+WT_LOCAL = os.path.join(TMP, "wt-local")
+os.makedirs(WT_LOCAL)
+git(WT_LOCAL, "init", "-q", "-b", "main")
+git(WT_LOCAL, "commit", "-q", "--allow-empty", "-m", "init")
+WT_LOCAL_MAIN = git(WT_LOCAL, "rev-parse", "HEAD")
+git(WT_LOCAL, "checkout", "-q", "-b", "work")
+git(WT_LOCAL, "worktree", "add", "-q", os.path.join(TMP, "wt-local-main"), "main")
+u = gates.branch_setup(base_state(code_repo_path=WT_LOCAL, plan_slug="loc", **PS))
+check("branch_setup: no remote -> the run branch is cut from the local main, nothing fetched or pushed",
+      u["_next"] == "select_tasks" and git(WT_LOCAL, "branch", "--show-current") == "feat/PLAN-loc"
+      and u["unit_base_sha"] == WT_LOCAL_MAIN and git(os.path.join(TMP, "wt-local-main"), "branch", "--show-current") == "main", u)
+git(WT_LOCAL, "checkout", "-q", "work")
+u = gates.branch_setup(base_state(code_repo_path=WT_LOCAL, plan_slug="loc", **PS))
+check("branch_setup: existing run branch with no upstream -> checked out, the pull skipped and ledgered",
+      u["_next"] == "select_tasks" and git(WT_LOCAL, "branch", "--show-current") == "feat/PLAN-loc"
+      and any("no upstream" in d for d in u["decisions"]), u)
+WT_HELD = os.path.join(TMP, "wt-held")
+git(WT_LOCAL, "checkout", "-q", "work")
+git(WT_LOCAL, "worktree", "add", "-q", "-b", "feat/PLAN-held", WT_HELD, "main")
+u = gates.branch_setup(base_state(code_repo_path=WT_LOCAL, plan_slug="held", **PS))
+E_HELD = u.get("escalation") or {}
+check("branch_setup: the run branch held by another worktree -> git_setup_failed naming that worktree, with fitting options",
+      u["_next"] == "escalate_gate" and E_HELD.get("kind") == "git_setup_failed"
+      and os.path.realpath(E_HELD["data"]["worktree"]) == os.path.realpath(WT_HELD)
+      and [o["text"] for o in E_HELD["options"]] == ["Use that worktree as the code dir", "Pick a different branch name", "Abort the run"]
+      and git(WT_LOCAL, "branch", "--show-current") == "work", u)
+s = base_state(code_repo_path=WT_LOCAL, plan_slug="held", escalation=E_HELD, last_answer="Use that worktree as the code dir", **PS)
+s.update(gates.apply_answer(s))
+s.update(gates.branch_setup(s))
+check("apply_answer: git_setup_failed 'Use that worktree' -> the code dir is that worktree, branch_setup succeeds there",
+      s["_next"] == "select_tasks" and os.path.realpath(s["code_repo_path"]) == os.path.realpath(WT_HELD)
+      and s["code_dir_override"] == s["code_repo_path"] and git(WT_LOCAL, "branch", "--show-current") == "work", s)
+s = base_state(code_repo_path=WT_LOCAL, plan_slug="held", escalation=E_HELD, last_answer="Pick a different branch name", **PS)
+s.update(gates.apply_answer(s))
+E_NAME = s.get("escalation") or {}
+s.update(last_answer="bad..name")
+u = gates.apply_answer(s)
+s.update(last_answer="feat/held-two")
+s.update(gates.apply_answer(s))
+s.update(gates.branch_setup(s))
+check("apply_answer: 'Pick a different branch name' -> asks for a name; an invalid one is asked again, a valid one is the run branch",
+      E_NAME.get("kind") == "branch_name" and u["escalation"]["kind"] == "branch_name" and "not a valid" in u["escalation"]["question"]
+      and s["run_branch_override"] == "feat/held-two" and s["_next"] == "select_tasks" and s["run_branch"] == "feat/held-two"
+      and git(WT_LOCAL, "branch", "--show-current") == "feat/held-two", s)
+check("snapshot: the owner's branch, base and code dir overrides are durable state",
+      {"run_branch_override", "base_branch_override", "code_dir_override"} <= set(_lib.STATE_KEYS))
+
 # ---------------------------------------------------------------- select_tasks (B7) / eligibility / waves
 import copy  # noqa: E402
 

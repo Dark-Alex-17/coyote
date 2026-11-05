@@ -339,6 +339,9 @@ initial_state:
   discussion_run_id: ''
   discussion_message: ''
   settled_answer: ''
+  run_branch_override: ''
+  base_branch_override: ''
+  code_dir_override: ''
   autonomous_digest: []
   autonomous_kinds: []
   # --- phase F ---

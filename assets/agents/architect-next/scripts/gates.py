@@ -228,6 +228,11 @@ def intake(state):
                      "reference_root_path"):
                 continue  # recomputed from the live variables
             u[k] = v
+        # an owner's answer that moved the base or the code dir outlives the live variables
+        if str(prior.get("base_branch_override") or "").strip():
+            u["base_branch_name"] = prior["base_branch_override"].strip()
+        if str(prior.get("code_dir_override") or "").strip() and os.path.isdir(prior["code_dir_override"]):
+            u["code_repo_path"] = prior["code_dir_override"]
         u["resume_phase"] = prior.get("phase", "")
         settled = (cont.group(1) or "").strip() if cont else ""
         u["settled_answer"] = settled if re.search(r"\w", settled) else ""
@@ -1052,10 +1057,61 @@ def _pr_unit(state, task, tasks):
 
 # ====================================================================== 2.5 per-task loop
 def _run_branch(state):
-    return f"feat/PLAN-{state.get('plan_slug')}"
+    return str(state.get("run_branch_override") or "").strip() or f"feat/PLAN-{state.get('plan_slug')}"
+
+
+WORKTREE_HELD_RE = re.compile(r"is already (?:used by worktree|checked out) at '?([^'\n]+?)'?\s*$", re.M)
+
+
+def _branch_start(state, u, code, base):
+    """The ref a new run branch is cut from, never checked out: the freshly fetched origin/<base>, or the local <base>
+    when it has no remote, the fetch fails, or it already holds origin/<base> plus unpushed commits. "" when the two diverged.
+    """
+    if not git_out(code, "remote", "get-url", "origin", default=""):
+        return base
+    rc, out, err = git(code, "fetch", "--quiet", "origin", base)
+    if rc != 0 or not git_out(code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", default=""):
+        ledger(state, u, f"branch: git fetch origin {base} failed ({tail(err or out, 200)}); cutting from the local {base}")
+        return base
+    remote = f"origin/{base}"
+    if not git_out(code, "rev-parse", "--verify", "--quiet", f"refs/heads/{base}", default=""):
+        return remote
+    if git(code, "merge-base", "--is-ancestor", remote, f"refs/heads/{base}")[0] == 0:
+        return base
+    if git(code, "merge-base", "--is-ancestor", f"refs/heads/{base}", remote)[0] == 0:
+        return remote
+    return ""
+
+
+def _git_setup_escalation(state, u, branch, base, code, step, detail):
+    """A failed branch step; a run branch held by another worktree gets the options that fit it."""
+    held = WORKTREE_HELD_RE.search(detail)
+    if held:
+        where = held.group(1).strip()
+        ledger(state, u, f"branch: {branch} is checked out in the worktree at {where}; asking how to go on")
+        return raise_escalation(state, u, escalation(
+            "git_setup_failed", f"The run branch {branch} is already checked out in the worktree at {where}, so it cannot be "
+                                f"checked out in {code}. Use that worktree, pick a different branch name, or abort?",
+            [option("Use that worktree as the code dir", recommended=True, evidence=where), option("Pick a different branch name"),
+             option("Abort the run")], evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base}))
+    return raise_escalation(state, u, escalation(
+        "git_setup_failed", f"Could not set up the branch {branch} from {base} in {code}: git {' '.join(step)} failed. Retry, or abort?",
+        [option("Retry the branch setup", recommended=True), option("Abort the run")], evidence=tail(detail, 1500),
+        data={"branch": branch, "base": base}))
+
+
+def _use_code_dir(state, u, path):
+    """Point the run at another checkout of the same repo (an owner answer); False when the path is no directory."""
+    path = os.path.abspath(os.path.expanduser(path.strip())) if path.strip() else ""
+    if not path or not os.path.isdir(path):
+        return False
+    u["code_repo_path"] = u["code_dir_override"] = path
+    ledger(state, u, f"branch: the code dir is now {path} (owner)")
+    return True
 
 
 def branch_setup(state):
+    """Check out the run branch in the code dir, never the base: a base held by another worktree stays where it is."""
     u = {}
     code = state.get("code_repo_path", "")
     base = state.get("base_branch_name") or "main"
@@ -1081,21 +1137,33 @@ def branch_setup(state):
         exists = git_out(code, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", default="") or \
             git_out(code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", default="")
         if exists:
-            steps = [("checkout", branch), ("pull", "--quiet", "--ff-only")]
+            steps = [("checkout", "--quiet", branch)]
         else:
-            steps = [("checkout", "--quiet", base), ("pull", "--quiet", "--ff-only"), ("checkout", "-b", branch), ("push", "-u", "origin", branch)]
+            start = _branch_start(state, u, code, base)
+            if not start:
+                ledger(state, u, f"branch: the local {base} and origin/{base} have diverged")
+                return _git_setup_escalation(state, u, branch, base, code, ("fetch", "origin", base),
+                                             f"the local {base} and origin/{base} have diverged; reconcile them, or name another base")
+            steps = [("checkout", "--quiet", "--no-track", "-b", branch, start)]
+            if git_out(code, "remote", "get-url", "origin", default=""):
+                steps.append(("push", "-u", "origin", branch))
         for s in steps:
             code_, out, err = git(code, *s)
-            if code_ != 0 and not (s[0] == "pull" and "no tracking" in (out + err).lower()):
+            if code_ != 0:
                 if s[0] == "push":
                     ledger(state, u, f"branch: push -u failed ({tail(err, 200)}); continuing on the local branch")
                     continue
                 ledger(state, u, f"branch: git {' '.join(s)} failed: {tail(err or out, 300)}")
-                return raise_escalation(state, u, escalation(
-                    "git_setup_failed", f"Could not set up the branch {branch} from {base} in {code}: git {' '.join(s)} failed. Retry, or abort?",
-                    [option("Retry the branch setup", recommended=True), option("Abort the run")], evidence=tail(err or out, 1500)))
+                return _git_setup_escalation(state, u, branch, base, code, s, err or out)
+        if exists and git_out(code, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", default=""):
+            code_, out, err = git(code, "pull", "--quiet", "--ff-only")
+            if code_ != 0:
+                ledger(state, u, f"branch: git pull --ff-only failed: {tail(err or out, 300)}")
+                return _git_setup_escalation(state, u, branch, base, code, ("pull", "--quiet", "--ff-only"), err or out)
+        elif exists:
+            ledger(state, u, f"branch: {branch} has no upstream; nothing to pull")
         u["unit_base_sha"] = git_out(code, "rev-parse", "HEAD", default="")
-        ledger(state, u, f"branch: {branch} ready ({'existing' if exists else 'created'} from {base}) @ {u['unit_base_sha']}")
+        ledger(state, u, f"branch: {branch} ready ({'existing' if exists else 'created from ' + start}) @ {u['unit_base_sha']}")
     else:
         u["run_branch"] = ""
         ledger(state, u, "branch: multi (per-task stacked PRs) - Sisyphus cuts each task branch at claim")
@@ -2806,7 +2874,7 @@ def apply_answer(state):
                 u["draft_feedback"] = answer
                 u["_next"] = "draft_brief"
     elif kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
-                  "git_setup_failed", "gate_fault") and abort:
+                  "git_setup_failed", "branch_name", "gate_fault") and abort:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
@@ -2904,7 +2972,25 @@ def apply_answer(state):
             u["failure_reason"] = "aborted after a promotion failure"
             u["_next"] = "end_aborted"
     elif kind == "git_setup_failed":
-        u["_next"] = "branch_setup"
+        data = as_dict(esc.get("data"))
+        if answer == "Use that worktree as the code dir" and not _use_code_dir(state, u, data.get("worktree") or ""):
+            ledger(state, u, f"branch: the worktree {data.get('worktree') or '(none named)'} is not a directory; retrying as is")
+        if answer == "Pick a different branch name":
+            raise_escalation(state, u, escalation(
+                "branch_name", f"Which branch name should the run use instead of {data.get('branch') or _run_branch(state)}?",
+                tier3_ok=False, data={"branch": data.get("branch") or ""}))
+        else:
+            u["_next"] = "branch_setup"
+    elif kind == "branch_name":
+        name = answer.strip().split()[0] if answer.strip() else ""
+        if name and git(state.get("code_repo_path") or ".", "check-ref-format", "--branch", name)[0] == 0:
+            u["run_branch_override"] = name
+            ledger(state, u, f"branch: the run branch is now {name} (owner)")
+            u["_next"] = "branch_setup"
+        else:
+            ledger(state, u, f"branch: {name!r} is not a valid branch name; asking again")
+            raise_escalation(state, u, escalation("branch_name", f"{name!r} is not a valid branch name. Which branch name "
+                                                                "should the run use?", tier3_ok=False, data=as_dict(esc.get("data"))))
     elif kind == "tasks_stuck":
         a = _answered(state, {"retry": ["retry"], "skip": ["skip"], "stop": ["stop"]}, "stop")
         if a == "retry":
