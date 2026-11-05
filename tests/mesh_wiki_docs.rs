@@ -3261,21 +3261,6 @@ fn method_body(path: &str, name: &str) -> String {
     source[start..end].to_string()
 }
 
-/// The source of the `impl` block in `path` whose header line is `header` (for one
-/// example, `impl fmt::Display for AlreadyClosed`): from that line to the first `\n}\n`
-/// after it, so a sentence a `Display` impl writes can be scraped like a function's.
-fn impl_body(path: &str, header: &str) -> String {
-    let source = read(repo_root().join(path));
-    let start = source
-        .find(&format!("\n{header} {{\n"))
-        .unwrap_or_else(|| panic!("{path} declares `{header}`"));
-    let end = source[start..]
-        .find("\n}\n")
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("{path}'s `{header}` does not end with `}}` on its own line"));
-    source[start..end].to_string()
-}
-
 /// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
 /// did not come up as the code formats it: the five `WARNING:` lines, the `Mesh relay` and
 /// `Local rnsd` failure texts, the hint appended when every configured interface is a
@@ -7018,35 +7003,70 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         all_source.contains(r#"plural(count, "asker", "askers")"#),
         "dismiss_all's progress line no longer counts with the plural helper:\n{all_source}"
     );
-    let own = string_literals(&fn_body("src/repl/mesh.rs", "asked_by_this_node"))
+    let own_source = fn_body("src/repl/mesh.rs", "asked_by_this_node");
+    let own = string_literals(&own_source)
         .into_iter()
         .find(|literal| literal.contains("this node asked"))
         .expect("asked_by_this_node words this node's own question with one literal");
     assert_eq!(
         own,
-        "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+        " is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
     );
-    let unknown = string_literals(&fn_body("src/repl/mesh.rs", "no_open_question"));
+    assert_in_source_order(
+        "asked_by_this_node",
+        &own_source,
+        &[".peer(id)", r#"" is a question this node asked"#],
+    );
+    let own = format!("{{id}}{own}");
+    let unknown_source = fn_body("src/repl/mesh.rs", "no_open_question");
+    let unknown_runs = string_literals(&unknown_source);
     assert_eq!(
-        unknown,
-        ["No open question has id {id}. `.mesh pending` lists the ones this node knows about."]
+        unknown_runs,
+        [
+            "No open question has id ",
+            ". `.mesh pending` lists the ones this node knows about."
+        ]
     );
-    let access = string_literals(&fn_body("src/mesh/pending.rs", "access_not_a_question"));
+    assert_in_source_order(
+        "no_open_question",
+        &unknown_source,
+        &[
+            r#""No open question has id ""#,
+            ".peer(id)",
+            r#"". `.mesh pending"#,
+        ],
+    );
+    let unknown = [unknown_runs.join("{id}")];
+    let access_source = fn_body("src/mesh/pending.rs", "access_not_a_question");
+    let access = string_literals(&access_source);
     assert_eq!(
         access,
         [
-            "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`"
+            "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`",
+            "id"
         ]
     );
-    let held = string_literals(&method_body(
-        "src/mesh/node.rs",
-        "refuse_dismiss_held_by_envoy",
-    ));
+    assert!(
+        access_source.contains(r#"&[("id", id)]"#),
+        "access_not_a_question no longer quotes the id as typed:\n{access_source}"
+    );
+    assert!(
+        method_body("src/mesh/node.rs", "refuse_dismiss_held_by_envoy")
+            .contains("return Err(dismiss_held_by_envoy(id));"),
+        "refuse_dismiss_held_by_envoy no longer words the hold with dismiss_held_by_envoy"
+    );
+    let held_source = fn_body("src/mesh/node.rs", "dismiss_held_by_envoy");
+    let held = string_literals(&held_source);
     assert_eq!(
         held,
         [
-            "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
+            "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}.",
+            "id"
         ]
+    );
+    assert!(
+        held_source.contains(r#"&[("id", id)]"#),
+        "dismiss_held_by_envoy no longer quotes the id as typed:\n{held_source}"
     );
     let could_not = string_literals(&method_body("src/mesh/node.rs", "dismiss_inbound"))
         .into_iter()
@@ -7056,15 +7076,18 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         could_not,
         "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
     );
-    let race = string_literals(&impl_body(
-        "src/mesh/node.rs",
-        "impl fmt::Display for AlreadyClosed",
-    ));
+    let race_source = fn_body("src/mesh/node.rs", "already_closed");
+    let race = string_literals(&race_source);
     assert_eq!(
         race,
         [
-            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+            "id"
         ]
+    );
+    assert!(
+        race_source.contains(r#"&[("id", id)]"#),
+        "already_closed no longer quotes the id as typed:\n{race_source}"
     );
     assert!(
         method_body("src/mesh/node.rs", "open_question").contains("bail!(already_closed(id))"),
