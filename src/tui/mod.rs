@@ -1751,6 +1751,20 @@ async fn settle_late_notices(rx: &mut UnboundedReceiver<UiMsg>, late: &mut Vec<S
     }
 }
 
+/// What a user's quit does to the shared abort signal. During a turn it
+/// interrupts the turn, which the exit then reports as interrupted. Idle,
+/// it clears whatever an earlier Esc left on the signal: the signal is
+/// shared across turns and nothing else resets it between a turn's end
+/// and the exit work, which would otherwise report a clean quit as an
+/// interrupted one. A SIGTERM or hang-up keeps setting the flag itself.
+fn quit_abort(abort: &AbortSignal, turn_running: bool) {
+    if turn_running {
+        abort.set_ctrlc();
+    } else {
+        abort.reset();
+    }
+}
+
 async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let Shell {
         app,
@@ -1828,9 +1842,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::Interrupt) => abort.set_ctrlc(),
                     Some(Command::Quit) => {
                         quit_requested = true;
-                        if task.is_some() {
-                            abort.set_ctrlc();
-                        }
+                        quit_abort(abort, task.is_some());
                     }
                     Some(Command::Suspend) => {
                         #[cfg(unix)]
@@ -2765,6 +2777,31 @@ mod tests {
         assert!(started.elapsed() < EXIT_CANCEL_WAIT);
         assert_eq!(early_answer.unwrap(), PromptAnswer::Confirmed(false));
         assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(false));
+    }
+
+    /// Esc ends a turn by latching ctrl-c on the shared signal and nothing
+    /// clears it afterwards; a quit from the idle composer must not inherit
+    /// it, or the exit work would report a deliberate quit as interrupted
+    /// (no `agent.completed`). A quit during a turn is the interruption.
+    #[test]
+    fn an_idle_quit_after_an_interrupted_turn_starts_the_exit_with_a_clean_signal() {
+        let abort = create_abort_signal();
+        // Esc during a turn, the turn ends, the user quits idle.
+        abort.set_ctrlc();
+        assert!(abort.aborted_ctrlc());
+        quit_abort(&abort, false);
+        assert!(
+            !abort.aborted_ctrlc(),
+            "the idle quit carried the earlier interrupt into the exit"
+        );
+        assert!(!abort.aborted());
+    }
+
+    #[test]
+    fn a_quit_during_a_turn_interrupts_it() {
+        let abort = create_abort_signal();
+        quit_abort(&abort, true);
+        assert!(abort.aborted_ctrlc());
     }
 
     /// A work task that never finishes is given up on at the deadline:
