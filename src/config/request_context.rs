@@ -1647,10 +1647,11 @@ impl RequestContext {
         };
         let session_name = match name {
             Some(v) => v.to_string(),
-            None => session
-                .autoname()
-                .unwrap_or_else(|| session.name())
-                .to_string(),
+            None => match session.autoname() {
+                Some(autoname) if session.name() == TEMP_SESSION_NAME => autoname,
+                _ => session.name(),
+            }
+            .to_string(),
         };
         let scope = scope.unwrap_or_else(|| session.scope());
         if scope == SessionScope::Workspace && session_name == TEMP_SESSION_NAME {
@@ -17255,6 +17256,29 @@ mod tests {
             .unwrap();
         assert!(
             ctx.session_file_for("named", SessionScope::Workspace)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_keeps_user_name_over_autoname() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        ctx.session.as_mut().unwrap().set_autoname("auto title");
+
+        ctx.save_session(Some("named"), Some(SessionScope::Workspace))
+            .unwrap();
+        ctx.save_session(None, None).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.name(), "named");
+        let named_file = ctx.session_file_for("named", SessionScope::Workspace);
+        assert_eq!(session.path(), Some(named_file.as_path()));
+        assert!(
+            !ctx.session_file_for("auto-title", SessionScope::Workspace)
                 .exists()
         );
     }
