@@ -526,6 +526,13 @@ check(f"normalize_choices: more than {_lib.CHOICE_OPTIONS_MAX} options -> the re
 check("normalize_choices: no recommended option, or a single option -> not askable",
       gates.normalize_choices(base_state(), {}, {"question": "q", "options": [{"text": "a"}, {"text": "b"}]}) is None
       and gates.normalize_choices(base_state(), {}, {"question": "q", "options": [{"text": "a", "recommended": True}]}) is None)
+u = {}
+n = gates.normalize_choices(base_state(), u, {"question": "q", "options": [
+    {"text": "Use PG"}, {"text": " use pg ", "recommended": True, "evidence": "ops"}, {"text": "sqlite"}]})
+dup = gates.normalize_choices(base_state(), {}, {"question": "q", "options": [{"text": "pg", "recommended": True}, {"text": "PG "}]})
+check("normalize_choices: case-insensitive duplicate texts -> one option, the recommended copy kept, ledgered; two copies are not askable",
+      [(o["text"], o["recommended"], o["evidence"]) for o in n["options"]] == [("use pg", True, "ops"), ("sqlite", False, "")]
+      and any("1 duplicate option(s) dropped" in d for d in u.get("decisions", [])) and dup is None, (n, dup))
 BAD = {"question": "Which org?", "options": [], "changes_scope": False}
 u = gates.open_questions_gate(base_state(open_questions=[qs[1], BAD], design_rounds=0, choice_reframed=False))
 check("open_questions_gate: a question that is not askable (a carried one has no options) -> one re-frame through frame_questions",

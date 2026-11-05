@@ -456,12 +456,22 @@ def plan_route(state):
 def normalize_choices(state, u, item):
     """`item` with its options cut to an askable multiple choice, the recommended one first; None when it is not askable.
 
-    Several recommended options keep the first; more than CHOICE_OPTIONS_MAX keep the recommended one plus the first
-    others. No recommended option or fewer than CHOICE_OPTIONS_MIN options leaves nothing to ask.
+    Options whose texts differ only in case collapse to one, the recommended copy winning. Several recommended options
+    keep the first; more than CHOICE_OPTIONS_MAX keep the recommended one plus the first others. No recommended option
+    or fewer than CHOICE_OPTIONS_MIN distinct options leaves nothing to ask.
     """
     opts = [{"text": str(o.get("text")).strip(), "recommended": truthy(o.get("recommended")),
              "evidence": str(o.get("evidence") or "").strip()}
             for o in as_list(item.get("options")) if isinstance(o, dict) and str(o.get("text") or "").strip()]
+    distinct = {}
+    for o in opts:
+        key = o["text"].casefold()
+        if key not in distinct or (o["recommended"] and not distinct[key]["recommended"]):
+            distinct[key] = o
+    if len(distinct) < len(opts):
+        ledger(state, u, f"choice: {len(opts) - len(distinct)} duplicate option(s) dropped on "
+                         f"{tail(item.get('question', ''), 120)!r}")
+        opts = list(distinct.values())
     recommended = [i for i, o in enumerate(opts) if o["recommended"]]
     if len(recommended) > 1:
         for i in recommended[1:]:
