@@ -151,7 +151,10 @@ pub fn drain_stale_tty_input() {
     use std::time::{Duration, Instant};
 
     // Under the full-screen UI the event stream owns stdin; reading here
-    // would steal its keystrokes and toggle the raw mode it set.
+    // would steal its keystrokes and toggle the raw mode it set. No caller
+    // reaches this branch today (the REPL loop and the startup env load
+    // run before the UI is up; the vault's callers sit behind the prompt
+    // gate); it holds for the next one.
     if crate::tui::active() || !io::stdin().is_terminal() {
         return;
     }

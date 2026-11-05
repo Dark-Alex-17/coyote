@@ -83,8 +83,16 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
                 while matches!(chars.get(i), Some(c) if ('\x20'..='\x2f').contains(c)) {
                     i += 1;
                 }
-                let final_byte = chars.get(i).copied();
-                i += 1;
+                // Only a final byte (0x40..=0x7e) is consumed; a sequence
+                // cut short by anything else leaves that character to the
+                // next round rather than swallowing it.
+                let final_byte = chars
+                    .get(i)
+                    .copied()
+                    .filter(|c| ('\x40'..='\x7e').contains(c));
+                if final_byte.is_some() {
+                    i += 1;
+                }
                 if keep_sgr && !private && final_byte == Some('m') {
                     let params: String = chars[start + 2..i - 1].iter().collect();
                     if let Some(kept) = without_conceal(&params) {

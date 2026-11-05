@@ -423,14 +423,18 @@ pub fn strip_ansi(text: &str) -> String {
             // payload is not screen text.
             Some(']' | 'P' | '_' | '^' | 'X') => {
                 i += 2;
+                // A bare ESC ends the string too, as on a terminal, and the
+                // sequence it starts is handled by the next round.
                 loop {
                     match chars.get(i) {
                         None | Some('\x07') => {
                             i += 1;
                             break;
                         }
-                        Some('\x1b') if chars.get(i + 1) == Some(&'\\') => {
-                            i += 2;
+                        Some('\x1b') => {
+                            if chars.get(i + 1) == Some(&'\\') {
+                                i += 2;
+                            }
                             break;
                         }
                         Some(_) => i += 1,

@@ -35,7 +35,9 @@
 # COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
 # nobody can; tools may branch on it before asking. Under "tui" only the
 # channel-backed path is safe: the /dev/tty fallback draws straight over the
-# full-screen UI.
+# full-screen UI, so under "tui" every helper without a channel
+# (COYOTE_PROMPT_REPLY unset) fails closed instead, exit 1 with one line on
+# stderr; guard_operation and guard_path then abort the operation they guard.
 
 import getpass
 import io

@@ -182,7 +182,8 @@ fn tty_flag_tokens(transcript: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Raw mode clears both; the UI must have put both back.
+/// Raw mode clears echo, icanon, isig and opost; the UI must have put all
+/// four back.
 fn assert_tty_restored(transcript: &str) {
     let tokens = tty_flag_tokens(transcript);
     // Raw mode clears all four; a restored line discipline has them back.
@@ -3536,6 +3537,9 @@ fn control_string_payloads_are_not_screen_text() {
     assert_eq!(strip_ansi("a\x1b^privacy\x07b"), "ab");
     assert_eq!(strip_ansi("a\x1bXstart\x1b\\b"), "ab");
     assert_eq!(strip_ansi("tail\x1bP"), "tail");
+    // An unterminated string ends at the next bare ESC, which then starts
+    // its own sequence: the text after it is kept.
+    assert_eq!(strip_ansi("a\x1b]8;;broken\x1b[31mb\x1b[0m"), "ab");
 }
 
 /// The conceal oracle reads `8` only as its own parameter: the palette
@@ -6330,7 +6334,6 @@ fn dot_file_through_a_file_loader_reading_stdin_returns_at_once_in_the_plain_rep
                 exit_started.elapsed()
             )
         });
-    eprintln!("repl exit took {:?}", exit_started.elapsed());
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }

@@ -493,6 +493,11 @@ mod tests {
     /// may land on it, and either turns the "unopenable" path into a
     /// working one and the case into a false pass.
     fn dead_reply_path() -> String {
+        format!("/dev/fd/{}", dead_fd())
+    }
+
+    /// A descriptor number no child can hold: the process limit itself.
+    fn dead_fd() -> u64 {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -501,8 +506,7 @@ mod tests {
         let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
         assert_eq!(rc, 0, "getrlimit failed");
         // An unlimited process still cannot hold a descriptor this high.
-        let dead: u64 = limit.rlim_cur.min(1 << 20);
-        format!("/dev/fd/{dead}")
+        limit.rlim_cur.min(1 << 20)
     }
 
     /// Installs a bash tool that sources the shipped helper on the
@@ -4072,7 +4076,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
             // The request descriptor the test points at is dead the same
             // way the reply one is: a number past the process limit.
-            let dead_out_fd = dead_reply_path().rsplit('/').next().unwrap().to_string();
+            let dead_out_fd = dead_fd().to_string();
             let dead_out = [(OUT_FD_ENV, dead_out_fd.as_str())];
             let run = drive_env(command("confirm(\"Go?\")"), Some(&[]), false, &dead_out);
             assert_eq!(run.requests, 0, "request sent over a dead request fd");
