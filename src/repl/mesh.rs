@@ -663,14 +663,14 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
                 ));
             }
             None => {
-                out_text(NODE_OFF_LINE);
+                out_path_text(&NoticeText::from(NODE_OFF_LINE).render(live_prefix()));
                 rows.push((
                     "reach".to_string(),
                     reach_line(&reach_facts_of_config(&ctx.app.config.mesh)),
                 ));
             }
         }
-        out_text(&render_info_table(rows));
+        out_path_text(&NoticeText::from(render_info_table(rows)).render(live_prefix()));
         return Ok(());
     };
     let runtime = live(ctx)?;
@@ -722,8 +722,11 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
             .render(live_prefix()),
     );
     if matches!(knock, KnockLookup::Unreadable) {
-        err_text(
-            "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh knocks` reports the error.",
+        err_path_text(
+            &NoticeText::from(
+                "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh knocks` reports the error.",
+            )
+            .render(live_prefix()),
         );
     }
     Ok(())
@@ -1691,18 +1694,18 @@ async fn message(
     rest: Option<&str>,
 ) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("message"));
+        out_path_text(&NoticeText::from(render_verb_help("message")).render(live_prefix()));
         return Ok(());
     };
     let (yes_first, rest) = take_flag(rest, "--yes");
     let Some((target, rest)) = rest.split_once(char::is_whitespace) else {
-        out_text(&render_verb_help("message"));
+        out_path_text(&NoticeText::from(render_verb_help("message")).render(live_prefix()));
         return Ok(());
     };
     let destination = destination_hash(ctx, target)?;
     let (attach, rest) = take_attach(rest, "message")?;
     let Some(outgoing) = parse_outgoing(&rest) else {
-        out_text(&render_verb_help("message"));
+        out_path_text(&NoticeText::from(render_verb_help("message")).render(live_prefix()));
         return Ok(());
     };
     let runtime = live(ctx)?;
@@ -1735,7 +1738,7 @@ async fn message(
         out_path_text(&attaching_notice(attachment, &destination));
     }
     if !confirm_or_flag("Send it?", "--yes", yes_first || outgoing.yes)? {
-        out_text("Nothing was sent.");
+        out_path_text(&NoticeText::from("Nothing was sent.").render(live_prefix()));
         return Ok(());
     }
     let out = OutboundPeer::with_parts(
@@ -1751,12 +1754,15 @@ async fn message(
         .send_peer_lending_reference(&destination, &out)
         .await
         .map_err(quoted_send_failure)?;
-    out_text(&format!(
-        "Sent {} to {} (via {}).",
-        short(&outcome.id),
-        short(&destination),
-        via_text(outcome.via)
-    ));
+    out_path_text(
+        &NoticeText::from(format!(
+            "Sent {} to {} (via {}).",
+            short(&outcome.id),
+            short(&destination),
+            via_text(outcome.via)
+        ))
+        .render(live_prefix()),
+    );
     Ok(())
 }
 
@@ -2430,12 +2436,12 @@ async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
 /// refused for a destination this node has blocked or an identity it has blocked.
 async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("knock"));
+        out_path_text(&NoticeText::from(render_verb_help("knock")).render(live_prefix()));
         return Ok(());
     };
     let args = parse_mutation_args(rest, "knock", &["--yes", "--intro"])?;
     let Some(target) = args.positional.first() else {
-        out_text(&render_verb_help("knock"));
+        out_path_text(&NoticeText::from(render_verb_help("knock")).render(live_prefix()));
         return Ok(());
     };
     let destination = destination_hash(ctx, target)?;
@@ -2471,7 +2477,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         .render(live_prefix()),
     );
     if !confirm_or_flag("Knock?", "--yes", args.yes)? {
-        out_text("Nothing was sent.");
+        out_path_text(&NoticeText::from("Nothing was sent.").render(live_prefix()));
         return Ok(());
     }
     let desc = match route_to(&runtime, &destination, abort_signal).await {
@@ -2482,24 +2488,29 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             left_mesh_hint(Some(&peer), SystemTime::now())
         ),
         Err(Unrouted::Interrupted) => {
-            out_text("Knock interrupted.");
+            out_path_text(&NoticeText::from("Knock interrupted.").render(live_prefix()));
             return Ok(());
         }
     };
-    out_text(&format!(
-        "Knocking on {}; Ctrl-C cancels...",
-        short(&destination)
-    ));
+    out_path_text(
+        &NoticeText::from(format!(
+            "Knocking on {}; Ctrl-C cancels...",
+            short(&destination)
+        ))
+        .render(live_prefix()),
+    );
     result_follows();
     let outcome = tokio::select! {
         outcome = runtime.knock(&desc, &intro) => outcome,
         _ = wait_user_interrupt(Some(abort_signal)) => {
-            out_text("Knock interrupted.");
+            out_path_text(&NoticeText::from("Knock interrupted.").render(live_prefix()));
             return Ok(());
         }
     };
     match outcome {
-        Ok(outcome) => out_text(&knock_report(short(&destination), &outcome)),
+        Ok(outcome) => out_path_text(
+            &NoticeText::from(knock_report(short(&destination), &outcome)).render(live_prefix()),
+        ),
         Err(err) => return Err(QuotingError::wrap(err.notice())),
     }
     Ok(())
@@ -2578,11 +2589,11 @@ async fn request(
     rest: Option<&str>,
 ) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("request"));
+        out_path_text(&NoticeText::from(render_verb_help("request")).render(live_prefix()));
         return Ok(());
     };
     let Some(args) = parse_request_args(rest)? else {
-        out_text(&render_verb_help("request"));
+        out_path_text(&NoticeText::from(render_verb_help("request")).render(live_prefix()));
         return Ok(());
     };
     let destination = destination_hash(ctx, &args.destination)?;
@@ -2622,7 +2633,7 @@ async fn request(
         valid.paths.join(", ")
     );
     if !confirm_or_flag(&question, "--yes", args.yes)? {
-        out_text("Nothing was sent.");
+        out_path_text(&NoticeText::from("Nothing was sent.").render(live_prefix()));
         return Ok(());
     }
     send_request(ctx, abort_signal, &runtime, &destination, &valid, reason).await
@@ -2647,16 +2658,21 @@ async fn send_request(
             left_mesh_hint(runtime.peers().get(destination).as_ref(), SystemTime::now())
         ),
         Err(Unrouted::Interrupted) => {
-            out_text("Request interrupted; nothing was sent.");
+            out_path_text(
+                &NoticeText::from("Request interrupted; nothing was sent.").render(live_prefix()),
+            );
             return Ok(());
         }
     }
     let d8 = short(destination);
-    out_text(&format!(
-        "Asking {} for {} path(s); Ctrl-C cancels...",
-        short(destination),
-        valid.paths.len()
-    ));
+    out_path_text(
+        &NoticeText::from(format!(
+            "Asking {} for {} path(s); Ctrl-C cancels...",
+            short(destination),
+            valid.paths.len()
+        ))
+        .render(live_prefix()),
+    );
     result_follows();
     // The send runs as its own task so a late interrupt ends only the wait: the request
     // may already be with the peer, and the task still settles an inline answer (a grant
@@ -2672,9 +2688,10 @@ async fn send_request(
     let joined = tokio::select! {
         joined = &mut handle => joined,
         _ = wait_user_interrupt(Some(abort_signal)) => {
-            out_text(&format!(
+            out_path_text(&NoticeText::from(format!(
                 "Request interrupted; it may still reach {d8}. If it does, the decision arrives as an idle line; .mesh inbox lists it."
-            ));
+            ))
+            .render(live_prefix()));
             return Ok(());
         }
     };
@@ -2793,11 +2810,11 @@ fn parse_request_args(rest: &str) -> Result<Option<RequestArgs>> {
 /// shares into the staging inbox and says where it landed. The bytes are never printed.
 async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("fetch"));
+        out_path_text(&NoticeText::from(render_verb_help("fetch")).render(live_prefix()));
         return Ok(());
     };
     let Some(args) = parse_fetch_args(rest)? else {
-        out_text(&render_verb_help("fetch"));
+        out_path_text(&NoticeText::from(render_verb_help("fetch")).render(live_prefix()));
         return Ok(());
     };
     let destination = destination_hash(ctx, &args.destination)?;
@@ -2855,8 +2872,11 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 hex_lower(&sha256),
                 path.display()
             ));
-            out_text(
-                "The file is the peer's; move it into the tree yourself if you want it there.",
+            out_path_text(
+                &NoticeText::from(
+                    "The file is the peer's; move it into the tree yourself if you want it there.",
+                )
+                .render(live_prefix()),
             );
         }
         Ok(Fetched::NotModified { .. }) => out_path_text(&format!(

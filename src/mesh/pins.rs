@@ -1389,6 +1389,20 @@ mod tests {
             ("src/repl/mesh.rs", "not_shared_refusal", Kind::Text),
             ("src/repl/mesh.rs", "send_confirmation", Kind::Text),
             ("src/repl/mesh.rs", "knock_confirmation", Kind::Text),
+            ("src/repl/mesh.rs", "dismiss_one", Kind::Text),
+            ("src/repl/mesh.rs", "dismiss_all", Kind::Text),
+            ("src/repl/mesh.rs", "dismissed_line", Kind::Text),
+            ("src/repl/mesh.rs", "dismiss_all_row", Kind::Text),
+            ("src/repl/mesh.rs", "dismiss_all_summary", Kind::Text),
+            ("src/repl/mesh.rs", "answered_line", Kind::Text),
+            ("src/repl/mesh.rs", "reply_sent_line", Kind::Text),
+            ("src/repl/mesh.rs", "fetch", Kind::Text),
+            ("src/repl/mesh.rs", "info", Kind::Text),
+            ("src/repl/mesh.rs", "knock", Kind::Text),
+            ("src/repl/mesh.rs", "message", Kind::Text),
+            ("src/repl/mesh.rs", "request", Kind::Text),
+            ("src/repl/mesh.rs", "send_request", Kind::Text),
+            ("src/mesh/knock.rs", "notice", Kind::Text),
             ("src/mesh/fetch.rs", "not_shared_sentence", Kind::Text),
             ("src/repl/mesh.rs", "resolve_pending_id", Kind::Error),
             ("src/repl/mesh.rs", "whole_id_refusal", Kind::Error),
@@ -1400,6 +1414,10 @@ mod tests {
             ("src/repl/mesh.rs", "no_open_access_request", Kind::Error),
             ("src/repl/mesh.rs", "no_open_question", Kind::Error),
             ("src/repl/mesh.rs", "asked_by_this_node", Kind::Error),
+            ("src/repl/mesh.rs", "resolve_hash", Kind::Error),
+            ("src/repl/mesh.rs", "invalid_path_refusal", Kind::Error),
+            ("src/repl/mesh.rs", "too_large_refusal", Kind::Error),
+            ("src/repl/mesh.rs", "undelivered_refusal", Kind::Error),
             ("src/mesh/pending.rs", "access_not_a_question", Kind::Error),
             (
                 "src/mesh/pending.rs",
@@ -1409,17 +1427,84 @@ mod tests {
             ("src/mesh/node.rs", "open_question", Kind::Error),
             ("src/mesh/node.rs", "runtime_to_answer", Kind::Error),
             ("src/mesh/node.rs", "already_closed", Kind::Error),
+            ("src/mesh/node.rs", "dismiss_held_by_envoy", Kind::Error),
+            ("src/mesh/node.rs", "answer_held_by_envoy", Kind::Error),
+            ("src/mesh/node.rs", "refuse_held_by_envoy", Kind::Error),
+            ("src/mesh/node.rs", "decline_not_told", Kind::Error),
+            ("src/mesh/node.rs", "dismiss_inbound", Kind::Error),
             ("src/mesh/access.rs", "pending", Kind::Error),
             ("src/mesh/access.rs", "standing_shares", Kind::Error),
             ("src/mesh/access.rs", "standing_write_failed", Kind::Error),
             ("src/mesh/access.rs", "grant_once", Kind::Error),
             ("src/mesh/access.rs", "put_back", Kind::Error),
+            ("src/mesh/access.rs", "revoke_failed", Kind::Error),
+            ("src/mesh/access.rs", "no_share_root", Kind::Error),
             ("src/mesh/shares.rs", "refused_at_load", Kind::Error),
             ("src/mesh/shares.rs", "quoted_share_write", Kind::Error),
         ];
 
         /// Calls that respell every dotted word in the text they are given.
         const RESPELLERS: [&str; 3] = ["out_text(", "err_text(", "render_hints("];
+
+        /// Template slots that hold a peer's or the human's own words. A listed site that
+        /// builds its text with `NoticeText::from_template` fills them from the quoted
+        /// values; a frame value is respelled under the slash prefix.
+        const PEER_SLOTS: [&str; 7] = ["id", "name", "shown", "path", "pattern", "intro", "label"];
+
+        /// The arguments of the call whose text starts just past its `(`, split at the
+        /// commas outside brackets and string literals, empty ones left out.
+        fn call_arguments(text: &str) -> Vec<&str> {
+            let mut args = Vec::new();
+            let (mut depth, mut start, mut in_string, mut escaped) = (0usize, 0, false, false);
+            for (at, c) in text.char_indices() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => in_string = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' if depth == 0 => {
+                        args.push(text[start..at].trim());
+                        break;
+                    }
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        args.push(text[start..at].trim());
+                        start = at + 1;
+                    }
+                    _ => {}
+                }
+            }
+            args.retain(|arg| !arg.is_empty());
+            args
+        }
+
+        /// The peer slots each `from_template` call in `body` fills from its frames.
+        fn framed_peer_slots(body: &str) -> Vec<String> {
+            const CALL: &str = "from_template(";
+            let mut found = Vec::new();
+            for (at, _) in body.match_indices(CALL) {
+                let args = call_arguments(&body[at + CALL.len()..]);
+                let Some(frames) = args.get(1) else {
+                    continue;
+                };
+                for (open, _) in frames.match_indices("(\"") {
+                    let key = &frames[open + 2..];
+                    let key = &key[..key.find('"').unwrap_or(key.len())];
+                    if PEER_SLOTS.contains(&key) {
+                        found.push(key.to_string());
+                    }
+                }
+            }
+            found
+        }
 
         /// The code of every function named `name` in `source` outside its test modules,
         /// a free function or a method one level into an `impl`, from its opening line to
@@ -1486,6 +1571,11 @@ mod tests {
                         "{path}: `{name}` builds its error without QuotingError::wrap or NoticeText runs"
                     ));
                 }
+                for slot in framed_peer_slots(body) {
+                    faults.push(format!(
+                        "{path}: `{name}` fills the template slot `{slot}` from its frames, which respell it; pass it among the quoted values"
+                    ));
+                }
             }
             faults
         }
@@ -1517,6 +1607,21 @@ mod tests {
             assert!(faults("f.rs", printed_path, "knocks", Kind::Text).is_empty());
             let in_tests = "#[cfg(test)]\nmod tests {\n    fn knocks() {\n        out_text(\"x\");\n    }\n}\n";
             assert_eq!(faults("f.rs", in_tests, "knocks", Kind::Text).len(), 1);
+
+            let framed_id = "fn answered_line(id: &str) -> NoticeText {\n    NoticeText::from_template(\"Answered {id}, (\\\"{peer}\\\").\", &[(\"peer\", p), (\"id\", short(id))], &[])\n}\n";
+            assert_eq!(
+                faults("f.rs", framed_id, "answered_line", Kind::Text),
+                [
+                    "f.rs: `answered_line` fills the template slot `id` from its frames, which respell it; pass it among the quoted values"
+                ]
+            );
+            let framed_by_variable = "fn dismissed_line(id: &str, name: &str) -> NoticeText {\n    NoticeText::from_template(\n        template,\n        &[(\"name\", name)],\n        &[(\"id\", id)],\n    )\n}\n";
+            assert_eq!(
+                faults("f.rs", framed_by_variable, "dismissed_line", Kind::Text).len(),
+                1
+            );
+            let quoted_slots = "fn dismissed_line(id: &str, name: &str) -> NoticeText {\n    NoticeText::from_template(\n        template,\n        &[(\"declined\", HUMAN_DECLINED)],\n        &[(\"id\", id), (\"name\", name)],\n    )\n}\n";
+            assert!(faults("f.rs", quoted_slots, "dismissed_line", Kind::Text).is_empty());
         }
 
         /// A peer's `.vault` or `.mesh trust x` reads as the peer wrote it under every
