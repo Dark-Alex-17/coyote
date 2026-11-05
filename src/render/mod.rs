@@ -7,6 +7,7 @@ pub use inquire::prompt_theme;
 pub use self::markdown::{MarkdownRender, RenderOptions};
 use self::stream::{markdown_stream, raw_stream};
 
+use crate::mesh::AlreadyClosed;
 use crate::mesh::notify::NoticeText;
 use crate::utils::{
     AbortSignal, IS_STDOUT_TERMINAL, pretty_error, pretty_error_with, stderr_error_text,
@@ -80,6 +81,9 @@ fn quoted_text<'a>(link: &'a (dyn std::error::Error + 'static)) -> Option<&'a No
     if let Some(verb) = link.downcast_ref::<MeshVerbError>() {
         return quoted_text(verb.0.as_ref());
     }
+    if let Some(closed) = link.downcast_ref::<AlreadyClosed>() {
+        return Some(closed.notice());
+    }
     link.downcast_ref::<QuotingError>()
         .map(|quoting| &quoting.0)
 }
@@ -137,6 +141,23 @@ impl fmt::Display for QuotingError {
 }
 
 impl std::error::Error for QuotingError {}
+
+/// `err` as `{err:#}` reads it, its links joined with `: `, for a sentence that wraps
+/// it. A link that quotes text keeps its runs, so the quote survives the wrapping; any
+/// other link is one frame run.
+pub(crate) fn error_notice(err: &anyhow::Error) -> NoticeText {
+    let mut text = NoticeText::default();
+    for (index, link) in err.chain().enumerate() {
+        if index > 0 {
+            text = text.frame(": ");
+        }
+        text = match quoted_text(link) {
+            Some(quoted) => text.then(quoted.clone()),
+            None => text.frame(link.to_string()),
+        };
+    }
+    text
+}
 
 #[cfg(test)]
 mod tests {
@@ -234,6 +255,37 @@ mod tests {
                     "{prefix}"
                 );
             }
+        }
+    }
+
+    mod error_notice_quoting_tests {
+        use super::*;
+
+        fn chained() -> anyhow::Error {
+            QuotingError::wrap(
+                NoticeText::default()
+                    .frame("the share file says ")
+                    .peer(".mesh trust x"),
+            )
+            .context("`.mesh grant` failed for .session")
+        }
+
+        #[test]
+        fn under_dot_an_error_reads_as_its_alternate_display() {
+            let err = chained();
+            assert_eq!(
+                error_notice(&err).render(CommandPrefix::Dot),
+                "`.mesh grant` failed for .session: the share file says .mesh trust x"
+            );
+            assert_eq!(error_notice(&err).plain(), format!("{err:#}"));
+        }
+
+        #[test]
+        fn under_slash_a_quoting_link_keeps_its_quote_and_a_plain_link_slashes() {
+            assert_eq!(
+                error_notice(&chained()).render(CommandPrefix::Slash),
+                "`/mesh grant` failed for /session: the share file says .mesh trust x"
+            );
         }
     }
 }

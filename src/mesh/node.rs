@@ -72,6 +72,7 @@ use crate::mesh::{
     PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
     mesh_cache_dir,
 };
+use crate::render::QuotingError;
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -4932,9 +4933,7 @@ impl MeshSlot {
     /// the refusal once the hold lapsed, so the peer would hear two answers.
     pub(crate) fn refuse_dismiss_held_by_envoy(&self, id: &str) -> Result<()> {
         if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
-            bail!(
-                "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
-            );
+            return Err(dismiss_held_by_envoy(id));
         }
         Ok(())
     }
@@ -4961,24 +4960,29 @@ impl MeshSlot {
         now: SystemTime,
     ) -> Result<(Arc<InboundStore>, InboundRecord)> {
         let Some(store) = self.inbound_store() else {
-            bail!("Mesh is off; turn it on with `.mesh on` before answering {id}");
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off; turn it on with `.mesh on` before answering {id}",
+                &[],
+                &[("id", id)],
+            )));
         };
         let record = match store.get(id)? {
             Some(record) if !record.is_expired(now) => record,
             _ => bail!(already_closed(id)),
         };
         if record.kind == InboundKind::Access {
-            bail!(access_not_a_question(id));
+            return Err(access_not_a_question(id));
         }
         Ok((store, record))
     }
 
     fn runtime_to_answer(&self, id: &str, record: &InboundRecord) -> Result<Arc<MeshRuntime>> {
         let Some(runtime) = self.get() else {
-            bail!(
-                "Mesh is off, so the answer to {id} cannot be sent to {}",
-                short(&record.peer_destination)
-            );
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off, so the answer to {id} cannot be sent to {peer}",
+                &[("peer", short(&record.peer_destination))],
+                &[("id", id)],
+            )));
         };
         Ok(runtime)
     }
@@ -5352,26 +5356,41 @@ fn take_question(store: &InboundStore, record: &InboundRecord) -> Result<()> {
 
 /// A question or access request another process closed under a verb that had found it
 /// open: nothing was sent and nothing is left to retry. Typed so a loop over many ids
-/// can tell this apart from a failure that left the row filed.
+/// can tell this apart from a failure that left the row filed. It carries its sentence
+/// as runs, so the id is quoted as typed wherever the error is shown.
 #[derive(Debug)]
-pub(crate) struct AlreadyClosed {
-    id: String,
+pub(crate) struct AlreadyClosed(NoticeText);
+
+impl AlreadyClosed {
+    pub(crate) fn notice(&self) -> &NoticeText {
+        &self.0
+    }
 }
 
 impl fmt::Display for AlreadyClosed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id = &self.id;
-        write!(
-            f,
-            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
-        )
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
 impl std::error::Error for AlreadyClosed {}
 
 pub(crate) fn already_closed(id: &str) -> AlreadyClosed {
-    AlreadyClosed { id: id.to_string() }
+    AlreadyClosed(NoticeText::from_template(
+        "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+        &[],
+        &[("id", id)],
+    ))
+}
+
+/// A dismiss refused while the envoy holds `id`; the id is quoted as it stands, since a
+/// peer chose it.
+pub(crate) fn dismiss_held_by_envoy(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}.",
+        &[],
+        &[("id", id)],
+    ))
 }
 
 fn non_blank(value: Option<String>) -> Option<Arc<String>> {
@@ -8672,6 +8691,83 @@ mod tests {
         let err = slot.answer_inbound("a-2", "yes").await.unwrap_err();
         assert_eq!(err.to_string(), already_closed("a-2").to_string());
         assert!(slot.inbound_store().unwrap().get("a-1").unwrap().is_some());
+    }
+
+    mod answer_refusal_quoting_tests {
+        use super::*;
+        use crate::config::CommandPrefix;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        /// The refusals an answer to a question a peer filed under the id `.vault` meets:
+        /// no store, an id that names an access request, a closed id, and a filed
+        /// question with no node to send the answer. Each comes with its dot sentence.
+        async fn refusals() -> Vec<(anyhow::Error, String)> {
+            let off = MeshSlot::default().answer_inbound(".vault", "yes").await;
+            let tmp = TempDir::new("slot-answer-quoting");
+            let slot = slot_with_inbound(&tmp);
+            let store = slot.inbound_store().unwrap();
+            store
+                .upsert(inbound_record(".vault"), SystemTime::now())
+                .unwrap();
+            store
+                .upsert(
+                    InboundRecord {
+                        kind: InboundKind::Access,
+                        paths: vec!["src/x.rs".into()],
+                        question: String::new(),
+                        ..inbound_record(".session")
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let peer = short(&hex_lower(&PEER_INSTANCE)).to_string();
+            vec![
+                (
+                    off.unwrap_err(),
+                    "Mesh is off; turn it on with `.mesh on` before answering .vault".to_string(),
+                ),
+                (
+                    slot.answer_inbound(".session", "yes").await.unwrap_err(),
+                    "`.session` is an access request, not a question; decide it with `.mesh grant .session` or `.mesh refuse .session`".to_string(),
+                ),
+                (
+                    slot.answer_inbound(".info", "yes").await.unwrap_err(),
+                    "`.info` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.".to_string(),
+                ),
+                (
+                    slot.answer_inbound(".vault", "yes").await.unwrap_err(),
+                    format!("Mesh is off, so the answer to .vault cannot be sent to {peer}"),
+                ),
+            ]
+        }
+
+        #[tokio::test]
+        async fn under_dot_each_answer_refusal_reads_as_it_did() {
+            for (err, dot) in refusals().await {
+                assert_eq!(err.to_string(), dot);
+                assert_eq!(
+                    command_error_text(&MeshVerbError::wrap(err), CommandPrefix::Dot),
+                    format!("Error: {dot}")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn under_slash_each_answer_refusal_keeps_the_id_and_slashes_its_hints() {
+            let peer = short(&hex_lower(&PEER_INSTANCE)).to_string();
+            let slashed = [
+                "Mesh is off; turn it on with `/mesh on` before answering .vault".to_string(),
+                "`.session` is an access request, not a question; decide it with `/mesh grant .session` or `/mesh refuse .session`".to_string(),
+                "`.info` was already closed by another process, so nothing more was done. /mesh pending shows what is still open.".to_string(),
+                format!("Mesh is off, so the answer to .vault cannot be sent to {peer}"),
+            ];
+            for ((err, _), slash) in refusals().await.into_iter().zip(slashed) {
+                assert_eq!(
+                    command_error_text(&MeshVerbError::wrap(err), CommandPrefix::Slash),
+                    format!("Error: {slash}")
+                );
+            }
+        }
     }
 
     #[tokio::test]

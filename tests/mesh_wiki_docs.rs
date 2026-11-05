@@ -3334,21 +3334,6 @@ fn method_body(path: &str, name: &str) -> String {
     source[start..end].to_string()
 }
 
-/// The source of the `impl` block in `path` whose header line is `header` (for one
-/// example, `impl fmt::Display for AlreadyClosed`): from that line to the first `\n}\n`
-/// after it, so a sentence a `Display` impl writes can be scraped like a function's.
-fn impl_body(path: &str, header: &str) -> String {
-    let source = read(repo_root().join(path));
-    let start = source
-        .find(&format!("\n{header} {{\n"))
-        .unwrap_or_else(|| panic!("{path} declares `{header}`"));
-    let end = source[start..]
-        .find("\n}\n")
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("{path}'s `{header}` does not end with `}}` on its own line"));
-    source[start..end].to_string()
-}
-
 /// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
 /// did not come up as the code formats it: the five `WARNING:` lines, the `Mesh relay` and
 /// `Local rnsd` failure texts, the hint appended when every configured interface is a
@@ -6679,31 +6664,44 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "QuestionRow::access's state word, label and path count moved"
     );
     assert_eq!(
-        string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")),
-        ["answer: .mesh answer {id} \"<text>\""],
+        string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")).first(),
+        Some(&"answer: .mesh answer {id} \"<text>\"".to_string()),
         "answer_footer's literal moved"
     );
-    let header = string_literals(&fn_body("src/repl/mesh.rs", "question_header"));
+    let header_source = fn_body("src/repl/mesh.rs", "question_header");
+    let header = string_literals(&header_source);
     assert_eq!(
         header,
         [
             "at an unknown time",
-            " ({}) . {} {age} . id {}",
-            " . expires in {}",
             "{} . ",
+            " ({}) . {} {age} . id ",
+            " . expires in {}",
         ],
         "question_header's literals moved"
     );
+    assert_in_source_order(
+        "question_header",
+        &header_source,
+        &[
+            r#""{} . ""#,
+            ".peer(row.name.clone())",
+            r#"" ({}) . {} {age} . id ""#,
+            ".peer(short(&row.id))",
+        ],
+    );
     let block = fn_body("src/repl/mesh.rs", "render_question_block");
     let block_literals = string_literals(&block);
-    for needle in ["", "envoy asks: ", "  {}"] {
+    for needle in ["", "envoy asks: ", "  "] {
         assert!(
             block_literals.iter().any(|literal| literal == needle),
             "render_question_block no longer prints {needle:?}:\n{block}"
         );
     }
     assert!(
-        block.contains("tool_name_style()"),
+        block.contains("painted_header(header)")
+            && fn_body("src/repl/mesh.rs", "painted_header")
+                .contains("tool_name_text_forced(&plain)"),
         "render_question_block does not paint the header in the tool-call name colour:\n{block}"
     );
     let pending_literals = string_literals(&fn_body("src/repl/mesh.rs", "render_pending"));
@@ -6730,8 +6728,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let entry_literals = string_literals(&fn_body("src/repl/mesh.rs", "pending_entry"));
     for needle in [
         "{marker}-> ",
-        "{peer} {age} . {} . id {id}",
-        "{peer} {} {age}{expires} . id {id}",
+        " {age} . {} . id ",
+        " {} {age}{expires} . id ",
         " . expires in {}",
         "  {number}. ",
         "\"{body}\"",
@@ -6753,7 +6751,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     assert_eq!(
         nothing_sent,
         [
-            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\".",
+            "id",
         ]
     );
     let refusal = string_literals(&fn_body("src/repl/mesh.rs", "prompt_answer_text_with"))
@@ -7077,35 +7076,70 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         all_source.contains(r#"plural(count, "asker", "askers")"#),
         "dismiss_all's progress line no longer counts with the plural helper:\n{all_source}"
     );
-    let own = string_literals(&fn_body("src/repl/mesh.rs", "asked_by_this_node"))
+    let own_source = fn_body("src/repl/mesh.rs", "asked_by_this_node");
+    let own = string_literals(&own_source)
         .into_iter()
         .find(|literal| literal.contains("this node asked"))
         .expect("asked_by_this_node words this node's own question with one literal");
     assert_eq!(
         own,
-        "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+        " is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
     );
-    let unknown = string_literals(&fn_body("src/repl/mesh.rs", "no_open_question"));
+    assert_in_source_order(
+        "asked_by_this_node",
+        &own_source,
+        &[".peer(id)", r#"" is a question this node asked"#],
+    );
+    let own = format!("{{id}}{own}");
+    let unknown_source = fn_body("src/repl/mesh.rs", "no_open_question");
+    let unknown_runs = string_literals(&unknown_source);
     assert_eq!(
-        unknown,
-        ["No open question has id {id}. `.mesh pending` lists the ones this node knows about."]
+        unknown_runs,
+        [
+            "No open question has id ",
+            ". `.mesh pending` lists the ones this node knows about."
+        ]
     );
-    let access = string_literals(&fn_body("src/mesh/pending.rs", "access_not_a_question"));
+    assert_in_source_order(
+        "no_open_question",
+        &unknown_source,
+        &[
+            r#""No open question has id ""#,
+            ".peer(id)",
+            r#"". `.mesh pending"#,
+        ],
+    );
+    let unknown = [unknown_runs.join("{id}")];
+    let access_source = fn_body("src/mesh/pending.rs", "access_not_a_question");
+    let access = string_literals(&access_source);
     assert_eq!(
         access,
         [
-            "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`"
+            "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`",
+            "id"
         ]
     );
-    let held = string_literals(&method_body(
-        "src/mesh/node.rs",
-        "refuse_dismiss_held_by_envoy",
-    ));
+    assert!(
+        access_source.contains(r#"&[("id", id)]"#),
+        "access_not_a_question no longer quotes the id as typed:\n{access_source}"
+    );
+    assert!(
+        method_body("src/mesh/node.rs", "refuse_dismiss_held_by_envoy")
+            .contains("return Err(dismiss_held_by_envoy(id));"),
+        "refuse_dismiss_held_by_envoy no longer words the hold with dismiss_held_by_envoy"
+    );
+    let held_source = fn_body("src/mesh/node.rs", "dismiss_held_by_envoy");
+    let held = string_literals(&held_source);
     assert_eq!(
         held,
         [
-            "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
+            "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}.",
+            "id"
         ]
+    );
+    assert!(
+        held_source.contains(r#"&[("id", id)]"#),
+        "dismiss_held_by_envoy no longer quotes the id as typed:\n{held_source}"
     );
     let could_not = string_literals(&method_body("src/mesh/node.rs", "dismiss_inbound"))
         .into_iter()
@@ -7115,15 +7149,18 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         could_not,
         "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
     );
-    let race = string_literals(&impl_body(
-        "src/mesh/node.rs",
-        "impl fmt::Display for AlreadyClosed",
-    ));
+    let race_source = fn_body("src/mesh/node.rs", "already_closed");
+    let race = string_literals(&race_source);
     assert_eq!(
         race,
         [
-            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+            "id"
         ]
+    );
+    assert!(
+        race_source.contains(r#"&[("id", id)]"#),
+        "already_closed no longer quotes the id as typed:\n{race_source}"
     );
     assert!(
         method_body("src/mesh/node.rs", "open_question").contains("bail!(already_closed(id))"),
@@ -8051,12 +8088,20 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     }
     let gone_tail = const_str("src/mesh/fetch.rs", "GONE_COPY_TAIL");
     assert_eq!(gone_tail, " That copy is no longer at that path.");
-    for (path, name) in [
-        ("src/repl/mesh.rs", "not_shared_refusal"),
-        ("src/function/mesh.rs", "fetch_result"),
+    for (path, name, appends) in [
+        (
+            "src/repl/mesh.rs",
+            "not_shared_refusal",
+            "sentence.frame(GONE_COPY_TAIL)",
+        ),
+        (
+            "src/function/mesh.rs",
+            "fetch_result",
+            "push_str(GONE_COPY_TAIL)",
+        ),
     ] {
         assert!(
-            fn_body(path, name).contains("push_str(GONE_COPY_TAIL)"),
+            fn_body(path, name).contains(appends),
             "{path}'s {name} no longer appends GONE_COPY_TAIL for a staged copy that is gone"
         );
     }
@@ -8070,7 +8115,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     let local_tail = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
         .into_iter()
         .find(|literal| literal.contains("answered from this node's own records"))
-        .and_then(|literal| literal.strip_prefix("{} ").map(str::to_string))
+        .and_then(|literal| literal.strip_prefix(' ').map(str::to_string))
         .expect("the REPL's fetch says a spent attachment was answered from this node's records")
         .replace("{peer}", "<dest8>");
     assert!(

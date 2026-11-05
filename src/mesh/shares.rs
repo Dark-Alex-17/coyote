@@ -23,13 +23,16 @@
 use crate::config::paths;
 use crate::mesh::grants::GrantStore;
 use crate::mesh::lock::acquire_mesh_lock;
+use crate::mesh::notify::NoticeText;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::write_atomically;
 use crate::mesh::{
-    canonical_hash, canonicalize, hex_lower, mesh_cache_dir, mesh_config_dir, redact_hashes, short,
+    canonical_hash, canonicalize, display_text, hex_lower, mesh_cache_dir, mesh_config_dir,
+    redact_hashes, short,
 };
+use crate::render::QuotingError;
 use crate::utils::fs::EXCLUSIVE_LOCK_WAIT;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -202,6 +205,39 @@ impl std::fmt::Display for ShareWriteError {
 }
 
 impl std::error::Error for ShareWriteError {}
+
+/// A load refusal as the human sees it: it quotes the file's own text, so escapes are
+/// stripped the way a pattern's are.
+pub(crate) fn shown_refusal(refusal: &str) -> String {
+    display_text(refusal, 4096).unwrap_or_default()
+}
+
+/// A `.mesh` error that quotes a share file refused at load; the file's words keep
+/// their bytes whatever the prefix.
+pub(crate) fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(shown_refusal(refusal))
+            .frame(tail),
+    )
+}
+
+/// A refused share-list write with the share file's words and the human's pattern quoted
+/// as they stand; any other error is passed on unchanged.
+pub(crate) fn quoted_share_write(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<ShareWriteError>() {
+        Ok(ShareWriteError::Refused(refusal)) => refused_at_load(&refusal, " Nothing was written."),
+        Ok(ShareWriteError::NoSuchPattern { file, pattern }) => QuotingError::wrap(
+            NoticeText::default()
+                .frame("No share entry in '")
+                .peer(file.display().to_string())
+                .frame("' has the pattern `")
+                .peer(pattern)
+                .frame("`; nothing was changed."),
+        ),
+        Err(err) => err,
+    }
+}
 
 /// Both hashes canonical lowercase 32-hex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

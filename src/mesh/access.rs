@@ -43,7 +43,7 @@ use crate::mesh::request::{
     refusal_remedy, request_remedy,
 };
 use crate::mesh::shares::PeerRef;
-use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
+use crate::mesh::shares::{Mutation, ShareSet, WriteScope, quoted_share_write, refused_at_load};
 use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore, same_hash,
 };
@@ -52,8 +52,9 @@ use crate::mesh::{
     already_closed, canonicalize, capped_peer_text, display_text, hex_lower, human_size,
     redact_hashes, rfc3339_utc, short,
 };
+use crate::render::{QuotingError, error_notice};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use rmpv::Value;
@@ -1218,10 +1219,7 @@ impl AccessStore<'_> {
                     .standing_shares(&runtime, &record)
                     .and_then(|mut shares| share_standing(&mut shares, &record, scope))
                 {
-                    let err = anyhow!(
-                        "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
-                        short(&record.peer_destination)
-                    );
+                    let err = standing_write_failed(&record, err);
                     return Err(put_back(self.slot, &store, &record, err));
                 }
                 self.settle(record, AccessDecision::Granted, None, true, sent)
@@ -1271,10 +1269,7 @@ impl AccessStore<'_> {
             Err(err) => {
                 let err = match grants.revoke(&record.id, &record.peer_destination) {
                     Ok(_) => err,
-                    Err(revoke) => anyhow!(
-                        "{err:#}; the grant written for `{}` could not be taken back either: {revoke:#}",
-                        record.id
-                    ),
+                    Err(revoke) => revoke_failed(&err, &record.id, &revoke),
                 };
                 Err(put_back(self.slot, store, &record, err))
             }
@@ -1308,20 +1303,25 @@ impl AccessStore<'_> {
         now: SystemTime,
     ) -> Result<(Arc<InboundStore>, InboundRecord, Arc<MeshRuntime>)> {
         let Some(store) = self.slot.inbound_store() else {
-            bail!("Mesh is off; turn it on with `.mesh on` before deciding {id}");
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off; turn it on with `.mesh on` before deciding {id}",
+                &[],
+                &[("id", id)],
+            )));
         };
         let record = match store.get(id)? {
             Some(record) if !record.is_expired(now) => record,
             _ => bail!(already_closed(id)),
         };
         if record.kind == InboundKind::Question {
-            bail!(question_not_an_access_request(id));
+            return Err(question_not_an_access_request(id));
         }
         let Some(runtime) = self.slot.get() else {
-            bail!(
-                "Mesh is off, so the decision on {id} cannot be sent to {}",
-                short(&record.peer_destination)
-            );
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off, so the decision on {id} cannot be sent to {peer}",
+                &[("peer", short(&record.peer_destination))],
+                &[("id", id)],
+            )));
         };
         Ok((store, record, runtime))
     }
@@ -1332,14 +1332,11 @@ impl AccessStore<'_> {
     /// written through rather than over.
     fn standing_shares(&self, runtime: &MeshRuntime, record: &InboundRecord) -> Result<ShareSet> {
         let Some(root) = ShareSource::share_root(self.slot) else {
-            bail!(
-                "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
-                id = record.id
-            );
+            return Err(no_share_root(&record.id));
         };
         let (shares, warning) = ShareSet::load_quietly(runtime.serving().share_locations(&root));
         if let Some(warning) = warning {
-            bail!("{warning} Nothing was written.");
+            return Err(refused_at_load(&warning, " Nothing was written."));
         }
         Ok(shares)
     }
@@ -1432,6 +1429,43 @@ fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
     Ok(())
 }
 
+/// A standing grant's error once the peer heard yes but `err` kept the share list from
+/// being written. The share file's words and the id are quoted as they stand; the re-run
+/// hint follows the prefix.
+fn standing_write_failed(record: &InboundRecord, err: anyhow::Error) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::from(format!(
+            "{} was already told yes, but the share list could not be written: ",
+            short(&record.peer_destination)
+        ))
+        .then(error_notice(&quoted_share_write(err)))
+        .frame(". Run `.mesh grant ")
+        .peer(record.id.as_str())
+        .frame(" --standing` again once the share list is writable; the request stays pending until then."),
+    )
+}
+
+/// A one-off grant whose decision `err` stopped and whose written grant `revoke` could
+/// not undo; both errors keep their quoted parts and the id is quoted as it stands.
+fn revoke_failed(err: &anyhow::Error, id: &str, revoke: &anyhow::Error) -> anyhow::Error {
+    QuotingError::wrap(
+        error_notice(err)
+            .frame("; the grant written for `")
+            .peer(id)
+            .frame("` could not be taken back either: ")
+            .then(error_notice(revoke)),
+    )
+}
+
+/// The id is quoted as it stands, since a peer chose it.
+fn no_share_root(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
+        &[],
+        &[("id", id)],
+    ))
+}
+
 /// Puts a taken record back after `err` stopped its decision or answer, so it stays
 /// pending to take again; a put-back that fails too is reported beside `err`, since the
 /// human needs to know both that the peer heard nothing and that the record is gone.
@@ -1447,9 +1481,12 @@ pub(crate) fn put_back(
             slot.announce_expired(displaced);
             err
         }
-        Err(put_back) => anyhow!(
-            "{err:#}; and `{}` could not be put back as pending: {put_back:#}",
-            record.id
+        Err(put_back) => QuotingError::wrap(
+            error_notice(&err)
+                .frame("; and `")
+                .peer(record.id.as_str())
+                .frame("` could not be put back as pending: ")
+                .then(error_notice(&put_back)),
         ),
     }
 }
@@ -3444,6 +3481,216 @@ mod tests {
         );
         assert_eq!(unknown.to_string(), already_closed("a-9").to_string());
         assert!(fixture.hooks.snapshot().is_empty());
+    }
+
+    mod mesh_off_quoting_tests {
+        use super::*;
+        use crate::config::CommandPrefix;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        /// The refusals `grant` and `refuse` give with the mesh off, for a request a peer
+        /// filed under the id `.vault`: one with no store at all, one with the request
+        /// filed but no node to send the decision.
+        async fn refusals() -> Vec<anyhow::Error> {
+            let off = Arc::new(MeshSlot::default());
+            let no_store = off.access().refuse(".vault").await.unwrap_err();
+            let fixture = bare_slot("access-mesh-off-quoting");
+            store_of(&fixture.slot)
+                .upsert(
+                    InboundRecord {
+                        kind: InboundKind::Access,
+                        question: String::new(),
+                        paths: strings(&["src/x.rs"]),
+                        ..question_record(".vault")
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let no_node = fixture.slot.access().refuse(".vault").await.unwrap_err();
+            vec![no_store, no_node]
+        }
+
+        #[tokio::test]
+        async fn under_dot_the_mesh_off_refusals_read_as_they_did() {
+            let peer = short(&destination()).to_string();
+            let [no_store, no_node] = <[_; 2]>::try_from(refusals().await).unwrap();
+            assert_eq!(
+                no_store.to_string(),
+                "Mesh is off; turn it on with `.mesh on` before deciding .vault"
+            );
+            assert_eq!(
+                no_node.to_string(),
+                format!("Mesh is off, so the decision on .vault cannot be sent to {peer}")
+            );
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(no_store), CommandPrefix::Dot),
+                "Error: Mesh is off; turn it on with `.mesh on` before deciding .vault"
+            );
+        }
+
+        #[tokio::test]
+        async fn under_slash_the_mesh_off_refusals_keep_the_id_and_slash_the_hint() {
+            let [no_store, no_node] = <[_; 2]>::try_from(refusals().await).unwrap();
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(no_store), CommandPrefix::Slash),
+                "Error: Mesh is off; turn it on with `/mesh on` before deciding .vault"
+            );
+            let shown = command_error_text(&MeshVerbError::wrap(no_node), CommandPrefix::Slash);
+            assert!(
+                shown.starts_with("Error: Mesh is off, so the decision on .vault cannot"),
+                "{shown}"
+            );
+        }
+    }
+
+    mod grant_error_quoting_tests {
+        use super::*;
+        use crate::config::CommandPrefix;
+        use crate::mesh::shares::ShareWriteError;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        const SHARE_FILE_WORDS: &str = "`.vault` is not a pattern; run .mesh trust x";
+
+        fn access_record(id: &str) -> InboundRecord {
+            InboundRecord {
+                kind: InboundKind::Access,
+                question: String::new(),
+                paths: strings(&["src/x.rs"]),
+                ..question_record(id)
+            }
+        }
+
+        fn standing_failure() -> anyhow::Error {
+            standing_write_failed(
+                &access_record(".session"),
+                ShareWriteError::Refused(SHARE_FILE_WORDS.to_string()).into(),
+            )
+        }
+
+        /// A record the store refuses to put back, so `put_back` reports both errors.
+        fn refused_put_back() -> anyhow::Error {
+            let fixture = bare_slot("access-put-back-quoting");
+            let unstorable = InboundRecord {
+                question: "may I?".to_string(),
+                ..access_record(".vault")
+            };
+            put_back(
+                &fixture.slot,
+                &store_of(&fixture.slot),
+                &unstorable,
+                standing_failure(),
+            )
+        }
+
+        fn dot_standing() -> String {
+            format!(
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written.. Run `.mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                short(&destination())
+            )
+        }
+
+        #[test]
+        fn under_dot_the_grant_errors_read_as_they_did() {
+            let standing = standing_failure();
+            assert_eq!(standing.to_string(), dot_standing());
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(standing), CommandPrefix::Dot),
+                format!("Error: {}", dot_standing())
+            );
+            let both = refused_put_back();
+            assert_eq!(
+                both.to_string(),
+                format!(
+                    "{}; and `.vault` could not be put back as pending: An inbound access request carries a question, which only a question may; refusing to store it.",
+                    dot_standing()
+                )
+            );
+        }
+
+        #[test]
+        fn under_slash_the_grant_errors_keep_share_words_and_ids_and_slash_the_hint() {
+            let slashed = format!(
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written.. Run `/mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                short(&destination())
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(standing_failure()),
+                    CommandPrefix::Slash
+                ),
+                format!("Error: {slashed}")
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(refused_put_back()),
+                    CommandPrefix::Slash
+                ),
+                format!(
+                    "Error: {slashed}; and `.vault` could not be put back as pending: An inbound access request carries a question, which only a question may; refusing to store it."
+                )
+            );
+        }
+
+        /// A one-off grant the peer never heard, whose grant could not be revoked
+        /// because the share file refused to load.
+        fn unrevoked() -> anyhow::Error {
+            revoke_failed(
+                &anyhow::anyhow!("The peer could not be reached; `.mesh status` shows the link"),
+                ".vault",
+                &refused_at_load(SHARE_FILE_WORDS, " Nothing was written."),
+            )
+        }
+
+        #[test]
+        fn under_dot_the_revoke_chain_and_standing_refusals_read_as_they_did() {
+            assert_eq!(
+                unrevoked().to_string(),
+                format!(
+                    "The peer could not be reached; `.mesh status` shows the link; the grant written for `.vault` could not be taken back either: {SHARE_FILE_WORDS} Nothing was written."
+                )
+            );
+            assert_eq!(
+                no_share_root(".vault").to_string(),
+                "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `.mesh grant .vault` instead"
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(refused_at_load(
+                        SHARE_FILE_WORDS,
+                        " Nothing was written."
+                    )),
+                    CommandPrefix::Dot
+                ),
+                format!("Error: {SHARE_FILE_WORDS} Nothing was written.")
+            );
+        }
+
+        #[test]
+        fn under_slash_the_revoke_chain_and_standing_refusals_keep_ids_and_share_words() {
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(unrevoked()), CommandPrefix::Slash),
+                format!(
+                    "Error: The peer could not be reached; `/mesh status` shows the link; the grant written for `.vault` could not be taken back either: {SHARE_FILE_WORDS} Nothing was written."
+                )
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(no_share_root(".vault")),
+                    CommandPrefix::Slash
+                ),
+                "Error: A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `/mesh grant .vault` instead"
+            );
+            assert_eq!(
+                command_error_text(
+                    &MeshVerbError::wrap(refused_at_load(
+                        SHARE_FILE_WORDS,
+                        " Nothing was written."
+                    )),
+                    CommandPrefix::Slash
+                ),
+                format!("Error: {SHARE_FILE_WORDS} Nothing was written.")
+            );
+        }
     }
 
     /// A request past `PENDING_TTL` the sweep has not yet taken out reads as already

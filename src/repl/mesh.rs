@@ -6,7 +6,9 @@ use crate::mesh::access::{
     ValidAccess, validate_access,
 };
 use crate::mesh::brief::{Brief, BriefSource};
-use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
+use crate::mesh::card::{
+    CardSource, DISPLAY_NAME_MAX_CHARS, StatusError, StatusHandler, render_for_human,
+};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
@@ -22,7 +24,7 @@ use crate::mesh::knock::{
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
-    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
+    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, SendError, is_wire_id,
     left_mesh_hint, unreachable_head,
 };
 use crate::mesh::notify::NoticeText;
@@ -33,9 +35,9 @@ use crate::mesh::pending::{
 };
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
-    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, ShareWriteError,
-    Verdict as ShareVerdict, WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer,
-    protected_segment, validate_override, validate_pattern,
+    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
+    WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
+    quoted_share_write, refused_at_load, shown_refusal, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule,
@@ -52,12 +54,12 @@ use crate::mesh::{
     display_text, hex_lower, human_size, loopback_endpoint, owner_label, parse_rfc3339,
     redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
-use crate::render::QuotingError;
+use crate::render::{QuotingError, error_notice};
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{
-    AbortSignal, NO_COLOR, drain_stale_tty_input, home_relative, tool_name_style,
-    tool_name_text_forced, wait_user_interrupt,
+    AbortSignal, NO_COLOR, drain_stale_tty_input, home_relative, tool_name_text_forced,
+    wait_user_interrupt,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -633,7 +635,7 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
     let now = SystemTime::now();
     let records = runtime.knock_gate().cache().list(now)?;
     let dropped = runtime.knock_gate().dropped_knocks(Instant::now());
-    out_text(&render_knocks(&records, now, &dropped));
+    out_path_text(&render_knocks(&records, now, &dropped).render(live_prefix()));
     Ok(())
 }
 
@@ -713,14 +715,10 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
         store.authorize(&identity, &destination),
         store.identity_standing(&identity),
     );
-    out_text(&render_peer_detail(
-        &destination,
-        peer.as_ref(),
-        successor,
-        &knock,
-        trust,
-        now,
-    ));
+    out_path_text(
+        &render_peer_detail(&destination, peer.as_ref(), successor, &knock, trust, now)
+            .render(live_prefix()),
+    );
     if matches!(knock, KnockLookup::Unreadable) {
         err_text(
             "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh knocks` reports the error.",
@@ -786,7 +784,7 @@ async fn status(
             ));
             result_follows();
             let card = tokio::select! {
-                outcome = runtime.request_status(&desc) => outcome?,
+                outcome = runtime.request_status(&desc) => outcome.map_err(quoted_status_failure)?,
                 _ = wait_user_interrupt(Some(abort_signal)) => {
                     out_text("Status request interrupted.");
                     return Ok(());
@@ -1205,7 +1203,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let (row, answering) = match (route, inbound, outbound) {
         (AnswerRoute::Inbound, Some(record), _) if !record.is_expired(now) => {
             if record.kind == InboundKind::Access {
-                bail!(access_not_a_question(id));
+                return Err(access_not_a_question(id));
             }
             if attach.is_some() {
                 ctx.app.mesh.refuse_held_by_envoy(id)?;
@@ -1233,7 +1231,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 Answering::OwnQuestion(Box::new(correlation)),
             )
         }
-        _ => bail!(no_open_question(id)),
+        _ => return Err(no_open_question(id)),
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     out_path_text(
@@ -1244,7 +1242,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         None => match prompt_answer_text(id)? {
             Some(text) => text,
             None => {
-                out_text(&nothing_sent(id));
+                out_path_text(&nothing_sent(id).render(live_prefix()));
                 return Ok(());
             }
         },
@@ -1462,14 +1460,14 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     let mut stayed: Vec<String> = Vec::new();
     for record in &questions {
         if let Err(err) = ctx.app.mesh.refuse_dismiss_held_by_envoy(&record.id) {
-            out_text(&format!("{err:#}"));
+            out_path_text(&dismiss_failure_line(&err, live_prefix()));
             held.push(record.id.clone());
             continue;
         }
         match ctx.app.mesh.dismiss_inbound(&record.id, silent).await {
             Ok(()) => dismissed += 1,
             Err(err) => {
-                out_text(&format!("{err:#}"));
+                out_path_text(&dismiss_failure_line(&err, live_prefix()));
                 if err.downcast_ref::<AlreadyClosed>().is_none() {
                     stayed.push(record.id.clone());
                 }
@@ -1478,6 +1476,12 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     }
     out_text(&dismiss_all_summary(dismissed, &held, &stayed, silent));
     Ok(())
+}
+
+/// The line `--all` prints for a question it could not dismiss, with the ids the error
+/// quotes kept as they stand.
+fn dismiss_failure_line(err: &anyhow::Error, prefix: CommandPrefix) -> String {
+    error_notice(err).render(prefix)
 }
 
 /// The `--all` summary: the count dismissed, then a clause for the questions the envoy
@@ -1532,22 +1536,31 @@ fn open_escalated_question(
         None => None,
     };
     match record {
-        Some(record) if record.is_expired(now) => bail!(no_open_question(id)),
-        Some(record) if record.kind == InboundKind::Access => bail!(access_not_a_question(id)),
+        Some(record) if record.is_expired(now) => Err(no_open_question(id)),
+        Some(record) if record.kind == InboundKind::Access => Err(access_not_a_question(id)),
         Some(record) => Ok(record),
-        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(asked_by_this_node(id)),
-        None => bail!(no_open_question(id)),
+        None if ctx.app.mesh.correlations().get(id).is_some() => Err(asked_by_this_node(id)),
+        None => Err(no_open_question(id)),
     }
 }
 
-fn asked_by_this_node(id: &str) -> String {
-    format!(
-        "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+fn asked_by_this_node(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(id)
+            .frame(" is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."),
     )
 }
 
-fn no_open_question(id: &str) -> String {
-    format!("No open question has id {id}. `.mesh pending` lists the ones this node knows about.")
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+fn no_open_question(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("No open question has id ")
+            .peer(id)
+            .frame(". `.mesh pending` lists the ones this node knows about."),
+    )
 }
 
 async fn message(
@@ -1585,18 +1598,17 @@ async fn message(
         peer.display_name.as_deref(),
     )
     .unwrap_or_else(|| name_label(peer.display_name.as_deref()));
-    let notice = NoticeText::default()
-        .frame("This sends your text to ")
-        .peer(name)
-        .frame(format!(
-            " ({}, trust: {}) over the mesh.",
-            short(&destination),
+    out_path_text(
+        &send_confirmation(
+            &name,
+            &destination,
             trust_label(
                 trust.authorize(&peer.identity_hash, &destination),
-                trust.identity_standing(&peer.identity_hash)
-            )
-        ));
-    out_path_text(&notice.render(live_prefix()));
+                trust.identity_standing(&peer.identity_hash),
+            ),
+        )
+        .render(live_prefix()),
+    );
     if let Some(attachment) = &attachment {
         out_path_text(&attaching_notice(attachment, &destination));
     }
@@ -1615,7 +1627,8 @@ async fn message(
     )?;
     let outcome = runtime
         .send_peer_lending_reference(&destination, &out)
-        .await?;
+        .await
+        .map_err(quoted_send_failure)?;
     out_text(&format!(
         "Sent {} to {} (via {}).",
         short(&outcome.id),
@@ -1623,6 +1636,140 @@ async fn message(
         via_text(outcome.via)
     ));
     Ok(())
+}
+
+/// The line `.mesh message` shows before it asks to send, with the name the peer goes
+/// by here quoted as it stands.
+fn send_confirmation(name: &str, destination: &str, trust: &str) -> NoticeText {
+    NoticeText::from_template(
+        "This sends your text to {name} ({destination}, trust: {trust}) over the mesh.",
+        &[("destination", short(destination)), ("trust", trust)],
+        &[("name", name)],
+    )
+}
+
+/// A peer-side refusal ends with the command the peer's owner runs on that node, which
+/// stays as that owner types it under any prefix; what this node adds after it is its
+/// own and follows the prefix.
+fn quoted_peer_side(err: &dyn std::fmt::Display, remedy: &dyn std::fmt::Display) -> anyhow::Error {
+    let whole = err.to_string();
+    let remedy = remedy.to_string();
+    let text = match whole.strip_prefix(remedy.as_str()) {
+        Some(tail) => NoticeText::default().peer(remedy.as_str()).frame(tail),
+        None => NoticeText::default().peer(whole.as_str()),
+    };
+    QuotingError::wrap(text)
+}
+
+fn quoted_status_failure(err: StatusError) -> anyhow::Error {
+    match &err {
+        StatusError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
+        StatusError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        _ => err.into(),
+    }
+}
+
+fn quoted_send_failure(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast_ref::<SendError>() {
+        Some(send @ SendError::NotTrustedByPeer(refusal)) => quoted_peer_side(send, refusal),
+        Some(send @ SendError::NoAnswer(no_answer)) => quoted_peer_side(send, no_answer),
+        _ => err,
+    }
+}
+
+fn quoted_access_failure(err: AccessError) -> anyhow::Error {
+    match &err {
+        AccessError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
+        AccessError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        _ => anyhow!(err.to_string()),
+    }
+}
+
+fn quoted_fetch_failure(err: FileFetchError) -> anyhow::Error {
+    match &err {
+        FileFetchError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
+        FileFetchError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        _ => anyhow!(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod peer_side_refusal_tests {
+    use super::*;
+    use crate::mesh::request::{NoAnswer, RemoteRefusal};
+    use crate::render::{MeshVerbError, command_error_text};
+
+    fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
+        command_error_text(
+            &MeshVerbError::wrap(err.context("`.mesh fetch` failed")),
+            prefix,
+        )
+    }
+
+    fn refusal() -> RemoteRefusal {
+        RemoteRefusal::new(&"ab".repeat(16), Some(".session"), "cd".repeat(16))
+    }
+
+    #[test]
+    fn a_peer_refusal_keeps_the_owner_remedy_and_name_as_written_in_every_verb() {
+        let refused = refusal().to_string();
+        let cases: [(fn() -> anyhow::Error, String); 4] = [
+            (
+                || quoted_fetch_failure(FileFetchError::NotTrustedByPeer(refusal())),
+                refused.clone(),
+            ),
+            (
+                || quoted_access_failure(AccessError::NotTrustedByPeer(refusal())),
+                refused.clone(),
+            ),
+            (
+                || quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into()),
+                refused.clone(),
+            ),
+            (
+                || quoted_status_failure(StatusError::NotTrustedByPeer(refusal())),
+                StatusError::NotTrustedByPeer(refusal()).to_string(),
+            ),
+        ];
+        for (quoted, today) in cases {
+            assert_eq!(
+                shown_as(quoted(), CommandPrefix::Dot),
+                shown_as(anyhow!(today.clone()), CommandPrefix::Dot)
+            );
+            let slash = shown_as(quoted(), CommandPrefix::Slash);
+            assert!(slash.starts_with("Error: `/mesh fetch` failed"), "{slash}");
+            assert!(slash.ends_with(&format!("    {today}")), "{slash}");
+            assert!(slash.contains(&format!("\"{}\"", ".session")), "{slash}");
+            assert!(
+                slash.contains(&format!("can run .mesh trust {}", "cd".repeat(16))),
+                "{slash}"
+            );
+        }
+    }
+
+    #[test]
+    fn silence_keeps_the_owner_remedy_while_this_node_hint_slashes() {
+        let no_answer = NoAnswer::new(&"ab".repeat(16), "cd".repeat(16));
+        let err = AccessError::NoAnswer(no_answer.clone());
+        let today = err.to_string();
+        assert_eq!(
+            shown_as(
+                quoted_access_failure(AccessError::NoAnswer(no_answer.clone())),
+                CommandPrefix::Dot
+            ),
+            shown_as(anyhow!(today.clone()), CommandPrefix::Dot)
+        );
+        let slash = shown_as(quoted_access_failure(err), CommandPrefix::Slash);
+        let tail = today.strip_prefix(&no_answer.to_string()).unwrap();
+        assert!(
+            slash.ends_with(&format!(
+                "    {no_answer}{}",
+                tail.replace("`.mesh peers`", "`/mesh peers`")
+            )),
+            "{slash}"
+        );
+        assert!(tail.contains("`.mesh peers`"), "{tail}");
+    }
 }
 
 /// The pre-flight every verb that contacts one peer runs: a destination the trust list
@@ -2192,17 +2339,15 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         bail!(refusal);
     }
     let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
-    let intro_label = if intro.as_str().is_empty() {
-        "without an intro".to_string()
-    } else {
-        format!("with intro \"{}\"", intro.as_str())
-    };
-    out_text(&format!(
-        "This knocks on {} ({}, trust: {}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.",
-        name_label(peer.display_name.as_deref()),
-        short(&destination),
-        trust_label(verdict, standing)
-    ));
+    out_path_text(
+        &knock_confirmation(
+            peer.display_name.as_deref(),
+            &destination,
+            trust_label(verdict, standing),
+            intro.as_str(),
+        )
+        .render(live_prefix()),
+    );
     if !confirm_or_flag("Knock?", "--yes", args.yes)? {
         out_text("Nothing was sent.");
         return Ok(());
@@ -2236,6 +2381,30 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
+}
+
+/// The line `.mesh knock` shows before it asks to knock. The name the peer announced
+/// and the intro the human typed are quoted as they stand.
+fn knock_confirmation(
+    name: Option<&str>,
+    destination: &str,
+    trust: &str,
+    intro: &str,
+) -> NoticeText {
+    let intro_label = if intro.is_empty() {
+        NoticeText::from("without an intro")
+    } else {
+        NoticeText::from("with intro \"").peer(intro).frame("\"")
+    };
+    NoticeText::default()
+        .frame("This knocks on ")
+        .peer(name_label(name))
+        .frame(format!(
+            " ({}, trust: {trust}) so it can trust this instance, ",
+            short(destination)
+        ))
+        .then(intro_label)
+        .frame("; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.")
 }
 
 /// The line `.mesh knock` ends with for a knock that was delivered somewhere. A link that
@@ -2399,7 +2568,7 @@ async fn send_request(
             &valid.paths,
             live_prefix(),
         )),
-        Err(err) => bail!(err.to_string()),
+        Err(err) => return Err(quoted_access_failure(err)),
     }
     Ok(())
 }
@@ -2525,10 +2694,11 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         &args.path,
         SystemTime::now(),
     ) {
-        bail!(
-            "{} This was answered from this node's own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}.",
-            not_shared_refusal(peer, &shown, &args.path, &reason)
-        );
+        return Err(QuotingError::wrap(
+            not_shared_refusal(peer, &shown, &args.path, &reason).frame(format!(
+                " This was answered from this node's own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}."
+            )),
+        ));
     }
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
@@ -2578,26 +2748,32 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 &args.path,
                 SystemTime::now(),
             );
-            bail!(not_shared_refusal(peer, &shown, &args.path, &reason))
+            return Err(QuotingError::wrap(not_shared_refusal(
+                peer, &shown, &args.path, &reason,
+            )));
         }
-        Ok(Fetched::InvalidPath { rule }) => bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it."
-            ))
-        ),
-        Ok(Fetched::TooLarge { limit }) => bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way."
-            ))
-        ),
-        Err(FileFetchError::NotServed) => bail!(not_shared_sentence(
-            peer,
-            &shown,
-            &args.path,
-            &NotSharedReason::PeerWithoutFetch
-        )),
+        Ok(Fetched::InvalidPath { rule }) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it.",
+                &[("rule", &rule), ("peer", peer)],
+                &[("shown", &shown)],
+            )));
+        }
+        Ok(Fetched::TooLarge { limit }) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way.",
+                &[("peer", peer), ("limit", &limit.to_string())],
+                &[("shown", &shown)],
+            )));
+        }
+        Err(FileFetchError::NotServed) => {
+            return Err(QuotingError::wrap(not_shared_sentence(
+                peer,
+                &shown,
+                &args.path,
+                &NotSharedReason::PeerWithoutFetch,
+            )));
+        }
         // A reply this Coyote could not read is a fragment that names the fault and
         // nothing else; the other arms already carry a whole sentence of their own.
         Err(
@@ -2605,28 +2781,48 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             | FileFetchError::Oversize { .. }
             | FileFetchError::Corrupt
             | FileFetchError::UnknownStatus),
-        ) => bail!(
-            "{}",
-            ctx.render_hints(&format!(
-                "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {}` again; if it repeats, the peer may run a different Coyote.",
-                args.path
-            ))
-        ),
-        Err(err) => bail!(err.to_string()),
+        ) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {path}` again; if it repeats, the peer may run a different Coyote.",
+                &[("peer", peer), ("err", &err.to_string())],
+                &[("shown", &shown), ("path", &args.path)],
+            )));
+        }
+        Err(err) => return Err(quoted_fetch_failure(err)),
     }
     Ok(())
 }
 
 /// The refusal for a path the peer did not serve, read against what this node knows,
 /// with the gone-copy tail when an already fetched copy has since been removed.
-fn not_shared_refusal(peer: &str, shown: &str, path: &str, reason: &NotSharedReason) -> String {
-    let mut sentence = not_shared_sentence(peer, shown, path, reason);
+fn not_shared_refusal(peer: &str, shown: &str, path: &str, reason: &NotSharedReason) -> NoticeText {
+    let sentence = not_shared_sentence(peer, shown, path, reason);
     if let NotSharedReason::AlreadyFetched { staged, .. } = reason
         && !staged.is_file()
     {
-        sentence.push_str(GONE_COPY_TAIL);
+        return sentence.frame(GONE_COPY_TAIL);
     }
     sentence
+}
+
+#[cfg(test)]
+mod not_shared_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_gone_copy_keeps_the_peer_paths_while_the_message_hint_slashes() {
+        let reason = NotSharedReason::AlreadyFetched {
+            message_id: "m-1".to_string(),
+            staged: PathBuf::from("/nonexistent/.vault"),
+        };
+        let refusal = not_shared_refusal("abcd1234", ".session", ".session", &reason);
+        let today = "`.session` was a one-time attachment from abcd1234 and this node already fetched it (staged at /nonexistent/.vault). Ask for it again with .mesh message abcd1234 if you need a fresh copy. That copy is no longer at that path.";
+        assert_eq!(refusal.render(CommandPrefix::Dot), today);
+        assert_eq!(
+            refusal.render(CommandPrefix::Slash),
+            today.replace(".mesh message", "/mesh message")
+        );
+    }
 }
 
 struct FetchArgs {
@@ -4667,7 +4863,13 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     out_text(&sending_notice(&record.peer_destination));
     result_follows();
-    let report = ctx.app.mesh.access().grant(id, kind).await?;
+    let report = ctx
+        .app
+        .mesh
+        .access()
+        .grant(id, kind)
+        .await
+        .map_err(quoted_share_write)?;
     let tail = match (&target, report.expires) {
         (Some(target), _) => format!(", standing; written to {}", target.written_to()),
         (None, Some(expires)) => format!(" until {}, each fetchable once", rfc3339_utc(expires)),
@@ -4724,10 +4926,10 @@ fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Resul
     match record {
         Some(record) if record.is_expired(now) => Err(no_open_access_request(id)),
         Some(record) if record.kind == InboundKind::Question => {
-            bail!(question_not_an_access_request(id))
+            Err(question_not_an_access_request(id))
         }
         Some(record) => Ok(record),
-        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(asked_by_this_node(id)),
+        None if ctx.app.mesh.correlations().get(id).is_some() => Err(asked_by_this_node(id)),
         None => Err(no_open_access_request(id)),
     }
 }
@@ -4956,6 +5158,7 @@ mod peer_text_prefix_tests {
 
     mod share_write_tests {
         use super::*;
+        use crate::mesh::shares::ShareWriteError;
 
         #[test]
         fn a_refused_write_quotes_the_share_file_and_the_pattern_as_they_stand() {
@@ -5199,39 +5402,6 @@ fn render_effective_shares(
 /// A pattern as a share file holds it, shown the way peer text is: escapes stripped.
 fn shown_pattern(pattern: &str) -> String {
     display_text(pattern, WIRE_PATH_MAX_BYTES).unwrap_or_default()
-}
-
-/// A load refusal as the human sees it: it quotes the file's own text, so escapes are
-/// stripped the way a pattern's are.
-fn shown_refusal(refusal: &str) -> String {
-    display_text(refusal, 4096).unwrap_or_default()
-}
-
-/// A `.mesh` error that quotes a share file refused at load; the file's words keep
-/// their bytes whatever the prefix.
-fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
-    QuotingError::wrap(
-        NoticeText::default()
-            .peer(shown_refusal(refusal))
-            .frame(tail),
-    )
-}
-
-/// A refused share-list write with the share file's words and the human's pattern quoted
-/// as they stand; any other error is passed on unchanged.
-fn quoted_share_write(err: anyhow::Error) -> anyhow::Error {
-    match err.downcast::<ShareWriteError>() {
-        Ok(ShareWriteError::Refused(refusal)) => refused_at_load(&refusal, " Nothing was written."),
-        Ok(ShareWriteError::NoSuchPattern { file, pattern }) => QuotingError::wrap(
-            NoticeText::default()
-                .frame("No share entry in '")
-                .peer(file.display().to_string())
-                .frame("' has the pattern `")
-                .peer(pattern)
-                .frame("`; nothing was changed."),
-        ),
-        Err(err) => err,
-    }
 }
 
 struct ShareArgs {
@@ -5809,7 +5979,9 @@ where
 /// id begins comes back as typed (32 hex digits lower-cased), so the verb's own lookup
 /// says which kind of id it has no open entry for.
 /// Each held id comes with the kind of inbound entry it is, `None` for a question this
-/// node asked, so a token that is a whole id can be told how its entries clear.
+/// node asked, so a token that is a whole id can be told how its entries clear. The
+/// refusals quote the token and the ids as they stand, since a peer may have chosen an
+/// id that reads as a command.
 fn resolve_pending_id(token: &str, held: Vec<(String, Option<InboundKind>)>) -> Result<String> {
     let lowered = token.to_ascii_lowercase();
     let mut matches: Vec<(String, Option<InboundKind>)> = held
@@ -5823,22 +5995,32 @@ fn resolve_pending_id(token: &str, held: Vec<(String, Option<InboundKind>)>) -> 
         if matches.is_empty() && !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(token.to_string());
         }
-        bail!(
-            "'{token}' is too short to pick a pending id: give the whole id or {HASH_PREFIX_MIN_CHARS} or more of its first characters; {} them.",
-            HashKind::Message.listing()
-        );
+        return Err(QuotingError::wrap(
+            NoticeText::from("'").peer(token).frame(format!(
+                "' is too short to pick a pending id: give the whole id or {HASH_PREFIX_MIN_CHARS} or more of its first characters; {} them.",
+                HashKind::Message.listing()
+            )),
+        ));
     }
     match matches.len() {
         0 => Ok(canonical_hash(token).unwrap_or_else(|| token.to_string())),
         1 => Ok(matches.remove(0).0),
-        _ if whole => bail!(whole_id_refusal(token, &matches)),
+        _ if whole => Err(QuotingError::wrap(whole_id_refusal(token, &matches))),
         count => {
             let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
-            bail!(
-                "'{token}' matches {count} {}: {}; give one of these (or enough of its characters to tell it apart).",
-                HashKind::Message.plural(),
-                pending_candidates(&ids, &ids).join(", ")
-            )
+            Err(QuotingError::wrap(
+                NoticeText::from("'")
+                    .peer(token)
+                    .frame(format!(
+                        "' matches {count} {}: ",
+                        HashKind::Message.plural()
+                    ))
+                    .then(joined_text(
+                        quoted_ids(&pending_candidates(&ids, &ids)),
+                        ", ",
+                    ))
+                    .frame("; give one of these (or enough of its characters to tell it apart)."),
+            ))
         }
     }
 }
@@ -5860,7 +6042,7 @@ fn pending_candidates(ids: &[&str], among: &[&str]) -> Vec<String> {
 /// matches ids that differ only in case. No form of the token can ever pick the short or
 /// twinned id, so the sentence names how the entries in the way leave instead. A longer
 /// id a peer sent goes once it is acted on, which a question this node asked does not.
-fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> String {
+fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> NoticeText {
     let ids: Vec<&str> = matches.iter().map(|(id, _)| id.as_str()).collect();
     let shown = pending_candidates(&ids, &ids);
     let (twins, longer): (Vec<usize>, Vec<usize>) =
@@ -5868,31 +6050,42 @@ fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> S
     let names = |at: &[usize]| at.iter().map(|&i| shown[i].clone()).collect::<Vec<_>>();
     let clear = pending_clear_clause(&names(&(0..ids.len()).collect::<Vec<_>>()), matches);
     if twins.len() > 1 {
-        let quoted: Vec<String> = names(&twins).iter().map(|id| format!("'{id}'")).collect();
+        let quoted: Vec<NoticeText> = names(&twins)
+            .into_iter()
+            .map(|id| NoticeText::from("'").peer(id).frame("'"))
+            .collect();
         let none = if twins.len() == 2 { "neither" } else { "none" };
-        return format!(
-            "{} differ only in case, so {none} can be picked; {clear}.",
-            join_and(&quoted)
-        );
+        return join_and_text(quoted)
+            .frame(format!(" differ only in case, so {none} can be picked; "))
+            .then(clear)
+            .frame(".");
     }
-    let longer_names = names(&longer).join(", ");
+    let longer_names = joined_text(quoted_ids(&names(&longer)), ", ");
     let verb = if longer.len() == 1 { "begins" } else { "begin" };
-    let what = format!(
-        "'{token}' is a whole pending id and also how {longer_names} {verb}, so it cannot pick one"
-    );
+    let what = NoticeText::from("'")
+        .peer(token)
+        .frame("' is a whole pending id and also how ")
+        .then(longer_names.clone())
+        .frame(format!(" {verb}, so it cannot pick one"));
     if longer.iter().any(|&at| matches[at].1.is_none()) {
-        return format!("{what}; {clear}.");
+        return what.frame("; ").then(clear).frame(".");
     }
     let it = if longer.len() == 1 { "it" } else { "them" };
-    format!(
-        "{what}. Act on {longer_names} first, typed as `.mesh pending` lists {it}, then '{token}' picks the one left; or {clear}."
-    )
+    what.frame(". Act on ")
+        .then(longer_names)
+        .frame(format!(
+            " first, typed as `.mesh pending` lists {it}, then '"
+        ))
+        .peer(token)
+        .frame("' picks the one left; or ")
+        .then(clear)
+        .frame(".")
 }
 
 /// How the entries `shown` names leave `.mesh pending` when no id can pick them: a peer's
 /// questions by `.mesh dismiss --all`, which leaves access requests alone, an access
 /// request at its expiry, and a question this node asked by no verb at all.
-fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind>)]) -> String {
+fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind>)]) -> NoticeText {
     let of_kind = |kind: Option<InboundKind>| {
         matches
             .iter()
@@ -5906,14 +6099,14 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
     let asked = of_kind(None);
     if questions.len() == matches.len() {
         let all = if matches.len() == 2 { "both" } else { "them" };
-        return format!("clear {all} with `.mesh dismiss --all`");
+        return format!("clear {all} with `.mesh dismiss --all`").into();
     }
     let mut clauses = Vec::new();
     if !questions.is_empty() {
-        clauses.push(format!(
-            "`.mesh dismiss --all` clears {}",
-            join_and(&questions)
-        ));
+        clauses.push(
+            NoticeText::from("`.mesh dismiss --all` clears ")
+                .then(join_and_text(quoted_ids(&questions))),
+        );
     }
     if !access.is_empty() {
         let (leave, expire) = if access.len() == 1 {
@@ -5921,10 +6114,10 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
         } else {
             ("leave", "they expire")
         };
-        clauses.push(format!(
-            "{} {leave} `.mesh pending` when {expire}",
-            join_and(&access)
-        ));
+        clauses.push(
+            join_and_text(quoted_ids(&access))
+                .frame(format!(" {leave} `.mesh pending` when {expire}")),
+        );
     }
     if !asked.is_empty() {
         let what = if asked.len() == 1 {
@@ -5932,9 +6125,11 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
         } else {
             "are questions this node asked"
         };
-        clauses.push(format!("{} {what}, which no verb clears", join_and(&asked)));
+        clauses.push(
+            join_and_text(quoted_ids(&asked)).frame(format!(" {what}, which no verb clears")),
+        );
     }
-    clauses.join(", and ")
+    joined_text(clauses, ", and ")
 }
 
 /// The fewest leading characters, never under `HASH_PREFIX_MIN_CHARS`, at which every hash
@@ -7334,10 +7529,13 @@ pub(crate) fn confirm_or_flag_with(
 const ANSWER_PROMPT: &str = "Your answer:";
 
 /// What a blank or cancelled `Your answer:` prompt leaves behind: the question stays
-/// open, so the line carries the full id for the one-line form.
-fn nothing_sent(id: &str) -> String {
-    format!(
-        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+/// open, so the line carries the full id, quoted as the peer chose it, for the one-line
+/// form.
+fn nothing_sent(id: &str) -> NoticeText {
+    NoticeText::from_template(
+        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\".",
+        &[],
+        &[("id", id)],
     )
 }
 
@@ -8527,11 +8725,18 @@ fn key_change_line(
 /// `KNOCK_DROPS_REMEMBERED` drops per identity, so a count at that cap reads `N+`. Each
 /// drop line ends with what serves the identity: trusting one of its cached knocks, or
 /// the fact that none is on file. The intro column is rendered at the length the cache
-/// keeps an intro, never shorter.
-fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKnocks]) -> String {
+/// keeps an intro, never shorter. The table holds the peers' names and intros, so it is
+/// quoted as it stands; the sentences around it follow the prefix.
+fn render_knocks(
+    records: &[KnockRecord],
+    now: SystemTime,
+    dropped: &[DroppedKnocks],
+) -> NoticeText {
     let mut lines = Vec::new();
     if records.is_empty() {
-        lines.push("No knocks. An untrusted node that wants in appears here.".to_string());
+        lines.push(NoticeText::from(
+            "No knocks. An untrusted node that wants in appears here.",
+        ));
     } else {
         let mut table = mesh_table(&["name", "identity", "dest", "age", "intro"]);
         for knock in records {
@@ -8547,11 +8752,11 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKno
                     .unwrap_or_else(|| "(no intro)".to_string()),
             ]);
         }
-        lines.push(table.to_string());
-        lines.push(format!(
+        lines.push(NoticeText::default().peer(table.to_string()));
+        lines.push(NoticeText::from(format!(
             "{} knock(s). Names and intros are peer-supplied text.",
             records.len()
-        ));
+        )));
     }
     for drop in dropped {
         let next = if drop.next_token_in.is_zero() {
@@ -8577,14 +8782,14 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKno
             ),
             None => "; none of its knocks is on file".to_string(),
         };
-        lines.push(format!(
+        lines.push(NoticeText::from(format!(
             "{} knock(s) from {} dropped in the last {} (rate limit; {next}){serve}",
             count,
             short(&drop.identity_hash),
             period_text(KNOCK_BUCKET_REFILL_INTERVAL),
-        ));
+        )));
     }
-    lines.join("\n")
+    joined_text(lines, "\n")
 }
 
 /// The bare `.mesh info` card: the settings, then the node's own rows, as one key/value
@@ -8768,53 +8973,47 @@ fn render_peer_detail(
     knock: &KnockLookup,
     trust: &str,
     now: SystemTime,
-) -> String {
-    let mut lines = vec![format!("destination: {destination}")];
+) -> NoticeText {
+    let mut lines = vec![NoticeText::from(format!("destination: {destination}"))];
+    let name_row = |name: Option<&str>| NoticeText::from("name: ").peer(name_label(name));
     if let Some(peer) = peer {
-        lines.push(format!("identity: {}", peer.identity_hash));
-        lines.push(format!(
-            "name: {}",
-            name_label(peer.display_name.as_deref())
-        ));
-        lines.push(format!("trust: {trust}"));
-        lines.push(format!("protocol: {}", peer.protocol_version));
+        lines.push(format!("identity: {}", peer.identity_hash).into());
+        lines.push(name_row(peer.display_name.as_deref()));
+        lines.push(format!("trust: {trust}").into());
+        lines.push(format!("protocol: {}", peer.protocol_version).into());
         if let Some(line) = peer.compatibility_line() {
-            lines.push(line);
+            lines.push(line.into());
         }
-        lines.push(format!("hops: {}", peer.hops));
+        lines.push(format!("hops: {}", peer.hops).into());
         let mut line = format!("last seen: {}", age_text(now, peer.last_seen));
         if let Some(state) = row_state(peer, successor, now) {
             line.push(' ');
             line.push_str(&state);
         }
-        lines.push(line);
+        lines.push(line.into());
     }
     match knock {
         KnockLookup::Knocked(knock) => {
             if peer.is_none() {
-                lines.push(format!("identity: {}", knock.identity_hash));
-                lines.push(format!(
-                    "name: {}",
-                    name_label(knock.display_name.as_deref())
-                ));
-                lines.push(format!("trust: {trust} (seen only in its knock)"));
+                lines.push(format!("identity: {}", knock.identity_hash).into());
+                lines.push(name_row(knock.display_name.as_deref()));
+                lines.push(format!("trust: {trust} (seen only in its knock)").into());
             }
             let age = parse_rfc3339(&knock.received_at)
                 .map(|then| age_text(now, then))
                 .unwrap_or_else(|| "unknown".to_string());
-            lines.push(format!(
-                "knocked: {age}, intro: {}",
-                peer_line(knock.intro.as_deref(), KNOCK_INTRO_MAX_CHARS)
-                    .unwrap_or_else(|| "(none)".to_string())
-            ));
+            lines.push(
+                NoticeText::from(format!("knocked: {age}, intro: ")).peer(
+                    peer_line(knock.intro.as_deref(), KNOCK_INTRO_MAX_CHARS)
+                        .unwrap_or_else(|| "(none)".to_string()),
+                ),
+            );
         }
-        KnockLookup::NotKnocked => lines.push("knocked: no".to_string()),
-        KnockLookup::Unreadable => {
-            lines.push("knocked: unknown (knock cache unreadable)".to_string())
-        }
+        KnockLookup::NotKnocked => lines.push("knocked: no".into()),
+        KnockLookup::Unreadable => lines.push("knocked: unknown (knock cache unreadable)".into()),
     }
-    lines.push("Names and intros are peer-supplied text.".to_string());
-    lines.join("\n")
+    lines.push("Names and intros are peer-supplied text.".into());
+    joined_text(lines, "\n")
 }
 
 /// One `.mesh inbox` block: a peer message, who put it in the inbox and when it landed.
@@ -9102,8 +9301,8 @@ fn time_left(received_at: &str, now: SystemTime) -> Option<Duration> {
         .map(|end| end.duration_since(now).unwrap_or_default())
 }
 
-fn answer_footer(id: &str) -> String {
-    format!("answer: .mesh answer {id} \"<text>\"")
+fn answer_footer(id: &str) -> NoticeText {
+    NoticeText::from_template("answer: .mesh answer {id} \"<text>\"", &[], &[("id", id)])
 }
 
 /// A question block in the `.mesh inbox` shape: a header the colour paints, then the
@@ -9111,8 +9310,9 @@ fn answer_footer(id: &str) -> String {
 /// `width` through `indented_rows`, then the answer footer on its own indented line.
 /// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
 /// is rendered at the length the store keeps it, never shorter. The footer is this
-/// node's own text and carries the full id, so it is neither wrapped nor shortened.
-/// The peer's name is quoted as it stands.
+/// node's own text and carries the full id, so it is neither wrapped nor shortened. The
+/// peer's name, id and words are quoted as they stand; only this node's hints follow the
+/// prefix.
 fn render_question_block(
     row: &QuestionRow,
     now: SystemTime,
@@ -9120,30 +9320,26 @@ fn render_question_block(
     colour: bool,
 ) -> NoticeText {
     let header = question_header(row, now);
-    let mut text = if colour {
-        let style = tool_name_style();
-        NoticeText::default()
-            .frame(style.prefix().to_string())
-            .then(header)
-            .frame(style.suffix().to_string())
+    let mut lines = vec![if colour {
+        painted_header(header)
     } else {
         header
-    };
-    let mut lines = Vec::new();
+    }];
     if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
-        lines.extend(indented_rows("", &body, width));
+        lines.extend(quoted_rows("", &body, width));
     }
     if let Some(question) = peer_line(Some(&row.envoy_question), INBOUND_ENVOY_QUESTION_MAX_CHARS) {
-        lines.extend(indented_rows("envoy asks: ", &question, width));
+        lines.extend(quoted_rows("envoy asks: ", &question, width));
     }
     for (label, text) in &row.extra {
-        lines.extend(indented_rows(label, text, width));
+        lines.extend(
+            indented_rows(label, text, width)
+                .into_iter()
+                .map(NoticeText::from),
+        );
     }
-    lines.push(format!("  {}", answer_footer(&row.id)));
-    for line in lines {
-        text = text.frame(format!("\n{line}"));
-    }
-    text
+    lines.push(NoticeText::from("  ").then(answer_footer(&row.id)));
+    joined_text(lines, "\n")
 }
 
 /// A question block's first line, dot-separated: state, peer, when it was asked or
@@ -9153,19 +9349,67 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> NoticeText {
         Some(when) => age_text(now, when),
         None => "at an unknown time".to_string(),
     };
-    let mut tail = format!(
-        " ({}) . {} {age} . id {}",
-        short(&row.destination),
-        row.when_label,
-        short(&row.id)
-    );
-    if let Some(left) = row.expires_in {
-        tail.push_str(&format!(" . expires in {}", span_text(left)));
-    }
-    NoticeText::default()
+    let mut header = NoticeText::default()
         .frame(format!("{} . ", row.state))
-        .peer(row.name.as_str())
-        .frame(tail)
+        .peer(row.name.clone())
+        .frame(format!(
+            " ({}) . {} {age} . id ",
+            short(&row.destination),
+            row.when_label
+        ))
+        .peer(short(&row.id));
+    if let Some(left) = row.expires_in {
+        header = header.frame(format!(" . expires in {}", span_text(left)));
+    }
+    header
+}
+
+/// `header` painted as `tool_name_text_forced` paints a line, its runs kept apart so the
+/// peer's part is still quoted as it stands.
+fn painted_header(header: NoticeText) -> NoticeText {
+    let plain = header.plain();
+    let painted = tool_name_text_forced(&plain);
+    match painted.split_once(plain.as_str()) {
+        Some((open, close)) => NoticeText::from(open).then(header).frame(close),
+        None => header,
+    }
+}
+
+/// `indented_rows` over peer text: every row is quoted as it stands. The label and the
+/// indent wrap with the text and carry no command hint.
+fn quoted_rows(label: &str, text: &str, width: usize) -> Vec<NoticeText> {
+    indented_rows(label, text, width)
+        .into_iter()
+        .map(|row| NoticeText::default().peer(row))
+        .collect()
+}
+
+/// `parts` in order with `separator`, a frame run, between each two.
+fn joined_text(parts: impl IntoIterator<Item = NoticeText>, separator: &str) -> NoticeText {
+    let mut joined = NoticeText::default();
+    for (index, part) in parts.into_iter().enumerate() {
+        if index > 0 {
+            joined = joined.frame(separator);
+        }
+        joined = joined.then(part);
+    }
+    joined
+}
+
+/// `join_and` over runs: `a, b and c`, the commas and the `and` this node's own words.
+fn join_and_text(mut parts: Vec<NoticeText>) -> NoticeText {
+    match parts.pop() {
+        None => NoticeText::default(),
+        Some(last) if parts.is_empty() => last,
+        Some(last) => joined_text(parts, ", ").frame(" and ").then(last),
+    }
+}
+
+/// Each of `ids` quoted as it stands.
+fn quoted_ids(ids: &[String]) -> Vec<NoticeText> {
+    ids.iter()
+        .map(|id| NoticeText::default().peer(id.clone()))
+        .collect()
 }
 
 /// Three sections in a fixed order, every one shown: a header carrying the count and,
@@ -9176,8 +9420,8 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> NoticeText {
 /// printed id picks its entry when typed back, except an id that is the whole of one
 /// entry's id and also how another's begins, or one that differs from another only in
 /// case. Those stay ambiguous on purpose, so a peer cannot mint an id that takes the
-/// place of another, and the refusal names how the entries clear.
-/// The peers' names are quoted as they stand.
+/// place of another, and the refusal names how the entries clear. Peer names, ids and
+/// words are quoted as they stand; the headers' hints follow the prefix.
 fn render_pending(
     asked: &[QuestionRow],
     escalated: &[QuestionRow],
@@ -9232,13 +9476,7 @@ fn render_pending(
             lines.extend(pending_entry(index + 1, row, *outbound, id_len, now, width));
         }
     }
-    lines
-        .into_iter()
-        .enumerate()
-        .fold(NoticeText::default(), |text, (at, line)| match at {
-            0 => text.then(line),
-            _ => text.frame("\n").then(line),
-        })
+    joined_text(lines, "\n")
 }
 
 /// How many characters of `id` tell it apart, without regard to case, from every id in
@@ -9277,47 +9515,44 @@ fn pending_entry(
         Some(when) => age_text(now, when),
         None => "at an unknown time".to_string(),
     };
-    let peer = format!(" ({})", short(&row.destination));
-    let id = row.id.get(..id_len).unwrap_or(&row.id);
     let marker = format!("  {number}. ");
-    let (lead, tail) = if outbound {
-        (
-            format!("{marker}-> "),
-            format!("{peer} {age} . {} . id {id}", row.state),
-        )
+    let peer = NoticeText::default()
+        .peer(row.name.clone())
+        .frame(format!(" ({})", short(&row.destination)));
+    let id = row.id.get(..id_len).unwrap_or(&row.id);
+    let head = if outbound {
+        NoticeText::from(format!("{marker}-> "))
+            .then(peer)
+            .frame(format!(" {age} . {} . id ", row.state))
     } else {
         let expires = row
             .expires_in
             .map(|left| format!(" . expires in {}", span_text(left)))
             .unwrap_or_default();
-        (
-            marker.clone(),
-            format!("{peer} {} {age}{expires} . id {id}", row.when_label),
-        )
+        NoticeText::from(marker.clone())
+            .then(peer)
+            .frame(format!(" {} {age}{expires} . id ", row.when_label))
     };
-    let mut lines = vec![
-        NoticeText::default()
-            .frame(lead)
-            .peer(row.name.as_str())
-            .frame(tail),
-    ];
+    let mut lines = vec![head.peer(id)];
     let indent = " ".repeat(marker.len() - 2);
     let inner = width.saturating_sub(indent.len());
-    let mut push = |label: &str, text: &str| {
-        lines.extend(
-            indented_rows(label, text, inner)
-                .into_iter()
-                .map(|row| NoticeText::from(format!("{indent}{row}"))),
-        );
+    let mut push = |label: &str, text: &str, quoted: bool| {
+        lines.extend(indented_rows(label, text, inner).into_iter().map(|row| {
+            if quoted {
+                NoticeText::from(indent.as_str()).peer(row)
+            } else {
+                NoticeText::from(format!("{indent}{row}"))
+            }
+        }));
     };
     if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
-        push("", &format!("\"{body}\""));
+        push("", &format!("\"{body}\""), true);
     }
     if let Some(question) = peer_line(Some(&row.envoy_question), INBOUND_ENVOY_QUESTION_MAX_CHARS) {
-        push("envoy asks: ", &question);
+        push("envoy asks: ", &question, true);
     }
     for (label, text) in &row.extra {
-        push(label, text);
+        push(label, text, false);
     }
     lines
 }
@@ -10917,7 +11152,8 @@ mod tests {
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             detail.contains(&format!("\nlast seen: 2h ago {stale}\n")),
             "{detail}"
@@ -11043,7 +11279,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             count: 2,
             next_token_in: Duration::from_secs(6 * 60),
         }];
-        assert_eq!(render_knocks(&records, now, &dropped), KNOCKS_SNAPSHOT);
+        assert_eq!(
+            render_knocks(&records, now, &dropped).plain(),
+            KNOCKS_SNAPSHOT
+        );
     }
 
     const KNOCKS_SNAPSHOT: &str = r#"┌───────┬──────────┬──────────┬─────────┬────────────────┐
@@ -11459,7 +11698,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             detail.contains(&format!("\nlast seen: 2h ago {superseded}\n")),
             "{detail}"
@@ -11472,7 +11712,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             detail.contains("\nlast seen: 40s ago\n"),
             "no successor, no marker: {detail}"
@@ -11996,12 +12237,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn knock_listing_shows_label_identity_age_and_intro() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
-        assert!(render_knocks(&[], now, &[]).starts_with("No knocks"));
+        assert!(
+            render_knocks(&[], now, &[])
+                .plain()
+                .starts_with("No knocks")
+        );
         let records = vec![
             knock(Some("Bea"), Some("hello there"), "2026-09-21T14:13:20Z"),
             knock(None, None, "not a time"),
         ];
-        let text = render_knocks(&records, now, &[]);
+        let text = render_knocks(&records, now, &[]).plain();
         assert_eq!(
             table_header(&text),
             ["name", "identity", "dest", "age", "intro"],
@@ -12030,7 +12275,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
         let intro = "z".repeat(KNOCK_INTRO_MAX_CHARS);
         let knocker = knock(Some("Bea"), Some(&intro), "2026-09-21T14:13:20Z");
-        let text = render_knocks(std::slice::from_ref(&knocker), now, &[]);
+        let text = render_knocks(std::slice::from_ref(&knocker), now, &[]).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][4].replace('\n', ""), intro, "{text}");
@@ -12042,7 +12287,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::Knocked(knocker),
             "untrusted",
             now,
-        );
+        )
+        .plain();
         assert!(text.contains(&format!(", intro: {intro}\n")), "{text}");
     }
 
@@ -12075,7 +12321,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 next_token_in: Duration::ZERO,
             },
         ];
-        let text = render_knocks(&records, now, &dropped);
+        let text = render_knocks(&records, now, &dropped).plain();
         assert_eq!(table_rows(&text).len(), 2, "{text}");
         let footer = table_footer(&text);
         assert_eq!(footer.len(), 4, "{text}");
@@ -12112,7 +12358,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             next_token_in: Duration::from_secs(30),
         }];
         assert_eq!(
-            render_knocks(&[], now, &dropped),
+            render_knocks(&[], now, &dropped).plain(),
             "No knocks. An untrusted node that wants in appears here.\n2 knock(s) from abababab dropped in the last 10 min (rate limit; next accepted in 1m); none of its knocks is on file"
         );
     }
@@ -12129,7 +12375,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::NotKnocked,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             text.starts_with(&format!("destination: {destination}\n")),
             "{text}"
@@ -12144,7 +12391,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::Unreadable,
             "trusted",
             now,
-        );
+        )
+        .plain();
         assert!(
             text.contains("knocked: unknown (knock cache unreadable)"),
             "{text}"
@@ -12166,7 +12414,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 &KnockLookup::Knocked(knocker.clone()),
                 label,
                 now,
-            );
+            )
+            .plain();
             assert!(
                 text.contains(&format!("trust: {label} (seen only in its knock)")),
                 "{text}"
@@ -12185,13 +12434,94 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             &KnockLookup::Knocked(knocker),
             "untrusted",
             now,
-        );
+        )
+        .plain();
         assert_eq!(text.matches("identity:").count(), 1, "{text}");
         assert!(text.contains("name: Ann"), "{text}");
         assert!(
             text.contains("knocked:") && text.contains("intro: hi"),
             "{text}"
         );
+    }
+
+    mod knock_listing_quoting_tests {
+        use super::*;
+
+        #[test]
+        fn knock_names_and_intros_keep_their_dots_while_the_drop_hint_slashes() {
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
+            let records = [knock(
+                Some(".session"),
+                Some(".mesh trust x"),
+                "2026-09-21T14:13:20Z",
+            )];
+            let dropped = [DroppedKnocks {
+                identity_hash: "ef".repeat(16),
+                count: 1,
+                next_token_in: Duration::ZERO,
+            }];
+            let listing = render_knocks(&records, now, &dropped);
+            let dot = listing.render(CommandPrefix::Dot);
+            let table = table_rows(&dot);
+            assert_eq!(table[0][0], ".session", "{dot}");
+            assert_eq!(table[0][4], ".mesh trust x", "{dot}");
+            let drop_line = format!(
+                "1 knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                "12".repeat(16)
+            );
+            assert!(dot.ends_with(&format!("\n{drop_line}")), "{dot}");
+            assert_eq!(dot, listing.plain());
+
+            let slash = listing.render(CommandPrefix::Slash);
+            assert_eq!(table_rows(&slash), table, "{slash}");
+            assert!(
+                slash.ends_with(&format!(
+                    "\n{}",
+                    drop_line.replace(".mesh trust", "/mesh trust")
+                )),
+                "{slash}"
+            );
+        }
+
+        #[test]
+        fn peer_detail_keeps_the_name_and_intro_as_the_peer_wrote_them() {
+            let now = SystemTime::now();
+            let destination = "12".repeat(16);
+            let knocker = knock(
+                Some(".session"),
+                Some(".mesh trust x"),
+                "2026-09-21T14:13:20Z",
+            );
+            let detail = render_peer_detail(
+                &destination,
+                None,
+                None,
+                &KnockLookup::Knocked(knocker),
+                "untrusted",
+                now,
+            );
+            let dot = detail.render(CommandPrefix::Dot);
+            let age = age_text(now, parse_rfc3339("2026-09-21T14:13:20Z").unwrap());
+            assert_eq!(
+                dot,
+                format!(
+                    "destination: {destination}\nidentity: {}\nname: .session\ntrust: untrusted (seen only in its knock)\nknocked: {age}, intro: .mesh trust x\nNames and intros are peer-supplied text.",
+                    "ef".repeat(16)
+                )
+            );
+            assert_eq!(detail.render(CommandPrefix::Slash), dot);
+
+            let named = render_peer_detail(
+                &"ab".repeat(16),
+                Some(&peer(Some(".vault"), 5, now)),
+                None,
+                &KnockLookup::NotKnocked,
+                "trusted",
+                now,
+            )
+            .render(CommandPrefix::Slash);
+            assert!(named.contains("\nname: .vault\n"), "{named}");
+        }
     }
 
     #[test]
@@ -13577,6 +13907,300 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
     }
 
+    mod pending_quoting_tests {
+        use super::*;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        /// A peer's question whose name, id and words all read as commands.
+        fn command_shaped_row() -> QuestionRow {
+            let mut row = escalated_row(".vault", "");
+            row.name = ".session".to_string();
+            row.body = ".mesh trust x".to_string();
+            row
+        }
+
+        fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
+            command_error_text(
+                &MeshVerbError::wrap(err.context("`.mesh answer` failed")),
+                prefix,
+            )
+        }
+
+        #[test]
+        fn the_listing_keeps_peer_names_ids_and_words_while_its_hints_slash() {
+            let listing =
+                render_pending(&[], &[command_shaped_row()], &[], pending_now(), 80, false);
+            assert_eq!(
+                listing.render(CommandPrefix::Dot),
+                "Waiting for YOU (1)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh trust x\"\nAccess requests: none\nAsked by this node: none"
+            );
+            assert_eq!(
+                listing.render(CommandPrefix::Slash),
+                "Waiting for YOU (1)     answer: /mesh answer <id> \"<text>\" . dismiss: /mesh dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh trust x\"\nAccess requests: none\nAsked by this node: none"
+            );
+        }
+
+        #[test]
+        fn the_question_block_and_nothing_sent_keep_the_peer_id_while_the_hint_slashes() {
+            let block = render_question_block(&command_shaped_row(), pending_now(), 80, false);
+            let header = "awaiting your answer . .session (12121212) . asked 3m ago . id .vault . expires in 6d";
+            assert_eq!(
+                block.render(CommandPrefix::Dot),
+                format!("{header}\n  .mesh trust x\n  answer: .mesh answer .vault \"<text>\"")
+            );
+            assert_eq!(
+                block.render(CommandPrefix::Slash),
+                format!("{header}\n  .mesh trust x\n  answer: /mesh answer .vault \"<text>\"")
+            );
+            let painted = render_question_block(&command_shaped_row(), pending_now(), 80, true)
+                .render(CommandPrefix::Slash);
+            assert_eq!(
+                painted.lines().next(),
+                Some(tool_name_text_forced(header).as_str())
+            );
+
+            let left = nothing_sent(".vault");
+            assert_eq!(
+                left.render(CommandPrefix::Dot),
+                "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer .vault \"<text>\"."
+            );
+            assert_eq!(
+                left.render(CommandPrefix::Slash),
+                "Nothing was sent: the answer was left blank or cancelled. Answer later with /mesh answer .vault \"<text>\"."
+            );
+        }
+
+        #[test]
+        fn pending_id_refusals_quote_the_token_and_ids_as_typed() {
+            let question = Some(InboundKind::Question);
+            let held = |ids: &[(&str, Option<InboundKind>)]| {
+                ids.iter()
+                    .map(|(id, kind)| (id.to_string(), *kind))
+                    .collect::<Vec<_>>()
+            };
+            let cases = [
+                (
+                    resolve_pending_id(".vault", held(&[(".vault:a", question)])),
+                    "'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them.",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[(".session:a", question), (".session:b", question)]),
+                    ),
+                    "'.session' matches 2 pending ids: .session:a, .session:b; give one of these (or enough of its characters to tell it apart).",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[(".session", question), (".session:b", question)]),
+                    ),
+                    "'.session' is a whole pending id and also how .session:... begins, so it cannot pick one. Act on .session:... first, typed as `.mesh pending` lists it, then '.session' picks the one left; or clear both with `.mesh dismiss --all`.",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[(".session", question), (".SESSION", question)]),
+                    ),
+                    "'.SESSION' and '.session' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`.",
+                ),
+                (
+                    resolve_pending_id(
+                        ".session",
+                        held(&[
+                            (".session", question),
+                            (".session:a", Some(InboundKind::Access)),
+                            (".session:b", None),
+                        ]),
+                    ),
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `.mesh dismiss --all` clears .session, and .session:a leaves `.mesh pending` when it expires, and .session:b is a question this node asked, which no verb clears.",
+                ),
+            ];
+            for (refused, dot) in cases {
+                let err = refused.unwrap_err();
+                assert_eq!(err.to_string(), dot);
+                assert!(shown_as(err, CommandPrefix::Dot).ends_with(dot));
+            }
+
+            let slashed = shown_as(
+                resolve_pending_id(
+                    ".session",
+                    held(&[
+                        (".session", question),
+                        (".session:a", Some(InboundKind::Access)),
+                        (".session:b", None),
+                    ]),
+                )
+                .unwrap_err(),
+                CommandPrefix::Slash,
+            );
+            assert!(
+                slashed.starts_with("Error: `/mesh answer` failed"),
+                "{slashed}"
+            );
+            assert!(
+                slashed.ends_with(
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `/mesh dismiss --all` clears .session, and .session:a leaves `/mesh pending` when it expires, and .session:b is a question this node asked, which no verb clears."
+                ),
+                "{slashed}"
+            );
+            let short = shown_as(
+                resolve_pending_id(".vault", held(&[(".vault:a", question)])).unwrap_err(),
+                CommandPrefix::Slash,
+            );
+            assert!(
+                short.ends_with("'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `/mesh pending` lists them."),
+                "{short}"
+            );
+        }
+    }
+
+    mod sibling_id_quoting_tests {
+        use super::*;
+        use crate::mesh::already_closed;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
+            command_error_text(
+                &MeshVerbError::wrap(err.context("`.mesh answer` failed")),
+                prefix,
+            )
+        }
+
+        /// Each refusal for an id a peer chose, with the id `.vault`, and the sentence
+        /// it reads as under the dot and the slash prefix.
+        fn refusals() -> Vec<(anyhow::Error, &'static str, &'static str)> {
+            vec![
+                (
+                    no_open_question(".vault"),
+                    "No open question has id .vault. `.mesh pending` lists the ones this node knows about.",
+                    "No open question has id .vault. `/mesh pending` lists the ones this node knows about.",
+                ),
+                (
+                    asked_by_this_node(".vault"),
+                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then.",
+                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `/mesh pending` shows it until then.",
+                ),
+                (
+                    access_not_a_question(".vault"),
+                    "`.vault` is an access request, not a question; decide it with `.mesh grant .vault` or `.mesh refuse .vault`",
+                    "`.vault` is an access request, not a question; decide it with `/mesh grant .vault` or `/mesh refuse .vault`",
+                ),
+                (
+                    question_not_an_access_request(".vault"),
+                    "`.vault` is a question, not an access request; answer it with `.mesh answer .vault`",
+                    "`.vault` is a question, not an access request; answer it with `/mesh answer .vault`",
+                ),
+                (
+                    anyhow::Error::new(already_closed(".vault")),
+                    "`.vault` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+                    "`.vault` was already closed by another process, so nothing more was done. /mesh pending shows what is still open.",
+                ),
+            ]
+        }
+
+        #[test]
+        fn under_dot_each_refusal_reads_as_it_did() {
+            for (err, dot, _) in refusals() {
+                assert_eq!(err.to_string(), dot);
+                assert_eq!(
+                    shown_as(err, CommandPrefix::Dot),
+                    format!("Error: `.mesh answer` failed\n\nCaused by:\n    {dot}")
+                );
+            }
+        }
+
+        #[test]
+        fn under_slash_each_refusal_keeps_the_id_and_slashes_its_hints() {
+            for (err, _, slash) in refusals() {
+                assert_eq!(
+                    shown_as(err, CommandPrefix::Slash),
+                    format!("Error: `/mesh answer` failed\n\nCaused by:\n    {slash}")
+                );
+            }
+        }
+    }
+
+    mod dismiss_all_quoting_tests {
+        use super::*;
+        use crate::mesh::{already_closed, dismiss_held_by_envoy};
+
+        /// The failures `--all` prints a line for, each for a question a peer filed under
+        /// the id `.vault`: one the envoy holds, one another process closed.
+        fn failures() -> [anyhow::Error; 2] {
+            [
+                dismiss_held_by_envoy(".vault"),
+                anyhow::Error::new(already_closed(".vault")),
+            ]
+        }
+
+        #[test]
+        fn under_dot_each_failure_line_reads_as_it_did() {
+            let dots = [
+                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss .vault.",
+                "`.vault` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+            ];
+            for (err, dot) in failures().into_iter().zip(dots) {
+                assert_eq!(format!("{err:#}"), dot);
+                assert_eq!(dismiss_failure_line(&err, CommandPrefix::Dot), dot);
+            }
+        }
+
+        #[test]
+        fn under_slash_each_failure_line_keeps_the_id_and_slashes_its_hint() {
+            let [held, closed] = failures();
+            assert_eq!(
+                dismiss_failure_line(&held, CommandPrefix::Slash),
+                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then /mesh dismiss .vault."
+            );
+            assert_eq!(
+                dismiss_failure_line(&closed, CommandPrefix::Slash),
+                "`.vault` was already closed by another process, so nothing more was done. /mesh pending shows what is still open."
+            );
+        }
+    }
+
+    mod confirmation_quoting_tests {
+        use super::*;
+
+        const DESTINATION: &str = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d";
+
+        #[test]
+        fn under_dot_the_confirmations_read_as_they_did() {
+            assert_eq!(
+                send_confirmation(".session", DESTINATION, "trusted").render(CommandPrefix::Dot),
+                "This sends your text to .session (1a2b3c4d, trust: trusted) over the mesh."
+            );
+            assert_eq!(
+                send_confirmation(&name_label(None), DESTINATION, "known")
+                    .render(CommandPrefix::Dot),
+                "This sends your text to (no name) (1a2b3c4d, trust: known) over the mesh."
+            );
+            assert_eq!(
+                knock_confirmation(Some(".session"), DESTINATION, "known", ".mesh trust x")
+                    .render(CommandPrefix::Dot),
+                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+            );
+            assert_eq!(
+                knock_confirmation(None, DESTINATION, "known", "").render(CommandPrefix::Dot),
+                "This knocks on (no name) (1a2b3c4d, trust: known) so it can trust this instance, without an intro; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+            );
+        }
+
+        #[test]
+        fn under_slash_the_name_and_intro_keep_their_dots_and_the_hint_slashes() {
+            assert_eq!(
+                send_confirmation(".session", DESTINATION, "trusted").render(CommandPrefix::Slash),
+                "This sends your text to .session (1a2b3c4d, trust: trusted) over the mesh."
+            );
+            assert_eq!(
+                knock_confirmation(Some(".session"), DESTINATION, "known", ".mesh trust x")
+                    .render(CommandPrefix::Slash),
+                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `/mesh trust` on both sides."
+            );
+        }
+    }
+
     mod id_prefix_tests {
         use super::*;
 
@@ -14169,7 +14793,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             Some(hostile),
             "2026-09-21T14:13:20Z",
         )];
-        let text = render_knocks(&records, now, &[]);
+        let text = render_knocks(&records, now, &[]).plain();
         for c in forbidden {
             assert!(
                 !text.contains(c),
@@ -14194,7 +14818,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         // empty column that could be mistaken for a blank name or intro.
         let blank = "\u{1b}[2J\u{7}\r\n";
         let records = vec![knock(Some(blank), Some(blank), "2026-09-21T14:13:20Z")];
-        let text = render_knocks(&records, now, &[]);
+        let text = render_knocks(&records, now, &[]).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][0], "(no name)", "{text}");
@@ -21423,9 +22047,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ["  what now?", "  answer: .mesh answer q1 \"<text>\""],
                         "{out:?}"
                     );
-                    assert_eq!(out[3], nothing_sent("q1"), "{out:?}");
+                    assert_eq!(out[3], nothing_sent("q1").plain(), "{out:?}");
                     assert!(out[4].starts_with(&inbound_header), "{out:?}");
-                    assert_eq!(out[8], nothing_sent("p1"), "{out:?}");
+                    assert_eq!(out[8], nothing_sent("p1").plain(), "{out:?}");
                     assert!(
                         !out.iter()
                             .any(|line| line.contains("Sending your answer to")),
@@ -21567,7 +22191,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines()[before..].join("\n");
                     let out: Vec<&str> = out.lines().collect();
                     assert!(out[0].starts_with(&outbound_header), "{out:?}");
-                    assert_eq!(out[3], nothing_sent("q1"), "{out:?}");
+                    assert_eq!(out[3], nothing_sent("q1").plain(), "{out:?}");
                     assert!(
                         !out.iter()
                             .any(|line| line.contains("Sending your answer to")),
@@ -39970,7 +40594,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,
-                            access_not_a_question("a-1")
+                            access_not_a_question("a-1").to_string()
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,
