@@ -469,8 +469,9 @@ fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>)
 /// your session running there when the row is under that session's identity, else the
 /// label `.mesh peers` shows for it. A name is offered only when it is
 /// one word that displays as spelled, is not itself a whole hash (which the verbs would
-/// take as given), and every name spelled the same stands for this destination, which is
-/// when the verbs resolve it here. Without `identity_labels` no name an identity label
+/// take as given), is not a reserved word or flag the verbs would read as such (`clear`,
+/// anything starting `--`), and every name spelled the same stands for this destination,
+/// which is when the verbs resolve it here. Without `identity_labels` no name an identity label
 /// shares is offered: the `--peer` verbs read an identity label as the identity, a grant
 /// wider than the destination row it was picked from.
 fn typed_name(
@@ -482,6 +483,8 @@ fn typed_name(
     let resolves_here = |name: &str| {
         let spelled = name.to_lowercase();
         !name.contains(char::is_whitespace)
+            && spelled != "clear"
+            && !name.starts_with("--")
             && display_text(name, DISPLAY_NAME_MAX_CHARS).as_deref() == Some(name)
             && canonical_hash(name).is_none()
             && names
@@ -37175,6 +37178,62 @@ mod tests {
             }
 
             fixture.stop().await;
+        }
+    }
+
+    mod reserved_name_completion_tests {
+        use super::*;
+
+        fn hash(byte: u8) -> String {
+            crate::mesh::hex_lower(&[byte; 16])
+        }
+
+        fn label(name: &str, destination: &str) -> AddressName {
+            AddressName {
+                name: name.to_string(),
+                target: NameTarget::DestinationLabel {
+                    destination: destination.to_string(),
+                    identity: None,
+                },
+            }
+        }
+
+        fn session(name: &str, destination: &str, identity: &str) -> AddressName {
+            AddressName {
+                name: name.to_string(),
+                target: NameTarget::Session {
+                    destination: destination.to_string(),
+                    identity: identity.to_string(),
+                },
+            }
+        }
+
+        /// A name the verbs would read as their reserved word or as a flag is never
+        /// offered, as a label or as a session name; the row falls back to its hash.
+        #[test]
+        fn reserved_words_and_flags_are_not_offered_as_names() {
+            let me = hash(0xa1);
+            let at = hash(0x0b);
+            for name in ["clear", "CLEAR", "--attach", "--all"] {
+                assert_eq!(
+                    typed_name(&[label(name, &at)], &at, &me, true),
+                    None,
+                    "{name}"
+                );
+                assert_eq!(
+                    typed_name(&[session(name, &at, &me)], &at, &me, true),
+                    None,
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                typed_name(&[label("clearing", &at)], &at, &me, true),
+                Some(TypedName::Label("clearing".to_string()))
+            );
+            assert_eq!(
+                typed_name(&[label("bea-lab", &at)], &at, &me, true),
+                Some(TypedName::Label("bea-lab".to_string()))
+            );
         }
     }
 
