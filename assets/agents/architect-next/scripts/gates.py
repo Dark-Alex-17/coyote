@@ -509,9 +509,13 @@ def _ask_choice(state, u, heading):
 
 
 def _choice_pick(text, options):
-    """The option text a reply names ("Option 2", "2", or the option's text), or None."""
-    m = re.match(r"(?i)^\s*option\s+(\d+)\b", text or "")
-    return match_option(m.group(1) if m else text, options)
+    """The option text a reply names ("Option 2", "2", or the option's text), or None.
+
+    Only the label's own "(recommended)" and trailing punctuation may follow the reference: "Option 2, but only for
+    reads" qualifies the pick, so it is left to the classifier and recorded in full.
+    """
+    m = re.match(r"(?i)^\s*option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", text or "")
+    return match_option(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
 
 
 def _record_choice(state, u, answer, via=""):

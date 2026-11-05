@@ -1350,6 +1350,19 @@ for reply, want in (("Option 1 (recommended)", "pg"), ("Option 3", "redis"), ("2
 u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="why not both?", reask_rounds=0))
 check("parse_answer: design question unmatched free text (a Slack reply) -> classify_reply, never a re-ask nor taken raw",
       u["_next"] == "classify_reply" and "last_answer" not in u and "reask_rounds" not in u, u)
+for reply, want in (("Option 2.", "sqlite"), ("2!", "sqlite"), ("redis.", "redis")):
+    u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text=reply))
+    check(f"parse_answer: design question reply {reply!r} with only punctuation after the option -> the pick {want!r}",
+          u["_next"] == "apply_answer" and u["last_answer"] == want, u)
+QUALIFIED = "Option 2, but only for reads"
+u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text=QUALIFIED))
+s = base_state(escalation=E_DQ, last_answer_text=QUALIFIED, reply_kind="answer", reply_reason="a qualified pick",
+               choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[])
+s.update(gates.choice_reply_route(s))
+s.update(gates.apply_answer(s))
+check("parse_answer -> classify_reply -> apply_answer: 'Option 2, but ...' is no pick; as an answer it is recorded in full, via other",
+      u["_next"] == "classify_reply" and s["choice_answers"] == [{"question": "Which store?", "answer": QUALIFIED, "via": "other"}],
+      (u, s.get("choice_answers")))
 check("ask_dispatch / ask_owner_route: a multiple-choice escalation picks ask_choice_<option count>",
       [gates.ask_dispatch(base_state(escalation={**E_DQ, "options": E_DQ["options"][:n]}))["_next"] for n in (2, 3)] == ["ask_choice_2", "ask_choice_3"]
       and gates._terminal_prompt({**E_DQ, "options": E_DQ["options"] + [option("x")]}) == "ask_choice_4"
