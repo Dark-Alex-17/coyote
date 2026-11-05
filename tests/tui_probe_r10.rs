@@ -497,22 +497,29 @@ fn a_burst_of_resizes_leaves_the_ui_live_and_painted_once_per_size_at_most() {
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
     let before = pty.raw().len();
-    // Twenty-one sizes with no pause between them, the way SIGWINCH
-    // arrives while an edge is dragged; the last one differs from the
-    // start size, so a repaint is owed.
-    for cols in (50..=100).step_by(5).rev().chain((55..=90).step_by(5)) {
+    // A run of sizes with no pause between them, the way SIGWINCH arrives
+    // while an edge is dragged; the last one differs from the start size,
+    // so a repaint is owed.
+    let sizes: Vec<u16> = (50..=100)
+        .step_by(5)
+        .rev()
+        .chain((55..=90).step_by(5))
+        .collect();
+    for &cols in &sizes {
         pty.resize(30, cols).unwrap();
     }
     pty.read_for(Duration::from_millis(1500));
     assert_repainted_after(&mut pty, before, "a burst of resizes ending at 90x30");
-    // Frames are coalesced: far fewer full repaints than resize events.
-    // Each full repaint paints the footer hint once; count those since the
-    // burst began. 21 events; a coalescing scheduler paints well under 21.
+    // Frames are coalesced: each full repaint paints the footer hint once,
+    // and a renderer that painted every event would paint once per size.
+    // The burst lands as one repaint on an idle host; a second is allowed
+    // for a frame that starts before the last size arrives under load.
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
     let repaints = since.matches("Type a prompt").count();
     assert!(
-        repaints < 21,
-        "{repaints} full repaints for 21 resize events: frames were not coalesced"
+        repaints <= 2,
+        "{repaints} full repaints for {} resize events: frames were not coalesced",
+        sizes.len()
     );
 
     pty.send(b".info\r").unwrap();
