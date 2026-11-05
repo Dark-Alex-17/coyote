@@ -2133,14 +2133,16 @@ async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time:
 
 /// Seeds this node's own grant once the start can no longer fail, so a refused start
 /// writes none. A seed that fails leaves the node running without the grant, warned
-/// about with the command that gives it, and reads as not granted.
+/// about with the trust file to fix and the command that gives it, and reads as not
+/// granted. The own hash is logged whole on purpose: the remedy is typed from it.
 fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
     match trust.seed_self_trust(fingerprint, minted, SystemTime::now()) {
         Ok(granted) => granted,
         Err(err) => {
             warn!(
-                "The mesh is on, but this node's own identity could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until you run `.mesh trust --identity {fingerprint}`.",
-                redact_hashes(&format!("{err:#}"))
+                "The mesh is on, but this node's own identity could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity {fingerprint}`.",
+                redact_hashes(&format!("{err:#}")),
+                trust.path().display()
             );
             false
         }
@@ -16509,7 +16511,10 @@ mod tests {
 
             assert!(!seed_own_grant(&trust, OWN, true));
 
-            let remedy = format!("`.mesh trust --identity {OWN}`");
+            let remedy = format!(
+                "make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity {OWN}`",
+                trust.path().display()
+            );
             let warned = warn_snapshot();
             assert!(
                 warned
