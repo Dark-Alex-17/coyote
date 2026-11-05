@@ -2273,6 +2273,69 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     );
 }
 
+/// The `.mesh peers` sample names your session and a labelled peer the way
+/// `own_session_name` and `labelled_name` format them, and the "Names instead of hashes"
+/// bullet quotes the `Did you mean` ending `unknown_name` prints.
+#[test]
+fn the_mesh_pages_name_sessions_and_labels_as_the_code_formats_them() {
+    let own = string_literals(&fn_body("src/repl/mesh.rs", "own_session_name"));
+    assert_eq!(
+        own,
+        ["(you: {session})"],
+        "own_session_name's format changed"
+    );
+    let labelled = string_literals(&fn_body("src/repl/mesh.rs", "labelled_name"));
+    assert!(
+        labelled
+            .iter()
+            .any(|literal| literal == "{label} ({announced})"),
+        "labelled_name's format changed: {labelled:?}"
+    );
+    let unknown = string_literals(&fn_body("src/repl/mesh.rs", "unknown_name"));
+    let ask = unknown
+        .iter()
+        .find(|literal| literal.contains("Did you mean"))
+        .expect("unknown_name offers the closest name");
+    let close = unknown
+        .iter()
+        .find(|literal| literal.starts_with("`?"))
+        .expect("unknown_name closes the offer after the name");
+    let ending = format!("{}<name>{close}", ask.trim_start());
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh peers`");
+    let sample = peers_section
+        .split("```text\n")
+        .nth(1)
+        .and_then(|block| block.split("\n```").next())
+        .expect("the `.mesh peers` section opens with a text sample");
+    let names: Vec<String> = boxed_table("the `.mesh peers` sample", sample)[1..]
+        .iter()
+        .map(|cells| cells[0].clone())
+        .collect();
+    for cell in [
+        own[0].replace("{session}", "temp"),
+        "{label} ({announced})"
+            .replace("{label}", "maki-laptop")
+            .replace("{announced}", "maki"),
+    ] {
+        assert!(
+            names.contains(&cell),
+            "the `.mesh peers` sample has no {cell:?} row: {names:?}"
+        );
+    }
+    let bullet = page
+        .split("\n- ")
+        .find(|item| item.starts_with("**Names instead of hashes.**"))
+        .expect("Mesh-Commands.md has a \"Names instead of hashes\" bullet");
+    let bullet = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        bullet.contains(&format!("`` `{ending}` ``")),
+        "the bullet does not quote {ending:?}:\n{bullet}"
+    );
+}
+
 /// `text` with every fenced code block removed, so a pin on a page's prose is not met by
 /// a sample alone.
 fn prose_outside_fences(text: &str) -> String {
@@ -6625,8 +6688,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         header,
         [
             "at an unknown time",
-            "{} . {} ({}) . {} {age} . id {}",
+            " ({}) . {} {age} . id {}",
             " . expires in {}",
+            "{} . ",
         ],
         "question_header's literals moved"
     );
@@ -6639,7 +6703,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         );
     }
     assert!(
-        block.contains("tool_name_text_forced(&header)"),
+        block.contains("tool_name_style()"),
         "render_question_block does not paint the header in the tool-call name colour:\n{block}"
     );
     let pending_literals = string_literals(&fn_body("src/repl/mesh.rs", "render_pending"));
@@ -6665,7 +6729,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .collect();
     let entry_literals = string_literals(&fn_body("src/repl/mesh.rs", "pending_entry"));
     for needle in [
-        "-> {peer} {age} . {} . id {id}",
+        "{marker}-> ",
+        "{peer} {age} . {} . id {id}",
         "{peer} {} {age}{expires} . id {id}",
         " . expires in {}",
         "  {number}. ",

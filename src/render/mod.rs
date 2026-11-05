@@ -118,6 +118,16 @@ impl QuotingError {
     pub(crate) fn wrap(text: NoticeText) -> anyhow::Error {
         anyhow::Error::new(Self(text))
     }
+
+    /// `err` with `tail` after its message, quoting as `err` did. Only the top message of
+    /// an error that quotes nothing is kept, all of it this node's own text.
+    pub(crate) fn followed_by(err: anyhow::Error, tail: NoticeText) -> anyhow::Error {
+        let head = match err.downcast::<Self>() {
+            Ok(Self(text)) => text,
+            Err(err) => NoticeText::from(err.to_string()),
+        };
+        Self::wrap(head.then(tail))
+    }
 }
 
 impl fmt::Display for QuotingError {

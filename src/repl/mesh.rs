@@ -56,8 +56,8 @@ use crate::render::QuotingError;
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{
-    AbortSignal, NO_COLOR, drain_stale_tty_input, home_relative, tool_name_text_forced,
-    wait_user_interrupt,
+    AbortSignal, NO_COLOR, drain_stale_tty_input, home_relative, tool_name_style,
+    tool_name_text_forced, wait_user_interrupt,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -753,7 +753,13 @@ async fn status(
         }
         StatusArg::Fetch(token) => {
             let runtime = live(ctx)?;
-            let destination = destination_hash(ctx, token)?;
+            let destination = destination_hash(ctx, token).map_err(|err| {
+                if is_hash_prefix(token) {
+                    err
+                } else {
+                    QuotingError::followed_by(err, quote_status_tail(token))
+                }
+            })?;
             let Some(peer) =
                 peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal).await?
             else {
@@ -1119,18 +1125,7 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     live(ctx)?;
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
-    let own_sessions = ctx.app.mesh.own_sessions();
     let names = ctx.app.mesh.address_names();
-    let name_at = |destination: &str| match own_sessions.get(destination) {
-        Some(session) => own_session_name(session),
-        None => match owner_label(&names, destination) {
-            Some(label) => labelled_name(
-                &label.name,
-                ctx.app.mesh.display_name_at(destination).as_deref(),
-            ),
-            None => ctx.app.mesh.peer_name_at(destination),
-        },
-    };
     let asked: Vec<QuestionRow> = ctx
         .app
         .mesh
@@ -1138,7 +1133,10 @@ fn pending(ctx: &RequestContext) -> Result<()> {
         .list()
         .iter()
         .map(|correlation| {
-            QuestionRow::outbound(correlation, name_at(&correlation.record.peer_destination))
+            QuestionRow::outbound(
+                correlation,
+                name_at(ctx, &names, &correlation.record.peer_destination),
+            )
         })
         .collect();
     let inbound = match ctx.app.mesh.inbound_store() {
@@ -1147,20 +1145,23 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     };
     let (mut access, mut escalated) = (Vec::new(), Vec::new());
     for record in &inbound {
-        let name = name_at(&record.peer_destination);
+        let name = name_at(ctx, &names, &record.peer_destination);
         match record.kind {
             InboundKind::Access => access.push(QuestionRow::access(record, name, now)),
             InboundKind::Question => escalated.push(QuestionRow::inbound(record, name, now)),
         }
     }
-    out_text(&render_pending(
-        &asked,
-        &escalated,
-        &access,
-        now,
-        terminal_width(),
-        !*NO_COLOR,
-    ));
+    out_path_text(
+        &render_pending(
+            &asked,
+            &escalated,
+            &access,
+            now,
+            terminal_width(),
+            !*NO_COLOR,
+        )
+        .render(live_prefix()),
+    );
     Ok(())
 }
 
@@ -1201,17 +1202,18 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if attach.is_some() {
                 ctx.app.mesh.refuse_held_by_envoy(id)?;
             }
-            let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
+            let name = name_at(ctx, &ctx.app.mesh.address_names(), &record.peer_destination);
             (
                 QuestionRow::inbound(&record, name, now),
                 Answering::Peer(record.peer_destination),
             )
         }
         (AnswerRoute::Outbound, _, Some(correlation)) => {
-            let name = ctx
-                .app
-                .mesh
-                .peer_name_at(&correlation.record.peer_destination);
+            let name = name_at(
+                ctx,
+                &ctx.app.mesh.address_names(),
+                &correlation.record.peer_destination,
+            );
             (
                 QuestionRow::outbound(&correlation, name),
                 Answering::OwnQuestion(Box::new(correlation)),
@@ -1220,12 +1222,9 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         _ => bail!(no_open_question(id)),
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
-    out_text(&render_question_block(
-        &row,
-        now,
-        terminal_width(),
-        !*NO_COLOR,
-    ));
+    out_path_text(
+        &render_question_block(&row, now, terminal_width(), !*NO_COLOR).render(live_prefix()),
+    );
     let text = match given {
         Some(text) => text.to_string(),
         None => match prompt_answer_text(id)? {
@@ -1355,12 +1354,15 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     let id = &record.id;
     ctx.app.mesh.refuse_dismiss_held_by_envoy(id)?;
     let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
-    out_text(&render_question_block(
-        &QuestionRow::inbound(&record, name.clone(), now),
-        now,
-        terminal_width(),
-        !*NO_COLOR,
-    ));
+    out_path_text(
+        &render_question_block(
+            &QuestionRow::inbound(&record, name.clone(), now),
+            now,
+            terminal_width(),
+            !*NO_COLOR,
+        )
+        .render(live_prefix()),
+    );
     if silent {
         ctx.app.mesh.dismiss_inbound(id, true).await?;
         out_text(&format!(
@@ -1562,15 +1564,24 @@ async fn message(
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let trust = runtime.trust();
-    out_text(&format!(
-        "This sends your text to {} ({}, trust: {}) over the mesh.",
-        name_label(peer.display_name.as_deref()),
-        short(&destination),
-        trust_label(
-            trust.authorize(&peer.identity_hash, &destination),
-            trust.identity_standing(&peer.identity_hash)
-        )
-    ));
+    let name = given_name(
+        &runtime.address_names(),
+        &destination,
+        peer.display_name.as_deref(),
+    )
+    .unwrap_or_else(|| name_label(peer.display_name.as_deref()));
+    let notice = NoticeText::default()
+        .frame("This sends your text to ")
+        .peer(name)
+        .frame(format!(
+            " ({}, trust: {}) over the mesh.",
+            short(&destination),
+            trust_label(
+                trust.authorize(&peer.identity_hash, &destination),
+                trust.identity_standing(&peer.identity_hash)
+            )
+        ));
+    out_path_text(&notice.render(live_prefix()));
     if let Some(attachment) = &attachment {
         out_path_text(&attaching_notice(attachment, &destination));
     }
@@ -6135,14 +6146,19 @@ fn joined_names(names: &[&AddressName], kind: HashKind) -> NoticeText {
 
 /// Two or more names spelled `token` that give different hashes.
 fn ambiguous_name(token: &str, kind: HashKind, names: &[&AddressName]) -> NoticeText {
-    NoticeText::default()
+    let text = NoticeText::default()
         .frame("'")
         .peer(token)
         .frame(format!("' names more than one {}: ", kind.noun()))
-        .then(joined_names(names, kind))
-        .frame(
-            ". Type the hash of the one you mean in its place; the 8 characters shown are enough.",
-        )
+        .then(joined_names(names, kind));
+    let example = names
+        .iter()
+        .find_map(|name| named_hash(kind, &name.target))
+        .map(|hash| format!(", e.g. {}", short(&hash)))
+        .unwrap_or_default();
+    text.frame(format!(
+        ". Type the hash of the one you mean in its place{example}; the 8 characters shown are enough."
+    ))
 }
 
 /// An identity label wanted as a destination when the peer table holds no instance of
@@ -6185,7 +6201,8 @@ fn not_an_identity(token: &str, names: &[&AddressName]) -> NoticeText {
         .then(joined_names(names, HashKind::Identity))
         .frame(", which names a running instance, not an identity; ");
     match identities.as_slice() {
-        [] => text.frame("type the identity hash `.mesh peers` lists for it in its place."),
+        [] => text
+            .frame("run `.mesh peers` to see its identity hash, then type that hash in its place."),
         [one] => text.frame(format!("type its identity hash {one} in its place.")),
         many => text.frame(format!(
             "type one of the identity hashes {} in its place.",
@@ -6290,6 +6307,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 mod name_addressing_tests {
     use super::tests::{peer, table_rows};
     use super::*;
+    use crate::render::{MeshVerbError, command_error_text};
 
     const TEMP: &str = "11111111111111111111111111111111";
     const LAPTOP: &str = "22222222222222222222222222222222";
@@ -6405,6 +6423,66 @@ mod name_addressing_tests {
         assert!(text.contains("heard no instance"), "{text}");
     }
 
+    /// Each refusal a name meets says what was typed, why it does not serve, and the
+    /// exact thing to type next.
+    #[test]
+    fn a_refused_name_gives_what_why_and_the_next_command() {
+        let names = vec![session("maki", TEMP), destination_label("Maki", LAPTOP)];
+        let text = refusal("maki", HashKind::Destination, &names);
+        assert!(
+            text.starts_with("'maki' names more than one destination: "),
+            "{text}"
+        );
+        assert!(text.contains("your session `maki` at 11111111"), "{text}");
+        assert!(
+            text.contains("Type the hash of the one you mean in its place, e.g. 11111111;"),
+            "{text}"
+        );
+
+        let names = vec![AddressName {
+            name: "desk".to_string(),
+            target: NameTarget::DestinationLabel {
+                destination: MAKI_DESK.to_string(),
+                identity: None,
+            },
+        }];
+        let text = refusal("desk", HashKind::Identity, &names);
+        assert!(
+            text.starts_with("'desk' is the trust label `desk`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("names a running instance, not an identity"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "run `.mesh peers` to see its identity hash, then type that hash in its place."
+            ),
+            "{text}"
+        );
+
+        let refused = QuotingError::followed_by(
+            QuotingError::wrap(
+                unknown_name("working", HashKind::Destination, &self::names()).unwrap(),
+            ),
+            quote_status_tail(".info"),
+        );
+        let text = command_error_text(&MeshVerbError::wrap(refused), CommandPrefix::Slash);
+        assert!(
+            text.contains("'working' is not a destination hash"),
+            "{text}"
+        );
+        assert!(
+            text.contains("none of your sessions or trust labels is called that"),
+            "{text}"
+        );
+        assert!(
+            text.contains("To set your own status instead, quote it: `/mesh status \".info\"`."),
+            "{text}"
+        );
+    }
+
     /// A token no name is spelled as is left to the hash rules, so whole hashes and
     /// prefixes still resolve; a label that looks like a prefix is taken as the label.
     #[test]
@@ -6508,6 +6586,57 @@ mod name_addressing_tests {
         let text = render_peers(&rows, now).plain();
         assert_eq!(table_rows(&text)[0][0], "maki-laptop (maki)", "{text}");
         assert!(text.contains(NAME_ADDRESSING_LINE), "{text}");
+    }
+
+    /// `.mesh pending`, `.mesh answer` and `.mesh message` name your session and your
+    /// labelled peer as `.mesh peers` does, and leave an instance you did not name to
+    /// the verb.
+    #[test]
+    fn the_name_you_gave_an_instance_reads_as_in_peers() {
+        let names = names();
+        assert_eq!(
+            given_name(&names, TEMP, Some("Coyote")).as_deref(),
+            Some("(you: temp)")
+        );
+        assert_eq!(
+            given_name(&names, LAPTOP, Some("maki")).as_deref(),
+            Some("maki-laptop (maki)")
+        );
+        assert_eq!(given_name(&names, MAKI_DESK, Some("desk")), None);
+    }
+
+    /// A label is quoted as you spelled it in a `.mesh pending` entry and a `.mesh answer`
+    /// block under any command prefix, while this node's own hints follow the prefix.
+    #[test]
+    fn a_label_is_quoted_verbatim_in_pending_and_the_question_block() {
+        let names = vec![destination_label(".info", LAPTOP)];
+        let row = QuestionRow {
+            state: "awaiting your answer",
+            name: given_name(&names, LAPTOP, Some("maki")).unwrap(),
+            destination: LAPTOP.to_string(),
+            when_label: "asked",
+            when: None,
+            id: "p1".to_string(),
+            body: "may I read the plan?".to_string(),
+            envoy_question: String::new(),
+            extra: Vec::new(),
+            expires_in: None,
+        };
+        let now = SystemTime::now();
+        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false);
+        let entry = "  1. .info (maki) (22222222) asked at an unknown time . id p1";
+        assert_eq!(pending.render(CommandPrefix::Dot), pending.plain());
+        assert!(pending.plain().contains(entry), "{pending}");
+        let slash = pending.render(CommandPrefix::Slash);
+        assert!(slash.contains(entry), "{slash}");
+        assert!(slash.contains("answer: /mesh answer <id>"), "{slash}");
+
+        let block = render_question_block(&row, now, 80, true).render(CommandPrefix::Slash);
+        assert!(
+            block.contains("awaiting your answer . .info (maki) (22222222) . asked"),
+            "{block}"
+        );
+        assert!(block.contains("answer: /mesh answer p1"), "{block}");
     }
 }
 
@@ -7003,6 +7132,15 @@ fn classify_status(rest: Option<&str>) -> StatusArg<'_> {
     } else {
         StatusArg::Fetch(rest)
     }
+}
+
+/// What a `.mesh status <word>` refusal adds for a reader who meant the word as their
+/// own status rather than a peer to ask.
+fn quote_status_tail(token: &str) -> NoticeText {
+    NoticeText::default()
+        .frame(" To set your own status instead, quote it: `.mesh status \"")
+        .peer(token)
+        .frame("\"`.")
 }
 
 enum BriefArg<'a> {
@@ -7855,6 +7993,31 @@ fn labelled_name(label: &str, display_name: Option<&str>) -> String {
         Some(announced) => format!("{label} ({announced})"),
         None => label,
     }
+}
+
+/// The name you gave the instance at `destination`, `announced` being the name it gives
+/// itself: one of your sessions, else your label with that name after it; `None` for an
+/// instance you have not named, which each verb then names its own way.
+fn given_name(names: &[AddressName], destination: &str, announced: Option<&str>) -> Option<String> {
+    let session = names.iter().find(|name| {
+        matches!(&name.target, NameTarget::Session { destination: at, .. } if at == destination)
+    });
+    match session {
+        Some(session) => Some(own_session_name(&session.name)),
+        None => owner_label(names, destination).map(|label| labelled_name(&label.name, announced)),
+    }
+}
+
+/// How `.mesh pending` and `.mesh answer` name the peer at `destination`: `given_name`,
+/// else the name the peer table holds, else its short hash.
+fn name_at(ctx: &RequestContext, names: &[AddressName], destination: &str) -> String {
+    let mesh = &ctx.app.mesh;
+    given_name(
+        names,
+        destination,
+        mesh.display_name_at(destination).as_deref(),
+    )
+    .unwrap_or_else(|| mesh.peer_name_at(destination))
 }
 
 /// A trust record's key-change mark with, when the peer table has heard it, the destination
@@ -8916,13 +9079,24 @@ fn answer_footer(id: &str) -> String {
 /// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
 /// is rendered at the length the store keeps it, never shorter. The footer is this
 /// node's own text and carries the full id, so it is neither wrapped nor shortened.
-fn render_question_block(row: &QuestionRow, now: SystemTime, width: usize, colour: bool) -> String {
+/// The peer's name is quoted as it stands.
+fn render_question_block(
+    row: &QuestionRow,
+    now: SystemTime,
+    width: usize,
+    colour: bool,
+) -> NoticeText {
     let header = question_header(row, now);
-    let mut lines = vec![if colour {
-        tool_name_text_forced(&header)
+    let mut text = if colour {
+        let style = tool_name_style();
+        NoticeText::default()
+            .frame(style.prefix().to_string())
+            .then(header)
+            .frame(style.suffix().to_string())
     } else {
         header
-    }];
+    };
+    let mut lines = Vec::new();
     if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
         lines.extend(indented_rows("", &body, width));
     }
@@ -8933,28 +9107,32 @@ fn render_question_block(row: &QuestionRow, now: SystemTime, width: usize, colou
         lines.extend(indented_rows(label, text, width));
     }
     lines.push(format!("  {}", answer_footer(&row.id)));
-    lines.join("\n")
+    for line in lines {
+        text = text.frame(format!("\n{line}"));
+    }
+    text
 }
 
 /// A question block's first line, dot-separated: state, peer, when it was asked or
 /// sent as a relative age, the short id, and the time left when that is known.
-fn question_header(row: &QuestionRow, now: SystemTime) -> String {
+fn question_header(row: &QuestionRow, now: SystemTime) -> NoticeText {
     let age = match row.when {
         Some(when) => age_text(now, when),
         None => "at an unknown time".to_string(),
     };
-    let mut header = format!(
-        "{} . {} ({}) . {} {age} . id {}",
-        row.state,
-        row.name,
+    let mut tail = format!(
+        " ({}) . {} {age} . id {}",
         short(&row.destination),
         row.when_label,
         short(&row.id)
     );
     if let Some(left) = row.expires_in {
-        header.push_str(&format!(" . expires in {}", span_text(left)));
+        tail.push_str(&format!(" . expires in {}", span_text(left)));
     }
-    header
+    NoticeText::default()
+        .frame(format!("{} . ", row.state))
+        .peer(row.name.as_str())
+        .frame(tail)
 }
 
 /// Three sections in a fixed order, every one shown: a header carrying the count and,
@@ -8966,6 +9144,7 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> String {
 /// entry's id and also how another's begins, or one that differs from another only in
 /// case. Those stay ambiguous on purpose, so a peer cannot mint an id that takes the
 /// place of another, and the refusal names how the entries clear.
+/// The peers' names are quoted as they stand.
 fn render_pending(
     asked: &[QuestionRow],
     escalated: &[QuestionRow],
@@ -8973,7 +9152,7 @@ fn render_pending(
     now: SystemTime,
     width: usize,
     colour: bool,
-) -> String {
+) -> NoticeText {
     let sections = [
         (
             "Waiting for YOU",
@@ -9003,24 +9182,30 @@ fn render_pending(
         .iter()
         .flat_map(|(_, _, rows, _)| rows.iter().map(|row| row.id.to_ascii_lowercase()))
         .collect();
-    let mut lines = Vec::new();
+    let mut lines: Vec<NoticeText> = Vec::new();
     for ((title, commands, rows, outbound), counted) in sections.iter().zip(&counted) {
         let header = if rows.is_empty() {
             format!("{title}: none")
         } else {
             format!("{counted:<column$}{commands}")
         };
-        lines.push(if colour {
+        lines.push(NoticeText::from(if colour {
             tool_name_text_forced(&header)
         } else {
             header
-        });
+        }));
         for (index, row) in rows.iter().enumerate() {
             let id_len = shown_id_len(&row.id, &ids);
             lines.extend(pending_entry(index + 1, row, *outbound, id_len, now, width));
         }
     }
-    lines.join("\n")
+    lines
+        .into_iter()
+        .enumerate()
+        .fold(NoticeText::default(), |text, (at, line)| match at {
+            0 => text.then(line),
+            _ => text.frame("\n").then(line),
+        })
 }
 
 /// How many characters of `id` tell it apart, without regard to case, from every id in
@@ -9054,31 +9239,42 @@ fn pending_entry(
     id_len: usize,
     now: SystemTime,
     width: usize,
-) -> Vec<String> {
+) -> Vec<NoticeText> {
     let age = match row.when {
         Some(when) => age_text(now, when),
         None => "at an unknown time".to_string(),
     };
-    let peer = format!("{} ({})", row.name, short(&row.destination));
+    let peer = format!(" ({})", short(&row.destination));
     let id = row.id.get(..id_len).unwrap_or(&row.id);
-    let head = if outbound {
-        format!("-> {peer} {age} . {} . id {id}", row.state)
+    let marker = format!("  {number}. ");
+    let (lead, tail) = if outbound {
+        (
+            format!("{marker}-> "),
+            format!("{peer} {age} . {} . id {id}", row.state),
+        )
     } else {
         let expires = row
             .expires_in
             .map(|left| format!(" . expires in {}", span_text(left)))
             .unwrap_or_default();
-        format!("{peer} {} {age}{expires} . id {id}", row.when_label)
+        (
+            marker.clone(),
+            format!("{peer} {} {age}{expires} . id {id}", row.when_label),
+        )
     };
-    let marker = format!("  {number}. ");
-    let mut lines = vec![format!("{marker}{head}")];
+    let mut lines = vec![
+        NoticeText::default()
+            .frame(lead)
+            .peer(row.name.as_str())
+            .frame(tail),
+    ];
     let indent = " ".repeat(marker.len() - 2);
     let inner = width.saturating_sub(indent.len());
     let mut push = |label: &str, text: &str| {
         lines.extend(
             indented_rows(label, text, inner)
                 .into_iter()
-                .map(|row| format!("{indent}{row}")),
+                .map(|row| NoticeText::from(format!("{indent}{row}"))),
         );
     };
     if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
@@ -12886,7 +13082,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn pending_lists_both_directions_or_says_none() {
         let now = pending_now();
-        let empty = render_pending(&[], &[], &[], now, 80, false);
+        let empty = render_pending(&[], &[], &[], now, 80, false).plain();
         let lines: Vec<&str> = empty.lines().collect();
         assert_eq!(
             lines,
@@ -12905,7 +13101,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             escalated_row("p1", "Share the plan?"),
             escalated_row("p2", ""),
         ];
-        let text = render_pending(&asked, &escalated, &[], now, 80, false);
+        let text = render_pending(&asked, &escalated, &[], now, 80, false).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines,
@@ -12988,7 +13184,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let row = QuestionRow::inbound(&record, "alice".to_string(), now);
         assert_eq!(row.expires_in, Some(PENDING_TTL - day));
         assert_eq!(
-            question_header(&row, now),
+            question_header(&row, now).plain(),
             "awaiting your answer . alice (12121212) . asked 1d ago . id p1 . expires in 6d"
         );
 
@@ -12996,7 +13192,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         access.received_at = rfc3339_utc(now - day);
         let row = QuestionRow::access(&access, "carol".to_string(), now);
         assert_eq!(
-            question_header(&row, now),
+            question_header(&row, now).plain(),
             "access request . carol (12121212) . asked 1d ago . id acc-1 . expires in 6d"
         );
 
@@ -13005,7 +13201,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let row = QuestionRow::inbound(&record, "alice".to_string(), now);
             assert_eq!(row.expires_in, Some(Duration::ZERO), "{past:?}");
             assert!(
-                question_header(&row, now).ends_with(" . id p1 . expires in 0s"),
+                question_header(&row, now)
+                    .plain()
+                    .ends_with(" . id p1 . expires in 0s"),
                 "{past:?}"
             );
         }
@@ -13013,7 +13211,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         record.received_at = "not a stamp".to_string();
         let row = QuestionRow::inbound(&record, "alice".to_string(), now);
         assert_eq!(row.expires_in, None);
-        assert!(question_header(&row, now).ends_with(" . id p1"));
+        assert!(question_header(&row, now).plain().ends_with(" . id p1"));
     }
 
     /// The block for each kind of question `.mesh answer` prints, rendered plain: header,
@@ -13023,7 +13221,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn question_block_renders_outbound_and_inbound_rows() {
         let now = pending_now();
-        let text = render_question_block(&asked_row("q1", PendingState::Open), now, 80, false);
+        let text =
+            render_question_block(&asked_row("q1", PendingState::Open), now, 80, false).plain();
         assert_eq!(
             text.lines().collect::<Vec<_>>(),
             [
@@ -13033,7 +13232,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ]
         );
 
-        let text = render_question_block(&escalated_row("p1", "Share the plan?"), now, 80, false);
+        let text =
+            render_question_block(&escalated_row("p1", "Share the plan?"), now, 80, false).plain();
         assert_eq!(
             text.lines().collect::<Vec<_>>(),
             [
@@ -13049,7 +13249,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         row.name = short(&row.destination).to_string();
         row.when = None;
         row.expires_in = Some(Duration::from_secs(6 * 86_400));
-        let text = render_question_block(&row, now, 80, false);
+        let text = render_question_block(&row, now, 80, false).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
@@ -13068,7 +13268,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     fn question_block_wraps_the_body_but_never_the_footer() {
         let mut row = escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "");
         row.body = "please delete docs/notes.md and docs/old.md before the merge lands".to_string();
-        let text = render_question_block(&row, pending_now(), 30, false);
+        let text = render_question_block(&row, pending_now(), 30, false).plain();
         let lines: Vec<&str> = text.lines().collect();
         let body = &lines[1..lines.len() - 1];
         assert!(body.len() > 1, "the body wrapped: {text}");
@@ -13088,10 +13288,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let row = escalated_row("p1", "Share the plan?");
         let now = pending_now();
 
-        let plain = render_question_block(&row, now, 80, false);
+        let plain = render_question_block(&row, now, 80, false).plain();
         assert!(!plain.contains('\x1b'), "{plain:?}");
 
-        let painted = render_question_block(&row, now, 80, true);
+        let painted = render_question_block(&row, now, 80, true).plain();
         let plain_header = plain.lines().next().unwrap();
         let mut painted_lines = painted.lines();
         assert_eq!(
@@ -13105,8 +13305,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "only the header is painted: {painted:?}"
         );
 
-        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, true);
-        let plain_pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false);
+        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, true).plain();
+        let plain_pending =
+            render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false).plain();
         for (painted, plain) in pending.lines().zip(plain_pending.lines()) {
             if plain.starts_with("  ") {
                 assert_eq!(painted, plain, "entries stay plain: {pending:?}");
@@ -13136,7 +13337,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             pending_now(),
             400,
             false,
-        );
+        )
+        .plain();
         let envoy_line = text
             .lines()
             .find(|line| line.starts_with("     envoy asks: "))
@@ -13157,7 +13359,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             now,
             80,
             false,
-        );
+        )
+        .plain();
         let lines: Vec<&str> = text.lines().collect();
         let access_title = lines
             .iter()
@@ -13188,7 +13391,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
 
-        let questions_only = render_pending(&[], &[question], &[], now, 80, false);
+        let questions_only = render_pending(&[], &[question], &[], now, 80, false).plain();
         assert!(
             questions_only.contains("\nAccess requests: none\n"),
             "an empty access section still shows: {questions_only}"
@@ -13221,7 +13424,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "9e519dff000011112222333344445555",
                 PendingState::Answered,
             )];
-            let text = render_pending(&asked, &escalated, &access, now, 80, false);
+            let text = render_pending(&asked, &escalated, &access, now, 80, false).plain();
             assert_eq!(
                 text.lines().collect::<Vec<_>>(),
                 [
@@ -13245,7 +13448,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn pending_shows_every_section_as_none_when_nothing_waits() {
             assert_eq!(
-                render_pending(&[], &[], &[], pending_now(), 80, false),
+                render_pending(&[], &[], &[], pending_now(), 80, false).plain(),
                 "Waiting for YOU: none\nAccess requests: none\nAsked by this node: none"
             );
         }
@@ -13257,7 +13460,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut row = escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "");
             row.body =
                 "please delete docs/notes.md and docs/old.md before the merge lands".to_string();
-            let text = render_pending(&[], &[row], &[], pending_now(), 30, false);
+            let text = render_pending(&[], &[row], &[], pending_now(), 30, false).plain();
             let body: Vec<&str> = text
                 .lines()
                 .skip(2)
@@ -13277,7 +13480,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 HASH_PREFIX_MIN_CHARS,
                 pending_now(),
                 80,
-            );
+            )
+            .iter()
+            .map(NoticeText::plain)
+            .collect::<Vec<_>>();
             assert_eq!(
                 entry,
                 [
@@ -13299,7 +13505,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 pending_now(),
                 80,
                 false,
-            );
+            )
+            .plain();
             for full in [
                 "9e519dff000011112222333344445555",
                 "3fe1be40a1b2c3d43fe1be40a1b2c3d4",
@@ -13327,7 +13534,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 pending_now(),
                 80,
                 false,
-            );
+            )
+            .plain();
             let ids: Vec<&str> = text
                 .lines()
                 .filter_map(|line| line.rsplit_once(" . id ").map(|(_, id)| id))
@@ -13894,7 +14102,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             pending_now(),
             200,
             false,
-        );
+        )
+        .plain();
         for c in forbidden {
             assert!(
                 !text.contains(c),
@@ -13959,7 +14168,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(rows[0][4], "(no intro)", "{text}");
         let mut escalated = escalated_row("p2", blank);
         escalated.body = blank.to_string();
-        let text = render_pending(&[], &[escalated], &[], pending_now(), 200, false);
+        let text = render_pending(&[], &[escalated], &[], pending_now(), 200, false).plain();
         assert!(
             !text.contains("envoy asks"),
             "a blank envoy question prints no envoy line: {text}"
@@ -38624,6 +38833,48 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                             assert_eq!(stdout_lines().len(), before);
                             assert_eq!(prompt_script::prompts_asked(), 0);
+                            assert_nothing_asked(&fx, &access);
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// On a running node your session's name gives its destination, and a
+                    /// request by a label is aimed at the labelled destination: the prompt
+                    /// that cannot be answered without a terminal names it.
+                    #[test]
+                    #[serial]
+                    fn a_session_name_and_a_label_address_the_running_node() {
+                        use crate::mesh::trust::LiveMesh;
+
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-by-name");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install_non_interactive();
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-by-name").await;
+                            let runtime = fx.started.runtime.clone();
+                            fx.ctx.app.mesh.rename_session("temp");
+                            assert_eq!(
+                                destination_hash(&fx.ctx, "temp").unwrap(),
+                                runtime.current_destination_hash()
+                            );
+
+                            let to = fx.stub.destination_hex();
+                            let slot: &dyn LiveMesh = fx.ctx.app.mesh.as_ref();
+                            let label = TrustOptions {
+                                label: Some("maki-laptop".to_string()),
+                                note: None,
+                            };
+                            runtime
+                                .trust()
+                                .trust_destination(slot, &to, label, SystemTime::now())
+                                .unwrap();
+
+                            let err = refusal(&mut fx.ctx, ".mesh request maki-laptop x").await;
+
+                            assert!(
+                                err.starts_with(&format!("Ask {} for 1 path(s): x? ", fx.dest())),
+                                "{err}"
+                            );
                             assert_nothing_asked(&fx, &access);
                             fx.stop().await;
                         });
