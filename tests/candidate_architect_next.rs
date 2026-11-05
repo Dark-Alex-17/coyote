@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 774;
+const SMOKE_FLOOR: usize = 808;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -1202,7 +1202,7 @@ fn route_instructions_send_a_discussion_continue_to_run() {
         .expect("graph.yaml has session.route.instructions");
     let flat = route.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
-        "After the last run parked on a design discussion",
+        "After the last run parked on a discussion (a design question or any other escalation)",
         "\"continue\" or \"continue: <answer>\" routes RUN",
         "the run resumes at the parked question",
     ] {
@@ -2856,10 +2856,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![46, 3274, 3283],
+        vec![46, 3504, 3513],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [3274, 3283] {
+    for line in [3504, 3513] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"

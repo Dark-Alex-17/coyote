@@ -56,7 +56,8 @@ oriented on it.
 
 A run that parks on a question for discussion exposes it as a non-empty
 `discussion` in its last-run record. `discussion.kind` names the question (a
-design round, quality bar, checklist item or Gate 1 question); the record
+design round, quality bar, checklist item or Gate 1 question, or any other
+escalation the user replied to with a question, such as `git_setup_failed`); the record
 carries the question, its options with the recommended one marked, the
 user's `reply` that parked it, the answers so far and the plan path. The engineer
 discusses it without editing the plan or answering for the user, then tells

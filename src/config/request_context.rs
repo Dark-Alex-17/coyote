@@ -23583,6 +23583,8 @@ mod tests {
                             "integrate_route",
                             "integration_check",
                             "integration_test",
+                            "interpret_reply",
+                            "interpret_route",
                             "ladder_judge",
                             "ladder_route",
                             "leak_route",

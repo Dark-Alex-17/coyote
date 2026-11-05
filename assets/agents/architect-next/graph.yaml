@@ -127,7 +127,8 @@ session:
       conversation discussed work to implement routes RUN; the run picks up the
       engineer's ready seed or drafts a brief from the conversation and confirms
       it with the user before any write to the repos.
-      After the last run parked on a design discussion, "continue" or
+      After the last run parked on a discussion (a design question or any
+      other escalation), "continue" or
       "continue: <answer>" routes RUN: the run resumes at the parked question,
       recording the answer when one is given and asking the question again when
       not. "resume" and "resume: <answer>" work the same; other prose that
