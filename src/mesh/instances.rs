@@ -158,7 +158,8 @@ enum RegistryRead {
 }
 
 /// The rows at `path` whose process is still running, judged on one process-table
-/// refresh; a missing file has none.
+/// refresh; a missing file has none. A row stamped without a start time stays while its
+/// pid is in use, since it cannot be told from the process that filed it.
 fn read_live_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, RegistryRead> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -172,7 +173,7 @@ fn read_live_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, Registry
     };
     let mut rows = parse_instances(&bytes)?.instances;
     let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
-    let alive = ProcessStamp::alive_set(&stamps);
+    let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);
     rows.retain(|_, row| alive.contains(&row.process));
     Ok(rows)
 }
@@ -364,6 +365,37 @@ mod tests {
 
             assert_eq!(alive_set_calls() - before, 1);
             assert_eq!(rows.len(), 2);
+        }
+
+        mod start_unknown_tests {
+            use super::*;
+
+            /// A row filed without a start time under a pid in use is kept, and each
+            /// read still costs one process-table refresh.
+            #[test]
+            fn a_live_pid_stamped_start_zero_is_kept_on_one_refresh_per_read() {
+                let tmp = TempDir::new("instances-start-unknown");
+                let unknown = InstanceRow {
+                    process: ProcessStamp {
+                        pid: std::process::id(),
+                        start: 0,
+                    },
+                    ..row(&"dd".repeat(16), "unknown")
+                };
+                let file = InstancesFile {
+                    version: INSTANCES_VERSION,
+                    instances: BTreeMap::from([(ID_B.to_string(), unknown)]),
+                };
+                write_raw(&tmp, &serde_json::to_vec(&file).unwrap());
+                register(&tmp.path, ID_A, row(&"aa".repeat(16), "a"));
+
+                for _ in 0..2 {
+                    let before = alive_set_calls();
+                    let rows = live(&tmp.path);
+                    assert_eq!(alive_set_calls() - before, 1);
+                    assert_eq!(rows.len(), 2, "{rows:?}");
+                }
+            }
         }
     }
 

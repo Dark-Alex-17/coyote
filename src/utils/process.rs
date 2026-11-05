@@ -61,22 +61,7 @@ impl ProcessStamp {
     /// rule, decided with one process-table refresh instead of one per
     /// stamp. An empty slice asks sysinfo nothing.
     pub(crate) fn alive_set(stamps: &[ProcessStamp]) -> HashSet<ProcessStamp> {
-        if stamps.is_empty() {
-            return HashSet::new();
-        }
-        #[cfg(test)]
-        ALIVE_SET_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let pids: HashSet<Pid> = stamps
-            .iter()
-            .map(|stamp| Pid::from_u32(stamp.pid))
-            .collect();
-        let pids: Vec<Pid> = pids.into_iter().collect();
-        let mut sys = System::new();
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&pids),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
+        let sys = Self::refreshed(stamps);
         stamps
             .iter()
             .copied()
@@ -86,6 +71,45 @@ impl ProcessStamp {
                     == Some(stamp.start)
             })
             .collect()
+    }
+
+    /// The subset of `stamps` that hold by the `is_alive_or_start_unknown`
+    /// rule, decided on the same single refresh as [`Self::alive_set`].
+    pub(crate) fn alive_or_start_unknown_set(stamps: &[ProcessStamp]) -> HashSet<ProcessStamp> {
+        let sys = Self::refreshed(stamps);
+        stamps
+            .iter()
+            .copied()
+            .filter(|stamp| {
+                let start = sys
+                    .process(Pid::from_u32(stamp.pid))
+                    .map(|p| p.start_time());
+                stamp.pid != 0
+                    && (start == Some(stamp.start) || (stamp.start == 0 && start.is_some()))
+            })
+            .collect()
+    }
+
+    /// One process-table refresh covering the pids in `stamps`; an empty
+    /// slice asks sysinfo nothing.
+    fn refreshed(stamps: &[ProcessStamp]) -> System {
+        let mut sys = System::new();
+        if stamps.is_empty() {
+            return sys;
+        }
+        #[cfg(test)]
+        ALIVE_SET_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let pids: HashSet<Pid> = stamps
+            .iter()
+            .map(|stamp| Pid::from_u32(stamp.pid))
+            .collect();
+        let pids: Vec<Pid> = pids.into_iter().collect();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys
     }
 }
 
