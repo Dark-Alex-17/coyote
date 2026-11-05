@@ -52,6 +52,7 @@ use crate::mesh::{
     already_closed, canonicalize, capped_peer_text, display_text, hex_lower, human_size,
     redact_hashes, rfc3339_utc, short,
 };
+use crate::render::QuotingError;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -1308,20 +1309,25 @@ impl AccessStore<'_> {
         now: SystemTime,
     ) -> Result<(Arc<InboundStore>, InboundRecord, Arc<MeshRuntime>)> {
         let Some(store) = self.slot.inbound_store() else {
-            bail!("Mesh is off; turn it on with `.mesh on` before deciding {id}");
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off; turn it on with `.mesh on` before deciding {id}",
+                &[],
+                &[("id", id)],
+            )));
         };
         let record = match store.get(id)? {
             Some(record) if !record.is_expired(now) => record,
             _ => bail!(already_closed(id)),
         };
         if record.kind == InboundKind::Question {
-            bail!(question_not_an_access_request(id));
+            return Err(question_not_an_access_request(id));
         }
         let Some(runtime) = self.slot.get() else {
-            bail!(
-                "Mesh is off, so the decision on {id} cannot be sent to {}",
-                short(&record.peer_destination)
-            );
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off, so the decision on {id} cannot be sent to {peer}",
+                &[("peer", short(&record.peer_destination))],
+                &[("id", id)],
+            )));
         };
         Ok((store, record, runtime))
     }
@@ -3444,6 +3450,66 @@ mod tests {
         );
         assert_eq!(unknown.to_string(), already_closed("a-9").to_string());
         assert!(fixture.hooks.snapshot().is_empty());
+    }
+
+    mod mesh_off_quoting_tests {
+        use super::*;
+        use crate::config::CommandPrefix;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        /// The refusals `grant` and `refuse` give with the mesh off, for a request a peer
+        /// filed under the id `.vault`: one with no store at all, one with the request
+        /// filed but no node to send the decision.
+        async fn refusals() -> Vec<anyhow::Error> {
+            let off = Arc::new(MeshSlot::default());
+            let no_store = off.access().refuse(".vault").await.unwrap_err();
+            let fixture = bare_slot("access-mesh-off-quoting");
+            store_of(&fixture.slot)
+                .upsert(
+                    InboundRecord {
+                        kind: InboundKind::Access,
+                        question: String::new(),
+                        paths: strings(&["src/x.rs"]),
+                        ..question_record(".vault")
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let no_node = fixture.slot.access().refuse(".vault").await.unwrap_err();
+            vec![no_store, no_node]
+        }
+
+        #[tokio::test]
+        async fn under_dot_the_mesh_off_refusals_read_as_they_did() {
+            let peer = short(&destination()).to_string();
+            let [no_store, no_node] = <[_; 2]>::try_from(refusals().await).unwrap();
+            assert_eq!(
+                no_store.to_string(),
+                "Mesh is off; turn it on with `.mesh on` before deciding .vault"
+            );
+            assert_eq!(
+                no_node.to_string(),
+                format!("Mesh is off, so the decision on .vault cannot be sent to {peer}")
+            );
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(no_store), CommandPrefix::Dot),
+                "Error: Mesh is off; turn it on with `.mesh on` before deciding .vault"
+            );
+        }
+
+        #[tokio::test]
+        async fn under_slash_the_mesh_off_refusals_keep_the_id_and_slash_the_hint() {
+            let [no_store, no_node] = <[_; 2]>::try_from(refusals().await).unwrap();
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(no_store), CommandPrefix::Slash),
+                "Error: Mesh is off; turn it on with `/mesh on` before deciding .vault"
+            );
+            let shown = command_error_text(&MeshVerbError::wrap(no_node), CommandPrefix::Slash);
+            assert!(
+                shown.starts_with("Error: Mesh is off, so the decision on .vault cannot"),
+                "{shown}"
+            );
+        }
     }
 
     /// A request past `PENDING_TTL` the sweep has not yet taken out reads as already

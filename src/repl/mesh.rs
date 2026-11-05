@@ -1187,7 +1187,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let (row, answering) = match (route, inbound, outbound) {
         (AnswerRoute::Inbound, Some(record), _) if !record.is_expired(now) => {
             if record.kind == InboundKind::Access {
-                bail!(access_not_a_question(id));
+                return Err(access_not_a_question(id));
             }
             if attach.is_some() {
                 ctx.app.mesh.refuse_held_by_envoy(id)?;
@@ -1208,7 +1208,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 Answering::OwnQuestion(Box::new(correlation)),
             )
         }
-        _ => bail!(no_open_question(id)),
+        _ => return Err(no_open_question(id)),
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     out_path_text(
@@ -1507,22 +1507,31 @@ fn open_escalated_question(
         None => None,
     };
     match record {
-        Some(record) if record.is_expired(now) => bail!(no_open_question(id)),
-        Some(record) if record.kind == InboundKind::Access => bail!(access_not_a_question(id)),
+        Some(record) if record.is_expired(now) => Err(no_open_question(id)),
+        Some(record) if record.kind == InboundKind::Access => Err(access_not_a_question(id)),
         Some(record) => Ok(record),
-        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(asked_by_this_node(id)),
-        None => bail!(no_open_question(id)),
+        None if ctx.app.mesh.correlations().get(id).is_some() => Err(asked_by_this_node(id)),
+        None => Err(no_open_question(id)),
     }
 }
 
-fn asked_by_this_node(id: &str) -> String {
-    format!(
-        "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+fn asked_by_this_node(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(id)
+            .frame(" is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."),
     )
 }
 
-fn no_open_question(id: &str) -> String {
-    format!("No open question has id {id}. `.mesh pending` lists the ones this node knows about.")
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+fn no_open_question(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("No open question has id ")
+            .peer(id)
+            .frame(". `.mesh pending` lists the ones this node knows about."),
+    )
 }
 
 async fn message(
@@ -4847,10 +4856,10 @@ fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Resul
     match record {
         Some(record) if record.is_expired(now) => Err(no_open_access_request(id)),
         Some(record) if record.kind == InboundKind::Question => {
-            bail!(question_not_an_access_request(id))
+            Err(question_not_an_access_request(id))
         }
         Some(record) => Ok(record),
-        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(asked_by_this_node(id)),
+        None if ctx.app.mesh.correlations().get(id).is_some() => Err(asked_by_this_node(id)),
         None => Err(no_open_access_request(id)),
     }
 }
@@ -13288,6 +13297,72 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 short.ends_with("'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `/mesh pending` lists them."),
                 "{short}"
             );
+        }
+    }
+
+    mod sibling_id_quoting_tests {
+        use super::*;
+        use crate::mesh::already_closed;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
+            command_error_text(
+                &MeshVerbError::wrap(err.context("`.mesh answer` failed")),
+                prefix,
+            )
+        }
+
+        /// Each refusal for an id a peer chose, with the id `.vault`, and the sentence
+        /// it reads as under the dot and the slash prefix.
+        fn refusals() -> Vec<(anyhow::Error, &'static str, &'static str)> {
+            vec![
+                (
+                    no_open_question(".vault"),
+                    "No open question has id .vault. `.mesh pending` lists the ones this node knows about.",
+                    "No open question has id .vault. `/mesh pending` lists the ones this node knows about.",
+                ),
+                (
+                    asked_by_this_node(".vault"),
+                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then.",
+                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `/mesh pending` shows it until then.",
+                ),
+                (
+                    access_not_a_question(".vault"),
+                    "`.vault` is an access request, not a question; decide it with `.mesh grant .vault` or `.mesh refuse .vault`",
+                    "`.vault` is an access request, not a question; decide it with `/mesh grant .vault` or `/mesh refuse .vault`",
+                ),
+                (
+                    question_not_an_access_request(".vault"),
+                    "`.vault` is a question, not an access request; answer it with `.mesh answer .vault`",
+                    "`.vault` is a question, not an access request; answer it with `/mesh answer .vault`",
+                ),
+                (
+                    anyhow::Error::new(already_closed(".vault")),
+                    "`.vault` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+                    "`.vault` was already closed by another process, so nothing more was done. /mesh pending shows what is still open.",
+                ),
+            ]
+        }
+
+        #[test]
+        fn under_dot_each_refusal_reads_as_it_did() {
+            for (err, dot, _) in refusals() {
+                assert_eq!(err.to_string(), dot);
+                assert_eq!(
+                    shown_as(err, CommandPrefix::Dot),
+                    format!("Error: `.mesh answer` failed\n\nCaused by:\n    {dot}")
+                );
+            }
+        }
+
+        #[test]
+        fn under_slash_each_refusal_keeps_the_id_and_slashes_its_hints() {
+            for (err, _, slash) in refusals() {
+                assert_eq!(
+                    shown_as(err, CommandPrefix::Slash),
+                    format!("Error: `/mesh answer` failed\n\nCaused by:\n    {slash}")
+                );
+            }
         }
     }
 
@@ -39637,7 +39712,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,
-                            access_not_a_question("a-1")
+                            access_not_a_question("a-1").to_string()
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,

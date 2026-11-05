@@ -7,6 +7,7 @@ pub use inquire::prompt_theme;
 pub use self::markdown::{MarkdownRender, RenderOptions};
 use self::stream::{markdown_stream, raw_stream};
 
+use crate::mesh::AlreadyClosed;
 use crate::mesh::notify::NoticeText;
 use crate::utils::{
     AbortSignal, IS_STDOUT_TERMINAL, pretty_error, pretty_error_with, stderr_error_text,
@@ -79,6 +80,9 @@ pub(crate) fn command_error_text(err: &anyhow::Error, prefix: CommandPrefix) -> 
 fn quoted_text<'a>(link: &'a (dyn std::error::Error + 'static)) -> Option<&'a NoticeText> {
     if let Some(verb) = link.downcast_ref::<MeshVerbError>() {
         return quoted_text(verb.0.as_ref());
+    }
+    if let Some(closed) = link.downcast_ref::<AlreadyClosed>() {
+        return Some(closed.notice());
     }
     link.downcast_ref::<QuotingError>()
         .map(|quoting| &quoting.0)

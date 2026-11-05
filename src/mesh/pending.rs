@@ -7,10 +7,12 @@
 
 use crate::mesh::access::{ACCESS_MAX_PATHS, ACCESS_REASON_MAX_CHARS};
 use crate::mesh::message::{Disposition, PEER_ID_MAX_CHARS, PeerMessage};
+use crate::mesh::notify::NoticeText;
 use crate::mesh::request::{redact_hashes, short};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
+use crate::render::QuotingError;
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
@@ -300,14 +302,22 @@ impl InboundKind {
     }
 }
 
-pub(crate) fn access_not_a_question(id: &str) -> String {
-    format!(
-        "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`"
-    )
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+pub(crate) fn access_not_a_question(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`",
+        &[],
+        &[("id", id)],
+    ))
 }
 
-pub(crate) fn question_not_an_access_request(id: &str) -> String {
-    format!("`{id}` is a question, not an access request; answer it with `.mesh answer {id}`")
+/// The id is quoted as typed, since a peer may have chosen one that reads as a command.
+pub(crate) fn question_not_an_access_request(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{id}` is a question, not an access request; answer it with `.mesh answer {id}`",
+        &[],
+        &[("id", id)],
+    ))
 }
 
 /// One line of `inbound-<instance_id>.jsonl`. Same on-disk discipline as
