@@ -1449,8 +1449,6 @@ struct Shell<'a> {
     auto_cancel: &'a AtomicBool,
 }
 
-/// Answers a question raised once nobody is left to see it; any other
-/// message has no screen left to go to.
 /// Answers a prompt nobody is left to answer and keeps a notice (late
 /// output, a panic's message among it) for the caller; anything else the
 /// UI would have drawn is dropped, there being no screen for it.
@@ -1722,10 +1720,6 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     result.map(|_| ())
 }
 
-/// Collects the notices a lost turn's capture is still forwarding. The
-/// drain thread hands the pipe's contents over after the guard went
-/// down, so the queue gets the same bounded quiet-gap settle a finished
-/// turn's capture gets before it is read.
 /// The late output the UI drew followed by what arrived during the wait
 /// on the task, without a notice counted twice: the wait's notices were
 /// never drawn, so none of them is in the drawn list.
@@ -1734,6 +1728,10 @@ fn with_late(mut drawn: Vec<String>, waited: Vec<String>) -> Vec<String> {
     drawn
 }
 
+/// Collects the notices a lost task's capture is still forwarding. The
+/// drain thread hands the pipe's contents over after the guard went
+/// down, so the queue gets the same bounded quiet-gap settle a finished
+/// turn's capture gets before it is read.
 async fn settle_late_notices(rx: &mut UnboundedReceiver<UiMsg>, late: &mut Vec<String>) {
     let started = Instant::now();
     let mut last = started;
@@ -2496,7 +2494,9 @@ mod tests {
         assert_eq!(app.composer_text(), "hello");
         // The app runs on the real clock here, so the elapsed seconds in
         // the status row depend on the host's speed.
-        insta::with_settings!({ filters => vec![(r"Working \. \d+s", "Working . [N]s")] }, {
+        // Width-preserving: the clock's digit becomes `N`, so the row keeps
+        // its length and the snapshot its columns.
+        insta::with_settings!({ filters => vec![(r"Working \. \d+s", "Working . Ns")] }, {
             insta::assert_snapshot!("sleeping_tool_composer_responsive_60x20", rendered);
         });
 
@@ -3509,22 +3509,6 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// Temp directories `edit_in_editor` made for this process.
-    #[cfg(unix)]
-    fn editor_temp_dirs() -> Vec<std::path::PathBuf> {
-        let marker = format!("-{}-tui-edit-", std::process::id());
-        std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(&marker))
-            })
-            .collect()
-    }
-
     /// An editor that exits non-zero has not finished the edit: the text
     /// stays as it was, and the temp directory is gone either way, even
     /// when the editor left files of its own in it.
@@ -3533,25 +3517,35 @@ mod tests {
     fn a_failing_editor_leaves_the_text_as_it_was() {
         use std::os::unix::fs::PermissionsExt;
         let script = crate::utils::temp_file("-editor-", ".sh");
+        // The script records the buffer's own directory, so the check is
+        // for this call's directory and not for whatever a sibling case
+        // has live at the same moment.
+        let recorded = crate::utils::temp_file("-editor-dir-", ".txt");
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf changed > \"$1\"\ntouch \"$1.swp\"\nexit 3\n",
+            format!(
+                "#!/bin/sh\ndirname \"$1\" > '{}'\nprintf changed > \"$1\"\ntouch \"$1.swp\"\nexit 3\n",
+                recorded.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let before = editor_temp_dirs();
 
         let edited = edit_in_editor(script.to_str().unwrap(), "draft").unwrap();
-        let after = editor_temp_dirs();
         std::fs::remove_file(&script).unwrap();
+        let dir = std::fs::read_to_string(&recorded).unwrap();
+        std::fs::remove_file(&recorded).unwrap();
 
         assert_eq!(edited, "draft");
-        // Another case's live directory may show up in either list; what
-        // matters is that this call left none of its own.
-        let left: Vec<_> = after.iter().filter(|dir| !before.contains(dir)).collect();
+        let dir = std::path::Path::new(dir.trim());
         assert!(
-            left.is_empty(),
-            "the editor's temp directory was left behind: {left:?}"
+            dir.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("-tui-edit-"))
+        );
+        assert!(
+            !dir.exists(),
+            "the editor's temp directory was left behind: {}",
+            dir.display()
         );
         let gone = edit_in_editor("true", "kept\n").unwrap();
         assert_eq!(gone, "kept");
