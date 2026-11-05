@@ -43,7 +43,7 @@ use crate::mesh::request::{
     refusal_remedy, request_remedy,
 };
 use crate::mesh::shares::PeerRef;
-use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
+use crate::mesh::shares::{Mutation, ShareSet, WriteScope, quoted_share_write, refused_at_load};
 use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore, same_hash,
 };
@@ -52,7 +52,7 @@ use crate::mesh::{
     already_closed, canonicalize, capped_peer_text, display_text, hex_lower, human_size,
     redact_hashes, rfc3339_utc, short,
 };
-use crate::render::QuotingError;
+use crate::render::{QuotingError, error_notice};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -1219,10 +1219,7 @@ impl AccessStore<'_> {
                     .standing_shares(&runtime, &record)
                     .and_then(|mut shares| share_standing(&mut shares, &record, scope))
                 {
-                    let err = anyhow!(
-                        "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
-                        short(&record.peer_destination)
-                    );
+                    let err = standing_write_failed(&record, err);
                     return Err(put_back(self.slot, &store, &record, err));
                 }
                 self.settle(record, AccessDecision::Granted, None, true, sent)
@@ -1272,9 +1269,12 @@ impl AccessStore<'_> {
             Err(err) => {
                 let err = match grants.revoke(&record.id, &record.peer_destination) {
                     Ok(_) => err,
-                    Err(revoke) => anyhow!(
-                        "{err:#}; the grant written for `{}` could not be taken back either: {revoke:#}",
-                        record.id
+                    Err(revoke) => QuotingError::wrap(
+                        error_notice(&err)
+                            .frame("; the grant written for `")
+                            .peer(record.id.as_str())
+                            .frame("` could not be taken back either: ")
+                            .then(error_notice(&revoke)),
                     ),
                 };
                 Err(put_back(self.slot, store, &record, err))
@@ -1338,14 +1338,15 @@ impl AccessStore<'_> {
     /// written through rather than over.
     fn standing_shares(&self, runtime: &MeshRuntime, record: &InboundRecord) -> Result<ShareSet> {
         let Some(root) = ShareSource::share_root(self.slot) else {
-            bail!(
+            return Err(QuotingError::wrap(NoticeText::from_template(
                 "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
-                id = record.id
-            );
+                &[],
+                &[("id", &record.id)],
+            )));
         };
         let (shares, warning) = ShareSet::load_quietly(runtime.serving().share_locations(&root));
         if let Some(warning) = warning {
-            bail!("{warning} Nothing was written.");
+            return Err(refused_at_load(&warning, " Nothing was written."));
         }
         Ok(shares)
     }
@@ -1438,6 +1439,22 @@ fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
     Ok(())
 }
 
+/// A standing grant's error once the peer heard yes but `err` kept the share list from
+/// being written. The share file's words and the id are quoted as they stand; the re-run
+/// hint follows the prefix.
+fn standing_write_failed(record: &InboundRecord, err: anyhow::Error) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::from(format!(
+            "{} was already told yes, but the share list could not be written: ",
+            short(&record.peer_destination)
+        ))
+        .then(error_notice(&quoted_share_write(err)))
+        .frame(". Run `.mesh grant ")
+        .peer(record.id.as_str())
+        .frame(" --standing` again once the share list is writable; the request stays pending until then."),
+    )
+}
+
 /// Puts a taken record back after `err` stopped its decision or answer, so it stays
 /// pending to take again; a put-back that fails too is reported beside `err`, since the
 /// human needs to know both that the peer heard nothing and that the record is gone.
@@ -1453,9 +1470,12 @@ pub(crate) fn put_back(
             slot.announce_expired(displaced);
             err
         }
-        Err(put_back) => anyhow!(
-            "{err:#}; and `{}` could not be put back as pending: {put_back:#}",
-            record.id
+        Err(put_back) => QuotingError::wrap(
+            error_notice(&err)
+                .frame("; and `")
+                .peer(record.id.as_str())
+                .frame("` could not be put back as pending: ")
+                .then(error_notice(&put_back)),
         ),
     }
 }
@@ -3508,6 +3528,89 @@ mod tests {
             assert!(
                 shown.starts_with("Error: Mesh is off, so the decision on .vault cannot"),
                 "{shown}"
+            );
+        }
+    }
+
+    mod grant_error_quoting_tests {
+        use super::*;
+        use crate::config::CommandPrefix;
+        use crate::mesh::shares::ShareWriteError;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        const SHARE_FILE_WORDS: &str = "`.vault` is not a pattern; run .mesh trust x";
+
+        fn access_record(id: &str) -> InboundRecord {
+            InboundRecord {
+                kind: InboundKind::Access,
+                question: String::new(),
+                paths: strings(&["src/x.rs"]),
+                ..question_record(id)
+            }
+        }
+
+        fn standing_failure() -> anyhow::Error {
+            standing_write_failed(
+                &access_record(".session"),
+                ShareWriteError::Refused(SHARE_FILE_WORDS.to_string()).into(),
+            )
+        }
+
+        /// A record the store refuses to put back, so `put_back` reports both errors.
+        fn refused_put_back() -> anyhow::Error {
+            let fixture = bare_slot("access-put-back-quoting");
+            let unstorable = InboundRecord {
+                question: "may I?".to_string(),
+                ..access_record(".vault")
+            };
+            put_back(
+                &fixture.slot,
+                &store_of(&fixture.slot),
+                &unstorable,
+                standing_failure(),
+            )
+        }
+
+        fn dot_standing() -> String {
+            format!(
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written.. Run `.mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                short(&destination())
+            )
+        }
+
+        #[test]
+        fn under_dot_the_grant_errors_read_as_they_did() {
+            let standing = standing_failure();
+            assert_eq!(standing.to_string(), dot_standing());
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(standing), CommandPrefix::Dot),
+                format!("Error: {}", dot_standing())
+            );
+            let both = refused_put_back();
+            assert_eq!(
+                both.to_string(),
+                format!(
+                    "{}; and `.vault` could not be put back as pending: An inbound access request carries a question, which only a question may; refusing to store it.",
+                    dot_standing()
+                )
+            );
+        }
+
+        #[test]
+        fn under_slash_the_grant_errors_keep_share_words_and_ids_and_slash_the_hint() {
+            let slashed = format!(
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written.. Run `/mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                short(&destination())
+            );
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(standing_failure()), CommandPrefix::Slash),
+                format!("Error: {slashed}")
+            );
+            assert_eq!(
+                command_error_text(&MeshVerbError::wrap(refused_put_back()), CommandPrefix::Slash),
+                format!(
+                    "Error: {slashed}; and `.vault` could not be put back as pending: An inbound access request carries a question, which only a question may; refusing to store it."
+                )
             );
         }
     }

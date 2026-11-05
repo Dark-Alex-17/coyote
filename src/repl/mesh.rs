@@ -35,9 +35,9 @@ use crate::mesh::pending::{
 };
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
-    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, ShareWriteError,
-    Verdict as ShareVerdict, WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer,
-    protected_segment, validate_override, validate_pattern,
+    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
+    WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
+    quoted_share_write, refused_at_load, shown_refusal, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule,
@@ -53,7 +53,7 @@ use crate::mesh::{
     canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
     loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
-use crate::render::QuotingError;
+use crate::render::{QuotingError, error_notice};
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{
@@ -1437,14 +1437,14 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     let mut stayed: Vec<String> = Vec::new();
     for record in &questions {
         if let Err(err) = ctx.app.mesh.refuse_dismiss_held_by_envoy(&record.id) {
-            out_text(&format!("{err:#}"));
+            out_path_text(&error_notice(&err).render(live_prefix()));
             held.push(record.id.clone());
             continue;
         }
         match ctx.app.mesh.dismiss_inbound(&record.id, silent).await {
             Ok(()) => dismissed += 1,
             Err(err) => {
-                out_text(&format!("{err:#}"));
+                out_path_text(&error_notice(&err).render(live_prefix()));
                 if err.downcast_ref::<AlreadyClosed>().is_none() {
                     stayed.push(record.id.clone());
                 }
@@ -4799,7 +4799,13 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     out_text(&sending_notice(&record.peer_destination));
     result_follows();
-    let report = ctx.app.mesh.access().grant(id, kind).await?;
+    let report = ctx
+        .app
+        .mesh
+        .access()
+        .grant(id, kind)
+        .await
+        .map_err(quoted_share_write)?;
     let tail = match (&target, report.expires) {
         (Some(target), _) => format!(", standing; written to {}", target.written_to()),
         (None, Some(expires)) => format!(" until {}, each fetchable once", rfc3339_utc(expires)),
@@ -5088,6 +5094,7 @@ mod peer_text_prefix_tests {
 
     mod share_write_tests {
         use super::*;
+        use crate::mesh::shares::ShareWriteError;
 
         #[test]
         fn a_refused_write_quotes_the_share_file_and_the_pattern_as_they_stand() {
@@ -5331,39 +5338,6 @@ fn render_effective_shares(
 /// A pattern as a share file holds it, shown the way peer text is: escapes stripped.
 fn shown_pattern(pattern: &str) -> String {
     display_text(pattern, WIRE_PATH_MAX_BYTES).unwrap_or_default()
-}
-
-/// A load refusal as the human sees it: it quotes the file's own text, so escapes are
-/// stripped the way a pattern's are.
-fn shown_refusal(refusal: &str) -> String {
-    display_text(refusal, 4096).unwrap_or_default()
-}
-
-/// A `.mesh` error that quotes a share file refused at load; the file's words keep
-/// their bytes whatever the prefix.
-fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
-    QuotingError::wrap(
-        NoticeText::default()
-            .peer(shown_refusal(refusal))
-            .frame(tail),
-    )
-}
-
-/// A refused share-list write with the share file's words and the human's pattern quoted
-/// as they stand; any other error is passed on unchanged.
-fn quoted_share_write(err: anyhow::Error) -> anyhow::Error {
-    match err.downcast::<ShareWriteError>() {
-        Ok(ShareWriteError::Refused(refusal)) => refused_at_load(&refusal, " Nothing was written."),
-        Ok(ShareWriteError::NoSuchPattern { file, pattern }) => QuotingError::wrap(
-            NoticeText::default()
-                .frame("No share entry in '")
-                .peer(file.display().to_string())
-                .frame("' has the pattern `")
-                .peer(pattern)
-                .frame("`; nothing was changed."),
-        ),
-        Err(err) => err,
-    }
 }
 
 struct ShareArgs {
