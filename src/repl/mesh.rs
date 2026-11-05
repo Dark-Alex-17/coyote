@@ -1568,15 +1568,17 @@ async fn message(
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let trust = runtime.trust();
-    out_text(&format!(
-        "This sends your text to {} ({}, trust: {}) over the mesh.",
-        name_label(peer.display_name.as_deref()),
-        short(&destination),
-        trust_label(
-            trust.authorize(&peer.identity_hash, &destination),
-            trust.identity_standing(&peer.identity_hash)
+    out_path_text(
+        &send_confirmation(
+            peer.display_name.as_deref(),
+            &destination,
+            trust_label(
+                trust.authorize(&peer.identity_hash, &destination),
+                trust.identity_standing(&peer.identity_hash),
+            ),
         )
-    ));
+        .render(live_prefix()),
+    );
     if let Some(attachment) = &attachment {
         out_path_text(&attaching_notice(attachment, &destination));
     }
@@ -1604,6 +1606,16 @@ async fn message(
         via_text(outcome.via)
     ));
     Ok(())
+}
+
+/// The line `.mesh message` shows before it asks to send, with the name the peer
+/// announced quoted as it stands.
+fn send_confirmation(name: Option<&str>, destination: &str, trust: &str) -> NoticeText {
+    NoticeText::from_template(
+        "This sends your text to {name} ({destination}, trust: {trust}) over the mesh.",
+        &[("destination", short(destination)), ("trust", trust)],
+        &[("name", &name_label(name))],
+    )
 }
 
 /// A peer-side refusal ends with the command the peer's owner runs on that node, which
@@ -2297,17 +2309,15 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         bail!(refusal);
     }
     let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
-    let intro_label = if intro.as_str().is_empty() {
-        "without an intro".to_string()
-    } else {
-        format!("with intro \"{}\"", intro.as_str())
-    };
-    out_text(&format!(
-        "This knocks on {} ({}, trust: {}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.",
-        name_label(peer.display_name.as_deref()),
-        short(&destination),
-        trust_label(verdict, standing)
-    ));
+    out_path_text(
+        &knock_confirmation(
+            peer.display_name.as_deref(),
+            &destination,
+            trust_label(verdict, standing),
+            intro.as_str(),
+        )
+        .render(live_prefix()),
+    );
     if !confirm_or_flag("Knock?", "--yes", args.yes)? {
         out_text("Nothing was sent.");
         return Ok(());
@@ -2341,6 +2351,30 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
+}
+
+/// The line `.mesh knock` shows before it asks to knock. The name the peer announced
+/// and the intro the human typed are quoted as they stand.
+fn knock_confirmation(
+    name: Option<&str>,
+    destination: &str,
+    trust: &str,
+    intro: &str,
+) -> NoticeText {
+    let intro_label = if intro.is_empty() {
+        NoticeText::from("without an intro")
+    } else {
+        NoticeText::from("with intro \"").peer(intro).frame("\"")
+    };
+    NoticeText::default()
+        .frame("This knocks on ")
+        .peer(name_label(name))
+        .frame(format!(
+            " ({}, trust: {trust}) so it can trust this instance, ",
+            short(destination)
+        ))
+        .then(intro_label)
+        .frame("; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.")
 }
 
 /// The line `.mesh knock` ends with for a knock that was delivered somewhere. A link that
@@ -13381,6 +13415,48 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(
                 dismiss_failure_line(&closed, CommandPrefix::Slash),
                 "`.vault` was already closed by another process, so nothing more was done. /mesh pending shows what is still open."
+            );
+        }
+    }
+
+    mod confirmation_quoting_tests {
+        use super::*;
+
+        const DESTINATION: &str = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d";
+
+        #[test]
+        fn under_dot_the_confirmations_read_as_they_did() {
+            assert_eq!(
+                send_confirmation(Some(".session"), DESTINATION, "trusted")
+                    .render(CommandPrefix::Dot),
+                "This sends your text to .session (1a2b3c4d, trust: trusted) over the mesh."
+            );
+            assert_eq!(
+                send_confirmation(None, DESTINATION, "known").render(CommandPrefix::Dot),
+                "This sends your text to (no name) (1a2b3c4d, trust: known) over the mesh."
+            );
+            assert_eq!(
+                knock_confirmation(Some(".session"), DESTINATION, "known", ".mesh trust x")
+                    .render(CommandPrefix::Dot),
+                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+            );
+            assert_eq!(
+                knock_confirmation(None, DESTINATION, "known", "").render(CommandPrefix::Dot),
+                "This knocks on (no name) (1a2b3c4d, trust: known) so it can trust this instance, without an intro; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+            );
+        }
+
+        #[test]
+        fn under_slash_the_name_and_intro_keep_their_dots_and_the_hint_slashes() {
+            assert_eq!(
+                send_confirmation(Some(".session"), DESTINATION, "trusted")
+                    .render(CommandPrefix::Slash),
+                "This sends your text to .session (1a2b3c4d, trust: trusted) over the mesh."
+            );
+            assert_eq!(
+                knock_confirmation(Some(".session"), DESTINATION, "known", ".mesh trust x")
+                    .render(CommandPrefix::Slash),
+                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `/mesh trust` on both sides."
             );
         }
     }
