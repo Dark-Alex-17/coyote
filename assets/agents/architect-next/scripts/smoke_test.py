@@ -883,7 +883,7 @@ u = gates.branch_setup(base_state(code_repo_path=WT_LOCAL, plan_slug="held", **P
 E_HELD = u.get("escalation") or {}
 check("branch_setup: the run branch held by another worktree -> git_setup_failed naming that worktree, with fitting options",
       u["_next"] == "escalate_gate" and E_HELD.get("kind") == "git_setup_failed"
-      and os.path.realpath(E_HELD["data"]["worktree"]) == os.path.realpath(WT_HELD)
+      and os.path.realpath(E_HELD.get("data", {}).get("worktree") or "/nonexistent") == os.path.realpath(WT_HELD)
       and [o["text"] for o in E_HELD["options"]] == ["Use that worktree as the code dir", "Pick a different branch name", "Abort the run"]
       and git(WT_LOCAL, "branch", "--show-current") == "work", u)
 s = base_state(code_repo_path=WT_LOCAL, plan_slug="held", escalation=E_HELD, last_answer="Use that worktree as the code dir", **PS)
@@ -1557,7 +1557,7 @@ check("intake -> choice_resume: a bare 'continue' on a parked escalation -> the 
       r["_next"] == "escalate_gate" and r["ask_question"] == _lib.render_question(E_GIT) and r["escalation"]["kind"] == "git_setup_failed", r)
 u = gates.choice_park(base_state(escalation=E_GIT, last_answer_text="why?", choice_parks={"git_setup_failed": _lib.DISCUSSION_PARKS_MAX}))
 check("choice_park: a non-choice escalation at the park cap -> choice_reask; its next reply is matched, never interpreted or forced",
-      u["_next"] == "choice_reask" and u["reply_interpreted"] is True and "choice_forced" not in u, u)
+      u["_next"] == "choice_reask" and u.get("reply_interpreted") is True and "choice_forced" not in u, u)
 u2 = gates.choice_reask(base_state(escalation=E_GIT, last_answer_text="why?"))
 check("choice_reask: a non-choice escalation is told to pick an option by its number or text",
       "pick an option by its number or its text" in u2["escalation"]["question"], u2["escalation"]["question"])

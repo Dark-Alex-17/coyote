@@ -805,8 +805,8 @@ fn choice_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "choice-discussion-park",
-                "    u[\"_next\"] = \"choice_park\"\n",
-                "    u[\"_next\"] = \"apply_answer\"\n",
+                "-> park for discussion\")\n    u[\"_next\"] = \"choice_park\"\n",
+                "-> park for discussion\")\n    u[\"_next\"] = \"apply_answer\"\n",
                 "choice_reply_route: discussion -> choice_park, still parked, nothing recorded",
             ),
             (
@@ -901,6 +901,100 @@ fn choice_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "accepted.append(f\"{item['item']} (owner: {answer})\")",
                 "checklist walk: a declining Other answer -> an owner ruling line, not an accepted \
              item",
+            ),
+        ],
+    );
+}
+
+/// The guards behind the free-text escalation reply and the branch setup that
+/// never checks out the base: the base held by another worktree, the pull only
+/// with an upstream, a local base ahead of origin kept, the run branch held by a
+/// worktree, the first unmatched reply interpreted, only accepted instructions
+/// applied, a discussion parked, one clarifying question, an interpreter fault
+/// re-asked, and the park cap of a non-choice escalation.
+#[test]
+#[ignore = "ten smoke battery runs take about two minutes; run with -- --ignored"]
+fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "base-not-checked-out",
+                "            steps = [(\"checkout\", \"--quiet\", \"--no-track\", \"-b\", branch, \
+                 start)]\n",
+                "            steps = [(\"checkout\", \"--quiet\", base), (\"checkout\", \"--quiet\", \
+                 \"--no-track\", \"-b\", branch, start)]\n",
+                "branch_setup: base main held by another worktree -> the run branch is cut from the \
+                 fetched origin/main, no checkout of main",
+            ),
+            (
+                "pull-needs-upstream",
+                "        if exists and git_out(code, \"rev-parse\", \"--abbrev-ref\", \
+                 \"--symbolic-full-name\", \"@{upstream}\", default=\"\"):\n",
+                "        if exists:\n",
+                "branch_setup: existing run branch with no upstream -> checked out, the pull skipped \
+                 and ledgered",
+            ),
+            (
+                "local-ahead-kept",
+                "    if git(code, \"merge-base\", \"--is-ancestor\", remote, \
+                 f\"refs/heads/{base}\")[0] == 0:\n        return base\n",
+                "    if False:\n        return base\n",
+                "branch_setup: single -> run branch created + pushed",
+            ),
+            (
+                "worktree-held-options",
+                "    held = WORKTREE_HELD_RE.search(detail)\n",
+                "    held = None\n",
+                "branch_setup: the run branch held by another worktree -> git_setup_failed naming \
+                 that worktree, with fitting options",
+            ),
+            (
+                "interpret-first-try",
+                "        if choice is None and text and not \
+                 truthy(state.get(\"reply_interpreted\")):\n",
+                "        if False:\n",
+                "parse_answer: the first unmatched typed reply -> interpret_reply with the kind's \
+                 accepted instructions, never a blind re-ask",
+            ),
+            (
+                "instruction-accepted-only",
+                "        if shape not in ACCEPTED_INSTRUCTIONS.get(kind, ()):\n",
+                "        if False:\n",
+                "interpret_route: an instruction the kind does not accept -> unclear, never applied, \
+                 ledgered",
+            ),
+            (
+                "interpret-discussion-park",
+                "        u[\"_next\"] = \"choice_park\"\n        return u\n    if verdict == \
+                 \"unclear\":\n",
+                "        u[\"_next\"] = \"apply_answer\"\n        return u\n    if verdict == \
+                 \"unclear\":\n",
+                "interpret_route: discussion -> choice_park, nothing recorded, ledgered",
+            ),
+            (
+                "clarify-once",
+                "\"reply_reason\": \"\", \"reply_interpreted\": True})\n",
+                "\"reply_reason\": \"\", \"reply_interpreted\": False})\n",
+                "parse_answer: after the clarifying question an unmatched reply keeps today's \
+                 re-ask, never a second interpretation",
+            ),
+            (
+                "interpret-fault-reask",
+                "(interpreter fault) -> re-ask\")\n    u[\"_next\"] = \"parse_answer\"\n",
+                "(interpreter fault) -> re-ask\")\n    u[\"_next\"] = \"choice_park\"\n",
+                "interpret_route: an interpreter fault -> parse_answer's re-ask, the fault ledgered; \
+                 the run never sticks",
+            ),
+            (
+                "escalation-park-cap",
+                "            u[\"reply_interpreted\"] = True\n",
+                "            pass\n",
+                "choice_park: a non-choice escalation at the park cap -> choice_reask; its next reply \
+                 is matched, never interpreted or forced",
             ),
         ],
     );
