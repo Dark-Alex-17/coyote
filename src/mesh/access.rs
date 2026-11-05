@@ -54,7 +54,7 @@ use crate::mesh::{
 };
 use crate::render::{QuotingError, error_notice};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use rmpv::Value;
