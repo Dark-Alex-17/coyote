@@ -2139,7 +2139,7 @@ fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
         Ok(granted) => granted,
         Err(err) => {
             warn!(
-                "The mesh is on, but this node's own identity could not be trusted for your other sessions ({}). Your sessions on this computer are treated like an unknown peer until you run `.mesh trust --identity {fingerprint}`.",
+                "The mesh is on, but this node's own identity could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until you run `.mesh trust --identity {fingerprint}`.",
                 redact_hashes(&format!("{err:#}"))
             );
             false
@@ -16485,6 +16485,7 @@ mod tests {
 
     mod own_grant_seed_tests {
         use super::*;
+        use crate::mesh::trust::SELF_TRUST_LABEL;
 
         const OWN: &str = "00112233445566778899aabbccddeeff";
 
@@ -16516,6 +16517,34 @@ mod tests {
                     .any(|line| line.contains("could not be trusted") && line.contains(&remedy)),
                 "{warned:#?}"
             );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_start_writes_no_own_grant_and_no_marker() {
+            let port = closed_port().await;
+            let tmp = TempDir::new("node-refused-start-no-seed");
+            let paths = mesh_paths(&tmp);
+            let trust_path = crate::mesh::mesh_config_dir(&paths.config_dir).join("trust.yaml");
+            let mut session = Session::default();
+
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                paths,
+                NodeOptions {
+                    connect_timeout: Duration::from_millis(300),
+                    ..NodeOptions::default()
+                },
+            )
+            .await
+            .err()
+            .expect("a closed relay port must be refused");
+
+            let written = std::fs::read_to_string(&trust_path).unwrap_or_default();
+            assert!(!written.contains("self_trust_seeded"), "{written}");
+            assert!(!written.contains(SELF_TRUST_LABEL), "{written}");
         }
     }
 

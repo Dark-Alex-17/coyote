@@ -692,6 +692,10 @@ pub(crate) struct SelfTrustRotation {
     pub retired: bool,
     /// The new identity was granted every destination as `this node`.
     pub granted: bool,
+    /// The old identity is blocked, so it held no grant to move.
+    pub blocked_old: bool,
+    /// The new identity is blocked, so it was not granted.
+    pub blocked_new: bool,
 }
 
 /// What `deny_destination` did, or with `dry_run` would do.
@@ -2258,7 +2262,6 @@ impl TrustStore {
         let old = valid_hash("identity", old_hash)?;
         let new = valid_hash("identity", new_hash)?;
         let mut state = self.writing()?;
-        state.own_identity = Some(new.clone());
         let planned = planned_self_trust_rotation(&state.file, &old);
         let mut file = state.file.clone();
         file.self_trust_seeded = true;
@@ -2268,13 +2271,19 @@ impl TrustStore {
                 .values()
                 .any(|entry| same_hash(&entry.identity, &old));
             match file.identities.get_mut(&old).filter(|_| bound) {
-                Some(entry) => entry.all_destinations = false,
+                Some(entry) => {
+                    entry.all_destinations = false;
+                    if entry.label.as_deref() == Some(SELF_TRUST_LABEL) {
+                        entry.label = None;
+                    }
+                }
                 None => {
                     file.identities.remove(&old);
                 }
             }
         }
-        let granted = if !planned.granted || file.blocked_identities.contains_key(&new) {
+        let blocked_new = file.blocked_identities.contains_key(&new);
+        let granted = if !planned.granted || blocked_new {
             false
         } else {
             match file.identities.get_mut(&new) {
@@ -2290,6 +2299,8 @@ impl TrustStore {
         let rotation = SelfTrustRotation {
             retired: planned.retired,
             granted,
+            blocked_old: planned.blocked_old,
+            blocked_new: planned.granted && blocked_new,
         };
         if file != state.file {
             self.commit(
@@ -2304,6 +2315,7 @@ impl TrustStore {
             )?;
             state.session_identities.remove(&new);
         }
+        state.own_identity = Some(new);
         Ok(rotation)
     }
 
@@ -3359,7 +3371,8 @@ fn identity_entry(now: SystemTime, last_seen: SystemTime, all_destinations: bool
 
 /// The old key's grant for all destinations is useless once its private key is gone, so
 /// it goes; the new key takes it over, or is seeded when no grant was ever seeded. A
-/// user who withdrew the own grant stays opted out.
+/// user who withdrew the own grant stays opted out. The new key is not known yet, so
+/// whether it is blocked is left to `rotate_self_trust`.
 fn planned_self_trust_rotation(file: &TrustFile, old: &str) -> SelfTrustRotation {
     let retired = file
         .identities
@@ -3368,6 +3381,8 @@ fn planned_self_trust_rotation(file: &TrustFile, old: &str) -> SelfTrustRotation
     SelfTrustRotation {
         retired,
         granted: retired || !file.self_trust_seeded,
+        blocked_old: file.blocked_identities.contains_key(old),
+        blocked_new: false,
     }
 }
 
@@ -5052,6 +5067,8 @@ mod tests {
             let expected = SelfTrustRotation {
                 retired: false,
                 granted: false,
+                blocked_old: false,
+                blocked_new: false,
             };
             assert_eq!(fx.store.self_trust_rotation(&old), expected);
             let before = fx.file_bytes().unwrap();
@@ -5171,6 +5188,8 @@ mod tests {
         const MOVED: SelfTrustRotation = SelfTrustRotation {
             retired: true,
             granted: true,
+            blocked_old: false,
+            blocked_new: false,
         };
 
         #[test]
@@ -5280,6 +5299,54 @@ mod tests {
                     all_destinations: false
                 }
             );
+            assert_eq!(record(&fx.store, &old.identity_hash).label, None);
+        }
+
+        #[test]
+        fn a_blocked_old_identity_moves_no_grant_and_says_why() {
+            let fx = Fixture::new("trust-rotate-self-blocked-old");
+            let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
+            fx.store
+                .block_identity(&fx.mesh, &old, None, t(1_500))
+                .unwrap();
+            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            let expected = SelfTrustRotation {
+                retired: false,
+                granted: false,
+                blocked_old: true,
+                blocked_new: false,
+            };
+            assert_eq!(fx.store.self_trust_rotation(&old), expected);
+
+            assert_eq!(
+                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                expected
+            );
+
+            assert_eq!(fx.store.identity_standing(&new), IdentityStanding::Unknown);
+        }
+
+        #[test]
+        fn a_blocked_new_identity_is_retired_from_but_not_granted() {
+            let fx = Fixture::new("trust-rotate-self-blocked-new");
+            let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
+            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            fx.store
+                .block_identity(&fx.mesh, &new, None, t(2_500))
+                .unwrap();
+
+            assert_eq!(
+                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                SelfTrustRotation {
+                    retired: true,
+                    granted: false,
+                    blocked_old: false,
+                    blocked_new: true,
+                }
+            );
+
+            assert_eq!(fx.store.identity_standing(&old), IdentityStanding::Unknown);
+            assert!(fx.store.blocked().iter().any(|record| record.hash == new));
         }
 
         #[test]
@@ -5291,7 +5358,9 @@ mod tests {
                 fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
                 SelfTrustRotation {
                     retired: false,
-                    granted: true
+                    granted: true,
+                    blocked_old: false,
+                    blocked_new: false,
                 }
             );
 

@@ -3992,7 +3992,10 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     match args.confirm {
         None => {
             let recorded = identity::predecessors(&path)?.len();
-            let own_trust = TrustStore::open(&config_dir)?.self_trust_rotation(&old);
+            let own_trust = match TrustStore::open(&config_dir) {
+                Ok(store) => rotation_self_trust_preview(store.self_trust_rotation(&old)),
+                Err(err) => unread_trust_preview(&config_dir, &err),
+            };
             let lines = [
                 format!("Rotating the mesh identity replaces {old}:"),
                 "  a new identity is minted and written over mesh/identity.key; the old private key is not kept".to_string(),
@@ -4003,7 +4006,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 "  the instance id is unchanged, so the node announces a new destination hash under the new identity".to_string(),
                 "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
                 "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band".to_string(),
-                format!("  {}", rotation_self_trust_preview(own_trust)),
+                format!("  {own_trust}"),
                 format!(
                     "{DRY_RUN_NOTHING_CHANGED} To rotate, run: .mesh rotate --confirm {expected}"
                 ),
@@ -4043,52 +4046,83 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 
 /// The dry run's line on the own grant; see `planned_self_trust_rotation`.
 fn rotation_self_trust_preview(own_trust: SelfTrustRotation) -> String {
+    let next = "to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh trust --identity <the new hash the rotation prints>";
     match own_trust {
         SelfTrustRotation {
             granted: true,
             retired: true,
+            ..
         } => format!(
             "your own trust list retires the old identity's \"{SELF_TRUST_LABEL}\" grant, which no key can use once the old private key is gone, and trusts the new identity as \"{SELF_TRUST_LABEL}\" in its place, so your sessions on this config dir can still message each other; its other entries stay"
         ),
         SelfTrustRotation {
             granted: true,
             retired: false,
+            ..
         } => format!(
             "your own trust list keeps its entries and trusts the new identity as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can message each other"
         ),
-        SelfTrustRotation { granted: false, .. } => format!(
-            "your own trust list keeps its entries and does not trust the new identity, because you withdrew the old identity's \"{SELF_TRUST_LABEL}\" grant; to let your sessions on this config dir message each other after rotating, run .mesh trust --identity with the new hash the rotation prints"
+        SelfTrustRotation {
+            blocked_old: true, ..
+        } => format!(
+            "your own trust list keeps its entries and does not trust the new identity, because the old identity is blocked on it and so holds no \"{SELF_TRUST_LABEL}\" grant to move; {next}"
+        ),
+        SelfTrustRotation { .. } => format!(
+            "your own trust list keeps its entries and does not trust the new identity, because the old identity holds no \"{SELF_TRUST_LABEL}\" grant; {next}"
         ),
     }
+}
+
+/// The dry run's line on the own grant when the trust list cannot be read; the rotation
+/// itself does not need the list, so the dry run still names the token.
+fn unread_trust_preview(config_dir: &Path, err: &anyhow::Error) -> String {
+    let trust_path = crate::mesh::mesh_config_dir(config_dir).join("trust.yaml");
+    format!(
+        "the trust list could not be read ({err:#}), so rotating will not move the \"{SELF_TRUST_LABEL}\" grant; fix or move {}, and after rotating run .mesh on, then .mesh trust --identity <the new hash the rotation prints>",
+        trust_path.display()
+    )
 }
 
 /// What `rotate_self_trust` did, for the rotation's result.
 fn rotated_self_trust_text(new: &str, own_trust: SelfTrustRotation) -> String {
     let new_short = short(new);
+    let next = "To let your sessions on this config dir message each other, run .mesh on, then";
     match own_trust {
         SelfTrustRotation {
             granted: true,
             retired: true,
+            ..
         } => format!(
             "Retired the old identity's \"{SELF_TRUST_LABEL}\" grant and trusted the new identity {new_short} as \"{SELF_TRUST_LABEL}\" in its place, so your sessions on this config dir can message each other."
         ),
         SelfTrustRotation {
             granted: true,
             retired: false,
+            ..
         } => format!(
             "Trusted the new identity {new_short} as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can message each other."
         ),
         SelfTrustRotation {
-            granted: false,
-            retired: true,
-        } => format!(
-            "Retired the old identity's \"{SELF_TRUST_LABEL}\" grant; the new identity {new_short} is blocked on your trust list, so it was not trusted. To let your sessions on this config dir message each other, run .mesh on, then .mesh unblock --identity {new} and .mesh trust --identity {new}."
-        ),
+            blocked_new: true,
+            retired,
+            ..
+        } => {
+            let what = if retired {
+                format!("Retired the old identity's \"{SELF_TRUST_LABEL}\" grant; the")
+            } else {
+                "The".to_string()
+            };
+            format!(
+                "{what} new identity {new_short} is blocked on your trust list, so it was not trusted. {next} .mesh unblock --identity {new} --yes and .mesh trust --identity {new}."
+            )
+        }
         SelfTrustRotation {
-            granted: false,
-            retired: false,
+            blocked_old: true, ..
         } => format!(
-            "The new identity {new_short} is not trusted, because you had withdrawn the old identity's \"{SELF_TRUST_LABEL}\" grant. To let your sessions on this config dir message each other, run .mesh on, then .mesh trust --identity {new}."
+            "The new identity {new_short} is not trusted, because the old identity was blocked on your trust list and so held no \"{SELF_TRUST_LABEL}\" grant to move. {next} .mesh trust --identity {new}."
+        ),
+        SelfTrustRotation { .. } => format!(
+            "The new identity {new_short} is not trusted, because the old identity held no \"{SELF_TRUST_LABEL}\" grant. {next} .mesh trust --identity {new}."
         ),
     }
 }
@@ -15940,6 +15974,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "{dry_run}"
                 );
                 assert!(dry_run.contains(".mesh trust --identity"), "{dry_run}");
+                assert!(
+                    dry_run.contains("because the old identity holds no \"this node\" grant; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh trust --identity <the new hash the rotation prints>"),
+                    "{dry_run}"
+                );
                 let new = current();
                 assert_eq!(
                     TrustStore::open(&guard.path)
@@ -15952,6 +15990,94 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     out.contains(&format!(".mesh on, then .mesh trust --identity {new}.")),
                     "{out}"
                 );
+            }
+
+            fn corrupt_trust_file(guard: &TestConfigDirGuard) -> PathBuf {
+                let trust_path = crate::mesh::mesh_config_dir(&guard.path).join("trust.yaml");
+                fs::create_dir_all(trust_path.parent().unwrap()).unwrap();
+                fs::write(&trust_path, "version: [unclosed\n").unwrap();
+                trust_path
+            }
+
+            #[test]
+            #[serial]
+            fn a_dry_run_over_an_unreadable_trust_list_still_names_the_token_and_the_way_out() {
+                let guard = TestConfigDirGuard::new("repl-mesh-rotate-unread-trust");
+                let _capture = capture::install();
+                let (_, _, old) = minted_key(&guard);
+                let trust_path = corrupt_trust_file(&guard);
+                let mut ctx = off_ctx();
+
+                run_async(run(&mut ctx, ".mesh rotate")).unwrap();
+
+                let out = stdout_lines().join("\n");
+                assert!(
+                    out.contains(&format!(".mesh rotate --confirm rotate-{}", short(&old))),
+                    "{out}"
+                );
+                assert!(out.contains("the trust list could not be read ("), "{out}");
+                assert!(
+                    out.contains(&format!(
+                        "so rotating will not move the \"this node\" grant; fix or move {}, and after rotating run .mesh on, then .mesh trust --identity <the new hash the rotation prints>",
+                        trust_path.display()
+                    )),
+                    "{out}"
+                );
+            }
+
+            #[test]
+            #[serial]
+            fn a_trust_list_that_fails_at_confirm_names_the_trust_and_untrust_commands() {
+                let guard = TestConfigDirGuard::new("repl-mesh-rotate-confirm-unread-trust");
+                let _capture = capture::install();
+                let (_, _, old) = minted_key(&guard);
+                corrupt_trust_file(&guard);
+                let mut ctx = off_ctx();
+
+                let err = run_async(run(
+                    &mut ctx,
+                    &format!(".mesh rotate --confirm rotate-{}", short(&old)),
+                ))
+                .unwrap_err();
+
+                let new = current();
+                assert_ne!(new, old);
+                let err = format!("{err:#}");
+                assert!(
+                    err.contains(&format!(".mesh trust --identity {new}")),
+                    "{err}"
+                );
+                assert!(
+                    err.contains(&format!(".mesh untrust --identity {old}")),
+                    "{err}"
+                );
+            }
+
+            #[test]
+            fn a_blocked_new_key_names_the_unblock_with_yes_so_it_needs_no_prompt() {
+                let new = "ab".repeat(16);
+                for retired in [true, false] {
+                    let text = rotated_self_trust_text(
+                        &new,
+                        SelfTrustRotation {
+                            retired,
+                            granted: false,
+                            blocked_old: false,
+                            blocked_new: true,
+                        },
+                    );
+                    assert!(
+                        text.contains(&format!(
+                            "new identity abababab is blocked on your trust list, so it was not trusted. To let your sessions on this config dir message each other, run .mesh on, then .mesh unblock --identity {new} --yes and .mesh trust --identity {new}."
+                        )),
+                        "{text}"
+                    );
+                    assert_eq!(
+                        text.starts_with("Retired the old identity's \"this node\" grant"),
+                        retired,
+                        "{text}"
+                    );
+                }
             }
         }
 

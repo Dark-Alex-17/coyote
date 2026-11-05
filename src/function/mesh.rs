@@ -6997,6 +6997,10 @@ mod tests {
                         },
                         SystemTime::now(),
                     );
+                    assert_eq!(
+                        a.own_sessions().get(&temp_dest).map(String::as_str),
+                        Some("temp")
+                    );
 
                     let result = handle_mesh_tool(
                         &mut ctx,

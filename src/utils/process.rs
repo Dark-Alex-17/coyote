@@ -94,7 +94,8 @@ thread_local! {
     /// How many process-table refreshes `alive_set` has spent on this thread,
     /// so a test can pin how many one caller costs. Counted per thread because
     /// the mesh instance registry refreshes on every read, and tests running
-    /// beside the one counting read it.
+    /// beside the one counting read it. The code being counted must therefore run
+    /// on the calling thread, not on a spawned one.
     static ALIVE_SET_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -117,7 +118,6 @@ fn lookup_start_time(pid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
     fn current_process_is_alive() {
@@ -143,9 +143,7 @@ mod tests {
         assert!(!stale.is_alive());
     }
 
-    /// Serial with the sweep tests that count `alive_set` calls.
     #[test]
-    #[serial]
     fn alive_set_keeps_only_the_live_self() {
         let current = ProcessStamp::current();
         let dead = ProcessStamp {
@@ -175,7 +173,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn alive_set_of_nothing_is_empty() {
         assert!(ProcessStamp::alive_set(&[]).is_empty());
     }
