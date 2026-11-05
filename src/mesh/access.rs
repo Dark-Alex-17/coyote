@@ -1433,13 +1433,19 @@ fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
 /// being written. The share file's words and the id are quoted as they stand; the re-run
 /// hint follows the prefix.
 fn standing_write_failed(record: &InboundRecord, err: anyhow::Error) -> anyhow::Error {
+    let failure = error_notice(&quoted_share_write(err));
+    let run = if failure.plain().ends_with('.') {
+        " Run `.mesh grant "
+    } else {
+        ". Run `.mesh grant "
+    };
     QuotingError::wrap(
         NoticeText::from(format!(
             "{} was already told yes, but the share list could not be written: ",
             short(&record.peer_destination)
         ))
-        .then(error_notice(&quoted_share_write(err)))
-        .frame(". Run `.mesh grant ")
+        .then(failure)
+        .frame(run)
         .peer(record.id.as_str())
         .frame(" --standing` again once the share list is writable; the request stays pending until then."),
     )
@@ -3584,7 +3590,7 @@ mod tests {
 
         fn dot_standing() -> String {
             format!(
-                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written.. Run `.mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written. Run `.mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
                 short(&destination())
             )
         }
@@ -3610,7 +3616,7 @@ mod tests {
         #[test]
         fn under_slash_the_grant_errors_keep_share_words_and_ids_and_slash_the_hint() {
             let slashed = format!(
-                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written.. Run `/mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written. Run `/mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
                 short(&destination())
             );
             assert_eq!(
