@@ -702,7 +702,7 @@ s.update(settled_answer="Y first")
 s.update(gates.choice_resume(s))
 s.update(gates.leak_route(s))
 check("choice_resume: a parked Gate 1 question settled -> recorded, the next question asked",
-      s["choice_answers"][0]["answer"] == "Y first" and s["choice_answers"][0]["via"] == "settled"
+      [(a["answer"], a["via"]) for a in s["choice_answers"]] == [("Y first", "settled")]
       and "2 of 2: who signs off?" in s["escalation"]["question"], s)
 s = base_state(leak_answers=[], leak_unanswerable=["what is the refund window?"])
 s.update(gates.leak_route(s))

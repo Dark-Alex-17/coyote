@@ -759,6 +759,88 @@ fn intake_smoke_rows_go_red_under_the_recorded_sabotages() {
     );
 }
 
+/// The multiple-choice design question guards, each removed from a scratch
+/// copy, turn their smoke row red: only the first of several recommended
+/// options stays recommended and moves first, an unmatched typed reply goes to
+/// the classifier, a discussion verdict parks the run, a resumed run parked on
+/// a discussion goes to `choice_resume`, which records the settled answer, the
+/// `>=` that stops parking at `DISCUSSION_PARKS_MAX`, the carried
+/// `discussion_run_id` cleared at intake, and a Gate 1 question that cannot be
+/// framed carried as an open amendment line.
+#[test]
+#[ignore = "nine smoke battery runs take about a minute and a half; run with -- --ignored"]
+fn choice_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "choice-one-recommended",
+                "        for i in recommended[1:]:\n            opts[i][\"recommended\"] = False\n",
+                "        for i in recommended[1:]:\n            pass\n",
+                "normalize_choices: several recommended -> the first kept and moved first, the rest \
+             unmarked, ledgered",
+            ),
+            (
+                "choice-recommended-first",
+                "        opts.insert(0, opts.pop(recommended[0]))\n",
+                "        pass\n",
+                "normalize_choices: several recommended -> the first kept and moved first, the rest \
+             unmarked, ledgered",
+            ),
+            (
+                "choice-other-classifier",
+                "        elif choice is None and text:\n            u[\"_next\"] = \"classify_reply\"\n",
+                "        elif False:\n            u[\"_next\"] = \"classify_reply\"\n",
+                "parse_answer: design question unmatched free text (a Slack reply) -> classify_reply, \
+             never a re-ask nor taken raw",
+            ),
+            (
+                "choice-discussion-park",
+                "    u[\"_next\"] = \"choice_park\"\n",
+                "    u[\"_next\"] = \"apply_answer\"\n",
+                "choice_reply_route: discussion -> choice_park, still parked, nothing recorded",
+            ),
+            (
+                "choice-resume-route",
+                "    if state.get(\"parked\") == DISCUSSION_PARKED:\n",
+                "    if False:\n",
+                "resume_route: a run parked on a discussion -> choice_resume",
+            ),
+            (
+                "choice-settled-record",
+                "        _record_choice(state, u, settled, via=\"settled\")\n",
+                "        pass\n",
+                "choice_resume: a settled answer is recorded for the parked question (via settled); \
+             discussion and settled answer cleared",
+            ),
+            (
+                "choice-park-bound",
+                "    if count >= DISCUSSION_PARKS_MAX:\n",
+                "    if count > DISCUSSION_PARKS_MAX:\n",
+                "choice_park: a question parked DISCUSSION_PARKS_MAX times -> no park, choice_reask, \
+             its next typed reply forced",
+            ),
+            (
+                "discussion-key-cleared",
+                "    u[\"discussion_run_id\"] = \"\"\n    m = RESUME_RE.search(brief)\n",
+                "    m = RESUME_RE.search(brief)\n",
+                "intake: a message that is not a continue with the carried key -> a fresh run, the key \
+             cleared, the left discussion ledgered",
+            ),
+            (
+                "leak-carried",
+                "\"answer\": LEAK_CARRIED} for q in invalid]\n",
+                "\"answer\": LEAK_CARRIED} for q in []]\n",
+                "leak_route: still not askable after the re-frame -> carried as an open amendment line, \
+             ledgered",
+            ),
+        ],
+    );
+}
+
 /// One `(label, guard, sabotaged guard, smoke row)` per guard: the guard must
 /// occur exactly once in gates.py, and with it replaced in a scratch copy the
 /// smoke battery must fail with exactly that row's `FAIL` line.

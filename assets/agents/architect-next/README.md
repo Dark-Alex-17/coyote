@@ -225,7 +225,13 @@ The wrapper's live test groups:
   explicit-path precedence over a seed, the project filter, the blank-input stop, the
   `draft_possible: false` and empty-draft fallbacks, `draft_fault`, the `DRAFT_ROUNDS_MAX`
   check, `_DRAFT_OUTPUT_RESET`, the `draft_confirm` answer read before any abort check, both
-  explicit Abort branches, and the confirmed draft becoming the design doc);
+  explicit Abort branches, and the confirmed draft becoming the design doc), and its ignored
+  choice tail (`choice_smoke_rows_go_red_under_the_recorded_sabotages`, run with
+  `-- --ignored`: only the first recommended option kept and moved first, an unmatched typed
+  reply sent to the classifier, a discussion verdict parking the run, `resume_route` sending
+  a discussion park to `choice_resume`, the settled answer recorded, the
+  `DISCUSSION_PARKS_MAX` `>=`, the carried `discussion_run_id` cleared at intake, and the
+  Gate 1 carried fallback);
 - run dir: run-dir precedence from a fresh process, and an empty `ARCHITECT_RUNS_ROOT`
   falling back to the cache-dir tier;
 - graph and gates: `build_lock` position, the variable mirror (the candidate's variables,
@@ -363,9 +369,10 @@ classifier. These kinds stay free text, because their answer is not a pick from 
 answer") and the `draft_edit` input node (the changes to make to a drafted brief). Every
 escalation outside the design phase is unchanged.
 
-Two tests are ignored and run with `-- --ignored`: the mode-matrix run and the intake
-sabotage tail (`intake_smoke_rows_go_red_under_the_recorded_sabotages`), which keeps the
-default sabotage pin near two minutes.
+Three tests are ignored and run with `-- --ignored`: the mode-matrix run and the intake and
+choice sabotage tails (`intake_smoke_rows_go_red_under_the_recorded_sabotages`,
+`choice_smoke_rows_go_red_under_the_recorded_sabotages`), which keep the default sabotage
+pin near two minutes.
 
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `ARCHITECT_RUNS_ROOT` pointed at a scratch directory and
