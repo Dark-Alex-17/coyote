@@ -49,7 +49,7 @@ pub(crate) use node::session_destination_name;
 pub(crate) use node::{
     AddressName, AlreadyClosed, HUMAN_DECLINED, InterfaceState, InterfaceStatus, LocalEndpoint,
     MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NameTarget, NodeOptions, already_closed,
-    loopback_endpoint, refusal_reply,
+    loopback_endpoint, owner_label, refusal_reply,
 };
 pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{

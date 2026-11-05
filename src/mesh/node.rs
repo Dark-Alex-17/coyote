@@ -637,6 +637,26 @@ impl NameTarget {
     }
 }
 
+/// The label you gave `destination` in the trust list: the one on its own grant, else
+/// the one on the grant of the identity the peer table hears it under.
+pub(crate) fn owner_label<'a>(
+    names: &'a [AddressName],
+    destination: &str,
+) -> Option<&'a AddressName> {
+    let find = |own_grant: bool| {
+        names.iter().find(|name| match &name.target {
+            NameTarget::DestinationLabel {
+                destination: at, ..
+            } => own_grant && at == destination,
+            NameTarget::IdentityLabel { instances, .. } => {
+                !own_grant && instances.iter().any(|at| at == destination)
+            }
+            NameTarget::Session { .. } => false,
+        })
+    };
+    find(true).or_else(|| find(false))
+}
+
 /// One in-process Reticulum node: a transport over the configured interfaces, one destination
 /// derived from the session's mesh instance id, and the tasks that announce it and track peers.
 pub(crate) struct MeshRuntime {

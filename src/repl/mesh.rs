@@ -49,8 +49,8 @@ use crate::mesh::{
     MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NameTarget, NodeOptions,
     PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord,
     PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
-    display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339, redact_hashes,
-    refuse_symlink, rfc3339_utc, short, span_text,
+    display_text, hex_lower, human_size, loopback_endpoint, owner_label, parse_rfc3339,
+    redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::render::QuotingError;
 use crate::repl::printer::terminal_width;
@@ -530,7 +530,7 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
             no_route: !runtime.path_known(&peer.destination_hash).await,
             is_you: peer.identity_hash == runtime.fingerprint(),
             own_session: own_sessions.get(&peer.destination_hash).cloned(),
-            label: owner_label(&names, &peer.destination_hash).map(str::to_string),
+            label: owner_label(&names, &peer.destination_hash).map(|label| label.name.clone()),
         });
     }
     let trust = runtime.trust();
@@ -1124,9 +1124,10 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     let name_at = |destination: &str| match own_sessions.get(destination) {
         Some(session) => own_session_name(session),
         None => match owner_label(&names, destination) {
-            Some(label) => {
-                labelled_name(label, ctx.app.mesh.display_name_at(destination).as_deref())
-            }
+            Some(label) => labelled_name(
+                &label.name,
+                ctx.app.mesh.display_name_at(destination).as_deref(),
+            ),
             None => ctx.app.mesh.peer_name_at(destination),
         },
     };
@@ -6477,9 +6478,13 @@ mod name_addressing_tests {
     #[test]
     fn a_labelled_peer_shows_the_label_then_its_announced_name() {
         let names = names();
-        assert_eq!(owner_label(&names, LAPTOP), Some("maki-laptop"));
         assert_eq!(
-            owner_label(&[identity_label("maki", &[LAPTOP])], LAPTOP),
+            owner_label(&names, LAPTOP).map(|label| label.name.as_str()),
+            Some("maki-laptop")
+        );
+        assert_eq!(
+            owner_label(&[identity_label("maki", &[LAPTOP])], LAPTOP)
+                .map(|label| label.name.as_str()),
             Some("maki")
         );
         assert_eq!(owner_label(&names, TEMP), None, "a session is not a label");
@@ -7840,25 +7845,6 @@ struct HeardFacts {
 /// sessions.
 fn own_session_name(session: &str) -> String {
     format!("(you: {session})")
-}
-
-/// The label you gave `destination` in the trust list: the one on its own grant, else
-/// the one on the grant of the identity the peer table hears it under.
-fn owner_label<'a>(names: &'a [AddressName], destination: &str) -> Option<&'a str> {
-    let find = |own_grant: bool| {
-        names.iter().find(|name| match &name.target {
-            NameTarget::DestinationLabel {
-                destination: at, ..
-            } => own_grant && at == destination,
-            NameTarget::IdentityLabel { instances, .. } => {
-                !own_grant && instances.iter().any(|at| at == destination)
-            }
-            NameTarget::Session { .. } => false,
-        })
-    };
-    find(true)
-        .or_else(|| find(false))
-        .map(|name| name.name.as_str())
 }
 
 /// How `.mesh peers` and `.mesh pending` name a peer you labelled: the label, then the

@@ -59,8 +59,8 @@ use crate::mesh::trust::{
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     AddressName, MeshPaths, MeshRuntime, MeshSlot, NameTarget, PeerRecord, age_text,
-    canonical_hash, capped_peer_text, display_text, parse_rfc3339, redact_hashes, rfc3339_utc,
-    short,
+    canonical_hash, capped_peer_text, display_text, owner_label, parse_rfc3339, redact_hashes,
+    rfc3339_utc, short,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -388,6 +388,12 @@ impl DestinationFilter {
         !matches!(self, Self::Heard | Self::TrustedAndHeard)
     }
 
+    /// Whether a row may offer an identity label as its value; the `--peer` verbs read
+    /// one as the identity, not the destination the row stands for.
+    fn offers_identity_labels(self) -> bool {
+        !matches!(self, Self::DestinationRecord)
+    }
+
     fn keep(self, candidate: &DestinationCandidate) -> bool {
         let heard = candidate.source == DestinationSource::Peer;
         let heard_or_knocked = candidate.source != DestinationSource::Record;
@@ -426,15 +432,11 @@ impl DestinationFilter {
 /// A row with a name to type offers that name as its value and leads with it, one of
 /// your sessions marked `(you)` after it.
 fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>) {
-    let cut = |name: &str| display_text(name, DISPLAY_NAME_MAX_CHARS);
     let who = match &candidate.typed {
-        Some(TypedName::Session(session)) => {
-            cut(session).map(|session| format!("{session} . (you)"))
-        }
-        Some(TypedName::Label(label)) => cut(label),
-        None => None,
+        Some(TypedName::Session(session)) => Some(format!("{session} . (you)")),
+        Some(TypedName::Label(label)) => Some(label.clone()),
+        None => candidate.name.clone(),
     }
-    .or_else(|| candidate.name.clone())
     .unwrap_or_else(|| {
         let hash = if candidate.identity.is_empty() {
             &candidate.destination
@@ -464,29 +466,42 @@ fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>)
 }
 
 /// The name a row for `destination` offers in place of its hash: your session running
-/// there, else your trust label on it. A name is offered only when it is one word, is not
-/// itself a whole hash (which the verbs would take as given), and every name spelled the
-/// same stands for this destination, which is when the verbs resolve it here.
-fn typed_name(names: &[AddressName], destination: &str) -> Option<TypedName> {
+/// there, else the label `.mesh peers` shows for it. A name is offered only when it is
+/// one word that displays as spelled, is not itself a whole hash (which the verbs would
+/// take as given), and every name spelled the same stands for this destination, which is
+/// when the verbs resolve it here. Without `identity_labels` no name an identity label
+/// shares is offered: the `--peer` verbs read an identity label as the identity, a grant
+/// wider than the destination row it was picked from.
+fn typed_name(
+    names: &[AddressName],
+    destination: &str,
+    identity_labels: bool,
+) -> Option<TypedName> {
     let resolves_here = |name: &str| {
         let spelled = name.to_lowercase();
         !name.contains(char::is_whitespace)
+            && display_text(name, DISPLAY_NAME_MAX_CHARS).as_deref() == Some(name)
             && canonical_hash(name).is_none()
             && names
                 .iter()
                 .filter(|other| other.name.to_lowercase() == spelled)
-                .all(|other| other.target.destination() == Some(destination))
+                .all(|other| {
+                    other.target.destination() == Some(destination)
+                        && (identity_labels
+                            || !matches!(other.target, NameTarget::IdentityLabel { .. }))
+                })
     };
-    let pick = |session: bool| {
-        names.iter().find(|name| {
-            matches!(name.target, NameTarget::Session { .. }) == session
-                && name.target.destination() == Some(destination)
-                && resolves_here(&name.name)
-        })
-    };
-    pick(true)
-        .map(|name| TypedName::Session(name.name.clone()))
-        .or_else(|| pick(false).map(|name| TypedName::Label(name.name.clone())))
+    let session = names.iter().find(|name| {
+        matches!(name.target, NameTarget::Session { .. })
+            && name.target.destination() == Some(destination)
+            && resolves_here(&name.name)
+    });
+    match session {
+        Some(session) => Some(TypedName::Session(session.name.clone())),
+        None => owner_label(names, destination)
+            .filter(|label| resolves_here(&label.name))
+            .map(|label| TypedName::Label(label.name.clone())),
+    }
 }
 
 /// The destination `token` stands for in the completions that follow it, read the way
@@ -666,7 +681,11 @@ fn collect_destination_rows(
             });
             let mut candidate =
                 sighting.candidate(record, *verdict, *standing, record_standing, now);
-            candidate.typed = typed_name(&names, &candidate.destination);
+            candidate.typed = typed_name(
+                &names,
+                &candidate.destination,
+                filter.offers_identity_labels(),
+            );
             candidate
         })
         .filter(|candidate| filter.keep(candidate))
@@ -36909,7 +36928,7 @@ mod tests {
                     all_destinations: false,
                 },
                 record_standing: None,
-                typed: typed_name(names, destination),
+                typed: typed_name(names, destination, true),
             }
         }
 
@@ -36948,14 +36967,59 @@ mod tests {
         fn a_name_that_would_not_resolve_here_is_not_offered() {
             let (a, b) = (hash(0x11), hash(0x22));
             let shared = vec![session("maki", &a), label("Maki", &b)];
-            assert_eq!(typed_name(&shared, &a), None);
-            assert_eq!(typed_name(&shared, &b), None);
-            assert_eq!(typed_name(&[label("two words", &a)], &a), None);
-            assert_eq!(typed_name(&[label(&b, &a)], &a), None);
+            assert_eq!(typed_name(&shared, &a, true), None);
+            assert_eq!(typed_name(&shared, &b, true), None);
+            assert_eq!(typed_name(&[label("two words", &a)], &a, true), None);
+            assert_eq!(typed_name(&[label(&b, &a)], &a, true), None);
             assert_eq!(
-                typed_name(&[session("temp", &a), label("mine", &a)], &a),
+                typed_name(&[session("temp", &a), label("mine", &a)], &a, true),
                 Some(TypedName::Session("temp".to_string())),
                 "a session beats a label on the same destination"
+            );
+            let long = "l".repeat(DISPLAY_NAME_MAX_CHARS + 1);
+            assert_eq!(
+                typed_name(&[label(&long, &a)], &a, true),
+                None,
+                "a label the row would show cut is not offered"
+            );
+        }
+
+        /// An instance under both an identity label and a destination label offers the
+        /// destination label whichever the trust list holds first, as `.mesh peers` shows
+        /// it; where a verb reads an identity label as the identity, an identity label is
+        /// never a destination row's value.
+        #[test]
+        fn the_destination_label_beats_the_identity_label_on_one_instance() {
+            let (laptop, maki) = (hash(0x22), hash(0x33));
+            let identity_label = |name: &str| AddressName {
+                name: name.to_string(),
+                target: NameTarget::IdentityLabel {
+                    identity: maki.clone(),
+                    instances: vec![laptop.clone()],
+                },
+            };
+            let both = vec![identity_label("maki"), label("maki-laptop", &laptop)];
+            for identity_labels in [true, false] {
+                assert_eq!(
+                    typed_name(&both, &laptop, identity_labels),
+                    Some(TypedName::Label("maki-laptop".to_string())),
+                    "{identity_labels}"
+                );
+            }
+            let only_identity = vec![identity_label("maki")];
+            assert_eq!(
+                typed_name(&only_identity, &laptop, true),
+                Some(TypedName::Label("maki".to_string()))
+            );
+            assert_eq!(typed_name(&only_identity, &laptop, false), None);
+            assert_eq!(
+                typed_name(
+                    &[identity_label("maki-laptop"), label("maki-laptop", &laptop)],
+                    &laptop,
+                    false
+                ),
+                None,
+                "a destination label an identity label shares is read as the identity"
             );
         }
 
