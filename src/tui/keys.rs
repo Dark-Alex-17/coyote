@@ -61,9 +61,12 @@ pub(crate) enum Action {
 
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // A chord's letter is matched case-folded once here: with the kitty
+    // protocol Ctrl+Shift+C arrives as an uppercase `C`.
+    let code = lowercase(key.code);
     // Job control and repaint are the terminal's, not the modal's: they
     // work the same whatever is on screen.
-    match key.code {
+    match code {
         KeyCode::Char('z') if ctrl => return Action::Suspend,
         KeyCode::Char('l') if ctrl => return Action::ScheduleFrame,
         _ => {}
@@ -71,7 +74,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     match ctx.modal {
         Some(ModalKind::Confirm { default, tool }) => {
             let answerable = ctx.idle_ok && ctx.question_fully_shown;
-            match lowercase(key.code) {
+            match code {
                 KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
                 KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
                 _ if !answerable => Action::Nothing,
@@ -82,7 +85,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
                 _ => Action::Nothing,
             }
         }
-        Some(ModalKind::Input) => match key.code {
+        Some(ModalKind::Input) => match code {
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
             KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
             // The field is one line, so the composer's newline chords have
@@ -91,7 +94,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('j') if ctrl => Action::Nothing,
             _ => Action::ModalInput(key),
         },
-        None => match key.code {
+        None => match code {
             KeyCode::Char('c') if ctrl => {
                 if ctx.turn_running {
                     Action::Interrupt
@@ -179,6 +182,28 @@ mod tests {
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
         }
+    }
+
+    /// Under the kitty protocol a chord held with Shift arrives with an
+    /// uppercase letter; the chord still matches, in every mode.
+    #[test]
+    fn chords_match_with_shift_held() {
+        let shifted = |c: char| {
+            press(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..IDLE
+        };
+        assert_eq!(map_key(shifted('C'), &running), Action::Interrupt);
+        assert_eq!(map_key(shifted('D'), &IDLE), Action::Quit);
+        assert_eq!(map_key(shifted('L'), &IDLE), Action::ScheduleFrame);
+        assert_eq!(map_key(shifted('Z'), &IDLE), Action::Suspend);
+        assert_eq!(map_key(shifted('J'), &IDLE), Action::InsertNewline);
+        assert_eq!(map_key(shifted('O'), &IDLE), Action::OpenEditor);
     }
 
     #[test]

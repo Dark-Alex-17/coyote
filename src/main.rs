@@ -65,6 +65,9 @@ use std::sync::atomic::Ordering;
 use std::{env, fs, process, sync::Arc};
 
 const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
+/// The name of the thread `main` hands the runtime to; the UI's panic
+/// echo recognises the main thread by it.
+pub(crate) const MAIN_THREAD_NAME: &str = "main";
 
 /// Bootstraps the async entry point on a dedicated thread with an explicit
 /// large stack instead of `#[tokio::main]`, which would poll the root
@@ -79,7 +82,7 @@ const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
 /// exit code identical to the direct arrangement.
 fn main() -> Result<()> {
     std::thread::Builder::new()
-        .name("main".into())
+        .name(MAIN_THREAD_NAME.into())
         .stack_size(MAIN_STACK_SIZE)
         .spawn(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -675,8 +678,9 @@ async fn run(
             result
         }
         true => {
-            let tui = env::var(config::UiKind::ENV).as_deref() == Ok(config::UiKind::Tui.as_str());
-            if tui {
+            let wants_tui =
+                env::var(config::UiKind::ENV).as_deref() == Ok(config::UiKind::Tui.as_str());
+            if wants_tui {
                 // Refused here, before the models refresh and the REPL
                 // setup are started on the UI's behalf; `tui::run` checks
                 // again so it holds on its own, whoever calls it.
@@ -686,7 +690,7 @@ async fn run(
             }
             maybe_spawn_models_refresh(&ctx.app.config);
             config::child_sessions::sweep_orphans();
-            if tui {
+            if wants_tui {
                 return tui::run(ctx).await;
             }
             start_interactive(ctx).await

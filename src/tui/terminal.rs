@@ -225,7 +225,7 @@ fn restore_from_static() {
 #[cfg(unix)]
 fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
     if super::redirect::fds_captured()
-        && std::thread::current().name() == Some("main")
+        && std::thread::current().name() == Some(crate::MAIN_THREAD_NAME)
         && let Some(mut tty) = static_tty()
     {
         // The payload is whatever the panicking code formatted; it goes

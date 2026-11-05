@@ -22,8 +22,8 @@ use serial_test::serial;
 /// Covers the keyboard-enhancement probe, which waits two seconds for an
 /// answer a pseudo-terminal never gives.
 const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Hotkeys count once typing has been idle for a second; settle before
-/// sending a quit chord after other keys.
+/// Hotkeys on a modal only count once typing has been idle for a second
+/// (pinned by the ManualClock unit test); settle before answering.
 const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 
 const ENTER_ALT: &[u8] = b"\x1b[?1049h";

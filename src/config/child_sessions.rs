@@ -2443,4 +2443,20 @@ updated_at: 2026-01-02T03:04:05Z
         assert!(tty_check < sweep);
         assert!(refresh < sweep && sweep < start);
     }
+
+    /// The full-screen start keeps the same order: the tty check refuses
+    /// before the models refresh is spawned, and the sweep runs before
+    /// the UI takes the terminal.
+    #[test]
+    fn tui_start_checks_the_tty_first_and_sweeps_before_taking_the_terminal() {
+        let main = include_str!("../main.rs");
+        let tty_check = main.find("tui::ensure_tty()?;").unwrap();
+        let refresh = main
+            .find("maybe_spawn_models_refresh(&ctx.app.config);")
+            .unwrap();
+        let sweep = main.find("child_sessions::sweep_orphans()").unwrap();
+        let start = main.find("tui::run(ctx).await").unwrap();
+        assert!(tty_check < refresh);
+        assert!(refresh < sweep && sweep < start);
+    }
 }

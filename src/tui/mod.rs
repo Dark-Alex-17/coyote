@@ -1782,6 +1782,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let mut ctx = Some(ctx);
     let mut task: Option<Task> = None;
     let mut quit_requested = false;
+    let mut frame_failing = false;
     loop {
         let step = tokio::select! {
             event = stream.next() => Step::Input(event),
@@ -1840,6 +1841,12 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                                 handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),
                                 command,
                             });
+                        } else {
+                            // Submit is not mapped while a task holds the
+                            // context; should that ever change, the draft
+                            // goes back rather than vanishing.
+                            debug_assert!(false, "a submit while the context was away");
+                            app.set_composer_text(&line);
                         }
                     }
                     Some(Command::Interrupt) => abort.set_ctrlc(),
@@ -1902,8 +1909,16 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             Step::Msg(Some(msg)) => app.handle_msg(msg),
             Step::Msg(None) => {}
             Step::Frame => {
-                if let Err(err) = screen.draw(|frame| app.render(frame)) {
-                    warn!("Failed to draw a frame: {err}");
+                // One line per streak of failed frames, not one per frame:
+                // a terminal that is gone would otherwise fill the log.
+                match screen.draw(|frame| app.render(frame)) {
+                    Ok(_) => frame_failing = false,
+                    Err(err) => {
+                        if !frame_failing {
+                            warn!("Failed to draw a frame: {err}");
+                        }
+                        frame_failing = true;
+                    }
                 }
                 app.frame_drawn();
             }

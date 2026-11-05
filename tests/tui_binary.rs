@@ -3511,6 +3511,8 @@ fn csi_with_intermediate_bytes_is_dropped_whole() {
     assert_eq!(strip_ansi("a\x1b[?2004lb"), "ab");
     assert_eq!(strip_ansi("a\x1b[2 qb"), "ab");
     assert_eq!(strip_ansi("a\x1b[1;31mb\x1b[0m"), "ab");
+    // A CSI cut short by the next escape does not swallow that escape.
+    assert_eq!(strip_ansi("a\x1b[31\x1b[0mb"), "ab");
 }
 
 #[test]

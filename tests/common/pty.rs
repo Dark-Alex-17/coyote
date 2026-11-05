@@ -417,7 +417,11 @@ pub fn strip_ansi(text: &str) -> String {
                 while matches!(chars.get(i), Some(c) if ('\x20'..='\x2f').contains(c)) {
                     i += 1;
                 }
-                i += 1;
+                // Only a real final byte is consumed: a CSI cut short by a
+                // bare ESC leaves that ESC to start the next sequence.
+                if matches!(chars.get(i), Some(c) if ('\x40'..='\x7e').contains(c)) {
+                    i += 1;
+                }
             }
             // OSC, DCS, APC, PM and SOS strings run to ST or BEL; their
             // payload is not screen text.
