@@ -992,7 +992,9 @@ fn engineer_architect_block_states_the_discussion_contract() {
     let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
     let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
-        "When the last run's exposed `discussion` is set",
+        "When the last run's exposed `discussion` is non-empty, the run is parked on that question",
+        "(`discussion.kind` names it: a design round, quality bar, checklist item or Gate 1 question)",
+        "the user's `reply`",
         "the recommended one is marked",
         "the answers so far and the plan path",
         "Do not edit the plan and do not answer for the user",

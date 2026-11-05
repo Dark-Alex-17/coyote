@@ -508,13 +508,13 @@ def _end_choices(u):
               "choice_parks": {}, "choice_forced": False})
 
 
-def _ask_choice(state, u, heading):
+def _ask_choice(state, u, heading, evidence=""):
     """Raise the queue's current question as a multiple-choice escalation of the queue's kind."""
     s = {**state, **u}
     queue, idx = as_list(s.get("choice_queue")), as_int(s.get("choice_index"))
     item = queue[idx]
     return raise_escalation(state, u, escalation(
-        s.get("choice_kind"), f"{heading} {idx + 1} of {len(queue)}: {item['question']}", item["options"],
+        s.get("choice_kind"), f"{heading} {idx + 1} of {len(queue)}: {item['question']}", item["options"], evidence=evidence,
         data={"multiple_choice": True, "question": item["question"], "index": idx}))
 
 
@@ -875,7 +875,7 @@ def leak_route(state):
     queue = as_list(state.get("choice_queue"))
     if state.get("choice_kind") == "leak_question" and queue:
         if as_int(state.get("choice_index")) < len(queue):
-            return _ask_choice(state, u, LEAK_HEADING)
+            return _ask_choice(state, u, LEAK_HEADING, tail(state.get("gate1_result", ""), 1500))
         return _leak_amend(state, u, [a for a in as_list(state.get("choice_answers")) if isinstance(a, dict)])
     reframed = state.get("choice_kind") == "leak_question" and truthy(state.get("choice_reframed"))
     items = [i for i in map(_leak_item, as_list(state.get("leak_unanswerable"))) if i]
@@ -921,7 +921,7 @@ def leak_route(state):
     if not askable:
         return _leak_amend(state, u, [])
     _start_choices(u, "leak_question", askable)
-    return _ask_choice(state, u, LEAK_HEADING)
+    return _ask_choice(state, u, LEAK_HEADING, tail(state.get("gate1_result", ""), 1500))
 
 
 def gate2_build(state):
@@ -2559,8 +2559,13 @@ def ask_owner_poll(state):
     polls = as_int(state.get("owner_polls")) + 1
     u["owner_polls"] = polls
     opts = " | ".join(f"{i}) {o.get('text', '')}" for i, o in enumerate(esc.get("options") or [], 1))
+    data = as_dict(esc.get("data"))
+    thread = f"{state.get('run_id', 'run')}-{esc.get('kind', 'q')}"
+    if data.get("multiple_choice"):
+        # one remote thread per question, so a reply to an earlier question never lands on the next one
+        thread += f"-{as_int(data.get('index'))}"
     binary = os.environ.get("ARCHITECT_ASK_OWNER_BIN", "ask_owner")
-    cmd = [binary, "--text", esc.get("question", ""), "--id", f"{state.get('run_id', 'run')}-{esc.get('kind', 'q')}",
+    cmd = [binary, "--text", esc.get("question", ""), "--id", thread,
            "--wait-minutes", str(OWNER_WAIT_MINUTES), "--poll-minutes", str(OWNER_POLL_MINUTES)]
     if opts:
         cmd += ["--options", opts]
@@ -2621,7 +2626,12 @@ def parse_answer(state):
                                  f"free text stands after {STRIKE_LIMIT} tries).\n\n" + state.get("ask_question", ""))
             u["_next"] = _terminal_prompt(esc)
             return u
-        choice = text
+        if not text and options and as_dict(esc.get("data")).get("multiple_choice"):
+            choice = options[0].get("text", "")
+            ledger(state, u, f"choice: {esc.get('kind')}: empty reply after {STRIKE_LIMIT} re-asks -> the recommended "
+                             f"option: {tail(choice, 200)}")
+        else:
+            choice = text
     u.update({"last_answer": choice, "last_answer_text": text, "parked": ""})
     ledger(state, u, f"decision: {esc.get('kind')}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"

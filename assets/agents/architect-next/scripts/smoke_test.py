@@ -693,6 +693,15 @@ check("leak_route: framed unanswerable questions -> one multiple choice per ques
       and "1 of 2: priority of X vs Y?" in s["escalation"]["question"] and len(s["choice_queue"]) == 2
       and s["leak_pending_answers"] == [{"question": "a", "answer": "b"}], s)
 leak_asked = dict(s)
+VERDICT = "x" * 2000 + "\nGATE1: QUESTIONS priority of X vs Y?"
+lv = base_state(gate1_result=VERDICT, leak_answers=[], leak_unanswerable=[LEAK_Q, LEAK_Q2])
+lv.update(gates.leak_route(lv))
+lv1 = lv["escalation"]["evidence"]
+lv.update(gates.apply_answer({**lv, "last_answer": "X first"}))
+lv.update(gates.leak_route(lv))
+check("leak_route: every leak_question escalation carries the gatekeeper verdict tail as its evidence",
+      lv1 == lv["escalation"]["evidence"] == gates.tail(VERDICT, 1500) and "GATE1: QUESTIONS" in lv1
+      and "2 of 2" in lv["escalation"]["question"], lv["escalation"])
 s.update(gates.apply_answer({**s, "last_answer": "X first"}))
 check("apply_answer: leak_question -> recorded through the queue -> leak_route", s["_next"] == "leak_route" and s["choice_index"] == 1)
 s.update(gates.leak_route(s))
@@ -1349,6 +1358,15 @@ check("ask_owner_route: PENDING at budget -> terminal (B21 side 2)", gates.ask_o
 check("ask_owner_route: ANSWERED -> parse_answer", gates.ask_owner_route(base_state(escalation=E, owner_polls=1, owner_poll_result="ANSWERED: 1"))["_next"] == "parse_answer")
 os.environ["ARCHITECT_ASK_OWNER_BIN"] = os.path.join(TMP, "missing-bin")
 check("ask_owner_poll: missing tool -> NOT_DELIVERED", "NOT_DELIVERED" in gates.ask_owner_poll(base_state(escalation=E))["owner_poll_result"])
+ARGS_ASK_OWNER = os.path.join(TMP, "args_ask_owner")
+write(ARGS_ASK_OWNER, "#!/usr/bin/env bash\necho \"PENDING $*\"\n", exe=True)
+os.environ["ARCHITECT_ASK_OWNER_BIN"] = ARGS_ASK_OWNER
+E_DQ_THREAD = {**E_DQ, "data": {**E_DQ["data"], "index": 2}}
+out_mc = gates.ask_owner_poll(base_state(run_id="r9", escalation=E_DQ_THREAD))["owner_poll_result"]
+out_plain = gates.ask_owner_poll(base_state(run_id="r9", escalation=E))["owner_poll_result"]
+check("ask_owner_poll: a multiple-choice question gets its own remote thread id <run_id>-<kind>-<index>",
+      f"--id r9-{E_DQ['kind']}-2 " in out_mc and "--id r9-conformance_stuck --wait-minutes" in out_plain, (out_mc, out_plain))
+os.environ["ARCHITECT_ASK_OWNER_BIN"] = os.path.join(TMP, "missing-bin")
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="2"))
 check("parse_answer: number -> option; parked cleared; decision ledgered", u["_next"] == "apply_answer" and u["last_answer"] == "One more round" and u["parked"] == "" and any(d.startswith("decision:") for d in u["decisions"]))
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0))
@@ -1357,6 +1375,13 @@ u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask
 check("parse_answer: B22 exhausted -> free text stands", u["_next"] == "apply_answer" and u["last_answer"] == "banana")
 u = gates.parse_answer(base_state(escalation=escalation("need_design_doc", "q"), last_answer_text="/tmp/x.md please"))
 check("parse_answer: free-text kinds never re-ask", u["_next"] == "apply_answer")
+u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="", reask_rounds=STRIKE_LIMIT - 1))
+check("parse_answer: an empty multiple-choice reply with re-asks left -> re-ask",
+      u["_next"] == gates._terminal_prompt(E_DQ) and u["reask_rounds"] == STRIKE_LIMIT and "last_answer" not in u, u)
+u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="", reask_rounds=STRIKE_LIMIT))
+check("parse_answer: an empty multiple-choice reply after the re-asks are spent -> the recommended option, ledgered",
+      u["_next"] == "apply_answer" and u["last_answer"] == E_DQ["options"][0]["text"] == "pg"
+      and any("empty reply" in d and "recommended" in d for d in u["decisions"]), u)
 for reply, want in (("Option 1 (recommended)", "pg"), ("Option 3", "redis"), ("2", "sqlite"), ("sqlite", "sqlite")):
     u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text=reply))
     check(f"parse_answer: design question reply {reply!r} -> option text {want!r} -> apply_answer",

@@ -54,9 +54,11 @@ whose `vehicle` is `architect` (a seed with no `vehicle` key counts as
 `architect`), and marks the one it uses `status: consumed` once the run has
 oriented on it.
 
-A run that parks on a design question for discussion exposes it as
-`discussion` in its last-run record: the question, its options with the
-recommended one marked, the answers so far and the plan path. The engineer
+A run that parks on a question for discussion exposes it as a non-empty
+`discussion` in its last-run record. `discussion.kind` names the question (a
+design round, quality bar, checklist item or Gate 1 question); the record
+carries the question, its options with the recommended one marked, the
+user's `reply` that parked it, the answers so far and the plan path. The engineer
 discusses it without editing the plan or answering for the user, then tells
 the user to say `continue: <settled answer>` (or `continue` to be asked again)
 so the run resumes at that question. `resume` works the same as `continue`;

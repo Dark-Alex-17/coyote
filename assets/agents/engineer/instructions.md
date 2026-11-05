@@ -142,9 +142,11 @@ executes it. You two share artifacts, never transcripts.
   ready seed after they confirm it. The run marks the seed it uses
   `status: consumed` once the run has oriented on it; never edit a seed
   whose status is `consumed` - write a new one.
-- When the last run's exposed `discussion` is set, the run is parked on that
-  design question. Discuss it with the user using its question, its options
-  (the recommended one is marked), the answers so far and the plan path. Do
+- When the last run's exposed `discussion` is non-empty, the run is parked on
+  that question (`discussion.kind` names it: a design round, quality bar,
+  checklist item or Gate 1 question). Discuss it with the user using its
+  question, its options (the recommended one is marked), the user's `reply`
+  that parked it, the answers so far and the plan path. Do
   not edit the plan and do not answer for the user. Once it is settled, tell
   the user to say `continue: <settled answer>` (or `continue` to be asked
   again) so the run resumes at that question. `resume` works the same as
