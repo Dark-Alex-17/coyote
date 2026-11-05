@@ -564,6 +564,7 @@ fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<O
         return Ok(ObsoleteAction::Keep);
     }
 
+    // The branch above already keeps under the UI; defence in depth.
     ensure_prompts_available()?;
     let prompt = format!(
         "Obsolete file {path} is no longer shipped by the bundle and has local modifications"
@@ -984,6 +985,7 @@ fn resolve_uninstall_action(
         return Ok(action);
     }
 
+    // The first branch already keeps under the UI; defence in depth.
     ensure_prompts_available()?;
     let choice = Select::new(prompt, vec!["keep", "delete", "keep-all", "delete-all"])
         .prompt()
@@ -2222,6 +2224,7 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
             conflict::rerun_hint()
         );
     }
+    // The refusal above already covers the UI; defence in depth.
     ensure_prompts_available()?;
     let rename_label = format!("rename remote as \"{name}-remote\"");
     let prompt = format!("Conflict on MCP server '{name}'");

@@ -16,7 +16,9 @@ use common::pty::{Pty, strip_ansi};
 use serial_test::serial;
 
 const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Hotkeys on a modal only count once it has been up for a second.
+/// Hotkeys on a modal count only once both the last keystroke and the
+/// modal's appearance are at least HOTKEY_IDLE (1 s) old; 1200 ms settles
+/// both.
 const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 const ENTER_ALT: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALT: &[u8] = b"\x1b[?1049l";

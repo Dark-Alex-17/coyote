@@ -603,8 +603,9 @@ mod tests {
     }
 
     impl ThisThreadRecording {
-        /// Subscribes to the process-wide bus, so every test that installs
-        /// one runs serially: a sibling's events would land in it too.
+        /// Subscribes to the process-wide bus, so it runs under
+        /// `#[serial]`: the bus's own `sink_count` pins in `events::tests`
+        /// must not see a second subscriber.
         fn install() -> Self {
             let sink = std::sync::Arc::new(ThisThreadSink {
                 thread: std::thread::current().id(),

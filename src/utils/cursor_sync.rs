@@ -363,12 +363,16 @@ fn resync_stdout() -> Resync {
     use crate::utils::IS_STDOUT_TERMINAL;
     use is_terminal::IsTerminal;
 
-    if should_skip(
-        *IS_STDOUT_TERMINAL,
-        io::stdin().is_terminal(),
-        std::env::var_os("TERM").as_deref(),
-        backoff_armed(),
-    ) {
+    // Under the full-screen UI the event stream owns stdin; a cursor query
+    // here would race it for the reply.
+    if crate::tui::active()
+        || should_skip(
+            *IS_STDOUT_TERMINAL,
+            io::stdin().is_terminal(),
+            std::env::var_os("TERM").as_deref(),
+            backoff_armed(),
+        )
+    {
         return Resync::Skipped;
     }
     let Ok((cols, _)) = crossterm::terminal::size() else {

@@ -12,12 +12,14 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
-use common::fake_llm::{Chunk, FakeLlm, Reply};
+use common::fake_llm::{Chunk, FakeLlm, HOLD_LIMIT, Reply};
 use common::pty::{Pty, strip_ansi};
 use serial_test::serial;
 
 const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Hotkeys on a modal only count once it has been up for a second.
+/// Hotkeys on a modal count only once both the last keystroke and the
+/// modal's appearance are at least HOTKEY_IDLE (1 s) old; 1200 ms settles
+/// both.
 const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 const ENTER_ALT: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
@@ -154,7 +156,7 @@ const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20   local marker\n\
     \x20   marker=\"$(jq -r '.marker' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
     \x20   : > \"${marker}-started\"\n\
-    \x20   for _ in $(seq 1 160); do\n\
+    \x20   for _ in $(seq 1 600); do\n\
     \x20       [ -e \"${marker}-release\" ] && break\n\
     \x20       sleep 0.05\n\
     \x20   done\n\
@@ -352,7 +354,12 @@ fn interrupt_a_held_stream(pty: &mut Pty, head: &str) -> usize {
     pty.wait_for("temp", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(500));
     pty.send(b"stream and hold\r").unwrap();
+    let started = Instant::now();
     wait_for_squeezed_after(pty, head, 0, "the first delta");
+    assert!(
+        started.elapsed() < HOLD_LIMIT,
+        "the first delta appeared only after the fake gave up holding the stream"
+    );
     pty.wait_for("Esc to interrupt", PTY_DEADLINE)
         .expect("the status row never offered Esc to interrupt");
     let pressed_at = pty.raw().len();
@@ -753,7 +760,12 @@ fn a_resize_mid_stream_leaves_no_duplicated_reply_rows() {
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b"stream and hold\r").unwrap();
+    let started = Instant::now();
     wait_for_squeezed_after(&mut pty, "head-a7q", 0, "the first delta");
+    assert!(
+        started.elapsed() < HOLD_LIMIT,
+        "the first delta appeared only after the fake gave up holding the stream"
+    );
     pty.wait_for("Esc to interrupt", PTY_DEADLINE)
         .expect("the status row never offered Esc to interrupt");
 

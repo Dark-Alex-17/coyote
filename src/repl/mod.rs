@@ -2091,10 +2091,7 @@ Press Ctrl+C while the model is working to interrupt the turn; press it again at
     prefix.render_hints(&text).into_owned()
 }
 
-pub(crate) fn parse_command(
-    line: &str,
-    prefix: CommandPrefix,
-) -> Option<(Cow<'_, str>, Option<&str>)> {
+fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Option<&str>)> {
     match COMMAND_RE.captures(line) {
         Ok(Some(captures)) => {
             let cmd = prefix.normalize(captures.get(1)?.as_str())?;
@@ -2109,7 +2106,7 @@ pub(crate) fn parse_command(
 /// The text inside a `::: ... :::` multi-line fence, or the line itself
 /// when it has none. Every surface classifies a submitted line through
 /// this, so a fenced command runs and is shown as a command everywhere.
-pub(crate) fn unfence(line: &str) -> &str {
+fn unfence(line: &str) -> &str {
     match MULTILINE_RE.captures(line) {
         Ok(Some(captures)) => captures.get(1).map_or(line, |text| text.as_str()),
         _ => line,

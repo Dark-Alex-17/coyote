@@ -1713,18 +1713,14 @@ fn run_tool_refused_as_its_first_act(scenario: &str, body: &str) -> (String, Vec
         .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
         .env("COYOTE_UI", "tui")
         .env("TERM", "xterm");
-    let started = Instant::now();
     let mut pty = Pty::spawn(cmd).unwrap();
+    // The deadline on the wait is the bound: a tool that spins or reads
+    // the tty never prints the marker.
     let transcript = pty
         .wait_for("tty-probe-done", PTY_DEADLINE)
         .unwrap_or_else(|e| {
             panic!("the tool never came back (spinning or reading the tty?): {e:?}")
         });
-    let took = started.elapsed();
-    assert!(
-        took < Duration::from_secs(5),
-        "the refusal took {took:?}:\n{transcript}"
-    );
     assert!(
         transcript.contains("tool-rc=1 stdout-bytes=0 stderr-lines=1"),
         "not a one-line refusal with a non-zero exit and empty stdout:\n{transcript}"

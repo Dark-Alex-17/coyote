@@ -22,7 +22,8 @@
 #
 # When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set), confirm,
 # list, checkbox, input and password are answered through it; range and
-# editor always use the terminal. File descriptor 9 is reserved for the
+# editor have no channel path and use the terminal when one is permitted
+# (see below). File descriptor 9 is reserved for the
 # channel's request stream while the helper is sourced. The channel answers
 # one prompt at a time: never run two helpers concurrently (background
 # subshells) in the same tool, or they will swallow each other's replies.

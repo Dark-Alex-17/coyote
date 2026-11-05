@@ -64,11 +64,12 @@ impl Pty {
                     }
                 }
                 // Everything else the test runner holds without
-                // close-on-exec goes too: a child must never inherit a
-                // lock file or a sibling test's pipe. Descriptors that
-                // carry the flag are left alone: exec drops them anyway,
-                // and one of them is std's exec-status pipe, which the
-                // parent needs to learn that execvp failed.
+                // close-on-exec goes too, scanning the descriptors below
+                // 1024 (or the soft limit when lower): a child must never
+                // inherit a lock file or a sibling test's pipe. Descriptors
+                // that carry the flag are left alone: exec drops them
+                // anyway, and one of them is std's exec-status pipe, which
+                // the parent needs to learn that execvp failed.
                 let mut nofile = libc::rlimit {
                     rlim_cur: 0,
                     rlim_max: 0,

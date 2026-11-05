@@ -2285,7 +2285,7 @@ mod tests {
             );
             harness.app.sync_from_ctx(&mut returned);
             let final_frame = harness.draw();
-            insta::assert_snapshot!("stream_final", final_frame.clone());
+            insta::assert_snapshot!("stream_final", &final_frame);
             // What tells the two frames apart: the status row shows the
             // running turn under the first delta and is empty once the
             // turn has ended.
@@ -2402,7 +2402,7 @@ mod tests {
             },
         );
         let rendered = harness.draw();
-        insta::assert_snapshot!("info_command_cell_100x30", rendered.clone());
+        insta::assert_snapshot!("info_command_cell_100x30", &rendered);
         assert!(rendered.contains("\"model                         openai:test-model"));
         assert_eq!(duplicated_adjacent_rows(&rendered), 0);
     }
@@ -3193,10 +3193,10 @@ mod tests {
         });
 
         let wide = harness.draw();
-        insta::assert_snapshot!("resize_80x24", wide.clone());
+        insta::assert_snapshot!("resize_80x24", &wide);
         harness.resize(40, 24);
         let narrow = harness.draw();
-        insta::assert_snapshot!("resize_40x24", narrow.clone());
+        insta::assert_snapshot!("resize_40x24", &narrow);
         harness.resize(80, 24);
         let wide_again = harness.draw();
 
@@ -3230,7 +3230,7 @@ mod tests {
         let _asker = ask_on_a_thread(&mut harness, req);
 
         let rendered = harness.draw();
-        insta::assert_snapshot!("wrapped_narration_and_question_40x20", rendered.clone());
+        insta::assert_snapshot!("wrapped_narration_and_question_40x20", &rendered);
         let shown = squeezed(&rendered);
         let hint = confirm_hint(true, true);
         for text in [narration.as_str(), question, hint.as_str()] {
@@ -3268,7 +3268,7 @@ mod tests {
         let asker = ask_on_a_thread(&mut harness, req);
 
         let rendered = harness.draw();
-        insta::assert_snapshot!("clipped_question_marker_40x20", rendered.clone());
+        insta::assert_snapshot!("clipped_question_marker_40x20", &rendered);
         assert!(
             rendered.contains("(+2 more lines; enlarge the terminal)"),
             "{rendered}"
@@ -3391,7 +3391,7 @@ mod tests {
         let asker = ask_on_a_thread(&mut harness, req);
 
         let rendered = harness.draw();
-        insta::assert_snapshot!("long_path_confirm_40x20", rendered.clone());
+        insta::assert_snapshot!("long_path_confirm_40x20", &rendered);
         assert!(
             squeezed(&rendered).contains(&squeezed(&question)),
             "{rendered}"
@@ -4182,9 +4182,10 @@ mod tests {
         assert_eq!(loader.matches("Stdio::null()").count(), 2, "{loader}");
     }
 
-    /// The two stdin readers outside this module stand down while the UI
-    /// owns the terminal: no spinner polls the keyboard and no stale-input
-    /// drain toggles raw mode under the event stream.
+    /// The stdin readers outside this module stand down while the UI owns
+    /// the terminal: no spinner polls the keyboard, no stale-input drain
+    /// toggles raw mode under the event stream, and no cursor query waits
+    /// for a reply the event stream would take.
     #[test]
     fn every_other_stdin_reader_checks_the_tui_flag() {
         let spinner = include_str!("../utils/spinner.rs");
@@ -4194,6 +4195,8 @@ mod tests {
         );
         let utils = include_str!("../utils/mod.rs");
         assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));
+        let cursor_sync = include_str!("../utils/cursor_sync.rs");
+        assert!(fn_body(cursor_sync, "fn resync_stdout").contains("crate::tui::active()"));
     }
 
     /// A keyboard prompt asked while the UI owns the terminal is refused
