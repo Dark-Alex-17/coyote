@@ -703,18 +703,24 @@ def checklist_round(state):
         if as_int(state.get("choice_index")) < len(queue):
             return _ask_choice(state, u, "Best-practice checklist item")
         accepted = []
+        rulings = []
         for item, a in zip(queue, as_list(state.get("choice_answers"))):
             answer = str(as_dict(a).get("answer") or "").strip()
             if answer == CHECKLIST_ACCEPT:
                 accepted.append(item["item"])
             elif answer and answer != CHECKLIST_DROP:
-                accepted.append(f"{item['item']} (owner: {answer})")
+                # typed text may decline the item as easily as accept it, so amend_plan reads it as a ruling
+                rulings.append(f"Owner ruling on {item['item']}: {answer}; apply only if it accepts the item")
         _end_choices(u)
-        if accepted:
-            u["pending_amendments"] = ["Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
-                                       "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
-                                       + "\n".join(f"- {x}" for x in accepted)]
-            ledger(state, u, f"checklist: {len(accepted)}/{len(queue)} items accepted")
+        if accepted or rulings:
+            lines = []
+            if accepted:
+                lines.append("Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
+                             "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
+                             + "\n".join(f"- {x}" for x in accepted))
+            lines += rulings
+            u["pending_amendments"] = ["\n".join(lines)]
+            ledger(state, u, f"checklist: {len(accepted)}/{len(queue)} items accepted, {len(rulings)} owner ruling(s)")
             u["_next"] = "amend_plan"
         else:
             ledger(state, u, "checklist: no items accepted")

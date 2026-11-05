@@ -618,11 +618,18 @@ def checklist_walk(replies):
     return s
 
 
-s = checklist_walk(["1", "Drop", "yes, the platform team owns it"])
-check("checklist walk: accept, drop and an Other answer -> amend_plan with the accepted items, the Other one in the user's wording",
+s = checklist_walk(["1", "Drop", "no, skip it"])
+check("checklist walk: a declining Other answer -> an owner ruling line, not an accepted item",
       s["_next"] == "amend_plan" and "- [grpc] use deadlines\n" in s["pending_amendments"][0]
-      and "- [grpc] retry calls (owner: yes, the platform team owns it)" in s["pending_amendments"][0]
+      and "Owner ruling on [grpc] retry calls: no, skip it; apply only if it accepts the item" in s["pending_amendments"][0]
+      and "- [grpc] retry calls" not in s["pending_amendments"][0]
       and "propagate metadata" not in s["pending_amendments"][0] and s["choice_kind"] == "", s.get("pending_amendments"))
+s = checklist_walk(["Drop", "Drop", "yes, but only for the public API"])
+check("checklist walk: an accepting Other answer alone -> an owner ruling line to amend_plan, no accepted-item list",
+      s["_next"] == "amend_plan"
+      and "Owner ruling on [grpc] retry calls: yes, but only for the public API; apply only if it accepts the item" in s["pending_amendments"][0]
+      and "Accepted best-practice checklist items" not in s["pending_amendments"][0]
+      and "- [grpc] retry calls" not in s["pending_amendments"][0], s.get("pending_amendments"))
 s = checklist_walk(["2", "drop", "Drop"])
 check("checklist walk: every item dropped -> checklist_gate, nothing to amend", s["_next"] == "checklist_gate"
       and "pending_amendments" not in s and s["choice_queue"] == [], s)

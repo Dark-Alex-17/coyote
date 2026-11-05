@@ -367,7 +367,10 @@ and any other one is carried (a design question as a plan Open question, a Gate 
 an open `Gate 1 leak:` amendment line for the next gatekeeper pass). A reply that names an
 option is recorded as that option; typed text goes to the `classify_reply` llm node, which
 decides whether it answers the question (recorded as given) or opens a discussion (unclear
-counts as a discussion). A discussion parks the run: `choice_park` keeps the queue and the
+counts as a discussion). A typed answer to a checklist item is never taken as an accept: it
+reaches `amend_plan` as its own `Owner ruling on <item>: <answer>; apply only if it accepts
+the item` line, apart from the accepted items, so the round goes to `amend_plan` unless every
+item was dropped. A discussion parks the run: `choice_park` keeps the queue and the
 answers so far, snapshots state.json, sets the exposed `discussion` state key (the question,
 its options with the recommended one marked, the reply, the answers so far and the plan path)
 for the engineer chat lane, carries `discussion_run_id` into the next run, and ends at
