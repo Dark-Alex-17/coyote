@@ -979,6 +979,11 @@ impl App {
         };
         if self.prompts.is_empty() {
             self.question_area = None;
+            // The idle gate counts from the moment the modal appears, not
+            // from the user's last key: a user idle for a second who taps a
+            // hotkey as the modal comes up has not seen it yet. The next
+            // queued prompt is re-armed the same way when the front answers.
+            self.last_keystroke = Some(self.clock.now());
         }
         self.prompts.push_back(PendingPrompt { req, reply, field });
     }
@@ -2509,10 +2514,42 @@ mod tests {
         ] {
             let mut harness = Harness::standalone(80, 24);
             let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+            // The gate counts from the modal's appearance.
+            harness.clock.advance(HOTKEY_IDLE);
             assert_eq!(harness.press(key), None);
             assert_eq!(asker.join().unwrap().unwrap(), expected, "{key:?}");
             assert!(harness.app.prompts.is_empty());
         }
+    }
+
+    /// A user idle for longer than the gate who taps a hotkey just as the
+    /// modal comes up has not seen it: the gate counts from the modal's
+    /// appearance, so the tap is dropped and the same key answers once
+    /// the modal has been up for `HOTKEY_IDLE`. Esc stays exempt.
+    #[test]
+    fn a_hotkey_as_the_modal_appears_is_not_an_answer() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.clock.advance(10 * HOTKEY_IDLE);
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            harness.app.prompts.len(),
+            1,
+            "the undrawn modal was answered"
+        );
+        assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+
+        let mut harness = Harness::standalone(80, 24);
+        harness.clock.advance(10 * HOTKEY_IDLE);
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
     }
 
     #[test]
