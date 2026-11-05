@@ -7015,20 +7015,65 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
 fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     let declined = const_str("src/mesh/node.rs", "HUMAN_DECLINED");
     assert_eq!(declined, "the human declined to answer");
-    let one = string_literals(&fn_body("src/repl/mesh.rs", "dismiss_one"));
+    let one_source = fn_body("src/repl/mesh.rs", "dismiss_one");
+    assert_eq!(
+        one_source
+            .matches("out_path_text(&dismissed_line(id, &name, silent)")
+            .count(),
+        2,
+        "dismiss_one no longer prints the line dismissed_line builds on both the silent and the told path:\n{one_source}"
+    );
+    let line_source = fn_body("src/repl/mesh.rs", "dismissed_line");
+    assert!(
+        line_source.contains(r#"&[("declined", HUMAN_DECLINED)],"#)
+            && line_source.contains(r#"&[("id", short(id)), ("name", name)],"#),
+        "dismissed_line no longer frames HUMAN_DECLINED and quotes the short id and the asker's name:\n{line_source}"
+    );
+    let one = string_literals(&line_source);
     let silent_line =
-        "Dismissed {} without telling {name}. .mesh pending shows what is still open.";
+        "Dismissed {id} without telling {name}. .mesh pending shows what is still open.";
     let told_line =
-        "Dismissed {}; {name} hears that {HUMAN_DECLINED}. .mesh pending shows what is still open.";
+        "Dismissed {id}; {name} hears that {declined}. .mesh pending shows what is still open.";
     for needle in [silent_line, told_line] {
         assert!(
             one.iter().any(|literal| literal == needle),
-            "dismiss_one no longer prints {needle:?}: {one:?}"
+            "dismissed_line no longer builds {needle:?}: {one:?}"
         );
     }
+    let silent_line = &silent_line.replace("{id}", "{id8}");
+    let told_line = &told_line
+        .replace("{id}", "{id8}")
+        .replace("{declined}", "{HUMAN_DECLINED}");
     let all_source = fn_body("src/repl/mesh.rs", "dismiss_all");
     let all = string_literals(&all_source);
-    let list_row = "  {} . {} ({}) . asked {asked}";
+    assert_in_source_order(
+        "dismiss_all",
+        &all_source,
+        &[
+            "dismiss_all_row(",
+            "&record.id,",
+            "&ctx.app.mesh.peer_name_at(&record.peer_destination),",
+            "&record.peer_destination,",
+            "&asked,",
+        ],
+    );
+    let row_source = fn_body("src/repl/mesh.rs", "dismiss_all_row");
+    assert!(
+        row_source.contains(r#"&[("destination", short(destination)), ("asked", asked)],"#)
+            && row_source.contains(r#"&[("id", id), ("name", name)],"#),
+        "dismiss_all_row no longer frames the short destination and age and quotes the id and name:\n{row_source}"
+    );
+    let row_template = "  {id} . {name} ({destination}) . asked {asked}";
+    assert!(
+        string_literals(&row_source)
+            .iter()
+            .any(|literal| literal == row_template),
+        "dismiss_all_row no longer builds {row_template:?}:\n{row_source}"
+    );
+    let list_row = &row_template
+        .replace("{id}", "{}")
+        .replace("{name}", "{}")
+        .replace("{destination}", "{}");
     let dry_run = const_str("src/repl/mesh.rs", "DRY_RUN_NOTHING_CHANGED");
     assert_eq!(dry_run, "This was a dry run; nothing changed.");
     assert!(
@@ -7040,13 +7085,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     let confirm_silent = "Dismiss {open_questions} without telling the askers?";
     let confirm_told = "Dismiss {open_questions}? Each asker hears that {HUMAN_DECLINED}.";
     let telling_all = "Telling {} that you declined over the mesh...";
-    for needle in [
-        list_row,
-        none_open,
-        confirm_silent,
-        confirm_told,
-        telling_all,
-    ] {
+    for needle in [none_open, confirm_silent, confirm_told, telling_all] {
         assert!(
             all.iter().any(|literal| literal == needle),
             "dismiss_all no longer prints {needle:?}: {all:?}"
@@ -7056,18 +7095,40 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         all_source.contains("dismiss_all_summary(dismissed, &held, &stayed, silent)"),
         "dismiss_all no longer prints the summary dismiss_all_summary builds:\n{all_source}"
     );
-    let summary_literals = string_literals(&fn_body("src/repl/mesh.rs", "dismiss_all_summary"));
+    let summary_source = fn_body("src/repl/mesh.rs", "dismiss_all_summary");
+    assert!(
+        summary_source.contains("NoticeText::default().peer(id.as_str())"),
+        "dismiss_all_summary no longer quotes each listed id:\n{summary_source}"
+    );
+    assert_in_source_order(
+        "dismiss_all_summary",
+        &summary_source,
+        &[
+            r#""Dismissed {dismissed}; .mesh pending shows what is still open""#,
+            r#""; {} still being answered by the envoy: ""#,
+            ".then(ids(held))",
+            r#"". Dismiss each with .mesh dismiss <id> once its hold lapses""#,
+            r#"("stay pending", "Retry with .mesh dismiss --all --silent")"#,
+            r#""could not be told and stay pending","#,
+            r#""Retry, or .mesh dismiss --all --silent","#,
+            r#"format!("; {} {head}: ", stayed.len())"#,
+            ".then(ids(stayed))",
+            r#"format!(". {tail}")"#,
+            r#"summary.frame(".")"#,
+        ],
+    );
+    let summary_literals = string_literals(&summary_source);
     let summary_base = "Dismissed {dismissed}; .mesh pending shows what is still open";
     let stayed =
         "; {} could not be told and stay pending: {}. Retry, or .mesh dismiss --all --silent";
     let stayed_silent = "; {} stay pending: {}. Retry with .mesh dismiss --all --silent";
     let held_tail = "; {} still being answered by the envoy: {}. Dismiss each with .mesh dismiss <id> once its hold lapses";
-    for needle in [summary_base, stayed, stayed_silent, held_tail] {
-        assert!(
-            summary_literals.iter().any(|literal| literal == needle),
-            "dismiss_all_summary no longer builds {needle:?}: {summary_literals:?}"
-        );
-    }
+    assert!(
+        summary_literals
+            .iter()
+            .any(|literal| literal == summary_base),
+        "dismiss_all_summary no longer builds {summary_base:?}: {summary_literals:?}"
+    );
     assert!(
         all_source.contains(r#"plural(count, "open question", "open questions")"#),
         "dismiss_all's confirmation no longer counts with the plural helper:\n{all_source}"
@@ -7141,10 +7202,38 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         held_source.contains(r#"&[("id", id)]"#),
         "dismiss_held_by_envoy no longer quotes the id as typed:\n{held_source}"
     );
-    let could_not = string_literals(&method_body("src/mesh/node.rs", "dismiss_inbound"))
+    assert_in_source_order(
+        "dismiss_inbound",
+        &method_body("src/mesh/node.rs", "dismiss_inbound"),
+        &[
+            "Err(decline_not_told(",
+            "&self.peer_name_at(&record.peer_destination),",
+            "id,",
+            "&err,",
+        ],
+    );
+    let not_told_source = fn_body("src/mesh/node.rs", "decline_not_told");
+    assert_in_source_order(
+        "decline_not_told",
+        &not_told_source,
+        &[
+            r#""Could not tell {name} that you declined (""#,
+            r#"&[("name", name)],"#,
+            ".then(error_notice(err))",
+            r#""); {short} stays pending."#,
+            r#"&[("short", short(id)), ("id", id)],"#,
+        ],
+    );
+    let not_told_runs: Vec<String> = string_literals(&not_told_source)
         .into_iter()
-        .find(|literal| literal.starts_with("Could not tell"))
-        .expect("dismiss_inbound words a failed send with one literal");
+        .filter(|literal| literal.contains(' '))
+        .collect();
+    let [opening, closing] = not_told_runs.as_slice() else {
+        panic!("decline_not_told no longer frames its sentence in two runs: {not_told_runs:?}");
+    };
+    let could_not = format!("{opening}{{err:#}}{closing}")
+        .replace("{name}", "{}")
+        .replace("{short}", "{}");
     assert_eq!(
         could_not,
         "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
@@ -8207,10 +8296,15 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
 /// peer standing as `<dest8>`.
 #[test]
 fn the_too_large_refusal_is_quoted_with_its_next_step_on_both_pages() {
-    let next_step = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
+    let fetch = fn_body("src/repl/mesh.rs", "fetch");
+    assert!(
+        fetch.contains("return Err(too_large_refusal(peer, &shown, limit));"),
+        "fetch no longer refuses a too-large file with too_large_refusal:\n{fetch}"
+    );
+    let next_step = string_literals(&fn_body("src/repl/mesh.rs", "too_large_refusal"))
         .into_iter()
         .find_map(|literal| literal.find(" Ask ").map(|at| literal[at..].to_string()))
-        .expect("fetch formats the too-large refusal with a next step opening ` Ask `");
+        .expect("too_large_refusal builds the refusal with a next step opening ` Ask `");
     assert!(
         next_step.contains("{peer}") && next_step.ends_with('.'),
         "the too-large next step names the peer and is a full sentence: {next_step:?}"
@@ -8665,10 +8759,21 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
 /// standing for the values.
 #[test]
 fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
-    let fetch_literal = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
+    let fetch = fn_body("src/repl/mesh.rs", "fetch");
+    assert!(
+        fetch.contains("return Err(too_large_refusal(peer, &shown, limit));"),
+        "fetch no longer refuses a too-large file with too_large_refusal:\n{fetch}"
+    );
+    let too_large = fn_body("src/repl/mesh.rs", "too_large_refusal");
+    assert!(
+        too_large.contains(r#"&[("peer", peer), ("limit", &limit.to_string())],"#)
+            && too_large.contains(r#"&[("shown", shown)],"#),
+        "too_large_refusal no longer frames the peer and its limit and quotes the path:\n{too_large}"
+    );
+    let fetch_literal = string_literals(&too_large)
         .into_iter()
         .find(|literal| literal.contains("serves files of at most {limit} bytes"))
-        .expect("fetch formats the too-large refusal naming the peer's limit");
+        .expect("too_large_refusal builds the refusal naming the peer's limit");
     assert!(
         fetch_literal.starts_with("{peer} "),
         "the `.mesh fetch` size refusal names the peer first: {fetch_literal:?}"
