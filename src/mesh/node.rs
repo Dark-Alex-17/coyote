@@ -16801,14 +16801,16 @@ mod tests {
             assert!(!seed_own_grant(&trust, OWN, true));
 
             let remedy = format!(
-                "make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity {OWN}`",
+                "make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity <hash>` with the identity hash `.mesh info` shows",
                 trust.path().display()
             );
             let warned = warn_snapshot();
             assert!(
-                warned
-                    .iter()
-                    .any(|line| line.contains("could not be trusted") && line.contains(&remedy)),
+                warned.iter().any(|line| {
+                    line.contains(&format!("own identity {} could not be trusted", short(OWN)))
+                        && line.contains(&remedy)
+                        && !line.contains(OWN)
+                }),
                 "{warned:#?}"
             );
         }
