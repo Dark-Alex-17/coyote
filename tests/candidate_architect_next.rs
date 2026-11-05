@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 668;
+const SMOKE_FLOOR: usize = 774;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -671,8 +671,8 @@ fn intake_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "draft-prompt",
-                ", \"draft_confirm\": \"confirm_draft\"}",
-                "}",
+                ", \"draft_confirm\": \"confirm_draft\",",
+                ",",
                 "ask_dispatch: draft_confirm -> confirm_draft",
             ),
             (
@@ -754,6 +754,153 @@ fn intake_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "\"mode_invalid\", \"need_design_doc\", \"seed_confirm\", \"clarify\"",
                 "\"mode_invalid\", \"need_design_doc\", \"clarify\"",
                 "apply_answer: seed_confirm abort -> end_aborted, seed still ready",
+            ),
+        ],
+    );
+}
+
+/// The multiple-choice design question guards, each removed from a scratch
+/// copy, turn their smoke row red: only the first of several recommended
+/// options stays recommended and moves first, an unmatched typed reply goes to
+/// the classifier, a discussion verdict parks the run, a resumed run parked on
+/// a discussion goes to `choice_resume`, which records the settled answer, the
+/// `>=` that stops parking at `DISCUSSION_PARKS_MAX`, the carried
+/// `discussion_run_id` cleared at intake, and a Gate 1 question that cannot be
+/// framed carried as an open amendment line. The rest guard the reply and
+/// resume edges: the re-frame keeps a question's scope flag, a multiple-choice
+/// escalation gets an `ask_choice_<n>` prompt, a forced question's typed reply
+/// skips the classifier, duplicate options collapse, a settled answer is read
+/// only after `continue:` or `resume:`, a resumed run keeps its held Gate 1
+/// answers and finished checklist labels, "Option 2, but ..." is no pick, and
+/// a checklist Other answer is an owner ruling, never an accepted item.
+#[test]
+#[ignore = "seventeen smoke battery runs take about three minutes; run with -- --ignored"]
+fn choice_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "choice-one-recommended",
+                "        for i in recommended[1:]:\n            opts[i][\"recommended\"] = False\n",
+                "        for i in recommended[1:]:\n            pass\n",
+                "normalize_choices: several recommended -> the first kept and moved first, the rest \
+             unmarked, ledgered",
+            ),
+            (
+                "choice-recommended-first",
+                "        opts.insert(0, opts.pop(recommended[0]))\n",
+                "        pass\n",
+                "normalize_choices: several recommended -> the first kept and moved first, the rest \
+             unmarked, ledgered",
+            ),
+            (
+                "choice-other-classifier",
+                "        elif choice is None and text:\n            u[\"_next\"] = \"classify_reply\"\n",
+                "        elif False:\n            u[\"_next\"] = \"classify_reply\"\n",
+                "parse_answer: design question unmatched free text (a Slack reply) -> classify_reply, \
+             never a re-ask nor taken raw",
+            ),
+            (
+                "choice-discussion-park",
+                "    u[\"_next\"] = \"choice_park\"\n",
+                "    u[\"_next\"] = \"apply_answer\"\n",
+                "choice_reply_route: discussion -> choice_park, still parked, nothing recorded",
+            ),
+            (
+                "choice-resume-route",
+                "    if state.get(\"parked\") == DISCUSSION_PARKED:\n",
+                "    if False:\n",
+                "resume_route: a run parked on a discussion -> choice_resume",
+            ),
+            (
+                "choice-settled-record",
+                "        _record_choice(state, u, settled, via=\"settled\")\n",
+                "        pass\n",
+                "choice_resume: a settled answer is recorded for the parked question (via settled); \
+             discussion and settled answer cleared",
+            ),
+            (
+                "choice-park-bound",
+                "    if count >= DISCUSSION_PARKS_MAX:\n",
+                "    if count > DISCUSSION_PARKS_MAX:\n",
+                "choice_park: a question parked DISCUSSION_PARKS_MAX times -> no park, choice_reask, \
+             its next typed reply forced",
+            ),
+            (
+                "discussion-key-cleared",
+                "    u[\"discussion_run_id\"] = \"\"\n    m = RESUME_RE.search(brief)\n",
+                "    m = RESUME_RE.search(brief)\n",
+                "intake: a message that is not a continue with the carried key -> a fresh run, the key \
+             cleared, the left discussion ledgered",
+            ),
+            (
+                "leak-carried",
+                "\"answer\": LEAK_CARRIED} for q in invalid]\n",
+                "\"answer\": LEAK_CARRIED} for q in []]\n",
+                "leak_route: still not askable after the re-frame -> carried as an open amendment line, \
+             ledgered",
+            ),
+            (
+                "choice-scope-flag-kept",
+                "truthy(f.get(\"changes_scope\")) or truthy(o.get(\"changes_scope\"))",
+                "truthy(f.get(\"changes_scope\"))",
+                "frame_questions_route: the re-framed question replaces the invalid one, keeps its \
+             scope flag -> open_questions_gate",
+            ),
+            (
+                "choice-terminal-prompt",
+                "    if as_dict(esc.get(\"data\")).get(\"multiple_choice\"):\n        return \
+             _TERMINAL_PROMPTS",
+                "    if False:\n        return _TERMINAL_PROMPTS",
+                "ask_dispatch / ask_owner_route: a multiple-choice escalation picks ask_choice_<option \
+             count>",
+            ),
+            (
+                "choice-forced-bypass",
+                "        if choice is None and text and truthy(state.get(\"choice_forced\")):\n",
+                "        if False:\n",
+                "parse_answer: a forced question's typed reply -> recorded as the answer without the \
+             classifier, ledgered",
+            ),
+            (
+                "choice-duplicate-drop",
+                "        opts = list(distinct.values())\n",
+                "        pass\n",
+                "normalize_choices: case-insensitive duplicate texts -> one option, the recommended \
+             copy kept, ledgered; two copies are not askable",
+            ),
+            (
+                "continue-colon-only",
+                "    cont = CONTINUE_RE.match(",
+                "    cont = re.compile(r\"(?is)^(?:continue|resume)\\W*(.*)$\").match(",
+                "intake: 'continue please' is prose, not a continue -> a fresh run, no answer \
+             recorded, the key cleared, the left discussion ledgered",
+            ),
+            (
+                "resume-state-keys",
+                "            if k in (\"phase\", \"updated_at\") or v is None:\n",
+                "            if k in (\"phase\", \"updated_at\", \"leak_pending_answers\", \
+             \"checklist_done\") or v is None:\n",
+                "resume chain: a parked Gate 1 question settled -> leak_route closes the round with \
+             the held, earlier and settled answers",
+            ),
+            (
+                "choice-qualified-pick",
+                "[\\W_]*$\", text or \"\")",
+                "\", text or \"\")",
+                "parse_answer -> classify_reply -> apply_answer: 'Option 2, but ...' is no pick; as \
+             an answer it is recorded in full, via other",
+            ),
+            (
+                "checklist-other-ruling",
+                "rulings.append(f\"Owner ruling on {item['item']}: {answer}; apply only if it accepts \
+             the item\")",
+                "accepted.append(f\"{item['item']} (owner: {answer})\")",
+                "checklist walk: a declining Other answer -> an owner ruling line, not an accepted \
+             item",
             ),
         ],
     );
@@ -892,6 +1039,78 @@ fn route_instructions_send_a_bare_go_ahead_to_run() {
         "routes RUN",
         "the run picks up the engineer's ready seed or drafts a brief",
         "confirms it with the user before any write to the repos",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the route instructions do not state {needle:?}:\n{route}"
+        );
+    }
+}
+
+/// A run parked on a design discussion hands the question to the chat lane,
+/// so the attachment block must say how to use it and how the user resumes.
+#[test]
+fn engineer_architect_block_states_the_discussion_contract() {
+    let text = fs::read_to_string(agents_dir().join("engineer/instructions.md")).unwrap();
+    let open = "<!-- when:chat_agent_for=architect -->";
+    let start = text.find(open).expect("no architect-attachment block") + open.len();
+    let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "When the last run's exposed `discussion` is non-empty, the run is parked on that question",
+        "(`discussion.kind` names it: a design round, quality bar, checklist item or Gate 1 question)",
+        "the user's `reply`",
+        "the recommended one is marked",
+        "the answers so far and the plan path",
+        "Do not edit the plan and do not answer for the user",
+        "`continue: <settled answer>`",
+        "(or `continue` to be asked again)",
+        "the run resumes at that question",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the architect-attachment block does not state {needle:?}:\n{block}"
+        );
+    }
+}
+
+/// The chat lane only sees what the graph exposes, and the resume only finds
+/// the parked run through the carried id.
+#[test]
+fn graph_exposes_the_discussion_and_carries_its_run_id() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let expose = doc["session"]["expose"]
+        .as_sequence()
+        .expect("graph.yaml has session.expose");
+    assert!(
+        expose.iter().any(|k| k.as_str() == Some("discussion")),
+        "session.expose does not list discussion: {expose:?}"
+    );
+    let carry: Vec<&str> = doc["carry"]
+        .as_sequence()
+        .expect("graph.yaml has carry")
+        .iter()
+        .filter_map(|k| k.as_str())
+        .collect();
+    assert_eq!(carry, ["discussion_run_id"]);
+    assert_eq!(doc["initial_state"]["discussion_run_id"].as_str(), Some(""));
+}
+
+/// "continue" after a discussion park is a resume, not a conversation, so the
+/// session router must send it to RUN.
+#[test]
+fn route_instructions_send_a_discussion_continue_to_run() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let route = doc["session"]["route"]["instructions"]
+        .as_str()
+        .expect("graph.yaml has session.route.instructions");
+    let flat = route.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "After the last run parked on a design discussion",
+        "\"continue\" or \"continue: <answer>\" routes RUN",
+        "the run resumes at the parked question",
     ] {
         assert!(
             flat.contains(needle),
@@ -2543,10 +2762,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![44, 2910, 2919],
+        vec![46, 3274, 3283],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2910, 2919] {
+    for line in [3274, 3283] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4223,8 +4442,8 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 
 /// Every integer field of every node in the shipped baseline (`timeout`,
 /// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
-/// plus the frozen budgets row, the review watch nodes and `draft_brief`; a
-/// node absent here declares none.
+/// plus the frozen budgets row, the review watch nodes, `draft_brief`,
+/// `classify_reply` and `frame_questions`; a node absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -4249,6 +4468,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("ci_evidence", "timeout", 390),
     ("ci_poll", "timeout", 180),
     ("claim_task", "timeout", 600),
+    ("classify_reply", "timeout", 120),
     ("compose_delegation", "timeout", 60),
     ("consult_navigator", "max_attempts", 1),
     ("consult_navigator", "timeout", 1800),
@@ -4264,6 +4484,8 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("final_report", "timeout", 300),
     ("finish_plan", "timeout", 600),
     ("flip_ready", "timeout", 390),
+    ("frame_questions", "max_iterations", 10),
+    ("frame_questions", "timeout", 600),
     ("gate1", "max_attempts", 2),
     ("gate1", "timeout", 3600),
     ("gate2", "max_attempts", 2),
@@ -4328,6 +4550,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "amend_cycles",
     "author_retries",
     "body_fix_rounds",
+    "choice_index",
     "ci_poll_fails",
     "ci_polls",
     "ci_polls_run",
@@ -4357,6 +4580,8 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// value the module computes from it.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("AMEND_CYCLES_MAX", "", "3", 3),
+    ("CHOICE_OPTIONS_MAX", "", "4", 4),
+    ("CHOICE_OPTIONS_MIN", "", "2", 2),
     ("CI_FLAKE_RERUNS", "", "2", 2),
     ("CI_MAX_ROUNDS", "", "CI_WALL_SECS // CI_POLL_SLEEP", 240),
     ("CI_POLL_FAILS", "", "3", 3),
@@ -4364,6 +4589,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("CI_WALL_SECS", "", "14400", 14400),
     ("CONFLICT_CYCLES_MAX", "", "2", 2),
     ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
+    ("DISCUSSION_PARKS_MAX", "", "3", 3),
     ("DRAFT_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
     ("GH_CALL_SECS", "", "90", 90),
     ("GH_LOOP_SECS", "", "180", 180),
@@ -4698,9 +4924,9 @@ fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
 }
 
 /// How each llm node's output schema carries the `anomalies` channel in the
-/// staging baseline plus `review_triage` and `draft_brief`: `Plain` is the
-/// optional string-array property, `NoSchema` is a node with no
-/// `output_schema` at all.
+/// staging baseline plus `review_triage`, `draft_brief`, `classify_reply` and
+/// `frame_questions`: `Plain` is the optional string-array property,
+/// `NoSchema` is a node with no `output_schema` at all.
 #[derive(Clone, Copy, Debug)]
 enum AnomaliesChannel {
     Plain,
@@ -4713,7 +4939,9 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("author_plan", AnomaliesChannel::Plain),
     ("batch_triage", AnomaliesChannel::Plain),
     ("ci_diagnose", AnomaliesChannel::Plain),
+    ("classify_reply", AnomaliesChannel::Plain),
     ("draft_brief", AnomaliesChannel::Plain),
+    ("frame_questions", AnomaliesChannel::Plain),
     ("integrate_findings", AnomaliesChannel::Plain),
     ("ladder_judge", AnomaliesChannel::Plain),
     ("orient_read", AnomaliesChannel::Plain),

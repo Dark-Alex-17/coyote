@@ -20,19 +20,21 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _lib  # noqa: E402
 from _lib import (  # noqa: E402
-    AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP,
-    CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, DRAFT_ROUNDS_MAX,
+    AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
+    CI_POLL_FAILS, CI_POLL_SLEEP,
+    CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONTINUE_RE, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
+    DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX,
     GATE1_HOUSE_LINE, GH_CALL_SECS, GH_LOOP_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
     PERM_LOOKUPS_PER_POLL, PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TAIL_CHARS, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
-    append_artifact, as_dict, as_int, as_list, commit_planning, context_pack, core_tool, emit,
+    append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, emit,
     ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section,
-    raise_escalation, read_artifact, read_file, run_dir_for, save_tasks, set_frontmatter,
+    raise_escalation, read_artifact, read_file, render_question, run_dir_for, save_tasks, set_frontmatter,
     set_task_status, sh, snapshot, tail, task_by_id, task_dir_for, task_section, today, truthy, var,
     write_artifact, write_file,
 )
@@ -201,17 +203,23 @@ def intake(state):
             git(u["plans_root"], "pull", "--quiet", "--ff-only")
         u["tasks_root"] = os.path.join(u["plans_root"], "tasks")
 
-    # Re-entry (A2).
+    # Re-entry (A2): the run id named in the prompt, or a continue after the last run parked on a discussion.
+    # The carried id is consumed here either way, so a run that does not park again carries nothing forward.
+    parked_run = str(state.get("discussion_run_id") or "").strip()
+    u["discussion_run_id"] = ""
     m = RESUME_RE.search(brief)
+    cont = CONTINUE_RE.match((RESUME_RE.sub("", brief) if m else brief).strip())
+    resume_id = m.group(1) if m else (parked_run if parked_run and cont else "")
+    left = f"discussion: the parked discussion of run {parked_run} was left" if parked_run and resume_id != parked_run else ""
     prior = {}
-    if m:
-        raw = read_artifact(run_dir_for(m.group(1)), "state.json")
+    if resume_id:
+        raw = read_artifact(run_dir_for(resume_id), "state.json")
         try:
             prior = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             prior = {}
     if prior:
-        run_id = m.group(1)
+        run_id = resume_id
         u.update({"run_id": run_id, "run_dir": ensure_run_dir(run_id), "resume_mode": True})
         for k, v in prior.items():
             if k in ("phase", "updated_at") or v is None:
@@ -221,6 +229,8 @@ def intake(state):
                 continue  # recomputed from the live variables
             u[k] = v
         u["resume_phase"] = prior.get("phase", "")
+        settled = (cont.group(1) or "").strip() if cont else ""
+        u["settled_answer"] = settled if re.search(r"\w", settled) else ""
         raw_tasks = read_artifact(u["run_dir"], "tasks.json")
         try:
             u["tasks"] = json.loads(raw_tasks) if raw_tasks else []
@@ -228,14 +238,18 @@ def intake(state):
             u["tasks"] = []
         append_artifact(u["run_dir"], "brief.md", f"\n\n## Re-entry {now_iso()}\n\n{brief}")
         ledger(state, u, f"run: re-entry into {run_id} at phase {u['resume_phase']!r}")
+        if left:
+            ledger(state, u, left)
         u["_next"] = "resume_route"
     else:
-        if m:
-            u["resume_note"] = f"The prompt names run {m.group(1)} but no durable state exists for it; treated as a fresh run."
+        if resume_id:
+            u["resume_note"] = f"The prompt names run {resume_id} but no durable state exists for it; treated as a fresh run."
         run_id = state.get("run_id") or new_run_id(brief)
         u.update({"run_id": run_id, "run_dir": ensure_run_dir(run_id)})
         write_artifact(u["run_dir"], "brief.md", brief)
         ledger(state, u, f"run: {run_id} mode[{u['mode_line']}] code={code} plans={u['plans_root']}")
+        if left:
+            ledger(state, u, f"{left}; this is a fresh run")
         if u.get("owner_note"):
             ledger(state, u, u["owner_note"])
         if bad:
@@ -271,7 +285,9 @@ def intake(state):
 def resume_route(state):
     u = {}
     phase = state.get("resume_phase") or ""
-    if state.get("parked"):
+    if state.get("parked") == DISCUSSION_PARKED:
+        u["_next"] = "choice_resume"
+    elif state.get("parked"):
         u["_next"] = "escalate_gate"
     elif phase.startswith("phase_f") or phase.startswith("ci") or phase.startswith("pr"):
         u["_next"] = "phase_f_gate"
@@ -437,8 +453,110 @@ def plan_route(state):
     return u
 
 
+def normalize_choices(state, u, item):
+    """`item` with its options cut to an askable multiple choice, the recommended one first; None when it is not askable.
+
+    Options whose texts differ only in case collapse to one, the recommended copy winning. Several recommended options
+    keep the first; more than CHOICE_OPTIONS_MAX keep the recommended one plus the first others. No recommended option
+    or fewer than CHOICE_OPTIONS_MIN distinct options leaves nothing to ask.
+    """
+    opts = [{"text": str(o.get("text")).strip(), "recommended": truthy(o.get("recommended")),
+             "evidence": str(o.get("evidence") or "").strip()}
+            for o in as_list(item.get("options")) if isinstance(o, dict) and str(o.get("text") or "").strip()]
+    distinct = {}
+    for o in opts:
+        key = o["text"].casefold()
+        if key not in distinct or (o["recommended"] and not distinct[key]["recommended"]):
+            distinct[key] = o
+    if len(distinct) < len(opts):
+        ledger(state, u, f"choice: {len(opts) - len(distinct)} duplicate option(s) dropped on "
+                         f"{tail(item.get('question', ''), 120)!r}")
+        opts = list(distinct.values())
+    recommended = [i for i, o in enumerate(opts) if o["recommended"]]
+    if len(recommended) > 1:
+        for i in recommended[1:]:
+            opts[i]["recommended"] = False
+        ledger(state, u, f"choice: {len(recommended)} recommended options on {tail(item.get('question', ''), 120)!r}; "
+                         f"kept the first: {opts[recommended[0]]['text']}")
+    if recommended:
+        opts.insert(0, opts.pop(recommended[0]))
+    if len(opts) > CHOICE_OPTIONS_MAX:
+        ledger(state, u, f"choice: {len(opts)} options on {tail(item.get('question', ''), 120)!r}; kept the recommended "
+                         f"one and the first {CHOICE_OPTIONS_MAX - 1} others")
+        opts = opts[:CHOICE_OPTIONS_MAX]
+    if not recommended or len(opts) < CHOICE_OPTIONS_MIN:
+        return None
+    return {**item, "options": opts}
+
+
+DISCUSSION_PARKED = "choice_discussion"
+
+# The gate that asks each choice kind's queue: it asks the current question, or closes the queue once all are answered.
+CHOICE_KIND_GATES = {"design_round": "open_questions_gate", "quality_bar": "quality_bar_gate",
+                     "checklist_accept": "checklist_round", "leak_question": "leak_route"}
+CHECKLIST_ACCEPT = "Accept: add it as a criterion"
+CHECKLIST_DROP = "Drop"
+
+
+def _start_choices(u, kind, queue):
+    u.update({"choice_kind": kind, "choice_queue": queue, "choice_index": 0, "choice_answers": [], "choice_parks": {},
+              "choice_forced": False})
+
+
+def _end_choices(u):
+    u.update({"choice_kind": "", "choice_queue": [], "choice_index": 0, "choice_answers": [], "choice_reframed": False,
+              "choice_parks": {}, "choice_forced": False})
+
+
+def _ask_choice(state, u, heading, evidence=""):
+    """Raise the queue's current question as a multiple-choice escalation of the queue's kind."""
+    s = {**state, **u}
+    queue, idx = as_list(s.get("choice_queue")), as_int(s.get("choice_index"))
+    item = queue[idx]
+    return raise_escalation(state, u, escalation(
+        s.get("choice_kind"), f"{heading} {idx + 1} of {len(queue)}: {item['question']}", item["options"], evidence=evidence,
+        data={"multiple_choice": True, "question": item["question"], "index": idx}))
+
+
+def _choice_pick(text, options):
+    """The option text a reply names ("Option 2", "2", or the option's text), or None.
+
+    Only the label's own "(recommended)" and trailing punctuation may follow the reference: "Option 2, but only for
+    reads" qualifies the pick, so it is left to the classifier and recorded in full.
+    """
+    m = re.match(r"(?i)^\s*option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", text or "")
+    return match_option(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
+
+
+def _record_choice(state, u, answer, via=""):
+    """Record the answer to the queue's current question and advance the queue; `via` overrides option/other."""
+    esc = as_dict(state.get("escalation"))
+    queue, idx = as_list(state.get("choice_queue")), as_int(state.get("choice_index"))
+    question = queue[idx]["question"] if idx < len(queue) else as_dict(esc.get("data")).get("question", "")
+    picked = _choice_pick(answer, esc.get("options") or [])
+    entry = {"question": question, "answer": picked or answer.strip(), "via": via or ("option" if picked else "other")}
+    u["choice_answers"] = list(as_list(state.get("choice_answers"))) + [entry]
+    u["choice_index"] = idx + 1
+    u["choice_forced"] = False
+    ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} answered ({entry['via']}): "
+                     f"{tail(entry['answer'], 200)}")
+
+
 def open_questions_gate(state):
     u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "design_round" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, f"Design frontier round {as_int(state.get('design_rounds'))}, question")
+        answers = as_list(state.get("choice_answers"))
+        u["pending_amendments"] = ["Design round answers (apply each to the plan, resolving its Open question):\n"
+                                   + "\n".join(f"{i}. {a.get('question')}\n   Answer: {a.get('answer')}"
+                                               for i, a in enumerate(answers, 1))]
+        u["open_questions"] = []
+        _end_choices(u)
+        ledger(state, u, f"design: round {as_int(state.get('design_rounds'))} answered ({len(answers)} question(s)) -> amend_plan")
+        u["_next"] = "amend_plan"
+        return u
     qs = [q for q in as_list(state.get("open_questions")) if isinstance(q, dict) and q.get("question")]
     if not qs:
         u["_next"] = "quality_bar_gate"
@@ -456,34 +574,95 @@ def open_questions_gate(state):
         u["open_questions"] = []
         u["_next"] = "quality_bar_gate"
         return u
-    lines, opts = [], []
-    for i, q in enumerate(qs, 1):
-        lines.append(f"{i}. {q['question']}")
-        for o in as_list(q.get("options")):
-            if isinstance(o, dict):
-                mark = " (recommended)" if o.get("recommended") else ""
-                ev = f" -- {o.get('evidence')}" if o.get("evidence") else ""
-                lines.append(f"   - {o.get('text', '')}{mark}{ev}")
+    askable, invalid = [], []
+    for q in qs:
+        n = normalize_choices(state, u, q)
+        (askable if n else invalid).append(n or q)
+    if invalid and not truthy(state.get("choice_reframed")):
+        u.update({"choice_reframed": True, "choice_invalid": invalid, "framed_questions": []})
+        ledger(state, u, f"design: {len(invalid)} question(s) lack {CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} options with "
+                         "exactly one recommended -> one re-frame")
+        u["_next"] = "frame_questions"
+        return u
+    scope = [q for q in invalid if truthy(q.get("changes_scope"))]
+    if scope:
+        u["failure_reason"] = ("an open design question changes scope and could not be framed as a multiple choice "
+                               f"({CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} options, exactly one recommended) even after a "
+                               f"re-frame: {scope[0]['question']}")
+        ledger(state, u, u["failure_reason"])
+        u["_next"] = "end_blocked"
+        return u
+    if invalid:
+        ledger(state, u, f"design: {len(invalid)} non-scope question(s) not askable as a multiple choice after a re-frame; "
+                         "carried as plan Open questions")
+    if not askable:
+        u["open_questions"] = []
+        _end_choices(u)
+        u["_next"] = "quality_bar_gate"
+        return u
     u["design_rounds"] = rounds + 1
-    return raise_escalation(state, u, escalation(
-        "design_round",
-        f"Design frontier round {rounds + 1}: answer each numbered question (a number alone takes its recommended option).\n"
-        + "\n".join(lines), [], evidence="", data={"questions": qs}))
+    _start_choices(u, "design_round", askable)
+    return _ask_choice(state, u, f"Design frontier round {rounds + 1}, question")
+
+
+def frame_questions_route(state):
+    u = {}
+    harvest_anomalies(state, u, "frame_questions")
+    note_script_error(state, u, "frame_questions")
+    invalid = as_list(state.get("choice_invalid"))
+    framed = [q for q in as_list(state.get("framed_questions")) if isinstance(q, dict) and q.get("question")]
+    if len(framed) == len(invalid):
+        # the re-frame may not drop a scope flag, or a scope-changing question would slip past the hard stop
+        framed = [{**f, "changes_scope": truthy(f.get("changes_scope")) or truthy(o.get("changes_scope"))}
+                  for f, o in zip(framed, invalid)]
+        ledger(state, u, f"design: re-framed {len(framed)} question(s)")
+    else:
+        ledger(state, u, f"design: the re-frame returned {len(framed)} question(s) for {len(invalid)}; kept the originals")
+        framed = invalid
+    source = "leak_unanswerable" if state.get("choice_kind") == "leak_question" else "open_questions"
+    kept = [q for q in as_list(state.get(source)) if q not in invalid]
+    u.update({source: kept + framed, "choice_invalid": [], "framed_questions": []})
+    u["_next"] = CHOICE_KIND_GATES[state.get("choice_kind") or "design_round"]
+    return u
+
+
+QUALITY_RIGORS = ("production", "prototype", "poc")
+
+
+def _quality_bar_answer(answer, rigor, surfaces):
+    """(rigor, surfaces) named by a quality bar answer, each falling back to the proposal when the answer omits it."""
+    m = re.search(r"rigor\s*=\s*([\w-]+)", answer) or re.search(rf"(?i)\b({'|'.join(QUALITY_RIGORS)})\b", answer)
+    # a bare "surfaces <value>" only counts as its own clause, so prose that mentions surfaces keeps the proposal
+    s = re.search(r"(?i)(?:\bsurfaces\s*[=:]\s*|(?:^|[,;])\s*surfaces\s+)([^;\n]*)", answer)
+    picked = s.group(1).strip() if s else surfaces
+    return (m.group(1) if m else rigor).strip().lower(), (surfaces if "(as proposed)" in picked else picked).strip()
 
 
 def quality_bar_gate(state):
     u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "quality_bar" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, "Quality bar question")
+        answer = str(as_dict(as_list(state.get("choice_answers"))[-1]).get("answer") or "")
+        rigor, surfaces = _quality_bar_answer(answer, queue[0].get("rigor") or "production", queue[0].get("surfaces") or "")
+        u.update({"quality_rigor": rigor, "quality_surfaces": surfaces})
+        _end_choices(u)
+        u["_next"] = "record_quality_bar"
+        return u
     if state.get("quality_rigor") and state.get("quality_surfaces") is not None and state.get("quality_recorded"):
         u["_next"] = "checklist_gate"
         return u
     rigor = state.get("rigor_proposal") or "production"
     surfaces = state.get("surfaces_proposal") or ""
-    return raise_escalation(state, u, escalation(
-        "quality_bar", f"Quality bar for this plan: rigor and surfaces. Proposal: rigor={rigor}, surfaces={surfaces or '(none)'}.",
-        [option(f"rigor={rigor}, surfaces={surfaces}", recommended=True, evidence=state.get("quality_evidence") or "the design doc's own signals"),
-         option("rigor=production, surfaces=(as proposed)"), option("rigor=prototype, surfaces=(as proposed)"),
-         option("rigor=poc, surfaces=(as proposed)")],
-        data={"rigor": rigor, "surfaces": surfaces}))
+    # the proposal's own rigor is already the recommended option, so it is not offered twice
+    options = [option(f"rigor={rigor}, surfaces={surfaces}", recommended=True,
+                      evidence=state.get("quality_evidence") or "the design doc's own signals")]
+    options += [option(f"rigor={r}, surfaces=(as proposed)") for r in QUALITY_RIGORS if r != rigor]
+    _start_choices(u, "quality_bar", [{
+        "question": f"Quality bar for this plan: rigor and surfaces. Proposal: rigor={rigor}, surfaces={surfaces or '(none)'}.",
+        "options": options[:CHOICE_OPTIONS_MAX], "rigor": rigor, "surfaces": surfaces}])
+    return _ask_choice(state, u, "Quality bar question")
 
 
 def record_quality_bar(state):
@@ -519,6 +698,34 @@ def checklist_gate(state):
 
 def checklist_round(state):
     u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "checklist_accept" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, "Best-practice checklist item")
+        accepted = []
+        rulings = []
+        for item, a in zip(queue, as_list(state.get("choice_answers"))):
+            answer = str(as_dict(a).get("answer") or "").strip()
+            if answer == CHECKLIST_ACCEPT:
+                accepted.append(item["item"])
+            elif answer and answer != CHECKLIST_DROP:
+                # typed text may decline the item as easily as accept it, so amend_plan reads it as a ruling
+                rulings.append(f"Owner ruling on {item['item']}: {answer}; apply only if it accepts the item")
+        _end_choices(u)
+        if accepted or rulings:
+            lines = []
+            if accepted:
+                lines.append("Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
+                             "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
+                             + "\n".join(f"- {x}" for x in accepted))
+            lines += rulings
+            u["pending_amendments"] = ["\n".join(lines)]
+            ledger(state, u, f"checklist: {len(accepted)}/{len(queue)} items accepted, {len(rulings)} owner ruling(s)")
+            u["_next"] = "amend_plan"
+        else:
+            ledger(state, u, "checklist: no items accepted")
+            u["_next"] = "checklist_gate"
+        return u
     labels = as_list(state.get("checklist_labels"))
     findings = as_list(state.get("checklist_findings"))
     items = []
@@ -532,10 +739,11 @@ def checklist_round(state):
         u["_next"] = "reseal_gate"
         return u
     u["checklist_items"] = items
-    return raise_escalation(state, u, escalation(
-        "checklist_accept", "Best-practice checklist round: reply with the item numbers to ACCEPT (e.g. '1,3,4'), "
-                            "'all', or 'none'. Accepted items become acceptance criteria / long-tail criteria in the plan.",
-        [option(it) for it in items[:40]], data={"items": items}))
+    _start_choices(u, "checklist_accept", [
+        {"question": f"{it}\nAccept this as an acceptance criterion (or a long-tail criterion) in the plan?", "item": it,
+         "options": [option(CHECKLIST_ACCEPT, recommended=True, evidence="the checklist reviewer's finding"),
+                     option(CHECKLIST_DROP)]} for it in items[:40]])
+    return _ask_choice(state, u, "Best-practice checklist item")
 
 
 # ====================================================================== 2.3 gates
@@ -640,24 +848,80 @@ def gate1_route(state):
     return u
 
 
-def leak_route(state):
-    u = {}
-    harvest_anomalies(state, u, "answer_leaks")
-    note_script_error(state, u, "answer_leaks")
-    answers = [a for a in as_list(state.get("leak_answers")) if isinstance(a, dict) and a.get("answer")]
-    unanswerable = [q for q in as_list(state.get("leak_unanswerable")) if isinstance(q, str) and q.strip()]
-    if not answers and not unanswerable:
-        unanswerable = as_list(state.get("leak_questions")) or ["the gatekeeper's questions (see the verdict)"]
-    if unanswerable:
-        u["leak_pending_answers"] = answers
-        return raise_escalation(state, u, escalation(
-            "leak_question", "Gate 1 questions that cannot be answered from code or docs (business rules / priority calls). "
-                             "Answer each; the plan is amended with your answers and re-sealed.\n"
-                             + "\n".join(f"{i}. {q}" for i, q in enumerate(unanswerable, 1)), [],
-            evidence=tail(state.get("gate1_result", ""), 1500), data={"questions": unanswerable}))
-    u["pending_amendments"] = [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in answers]
+LEAK_CARRIED = "(open, could not be framed; carried for the gatekeeper)"
+LEAK_HEADING = "Gate 1 question (not answerable from code or docs)"
+
+
+def _leak_item(q):
+    """A gatekeeper question as an open-question item; a plain string becomes an item with no options."""
+    if isinstance(q, str):
+        return {"question": q.strip()} if q.strip() else None
+    return q if isinstance(q, dict) and str(q.get("question") or "").strip() else None
+
+
+def _leak_amend(state, u, asked):
+    """Close the leak round: the held answers and the asked ones become the amendment."""
+    held = [a for a in as_list({**state, **u}.get("leak_pending_answers")) if isinstance(a, dict) and a.get("answer")]
+    u["pending_amendments"] = [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in held + asked]
+    u["leak_pending_answers"] = []
+    _end_choices(u)
+    ledger(state, u, f"gate1: {len(held)} held and {len(asked)} asked answer(s) -> amend_plan")
     u["_next"] = "amend_plan"
     return u
+
+
+def leak_route(state):
+    u = {}
+    queue = as_list(state.get("choice_queue"))
+    if state.get("choice_kind") == "leak_question" and queue:
+        if as_int(state.get("choice_index")) < len(queue):
+            return _ask_choice(state, u, LEAK_HEADING, tail(state.get("gate1_result", ""), 1500))
+        return _leak_amend(state, u, [a for a in as_list(state.get("choice_answers")) if isinstance(a, dict)])
+    reframed = state.get("choice_kind") == "leak_question" and truthy(state.get("choice_reframed"))
+    items = [i for i in map(_leak_item, as_list(state.get("leak_unanswerable"))) if i]
+    if not reframed:
+        harvest_anomalies(state, u, "answer_leaks")
+        note_script_error(state, u, "answer_leaks")
+        answers = [a for a in as_list(state.get("leak_answers")) if isinstance(a, dict) and a.get("answer")]
+        if not answers and not items:
+            items = [{"question": q} for q in as_list(state.get("leak_questions"))
+                     or ["the gatekeeper's questions (see the verdict)"]]
+        u["leak_pending_answers"] = answers
+        if not items:
+            return _leak_amend(state, u, [])
+    askable, invalid, seen = [], [], set()
+    for item in items:
+        key = re.sub(r"\W+", " ", item["question"].lower()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        n = normalize_choices(state, u, item)
+        (askable if n else invalid).append(n or item)
+    if invalid and not reframed:
+        u.update({"choice_kind": "leak_question", "choice_queue": [], "choice_reframed": True, "choice_invalid": invalid,
+                  "framed_questions": [], "leak_unanswerable": askable + invalid})
+        ledger(state, u, f"gate1: {len(invalid)} unanswerable question(s) lack {CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} "
+                         "options with exactly one recommended -> one re-frame")
+        u["_next"] = "frame_questions"
+        return u
+    scope = [q for q in invalid if truthy(q.get("changes_scope"))]
+    if scope:
+        u["failure_reason"] = ("a Gate 1 question changes scope and could not be framed as a multiple choice "
+                               f"({CHOICE_OPTIONS_MIN}-{CHOICE_OPTIONS_MAX} options, exactly one recommended) even after a "
+                               f"re-frame: {scope[0]['question']}")
+        ledger(state, u, u["failure_reason"])
+        u["_next"] = "end_blocked"
+        return u
+    if invalid:
+        # a gatekeeper question is never dropped: it reaches the next gatekeeper pass as an open amendment line
+        held = as_list({**state, **u}.get("leak_pending_answers"))
+        u["leak_pending_answers"] = held + [{"question": q["question"], "answer": LEAK_CARRIED} for q in invalid]
+        ledger(state, u, f"gate1: {len(invalid)} question(s) not askable as a multiple choice after a re-frame; "
+                         "carried for the gatekeeper")
+    if not askable:
+        return _leak_amend(state, u, [])
+    _start_choices(u, "leak_question", askable)
+    return _ask_choice(state, u, LEAK_HEADING, tail(state.get("gate1_result", ""), 1500))
 
 
 def gate2_build(state):
@@ -2179,13 +2443,21 @@ def batch_close(state):
 
 
 # ====================================================================== 2.8 escalation ladder
+def _autonomy_key(esc):
+    """What the resolve-autonomously-once rule counts: the kind, or the kind and question index of a multiple choice."""
+    data = as_dict(esc.get("data"))
+    if data.get("multiple_choice"):
+        return f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}"
+    return esc.get("kind", "unknown")
+
+
 def escalate_gate(state):
     u = {}
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "unknown")
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
-    failed_once = kind in as_list(state.get("autonomous_kinds"))
+    failed_once = _autonomy_key(esc) in as_list(state.get("autonomous_kinds"))
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
         rulings = ""
         path = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "standing-rulings.md")
@@ -2217,7 +2489,7 @@ def ladder_route(state):
             basis = state.get("ladder_basis") or res
             line = f"{esc.get('kind')}: {choice} (basis: {basis})"
             u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line],
-                      "autonomous_kinds": list(as_list(state.get("autonomous_kinds"))) + [esc.get("kind")],
+                      "autonomous_kinds": list(as_list(state.get("autonomous_kinds"))) + [_autonomy_key(esc)],
                       "last_answer": choice, "last_answer_text": choice})
             ledger(state, u, f"autonomous: {line}")
             u["_next"] = "apply_answer"
@@ -2247,10 +2519,13 @@ def consult_route(state):
     return u
 
 
-_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed", "draft_confirm": "confirm_draft"}
+_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed", "draft_confirm": "confirm_draft",
+                     "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
 
 
 def _terminal_prompt(esc):
+    if as_dict(esc.get("data")).get("multiple_choice"):
+        return _TERMINAL_PROMPTS.get(f"choice_{len(esc.get('options') or [])}", "ask_user")
     return _TERMINAL_PROMPTS.get(esc.get("kind"), "ask_user")
 
 
@@ -2284,8 +2559,13 @@ def ask_owner_poll(state):
     polls = as_int(state.get("owner_polls")) + 1
     u["owner_polls"] = polls
     opts = " | ".join(f"{i}) {o.get('text', '')}" for i, o in enumerate(esc.get("options") or [], 1))
+    data = as_dict(esc.get("data"))
+    thread = f"{state.get('run_id', 'run')}-{esc.get('kind', 'q')}"
+    if data.get("multiple_choice"):
+        # one remote thread per question, so a reply to an earlier question never lands on the next one
+        thread += f"-{as_int(data.get('index'))}"
     binary = os.environ.get("ARCHITECT_ASK_OWNER_BIN", "ask_owner")
-    cmd = [binary, "--text", esc.get("question", ""), "--id", f"{state.get('run_id', 'run')}-{esc.get('kind', 'q')}",
+    cmd = [binary, "--text", esc.get("question", ""), "--id", thread,
            "--wait-minutes", str(OWNER_WAIT_MINUTES), "--poll-minutes", str(OWNER_POLL_MINUTES)]
     if opts:
         cmd += ["--options", opts]
@@ -2322,14 +2602,22 @@ def parse_answer(state):
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
-    free_text_kinds = ("design_round", "leak_question", "checklist_accept", "need_design_doc")
     if esc.get("kind") == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
     elif esc.get("kind") == "seed_confirm" and _typed_doc_path(text):
         choice = text
+    elif as_dict(esc.get("data")).get("multiple_choice"):
+        choice = _choice_pick(text, options)
+        if choice is None and text and truthy(state.get("choice_forced")):
+            choice = text
+            ledger(state, u, f"choice: {esc.get('kind')}: typed reply recorded as the answer without the classifier "
+                             f"(the question reached its {DISCUSSION_PARKS_MAX} discussion parks)")
+        elif choice is None and text:
+            u["_next"] = "classify_reply"
+            return u
     else:
-        choice = text if esc.get("kind") in free_text_kinds else match_option(text, options)
+        choice = text if esc.get("kind") == "need_design_doc" else match_option(text, options)
     if choice is None:
         rounds = as_int(state.get("reask_rounds"))
         if rounds < STRIKE_LIMIT:
@@ -2338,10 +2626,121 @@ def parse_answer(state):
                                  f"free text stands after {STRIKE_LIMIT} tries).\n\n" + state.get("ask_question", ""))
             u["_next"] = _terminal_prompt(esc)
             return u
-        choice = text
+        if not text and options and as_dict(esc.get("data")).get("multiple_choice"):
+            choice = options[0].get("text", "")
+            ledger(state, u, f"choice: {esc.get('kind')}: empty reply after {STRIKE_LIMIT} re-asks -> the recommended "
+                             f"option: {tail(choice, 200)}")
+        else:
+            choice = text
     u.update({"last_answer": choice, "last_answer_text": text, "parked": ""})
     ledger(state, u, f"decision: {esc.get('kind')}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
+    return u
+
+
+def choice_reply_route(state):
+    u = {}
+    harvest_anomalies(state, u, "classify_reply")
+    note_script_error(state, u, "classify_reply")
+    esc = as_dict(state.get("escalation"))
+    text = (state.get("last_answer_text") or "").strip()
+    kind = state.get("reply_kind") or ""
+    reason = tail(state.get("reply_reason") or "", 200)
+    u.update({"reply_kind": "", "reply_reason": ""})
+    if kind == "answer" and text:
+        u.update({"last_answer": text, "last_answer_text": text, "parked": ""})
+        ledger(state, u, f"decision: {esc.get('kind')}: {tail(text, 300)} (typed reply classified as an answer: {reason})")
+        u["_next"] = "apply_answer"
+        return u
+    verdict = "a discussion" if kind == "discussion" else "unclassified (the classifier gave no verdict)"
+    ledger(state, u, f"choice: {esc.get('kind')}: typed reply is {verdict}: {reason} -> park for discussion")
+    u["_next"] = "choice_park"
+    return u
+
+
+def _discussion_message(d):
+    """The parked run's final message: the question, its options, the reply, the answers so far and how to resume."""
+    title = "Design question" if d["kind"] == "design_round" else "Question"
+    lines = ["ARCHITECT_AWAITING_DISCUSSION", f"{title} {d['number']} of {d['total']} is open for discussion:", d["question"],
+             "", "Options:"]
+    lines += [f"  {o['label']}: {o['text']}" for o in d["options"]]
+    lines += ["", f"Your reply: {d['reply']}", "", "Answered so far:"]
+    lines += [f"  {i}. {a.get('question')} -> {a.get('answer')}" for i, a in enumerate(d["answers"], 1)] or ["  (none yet)"]
+    lines += ["", f"Plan: {d['plan_path']}", "", d["resume"], "", f"Architect run id: {d['run_id']}"]
+    return "\n".join(lines)
+
+
+def choice_park(state):
+    """End the run parked on the current multiple-choice question so the user can discuss it in the chat lane.
+
+    A question parked DISCUSSION_PARKS_MAX times is asked again instead, and its next typed reply is taken as the answer.
+    """
+    u = {}
+    esc = as_dict(state.get("escalation"))
+    queue, idx = as_list(state.get("choice_queue")), as_int(state.get("choice_index"))
+    parks = dict(as_dict(state.get("choice_parks")))
+    count = as_int(parks.get(str(idx)))
+    if count >= DISCUSSION_PARKS_MAX:
+        u["choice_forced"] = True
+        ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1} already parked {count} time(s) for discussion "
+                         f"(cap {DISCUSSION_PARKS_MAX}) -> re-ask; its next typed reply is recorded as the answer")
+        u["_next"] = "choice_reask"
+        return u
+    parks[str(idx)] = count + 1
+    run_id = state.get("run_id") or ""
+    u["discussion"] = {
+        "run_id": run_id, "plan_path": state.get("plan_path") or "", "kind": esc.get("kind", ""),
+        "question": as_dict(esc.get("data")).get("question") or esc.get("question", ""),
+        "options": [{"label": choice_label(i), "text": o.get("text", ""), "recommended": truthy(o.get("recommended")),
+                     "evidence": o.get("evidence", "")} for i, o in enumerate(esc.get("options") or [])],
+        "reply": (state.get("last_answer_text") or "").strip(), "answers": as_list(state.get("choice_answers")),
+        "number": idx + 1, "total": len(queue),
+        "resume": ('Discuss it here. When it is settled, say "continue" to be asked this question again, or '
+                   '"continue: <your answer>" to record that answer and go on to the remaining questions. '
+                   '"resume" works the same as "continue".'),
+    }
+    u.update({"choice_parks": parks, "parked": DISCUSSION_PARKED, "discussion_run_id": run_id,
+              "discussion_message": _discussion_message(u["discussion"])})
+    ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} parked for discussion "
+                     f"({count + 1}/{DISCUSSION_PARKS_MAX})")
+    snapshot(state, u, DISCUSSION_PARKED)
+    u["_next"] = "end_discussion"
+    return u
+
+
+def choice_resume(state):
+    """Resume a run parked on a discussion: record the settled answer, or ask the parked question again."""
+    u = {"discussion": {}, "settled_answer": "", "parked": ""}
+    esc = as_dict(state.get("escalation"))
+    kind = state.get("choice_kind") or esc.get("kind")
+    gate = CHOICE_KIND_GATES.get(kind)
+    if not gate:
+        ledger(state, u, f"choice: resumed a discussion parked on an unknown kind {kind!r} -> escalate_gate asks it again")
+        u["_next"] = "escalate_gate"
+        return u
+    settled = str(state.get("settled_answer") or "").strip()
+    if settled:
+        _record_choice(state, u, settled, via="settled")
+    else:
+        ledger(state, u, f"choice: {esc.get('kind')}: resumed without a settled answer -> question "
+                         f"{as_int(state.get('choice_index')) + 1} asked again")
+    u["_next"] = gate
+    return u
+
+
+def choice_reask(state):
+    u = {}
+    esc = as_dict(state.get("escalation"))
+    data = as_dict(esc.get("data"))
+    asked = data.get("asked") or esc.get("question", "")
+    reply = tail((state.get("last_answer_text") or "").strip(), 200)
+    # the note goes into the escalation itself so a remote owner sees it too and ask_owner sends a fresh question
+    u["escalation"] = {**esc, "data": {**data, "asked": asked},
+                       "question": f"Your reply ({reply!r}) reads as a question or a discussion, but this question has "
+                                   f"already been parked for discussion {DISCUSSION_PARKS_MAX} times, the most allowed: "
+                                   f"pick an option or type your answer, which is recorded as given.\n\n{asked}"}
+    u["ask_question"] = render_question(u["escalation"])
+    u["_next"] = "ask_dispatch"
     return u
 
 
@@ -2444,39 +2843,9 @@ def apply_answer(state):
         if p and os.path.isfile(p):
             u["design_doc_path"] = os.path.abspath(p)
         u["_next"] = "orient_read"
-    elif kind == "design_round":
-        qs = as_list(as_dict(esc.get("data")).get("questions"))
-        u["pending_amendments"] = [f"Design round answers (apply each to the plan, resolving its Open question):\nQuestions:\n"
-                                   + "\n".join(f"{i}. {q.get('question')}" for i, q in enumerate(qs, 1)) + f"\nAnswers:\n{answer}"]
-        u["open_questions"] = []
-        u["_next"] = "amend_plan"
-    elif kind == "quality_bar":
-        d = as_dict(esc.get("data"))
-        rigor = (re.search(r"rigor\s*=\s*([\w-]+)", answer) or [None, d.get("rigor", "production")])[1]
-        surfaces = (re.search(r"surfaces\s*=\s*([^;\n]+)", answer) or [None, d.get("surfaces", "")])[1]
-        if "(as proposed)" in str(surfaces):
-            surfaces = d.get("surfaces", "")
-        u.update({"quality_rigor": rigor.strip(), "quality_surfaces": str(surfaces).strip()})
-        u["_next"] = "record_quality_bar"
-    elif kind == "checklist_accept":
-        items = as_list(as_dict(esc.get("data")).get("items"))
-        a = answer.strip().lower()
-        if a == "none" or not a:
-            accepted = []
-        elif a == "all":
-            accepted = items
-        else:
-            nums = [int(n) for n in re.findall(r"\d+", a)]
-            accepted = [items[n - 1] for n in nums if 1 <= n <= len(items)] or [it for it in items if it.lower() in a]
-        if accepted:
-            u["pending_amendments"] = ["Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
-                                       "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
-                                       + "\n".join(f"- {x}" for x in accepted)]
-            ledger(state, u, f"checklist: {len(accepted)}/{len(items)} items accepted")
-            u["_next"] = "amend_plan"
-        else:
-            ledger(state, u, "checklist: no items accepted")
-            u["_next"] = "checklist_gate"
+    elif kind in CHOICE_KIND_GATES:
+        _record_choice(state, u, answer)
+        u["_next"] = CHOICE_KIND_GATES[kind]
     elif kind == "plan_unauthored":
         u["_next"] = "quality_bar_gate"
     elif kind == "amend_cap":
@@ -2494,11 +2863,6 @@ def apply_answer(state):
             u["pending_amendments"] = [f"Owner's answers to the gatekeeper's open questions:\n{answer}"]
             u["leak_fingerprints"] = []
             u["_next"] = "amend_plan"
-    elif kind == "leak_question":
-        pend = [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in as_list(state.get("leak_pending_answers")) if isinstance(a, dict) and a.get("answer")]
-        u["pending_amendments"] = pend + [f"Owner's answers to the unanswerable Gate 1 questions:\n{answer}"]
-        u["leak_pending_answers"] = []
-        u["_next"] = "amend_plan"
     elif kind == "gate2_stuck":
         if stop or abort:
             u["failure_reason"] = "stopped: the oracle still rejects the plan after 3 rounds"
@@ -4064,6 +4428,7 @@ GATES = {
     "research_dispatch": research_dispatch, "explore_fault": explore_fault, "archivist_fault": archivist_fault,
     "librarian_fault": librarian_fault, "checklist_fault": checklist_fault, "plan_route": plan_route,
     "open_questions_gate": open_questions_gate, "quality_bar_gate": quality_bar_gate, "record_quality_bar": record_quality_bar,
+    "frame_questions_route": frame_questions_route,
     "checklist_gate": checklist_gate, "checklist_round": checklist_round,
     "reseal_gate": reseal_gate, "gate1_build": gate1_build, "gate1_route": gate1_route, "leak_route": leak_route,
     "gate2_build": gate2_build, "gate2_route": gate2_route, "autonomy_gate": autonomy_gate, "reseal_return": reseal_return,
@@ -4078,6 +4443,8 @@ GATES = {
     "batch_gauntlet_build": batch_gauntlet_build, "batch_fix_route": batch_fix_route, "batch_close": batch_close,
     "escalate_gate": escalate_gate, "ladder_route": ladder_route, "consult_route": consult_route, "ask_dispatch": ask_dispatch,
     "ask_owner_poll": ask_owner_poll, "ask_owner_route": ask_owner_route, "parse_answer": parse_answer, "apply_answer": apply_answer,
+    "choice_reply_route": choice_reply_route, "choice_reask": choice_reask, "choice_park": choice_park,
+    "choice_resume": choice_resume,
     "phase_f_gate": phase_f_gate, "integration_check": integration_check, "integrate_route": integrate_route,
     "hygiene_create": hygiene_create, "stack_gate_final": stack_gate_final, "pr_body": pr_body, "open_pr": open_pr,
     "pr_round_comments": pr_round_comments, "ci_poll": ci_poll, "ci_route": ci_route, "ci_evidence": ci_evidence, "ci_apply": ci_apply,

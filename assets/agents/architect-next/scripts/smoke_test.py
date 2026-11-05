@@ -457,7 +457,8 @@ check("intake: re-entry loads the prior run state + tasks.json (A2)", st2["_next
       and st2["tasks"] and st2["tasks"][0]["id"] == "TASK-101" and st2["sealed"] is True)
 st3 = gates.intake({"initial_prompt": f"go {DESIGN}\nArchitect run id: 20200101T000000-deadbeef", **STORE.variables(DESIGN, TMP)})
 check("intake: unknown run id -> fresh run, declared", not st3.get("resume_mode") and "no durable state" in st3["resume_note"])
-for phase, parked, exp in [("task TASK-101 done", "", "select_tasks"), ("phase_f", "", "phase_f_gate"), ("sealed", "", "reseal_gate"), ("x", "design_round", "escalate_gate")]:
+for phase, parked, exp in [("task TASK-101 done", "", "select_tasks"), ("phase_f", "", "phase_f_gate"), ("sealed", "", "reseal_gate"), ("x", "design_round", "escalate_gate"),
+                           ("choice_discussion", "choice_discussion", "choice_resume")]:
     u = gates.resume_route(base_state(resume_phase=phase, parked=parked, sealed=False, tasks=[]))
     check(f"resume_route: phase {phase!r} parked={parked!r} -> {exp}", u["_next"] == exp)
 u = gates.orient_fault(base_state(last_script_error="boom"))
@@ -487,16 +488,110 @@ u = gates.plan_route(base_state(task_granularity="micro", acceptance_criteria=["
 check("plan_route: micro - no Batch column + prose criterion = plan defects -> author re-run", u["_next"] == "author_plan" and "Batch" in u["author_defects"] and "non-executable" in u["author_defects"])
 u = gates.open_questions_gate(base_state(open_questions=[]))
 check("open_questions_gate: none -> quality_bar_gate", u["_next"] == "quality_bar_gate")
-qs = [{"question": "Which store?", "options": [{"text": "pg", "recommended": True, "evidence": "e"}], "changes_scope": True}]
+qs = [{"question": "Which store?", "options": [{"text": "sqlite", "evidence": "small"}, {"text": "pg", "recommended": True, "evidence": "ops runs pg"},
+                                               {"text": "redis"}], "changes_scope": True},
+      {"question": "Which port?", "options": [{"text": "8080", "recommended": True}, {"text": "9090"}]}]
 u = gates.open_questions_gate(base_state(open_questions=qs, design_rounds=0))
-check("open_questions_gate: round 1 -> ONE escalation design_round carrying the numbered round", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "design_round"
-      and "1. Which store?" in u["escalation"]["question"] and "(recommended)" in u["escalation"]["question"] and u["design_rounds"] == 1)
+e = u.get("escalation") or {}
+check("open_questions_gate: round 1 -> a design_round queue of 2; question 1 raised alone, recommended option moved first",
+      u["_next"] == "escalate_gate" and e.get("kind") == "design_round" and u["design_rounds"] == 1 and len(u["choice_queue"]) == 2
+      and u["choice_index"] == 0 and u["choice_answers"] == [] and "Which store?" in e["question"] and "Which port?" not in e["question"]
+      and [o["text"] for o in e["options"]] == ["pg", "sqlite", "redis"] and [o["recommended"] for o in e["options"]] == [True, False, False]
+      and e["data"] == {"multiple_choice": True, "question": "Which store?", "index": 0}, e)
+check("open_questions_gate: the prompt lists each option's text and evidence under its label, recommended first, and names Other (custom)",
+      "Option 1 (recommended): pg\n    Evidence: ops runs pg\nOption 2: sqlite\n    Evidence: small\nOption 3: redis" in u["ask_question"]
+      and '"Other (custom)"' in u["ask_question"] and "question 1 of 2" in u["ask_question"], u["ask_question"])
+E_DQ, E_QUEUE = e, u["choice_queue"]
+u = gates.open_questions_gate(base_state(open_questions=qs, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=1))
+check("open_questions_gate: queue mid-way -> asks the next question, round counter untouched",
+      u["_next"] == "escalate_gate" and u["escalation"]["data"]["index"] == 1 and "Which port?" in u["escalation"]["question"]
+      and "question 2 of 2" in u["escalation"]["question"] and "design_rounds" not in u, u.get("escalation"))
+ANSWERS = [{"question": "Which store?", "answer": "pg", "via": "option"}, {"question": "Which port?", "answer": "use 7000", "via": "other"}]
+u = gates.open_questions_gate(base_state(open_questions=qs, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=2,
+                                         choice_answers=ANSWERS, choice_reframed=True))
+check("open_questions_gate: queue answered -> ONE amendment with every question and its answer -> amend_plan; open questions and queue cleared",
+      u["_next"] == "amend_plan" and len(u["pending_amendments"]) == 1
+      and "1. Which store?\n   Answer: pg\n2. Which port?\n   Answer: use 7000" in u["pending_amendments"][0] and u["open_questions"] == []
+      and u["choice_kind"] == "" and u["choice_queue"] == [] and u["choice_index"] == 0 and u["choice_answers"] == [] and u["choice_reframed"] is False,
+      u.get("pending_amendments"))
+u = {}
+n = gates.normalize_choices(base_state(), u, {"question": "q", "options": [{"text": "a"}, {"text": "b", "recommended": True}, {"text": "c", "recommended": True}]})
+check("normalize_choices: several recommended -> the first kept and moved first, the rest unmarked, ledgered",
+      [(o["text"], o["recommended"]) for o in n["options"]] == [("b", True), ("a", False), ("c", False)]
+      and any("2 recommended options" in d for d in u.get("decisions", [])), n)
+u = {}
+n = gates.normalize_choices(base_state(), u, {"question": "q", "options": [{"text": t} for t in "abcd"] + [{"text": "e", "recommended": True}]})
+check(f"normalize_choices: more than {_lib.CHOICE_OPTIONS_MAX} options -> the recommended plus the first others, ledgered",
+      [o["text"] for o in n["options"]] == ["e", "a", "b", "c"] and any("5 options" in d for d in u.get("decisions", [])), n)
+check("normalize_choices: no recommended option, or a single option -> not askable",
+      gates.normalize_choices(base_state(), {}, {"question": "q", "options": [{"text": "a"}, {"text": "b"}]}) is None
+      and gates.normalize_choices(base_state(), {}, {"question": "q", "options": [{"text": "a", "recommended": True}]}) is None)
+u = {}
+n = gates.normalize_choices(base_state(), u, {"question": "q", "options": [
+    {"text": "Use PG"}, {"text": " use pg ", "recommended": True, "evidence": "ops"}, {"text": "sqlite"}]})
+dup = gates.normalize_choices(base_state(), {}, {"question": "q", "options": [{"text": "pg", "recommended": True}, {"text": "PG "}]})
+check("normalize_choices: case-insensitive duplicate texts -> one option, the recommended copy kept, ledgered; two copies are not askable",
+      [(o["text"], o["recommended"], o["evidence"]) for o in n["options"]] == [("use pg", True, "ops"), ("sqlite", False, "")]
+      and any("1 duplicate option(s) dropped" in d for d in u.get("decisions", [])) and dup is None, (n, dup))
+BAD = {"question": "Which org?", "options": [], "changes_scope": False}
+u = gates.open_questions_gate(base_state(open_questions=[qs[1], BAD], design_rounds=0, choice_reframed=False))
+check("open_questions_gate: a question that is not askable (a carried one has no options) -> one re-frame through frame_questions",
+      u["_next"] == "frame_questions" and u["choice_reframed"] is True and u["choice_invalid"] == [BAD] and "design_rounds" not in u, u)
+u = gates.open_questions_gate(base_state(open_questions=[qs[1], {**BAD, "changes_scope": True}], design_rounds=0, choice_reframed=True))
+check("open_questions_gate: still not askable after the re-frame + changes_scope -> end_blocked naming the question",
+      u["_next"] == "end_blocked" and "Which org?" in u["failure_reason"] and "re-frame" in u["failure_reason"], u)
+u = gates.open_questions_gate(base_state(open_questions=[qs[1], BAD], design_rounds=0, choice_reframed=True))
+check("open_questions_gate: still not askable after the re-frame, non-scope -> carried and ledgered; the askable rest is asked",
+      u["_next"] == "escalate_gate" and [q["question"] for q in u["choice_queue"]] == ["Which port?"]
+      and any("carried as plan Open questions" in d for d in u["decisions"]), u.get("choice_queue"))
+u = gates.open_questions_gate(base_state(open_questions=[BAD], design_rounds=0, choice_reframed=True))
+check("open_questions_gate: nothing askable after the re-frame, non-scope -> quality_bar_gate, open questions cleared",
+      u["_next"] == "quality_bar_gate" and u["open_questions"] == [] and u["choice_reframed"] is False, u)
+FRAMED = {"question": "Which org?", "options": [{"text": "acme", "recommended": True}, {"text": "initech"}], "changes_scope": False}
+u = gates.frame_questions_route(base_state(open_questions=[qs[1], {**BAD, "changes_scope": True}], choice_invalid=[{**BAD, "changes_scope": True}],
+                                           framed_questions=[FRAMED], anomalies=["odd"]))
+check("frame_questions_route: the re-framed question replaces the invalid one, keeps its scope flag -> open_questions_gate",
+      u["_next"] == "open_questions_gate" and u["open_questions"] == [qs[1], {**FRAMED, "changes_scope": True}]
+      and u["choice_invalid"] == [] and u["framed_questions"] == [] and u["anomalies_log"] == ["frame_questions: odd"], u)
+u = gates.frame_questions_route(base_state(open_questions=[qs[1], BAD], choice_invalid=[BAD], framed_questions=[],
+                                           last_script_error="llm node 'frame_questions' failed: timeout"))
+check("frame_questions_route: a faulted or short re-frame keeps the originals, fault ledgered -> open_questions_gate",
+      u["_next"] == "open_questions_gate" and u["open_questions"] == [qs[1], BAD] and any(d.startswith("fallback: frame_questions") for d in u["decisions"]), u)
 u = gates.open_questions_gate(base_state(open_questions=qs, design_rounds=DESIGN_ROUNDS_MAX))
 check("open_questions_gate: B1 exhausted + changes_scope -> end_blocked (hard stop even in full)", u["_next"] == "end_blocked")
 u = gates.open_questions_gate(base_state(open_questions=[{"question": "color?", "changes_scope": False}], design_rounds=DESIGN_ROUNDS_MAX))
 check("open_questions_gate: B1 exhausted, non-scope -> carried, continue", u["_next"] == "quality_bar_gate" and u["open_questions"] == [])
 u = gates.quality_bar_gate(base_state(rigor_proposal="prototype", surfaces_proposal="http,other:grpc"))
-check("quality_bar_gate: proposal recommended", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "quality_bar" and u["escalation"]["options"][0]["recommended"])
+QB_TEXTS = [o["text"] for o in u["escalation"]["options"]]
+check("quality_bar_gate: one multiple-choice question through the queue, the proposal recommended first, every option distinct",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "quality_bar" and u["escalation"]["data"]["multiple_choice"]
+      and u["choice_kind"] == "quality_bar" and len(u["choice_queue"]) == 1 and u["escalation"]["options"][0]["recommended"]
+      and [o["recommended"] for o in u["escalation"]["options"]].count(True) == 1
+      and QB_TEXTS[0] == "rigor=prototype, surfaces=http,other:grpc" and len(set(QB_TEXTS)) == len(QB_TEXTS)
+      and "rigor=prototype, surfaces=(as proposed)" not in QB_TEXTS, QB_TEXTS)
+QB = base_state(**{k: v for k, v in u.items() if k != "_next"})
+for reply, rigor, surfaces in (("2", "production", "http,other:grpc"), ("prototype, surfaces api", "prototype", "api"),
+                               ("rigor=poc", "poc", "http,other:grpc")):
+    s = {**QB, "last_answer": reply}
+    s.update(gates.apply_answer(s))
+    s.update(gates.quality_bar_gate(s))
+    check(f"quality_bar walk: {reply!r} -> recorded, the queue closed -> record_quality_bar with rigor={rigor} surfaces={surfaces}",
+          s["_next"] == "record_quality_bar" and s["quality_rigor"] == rigor and s["quality_surfaces"] == surfaces
+          and s["choice_kind"] == "" and s["choice_queue"] == [], s)
+s = {**QB, "last_answer_text": "what does prototype drop?"}
+s.update(gates.choice_park(s))
+check("choice_park: a quality bar question parks like a design question", s["_next"] == "end_discussion"
+      and s["parked"] == "choice_discussion" and s["discussion"]["kind"] == "quality_bar", s)
+u = gates.choice_resume(s)
+u2 = gates.quality_bar_gate({**s, **u})
+check("choice_resume: a parked quality bar resumed without an answer -> quality_bar_gate asks it again",
+      u["_next"] == "quality_bar_gate" and u2["_next"] == "escalate_gate" and u2["escalation"]["kind"] == "quality_bar"
+      and u2["escalation"]["data"]["index"] == 0, (u, u2))
+s.update(settled_answer="rigor=poc")
+s.update(gates.choice_resume(s))
+s.update(gates.quality_bar_gate(s))
+check("choice_resume: a parked quality bar settled as 'rigor=poc' -> record_quality_bar with poc, the proposal's surfaces",
+      s["_next"] == "record_quality_bar" and s["quality_rigor"] == "poc" and s["quality_surfaces"] == "http,other:grpc", s)
 u = gates.quality_bar_gate(base_state(quality_rigor="production", quality_surfaces="", quality_recorded=True))
 check("quality_bar_gate: recorded -> checklist_gate", u["_next"] == "checklist_gate")
 u = gates.record_quality_bar(base_state(quality_rigor="prototype", quality_surfaces="http,other:grpc"))
@@ -505,8 +600,59 @@ u = gates.checklist_gate(base_state(quality_surfaces="http,other:grpc", checklis
 check("checklist_gate: other:<label> -> checklist fan-out", u["_next"] == "checklist_fanout" and u["checklist_labels"] == ["grpc"])
 u = gates.checklist_gate(base_state(quality_surfaces="http,other:grpc", checklist_done=["grpc"]))
 check("checklist_gate: done -> reseal_gate", u["_next"] == "reseal_gate")
-u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findings=["1. use deadlines\n2. propagate metadata\n"]))
-check("checklist_round: items -> escalation checklist_accept", u["_next"] == "escalate_gate" and len(u["escalation"]["options"]) == 2 and u["checklist_done"] == ["grpc"])
+u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findings=["1. use deadlines\n2. propagate metadata\n3. retry calls\n"]))
+check("checklist_round: items -> one accept/drop multiple choice per item, accept recommended",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "checklist_accept" and u["escalation"]["data"]["multiple_choice"]
+      and [o["text"] for o in u["escalation"]["options"]] == [gates.CHECKLIST_ACCEPT, gates.CHECKLIST_DROP]
+      and u["escalation"]["options"][0]["recommended"] and not u["escalation"]["options"][1]["recommended"]
+      and [q["item"] for q in u["choice_queue"]] == ["[grpc] use deadlines", "[grpc] propagate metadata", "[grpc] retry calls"]
+      and "use deadlines" in u["escalation"]["question"] and u["checklist_done"] == ["grpc"], u)
+CL = base_state(**{k: v for k, v in u.items() if k != "_next"})
+
+
+def checklist_walk(replies):
+    s = dict(CL)
+    for reply in replies:
+        s.update(gates.apply_answer({**s, "last_answer": reply}))
+        s.update(gates.checklist_round(s))
+    return s
+
+
+s = checklist_walk(["1", "Drop", "no, skip it"])
+check("checklist walk: a declining Other answer -> an owner ruling line, not an accepted item",
+      s["_next"] == "amend_plan" and "- [grpc] use deadlines\n" in s["pending_amendments"][0]
+      and "Owner ruling on [grpc] retry calls: no, skip it; apply only if it accepts the item" in s["pending_amendments"][0]
+      and "- [grpc] retry calls" not in s["pending_amendments"][0]
+      and "propagate metadata" not in s["pending_amendments"][0] and s["choice_kind"] == "", s.get("pending_amendments"))
+s = checklist_walk(["Drop", "Drop", "yes, but only for the public API"])
+check("checklist walk: an accepting Other answer alone -> an owner ruling line to amend_plan, no accepted-item list",
+      s["_next"] == "amend_plan"
+      and "Owner ruling on [grpc] retry calls: yes, but only for the public API; apply only if it accepts the item" in s["pending_amendments"][0]
+      and "Accepted best-practice checklist items" not in s["pending_amendments"][0]
+      and "- [grpc] retry calls" not in s["pending_amendments"][0], s.get("pending_amendments"))
+s = checklist_walk(["2", "drop", "Drop"])
+check("checklist walk: every item dropped -> checklist_gate, nothing to amend", s["_next"] == "checklist_gate"
+      and "pending_amendments" not in s and s["choice_queue"] == [], s)
+s = checklist_walk(["1"])
+s.update(gates.choice_park({**s, "last_answer_text": "who would own the metadata?"}))
+check("choice_park: a checklist item parks like a design question", s["_next"] == "end_discussion"
+      and s["discussion"]["kind"] == "checklist_accept" and s["discussion"]["number"] == 2 and s["discussion"]["total"] == 3, s)
+u = gates.choice_resume(s)
+u2 = gates.checklist_round({**s, **u})
+check("choice_resume: a parked checklist item resumed without an answer -> checklist_round asks the same item again",
+      u["_next"] == "checklist_round" and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 1
+      and "propagate metadata" in u2["escalation"]["question"], (u, u2))
+s.update(settled_answer="drop")
+s.update(gates.choice_resume(s))
+s.update(gates.checklist_round(s))
+check("choice_resume: a parked checklist item settled as 'drop' -> recorded as Drop, the next item asked",
+      s["choice_answers"][-1]["answer"] == gates.CHECKLIST_DROP and s["_next"] == "escalate_gate"
+      and s["escalation"]["data"]["index"] == 2, s)
+check("choice kind gates: resumed without an answer, every kind returns to the gate that asks its own queue",
+      gates.CHOICE_KIND_GATES == {"design_round": "open_questions_gate", "quality_bar": "quality_bar_gate",
+                                  "checklist_accept": "checklist_round", "leak_question": "leak_route"}
+      and all(gates.choice_resume(base_state(choice_kind=k, escalation=escalation(k, "q")))["_next"] == g
+              for k, g in gates.CHOICE_KIND_GATES.items()))
 u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findings=["PIPELINE-FAULT: x"]))
 check("checklist_round: no items -> reseal_gate (declared)", u["_next"] == "reseal_gate")
 
@@ -537,10 +683,87 @@ u = gates.gate1_route(base_state(gate1_result="Agent node failed: timeout"))
 check("gate1_route: agent fault -> escalation gate_fault (never a verdict)", u["escalation"]["kind"] == "gate_fault")
 u = gates.leak_route(base_state(leak_answers=[{"question": "infra?", "answer": "infra/ per CLAUDE.md:12"}], leak_unanswerable=[]))
 check("leak_route: answers -> amend_plan with pending amendments", u["_next"] == "amend_plan" and u["pending_amendments"] and "infra/" in u["pending_amendments"][0])
-u = gates.leak_route(base_state(leak_answers=[{"question": "a", "answer": "b"}], leak_unanswerable=["priority of X vs Y?"]))
-check("leak_route: unanswerable -> escalation leak_question (answers held)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "leak_question" and u["leak_pending_answers"])
+LEAK_Q = {"question": "priority of X vs Y?", "options": [{"text": "X first"}, {"text": "Y first", "recommended": True, "evidence": "the verdict"}]}
+LEAK_Q2 = {"question": "who signs off?", "options": [{"text": "the owner", "recommended": True}, {"text": "the team"}]}
+s = base_state(leak_answers=[{"question": "a", "answer": "b"}], leak_unanswerable=[LEAK_Q, {**LEAK_Q, "question": "Priority of X vs Y"}, LEAK_Q2])
+s.update(gates.leak_route(s))
+check("leak_route: framed unanswerable questions -> one multiple choice per question, recommended first, duplicates removed, answers held",
+      s["_next"] == "escalate_gate" and s["escalation"]["kind"] == "leak_question" and s["escalation"]["data"]["multiple_choice"]
+      and s["escalation"]["options"][0]["text"] == "Y first" and s["escalation"]["options"][0]["recommended"]
+      and "1 of 2: priority of X vs Y?" in s["escalation"]["question"] and len(s["choice_queue"]) == 2
+      and s["leak_pending_answers"] == [{"question": "a", "answer": "b"}], s)
+leak_asked = dict(s)
+VERDICT = "x" * 2000 + "\nGATE1: QUESTIONS priority of X vs Y?"
+lv = base_state(gate1_result=VERDICT, leak_answers=[], leak_unanswerable=[LEAK_Q, LEAK_Q2])
+lv.update(gates.leak_route(lv))
+lv1 = lv["escalation"]["evidence"]
+lv.update(gates.apply_answer({**lv, "last_answer": "X first"}))
+lv.update(gates.leak_route(lv))
+check("leak_route: every leak_question escalation carries the gatekeeper verdict tail as its evidence",
+      lv1 == lv["escalation"]["evidence"] == gates.tail(VERDICT, 1500) and "GATE1: QUESTIONS" in lv1
+      and "2 of 2" in lv["escalation"]["question"], lv["escalation"])
+s.update(gates.apply_answer({**s, "last_answer": "X first"}))
+check("apply_answer: leak_question -> recorded through the queue -> leak_route", s["_next"] == "leak_route" and s["choice_index"] == 1)
+s.update(gates.leak_route(s))
+check("leak_route: the next unanswerable question is asked on its own", s["_next"] == "escalate_gate"
+      and "2 of 2: who signs off?" in s["escalation"]["question"], s)
+s.update(gates.apply_answer({**s, "last_answer": "a lawyer"}))
+s.update(gates.leak_route(s))
+check("leak_route: queue done -> held answers + one line per asked question -> amend_plan, held answers cleared",
+      s["_next"] == "amend_plan" and s["pending_amendments"] == [
+          "Gate 1 leak: a -> b", "Gate 1 leak: priority of X vs Y? -> X first", "Gate 1 leak: who signs off? -> a lawyer"]
+      and s["leak_pending_answers"] == [] and s["choice_kind"] == "" and s["choice_queue"] == [], s.get("pending_amendments"))
+s = dict(leak_asked)
+s.update(gates.choice_park({**s, "last_answer_text": "depends on the contract?"}))
+check("choice_park: a Gate 1 question parks like a design question", s["_next"] == "end_discussion"
+      and s["parked"] == gates.DISCUSSION_PARKED and s["discussion"]["kind"] == "leak_question" and s["discussion"]["number"] == 1, s)
+u = gates.choice_resume(s)
+u2 = gates.leak_route({**s, **u})
+check("choice_resume: a parked Gate 1 question resumed without an answer -> leak_route asks it again",
+      u["_next"] == "leak_route" and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 0, (u, u2))
+s.update(settled_answer="Y first")
+s.update(gates.choice_resume(s))
+s.update(gates.leak_route(s))
+check("choice_resume: a parked Gate 1 question settled -> recorded, the next question asked",
+      [(a["answer"], a["via"]) for a in s["choice_answers"]] == [("Y first", "settled")]
+      and "2 of 2: who signs off?" in s["escalation"]["question"], s)
+s = base_state(leak_answers=[], leak_unanswerable=["what is the refund window?"])
+s.update(gates.leak_route(s))
+check("leak_route: a plain string question -> one re-frame", s["_next"] == "frame_questions" and s["choice_kind"] == "leak_question"
+      and s["choice_invalid"] == [{"question": "what is the refund window?"}], s)
+leak_reframe = dict(s)
+s.update(gates.frame_questions_route({**s, "framed_questions": [{"question": "what is the refund window?", "options": [
+    {"text": "30 days", "recommended": True, "evidence": "docs/billing.md"}, {"text": "14 days"}]}]}))
+check("frame_questions_route: a re-framed Gate 1 question -> back to leak_route", s["_next"] == "leak_route"
+      and s["leak_unanswerable"][0]["options"][0]["text"] == "30 days", s)
+s.update(gates.leak_route(s))
+check("leak_route: the re-framed question is asked as a multiple choice", s["_next"] == "escalate_gate"
+      and s["escalation"]["options"][0]["text"] == "30 days" and s["choice_kind"] == "leak_question", s)
+s = dict(leak_reframe)
+s.update(gates.frame_questions_route({**s, "framed_questions": []}))
+s.update(gates.leak_route(s))
+check("leak_route: still not askable after the re-frame -> carried as an open amendment line, ledgered",
+      s["_next"] == "amend_plan" and s["pending_amendments"] == [
+          f"Gate 1 leak: what is the refund window? -> {gates.LEAK_CARRIED}"]
+      and any("carried for the gatekeeper" in d for d in s["decisions"]) and s["choice_reframed"] is False, s)
+s = base_state(leak_answers=[], leak_unanswerable=[LEAK_Q, "what is the refund window?"])
+s.update(gates.leak_route(s))
+s.update(gates.frame_questions_route({**s, "framed_questions": [{"question": "what is the refund window?"}]}))
+s.update(gates.leak_route(s))
+s.update(gates.apply_answer({**s, "last_answer": "1"}))
+s.update(gates.leak_route(s))
+check("leak_route: an askable question is asked while a carried one waits; both reach the amendment",
+      s["_next"] == "amend_plan" and s["pending_amendments"] == [
+          f"Gate 1 leak: what is the refund window? -> {gates.LEAK_CARRIED}", "Gate 1 leak: priority of X vs Y? -> Y first"], s)
+s = base_state(leak_answers=[], leak_unanswerable=[{"question": "drop the API?", "changes_scope": True}])
+s.update(gates.leak_route(s))
+s.update(gates.frame_questions_route({**s, "framed_questions": []}))
+u = gates.leak_route(s)
+check("leak_route: a scope-changing Gate 1 question not framed after the re-frame -> end_blocked",
+      u["_next"] == "end_blocked" and "drop the API?" in u["failure_reason"], u)
 u = gates.leak_route(base_state(leak_answers=[], leak_unanswerable=[], leak_questions=["q?"], last_node_output="llm node failed"))
-check("leak_route: dead answer_leaks -> every question to the owner (fail-open)", u["_next"] == "escalate_gate")
+check("leak_route: dead answer_leaks -> every question to the owner through the re-frame (fail-open)",
+      u["_next"] == "frame_questions" and u["choice_invalid"] == [{"question": "q?"}], u)
 u = gates.gate2_build(base_state(task_granularity="micro"))
 check("gate2_build: micro sizing sentence", "Micro-grain" in u["gate2_prompt"] and "PLAN_REVIEW" in u["gate2_prompt"])
 u = gates.gate2_route(base_state(gate2_result="PLAN_REVIEW: OKAY"))
@@ -1135,14 +1358,255 @@ check("ask_owner_route: PENDING at budget -> terminal (B21 side 2)", gates.ask_o
 check("ask_owner_route: ANSWERED -> parse_answer", gates.ask_owner_route(base_state(escalation=E, owner_polls=1, owner_poll_result="ANSWERED: 1"))["_next"] == "parse_answer")
 os.environ["ARCHITECT_ASK_OWNER_BIN"] = os.path.join(TMP, "missing-bin")
 check("ask_owner_poll: missing tool -> NOT_DELIVERED", "NOT_DELIVERED" in gates.ask_owner_poll(base_state(escalation=E))["owner_poll_result"])
+ARGS_ASK_OWNER = os.path.join(TMP, "args_ask_owner")
+write(ARGS_ASK_OWNER, "#!/usr/bin/env bash\necho \"PENDING $*\"\n", exe=True)
+os.environ["ARCHITECT_ASK_OWNER_BIN"] = ARGS_ASK_OWNER
+E_DQ_THREAD = {**E_DQ, "data": {**E_DQ["data"], "index": 2}}
+out_mc = gates.ask_owner_poll(base_state(run_id="r9", escalation=E_DQ_THREAD))["owner_poll_result"]
+out_plain = gates.ask_owner_poll(base_state(run_id="r9", escalation=E))["owner_poll_result"]
+check("ask_owner_poll: a multiple-choice question gets its own remote thread id <run_id>-<kind>-<index>",
+      f"--id r9-{E_DQ['kind']}-2 " in out_mc and "--id r9-conformance_stuck --wait-minutes" in out_plain, (out_mc, out_plain))
+os.environ["ARCHITECT_ASK_OWNER_BIN"] = os.path.join(TMP, "missing-bin")
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="2"))
 check("parse_answer: number -> option; parked cleared; decision ledgered", u["_next"] == "apply_answer" and u["last_answer"] == "One more round" and u["parked"] == "" and any(d.startswith("decision:") for d in u["decisions"]))
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0))
 check("parse_answer: unparseable -> re-ask (B22 side 1)", u["_next"] == "ask_user" and u["reask_rounds"] == 1)
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=STRIKE_LIMIT))
 check("parse_answer: B22 exhausted -> free text stands", u["_next"] == "apply_answer" and u["last_answer"] == "banana")
-u = gates.parse_answer(base_state(escalation=escalation("design_round", "q"), last_answer_text="1: pg; 2: no"))
+u = gates.parse_answer(base_state(escalation=escalation("need_design_doc", "q"), last_answer_text="/tmp/x.md please"))
 check("parse_answer: free-text kinds never re-ask", u["_next"] == "apply_answer")
+u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="", reask_rounds=STRIKE_LIMIT - 1))
+check("parse_answer: an empty multiple-choice reply with re-asks left -> re-ask",
+      u["_next"] == gates._terminal_prompt(E_DQ) and u["reask_rounds"] == STRIKE_LIMIT and "last_answer" not in u, u)
+u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="", reask_rounds=STRIKE_LIMIT))
+check("parse_answer: an empty multiple-choice reply after the re-asks are spent -> the recommended option, ledgered",
+      u["_next"] == "apply_answer" and u["last_answer"] == E_DQ["options"][0]["text"] == "pg"
+      and any("empty reply" in d and "recommended" in d for d in u["decisions"]), u)
+for reply, want in (("Option 1 (recommended)", "pg"), ("Option 3", "redis"), ("2", "sqlite"), ("sqlite", "sqlite")):
+    u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text=reply))
+    check(f"parse_answer: design question reply {reply!r} -> option text {want!r} -> apply_answer",
+          u["_next"] == "apply_answer" and u["last_answer"] == want and u["parked"] == "", u)
+u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text="why not both?", reask_rounds=0))
+check("parse_answer: design question unmatched free text (a Slack reply) -> classify_reply, never a re-ask nor taken raw",
+      u["_next"] == "classify_reply" and "last_answer" not in u and "reask_rounds" not in u, u)
+for reply, want in (("Option 2.", "sqlite"), ("2!", "sqlite"), ("redis.", "redis")):
+    u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text=reply))
+    check(f"parse_answer: design question reply {reply!r} with only punctuation after the option -> the pick {want!r}",
+          u["_next"] == "apply_answer" and u["last_answer"] == want, u)
+QUALIFIED = "Option 2, but only for reads"
+u = gates.parse_answer(base_state(escalation=E_DQ, last_answer_text=QUALIFIED))
+s = base_state(escalation=E_DQ, last_answer_text=QUALIFIED, reply_kind="answer", reply_reason="a qualified pick",
+               choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[])
+s.update(gates.choice_reply_route(s))
+s.update(gates.apply_answer(s))
+check("parse_answer -> classify_reply -> apply_answer: 'Option 2, but ...' is no pick; as an answer it is recorded in full, via other",
+      u["_next"] == "classify_reply" and s["choice_answers"] == [{"question": "Which store?", "answer": QUALIFIED, "via": "other"}],
+      (u, s.get("choice_answers")))
+check("ask_dispatch / ask_owner_route: a multiple-choice escalation picks ask_choice_<option count>",
+      [gates.ask_dispatch(base_state(escalation={**E_DQ, "options": E_DQ["options"][:n]}))["_next"] for n in (2, 3)] == ["ask_choice_2", "ask_choice_3"]
+      and gates._terminal_prompt({**E_DQ, "options": E_DQ["options"] + [option("x")]}) == "ask_choice_4"
+      and gates.ask_owner_route(base_state(escalation=E_DQ, owner_polls=1, owner_poll_result="TIMEOUT"))["_next"] == "ask_choice_3")
+check("_terminal_prompt: a design_round without the multiple-choice marker keeps ask_user",
+      gates._terminal_prompt({"kind": "design_round", "options": E_DQ["options"]}) == "ask_user")
+u = gates.choice_reply_route(base_state(escalation=E_DQ, last_answer_text="use mysql", reply_kind="answer", reply_reason="names a store",
+                                        parked="design_round", anomalies=["hm"]))
+check("choice_reply_route: answer -> the typed text to apply_answer; parked cleared; verdict reset; decision ledgered",
+      u["_next"] == "apply_answer" and u["last_answer"] == "use mysql" and u["parked"] == "" and u["reply_kind"] == ""
+      and any(d.startswith("decision: design_round: use mysql") for d in u["decisions"]) and u["anomalies_log"] == ["classify_reply: hm"], u)
+u = gates.choice_reply_route(base_state(escalation=E_DQ, last_answer_text="what does pg cost us?", reply_kind="discussion", parked="design_round"))
+check("choice_reply_route: discussion -> choice_park, still parked, nothing recorded",
+      u["_next"] == "choice_park" and "last_answer" not in u and "parked" not in u and "choice_answers" not in u, u)
+u = gates.choice_reply_route(base_state(escalation=E_DQ, last_answer_text="hmm", reply_kind="", last_script_error="llm node 'classify_reply' failed: x"))
+check("choice_reply_route: classifier fault (no verdict) -> choice_park, fault ledgered",
+      u["_next"] == "choice_park" and any(d.startswith("fallback: classify_reply") for d in u["decisions"]), u)
+u = gates.choice_reask(base_state(escalation=E_DQ, last_answer_text="what does pg cost us?", ask_question="stale"))
+check("choice_reask: at the park cap the same question back through ask_dispatch with a one-line note naming the cap",
+      u["_next"] == "ask_dispatch" and u["ask_question"].split("\n\n", 1)[1] == _lib.render_question(E_DQ)
+      and "what does pg cost us?" in u["ask_question"].split("\n", 1)[0]
+      and f"parked for discussion {_lib.DISCUSSION_PARKS_MAX} times" in u["ask_question"].split("\n", 1)[0]
+      and u["escalation"]["options"] == E_DQ["options"], u)
+u2 = gates.choice_reask(base_state(escalation=u["escalation"], last_answer_text="and redis?"))
+check("choice_reask: a second re-ask replaces the note instead of stacking it",
+      u2["escalation"]["question"].split("\n\n", 1)[1] == E_DQ["question"] and "and redis?" in u2["escalation"]["question"]
+      and "what does pg cost us?" not in u2["escalation"]["question"], u2["escalation"]["question"])
+u2 = gates.ask_dispatch(base_state(escalation=u["escalation"], top_level=True, owner_away=True))
+check("choice_reask -> ask_dispatch: an away owner gets the re-ask remotely, else the ask_choice prompt",
+      u2["_next"] == ("ask_owner_poll" if gates.OWNER_REMOTE_INPUT else "ask_choice_3"), u2)
+
+# discussion park and resume
+E_PORT = gates.open_questions_gate(base_state(design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=1))["escalation"]
+PARK_ID = _lib.new_run_id("discussion park")
+PARK_ANSWERS = [{"question": "Which store?", "answer": "pg", "via": "option"}]
+PARK = dict(run_id=PARK_ID, run_dir=_lib.run_dir_for(PARK_ID), escalation=E_PORT, design_rounds=1, choice_kind="design_round",
+            choice_queue=E_QUEUE, choice_index=1, choice_answers=PARK_ANSWERS, choice_parks={}, parked="design_round",
+            last_answer_text="what does 9090 collide with?")
+u = gates.choice_park(base_state(**PARK))
+d = u.get("discussion") or {}
+check("choice_park: discussion below the cap -> parked choice_discussion, the run id carried, the park counted, end_discussion",
+      u["_next"] == "end_discussion" and u["parked"] == "choice_discussion" and u["discussion_run_id"] == PARK_ID
+      and u["choice_parks"] == {"1": 1} and "choice_forced" not in u, u)
+check("choice_park: the exposed discussion holds the run, plan, question, marked options, reply, answers, position and resume text",
+      d.get("run_id") == PARK_ID and d.get("plan_path") == PLAN and d.get("kind") == "design_round" and d.get("question") == "Which port?"
+      and [(o["label"], o["text"], o["recommended"]) for o in d.get("options", [])]
+      == [("Option 1 (recommended)", "8080", True), ("Option 2", "9090", False)]
+      and d.get("reply") == "what does 9090 collide with?" and d.get("answers") == PARK_ANSWERS
+      and (d.get("number"), d.get("total")) == (2, 2)
+      and '"continue"' in d.get("resume", "") and '"continue: <your answer>"' in d.get("resume", ""), d)
+snap = json.loads(read_file(os.path.join(PARK["run_dir"], "state.json")) or "{}")
+check("choice_park: state.json keeps the queue, the answers, the escalation, the park count and the round, phase choice_discussion",
+      snap.get("phase") == "choice_discussion" and snap.get("parked") == "choice_discussion" and snap.get("choice_queue") == E_QUEUE
+      and snap.get("choice_index") == 1 and snap.get("choice_answers") == PARK_ANSWERS and snap.get("escalation") == E_PORT
+      and snap.get("choice_parks") == {"1": 1} and snap.get("design_rounds") == 1, snap)
+msg = u.get("discussion_message", "")
+check("choice_park: the ASCII final message names the question, the marked recommended option, the reply, the answers and both resume forms",
+      msg.startswith("ARCHITECT_AWAITING_DISCUSSION\nDesign question 2 of 2 is open for discussion:\nWhich port?\n")
+      and "Options:\n  Option 1 (recommended): 8080\n  Option 2: 9090\n" in msg and "Your reply: what does 9090 collide with?" in msg
+      and "Answered so far:\n  1. Which store? -> pg\n" in msg and '"continue"' in msg and '"continue: <your answer>"' in msg
+      and msg.isascii() and _lib.RESUME_RE.search(msg).group(1) == PARK_ID, msg)
+s = {"initial_prompt": "continue: 9091", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: 'continue: <answer>' with the carried discussion_run_id -> re-entry into that run, answer stashed, carried key cleared",
+      s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["resume_mode"] is True and s["settled_answer"] == "9091"
+      and s["discussion_run_id"] == "" and s["parked"] == "choice_discussion" and s["choice_index"] == 1, s)
+s.update(gates.resume_route(s))
+check("resume_route: a run parked on a discussion -> choice_resume", s["_next"] == "choice_resume", s["_next"])
+s.update(gates.choice_resume(s))
+check("choice_resume: a settled answer is recorded for the parked question (via settled); discussion and settled answer cleared",
+      s["_next"] == "open_questions_gate" and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "9091", "via": "settled"}]
+      and s["choice_index"] == 2 and s["discussion"] == {} and s["settled_answer"] == "" and s["parked"] == "", s)
+s.update(gates.open_questions_gate(s))
+check("choice_resume -> open_questions_gate: the last question settled -> the round's amendment carries every answer",
+      s["_next"] == "amend_plan" and "1. Which store?\n   Answer: pg\n2. Which port?\n   Answer: 9091" in s["pending_amendments"][0],
+      s.get("pending_amendments"))
+s = base_state(escalation=E_DQ, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[],
+               settled_answer="Option 2", parked="choice_discussion", discussion={"run_id": "x"})
+u = gates.choice_resume(s)
+u2 = gates.open_questions_gate({**s, **u})
+check("choice_resume: 'continue: Option 2' on the first question -> its option text recorded, the next question asked",
+      u["choice_answers"] == [{"question": "Which store?", "answer": "sqlite", "via": "settled"}]
+      and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 1 and "Which port?" in u2["escalation"]["question"], (u, u2))
+for prompt, carried in (("Continue", PARK_ID), ("resume.", PARK_ID), (f"Architect run id: {PARK_ID}\ncontinue", "")):
+    s = {"initial_prompt": prompt, "discussion_run_id": carried, **STORE.variables(DESIGN, TMP)}
+    s.update(gates.intake(s))
+    s.update(gates.resume_route(s))
+    s.update(gates.choice_resume(s))
+    s.update(gates.open_questions_gate(s))
+    check(f"intake -> choice_resume: {prompt!r} without an answer -> the same question asked again, answers and park count kept",
+          s["run_id"] == PARK_ID and s["escalation"]["kind"] == "design_round" and s["escalation"]["data"]["index"] == 1
+          and s["_next"] == "escalate_gate" and s["choice_answers"] == PARK_ANSWERS and s["choice_parks"] == {"1": 1}
+          and s["discussion"] == {} and s["settled_answer"] == "", s)
+s = {"initial_prompt": f"Architect run id: {PARK_ID}\ncontinue: Option 2", **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: an explicit run id with 'continue: <answer>' -> re-entry with the answer stashed, no carried key needed",
+      s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["settled_answer"] == "Option 2", s)
+s = {"initial_prompt": f"Implement the design at {DESIGN}", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: a message that is not a continue with the carried key -> a fresh run, the key cleared, the left discussion ledgered",
+      not s.get("resume_mode") and s["run_id"] != PARK_ID and s["discussion_run_id"] == "" and s["_next"] == "orient_read"
+      and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
+s = {"initial_prompt": "continue", **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+check("intake: 'continue' with no carried key -> a fresh run as before", not s.get("resume_mode") and s["run_id"] != PARK_ID, s)
+s = {"initial_prompt": "continue: use pg", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+s.update(gates.resume_route(s))
+s.update(gates.choice_resume(s))
+check("intake -> choice_resume: 'continue: use pg' -> 'use pg' recorded for the parked question",
+      s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "use pg", "via": "settled"}],
+      s.get("choice_answers"))
+s = {"initial_prompt": "resume: option 2", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+s.update(gates.resume_route(s))
+s.update(gates.choice_resume(s))
+check("intake -> choice_resume: 'resume: option 2' -> option 2 recorded for the parked question",
+      s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "9090", "via": "settled"}],
+      s.get("choice_answers"))
+s = {"initial_prompt": "continue.", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s.update(gates.intake(s))
+s.update(gates.resume_route(s))
+s.update(gates.choice_resume(s))
+s.update(gates.open_questions_gate(s))
+check("intake -> choice_resume: bare 'continue.' -> the parked question asked again, no answer recorded",
+      s["run_id"] == PARK_ID and s["_next"] == "escalate_gate" and s["escalation"]["data"]["index"] == 1
+      and s["choice_answers"] == PARK_ANSWERS and s["settled_answer"] == "", s)
+for prompt in ("continue please", "continue, but why X?"):
+    s = {"initial_prompt": prompt, "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+    s.update(gates.intake(s))
+    check(f"intake: {prompt!r} is prose, not a continue -> a fresh run, no answer recorded, the key cleared, the left discussion ledgered",
+          not s.get("resume_mode") and s["run_id"] != PARK_ID and not s.get("settled_answer") and s["discussion_run_id"] == ""
+          and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
+
+
+def resume_chain(run_id, prompt, gate):
+    """Re-enter a parked run from its state.json the way the graph does; returns the state and the `_next` of each step."""
+    s = {"initial_prompt": prompt, "discussion_run_id": run_id, **STORE.variables(DESIGN, TMP)}
+    steps = []
+    for step in (gates.intake, gates.resume_route, gates.choice_resume, gate):
+        s.update(step(s))
+        steps.append(s["_next"])
+    return s, steps
+
+
+LEAK_ID = _lib.new_run_id("leak park")
+s = {**leak_asked, "run_id": LEAK_ID, "run_dir": _lib.run_dir_for(LEAK_ID)}
+s.update(gates.apply_answer({**s, "last_answer": "X first"}))
+s.update(gates.leak_route(s))
+s.update(gates.choice_park({**s, "last_answer_text": "who is allowed to sign?"}))
+s, steps = resume_chain(LEAK_ID, "continue: the owner", gates.leak_route)
+check("resume chain: a parked Gate 1 question settled -> leak_route closes the round with the held, earlier and settled answers",
+      steps == ["resume_route", "choice_resume", "leak_route", "amend_plan"] and s["pending_amendments"] == [
+          "Gate 1 leak: a -> b", "Gate 1 leak: priority of X vs Y? -> X first", "Gate 1 leak: who signs off? -> the owner"]
+      and s["choice_kind"] == "", (steps, s.get("pending_amendments")))
+CL_ID = _lib.new_run_id("checklist park")
+s = {**CL, "run_id": CL_ID, "run_dir": _lib.run_dir_for(CL_ID), "quality_surfaces": "http,other:grpc"}
+s.update(gates.apply_answer({**s, "last_answer": "1"}))
+s.update(gates.checklist_round(s))
+s.update(gates.choice_park({**s, "last_answer_text": "who would own the metadata?"}))
+s, steps = resume_chain(CL_ID, "continue: drop", gates.checklist_round)
+check("resume chain: a parked checklist item settled -> the next unanswered item asked, the earlier answer kept",
+      steps == ["resume_route", "choice_resume", "checklist_round", "escalate_gate"] and s["escalation"]["data"]["index"] == 2
+      and "retry calls" in s["escalation"]["question"]
+      and [a["answer"] for a in s["choice_answers"]] == [gates.CHECKLIST_ACCEPT, gates.CHECKLIST_DROP], (steps, s))
+s.update(gates.apply_answer({**s, "last_answer": "1"}))
+s.update(gates.checklist_round(s))
+check("resume chain: the resumed checklist round closes with the items accepted before and after the park",
+      s["_next"] == "amend_plan" and "- [grpc] use deadlines\n" in s["pending_amendments"][0]
+      and "- [grpc] retry calls" in s["pending_amendments"][0] and "propagate metadata" not in s["pending_amendments"][0],
+      s.get("pending_amendments"))
+u = gates.checklist_gate(s)
+check("resume chain: a label answered before the park is not fanned out again", u["_next"] == "reseal_gate", u)
+u = gates.choice_resume(base_state(choice_kind="mystery", escalation=escalation("mystery", "q"), parked="choice_discussion"))
+check("choice_resume: a discussion parked on an unknown kind -> escalate_gate, ledgered, no KeyError",
+      u["_next"] == "escalate_gate" and any("unknown kind 'mystery'" in d for d in u["decisions"]), u)
+s = base_state(**{**PARK, "choice_parks": {}}, reply_kind="", last_script_error="llm node 'classify_reply' failed: x")
+s.update(gates.choice_reply_route(s))
+s.update(gates.choice_park(s))
+check("choice_reply_route -> choice_park: a classifier fault parks the run like a discussion",
+      s["_next"] == "end_discussion" and s["parked"] == "choice_discussion" and s["discussion"]["reply"] == "what does 9090 collide with?", s)
+u = gates.choice_park(base_state(**{**PARK, "choice_parks": {"1": _lib.DISCUSSION_PARKS_MAX - 1}}))
+check("choice_park: the last park below the cap still parks and counts it",
+      u["_next"] == "end_discussion" and u["choice_parks"] == {"1": _lib.DISCUSSION_PARKS_MAX}, u)
+u = gates.choice_park(base_state(**{**PARK, "choice_parks": {"0": 1, "1": _lib.DISCUSSION_PARKS_MAX}}))
+check("choice_park: a question parked DISCUSSION_PARKS_MAX times -> no park, choice_reask, its next typed reply forced",
+      u["_next"] == "choice_reask" and u["choice_forced"] is True and "parked" not in u and "discussion" not in u
+      and "discussion_run_id" not in u and "choice_parks" not in u, u)
+u = gates.parse_answer(base_state(escalation=E_PORT, last_answer_text="what about 9091?", choice_forced=True))
+check("parse_answer: a forced question's typed reply -> recorded as the answer without the classifier, ledgered",
+      u["_next"] == "apply_answer" and u["last_answer"] == "what about 9091?"
+      and any("without the classifier" in d for d in u["decisions"]), u)
+u = gates.apply_answer(base_state(escalation=E_PORT, last_answer="what about 9091?", choice_kind="design_round", choice_queue=E_QUEUE,
+                                  choice_index=1, choice_answers=PARK_ANSWERS, choice_forced=True))
+check("apply_answer: the forced reply recorded (via other) and the force lifted for the next question",
+      u["choice_answers"][-1] == {"question": "Which port?", "answer": "what about 9091?", "via": "other"} and u["choice_forced"] is False, u)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, choice_forced=True))
+check("parse_answer: a non-design escalation ignores the force and still re-asks", u["_next"] == "ask_user" and u["reask_rounds"] == 1, u)
+E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
+check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index",
+      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_kinds=["design_round#0"]))["_next"] == "ladder_judge"
+      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_kinds=["design_round#0"]))["_next"] == "ask_dispatch")
+u2 = gates.ladder_route(base_state(escalation=E_DQ, ladder_resolution="recommended", ladder_choice=""))
+check("ladder_route: a multiple-choice question records its kind and index as ruled autonomously",
+      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2["autonomous_kinds"] == ["design_round#0"], u2)
 
 # ---------------------------------------------------------------- apply_answer (every kind)
 def AA(kind, answer, **over):
@@ -1154,23 +1618,48 @@ check("apply_answer: mode_invalid -> value applied -> intake/orient", AA("mode_i
 check("apply_answer: mode_invalid abort -> end_aborted", AA("mode_invalid", "Abort the run")["_next"] == "end_aborted")
 check("apply_answer: need_design_doc with a real path -> orient_read", AA("need_design_doc", DESIGN)["design_doc_path"] == DESIGN)
 check("apply_answer: need_design_doc bad path -> end_blocked", AA("need_design_doc", "/nope.md")["_next"] == "end_blocked")
-u = AA("design_round", "1: pg", esc=escalation("design_round", "q", data={"questions": qs}))
-check("apply_answer: design_round -> amendments -> amend_plan; open questions cleared", u["_next"] == "amend_plan" and "1: pg" in u["pending_amendments"][0] and u["open_questions"] == [])
-u = AA("quality_bar", "rigor=prototype, surfaces=http,other:grpc", esc=escalation("quality_bar", "q", data={"rigor": "production", "surfaces": "x"}))
-check("apply_answer: quality_bar -> record_quality_bar with the chosen values", u["_next"] == "record_quality_bar" and u["quality_rigor"] == "prototype" and u["quality_surfaces"] == "http,other:grpc")
-u = AA("quality_bar", "rigor=poc, surfaces=(as proposed)", esc=escalation("quality_bar", "q", data={"rigor": "production", "surfaces": "http"}))
-check("apply_answer: quality_bar '(as proposed)' keeps the proposal's surfaces", u["quality_surfaces"] == "http" and u["quality_rigor"] == "poc")
-u = AA("checklist_accept", "1,3", esc=escalation("checklist_accept", "q", data={"items": ["a", "b", "c"]}))
-check("apply_answer: checklist_accept numbers -> amend_plan with the accepted items", u["_next"] == "amend_plan" and "- a" in u["pending_amendments"][0] and "- c" in u["pending_amendments"][0] and "- b" not in u["pending_amendments"][0])
-check("apply_answer: checklist_accept none -> checklist_gate", AA("checklist_accept", "none", esc=escalation("checklist_accept", "q", data={"items": ["a"]}))["_next"] == "checklist_gate")
+u = AA("design_round", "pg", esc=E_DQ, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[])
+check("apply_answer: design_round option -> recorded (via option), queue advanced -> open_questions_gate",
+      u["_next"] == "open_questions_gate" and u.get("choice_answers") == [{"question": "Which store?", "answer": "pg", "via": "option"}]
+      and u.get("choice_index") == 1 and "pending_amendments" not in u, u)
+u = AA("design_round", "use mysql", esc=E_DQ, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[])
+check("apply_answer: design_round typed answer -> recorded verbatim (via other)",
+      u.get("choice_answers") == [{"question": "Which store?", "answer": "use mysql", "via": "other"}] and u.get("choice_index") == 1, u)
+s = base_state(open_questions=qs, design_rounds=0)
+for reply in ("Option 2", "use 7000"):
+    s.update(gates.open_questions_gate(s))
+    s.update(last_answer_text=reply)
+    s.update(gates.parse_answer(s))
+    if s["_next"] == "classify_reply":
+        s.update(reply_kind="answer")
+        s.update(gates.choice_reply_route(s))
+    s.update(gates.apply_answer(s))
+s.update(gates.open_questions_gate(s))
+check("design round walk: an option pick then a typed answer -> one amendment carrying both answers -> amend_plan",
+      s["_next"] == "amend_plan" and "1. Which store?\n   Answer: sqlite\n2. Which port?\n   Answer: use 7000" in s["pending_amendments"][0]
+      and s["design_rounds"] == 1, s.get("pending_amendments"))
+u = gates.consult_route(base_state(escalation=E_DQ, consult_result="CONSULT: ANSWER 3"))
+check("consult_route: a navigator answer on a design question -> the option's text -> apply_answer",
+      u["_next"] == "apply_answer" and u["last_answer"] == "redis", u)
+check("quality bar answer: an explicit rigor=, a bare rigor word, surfaces= and '(as proposed)' each parse; the proposal fills the rest",
+      gates._quality_bar_answer("rigor=prototype, surfaces=http,other:grpc", "production", "x") == ("prototype", "http,other:grpc")
+      and gates._quality_bar_answer("rigor=poc, surfaces=(as proposed)", "production", "http") == ("poc", "http")
+      and gates._quality_bar_answer("go with poc", "production", "http") == ("poc", "http"))
+check("quality bar answer: an empty surfaces= stays empty, surfaces named in passing keep the proposal, a bare rigor word is lowercased",
+      gates._quality_bar_answer("rigor=production, surfaces=", "production", "") == ("production", "")
+      and gates._quality_bar_answer("go with poc, the surfaces listed are fine", "production", "http") == ("poc", "http")
+      and gates._quality_bar_answer("Prototype please", "production", "http") == ("prototype", "http")
+      and gates._quality_bar_answer("prototype, surfaces api", "production", "http") == ("prototype", "api"))
+u = AA("quality_bar", "rigor=poc", esc=escalation("quality_bar", "q", data={"multiple_choice": True, "index": 0}))
+check("apply_answer: quality_bar -> recorded through the queue -> quality_bar_gate", u["_next"] == "quality_bar_gate" and u["choice_index"] == 1)
+u = AA("checklist_accept", "Drop", esc=escalation("checklist_accept", "q", data={"multiple_choice": True, "index": 0}))
+check("apply_answer: checklist_accept -> recorded through the queue -> checklist_round", u["_next"] == "checklist_round" and u["choice_index"] == 1)
 check("apply_answer: amend_cap stop -> end_blocked", AA("amend_cap", "Stop and report")["_next"] == "end_blocked")
 u = AA("amend_cap", "Allow one more amendment cycle")
 check("apply_answer: amend_cap allow -> one more cycle then gate1", u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1)
 check("apply_answer: gate1_stuck stop -> end_blocked", AA("gate1_stuck", "Stop and report")["_next"] == "end_blocked")
 u = AA("gate1_stuck", "infra goes in infra/; DB is pg")
 check("apply_answer: gate1_stuck answers -> amend_plan (fingerprints reset)", u["_next"] == "amend_plan" and u["leak_fingerprints"] == [])
-u = AA("leak_question", "priority: X first", leak_pending_answers=[{"question": "a", "answer": "b"}])
-check("apply_answer: leak_question -> held answers + owner's answers amended", u["_next"] == "amend_plan" and len(u["pending_amendments"]) == 2)
 check("apply_answer: gate2_stuck stop -> end_blocked", AA("gate2_stuck", "Stop and report")["_next"] == "end_blocked")
 check("apply_answer: gate2_stuck override -> reseal_return (recorded)", AA("gate2_stuck", "Override: promote the plan as reviewed (recorded)")["_next"] == "reseal_return")
 u = AA("gate_fault", "Retry the gatekeeper", esc=escalation("gate_fault", "q", data={"gate": "gate1"}), gate_fault_retries=0)
@@ -1621,6 +2110,49 @@ check("graph: draft_edit returns to draft_brief, which routes to draft_route and
       and NODES.get("draft_brief", {}).get("fallback") == "draft_fault", {k: NODES.get(k) for k in ("draft_edit", "draft_brief")})
 check("graph: draft_brief's prompt carries the earlier turns, the previous draft and the requested changes",
       all(f"{{{{{k}}}}}" in NODES.get("draft_brief", {}).get("prompt", "") for k in ("previous_turns", "draft_text", "draft_feedback")))
+CHOICE_COUNTS = range(_lib.CHOICE_OPTIONS_MIN, _lib.CHOICE_OPTIONS_MAX + 1)
+check("graph: ask_choice_<n> offers exactly the n labels render_question uses, each routed to parse_answer, Other too",
+      all(NODES.get(f"ask_choice_{n}", {}).get("type") == "approval"
+          and NODES.get(f"ask_choice_{n}", {}).get("options") == [_lib.choice_label(i) for i in range(n)]
+          and NODES.get(f"ask_choice_{n}", {}).get("routes") == {_lib.choice_label(i): "parse_answer" for i in range(n)}
+          and NODES.get(f"ask_choice_{n}", {}).get("on_other") == "parse_answer"
+          and NODES.get(f"ask_choice_{n}", {}).get("question", "").strip() == "{{ask_question}}"
+          and NODES.get(f"ask_choice_{n}", {}).get("state_updates") == {"last_answer": "{{choice}}", "last_answer_text": "{{choice}}"}
+          for n in CHOICE_COUNTS), {n: NODES.get(f"ask_choice_{n}") for n in CHOICE_COUNTS})
+check("graph: every askable option count has its ask_choice prompt in _TERMINAL_PROMPTS",
+      [gates._TERMINAL_PROMPTS.get(f"choice_{n}") for n in CHOICE_COUNTS] == [f"ask_choice_{n}" for n in CHOICE_COUNTS])
+CR = NODES.get("classify_reply", {})
+check("graph: classify_reply has no tools, a reply_kind enum of answer/discussion, and its fault routes to choice_reply_route",
+      CR.get("type") == "llm" and CR.get("tools") == [] and CR.get("next") == "choice_reply_route" and CR.get("fallback") == "choice_reply_route"
+      and (CR.get("output_schema") or {}).get("properties", {}).get("reply_kind", {}).get("enum") == ["answer", "discussion"]
+      and "{{last_answer_text}}" in CR.get("prompt", ""), CR)
+FQ, AP = NODES.get("frame_questions", {}), NODES.get("author_plan", {})
+AP_ITEMS = (AP.get("output_schema") or {}).get("properties", {}).get("open_questions")
+check("graph: frame_questions returns author_plan's open_questions item shape and always routes to frame_questions_route",
+      AP_ITEMS is not None and (FQ.get("output_schema") or {}).get("properties", {}).get("framed_questions") == AP_ITEMS
+      and FQ.get("next") == FQ.get("fallback") == "frame_questions_route" and "{{choice_invalid}}" in FQ.get("prompt", ""), FQ)
+check("graph: author_plan asks for exactly one recommended option, listed first",
+      "exactly one" in AP.get("instructions", "") and "listed first" in AP.get("instructions", ""))
+CHOICE_KEYS = ("choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed", "choice_parks", "choice_forced")
+check("graph: initial_state seeds the choice queue and STATE_KEYS snapshots it",
+      [SEEDS.get(k) for k in CHOICE_KEYS] == ["", [], 0, [], False, {}, False] and all(k in _lib.STATE_KEYS for k in CHOICE_KEYS),
+      {k: SEEDS.get(k) for k in CHOICE_KEYS})
+check("graph: end_discussion is an end node whose output is the script-composed discussion message",
+      NODES.get("end_discussion", {}).get("type") == "end" and NODES.get("end_discussion", {}).get("output", "").strip() == "{{discussion_message}}",
+      NODES.get("end_discussion"))
+check("graph: choice_park and choice_resume are script nodes failing to end_failure",
+      all(NODES.get(n, {}).get("type") == "script" and NODES.get(n, {}).get("script") == f"scripts/{n}.py"
+          and NODES.get(n, {}).get("fallback") == "end_failure" for n in ("choice_park", "choice_resume")))
+check("graph: carry is exactly discussion_run_id, seeded empty, and never snapshotted",
+      GRAPH.get("carry") == ["discussion_run_id"] and SEEDS.get("discussion_run_id") == "" and "discussion_run_id" not in _lib.STATE_KEYS,
+      GRAPH.get("carry"))
+check("graph: session.expose shows the discussion to the chat lane; the discussion keys are seeded empty",
+      "discussion" in ((GRAPH.get("session") or {}).get("expose") or [])
+      and [SEEDS.get(k) for k in ("discussion", "discussion_message", "settled_answer")] == [{}, "", ""],
+      (GRAPH.get("session") or {}).get("expose"))
+_route = " ".join((((GRAPH.get("session") or {}).get("route") or {}).get("instructions") or "").split())
+check("graph: route instructions send continue / continue: <answer> after a design discussion park to RUN",
+      '"continue" or "continue: <answer>" routes RUN' in _route and "resumes at the parked question" in _route, _route)
 
 _real_run, _real_gh_timeout, gh_timeouts = subprocess.run, gates.GH_CALL_SECS, []
 subprocess.run = lambda *a, **kw: (gh_timeouts.append(kw.get("timeout")), _real_run(*a, **kw))[1]

@@ -7,7 +7,8 @@ subgraphs stay disjoint from the main flow; every cycle (static + dynamic)
 passes through a node that owns a named bound (section 5); the engine backstop
 is set. Script `_next` targets are harvested per gate function from gates.py
 by AST (string constants assigned to `u["_next"]` and the shared
-`raise_escalation` / `_terminal_prompt` helpers), so the dynamic edges are
+`raise_escalation` / `_terminal_prompt` helpers, plus every gate of the
+CHOICE_KIND_GATES table for a function that reads it), so the dynamic edges are
 attributed to the node that emits them, not smeared over every script node.
 
 Usage: audit_graph.py [agent dir]   (exit 1 on any problem)
@@ -26,9 +27,10 @@ AGENT_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(o
 # Node -> bound id(s) (the named loop bounds). A cycle is legal
 # only if it passes through at least one of these nodes.
 BOUNDED = {
-    "open_questions_gate": "B1 design_rounds<=3",
+    "open_questions_gate": "B1 design_rounds<=3 / re-frame once per round (choice_reframed) / choice_index list-bounded",
     "reseal_gate": "B2 amend_cycles<=3 (A1)",
     "gate1_route": "B3 same-leak retry once (A1) / FRICTION seal",
+    "leak_route": "re-frame once per leak round (choice_reframed) / choice_index list-bounded",
     "plan_route": "B4 author_retries<=1",
     "gate2_route": "B5 oracle_rejects<=3",
     "promote_verify": "B6 promote_retries<=1",
@@ -47,6 +49,8 @@ BOUNDED = {
     "review_apply": "review fix rounds<=3 per PR",
     "ask_owner_route": "B21 owner_polls<=2",
     "parse_answer": "B22 reask_rounds<=3",
+    "choice_reask": "user-driven: every pass waits on the owner's next reply",
+    "choice_park": "DISCUSSION_PARKS_MAX=3 parks per question (choice_parks); each park ends the run",
     "wave_integrate": "wave_index list-bounded",
     "task_done_route": "batch closed once (batch_state.passed)",
     "checklist_gate": "checklist_done list-bounded",
@@ -74,15 +78,22 @@ def harvest_gate_targets(gates_src):
     """gate function name -> set of `_next` literals it can emit (incl. helpers)."""
     tree = ast.parse(gates_src)
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    found = [{v.value for v in n.value.values if isinstance(v, ast.Constant)} for n in tree.body
-             if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and any(getattr(t, "id", None) == "_TERMINAL_PROMPTS" for t in n.targets)]
-    if not found:
-        sys.exit("gates.py has no module-level _TERMINAL_PROMPTS dict literal; the terminal prompt edges cannot be audited")
-    prompts = {"ask_user"} | found[0]
+
+    def dict_values(name):
+        found = [{v.value for v in n.value.values if isinstance(v, ast.Constant)} for n in tree.body
+                 if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and any(getattr(t, "id", None) == name for t in n.targets)]
+        if not found:
+            sys.exit(f"gates.py has no module-level {name} dict literal; the edges it drives cannot be audited")
+        return found[0]
+
+    prompts = {"ask_user"} | dict_values("_TERMINAL_PROMPTS")
+    kind_gates = dict_values("CHOICE_KIND_GATES")
 
     def literals(fn):
         out = set()
         for node in ast.walk(fn):
+            if isinstance(node, ast.Name) and node.id == "CHOICE_KIND_GATES":
+                out.update(kind_gates)
             if isinstance(node, ast.Assign):
                 for t in node.targets:
                     if (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "_next"
