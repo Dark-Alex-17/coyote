@@ -3570,11 +3570,36 @@ mod tests {
     fn thinking_events_pass_through_the_sink() {
         let (tx, mut rx) = unbounded_channel();
         let sink = TuiSink::new(tx);
-        sink.on_event(&Event::ThinkingStarted);
+        sink.on_event(&Event::ThinkingStarted {
+            origin: Origin::detached(),
+        });
         assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStarted)));
-        sink.on_event(&Event::ThinkingStopped);
+        sink.on_event(&Event::ThinkingStopped {
+            origin: Origin::detached(),
+        });
         assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStopped)));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A child agent's reasoning says nothing about what the root is
+    /// doing, so only root-origin thinking events reach the status row.
+    #[test]
+    fn a_child_agents_thinking_never_drives_the_status_row() {
+        let (tx, mut rx) = unbounded_channel();
+        let sink = TuiSink::new(tx);
+        let child = Origin {
+            agent_id: Some("agent_c".into()),
+            depth: 1,
+        };
+        sink.on_event(&Event::ThinkingStarted {
+            origin: child.clone(),
+        });
+        sink.on_event(&Event::ThinkingStopped { origin: child });
+        assert!(rx.try_recv().is_err(), "a child's thinking reached the UI");
+        sink.on_event(&Event::ThinkingStarted {
+            origin: Origin::detached(),
+        });
+        assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStarted)));
     }
 
     /// An editor that exits non-zero has not finished the edit: the text

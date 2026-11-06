@@ -371,6 +371,7 @@ pub async fn openai_chat_completions_streaming(
             if reasoning_state == 1 {
                 handler.text("\n</think>\n\n")?;
                 reasoning_state = 0;
+                handler.thinking_stopped();
             }
             handler.text(text)?;
         } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
@@ -379,6 +380,7 @@ pub async fn openai_chat_completions_streaming(
             .filter(|v| !v.is_empty())
         {
             if reasoning_state == 0 {
+                handler.thinking_started();
                 handler.text("<think>\n")?;
                 reasoning_state = 1;
             }
@@ -394,6 +396,7 @@ pub async fn openai_chat_completions_streaming(
             if reasoning_state == 1 {
                 handler.text("\n</think>\n\n")?;
                 reasoning_state = 0;
+                handler.thinking_stopped();
             }
             let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
             if maybe_call_id != call_id && maybe_call_id.len() >= call_id.len() {

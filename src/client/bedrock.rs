@@ -236,6 +236,9 @@ async fn chat_completions_streaming(
                     debug!("stream-data: {smithy_type} {data}");
                     match smithy_type {
                         "contentBlockStart" => {
+                            if data["start"]["reasoningContent"].is_object() {
+                                handler.thinking_started();
+                            }
                             if let Some(tool_use) = data["start"]["toolUse"].as_object()
                                 && let (Some(id), Some(name)) = (
                                     json_str_from_map(tool_use, "toolUseId"),
@@ -267,6 +270,9 @@ async fn chat_completions_streaming(
                             } else if let Some(text) =
                                 data["delta"]["reasoningContent"]["text"].as_str()
                             {
+                                if reasoning_state == 0 {
+                                    handler.thinking_started();
+                                }
                                 reasoning_state = 1;
                                 thinking_text.push_str(text);
                             } else if let Some(signature) =

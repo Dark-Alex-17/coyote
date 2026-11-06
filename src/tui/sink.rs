@@ -155,8 +155,9 @@ fn hook_tool_name(envs: &[(String, String)]) -> Option<String> {
         .map(|(_, value)| super::render::plain_text(value))
 }
 
-/// Only the root turn's own tools drive the status row; a child agent's
-/// tool starting or finishing says nothing about what the root is doing.
+/// Only the root turn's own tools and thinking drive the status row; a
+/// child agent's tool or reasoning starting or finishing says nothing
+/// about what the root is doing.
 fn is_root(origin: &Origin) -> bool {
     origin.agent_id.is_none() && origin.depth == 0
 }
@@ -164,8 +165,12 @@ fn is_root(origin: &Origin) -> bool {
 impl EventSink for TuiSink {
     fn on_event(&self, event: &Event) {
         match event {
-            Event::ThinkingStarted => self.send(UiMsg::ThinkingStarted),
-            Event::ThinkingStopped => self.send(UiMsg::ThinkingStopped),
+            Event::ThinkingStarted { origin } if is_root(origin) => {
+                self.send(UiMsg::ThinkingStarted)
+            }
+            Event::ThinkingStopped { origin } if is_root(origin) => {
+                self.send(UiMsg::ThinkingStopped)
+            }
             Event::UsageUpdated { right_prompt } => {
                 self.send(UiMsg::UsageUpdated(right_prompt.clone()))
             }

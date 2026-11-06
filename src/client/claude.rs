@@ -241,6 +241,9 @@ pub async fn claude_chat_completions_streaming(
         if let Some(typ) = data["type"].as_str() {
             match typ {
                 "content_block_start" => {
+                    if data["content_block"]["type"].as_str() == Some("thinking") {
+                        handler.thinking_started();
+                    }
                     if let (Some("redacted_thinking"), Some(redacted_data)) = (
                         data["content_block"]["type"].as_str(),
                         data["content_block"]["data"].as_str(),
@@ -277,6 +280,9 @@ pub async fn claude_chat_completions_streaming(
                     if let Some(text) = data["delta"]["text"].as_str() {
                         handler.text(text)?;
                     } else if let Some(text) = data["delta"]["thinking"].as_str() {
+                        if reasoning_state == 0 {
+                            handler.thinking_started();
+                        }
                         reasoning_state = 1;
                         thinking_text.push_str(text);
                     } else if let Some(signature) = data["delta"]["signature"].as_str() {
