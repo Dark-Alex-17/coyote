@@ -1485,8 +1485,6 @@ def compose_delegation(state):
     u["delegate_review_cadence"] = "batch" if is_micro(state) else "task"
     u["delegate_parallel"] = "0"
     u["delegate_project_dir"] = state.get("code_repo_path", "")
-    if is_micro(state):
-        ledger(state, u, f"mode-degraded: {task['id']}: review_cadence=batch carried in the prompt (config-agent child; E9)")
     ledger(state, u, f"delegate: {task['id']} kind={kind}" + (f" items={len(as_list(state.get('fix_items')))}" if kind == "fix" else ""))
     snapshot(state, u, f"task {task['id']} delegated")
     return u
@@ -1495,7 +1493,8 @@ def compose_delegation(state):
 def _report_failed(text):
     if not text or text.startswith("Agent node failed"):
         return True
-    if re.search(r"SISYPHUS_(FAILED|BLOCKED|ABORTED)", text):
+    # REDIRECT and AWAITING_DISCUSSION end a sisyphus-next run before any work lands
+    if re.search(r"SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT|AWAITING_DISCUSSION)", text):
         return True
     head = "\n".join(text.splitlines()[:30] + text.splitlines()[-30:])
     return bool(re.search(r"(?im)^\W*(STOP(PED)?|BLOCKED|FAILED)\b.*\b(plan|scope|cannot|could not|unable)", head)
@@ -1503,9 +1502,9 @@ def _report_failed(text):
 
 
 def _parse_report(text):
-    """The sisyphus report sections the architect ledgers."""
+    """The sisyphus report sections the architect ledgers; a section ends at the next one or at any markdown heading."""
     def sec(name):
-        m = re.search(rf"(?ims)^\W*{name}\s*:?\s*\n(.*?)(?=^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions|Decisions taken autonomously|Sisyphus run id)\b|\Z)", text)
+        m = re.search(rf"(?ims)^\W*{name}\s*:?\s*\n(.*?)(?=^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions|Decisions taken autonomously|Sisyphus run id)\b|^\#{{1,6}}\s|\Z)", text)
         if not m:
             m2 = re.search(rf"(?im)^\W*{name}\s*:\s*(.+)$", text)
             return [m2.group(1).strip()] if m2 and m2.group(1).strip().lower() not in ("none", "- none") else []
@@ -2239,8 +2238,8 @@ def wave_claim(state):
         t["base_sha"] = git_out(wt, "rev-parse", "HEAD", default=t.get("base_sha", ""))
         roster = "\n".join(l for l in roster_lines if not l.startswith(f"- {t['id']}")) or "(no siblings)"
         prompt = _delegation_text(state, t, "implement", project_dir=wt, roster=roster)
-        wave.append({"task": t["id"], "prompt": prompt, "worktree": wt, "branch": t["branch"], "base_sha": t["base_sha"]})
-        ledger(state, u, f"mode-degraded: {t['id']}: parallel=1 + project_dir={wt} carried in the prompt (config-agent child; E9)")
+        wave.append({"task": t["id"], "prompt": prompt, "worktree": wt, "branch": t["branch"], "base_sha": t["base_sha"],
+                     "review_cadence": "batch" if is_micro(state) else "task"})
     u["wave"] = wave
     u["wave_fix_rounds"] = 0
     save_tasks(state, u, tasks)

@@ -966,6 +966,7 @@ p = u["delegation_prompt"]
 check("compose_delegation: single template - run branch, no PR, MUST NOT branches; never the multi blocks; task file + plan section + quality bar pasted",
       "feat/PLAN-widgets" in p and "Do NOT open a PR" in p and "DRAFT PR" not in p and "### Task file (verbatim)" in p and "Do widget-model" in p
       and "## Quality bar" not in p and "rigor=" in p and "## MODE" not in p and u["delegate_review_cadence"] == "task")
+U_SEQ = u
 ts_m = copy.deepcopy(TS1)
 gates.task_by_id(ts_m, T1)["pr_base"] = "main"
 gates.task_by_id(ts_m, T1)["branch"] = "feat/task-101-widget-model"
@@ -977,9 +978,10 @@ gates.task_by_id(ts_m, T1)["pr_base"] = "feat/task-100-base"
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=ts_m, current_task=T1, pr_strategy="multi", delegation_kind="implement"))
 check("compose_delegation: multi stacked on an unmerged blocker -> STACKED PR block (cascade rule)", MULTI_IS_GROUPS or ("STACKED PR" in u["delegation_prompt"] and "never force-push" in u["delegation_prompt"]))
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, run_branch="feat/PLAN-widgets", task_granularity="micro"))
-check("compose_delegation: micro -> MODE block review_cadence=batch + context pack section + mode-degraded ledger (E9/V9)",
+check("compose_delegation: micro -> MODE block review_cadence=batch + context pack section; the cadence rides delegate_review_cadence, no mode-degraded ledger (V9)",
       "## MODE" in u["delegation_prompt"] and "review_cadence=batch" in u["delegation_prompt"] and "### Context pack" in u["delegation_prompt"]
-      and u["delegate_review_cadence"] == "batch" and any(d.startswith("mode-degraded") for d in u["decisions"]))
+      and u["delegate_review_cadence"] == "batch" and not any(d.startswith("mode-degraded") for d in u["decisions"]))
+U_MICRO = u
 rd = base_state()["run_dir"]
 write(os.path.join(rd, "reports", f"{T1}-r1.md"), "Implemented.\nHEAD SHA abc1234\nSisyphus run id: 20260101T000000-0badf00d\nFOLLOW-UPS: none\n")
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, run_branch="feat/PLAN-widgets", delegation_kind="fix",
@@ -1000,6 +1002,49 @@ check("route_delegate: report stored (reports/<task>-rN.md) + parsed (SHA, follo
       and pr_["design_asks"] == ["ASK -- should the worker share the store?"] and pr_["sisyphus_run_id"] == "20260101T000000-0badf00d")
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="SISYPHUS_FAILED\ncould not complete: build broken"))
 check("route_delegate: failure sentinel -> oracle_diagnose", u["_next"] == "oracle_diagnose")
+for sentinel in ("SISYPHUS_REDIRECT\nPlan-shaped work: this wants an architect run.", "SISYPHUS_AWAITING_DISCUSSION\nA design question is open for discussion:"):
+    u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=sentinel + "\n\nSisyphus run id: 20260101T000000-0badf00d"))
+    check(f"route_delegate: sisyphus-next {sentinel.split(chr(10))[0]} (no work landed) -> oracle_diagnose", u["_next"] == "oracle_diagnose")
+
+# The delegate's final report as the real sisyphus-next `final_report` renders it, wrapped the way its end_complete node does.
+SN_SCRIPTS = os.path.join(HERE, "..", "..", "sisyphus-next", "scripts")
+SN_ROOT = os.path.join(TMP, "sn-report")
+os.makedirs(SN_ROOT, exist_ok=True)
+SN_STATE = {"run_id": "20260102T030405-0123abcd", "run_dir": os.path.join(SN_ROOT, "run"), "project_dir": SN_ROOT, "git_root": SN_ROOT,
+            "base_sha": "1111111", "head_sha": "2a3b4c5d6e7f", "intent": "implementation", "sizing": "single", "review_cadence": "batch",
+            "coder_result": "CODER_COMPLETE\nBuild: ok\nTests: ok", "coder_sentinel": "CODER_COMPLETE", "gauntlet_verdict": "PASS",
+            "round_heads": [{"round": 1, "head": "2a3b4c5", "verdict": "PASS"}],
+            "debt_left_behind": ["src/a.rs:3 -- #[allow(dead_code)] -- TASK-999"], "debris_exemptions": ["src/b.rs:4 -- the arrow is the point"],
+            "design_decisions": ["introduced a WidgetStore trait in src/a.rs"], "observability_artifact": "## Observability\n\nNo operational surface added.",
+            "follow_ups": ["rotate the widget key before merge"], "anomalies_log": ["a flaky unrelated test"], "git_report": "pushed 2a3b4c5d6e7f"}
+
+
+def sisyphus_next_report(state):
+    """(process, report): sisyphus-next's own final_report over `state`, run from its scripts dir without bytecode."""
+    proc = subprocess.run([sys.executable, "-B", "-c", "import json, sys; import gates; print(json.dumps(gates.final_report(json.load(sys.stdin))['report']))"],
+                          input=json.dumps(state), capture_output=True, text=True, cwd=SN_SCRIPTS,
+                          env={k: v for k, v in os.environ.items() if k not in ("GRAPH_STATE", "GRAPH_STATE_FILE")})
+    return proc, (json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else "")
+
+
+p, SN_REPORT = sisyphus_next_report(SN_STATE)
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegation_kind="implement",
+                                    delegate_result="Implemented the widget model; build and tests green.\n\n" + SN_REPORT))
+sn_pr = u["report_parsed"]
+check("route_delegate: the real sisyphus-next final report parses - HEAD SHA, run id, debt / exemptions / design / follow-ups, "
+      "each section stopping at the next markdown heading -> verify_gate",
+      SN_REPORT.startswith("# Sisyphus run report") and u["_next"] == "verify_gate" and sn_pr["head_sha"] == "2a3b4c5d6e7f"
+      and "2a3b4c5d6e7f" in sn_pr["shas"] and sn_pr["sisyphus_run_id"] == "20260102T030405-0123abcd"
+      and sn_pr["debt"] == ["src/a.rs:3 -- #[allow(dead_code)] -- TASK-999"] and sn_pr["exemptions"] == ["src/b.rs:4 -- the arrow is the point"]
+      and sn_pr["design"] == ["introduced a WidgetStore trait in src/a.rs"] and sn_pr["design_asks"] == []
+      and sn_pr["follow_ups"] == ["rotate the widget key before merge"] and gates.task_by_id(u["tasks"], T1)["sisyphus_run_id"] == "20260102T030405-0123abcd",
+      f"rc={p.returncode} stderr={p.stderr[-300:]} parsed={sn_pr}")
+empty = dict(SN_STATE, debt_left_behind=[], debris_exemptions=[], design_decisions=[], follow_ups=[], observability_artifact="")
+p, sn_empty = sisyphus_next_report(empty)
+sn_pr = gates._parse_report(sn_empty)
+check("route_delegate: a sisyphus-next report with every ledger section `- none` / `none` parses to empty lists",
+      "Design decisions:\n- none" in sn_empty and sn_pr["debt"] == [] and sn_pr["exemptions"] == [] and sn_pr["design"] == [] and sn_pr["follow_ups"] == [],
+      f"{p.stderr[-300:]} {sn_pr}")
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="Agent node failed: timeout"))
 check("route_delegate: agent node failed -> oracle_diagnose (evidence = the error)", u["_next"] == "oracle_diagnose" and "timeout" in u["failure_evidence"])
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="STOP: the plan is wrong - criterion 3 contradicts the schema; cannot proceed"))
@@ -1325,9 +1370,10 @@ check("task_done_route: full -> select_tasks", gates.task_done_route(base_state(
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 ts_w = tasks_with()
 u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=ts_w, wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1"))
-check("wave_claim: worktrees + task branches from the run branch; roster in every prompt; mode-degraded ledgered (E9)",
+check("wave_claim: worktrees + task branches from the run branch; roster in every prompt; every item carries review_cadence=task; no mode-degraded ledger",
       len(u["wave"]) == 2 and all(os.path.isdir(w["worktree"]) for w in u["wave"]) and all("Teammate roster" in w["prompt"] and "parallel=1" in w["prompt"] for w in u["wave"])
-      and T3 in u["wave"][0]["prompt"] and u["wave"][0]["branch"].startswith("feat/PLAN-widgets-task-") and any(d.startswith("mode-degraded") for d in u["decisions"]))
+      and T3 in u["wave"][0]["prompt"] and u["wave"][0]["branch"].startswith("feat/PLAN-widgets-task-")
+      and all(w.get("review_cadence") == "task" for w in u["wave"]) and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])))
 WAVE = u["wave"]
 TS_W = u["tasks"]
 u = gates.wave_verify_build(base_state(plan_path=PROMOTED, tasks=TS_W, wtask=WAVE[0], wave_delegate_result=REPORT_OK))
@@ -2373,6 +2419,37 @@ check("graph: confirm_seed offers exactly the seed_confirm options intake raises
       NODES.get("confirm_seed", {}).get("options") == [o["text"] for o in E_SEED["options"]], NODES.get("confirm_seed", {}).get("options"))
 check("graph: confirm_draft offers exactly the draft_confirm options draft_route raises",
       NODES.get("confirm_draft", {}).get("options") == [o["text"] for o in E_DRAFT["options"]], NODES.get("confirm_draft", {}).get("options"))
+
+
+def render_inputs(node, state):
+    """An agent node's `inputs:` as the engine resolves them: a lone {{dotted.key}} yields the state value, else the text."""
+    out = {}
+    for key, tpl in (NODES.get(node, {}).get("inputs") or {}).items():
+        m = re.fullmatch(r"\{\{\s*([\w.]+)\s*\}\}", str(tpl).strip())
+        if not m:
+            out[key] = tpl
+            continue
+        v = state
+        for part in m.group(1).split("."):
+            v = v.get(part) if isinstance(v, dict) else None
+        out[key] = v
+    return out
+
+
+check("graph: delegate and wave_delegate run sisyphus-next; wave_delegate keeps teammates; their inputs are exactly review_cadence / parallel / project_dir",
+      all(NODES.get(n, {}).get("agent") == "sisyphus-next" and sorted(NODES.get(n, {}).get("inputs") or {}) == ["parallel", "project_dir", "review_cadence"]
+          for n in ("delegate", "wave_delegate")) and NODES.get("wave_delegate", {}).get("teammates") is True
+      and all(SEEDS.get(k) is not None for k in ("delegate_review_cadence", "delegate_parallel", "delegate_project_dir")),
+      {n: (NODES.get(n, {}).get("agent"), NODES.get(n, {}).get("inputs")) for n in ("delegate", "wave_delegate")})
+check("graph: delegate inputs - sequential standard -> review_cadence=task, parallel=0, project_dir=the code repo",
+      render_inputs("delegate", {**base_state(), **U_SEQ}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE},
+      render_inputs("delegate", {**base_state(), **U_SEQ}))
+check("graph: delegate inputs - micro -> review_cadence=batch, parallel=0, project_dir=the code repo",
+      render_inputs("delegate", {**base_state(), **U_MICRO}) == {"review_cadence": "batch", "parallel": "0", "project_dir": CODE},
+      render_inputs("delegate", {**base_state(), **U_MICRO}))
+check("graph: wave_delegate inputs - wave item -> parallel=1, project_dir=the item's worktree, review_cadence=the item's (task)",
+      render_inputs("wave_delegate", {"wtask": WAVE[0]}) == {"parallel": "1", "project_dir": WAVE[0]["worktree"], "review_cadence": "task"},
+      render_inputs("wave_delegate", {"wtask": WAVE[0]}))
 check("graph: draft_edit returns to draft_brief, which routes to draft_route and falls back to draft_fault",
       NODES.get("draft_edit", {}).get("next") == "draft_brief" and NODES.get("draft_brief", {}).get("next") == "draft_route"
       and NODES.get("draft_brief", {}).get("fallback") == "draft_fault", {k: NODES.get(k) for k in ("draft_edit", "draft_brief")})
@@ -3722,6 +3799,15 @@ check("entry script: GRAPH_STATE_FILE path (>32 KiB) -> JSON with _next", p.retu
 env = {**os.environ, "GRAPH_STATE": json.dumps({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP)})}
 p = subprocess.run([sys.executable, os.path.join(HERE, "intake.py")], capture_output=True, text=True, env=env)
 check("entry script: intake through GRAPH_STATE", p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "orient_read", p.stderr[-300:])
+
+# ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
+git(CODE, "checkout", "-q", "feat/PLAN-widgets")
+u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1",
+                                task_granularity="micro"))
+check("wave_claim: micro -> every item carries review_cadence=batch; wave_delegate renders it with parallel=1 and the item's worktree",
+      len(u["wave"]) == 2 and all(w.get("review_cadence") == "batch" for w in u["wave"])
+      and all(render_inputs("wave_delegate", {"wtask": w}) == {"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch"} for w in u["wave"])
+      and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])), [render_inputs("wave_delegate", {"wtask": w}) for w in u["wave"]])
 
 # ---------------------------------------------------------------- summary
 fails = [n for n, ok, _ in RESULTS if not ok]

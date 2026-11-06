@@ -213,7 +213,7 @@
   "condition": "task_granularity=micro",
   "first": "Micro mode: add `\"review_cadence\": \"batch\"` to the spawn's `",
   "mechanism": "I",
-  "home": "`compose_delegation` `## MODE` block (E9/V9)"
+  "home": "`compose_delegation` `delegate_review_cadence` -> `delegate` `inputs: review_cadence`, plus the `## MODE` block (V9)"
  },
  {
   "ordinal": 28,
