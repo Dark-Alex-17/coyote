@@ -35,6 +35,12 @@ pub(crate) struct KeyContext {
     /// approved: only Esc and Ctrl+C answer until the terminal is tall
     /// enough to show all of it.
     pub(crate) question_fully_shown: bool,
+    /// Whether the transcript is scrolled away from its bottom; only
+    /// then does End leave the composer to jump the view back.
+    pub(crate) scrolled: bool,
+    /// Whether a transcript row holds the focus; Esc and an Enter on an
+    /// empty composer go to it first.
+    pub(crate) focused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,11 +63,23 @@ pub(crate) enum Action {
     SubmitModalInput,
     ModalInput(KeyEvent),
     ComposerInput(KeyEvent),
+    ToggleTodo,
+    /// Move the transcript view by this many lines, down when positive.
+    ScrollLines(i32),
+    /// Move the transcript view by this many pages, down when positive.
+    ScrollPage(i32),
+    ScrollToBottom,
+    FocusPrev,
+    FocusNext,
+    /// Open or close the focused transcript row.
+    ToggleFocused,
+    ClearFocus,
     Nothing,
 }
 
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // A chord's letter is matched case-folded once here: with the kitty
     // protocol Ctrl+Shift+C arrives as an uppercase `C`.
     let code = lowercase(key.code);
@@ -108,12 +126,23 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             // Readline's split: EOF only on an empty line; with a draft the
             // chord reaches the textarea, which deletes forward.
             KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
+            KeyCode::F(2) => Action::ToggleTodo,
+            KeyCode::PageUp => Action::ScrollPage(-1),
+            KeyCode::PageDown => Action::ScrollPage(1),
+            KeyCode::Up if shift => Action::ScrollLines(-1),
+            KeyCode::Down if shift => Action::ScrollLines(1),
+            KeyCode::Up if ctrl => Action::FocusPrev,
+            KeyCode::Down if ctrl => Action::FocusNext,
+            KeyCode::End if ctx.scrolled => Action::ScrollToBottom,
+            // A focused row takes the first Esc; a second one interrupts.
+            KeyCode::Esc if ctx.focused => Action::ClearFocus,
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
             KeyCode::Esc => Action::Nothing,
             // The editor would inherit fds 1 and 2 on the turn's capture pipe.
             KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
+            KeyCode::Enter if ctx.focused && ctx.composer_empty => Action::ToggleFocused,
             KeyCode::Enter
                 if key
                     .modifiers
@@ -158,6 +187,8 @@ mod tests {
         modal: None,
         idle_ok: true,
         question_fully_shown: true,
+        scrolled: false,
+        focused: false,
     };
 
     #[test]
@@ -238,6 +269,85 @@ mod tests {
         let typed = plain(KeyCode::Char('x'));
         assert_eq!(map_key(typed, &IDLE), Action::ComposerInput(typed));
         assert_eq!(map_key(typed, &running), Action::ComposerInput(typed));
+    }
+
+    /// The transcript's keys: F2, the page and Shift+arrow scrolls and
+    /// the Ctrl+arrow focus walk work whatever the turn is doing; End
+    /// goes to the view only while it is scrolled; Esc and Enter go to a
+    /// focused row first, Enter only while the composer is empty. The
+    /// plain arrows and Tab stay the composer's.
+    #[test]
+    fn transcript_keys() {
+        let running = KeyContext {
+            turn_running: true,
+            ..IDLE
+        };
+        let scrolled = KeyContext {
+            scrolled: true,
+            ..IDLE
+        };
+        let focused = KeyContext {
+            focused: true,
+            ..IDLE
+        };
+        let focused_running = KeyContext {
+            turn_running: true,
+            ..focused
+        };
+        let focused_typing = KeyContext {
+            composer_empty: false,
+            ..focused
+        };
+        let shift = |code: KeyCode| press(code, KeyModifiers::SHIFT);
+        let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
+        let cases = [
+            (plain(KeyCode::F(2)), IDLE, Action::ToggleTodo),
+            (plain(KeyCode::F(2)), running, Action::ToggleTodo),
+            (plain(KeyCode::PageUp), IDLE, Action::ScrollPage(-1)),
+            (plain(KeyCode::PageDown), running, Action::ScrollPage(1)),
+            (shift(KeyCode::Up), IDLE, Action::ScrollLines(-1)),
+            (shift(KeyCode::Down), running, Action::ScrollLines(1)),
+            (control(KeyCode::Up), IDLE, Action::FocusPrev),
+            (control(KeyCode::Down), running, Action::FocusNext),
+            (plain(KeyCode::End), scrolled, Action::ScrollToBottom),
+            (
+                plain(KeyCode::End),
+                IDLE,
+                Action::ComposerInput(plain(KeyCode::End)),
+            ),
+            (plain(KeyCode::Esc), focused, Action::ClearFocus),
+            (plain(KeyCode::Esc), focused_running, Action::ClearFocus),
+            (plain(KeyCode::Enter), focused, Action::ToggleFocused),
+            (
+                plain(KeyCode::Enter),
+                focused_running,
+                Action::ToggleFocused,
+            ),
+            (plain(KeyCode::Enter), focused_typing, Action::Submit),
+            (
+                plain(KeyCode::Up),
+                focused,
+                Action::ComposerInput(plain(KeyCode::Up)),
+            ),
+            (
+                plain(KeyCode::Down),
+                scrolled,
+                Action::ComposerInput(plain(KeyCode::Down)),
+            ),
+            (
+                plain(KeyCode::Tab),
+                focused,
+                Action::ComposerInput(plain(KeyCode::Tab)),
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::ALT),
+                focused,
+                Action::ComposerInput(press(KeyCode::Up, KeyModifiers::ALT)),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
     }
 
     /// Suspend and repaint belong to the terminal: a modal, answerable or

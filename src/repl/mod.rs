@@ -72,7 +72,7 @@ pub(crate) const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
 const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
 
-const WELCOME_INTERRUPT_HINT: &str = "\
+pub(crate) const WELCOME_INTERRUPT_HINT: &str = "\
 Tip: Press Ctrl-C as the model works to interrupt the turn and send another prompt.
 Press it again at the idle prompt to cancel background work it left running.";
 
