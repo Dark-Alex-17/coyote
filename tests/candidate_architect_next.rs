@@ -1137,7 +1137,8 @@ fn engineer_standalone_block_states_the_handoff_contract() {
         "project:",
         "created:",
         "vehicle:",
-        "An architect run only picks handoffs with `vehicle: architect`",
+        "An architect run of the candidate architect graph only picks handoffs with `vehicle: \
+         architect`",
         "once it has oriented on it",
         "never edit a consumed handoff",
     ] {
@@ -1183,7 +1184,8 @@ fn engineer_architect_block_states_the_discussion_contract() {
     let flat = block.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
         "When the last run's exposed `discussion` is non-empty, the run is parked on that question",
-        "(`discussion.kind` names it: a design round, quality bar, checklist item or Gate 1 question)",
+        "(`discussion.kind` names it: a design round, quality bar, checklist item, Gate 1 question or \
+         any other escalation kind)",
         "the user's `reply`",
         "the recommended one is marked",
         "the answers so far and the plan path",

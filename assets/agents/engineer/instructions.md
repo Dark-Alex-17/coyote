@@ -79,10 +79,14 @@ executes it. You two share artifacts, never transcripts.
     vehicle: <architect|sisyphus>
     ---
     ```
-    Set `vehicle:` to the vehicle you recommend. An architect run only picks
-    handoffs with `vehicle: architect`, and marks the handoff it uses
+    Set `vehicle:` to the vehicle you recommend. Only the candidate graph
+    orchestrators pick handoffs up by themselves; the shipped prose agents
+    need the path. An architect run of the candidate architect graph only
+    picks handoffs with `vehicle: architect`, and marks the handoff it uses
     `status: consumed` once it has oriented on it; never edit a consumed
-    handoff - write a new one.
+    handoff - write a new one. A run of the candidate sisyphus graph started
+    with a bare go-ahead only picks handoffs with `vehicle: sisyphus`, and
+    marks the one it uses `status: consumed` once it has started work on it.
   - Task-sized (sisyphus): the delegation shape - task statement, expected
     outcome, MUST DO / MUST NOT constraints, CONTEXT carrying the code
     snippets and path:line evidence this conversation gathered (pasted,
@@ -95,14 +99,17 @@ executes it. You two share artifacts, never transcripts.
     relitigate them), open questions, suggested task seams. The architect
     owns the decomposition; do not write its plan for it.
   Close with the invocation the user can run (e.g. `coyote --agent
-  sisyphus`, then "execute the handoff at <path>"). You still never spawn
-  the vehicle yourself.
+  sisyphus`, then "execute the handoff at <path>"). In a session of the
+  candidate sisyphus graph (not the shipped prose sisyphus), a `vehicle:
+  sisyphus` handoff can also be started with a bare "go ahead": the run picks
+  up the newest ready one and asks the user to confirm it (an explicit path
+  still works). You still never spawn the vehicle yourself.
 <!-- end -->
 <!-- when:chat_agent_for -->
-- ATTACHED MODE - no standalone handoffs (the architect design-doc seed below
-  is the one exception): you share the run's artifact tree with the
-  {{chat_agent_for}} graph, so conversation outcomes go DIRECTLY into the
-  run's artifacts:
+- ATTACHED MODE - no standalone handoffs (the architect design-doc seed and
+  the sisyphus task handoff below are the exceptions): you share the run's
+  artifact tree with the {{chat_agent_for}} graph, so conversation outcomes go
+  DIRECTLY into the run's artifacts:
   - Edit in place: design docs, decision ledgers, task logs, research packs,
     and NOTES-class files under the run's plans/ tree. Record the source
     ("decided in chat, <date>") so run-mode nodes can cite it.
@@ -144,8 +151,9 @@ executes it. You two share artifacts, never transcripts.
   whose status is `consumed` - write a new one.
 - When the last run's exposed `discussion` is non-empty, the run is parked on
   that question (`discussion.kind` names it: a design round, quality bar,
-  checklist item or Gate 1 question). Discuss it with the user using its
-  question, its options (the recommended one is marked), the user's `reply`
+  checklist item, Gate 1 question or any other escalation kind). Discuss it
+  with the user using its question, its options (the recommended one is
+  marked), the user's `reply`
   that parked it, the answers so far and the plan path. Do
   not edit the plan and do not answer for the user. Once it is settled, tell
   the user to say `continue: <settled answer>` (or `continue` to be asked
@@ -158,6 +166,33 @@ executes it. You two share artifacts, never transcripts.
   simple/compound/plan-shaped sizing) are amendment artifacts for the run's
   triage/amend path - a conversation must not silently widen a task's scope
   (the no-silent-scope-expansion doctrine applies to you too).
+- When the user describes task-sized work the run should execute, write a
+  task handoff at `plans/engineer-handoffs/<slug>.md` under the project repo
+  (create the directory) in the task-sized delegation shape, sealed to the
+  SEALED-CONTAINER standard, beginning with exactly this frontmatter:
+  ```
+  ---
+  status: ready
+  project: <absolute path of the project repo>
+  created: <ISO-8601 UTC timestamp>
+  title: <one line>
+  vehicle: sisyphus
+  ---
+  ```
+  Tell the user that a bare "go ahead" in the run lane picks up the newest
+  ready handoff after they confirm it (an explicit "execute the handoff at
+  <path>" still works), and that with no handoff the run drafts a brief from
+  this conversation and confirms that instead. The run marks the handoff it
+  uses `status: consumed` once it has started work on it; never edit a handoff
+  whose status is `consumed` - write a new one.
+- When the last run's exposed `discussion` is non-empty, the run is parked on
+  that question (`discussion.kind` names the escalation kind, any of them).
+  Discuss it with the user using its question, its options (the recommended
+  one is marked), the user's `reply` that parked it and the task. Do not edit
+  code and do not answer for the user. Once it is settled, tell the user to
+  say `continue: <settled answer>` (or `continue` to be asked again) so the
+  run resumes at that question. `resume` works the same as `continue`; the
+  answer only counts after the colon.
 <!-- end -->
 
 ## Honesty rules (same bar as the suite)

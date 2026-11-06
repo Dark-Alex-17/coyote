@@ -33,13 +33,15 @@ BOUNDED = {
     "next_subtask": "B3 list-bounded subtask index",
     "oracle_gate": "B4 once per task",
     "route_coder_result": "B5 fix_strikes<=3 / B7 rejected_rounds<=3",
-    "apply_answer": "B6 strikeout_rounds<=1 / B9 design_ask_rounds<=1 / user-driven choices",
+    "apply_answer": "B6 strikeout_rounds<=1 / B9 design_ask_rounds<=1 / DRAFT_ROUNDS_MAX redrafts / user-driven choices",
     "bookkeeping_route": "B8 debt_rounds<=1 / B9 design ask once",
     "triage_route": "B10 review_rounds<=3 + lane streak<=1",
     "route_gauntlet": "B11 debris_reruns<=1",
     "observability_route": "B12 obs_rounds<=1",
     "ask_owner_route": "B13 owner_polls<=2",
     "parse_answer": "B14 reask_rounds<=3",
+    "interpret_route": "one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask",
+    "choice_park": "DISCUSSION_PARKS_MAX parks per question (kind + question text), then a matched re-ask",
     "ci_poll": "B15 wall clock + poll fails<=3; review mode also stops at REVIEW_CI_POLL_CEILING per run",
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
     "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",
@@ -75,6 +77,11 @@ def harvest_gate_targets(gates_src):
     """gate function name -> set of `_next` literals it can emit (incl. helpers)."""
     tree = ast.parse(gates_src)
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    prompts = {"ask_user"}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                and any(isinstance(t, ast.Name) and t.id == "_TERMINAL_PROMPTS" for t in node.targets)):
+            prompts.update(v.value for v in node.value.values if isinstance(v, ast.Constant))
 
     def literals(fn):
         out = set()
@@ -98,7 +105,7 @@ def harvest_gate_targets(gates_src):
                 if name == "raise_escalation":
                     out.add("escalate_gate")
                 if name == "_terminal_prompt":
-                    out.update({"ask_user", "ask_review_incomplete"})
+                    out.update(prompts)
                 if name in funcs and name.startswith("_") and name not in ("_terminal_prompt",):
                     out.update(literals(funcs[name]))
         return out
