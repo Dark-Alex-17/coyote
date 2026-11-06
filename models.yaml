@@ -923,9 +923,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0765
-    output_price: 0.255
-    cache_read_price: 0.0425
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -7983,9 +7983,9 @@
   - name: deepseek/deepseek-chat
     type: chat
     max_input_tokens: 163840
-    input_price: 0.2574
-    output_price: 1.0287
-    max_output_tokens: 16000
+    input_price: 0.32
+    output_price: 0.89
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: deepseek/deepseek-chat-v3-0324
     type: chat
@@ -8069,16 +8069,16 @@
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.103
-    output_price: 4.11
-    cache_read_price: 0.098
+    input_price: 0.1165
+    output_price: 4.66
+    cache_read_price: 0.111
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.045
-    output_price: 0.5
+    input_price: 0.051
+    output_price: 0.567
     cache_read_price: 0.018
     max_output_tokens: 943718
     supports_vision: true
@@ -8497,9 +8497,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0765
-    output_price: 0.255
-    cache_read_price: 0.0425
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -8834,9 +8834,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9158,10 +9158,9 @@
   - name: nvidia/nemotron-3-super-120b-a12b
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.3
-    output_price: 2.4
-    cache_read_price: 0.15
-    max_output_tokens: 262144
+    input_price: 0.075
+    output_price: 0.4
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: nvidia/nemotron-3-ultra-550b-a55b
     type: chat
@@ -9184,13 +9183,6 @@
     input_price: 0.2
     output_price: 0.2
     max_output_tokens: 117964
-    supports_vision: true
-  - name: nvidia/nemotron-3.5-content-safety:free
-    type: chat
-    max_input_tokens: 128000
-    input_price: 0.0
-    output_price: 0.0
-    max_output_tokens: 8192
     supports_vision: true
   - name: nvidia/nemotron-3.5-lightning
     type: chat
@@ -11367,9 +11359,9 @@
   - name: ~deepseek/deepseek-pro-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0927
+    input_price: 0.0999
     output_price: 8.0
-    cache_read_price: 0.0927
+    cache_read_price: 0.0999
     max_output_tokens: 393216
     supports_function_calling: true
   - name: ~deepseek/deepseek-v4-flash-latest
@@ -11403,9 +11395,9 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.1824
-    output_price: 10.5539
-    cache_read_price: 0.18
+    input_price: 0.1624
+    output_price: 10.1522
+    cache_read_price: 0.16
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -11480,9 +11472,9 @@
   - name: ~z-ai/glm-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0285
+    input_price: 0.0284
     output_price: 0.0923
-    cache_read_price: 0.0285
+    cache_read_price: 0.0284
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
