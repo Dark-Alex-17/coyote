@@ -7219,4 +7219,203 @@ mod cold_start {
             "--repl is not documented under Shell:\n{plain}"
         );
     }
+
+    /// Choosing the full-screen UI by flag or by the `ui:` key, rather
+    /// than by `COYOTE_UI`, reaches the same tty check: without a tty on
+    /// stdin the run says `No TTY for TUI`, exits 1, and neither the
+    /// alternate screen nor the REPL banner is written.
+    #[test]
+    #[serial]
+    fn the_tui_flag_and_key_without_a_tty_are_refused_like_the_env() {
+        let dir = fresh_config_dir("tui-flag-no-tty");
+        let _guard = TempDirGuard(dir.clone());
+
+        write_dry_run_config(&dir);
+        let by_flag = run_piped(&dir, &[("COYOTE_UI", "")], &["--tui"]);
+        write_config(&dir, "save_session: false\nui: tui\n");
+        let by_key = run_piped(&dir, &[("COYOTE_UI", "")], &[]);
+
+        for (what, out) in [("--tui", by_flag), ("ui: tui", by_key)] {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let all = format!("{stdout}\n{stderr}");
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{what} without a tty did not exit 1:\n{all}"
+            );
+            assert!(
+                stderr.contains("No TTY for TUI"),
+                "{what} without a tty gave no tty refusal on stderr:\n{all}"
+            );
+            assert!(
+                find(&out.stdout, ENTER_ALT, 0).is_none()
+                    && find(&out.stderr, ENTER_ALT, 0).is_none(),
+                "{what} without a tty entered the alternate screen:\n{all}"
+            );
+            assert!(
+                !all.contains("Welcome to"),
+                "{what} without a tty fell through to the REPL:\n{all}"
+            );
+        }
+    }
+
+    /// The prompt refusal is an error, not output: exit 1, the message on
+    /// stderr, and nothing at all on stdout, so a script wrapping the run
+    /// cannot mistake the refusal for a reply.
+    #[test]
+    #[serial]
+    fn a_shell_flag_prompt_refusal_is_stderr_only_with_exit_one() {
+        let dir = fresh_config_dir("shell-flag-prompt-streams");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+
+        for flag in ["--tui", "--repl"] {
+            let out = run_piped(&dir, &[], &[flag, "say hello-sentinel"]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{flag} with a prompt did not exit 1:\n{stderr}"
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "{flag} with a prompt wrote to stdout: {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(
+                stderr.contains(&format!(
+                    "{flag} requires the interactive mode; drop the prompt"
+                )),
+                "{flag} refusal was not on stderr:\n{stderr}"
+            );
+        }
+    }
+
+    /// A `--headless` run is the one-shot path too: `COYOTE_UI=tui`, as a
+    /// child of a full-screen session inherits it, never blocks it and the
+    /// reply arrives on the normal screen.
+    #[test]
+    #[serial]
+    fn a_tui_env_never_blocks_a_headless_run() {
+        let dir = fresh_config_dir("tui-env-headless");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+
+        let out = run_piped(
+            &dir,
+            &[("COYOTE_UI", "tui")],
+            &["--headless", "say hello-sentinel"],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let all = format!("{stdout}\n{stderr}");
+        assert!(
+            out.status.success(),
+            "--headless under COYOTE_UI=tui failed:\n{all}"
+        );
+        assert!(
+            stdout.contains("hello-sentinel"),
+            "--headless under COYOTE_UI=tui never reached the model:\n{all}"
+        );
+        assert!(
+            find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
+            "--headless under COYOTE_UI=tui entered the alternate screen:\n{all}"
+        );
+        assert!(
+            !all.contains("requires the interactive mode") && !all.contains("No TTY"),
+            "--headless under COYOTE_UI=tui was refused:\n{all}"
+        );
+    }
+
+    /// A shell flag decides the shell, it does not skip validation: a
+    /// typo in the `ui:` key or in `COYOTE_UI` is still refused by name
+    /// when the other source is overriding it.
+    #[test]
+    #[serial]
+    fn a_shell_flag_does_not_silence_a_bogus_key_or_env() {
+        let dir = fresh_config_dir("flag-over-bogus");
+        let _guard = TempDirGuard(dir.clone());
+
+        write_config(&dir, "save_session: false\nui: bogus\n");
+        let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--tui", "--info"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "--tui accepted ui: bogus");
+        assert!(
+            stderr.contains("Invalid value 'bogus', expected one of: repl, tui"),
+            "--tui over ui: bogus did not name the bad value:\n{stderr}"
+        );
+
+        write_dry_run_config(&dir);
+        let out = run_piped(&dir, &[("COYOTE_UI", "bogus")], &["--repl", "--info"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "--repl accepted COYOTE_UI=bogus");
+        assert!(
+            stderr.contains("Invalid value 'bogus', expected one of: repl, tui"),
+            "--repl over COYOTE_UI=bogus did not name the bad value:\n{stderr}"
+        );
+    }
+
+    /// The generated completions for the common shells know both flags,
+    /// so a user who tabs after `coyote --` can find them.
+    #[test]
+    #[serial]
+    fn completions_for_the_common_shells_name_both_shell_flags() {
+        let dir = fresh_config_dir("completions-shell-flags");
+        let _guard = TempDirGuard(dir.clone());
+
+        for (shell, tui, repl) in [
+            ("bash", "--tui", "--repl"),
+            ("zsh", "--tui", "--repl"),
+            ("fish", "-l tui", "-l repl"),
+        ] {
+            let out = run_piped(&dir, &[], &["--completions", shell]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "--completions {shell} failed");
+            assert!(
+                stdout.contains(tui) && stdout.contains(repl),
+                "{shell} completions do not list both shell flags:\n{stdout}"
+            );
+        }
+    }
+
+    /// `config.example.yaml` and the config template ship the two new rows,
+    /// and those rows, taken verbatim, load into a config whose `--info`
+    /// resolves the documented default, the REPL.
+    #[test]
+    #[serial]
+    fn the_documented_ui_rows_load_verbatim_and_resolve_to_the_repl() {
+        let dir = fresh_config_dir("documented-ui-rows");
+        let _guard = TempDirGuard(dir.clone());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        for file in ["config.example.yaml", "assets/config-template.yaml"] {
+            let text = fs::read_to_string(root.join(file)).unwrap();
+            let rows: Vec<&str> = text
+                .lines()
+                .filter(|line| line.starts_with("ui:") || line.starts_with("tui_dump_on_exit:"))
+                .collect();
+            assert_eq!(
+                rows.len(),
+                2,
+                "{file} lacks the ui / tui_dump_on_exit rows:\n{text}"
+            );
+            assert!(
+                rows.iter().any(|row| row.starts_with("ui: repl")),
+                "{file} documents a default other than `ui: repl`: {rows:?}"
+            );
+            assert!(
+                rows.iter().all(|row| row.is_ascii()),
+                "{file} has a non-ASCII ui row: {rows:?}"
+            );
+
+            write_config(&dir, &format!("save_session: false\n{}\n", rows.join("\n")));
+            let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--info"]);
+            assert_eq!(
+                info_ui_row(&out),
+                "repl",
+                "the rows from {file} did not resolve to repl"
+            );
+        }
+    }
 }
