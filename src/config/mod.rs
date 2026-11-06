@@ -1620,6 +1620,12 @@ clients:
         let example = include_str!("../../config.example.yaml");
         assert!(example.contains("command_prefix: dot"));
         assert!(example.contains("\nmemory_round_chains: supersede"));
+        assert!(example.contains(
+            "\nui: repl                         # Which shell starts for an interactive run (repl, tui). Also COYOTE_UI or --tui / --repl"
+        ));
+        assert!(example.contains(
+            "\ntui_dump_on_exit: true           # Print the committed transcript on the normal screen when the full-screen UI leaves"
+        ));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);

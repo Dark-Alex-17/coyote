@@ -129,8 +129,9 @@ async fn async_main() -> Result<()> {
     } else {
         WorkingMode::Cmd
     };
-    if cli.tui && !working_mode.is_repl() {
-        bail!("--tui requires the interactive mode; drop the prompt");
+    if (cli.tui || cli.repl) && !working_mode.is_repl() {
+        let flag = if cli.tui { "--tui" } else { "--repl" };
+        bail!("{flag} requires the interactive mode; drop the prompt");
     }
 
     if cli.headless || cli.acp_server {

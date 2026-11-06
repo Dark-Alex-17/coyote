@@ -3,7 +3,7 @@ use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
-use super::{CommandPrefix, RoundChains, UiMode, paths};
+use super::{CommandPrefix, RoundChains, UiKind, UiMode, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
@@ -583,14 +583,10 @@ impl AppConfig {
         {
             self.command_prefix = v;
         }
-        // A nested coyote under a headless parent inherits COYOTE_UI=headless
-        // from the child-env builders; that is a fact about the parent, not a
-        // choice of shell, so it leaves the file value alone.
-        if let Ok(v) = env::var(get_env_name("ui")) {
-            let v = v.trim();
-            if !v.is_empty() && v != "headless" {
-                self.ui = v.parse()?;
-            }
+        if let Ok(v) = env::var(get_env_name("ui"))
+            && let Some(ui) = Self::ui_from_env(&v)?
+        {
+            self.ui = ui;
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("editor")) {
             self.editor = v;
@@ -764,6 +760,18 @@ impl AppConfig {
             self.sync_models_ttl_hours = v;
         }
         Ok(())
+    }
+
+    /// The shell `COYOTE_UI` asks for: `None` when it states no preference.
+    /// A nested coyote under a headless parent inherits the parent's
+    /// `headless` from the child-env builders; that is a fact about the
+    /// parent, not a choice of shell, so it leaves the file value alone.
+    fn ui_from_env(value: &str) -> Result<Option<UiMode>> {
+        let value = value.trim();
+        if value.is_empty() || value == UiKind::Headless.as_str() {
+            return Ok(None);
+        }
+        Ok(Some(value.parse()?))
     }
 }
 
@@ -1173,7 +1181,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_config_copies_ui_and_tui_dump_on_exit() {
+        let env_name = get_env_name("ui");
+        let prev = env::var_os(&env_name);
+        unsafe { env::remove_var(&env_name) };
+
         let cfg = Config {
             model_id: "test-model".to_string(),
             ui: UiMode::Tui,
@@ -1184,8 +1197,26 @@ mod tests {
 
         let app = AppConfig::from_config(cfg).unwrap();
 
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
+
         assert_eq!(app.ui, UiMode::Tui);
         assert!(!app.tui_dump_on_exit);
+    }
+
+    #[test]
+    fn ui_from_env_accepts_the_shells_and_skips_no_preference() {
+        assert_eq!(AppConfig::ui_from_env("tui").unwrap(), Some(UiMode::Tui));
+        assert_eq!(AppConfig::ui_from_env("repl").unwrap(), Some(UiMode::Repl));
+        assert_eq!(AppConfig::ui_from_env(" tui ").unwrap(), Some(UiMode::Tui));
+        assert_eq!(AppConfig::ui_from_env("").unwrap(), None);
+        assert_eq!(AppConfig::ui_from_env("headless").unwrap(), None);
+        let err = AppConfig::ui_from_env("bogus").unwrap_err().to_string();
+        assert_eq!(err, "Invalid value 'bogus', expected one of: repl, tui");
     }
 
     #[test]
@@ -1215,11 +1246,6 @@ mod tests {
 
         unsafe { env::set_var(&env_name, "") };
         app.load_envs().unwrap();
-        assert_eq!(app.ui, UiMode::Tui);
-
-        unsafe { env::set_var(&env_name, "bogus") };
-        let err = app.load_envs().unwrap_err().to_string();
-        assert_eq!(err, "Invalid value 'bogus', expected one of: repl, tui");
         assert_eq!(app.ui, UiMode::Tui);
 
         unsafe { env::remove_var(&env_name) };

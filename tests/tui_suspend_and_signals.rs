@@ -578,12 +578,8 @@ fn an_unknown_coyote_ui_value_is_reported_by_name_with_the_accepted_values() {
         "COYOTE_UI=bogus --info exited 0 instead of refusing the value:\n{all}"
     );
     assert!(
-        all.contains("Invalid value 'bogus'"),
-        "the unknown value was not named in the refusal:\n{all}"
-    );
-    assert!(
-        all.contains("repl") && all.contains("tui"),
-        "the refusal did not list the accepted values (repl, tui):\n{all}"
+        all.contains("Invalid value 'bogus', expected one of: repl, tui"),
+        "the refusal did not name the value and the accepted values:\n{all}"
     );
 }
 

@@ -95,7 +95,8 @@ fn fixture_path() -> std::ffi::OsString {
 }
 
 /// Pins `COYOTE_CONFIG_DIR`/`COYOTE_CACHE_DIR`, strips every inherited
-/// `COYOTE_*`, selects the TUI through the provisional env branch.
+/// `COYOTE_*`, selects the TUI through `COYOTE_UI=tui`, which the config
+/// layer parses into the shell choice.
 fn base_env(cmd: &mut Command, dir: &Path) {
     for (key, _) in env::vars_os() {
         if key.to_string_lossy().starts_with("COYOTE_") {
@@ -255,8 +256,8 @@ fn quit_and_check(mut pty: Pty, what: &str) -> String {
 }
 
 // ---------------------------------------------------------------------
-// Non-interactive modes under the provisional env branch. `main` routes
-// `COYOTE_UI=tui` to `tui::run` only for the interactive mode; a positional
+// Non-interactive modes: `main` starts the full-screen UI only for an
+// interactive run, whatever `COYOTE_UI` or the `ui:` key says; a positional
 // prompt or an inspection flag is the plain command path, which has no
 // business with the alternate screen and must work without a tty.
 // ---------------------------------------------------------------------

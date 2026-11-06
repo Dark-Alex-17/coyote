@@ -1431,32 +1431,6 @@ fn a_window_resize_repaints_the_screen_and_keys_still_work() {
     assert_tty_restored(&transcript);
 }
 
-/// `COYOTE_UI=repl` picks the plain REPL for an interactive run, which
-/// never touches the alternate screen.
-#[test]
-#[serial]
-fn coyote_ui_repl_starts_the_plain_repl() {
-    let dir = fresh_config_dir("repl-branch");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "repl")]);
-
-    let transcript = pty.wait_for("Welcome to", PTY_DEADLINE).unwrap();
-    assert!(
-        find(pty.raw(), ENTER_ALT, 0).is_none(),
-        "COYOTE_UI=repl entered the alternate screen:\n{transcript}"
-    );
-    pty.read_for(Duration::from_millis(500));
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert!(
-        find(pty.raw(), ENTER_ALT, 0).is_none(),
-        "COYOTE_UI=repl entered the alternate screen:\n{transcript}"
-    );
-    assert_tty_restored(&transcript);
-}
-
 /// Teardown mirrors `Repl::run`: `top_level_agent_finished` fires the
 /// agent's `agent.completed` hook and `tui::run` awaits
 /// `hooks::drain_pending` before returning, so a Ctrl+D under `--agent`
@@ -6763,6 +6737,19 @@ mod cold_start {
         assert_full_screen_ui_then_ctrl_d(&mut pty, "ui: tui");
     }
 
+    /// `COYOTE_UI=repl` picks the plain REPL for an interactive run, which
+    /// never touches the alternate screen.
+    #[test]
+    #[serial]
+    fn coyote_ui_repl_starts_the_plain_repl() {
+        let dir = fresh_config_dir("repl-branch");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "repl")]);
+
+        assert_plain_repl_then_ctrl_d(&mut pty, "COYOTE_UI=repl");
+    }
+
     /// `--repl` overrides `ui: tui` in the config.
     #[test]
     #[serial]
@@ -6812,47 +6799,56 @@ mod cold_start {
         assert_full_screen_ui_then_ctrl_d(&mut pty, "ui: tui under COYOTE_UI=headless");
     }
 
-    /// A positional prompt makes the run a one-shot command, which the
-    /// full-screen UI cannot host: `--tui` with a prompt is refused before
-    /// the config is read, and neither shell starts.
+    /// A positional prompt makes the run a one-shot command, which neither
+    /// shell flag can host: `--tui` and `--repl` with a prompt are refused
+    /// before the config is read (a `ui: bogus` key is never seen), and
+    /// neither shell starts.
     #[test]
     #[serial]
-    fn the_tui_flag_with_a_prompt_is_refused_before_anything_starts() {
-        let dir = fresh_config_dir("tui-prompt");
+    fn a_shell_flag_with_a_prompt_is_refused_before_the_config_is_read() {
+        let dir = fresh_config_dir("shell-flag-prompt");
         let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir);
+        write_config(&dir, "save_session: false\nui: bogus\n");
 
-        let out = run_piped(&dir, &[], &["--tui", "hello"]);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let all = format!("{stdout}\n{stderr}");
+        for flag in ["--tui", "--repl"] {
+            let out = run_piped(&dir, &[], &[flag, "hello"]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let all = format!("{stdout}\n{stderr}");
 
-        assert!(
-            !out.status.success(),
-            "--tui with a prompt exited 0 instead of refusing:\n{all}"
-        );
-        assert!(
-            all.contains("--tui requires the interactive mode; drop the prompt"),
-            "the refusal did not name the flag and the prompt:\n{all}"
-        );
-        assert!(
-            find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
-            "--tui with a prompt entered the alternate screen:\n{all}"
-        );
-        assert!(
-            !all.contains("Welcome to"),
-            "--tui with a prompt started the REPL:\n{all}"
-        );
+            assert!(
+                !out.status.success(),
+                "{flag} with a prompt exited 0 instead of refusing:\n{all}"
+            );
+            assert!(
+                all.contains(&format!(
+                    "{flag} requires the interactive mode; drop the prompt"
+                )),
+                "the refusal did not name the flag and the prompt:\n{all}"
+            );
+            assert!(
+                !all.contains("Invalid value"),
+                "{flag} with a prompt read the config before refusing:\n{all}"
+            );
+            assert!(
+                find(&out.stdout, ENTER_ALT, 0).is_none()
+                    && find(&out.stderr, ENTER_ALT, 0).is_none(),
+                "{flag} with a prompt entered the alternate screen:\n{all}"
+            );
+            assert!(
+                !all.contains("Welcome to"),
+                "{flag} with a prompt started the REPL:\n{all}"
+            );
+        }
     }
 
     /// The shell flags exclude the non-interactive modes and each other at
     /// the parser, so the clash is a usage error rather than a late bail.
     #[test]
     #[serial]
-    fn the_tui_flag_conflicts_with_execute_in_clap() {
+    fn the_shell_flags_conflict_with_execute_and_each_other_in_clap() {
         let dir = fresh_config_dir("tui-conflict");
         let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir);
 
         for args in [&["--tui", "-e"][..], &["--tui", "--repl"][..]] {
             let out = run_piped(&dir, &[], args);
@@ -6872,31 +6868,177 @@ mod cold_start {
         }
     }
 
+    /// The `ui` row of `--info`, or a panic naming the whole output.
+    fn info_ui_row(out: &std::process::Output) -> String {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "--info failed:\n{stdout}\n{stderr}");
+        stdout
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some("ui"))
+            .unwrap_or_else(|| panic!("no ui row in --info:\n{stdout}"))
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .to_string()
+    }
+
     /// `--info` shows the `ui` the run resolved to, whichever source set it.
     #[test]
     #[serial]
     fn info_reports_the_resolved_ui() {
-        fn ui_row(out: &std::process::Output) -> String {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(out.status.success(), "--info failed:\n{stdout}");
-            let row = stdout
-                .lines()
-                .find(|line| line.split_whitespace().next() == Some("ui"))
-                .unwrap_or_else(|| panic!("no ui row in --info:\n{stdout}"));
-            row.split_whitespace().last().unwrap().to_string()
-        }
-
         let dir = fresh_config_dir("info-ui");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let out = run_piped(&dir, &[("COYOTE_UI", "tui")], &["--info"]);
-        assert_eq!(ui_row(&out), "tui", "COYOTE_UI=tui was not reported");
+        assert_eq!(info_ui_row(&out), "tui", "COYOTE_UI=tui was not reported");
 
         let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--info"]);
-        assert_eq!(ui_row(&out), "repl", "the default ui was not reported");
+        assert_eq!(info_ui_row(&out), "repl", "the default ui was not reported");
 
         write_config(&dir, "save_session: false\nui: tui\n");
         let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--repl", "--info"]);
-        assert_eq!(ui_row(&out), "repl", "--repl over ui: tui was not reported");
+        assert_eq!(
+            info_ui_row(&out),
+            "repl",
+            "--repl over ui: tui was not reported"
+        );
+    }
+
+    /// `COYOTE_UI=headless` (what a nested run inherits from a headless
+    /// parent) states no shell preference: `--info` keeps reporting the
+    /// file's value, and `--tui` still wins over `COYOTE_UI=repl`.
+    #[test]
+    #[serial]
+    fn info_keeps_the_file_value_under_a_headless_env_and_the_flag_over_the_env() {
+        let dir = fresh_config_dir("info-headless-env");
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, "save_session: false\nui: tui\n");
+
+        let out = run_piped(&dir, &[("COYOTE_UI", "headless")], &["--info"]);
+        assert_eq!(
+            info_ui_row(&out),
+            "tui",
+            "COYOTE_UI=headless displaced ui: tui"
+        );
+
+        write_dry_run_config(&dir);
+        let out = run_piped(&dir, &[("COYOTE_UI", "headless")], &["--info"]);
+        assert_eq!(
+            info_ui_row(&out),
+            "repl",
+            "COYOTE_UI=headless displaced the default"
+        );
+
+        let out = run_piped(&dir, &[("COYOTE_UI", "repl")], &["--tui", "--info"]);
+        assert_eq!(
+            info_ui_row(&out),
+            "tui",
+            "--tui did not beat COYOTE_UI=repl"
+        );
+    }
+
+    /// A typo in the `ui:` key is a config error naming both accepted
+    /// values; the run never reaches `--info`.
+    #[test]
+    #[serial]
+    fn a_bogus_ui_key_is_a_config_error_naming_the_accepted_values() {
+        let dir = fresh_config_dir("bogus-ui-key");
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, "save_session: false\nui: bogus\n");
+
+        let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--info"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "ui: bogus was accepted:\n{stdout}");
+        assert!(
+            stderr.contains("ui")
+                && stderr.contains("bogus")
+                && stderr.contains("repl")
+                && stderr.contains("tui"),
+            "the error did not name the key, the value and the accepted values:\n{stderr}"
+        );
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some("ui")),
+            "--info still printed a ui row:\n{stdout}"
+        );
+    }
+
+    /// `COYOTE_UI` is parsed on every start, not only interactive ones: a
+    /// bogus value stops a prompt run and a headless run with the same
+    /// message, before the model answers.
+    #[test]
+    #[serial]
+    fn a_bogus_coyote_ui_value_stops_prompt_and_headless_runs_before_the_model() {
+        let dir = fresh_config_dir("bogus-ui-env-prompt");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+
+        for args in [
+            &["say hello-sentinel"][..],
+            &["--headless", "say hello-sentinel"][..],
+        ] {
+            let out = run_piped(&dir, &[("COYOTE_UI", "bogus")], args);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let all = format!("{stdout}\n{stderr}");
+            assert!(
+                !out.status.success(),
+                "{args:?} ran under COYOTE_UI=bogus:\n{all}"
+            );
+            assert!(
+                all.contains("Invalid value 'bogus', expected one of: repl, tui"),
+                "{args:?} did not report the bogus value by name:\n{all}"
+            );
+            assert!(
+                !stdout.contains("hello-sentinel"),
+                "{args:?} reached the model before the env was checked:\n{all}"
+            );
+        }
+    }
+
+    /// `--repl` excludes the same non-interactive modes `--tui` does, at
+    /// the parser: usage error, exit 2, nothing started.
+    #[test]
+    #[serial]
+    fn the_repl_flag_conflicts_with_every_prompt_path_in_clap() {
+        let dir = fresh_config_dir("repl-conflict");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let file = dir.join("prompt.txt");
+        fs::write(&file, "hi\n").unwrap();
+        let file = file.to_str().unwrap();
+
+        for args in [
+            &["--repl", "-e"][..],
+            &["--repl", "--headless"],
+            &["--repl", "--acp-server"],
+            &["--repl", "-f", file],
+            &["--repl", "--macro", "m"],
+            &["--tui", "--headless"],
+            &["--tui", "--acp-server"],
+            &["--tui", "-f", file],
+            &["--tui", "--macro", "m"],
+        ] {
+            let out = run_piped(&dir, &[], args);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let all = format!("{stdout}\n{stderr}");
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{args:?} did not exit with clap's usage error code:\n{all}"
+            );
+            assert!(
+                all.contains("cannot be used with"),
+                "{args:?} was not reported as a clap conflict:\n{all}"
+            );
+            assert!(
+                !all.contains("Welcome to"),
+                "{args:?} started the REPL:\n{all}"
+            );
+        }
     }
 }

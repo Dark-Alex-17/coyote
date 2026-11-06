@@ -4,7 +4,7 @@ use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String")]
 pub enum UiMode {
     #[default]
     Repl,
@@ -27,6 +27,14 @@ impl FromStr for UiMode {
                 Self::NAMES.join(", ")
             ),
         }
+    }
+}
+
+impl TryFrom<String> for UiMode {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
     }
 }
 
@@ -65,7 +73,7 @@ mod tests {
             .to_string();
 
         assert!(
-            err.contains("repl") && err.contains("tui"),
+            err.contains("Invalid value 'bogus', expected one of: repl, tui"),
             "unexpected error: {err}"
         );
     }
