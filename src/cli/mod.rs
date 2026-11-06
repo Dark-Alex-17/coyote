@@ -62,6 +62,11 @@ pub enum McpScopeArg {
 			.args(["mcp_add", "mcp_remove", "mcp_list", "mcp_get"])
 			.multiple(false)
 	),
+	group(
+		ArgGroup::new("ui-mode")
+			.args(["tui", "repl"])
+			.multiple(false)
+	),
 )]
 pub struct Cli {
     /// Input text
@@ -152,7 +157,7 @@ pub struct Cli {
             "dangerously_skip_permissions", "agent_variable", "git_host", "filter",
             "install_force", "yes", "force", "transport", "url", "scope", "env", "header", "cwd",
             "client_id", "client_secret", "callback_port", "redirect_host", "mcp_force",
-            "disable_log_colors", "mcp_command",
+            "disable_log_colors", "mcp_command", "tui", "repl",
         ]
     )]
     pub memory_migrate: Option<MigrateScope>,
@@ -417,6 +422,20 @@ pub struct Cli {
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum, help_heading = "Shell")]
     pub completions: Option<ShellCompletion>,
+    /// Start the full-screen UI for this interactive run
+    #[arg(
+        long,
+        help_heading = "Shell",
+        conflicts_with_all = ["headless", "acp_server", "execute", "file", "macro_name"]
+    )]
+    pub tui: bool,
+    /// Start the plain line-editor REPL for this interactive run
+    #[arg(
+        long,
+        help_heading = "Shell",
+        conflicts_with_all = ["headless", "acp_server", "execute", "file", "macro_name"]
+    )]
+    pub repl: bool,
 
     /// Stdio command for --mcp-add: everything after `--` is passed to the server verbatim
     #[arg(
@@ -1166,5 +1185,39 @@ mod tests {
         let cli = parse(&["hello", "world"]);
         assert_eq!(cli.text, vec!["hello", "world"]);
         assert!(cli.mcp_command.is_empty());
+    }
+
+    #[test]
+    fn parse_ui_mode_flags() {
+        let cli = parse(&[]);
+        assert!(!cli.tui);
+        assert!(!cli.repl);
+        assert!(parse(&["--tui"]).tui);
+        assert!(parse(&["--repl"]).repl);
+    }
+
+    #[test]
+    fn ui_mode_flags_conflict_with_each_other_and_with_every_prompt_path() {
+        fn conflict(args: &[&str]) -> Option<clap::error::ErrorKind> {
+            let mut full_args = vec!["coyote"];
+            full_args.extend_from_slice(args);
+            Cli::try_parse_from(full_args).err().map(|err| err.kind())
+        }
+        let conflicting = Some(clap::error::ErrorKind::ArgumentConflict);
+
+        assert_eq!(conflict(&["--tui", "--repl"]), conflicting);
+        for flag in ["--tui", "--repl"] {
+            for other in [
+                &["--headless"][..],
+                &["--acp-server"],
+                &["-e"],
+                &["-f", "x"],
+                &["--macro", "m"],
+            ] {
+                let mut args = vec![flag];
+                args.extend_from_slice(other);
+                assert_eq!(conflict(&args), conflicting, "{args:?}");
+            }
+        }
     }
 }

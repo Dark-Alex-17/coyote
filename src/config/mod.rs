@@ -28,6 +28,7 @@ mod skill_registry;
 pub(crate) mod todo;
 mod tool_scope;
 pub(crate) mod ui_kind;
+mod ui_mode;
 mod update;
 
 #[cfg(test)]
@@ -84,6 +85,7 @@ pub use self::tool_scope::{
     sanitize_display_text,
 };
 pub(crate) use self::ui_kind::UiKind;
+pub use self::ui_mode::UiMode;
 pub use self::update::run_self_update;
 use crate::client::{
     self, ClientConfig, MODELS_YAML, MessageContentToolCalls, Model, ModelType,
@@ -254,6 +256,8 @@ pub struct Config {
     pub save: bool,
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
+    pub ui: UiMode,
+    pub tui_dump_on_exit: bool,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -359,6 +363,8 @@ impl Default for Config {
             save: false,
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
+            ui: UiMode::default(),
+            tui_dump_on_exit: true,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -1573,6 +1579,16 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_ui() {
+        assert!(CONFIG_TEMPLATE.contains(
+            "ui: repl                         # Which shell starts for an interactive run (repl, tui). Also COYOTE_UI or --tui / --repl"
+        ));
+        assert!(CONFIG_TEMPLATE.contains(
+            "tui_dump_on_exit: true           # Print the committed transcript on the normal screen when the full-screen UI leaves"
+        ));
+    }
+
+    #[test]
     fn config_template_documents_child_sessions() {
         assert!(CONFIG_TEMPLATE.contains("\nchild_sessions: null"));
         assert!(CONFIG_TEMPLATE.contains("# ---- Child Sessions ----"));
@@ -1607,6 +1623,8 @@ clients:
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
+        assert_eq!(cfg.ui, UiMode::Repl);
+        assert!(cfg.tui_dump_on_exit);
     }
 
     #[test]
