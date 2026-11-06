@@ -550,6 +550,9 @@ impl AppConfig {
         }
     }
 
+    /// Applied after the file and before the `--tui`/`--repl` override in
+    /// `main`. Only the `ui` arm can fail; every other arm ignores a value
+    /// it cannot parse.
     pub fn load_envs(&mut self) -> Result<()> {
         if let Ok(v) = env::var(get_env_name("model")) {
             self.model_id = v;

@@ -54,7 +54,7 @@ pub enum McpScopeArg {
 				"install_builtins", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
 				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
-				"update", "update_bundle", "uninstall", "generate_models",
+				"update", "update_bundle", "uninstall", "generate_models", "tui", "repl",
 			])
 	),
 	group(
@@ -66,6 +66,7 @@ pub enum McpScopeArg {
 		ArgGroup::new("ui-mode")
 			.args(["tui", "repl"])
 			.multiple(false)
+			.conflicts_with_all(["headless", "acp_server", "execute", "file", "macro_name"])
 	),
 )]
 pub struct Cli {
@@ -423,18 +424,10 @@ pub struct Cli {
     #[arg(long, value_name = "SHELL", value_enum, help_heading = "Shell")]
     pub completions: Option<ShellCompletion>,
     /// Start the full-screen UI for this interactive run
-    #[arg(
-        long,
-        help_heading = "Shell",
-        conflicts_with_all = ["headless", "acp_server", "execute", "file", "macro_name"]
-    )]
+    #[arg(long, help_heading = "Shell")]
     pub tui: bool,
     /// Start the plain line-editor REPL for this interactive run
-    #[arg(
-        long,
-        help_heading = "Shell",
-        conflicts_with_all = ["headless", "acp_server", "execute", "file", "macro_name"]
-    )]
+    #[arg(long, help_heading = "Shell")]
     pub repl: bool,
 
     /// Stdio command for --mcp-add: everything after `--` is passed to the server verbatim
@@ -1218,6 +1211,12 @@ mod tests {
                 args.extend_from_slice(other);
                 assert_eq!(conflict(&args), conflicting, "{args:?}");
             }
+            assert_eq!(conflict(&["--sandbox", flag]), conflicting, "{flag}");
+            assert_eq!(
+                conflict(&["--sandbox", "--fresh", flag]),
+                conflicting,
+                "{flag}"
+            );
         }
     }
 }
