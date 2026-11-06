@@ -792,6 +792,9 @@ fn agent_references(value: &serde_yaml::Value, found: &mut Vec<(String, String)>
     }
 }
 
+/// A shipped agent never reaches a candidate. A candidate may reach the
+/// other one (architect-next delegates to sisyphus-next), so the candidates'
+/// own files are swept for references but never count as hits.
 #[test]
 fn no_bundled_agent_reaches_a_candidate() {
     let mut agents: Vec<PathBuf> = fs::read_dir(agents_dir())
@@ -826,8 +829,9 @@ fn no_bundled_agent_reaches_a_candidate() {
                 found.push(("session.chat.agent".to_string(), chat_agent.to_string()));
             }
             references_checked += found.len();
+            let from_candidate = CANDIDATE_NAMES.iter().any(|c| agent.ends_with(c));
             for (key, name) in found {
-                if CANDIDATE_NAMES.contains(&name.as_str()) {
+                if CANDIDATE_NAMES.contains(&name.as_str()) && !from_candidate {
                     hits.push(format!("{}: {key} = {name}", path.display()));
                 }
             }

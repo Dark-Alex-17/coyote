@@ -2901,7 +2901,7 @@ fn readme_toolchain_census_matches_the_live_grep() {
 }
 
 /// The README's counts hold against the graph and the prose twin: two
-/// `agent: sisyphus` lines, the `chat_agent_for: architect` chat lane, and
+/// `agent: sisyphus-next` lines, the `chat_agent_for: architect` chat lane, and
 /// one marker region in the map per `<!-- when:` region in the landed
 /// `architect/instructions.md`.
 #[test]
@@ -2910,10 +2910,14 @@ fn readme_counts_match_the_graph_and_the_prose_twin() {
     assert_eq!(
         graph
             .lines()
-            .filter(|l| l.trim() == "agent: sisyphus")
+            .filter(|l| l.trim() == "agent: sisyphus-next")
             .count(),
         2,
-        "the README promises two `agent: sisyphus` lines"
+        "the README promises two `agent: sisyphus-next` lines"
+    );
+    assert!(
+        !graph.lines().any(|l| l.trim() == "agent: sisyphus"),
+        "the prose `sisyphus` is no longer a delegate"
     );
     assert!(
         graph
@@ -3023,8 +3027,8 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         .find(|l| l.starts_with("| `build_lock` variable |"))
         .expect("the README lost its build_lock row");
     for (node, agent) in [
-        ("delegate", "sisyphus"),
-        ("wave_delegate", "sisyphus"),
+        ("delegate", "sisyphus-next"),
+        ("wave_delegate", "sisyphus-next"),
         ("run_gauntlet", "review-gauntlet"),
         ("wave_gauntlet", "review-gauntlet"),
         ("run_adversary", "adversary"),
@@ -3052,7 +3056,7 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         );
     }
     for (agent, file) in [
-        ("sisyphus", "config.yaml"),
+        ("sisyphus-next", "graph.yaml"),
         ("review-gauntlet", "graph.yaml"),
         ("adversary", "graph.yaml"),
     ] {
@@ -5358,7 +5362,7 @@ fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
 
 /// The `build_lock` variable row as it landed with the variable; the
 /// threading row beside it must not reword it.
-const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of the three agents behind those five nodes declares `build_lock` itself |";
+const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus-next`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of the three agents behind those five nodes declares `build_lock` itself |";
 
 /// Every agent the graph delegates to that declares no `build_lock` receives
 /// the inherited value without consuming it: none of its own files names
@@ -5431,17 +5435,14 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
     for clause in [
         "a child that declares no `build_lock` does not consume it",
         "the graph agent librarian and the config agents",
-        "`## MODE` block with the `mode-degraded:` ledger line",
+        "pass those three through `inputs:`",
+        "no `mode-degraded:` ledger line is written",
     ] {
         assert!(row.contains(clause), "the E9 row lost {clause:?}: {row}");
     }
     for agent in expected {
         assert!(row.contains(agent), "{agent} missing from: {row}");
     }
-    assert!(
-        !row.contains("inputs"),
-        "the E9 row must not describe an inputs channel: {row}"
-    );
     assert_eq!(
         adjustments_row("| `build_lock` variable |"),
         BUILD_LOCK_ROW,
