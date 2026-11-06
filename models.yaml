@@ -923,9 +923,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.03
-    output_price: 0.089
-    cache_read_price: 0.015
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8052,19 +8052,19 @@
   - name: deepseek/deepseek-v4-flash-vision-exp
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.2156
-    output_price: 0.6468
-    cache_read_price: 0.0069
-    max_output_tokens: 262144
+    input_price: 0.44
+    output_price: 1.32
+    cache_read_price: 0.014
+    max_output_tokens: 943717
     supports_vision: true
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 1.6
-    output_price: 3.2
-    cache_read_price: 0.135
-    max_output_tokens: 393216
+    input_price: 0.9553
+    output_price: 1.9105
+    cache_read_price: 0.0796
+    max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
@@ -8450,6 +8450,20 @@
     max_output_tokens: 58982
     supports_vision: true
     supports_function_calling: true
+  - name: google/gemini-omni-1.1-flash
+    type: chat
+    max_input_tokens: 131072
+    input_price: 1.5
+    output_price: 9.0
+    max_output_tokens: 65536
+    supports_vision: true
+  - name: google/gemini-omni-1.2-flash
+    type: chat
+    max_input_tokens: 131072
+    input_price: 1.5
+    output_price: 9.0
+    max_output_tokens: 65536
+    supports_vision: true
   - name: google/gemma-2-27b-it
     type: chat
     max_input_tokens: 8192
@@ -8483,10 +8497,10 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.03
-    output_price: 0.089
-    cache_read_price: 0.015
-    max_output_tokens: 32768
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
+    max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
   - name: google/gemma-4-26b-a4b-it:free
@@ -8678,10 +8692,10 @@
   - name: meta-llama/llama-3.3-70b-instruct
     type: chat
     max_input_tokens: 131072
-    input_price: 0.2
-    output_price: 0.52
-    cache_read_price: 0.1
-    max_output_tokens: 128000
+    input_price: 0.59
+    output_price: 0.79
+    cache_read_price: 0.295
+    max_output_tokens: 32768
     supports_function_calling: true
   - name: meta-llama/llama-4-maverick
     type: chat
@@ -8785,41 +8799,12 @@
     input_price: 0.07
     output_price: 0.14
     max_output_tokens: 14745
-  - name: minimax/minimax-01
-    type: chat
-    max_input_tokens: 1000192
-    input_price: 0.2
-    output_price: 1.1
-    max_output_tokens: 900172
-    supports_vision: true
   - name: minimax/minimax-m1
     type: chat
     max_input_tokens: 1000000
     input_price: 0.55
     output_price: 2.2
     max_output_tokens: 40000
-    supports_function_calling: true
-  - name: minimax/minimax-m2
-    type: chat
-    max_input_tokens: 204800
-    input_price: 0.255
-    output_price: 1.02
-    max_output_tokens: 131072
-    supports_function_calling: true
-  - name: minimax/minimax-m2-her
-    type: chat
-    max_input_tokens: 65536
-    input_price: 0.3
-    output_price: 1.2
-    cache_read_price: 0.03
-    max_output_tokens: 2048
-  - name: minimax/minimax-m2.1
-    type: chat
-    max_input_tokens: 204800
-    input_price: 0.3
-    output_price: 1.2
-    cache_read_price: 0.03
-    max_output_tokens: 131072
     supports_function_calling: true
   - name: minimax/minimax-m2.5
     type: chat
@@ -8832,10 +8817,10 @@
   - name: minimax/minimax-m2.7
     type: chat
     max_input_tokens: 204800
-    input_price: 0.3
-    output_price: 1.2
-    cache_read_price: 0.06
-    max_output_tokens: 131072
+    input_price: 0.21
+    output_price: 0.84
+    cache_read_price: 0.042
+    max_output_tokens: 176947
     supports_function_calling: true
   - name: minimax/minimax-m3
     type: chat
@@ -8849,9 +8834,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.015
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.0075
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9087,7 +9072,7 @@
     max_input_tokens: 262144
     input_price: 0.6
     output_price: 3.5
-    cache_read_price: 0.15
+    cache_read_price: 0.16
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -10289,6 +10274,12 @@
     max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
+  - name: openrouter/auto-code
+    type: chat
+    max_input_tokens: 2000000
+    max_output_tokens: 65536
+    supports_vision: true
+    supports_function_calling: true
   - name: openrouter/bodybuilder
     type: chat
     max_input_tokens: 128000
@@ -10744,10 +10735,10 @@
   - name: reflection/beam-1.0-501b-a23b
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.25
+    input_price: 0.3
     output_price: 1.0
-    cache_read_price: 0.05
-    max_output_tokens: 131072
+    cache_read_price: 0.04
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: rekaai/reka-edge
     type: chat
@@ -11413,7 +11404,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.1824
-    output_price: 9.3388
+    output_price: 10.5539
     cache_read_price: 0.18
     max_output_tokens: 943718
     supports_vision: true
