@@ -48,7 +48,8 @@ os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 
 import _lib  # noqa: E402
 import gates  # noqa: E402
-from _lib import (CI_FLAKE_RERUNS, CI_POLL_FAILS, CLARIFY_MAX, REASK_MAX, RERUN_ONCE, REVIEW_CI_POLL_BUDGET,  # noqa: E402
+from _lib import (CI_FLAKE_RERUNS, CI_POLL_FAILS, CLARIFY_MAX, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX,  # noqa: E402
+                  REASK_MAX, RERUN_ONCE, REVIEW_CI_POLL_BUDGET,
                   REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_WALL_SECS, STRIKE_LIMIT, SUBTASK_MAX, option, escalation)
 
 RESULTS = []
@@ -298,9 +299,9 @@ u = gates.parse_answer(base_state(escalation=esc, last_answer_text="2"))
 check("parse_answer: number -> option, parked cleared", u["last_answer"] == "B" and u["parked"] == "" and u["_next"] == "apply_answer")
 u = gates.parse_answer(base_state(escalation=esc, last_answer_text="recommended"))
 check("parse_answer: 'recommended' -> the recommended option", u["last_answer"] == "A")
-u = gates.parse_answer(base_state(escalation=esc, last_answer_text="garbage", reask_rounds=0))
+u = gates.parse_answer(base_state(escalation=esc, last_answer_text="garbage", reask_rounds=0, reply_interpreted=True))
 check("parse_answer: unparseable -> re-ask (round 1)", u["_next"] == "ask_user" and u["reask_rounds"] == 1)
-u = gates.parse_answer(base_state(escalation=esc, last_answer_text="garbage", reask_rounds=REASK_MAX))
+u = gates.parse_answer(base_state(escalation=esc, last_answer_text="garbage", reask_rounds=REASK_MAX, reply_interpreted=True))
 check("parse_answer: B14 exhausted -> free text stands", u["_next"] == "apply_answer" and u["last_answer"] == "garbage")
 u = gates.parse_answer(base_state(escalation=escalation("clarify", "q", []), last_answer_text="the auth module"))
 check("parse_answer: no options -> free text", u["last_answer"] == "the auth module")
@@ -341,6 +342,227 @@ check("apply: scope_breach abort", aa("scope_breach", "Abort this task")["_next"
 check("apply: ci_unsure leave -> final_report + follow-up", aa("ci_unsure", "Leave the PR in draft and report")["_next"] == "final_report")
 check("apply: ci_unsure rerun -> ci_poll reset", aa("ci_unsure", "Re-run the failing checks once")["_next"] == "ci_poll")
 check("apply: unknown kind -> final_report (never hangs)", aa("weird", "x")["_next"] == "final_report")
+
+
+# ---------------------------------------------------------------- bare go-ahead intake: handoff pickup
+def chain(state, *names):
+    """Run gates in order, merging each update into the state the way the engine does; returns (state, last update)."""
+    st, u = dict(state), {}
+    for name in names:
+        u = gates.GATES[name](st)
+        st.update({k: v for k, v in u.items() if k != "_next"})
+    return st, u
+
+
+HREPO = os.path.join(TMP, "hrepo")
+os.makedirs(os.path.join(HREPO, "plans", "engineer-handoffs"))
+subprocess.run(["git", "-C", HREPO, "init", "-q"], check=True, capture_output=True)
+HDIR = os.path.join(HREPO, "plans", "engineer-handoffs")
+
+
+def handoff(name, vehicle="sisyphus", status="ready", created="2026-11-01T10:00:00Z", project=None, body="Add a /health route."):
+    path = os.path.join(HDIR, name)
+    vline = f"vehicle: {vehicle}\n" if vehicle else ""
+    open(path, "w").write(f"---\nstatus: {status}\nproject: {project or HREPO}\ncreated: {created}\ntitle: {name}\n{vline}---\n\n"
+                          f"# {name}\n\n{body}\n")
+    return path
+
+
+def fm(path):
+    return _lib.frontmatter(open(path).read())[0]
+
+
+check("bare_go_ahead: a go-ahead that names no work",
+      all(_lib.bare_go_ahead(t) for t in ("okay, go ahead and get started", "do it", "Go ahead.", "lgtm, ship it", "",
+                                         "sounds good, let's do it")))
+check("bare_go_ahead: a message that names its work is not one",
+      not any(_lib.bare_go_ahead(t) for t in ("fix the login bug", "go ahead and fix the flaky test", "execute the handoff at "
+                                              "plans/engineer-handoffs/x.md", "okay thanks", "continue",
+                                              "go " * 13)))
+arch = handoff("arch.md", vehicle="architect", created="2026-11-03T10:00:00Z")
+legacy = handoff("legacy.md", vehicle="", created="2026-11-04T10:00:00Z")
+st = gates.intake({"initial_prompt": "go ahead", "project_dir": HREPO})
+check("handoff pickup: vehicle architect (and a seed with no vehicle) left alone -> assess, files untouched",
+      st["_next"] == "assess" and not st.get("handoff_path") and fm(arch)["status"] == "ready" and fm(legacy)["status"] == "ready")
+old = handoff("old.md", created="2026-11-01T10:00:00Z")
+new = handoff("new.md", created="2026-11-02T10:00:00Z", body="Add a /ready route.\nQuality bar: rigor=prototype")
+handoff("other.md", created="2026-11-05T10:00:00Z", project=os.path.join(TMP, "elsewhere"))
+handoff("used.md", status="consumed", created="2026-11-06T10:00:00Z")
+st = gates.intake({"initial_prompt": "okay, go ahead and get started", "project_dir": HREPO, "previous_turns": "user: x"})
+e = st.get("escalation") or {}
+check("handoff pickup: a top-level bare go-ahead -> hard-trigger handoff_confirm for the newest ready sisyphus handoff",
+      st["_next"] == "escalate_gate" and e.get("kind") == "handoff_confirm" and e.get("hard_trigger")
+      and st["handoff_path"] == new and new in e["question"] and not e.get("tier3_ok")
+      and [o["text"] for o in e["options"]] == ["Use this handoff", "Give a handoff path instead",
+                                                "Draft a brief from this conversation instead", "Abort the run"])
+u = gates.escalate_gate(base_state(escalation=e, escalation_policy="autonomous"))
+check("handoff pickup: the confirmation escalates even under escalation_policy=autonomous",
+      u["_next"] == "ask_dispatch" and gates.ask_dispatch(base_state(escalation=e))["_next"] == "confirm_handoff")
+hs = {**st, "escalation_policy": "interactive"}
+s2, u = chain({**hs, "last_answer": "Use this handoff", "last_answer_text": "Use this handoff"}, "apply_answer")
+check("handoff pickup: 'Use this handoff' -> its body is the brief, quality bar re-read, assess next, NOT consumed yet",
+      u["_next"] == "assess" and "Add a /ready route." in s2["brief"] and "status:" not in s2["brief"]
+      and s2["quality_rigor"] == "prototype" and fm(new)["status"] == "ready")
+s3, u = chain({**s2, "intent": "implementation", "sizing": "simple", "last_script_error": "boom"}, "assess_fault", "route_intent")
+check("handoff pickup: an assess fault leaves the handoff ready", fm(new)["status"] == "ready" and s3["assess_faulted"])
+s4, u = chain({**s2, "intent": "implementation", "sizing": "simple"}, "route_intent")
+check("handoff pickup: consumed only after assess succeeds (status, consumed_by, ledgered)",
+      fm(new)["status"] == "consumed" and fm(new)["consumed_by"] == s2["run_id"] and fm(new).get("consumed_at")
+      and any(d.startswith(f"handoff: {new} consumed") for d in s4["decisions"]) and u["_next"] == "next_subtask")
+s5, u = chain({**s4}, "route_intent")
+check("handoff pickup: a second route_intent never re-stamps a consumed handoff",
+      sum(1 for d in s5["decisions"] if "consumed as the brief" in d) == 1)
+handoff("new.md", created="2026-11-02T10:00:00Z")
+s2, u = chain({**hs, "last_answer": "Abort the run", "last_answer_text": "Abort the run"}, "apply_answer")
+check("handoff pickup: abort -> end_aborted, handoff left ready", u["_next"] == "end_aborted" and fm(new)["status"] == "ready")
+s2, u = chain({**hs, "last_answer": "Draft a brief from this conversation instead"}, "apply_answer")
+check("handoff pickup: draft instead -> draft_brief, handoff left ready and dropped",
+      u["_next"] == "draft_brief" and s2["handoff_path"] == "" and fm(new)["status"] == "ready")
+s2, u = chain({**hs, "last_answer_text": old}, "parse_answer", "apply_answer")
+check("handoff pickup: a typed path -> that handoff is the brief, the found one left ready",
+      u["_next"] == "assess" and s2["handoff_path"] == old and "Add a /health route." in s2["brief"] and fm(new)["status"] == "ready")
+s2, u = chain({**hs, "last_answer": "Give a handoff path instead"}, "apply_answer")
+check("handoff pickup: give a path -> handoff_path question accepting a path",
+      s2["escalation"]["kind"] == "handoff_path" and gates.ACCEPTED_INSTRUCTIONS["handoff_path"] == ("path",))
+s3, u = chain({**s2, "last_answer_text": "/no/such/file.md"}, "parse_answer")
+check("handoff pickup: a non-path reply to the path question is interpreted first", u["_next"] == "interpret_reply")
+st = gates.intake({"initial_prompt": f"execute the handoff at {new}", "project_dir": HREPO})
+check("handoff pickup: an explicit 'execute the handoff at <path>' is unchanged -> assess, no confirmation",
+      st["_next"] == "assess" and not st.get("handoff_path") and st["brief"].startswith("execute the handoff"))
+st = gates.intake({"initial_prompt": "fix the login bug", "project_dir": HREPO, "previous_turns": "user: x"})
+check("handoff pickup: a message that names its work -> assess, no pickup, no draft", st["_next"] == "assess" and not st.get("handoff_path"))
+for label, prompt, extra in (("roster", "go ahead\nTeammate roster:\n- TASK-001 a scope: x/", {}),
+                             ("parallel", "go ahead", {"parallel": "1"})):
+    st = gates.intake({"initial_prompt": prompt, "project_dir": HREPO, "previous_turns": "user: build x", **extra})
+    check(f"delegated run ({label}): never picks up a handoff or drafts -> assess",
+          st["delegated"] and st["_next"] == "assess" and not st.get("handoff_path") and "draft_rounds" not in st)
+
+# ---------------------------------------------------------------- bare go-ahead intake: drafted brief
+DREPO = os.path.join(TMP, "drepo")
+os.makedirs(DREPO)
+st = gates.intake({"initial_prompt": "do it", "project_dir": DREPO, "previous_turns": "user: add a --json flag to list"})
+check("draft: a bare go-ahead with no handoff and earlier turns -> draft_brief, draft state reset",
+      st["_next"] == "draft_brief" and st["draft_rounds"] == 0 and st["draft_markdown"] == "" and st["draft_possible"] is False)
+st0 = gates.intake({"initial_prompt": "do it", "project_dir": DREPO})
+check("draft: no handoff and no earlier turns -> assess classifies the message as is", st0["_next"] == "assess")
+ds, u = chain({**st, "draft_possible": True, "draft_title": "List --json", "draft_markdown": "Task: add --json"}, "draft_route")
+e = ds["escalation"]
+check("draft: draft_route writes brief-draft.md and raises a hard-trigger draft_confirm",
+      e["kind"] == "draft_confirm" and e["hard_trigger"] and os.path.isfile(ds["draft_path"])
+      and ds["draft_text"].startswith("# List --json") and gates.ask_dispatch(base_state(escalation=e))["_next"] == "confirm_draft")
+s2, u = chain({**ds, "last_answer": "Use this draft"}, "apply_answer")
+check("draft: 'Use this draft' -> the draft is the brief, assess next", u["_next"] == "assess" and s2["brief"].startswith("# List --json"))
+s2, u = chain({**ds, "last_answer": "Edit the draft"}, "apply_answer")
+check("draft: 'Edit the draft' -> draft_edit, round counted", u["_next"] == "draft_edit" and s2["draft_rounds"] == 1)
+s2, u = chain({**ds, "last_answer_text": "do not abort on empty lists, add a --pretty flag"}, "parse_answer", "apply_answer")
+check("draft: typed feedback -> a redraft with that feedback, never an abort or an interpretation",
+      u["_next"] == "draft_brief" and s2["draft_feedback"].startswith("do not abort") and s2["draft_markdown"] == "")
+s2, u = chain({**ds, "last_answer": "more", "draft_rounds": DRAFT_ROUNDS_MAX}, "apply_answer")
+check("draft: redrafts bounded by DRAFT_ROUNDS_MAX -> assess on the message as is",
+      u["_next"] == "assess" and s2["brief"] == "do it")
+s2, u = chain({**ds, "last_answer": "Abort the run"}, "apply_answer")
+check("draft: abort -> end_aborted", u["_next"] == "end_aborted")
+s2, u = chain({**st, "draft_possible": False, "draft_reason": "no work described"}, "draft_route")
+check("draft: no draft possible -> assess on the message as is, ledgered",
+      u["_next"] == "assess" and any("no work described" in d for d in s2["decisions"]))
+s2, u = chain({**st, "last_script_error": "llm node failed"}, "draft_fault")
+check("draft: a draft fault falls back to assess on the message as is", u["_next"] == "assess" and s2["brief"] == "do it")
+
+# ---------------------------------------------------------------- typed escalation replies
+pd = escalation("plan_defect", "The plan is the root cause. Stop or continue?",
+                [option("Stop; the plan needs amending (report it)", True), option("Continue; treat the criterion as amended (state the amendment)")])
+u = gates.parse_answer(base_state(escalation=pd, last_answer_text="keep going but stop requiring the 5xx retry"))
+check("parse_answer: the first unmatched typed reply -> interpret_reply with the kind's accepted instructions",
+      u["_next"] == "interpret_reply" and "amendment" in u["reply_accepts"])
+u = gates.parse_answer(base_state(escalation=pd, last_answer_text="keep going", delegated=True, top_level=False))
+check("parse_answer: a delegated run's escalation interprets typed replies too", u["_next"] == "interpret_reply")
+text = "keep going but stop requiring the 5xx retry; do not abort"
+s2, u = chain(base_state(escalation=pd, last_answer_text=text, reply_verdict="instruction", reply_instruction="amendment",
+                         reply_value="drop the 5xx criterion", spec_text="AC"), "interpret_route", "apply_answer")
+check("interpret_route -> apply_answer: an accepted free-form instruction keeps the owner's words verbatim, never a stop",
+      u["_next"] == "build_gauntlet_prompt" and text in s2["spec_text"] and s2["reply_interpreted"] is False)
+s2, u = chain(base_state(escalation=pd, last_answer_text="stop"), "parse_answer", "apply_answer")
+check("apply_answer: a whole-reply stop is a stop", u["_next"] == "end_blocked" and aa("plan_defect", "Stop.")["_next"] == "end_blocked")
+u = gates.interpret_route(base_state(escalation=pd, last_answer_text="x", reply_verdict="instruction", reply_instruction="path",
+                                     reply_value=old))
+check("interpret_route: an instruction the kind does not accept -> unclear, never applied, ledgered",
+      u["_next"] == "ask_dispatch" and "last_answer" not in u and any("does not accept" in d for d in u["decisions"]))
+u = gates.interpret_route(base_state(escalation=pd, last_answer_text="the first one", reply_verdict="option", reply_option="1"))
+check("interpret_route: an option by number -> that option through apply_answer", u["_next"] == "apply_answer"
+      and u["last_answer"].startswith("Stop;"))
+u = gates.interpret_route(base_state(escalation=pd, last_answer_text="stop it", reply_verdict="option", reply_option="Stop"))
+check("interpret_route: a loose option name is no pick -> one clarifying question", u["_next"] == "ask_dispatch" and "last_answer" not in u)
+u = gates.interpret_route(base_state(escalation=pd, last_answer_text="why is the plan wrong?", reply_verdict="discussion"))
+check("interpret_route: discussion -> choice_park, nothing recorded, ledgered",
+      u["_next"] == "choice_park" and "last_answer" not in u and any("park for discussion" in d for d in u["decisions"]))
+s2, u = chain(base_state(escalation=pd, last_answer_text="hmm", reply_verdict="unclear", reply_clarify="Stop or go on?"), "interpret_route")
+check("interpret_route: unclear -> one clarifying question in the escalation itself",
+      u["_next"] == "ask_dispatch" and "Stop or go on?" in s2["ask_question"] and s2["reply_interpreted"] is True)
+s3, u = chain({**s2, "last_answer_text": "whatever"}, "parse_answer")
+check("parse_answer: after the clarifying question an unmatched reply keeps today's re-ask, never a second interpretation",
+      u["_next"] == "ask_user" and s3["reask_rounds"] == 1)
+s2, u = chain(base_state(escalation=pd, last_answer_text="hmm", reply_verdict=""), "interpret_route")
+check("interpret_route: an interpreter fault -> parse_answer's re-ask, the fault ledgered; the run never sticks",
+      u["_next"] == "parse_answer" and any("interpreter fault" in d for d in s2["decisions"])
+      and chain(s2, "parse_answer")[1]["_next"] == "ask_user")
+sb = escalation("scope_breach", "breach", [option("Serialize: finish in-scope work only", True), option("Proceed: scope re-declared"), option("Abort this task")])
+s2, u = chain(base_state(escalation=sb, coder_brief={}, last_answer_text="re-scope to add src/x.rs; never abort the batch",
+                         reply_verdict="instruction", reply_instruction="rescope", reply_value="src/x.rs"), "interpret_route", "apply_answer")
+check("apply_answer: a rescope that mentions abort proceeds with the owner's words, never an abort",
+      u["_next"] == "render_coder_prompt" and any("never abort the batch" in x for x in s2["coder_brief"]["must_not_do_extra"]))
+check("apply_answer: stop/abort read from the whole reply or an exact option only",
+      aa("review_incomplete", "retry, do not abort")["_next"] == "build_gauntlet_prompt"
+      and aa("oracle_fault", "proceed; abort only if it breaks")["_next"] == "design_gate"
+      and aa("engine_fault", "abort")["_next"] == "end_aborted" and aa("clarify", "Abort")["_next"] == "end_aborted")
+
+# ---------------------------------------------------------------- discussion park and continue: re-entry
+PROOT = os.environ["SISYPHUS_RUNS_ROOT"]
+pst = base_state(run_id="20261101T000000-aaaaaaaa", run_dir=_lib.ensure_run_dir("20261101T000000-aaaaaaaa"),
+                 escalation=pd, ask_question=_lib.render_question(pd), last_answer_text="why is the plan wrong?",
+                 spec_text="AC", fix_round=2, escalation_policy="autonomous", initial_prompt="old prompt")
+s2, u = chain(pst, "choice_park")
+d = s2["discussion"]
+check("choice_park: parks the run -> end_discussion with the exposed discussion, the carried run id and the parked state",
+      u["_next"] == "end_discussion" and s2["parked"] == "discussion" and s2["discussion_run_id"] == pst["run_id"]
+      and d["kind"] == "plan_defect" and d["reply"] == "why is the plan wrong?" and len(d["options"]) == 2
+      and os.path.isfile(os.path.join(pst["run_dir"], gates.PARKED_STATE))
+      and s2["discussion_message"].startswith("SISYPHUS_AWAITING_DISCUSSION")
+      and f"Sisyphus run id: {pst['run_id']}" in s2["discussion_message"] and s2["choice_parks"] == {"plan_defect": 1})
+r, u = chain({"initial_prompt": "continue: Continue; treat the criterion as amended: drop AC2",
+              "discussion_run_id": pst["run_id"], "escalation_policy": "interactive"}, "intake")
+check("intake: 'continue: <answer>' with the carried id -> choice_resume on the restored run, the key cleared",
+      u["_next"] == "choice_resume" and r["run_id"] == pst["run_id"] and r["fix_round"] == 2
+      and r["escalation"]["kind"] == "plan_defect" and r["settled_answer"].startswith("Continue; treat")
+      and r["discussion_run_id"] == "" and r["escalation_policy"] == "interactive" and r["initial_prompt"].startswith("continue:")
+      and not os.path.exists(os.path.join(pst["run_dir"], gates.PARKED_STATE)))
+r2, u = chain(r, "choice_resume", "parse_answer")
+r3, u3 = chain({**r2, "reply_verdict": "instruction", "reply_instruction": "amendment", "reply_value": "drop AC2"},
+               "interpret_route", "apply_answer")
+check("continue: re-entry end to end: the settled answer is interpreted like a fresh reply, then applied",
+      u["_next"] == "interpret_reply" and u3["_next"] == "build_gauntlet_prompt" and "drop AC2" in r3["spec_text"]
+      and r3["discussion"] == {} and r3["parked"] == "")
+chain(pst, "choice_park")
+r, u = chain({"initial_prompt": "continue", "discussion_run_id": pst["run_id"]}, "intake")
+r2, u2 = chain(r, "choice_resume")
+check("intake: a bare 'continue' -> the parked question asked again", u["_next"] == "choice_resume" and r["settled_answer"] == ""
+      and u2["_next"] == "escalate_gate" and "Stop or continue?" in r2["ask_question"])
+r, u = chain({"initial_prompt": "continue", "discussion_run_id": pst["run_id"]}, "intake")
+check("intake: the parked state is spent by one resume -> a second continue starts a fresh run", u["_next"] != "choice_resume")
+chain(pst, "choice_park")
+r, u = chain({"initial_prompt": f"resume: Stop\n\nSisyphus run id: {pst['run_id']}"}, "intake")
+check("intake: a parent's 'Sisyphus run id: <id>' plus 'resume: <answer>' resumes the park",
+      u["_next"] == "choice_resume" and r["settled_answer"] == "Stop")
+chain(pst, "choice_park")
+r, u = chain({"initial_prompt": "continue please, and fix the docs", "discussion_run_id": pst["run_id"], "project_dir": DREPO}, "intake")
+check("intake: other prose starting with continue is a fresh run, the key cleared, the left discussion ledgered",
+      u["_next"] == "assess" and r["run_id"] != pst["run_id"] and r["discussion_run_id"] == ""
+      and any("was left" in x for x in r["decisions"]))
+s2, u = chain({**pst, "choice_parks": {"plan_defect": DISCUSSION_PARKS_MAX}}, "choice_park")
+check("choice_park: at the park cap -> choice_reask; its next reply is matched, never interpreted",
+      u["_next"] == "choice_reask" and s2["reply_interpreted"] is True
+      and chain(s2, "choice_reask")[1]["_next"] == "ask_dispatch" and chain(s2, "choice_reask", "parse_answer")[1]["_next"] == "ask_user")
+_vars = re.findall(r"(?m)^  - name: (\w+)$", open(os.path.join(HERE, "..", "graph.yaml")).read())
+check("RUN_VARIABLES: the graph's variables, kept live across a discussion resume", tuple(_vars) == _lib.RUN_VARIABLES, _vars)
 
 # ---------------------------------------------------------------- scope / render / coder routing (B5, B7)
 u = gates.scope_check(base_state(parallel_mode=True, own_scope=["src/payments/"], roster_scope={"TASK-002": ["src/auth/"]}, expected_files=["src/payments/a.go", "src/auth/b.go"]))

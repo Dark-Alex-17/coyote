@@ -89,6 +89,7 @@ session:
     - head_sha
     - gauntlet_verdict
     - report
+    - discussion
   route:
     instructions: |
       Route RUN when the message asks for WORK to be executed: implement, fix,
@@ -103,10 +104,22 @@ session:
       amendment artifacts instead of code. When uncertain or the message mixes
       both, route CHAT: the engineer can always end with a handoff the user
       explicitly runs, but a wrongly-routed RUN performs writes nobody asked for.
+      A bare go-ahead ("okay, go ahead and get started", "do it") after the
+      conversation discussed work to implement routes RUN; the run picks up the
+      engineer's ready sisyphus handoff or drafts a brief from the conversation
+      and confirms it with the user before any write to the repo.
+      After the last run parked on a discussion (any escalation it asked),
+      "continue" or "continue: <answer>" routes RUN: the run resumes at the
+      parked question, recording the answer when one is given and asking the
+      question again when not. "resume" and "resume: <answer>" work the same;
+      other prose that starts with continue or resume starts a fresh run.
   chat:
     agent: engineer
     variables:
       chat_agent_for: sisyphus
+
+carry:
+  - discussion_run_id
 
 initial_state:
   # --- run identity / A2 artifacts ---
@@ -128,9 +141,20 @@ initial_state:
   owner_away: false
   roster_scope: {}
   own_scope: []
+  # --- bare go-ahead intake: handoff pickup / drafted brief ---
+  handoff_path: ''
+  draft_rounds: 0
+  draft_feedback: ''
+  draft_text: ''
+  draft_path: ''
+  draft_possible: false
+  draft_title: ''
+  draft_markdown: ''
+  draft_reason: ''
   # --- assess ---
   intent: ''
   sizing: ''
+  assess_faulted: false
   intent_statement: ''
   clarifying_questions: []
   clarifications: ''
@@ -185,6 +209,19 @@ initial_state:
   owner_poll_result: ''
   owner_polls: 0
   reask_rounds: 0
+  reply_verdict: ''
+  reply_option: ''
+  reply_instruction: ''
+  reply_value: ''
+  reply_clarify: ''
+  reply_reason: ''
+  reply_accepts: ''
+  reply_interpreted: false
+  choice_parks: {}
+  discussion: {}
+  discussion_run_id: ''
+  discussion_message: ''
+  settled_answer: ''
   autonomous_digest: []
   decisions: []
   # --- implementation ---
@@ -307,11 +344,156 @@ nodes:
       Resolve project_dir, record the git base, create the A2 run directory
       (outside the project tree), write the brief verbatim, detect re-entry
       ("Sisyphus run id:"), a delegated brief, the quality bar, a teammate roster,
-      a plan repo, and the owner-away flag.
+      a plan repo, and the owner-away flag. A "continue" after a discussion park
+      restores the parked run and goes to choice_resume. A top-level bare
+      go-ahead picks up the engineer's newest ready vehicle: sisyphus handoff
+      and raises a hard-trigger handoff_confirm escalation for it; with no
+      handoff but earlier turns it drafts a brief from them (draft_brief).
     script: scripts/intake.py
     timeout: 60
     fallback: end_failure
-    next: assess
+
+  confirm_handoff:
+    id: confirm_handoff
+    type: approval
+    description: >-
+      Terminal prompt for the handoff_confirm escalation, reached from ask_dispatch
+      or ask_owner_route through _terminal_prompt - confirm the engineer's newest
+      ready handoff as the run's brief.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Use this handoff'
+      - 'Give a handoff path instead'
+      - 'Draft a brief from this conversation instead'
+      - 'Abort the run'
+    routes:
+      'Use this handoff': apply_answer
+      'Give a handoff path instead': apply_answer
+      'Draft a brief from this conversation instead': apply_answer
+      'Abort the run': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  draft_brief:
+    id: draft_brief
+    type: llm
+    description: >-
+      Draft a task brief from the earlier turns when a top-level bare go-ahead
+      finds no ready handoff; on a redraft, apply the requested changes to the
+      previous draft.
+    instructions: |
+      You draft a task brief for the work the user asked to implement, from the
+      message and the earlier turns of this session only. You read; you never
+      edit files and never run build or test commands here.
+
+      The brief is markdown in the delegation shape:
+      - `# Title` (one line)
+      - Task: one coherent change, what to build or modify and where
+      - Expected outcome ("Done when ...")
+      - Must do / must not do (the constraints the conversation settled)
+      - Context: the files, snippets and path:line evidence the turns gathered
+      - Acceptance criteria (each one checkable; commands where possible)
+      - Verification commands the turns named (never guessed)
+      - Open questions
+
+      Never invent requirements the conversation did not state; a gap is an open
+      question. You may read the project to name real files, never to add scope.
+      On a redraft, apply the requested changes to the previous draft and keep the
+      rest of it.
+
+      Output:
+      - draft_possible: false when the message and the turns describe no
+        implementable work; true otherwise.
+      - draft_title: the title (one line).
+      - draft_markdown: the whole draft; "" when draft_possible is false.
+      - draft_reason: why no draft was possible; "" otherwise.
+      - anomalies: anything outside this step's job someone should know; empty is
+        the normal case.
+
+      Project directory: {{project_dir}}
+    prompt: |
+      ## Message
+      {{brief}}
+
+      ## Earlier turns in this session (empty when none)
+      {{previous_turns}}
+
+      ## Previous draft (empty on the first draft)
+      {{draft_text}}
+
+      ## Requested changes (empty on the first draft)
+      {{draft_feedback}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls]
+    max_iterations: 10
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        draft_possible: { type: boolean }
+        draft_title: { type: string }
+        draft_markdown: { type: string }
+        draft_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [draft_possible]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: draft_fault
+    next: draft_route
+
+  draft_route:
+    id: draft_route
+    type: script
+    description: >-
+      Write the drafted brief to brief-draft.md in the run dir and raise a
+      hard-trigger draft_confirm escalation for it; no draft falls back to assess
+      on the message as is.
+    script: scripts/draft_route.py
+    fallback: end_failure
+
+  draft_fault:
+    id: draft_fault
+    type: script
+    description: Fail-safe when drafting died - assess classifies the message as is (today's behaviour).
+    script: scripts/draft_fault.py
+    fallback: end_failure
+
+  confirm_draft:
+    id: confirm_draft
+    type: approval
+    description: >-
+      Terminal prompt for the draft_confirm escalation, reached from ask_dispatch or
+      ask_owner_route through _terminal_prompt - confirm the drafted brief. Typed
+      text that names no option is feedback for a redraft.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Use this draft'
+      - 'Edit the draft'
+      - 'Abort the run'
+    routes:
+      'Use this draft': apply_answer
+      'Edit the draft': apply_answer
+      'Abort the run': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  draft_edit:
+    id: draft_edit
+    type: input
+    description: Ask what to change in the drafted brief, then redraft it.
+    question: |
+      What should change in the drafted brief at {{draft_path}}?
+    validation: 'len(input) > 0'
+    state_updates:
+      draft_feedback: '{{input}}'
+    next: draft_brief
 
   assess:
     id: assess
@@ -1032,8 +1214,103 @@ nodes:
   parse_answer:
     id: parse_answer
     type: script
-    description: Number or text -> option; unparseable re-asks (B14) then the free text stands; clears the parked marker; ledgers the decision.
+    description: >-
+      Number or text -> option; the first typed reply that names no option goes to
+      interpret_reply; after that, unparseable re-asks (B14) then the free text
+      stands; clears the parked marker; ledgers the decision.
     script: scripts/parse_answer.py
+    fallback: end_failure
+
+  interpret_reply:
+    id: interpret_reply
+    type: llm
+    description: >-
+      Read a typed reply to an escalation that names none of its options: one of
+      the options, an instruction the question accepts, a discussion, or unclear.
+    instructions: |
+      A user was asked a question with fixed options and typed their own text
+      instead of picking one. Decide what the text is:
+      - option: the text means one of the offered options. Set reply_option to
+        that option's exact text.
+      - instruction: the text asks for something this question accepts (listed
+        under "Accepted instructions"). Set reply_instruction to that shape's
+        name and reply_value to its value, taken from the user's words.
+      - discussion: the text asks a question, asks for context, or wants to talk
+        the options through.
+      - unclear: none of the above, or you cannot tell. Set reply_clarify to ONE
+        short question that would settle it.
+      Never invent an instruction shape that is not listed, never pick an
+      option the text does not mean, and never answer the question yourself.
+      Output reply_verdict, the fields that verdict needs, reply_reason (one
+      line), and anomalies (anything outside this step's job someone should
+      know; empty is the normal case).
+    prompt: |
+      ## Question and options
+      {{ask_question}}
+
+      ## Accepted instructions
+      {{reply_accepts}}
+
+      ## The user's text
+      {{last_answer_text}}
+    tools: []
+    timeout: 120
+    output_schema:
+      type: object
+      properties:
+        reply_verdict:
+          type: string
+          enum: [option, instruction, discussion, unclear]
+        reply_option: { type: string }
+        reply_instruction: { type: string }
+        reply_value: { type: string }
+        reply_clarify: { type: string }
+        reply_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [reply_verdict]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: interpret_route
+    next: interpret_route
+
+  interpret_route:
+    id: interpret_route
+    type: script
+    description: >-
+      An option or an accepted instruction is applied through apply_answer, a
+      discussion goes to choice_park, an unclear reply gets one clarifying
+      question, and an interpreter fault falls back to parse_answer's re-ask.
+    script: scripts/interpret_route.py
+    fallback: end_failure
+
+  choice_park:
+    id: choice_park
+    type: script
+    description: >-
+      Park the run on the current escalation for a discussion in the chat lane:
+      the exposed discussion, the carried discussion_run_id and the parked state,
+      then end_discussion. A question already parked DISCUSSION_PARKS_MAX times
+      goes to choice_reask instead, and its next typed reply is matched without
+      interpreting it.
+    script: scripts/choice_park.py
+    fallback: end_failure
+
+  choice_resume:
+    id: choice_resume
+    type: script
+    description: >-
+      Re-entry into a run parked on a discussion: a settled answer goes through
+      parse_answer like a fresh typed reply; otherwise the question is asked again.
+    script: scripts/choice_resume.py
+    fallback: end_failure
+
+  choice_reask:
+    id: choice_reask
+    type: script
+    description: Re-ask the same question with a one-line note that it reached its discussion park cap.
+    script: scripts/choice_reask.py
     fallback: end_failure
 
   apply_answer:
@@ -1991,3 +2268,9 @@ nodes:
       {{last_script_error}}
 
       Sisyphus run id: {{run_id}}
+
+  end_discussion:
+    id: end_discussion
+    type: end
+    output: |
+      {{discussion_message}}

@@ -42,6 +42,8 @@ REVIEW_CI_POLL_CEILING = 90  # review mode stops the CI watch here, below the pe
 RESOLVE_DEADLINE_SECS = 480  # below the pr_review_resolve node timeout of 600 with one GH_CALL_SECS call of margin
 REVIEW_PERM_SECS = 120  # per-poll wall-clock budget for uncached permission reads; inside the pr_review_poll node timeout
 TAIL_CHARS = 6000         # trim_output class: evidence tails handed to llm nodes
+DISCUSSION_PARKS_MAX = 3  # times one escalation may park the run for a discussion (architect-next's bound)
+DRAFT_ROUNDS_MAX = STRIKE_LIMIT  # redrafts of an LLM-drafted brief before the run falls back to the message as is
 
 # Fork constants (the ONLY script-level fork deltas; design doc section 7).
 OWNER_REMOTE_INPUT = False  # upstream: no Slack owner channel; ask_dispatch never routes to ask_owner_poll
@@ -53,8 +55,36 @@ HARD_TRIGGER_RE = re.compile(
     re.I,
 )
 RESUME_RE = re.compile(r"Sisyphus run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
+CONTINUE_RE = re.compile(r"(?is)^(?:continue|resume)(?:\s*:\s*(.+)|\W*)$")
 DELEGATED_RE = re.compile(r"## SOURCE OF TRUTH|\bTASK-\d{3}\b|Teammate roster", re.I)
 QUALITY_RE = re.compile(r"Quality bar:\s*rigor=([A-Za-z]+)(?:[,;]?\s*surfaces=([^\n]*))?")
+
+# A bare go-ahead: a short message made only of these words, at least one of them a go word. Anything else
+# (a file, a path, a verb naming the work) is a message that names its own work.
+GO_AHEAD_WORDS_MAX = 12
+GO_WORDS = frozenset((
+    "go", "proceed", "start", "started", "begin", "do", "run", "execute", "implement", "build", "ship", "kick",
+    "lgtm", "approved",
+))
+GO_AHEAD_FILLER = frozenset((
+    "ok", "okay", "k", "yes", "yeah", "yep", "yup", "sure", "alright", "right", "great", "cool", "good", "sounds",
+    "perfect", "fine", "please", "pls", "and", "then", "now", "so", "get", "it", "that", "this", "let", "lets",
+    "let's", "us", "with", "the", "a", "on", "ahead", "off", "away", "thanks", "thank", "you", "just", "work",
+    "handoff", "brief", "make", "happen", "all", "set", "we", "can", "i", "think", "is", "ready",
+))
+
+# The graph variables; a run restored from a discussion park keeps the live values of these.
+RUN_VARIABLES = ("project_dir", "observability_agent", "parallel", "auto_confirm", "escalation_policy", "build_lock",
+                 "review_cadence", "pr_tracking")
+
+
+def bare_go_ahead(text):
+    """True for an empty message or a short go-ahead that names no work ("okay, go ahead and get started")."""
+    words = re.findall(r"[a-z]+(?:'[a-z]+)?", (text or "").lower())
+    if not words:
+        return not re.search(r"\S", text or "")
+    return (len(words) <= GO_AHEAD_WORDS_MAX and any(w in GO_WORDS for w in words)
+            and all(w in GO_WORDS or w in GO_AHEAD_FILLER for w in words))
 
 
 # ---------------------------------------------------------------- state I/O
@@ -328,6 +358,7 @@ def raise_escalation(state, updates, esc):
     updates["last_answer"] = ""
     updates["last_answer_text"] = ""
     updates["reask_rounds"] = 0
+    updates["reply_interpreted"] = False
     updates["_next"] = "escalate_gate"
     return updates
 
@@ -354,6 +385,47 @@ def match_option(text, options):
             if o.get("recommended"):
                 return o["text"]
     return None
+
+
+# ---------------------------------------------------------------- handoff frontmatter
+def read_file(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def frontmatter(text):
+    """Flat `key: value` pairs from a leading --- block, values unquoted, and the body after it."""
+    fm = {}
+    if not text.startswith("---"):
+        return fm, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return fm, text
+    for line in text[3:end].splitlines():
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*?)\s*$", line)
+        if m:
+            fm[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return fm, text[end + 4:].lstrip("\n")
+
+
+def set_frontmatter(path, key, value):
+    """Set or insert one flat frontmatter key in place."""
+    text = read_file(path)
+    if not text.startswith("---") or text.find("\n---", 3) < 0:
+        text = f"---\n{key}: {value}\n---\n\n" + text
+    else:
+        end = text.find("\n---", 3)
+        head, rest = text[3:end], text[end:]
+        if re.search(rf"(?m)^{re.escape(key)}:", head):
+            head = re.sub(rf"(?m)^{re.escape(key)}:.*$", lambda _m: f"{key}: {value}", head)
+        else:
+            head = head.rstrip("\n") + f"\n{key}: {value}\n"
+        text = "---" + head + rest
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
 
 
 # ---------------------------------------------------------------- git
