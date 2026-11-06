@@ -8512,8 +8512,9 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
             let label = &status.label;
             Some(match &status.state {
                 InterfaceState::Connected => return None,
-                // A `local` rnsd is only unreachable when the attach failed, and nothing
-                // retries it: rnsd starting later is not enough, the node must start again.
+                // A `local` rnsd is only unreachable when the attach failed or its client
+                // stopped reporting before it connected, and nothing retries it: rnsd
+                // starting later is not enough, the node must start again.
                 InterfaceState::Unreachable { reason, .. } if status.kind == "local" => format!(
                     "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until the local rnsd is running and the mesh is restarted with `.mesh off`, then `.mesh on`."
                 ),
@@ -8535,7 +8536,7 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                             advice: DialAdvice::StartRnsd,
                         }),
                 } => format!(
-                    "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
+                    "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
                 ),
                 InterfaceState::Connecting {
                     dial_failure:
@@ -8550,7 +8551,7 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                     "WARNING: {label} has not finished connecting; mesh traffic through it waits until it does"
                 ),
                 InterfaceState::Disconnected { reason } => format!(
-                    "WARNING: {label} dropped the connection: {reason}; it is being redialed"
+                    "WARNING: {label} lost its connection: {reason}; the transport is redialing it, and `.mesh info` shows when it reconnects"
                 ),
             })
         })
@@ -11381,6 +11382,14 @@ mod tests {
                 },
             },
             InterfaceStatus {
+                label: "local rnsd at @rns/default".into(),
+                kind: "local",
+                endpoint: Some("@rns/default".into()),
+                state: InterfaceState::Disconnected {
+                    reason: "the connection ended".into(),
+                },
+            },
+            InterfaceStatus {
                 label: "local rnsd at 127.0.0.1:37428".into(),
                 kind: "local",
                 endpoint: Some("127.0.0.1:37428".into()),
@@ -11397,10 +11406,11 @@ mod tests {
                 "WARNING: lan is unreachable (address in use); peers on this link-local segment are out of reach.".to_string(),
                 "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
-                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: rnsd did not answer; the transport keeps redialing it, and `.mesh info` shows when it connects".to_string(),
                 "WARNING: local rnsd at @rns/default has not finished connecting; mesh traffic through it waits until it does".to_string(),
-                "WARNING: local rnsd at @rns/default dropped the connection: rnsd closed the socket; it is being redialed".to_string(),
+                "WARNING: local rnsd at @rns/default lost its connection: rnsd closed the socket; the transport is redialing it, and `.mesh info` shows when it reconnects".to_string(),
+                "WARNING: local rnsd at @rns/default lost its connection: the connection ended; the transport is redialing it, and `.mesh info` shows when it reconnects".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is unreachable (attach to the shared instance failed: InvalidArgument); sessions on this machine cannot reach each other until the local rnsd is running and the mesh is restarted with `.mesh off`, then `.mesh on`.".to_string(),
             ]
         );
@@ -21990,7 +22000,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         warnings(),
                         vec![format!(
-                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
+                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
                         )],
                         "{:?}",
                         stderr_lines()
@@ -22130,7 +22140,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         warnings_now,
                         vec![format!(
-                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
+                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
                         )],
                         "{:?}",
                         stderr_lines()

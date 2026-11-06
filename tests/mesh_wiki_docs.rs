@@ -3335,10 +3335,11 @@ fn method_body(path: &str, name: &str) -> String {
 }
 
 /// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
-/// did not come up as the code formats it: the eight `WARNING:` lines (seven `.mesh on`
-/// prints and the lost-rnsd one), the `Mesh relay` and `Local rnsd` failure texts, the hint
-/// appended when every configured interface is a loopback relay, the `lan` bind failure
-/// and the six `InterfaceState` rows of `.mesh info`.
+/// did not come up as the code formats it: the eight `WARNING:` lines (seven for an
+/// interface that did not come up, one for a lost rnsd), the `Mesh relay` and
+/// `Local rnsd` failure texts, the hint appended when every configured interface is a
+/// loopback relay, the `lan` bind failure and the six `InterfaceState` rows of
+/// `.mesh info`.
 /// Every piece of text around a placeholder is on both pages byte for byte. The code side
 /// is checked on every run.
 #[test]

@@ -5155,14 +5155,19 @@ fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_
         "one WARNING, for the local entry: {joined:?}"
     );
     assert!(
-        warnings[0].starts_with(&warning_prefix) && warnings[0].ends_with("; start the local rnsd"),
+        warnings[0].starts_with(&warning_prefix)
+            && warnings[0].ends_with(
+                "; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
+            ),
         "{joined:?}"
     );
     let connecting_prefix = format!("{label}  connecting, retrying: ");
     let reason = format!("nothing is listening at {endpoint}");
     assert_eq!(
         warnings[0],
-        format!("{warning_prefix}{reason}; start the local rnsd"),
+        format!(
+            "{warning_prefix}{reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
+        ),
         "{joined:?}"
     );
 

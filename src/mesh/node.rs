@@ -355,9 +355,9 @@ impl fmt::Display for LocalEndpoint {
 }
 
 /// What one configured interface is doing. `retrying` means it is tried again without
-/// the user: a TCP client the transport keeps reconnecting, or a `local` rnsd endpoint
-/// the shared-instance client keeps redialing.
-/// `Unreachable` without it is a `lan` bind that failed and will not be tried again.
+/// the user: a TCP client the transport keeps reconnecting.
+/// `Unreachable` without it is a `lan` bind that failed, or a `local` rnsd the node could
+/// not attach to; neither is tried again.
 /// `Connecting` is a `local` rnsd not connected yet: with the client's last dial failure,
 /// without one while no dial has failed;
 /// `Disconnected` one that dropped the socket after the node attached, which the
