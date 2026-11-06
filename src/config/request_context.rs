@@ -1071,8 +1071,10 @@ impl RequestContext {
     /// UI while it owns the terminal, the REPL otherwise. An interactive
     /// run configured for the full-screen UI already counts as `Tui`
     /// before the loop takes the terminal, so the dispatch in `main` and
-    /// the interrupt policy agree with what is about to start. A prompt
-    /// run with a human present stays `Repl` whatever the config says.
+    /// the tools it starts on the way agree with what is about to start.
+    /// A prompt run with a human present stays `Repl` whatever the config
+    /// says. Who owns the interrupt is a separate question, answered by
+    /// `interrupt_policy` from the terminal's actual owner.
     pub(crate) fn ui_kind(&self) -> UiKind {
         match UiKind::current() {
             UiKind::Repl if self.working_mode.is_repl() && self.app.config.ui == UiMode::Tui => {
@@ -1102,8 +1104,11 @@ impl RequestContext {
     /// The full-screen UI reads the keyboard itself and turns Esc into an
     /// abort, so the derivation says `NotOwned` while it runs; the spinner
     /// entry point enforces the same rule for sites that pass a literal.
+    /// Until the loop has taken the terminal nothing else answers a key,
+    /// so a run merely configured for the full-screen UI keeps SIGINT
+    /// armed on the spinners it starts on the way in.
     pub(crate) fn interrupt_policy(&self) -> UserInterrupt {
-        if self.user_interrupts_here() && self.ui_kind() != UiKind::Tui {
+        if self.user_interrupts_here() && !crate::tui::active() {
             UserInterrupt::Owned
         } else {
             UserInterrupt::NotOwned
@@ -11803,17 +11808,21 @@ mod tests {
     }
 
     /// An interactive run configured for the full-screen UI is `Tui` from
-    /// the start, so the spinners started on its behalf before the loop
-    /// takes the terminal never arm SIGINT either.
+    /// the start, but the spinners it runs before the loop takes the
+    /// terminal (the MCP start, the models refresh) still paint the normal
+    /// screen with nobody reading Esc, so they keep SIGINT armed until the
+    /// UI is actually up.
     #[test]
     #[serial]
-    fn interrupt_policy_follows_the_configured_ui_before_the_tui_is_active() {
+    fn interrupt_policy_stays_owned_until_the_configured_tui_takes_the_terminal() {
         let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
         let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
         ctx.update_app_config(|app| app.ui = UiMode::Tui);
         assert!(!crate::tui::active());
         assert_eq!(ctx.ui_kind(), UiKind::Tui);
+        assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         assert_eq!(ctx.interrupt_policy(), UserInterrupt::NotOwned);
     }
 

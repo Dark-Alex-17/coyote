@@ -96,5 +96,8 @@ mod tests {
         for mode in [UiMode::Repl, UiMode::Tui] {
             assert_eq!(mode.to_string().parse::<UiMode>().unwrap(), mode);
         }
+        for name in UiMode::NAMES {
+            assert_eq!(name.parse::<UiMode>().unwrap().to_string(), name);
+        }
     }
 }

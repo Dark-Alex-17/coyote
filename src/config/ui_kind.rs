@@ -15,8 +15,10 @@ impl UiKind {
     pub(crate) const ENV: &'static str = "COYOTE_UI";
 
     /// The surface of this process right now: no human means headless,
-    /// otherwise whichever UI owns the terminal. Every child-process env
-    /// builder exports this under `ENV`.
+    /// otherwise whichever UI owns the terminal. The process-wide part of
+    /// the answer; `RequestContext::ui_kind` layers the configured shell of
+    /// an interactive run on top, and that is what the child-process env
+    /// builders should export under `ENV`.
     pub(crate) fn current() -> Self {
         if !crate::prompt::human_present() {
             Self::Headless

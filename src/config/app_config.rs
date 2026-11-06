@@ -583,7 +583,7 @@ impl AppConfig {
         {
             self.command_prefix = v;
         }
-        if let Ok(v) = env::var(get_env_name("ui"))
+        if let Ok(v) = env::var(UiKind::ENV)
             && let Some(ui) = Self::ui_from_env(&v)?
         {
             self.ui = ui;
@@ -1183,9 +1183,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn from_config_copies_ui_and_tui_dump_on_exit() {
-        let env_name = get_env_name("ui");
-        let prev = env::var_os(&env_name);
-        unsafe { env::remove_var(&env_name) };
+        let env_name = UiKind::ENV;
+        let prev = env::var_os(env_name);
+        unsafe { env::remove_var(env_name) };
 
         let cfg = Config {
             model_id: "test-model".to_string(),
@@ -1199,8 +1199,8 @@ mod tests {
 
         unsafe {
             match prev {
-                Some(v) => env::set_var(&env_name, v),
-                None => env::remove_var(&env_name),
+                Some(v) => env::set_var(env_name, v),
+                None => env::remove_var(env_name),
             }
         }
 
@@ -1222,41 +1222,41 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_envs_overrides_ui_except_for_headless_and_empty() {
-        let env_name = get_env_name("ui");
-        let prev = env::var_os(&env_name);
+        let env_name = UiKind::ENV;
+        let prev = env::var_os(env_name);
 
         let mut app = AppConfig::default();
 
-        unsafe { env::set_var(&env_name, "tui") };
+        unsafe { env::set_var(env_name, "tui") };
         app.load_envs().unwrap();
         assert_eq!(app.ui, UiMode::Tui);
 
-        unsafe { env::set_var(&env_name, "repl") };
+        unsafe { env::set_var(env_name, "repl") };
         app.ui = UiMode::Tui;
         app.load_envs().unwrap();
         assert_eq!(app.ui, UiMode::Repl);
 
-        unsafe { env::set_var(&env_name, " tui ") };
+        unsafe { env::set_var(env_name, " tui ") };
         app.load_envs().unwrap();
         assert_eq!(app.ui, UiMode::Tui);
 
-        unsafe { env::set_var(&env_name, "headless") };
+        unsafe { env::set_var(env_name, "headless") };
         app.load_envs().unwrap();
         assert_eq!(app.ui, UiMode::Tui);
 
-        unsafe { env::set_var(&env_name, "") };
+        unsafe { env::set_var(env_name, "") };
         app.load_envs().unwrap();
         assert_eq!(app.ui, UiMode::Tui);
 
-        unsafe { env::remove_var(&env_name) };
+        unsafe { env::remove_var(env_name) };
         app.ui = UiMode::Repl;
         app.load_envs().unwrap();
         assert_eq!(app.ui, UiMode::Repl);
 
         unsafe {
             match prev {
-                Some(v) => env::set_var(&env_name, v),
-                None => env::remove_var(&env_name),
+                Some(v) => env::set_var(env_name, v),
+                None => env::remove_var(env_name),
             }
         }
     }
