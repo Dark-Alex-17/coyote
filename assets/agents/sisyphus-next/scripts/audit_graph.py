@@ -41,7 +41,7 @@ BOUNDED = {
     "ask_owner_route": "B13 owner_polls<=2",
     "parse_answer": "B14 reask_rounds<=3",
     "interpret_route": "one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask",
-    "choice_park": "DISCUSSION_PARKS_MAX parks per question, then a matched re-ask",
+    "choice_park": "DISCUSSION_PARKS_MAX parks per question (kind + question text), then a matched re-ask",
     "ci_poll": "B15 wall clock + poll fails<=3; review mode also stops at REVIEW_CI_POLL_CEILING per run",
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
     "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",

@@ -1137,7 +1137,8 @@ fn engineer_standalone_block_states_the_handoff_contract() {
         "project:",
         "created:",
         "vehicle:",
-        "An architect run only picks handoffs with `vehicle: architect`",
+        "An architect run of the candidate architect graph only picks handoffs with `vehicle: \
+         architect`",
         "once it has oriented on it",
         "never edit a consumed handoff",
     ] {

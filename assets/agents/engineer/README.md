@@ -58,7 +58,7 @@ Attached to `sisyphus-next`, the engineer writes a task handoff there with
 `vehicle: sisyphus` when the user describes task-sized work. A top-level
 sisyphus-next run whose message is a bare go-ahead ("go ahead", "do it")
 offers the newest ready `vehicle: sisyphus` handoff for its project, and marks
-the one it uses `status: consumed` once the run has classified it; with no
+the one it uses `status: consumed` once the run has started work on it; with no
 handoff it drafts a brief from the conversation and confirms that instead. An
 explicit "execute the handoff at <path>" still works, and runs delegated by a
 parent orchestrator never pick up handoffs.

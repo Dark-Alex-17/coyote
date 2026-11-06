@@ -1293,8 +1293,8 @@ nodes:
       Park the run on the current escalation for a discussion in the chat lane:
       the exposed discussion, the carried discussion_run_id and the parked state,
       then end_discussion. A question already parked DISCUSSION_PARKS_MAX times
-      goes to choice_reask instead, and its next typed reply is matched without
-      interpreting it.
+      (the budget is per question: kind plus question text) goes to choice_reask
+      instead, and its next typed reply is matched without interpreting it.
     script: scripts/choice_park.py
     fallback: end_failure
 

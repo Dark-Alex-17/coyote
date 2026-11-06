@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 532;
+const SMOKE_FLOOR: usize = 547;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -1525,16 +1525,19 @@ fn run_smoke_sabotages(python: &Path, sabotages: &[(&str, &str, &str, &str)]) {
 
 /// The guards behind the bare go-ahead intake and the typed escalation
 /// replies: only a top-level run picks up a handoff, only a `vehicle:
-/// sisyphus` one, the handoff is consumed only after assess succeeds, its
+/// sisyphus` one, the handoff is consumed only once work starts, its
 /// confirmation is a hard trigger, a draft fault falls back to assess, the
 /// first unmatched reply is interpreted, only accepted instructions apply,
 /// free-form instructions keep the owner's words, stop and abort are read
 /// from the whole reply, the interpreter's option must match exactly, an
 /// interpreter fault re-asks, a discussion parks, the park cap holds, only
 /// `continue:` with a colon carries an answer, one park is resumed once, and
-/// the live variables survive a resume.
+/// the live variables survive a resume; then the fix-round guards: a clarify
+/// option that starts with "Stop" is an answer, the park cap is per question,
+/// the strikeout and owner-judgment replies stop only on the whole reply, and
+/// only a `vehicle: sisyphus` handoff is consumed.
 #[test]
-#[ignore = "sixteen smoke battery runs take about three minutes; run with -- --ignored"]
+#[ignore = "twenty-one smoke battery runs take about four minutes; run with -- --ignored"]
 fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     run_smoke_sabotages(
@@ -1554,9 +1557,10 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
                  assess, files untouched",
             ),
             (
-                "consume-after-assess",
-                "    if not truthy(state.get(\"assess_faulted\")):\n",
-                "    if True:\n",
+                "consume-on-work-start",
+                "        if u.get(\"_next\") in WORK_STARTS and not \
+                 truthy(state.get(\"assess_faulted\")):\n",
+                "        if True:\n",
                 "handoff pickup: an assess fault leaves the handoff ready",
             ),
             (
@@ -1598,8 +1602,9 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "stop-whole-reply",
-                "    return bare in STOP_REPLIES or bool(",
-                "    return any(w in bare for w in STOP_REPLIES) or bool(",
+                "    return bare in STOP_REPLIES or bool(picked and picked.lower().startswith(",
+                "    return any(w in bare for w in STOP_REPLIES) or bool(picked and \
+                 picked.lower().startswith(",
                 "apply_answer: a rescope that mentions abort proceeds with the owner's words, \
                  never an abort",
             ),
@@ -1651,6 +1656,45 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "PARK_FRESH_KEYS = frozenset() | {",
                 "intake: 'continue: <answer>' with the carried id -> choice_resume on the restored \
                  run, the key cleared",
+            ),
+            (
+                "clarify-stop-options",
+                "bool(picked and picked in stop_options)",
+                "bool(picked and picked.lower().startswith((\"stop\", \"abort\")))",
+                "apply_answer: an assessed clarify option that starts with Stop is an answer -> \
+                 assess re-runs",
+            ),
+            (
+                "park-per-question",
+                "    key = f\"{kind}#{_question_key(esc)}\"\n",
+                "    key = kind\n",
+                "choice_park: the cap is per question - a new plan_defect after one parked 3 times \
+                 still parks",
+            ),
+            (
+                "strikeout-whole-reply",
+                "a = \"abort\" if stop else _answered(state, {\"round\": [\"apply\", \"one more\", \
+                 \"round\"], \"accept\": [\"accept\"]},",
+                "a = _answered(state, {\"abort\": [\"abort\"], \"round\": [\"apply\", \"one more\", \
+                 \"round\"], \"accept\": [\"accept\"]},",
+                "apply_answer: strikeout / lane_stuck replies that mention abort are no abort; the \
+                 whole reply or the option is",
+            ),
+            (
+                "owner-judgment-whole-reply",
+                "a = \"stop\" if stop else _answered(state, {\"skip\": [\"skip\"], \"fix\": [\"fix\", \
+                 \"address\"]}, \"stop\")",
+                "a = _answered(state, {\"stop\": [\"stop\"], \"skip\": [\"skip\"], \"fix\": [\"fix\", \
+                 \"address\"]}, \"stop\")",
+                "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is a fix \
+                 round, never a stop",
+            ),
+            (
+                "consume-vehicle",
+                "    if fm.get(\"vehicle\") != \"sisyphus\":\n        ledger(",
+                "    if False:\n        ledger(",
+                "handoff pickup: a typed path to a vehicle-architect handoff is the brief but stays \
+                 ready, ledgered",
             ),
         ],
     );
@@ -5099,7 +5143,7 @@ fn engineer_sisyphus_block_states_the_handoff_contract() {
         "a bare \"go ahead\" in the run lane picks up the newest ready handoff after they confirm it",
         "(an explicit \"execute the handoff at <path>\" still works)",
         "the run drafts a brief from this conversation and confirms that instead",
-        "`status: consumed` once it has classified it",
+        "`status: consumed` once it has started work on it",
         "never edit a handoff whose status is `consumed`",
     ] {
         assert!(
@@ -5139,9 +5183,12 @@ fn engineer_sisyphus_block_states_the_discussion_contract() {
 fn engineer_standalone_block_states_the_sisyphus_go_ahead() {
     let flat = engineer_block("<!-- when:!chat_agent_for -->");
     for needle in [
-        "A sisyphus run started with a bare go-ahead only picks handoffs with `vehicle: sisyphus`",
-        "A `vehicle: sisyphus` handoff can also be started with a bare \"go ahead\" in a sisyphus \
-         session",
+        "Only the candidate graph orchestrators pick handoffs up by themselves; the shipped prose \
+         agents need the path",
+        "A run of the candidate sisyphus graph started with a bare go-ahead only picks handoffs \
+         with `vehicle: sisyphus`",
+        "In a session of the candidate sisyphus graph (not the shipped prose sisyphus), a \
+         `vehicle: sisyphus` handoff can also be started with a bare \"go ahead\"",
         "(an explicit path still works)",
         "\"execute the handoff at <path>\"",
     ] {

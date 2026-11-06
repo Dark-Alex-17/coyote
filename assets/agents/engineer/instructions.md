@@ -79,12 +79,14 @@ executes it. You two share artifacts, never transcripts.
     vehicle: <architect|sisyphus>
     ---
     ```
-    Set `vehicle:` to the vehicle you recommend. An architect run only picks
-    handoffs with `vehicle: architect`, and marks the handoff it uses
+    Set `vehicle:` to the vehicle you recommend. Only the candidate graph
+    orchestrators pick handoffs up by themselves; the shipped prose agents
+    need the path. An architect run of the candidate architect graph only
+    picks handoffs with `vehicle: architect`, and marks the handoff it uses
     `status: consumed` once it has oriented on it; never edit a consumed
-    handoff - write a new one. A sisyphus run started with a bare go-ahead
-    only picks handoffs with `vehicle: sisyphus`, and marks the one it uses
-    `status: consumed` once it has classified it.
+    handoff - write a new one. A run of the candidate sisyphus graph started
+    with a bare go-ahead only picks handoffs with `vehicle: sisyphus`, and
+    marks the one it uses `status: consumed` once it has started work on it.
   - Task-sized (sisyphus): the delegation shape - task statement, expected
     outcome, MUST DO / MUST NOT constraints, CONTEXT carrying the code
     snippets and path:line evidence this conversation gathered (pasted,
@@ -97,10 +99,11 @@ executes it. You two share artifacts, never transcripts.
     relitigate them), open questions, suggested task seams. The architect
     owns the decomposition; do not write its plan for it.
   Close with the invocation the user can run (e.g. `coyote --agent
-  sisyphus`, then "execute the handoff at <path>"). A `vehicle: sisyphus`
-  handoff can also be started with a bare "go ahead" in a sisyphus session:
-  the run picks up the newest ready one and asks the user to confirm it (an
-  explicit path still works). You still never spawn the vehicle yourself.
+  sisyphus`, then "execute the handoff at <path>"). In a session of the
+  candidate sisyphus graph (not the shipped prose sisyphus), a `vehicle:
+  sisyphus` handoff can also be started with a bare "go ahead": the run picks
+  up the newest ready one and asks the user to confirm it (an explicit path
+  still works). You still never spawn the vehicle yourself.
 <!-- end -->
 <!-- when:chat_agent_for -->
 - ATTACHED MODE - no standalone handoffs (the architect design-doc seed and
@@ -180,7 +183,7 @@ executes it. You two share artifacts, never transcripts.
   ready handoff after they confirm it (an explicit "execute the handoff at
   <path>" still works), and that with no handoff the run drafts a brief from
   this conversation and confirms that instead. The run marks the handoff it
-  uses `status: consumed` once it has classified it; never edit a handoff
+  uses `status: consumed` once it has started work on it; never edit a handoff
   whose status is `consumed` - write a new one.
 - When the last run's exposed `discussion` is non-empty, the run is parked on
   that question (`discussion.kind` names the escalation kind, any of them).

@@ -1077,7 +1077,7 @@ def apply_answer(state):
             _start_draft(state, u, f"handoff: {handoff} left ready; drafting a brief from the earlier turns")
         elif a == "use" and os.path.isfile(handoff):
             u["handoff_path"] = handoff
-            _adopt_brief(state, u, _handoff_brief(handoff), f"the handoff {handoff}; consumed once assess succeeds")
+            _adopt_brief(state, u, _handoff_brief(handoff), f"the handoff {handoff}; consumed once work starts")
         elif typed := _typed_path(answer, state):
             u["handoff_path"] = typed
             _adopt_brief(state, u, _handoff_brief(typed), f"the typed handoff path {typed} ({handoff} left ready)")

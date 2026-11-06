@@ -360,8 +360,8 @@ redraft, starts with the drafting node's output keys (`draft_possible`, `draft_t
 `draft_markdown`, `draft_reason`) cleared, so a reply that omits one cannot replay the last
 draft. The session block's `route:` instructions send a bare go-ahead ("okay, go ahead and
 get started") after a conversation that discussed work to RUN, where the seed pickup or the
-drafted brief takes over. `sisyphus-next` needs no equivalent: its `intake` takes the brief
-from the message itself and has no design-doc stop.
+drafted brief takes over. `sisyphus-next` has its own go-ahead intake, which picks up only
+`vehicle: sisyphus` handoffs (see its README).
 
 Design questions: the design escalations `design_round` (the open questions of a design
 frontier round), `quality_bar` (rigor and surfaces), `checklist_accept` (accept or drop each
