@@ -135,7 +135,7 @@ const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}'{args} <{stdin}; rc=$?; \
      sleep 1; fg %1; rc=$?; done; {report}";
 
 /// The build's own binary; every pty spawn goes through
-/// [`spawn_binary_under`], and [`run_piped`] is the no-tty counterpart.
+/// [`spawn_binary_under`] and every no-tty run through [`run_with_stdin`].
 fn built_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_coyote"))
 }
@@ -158,38 +158,42 @@ fn spawn_binary_under(
     stdin: &str,
     args: &str,
 ) -> Pty {
-    let home = dir.join("home");
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(
+        wrapper
+            .replace("{coyote}", binary.to_str().unwrap())
+            .replace("{args}", args)
+            .replace("{stdin}", stdin)
+            .replace("{report}", TTY_REPORT),
+    );
+    base_env(&mut cmd, dir);
+    cmd.env("COYOTE_UI", "tui").envs(extra_env.iter().copied());
+    Pty::spawn(cmd).unwrap()
+}
+
+/// The environment every spawn of the binary shares: working dir, config
+/// and cache dirs and `HOME` all under `dir`, the fixture bin first on
+/// `PATH`, and no inherited `COYOTE_*` or color variables.
+fn base_env(cmd: &mut Command, dir: &Path) {
     let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
     let path = env::join_paths(
         iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
     )
     .unwrap();
-    let mut cmd = Command::new("bash");
     for (key, _) in env::vars_os() {
         if key.to_string_lossy().starts_with("COYOTE_") {
             cmd.env_remove(&key);
         }
     }
-    cmd.arg("-c")
-        .arg(
-            wrapper
-                .replace("{coyote}", binary.to_str().unwrap())
-                .replace("{args}", args)
-                .replace("{stdin}", stdin)
-                .replace("{report}", TTY_REPORT),
-        )
-        .current_dir(dir)
+    cmd.current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("COYOTE_UI", "tui")
-        .env("HOME", &home)
+        .env("HOME", dir.join("home"))
         .env("TERM", "xterm-256color")
         .env("PATH", path)
         .env_remove("IS_SANDBOX")
         .env_remove("COLORTERM")
-        .env_remove("NO_COLOR")
-        .envs(extra_env.iter().copied());
-    Pty::spawn(cmd).unwrap()
+        .env_remove("NO_COLOR");
 }
 
 /// The binary with no terminal at all (stdin from /dev/null, stdout and
@@ -199,36 +203,18 @@ fn run_piped(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> std::proc
 }
 
 /// [`run_piped`] with `stdin` fed through a pipe when given (a prompt
-/// arriving on stdin, the way `echo prompt | coyote` runs).
+/// arriving on stdin, the way `echo prompt | coyote` runs). Unlike the pty
+/// wrapper, which defaults `COYOTE_UI` to `tui`, this path sets no
+/// `COYOTE_UI`, so the file value or the flags decide.
 fn run_with_stdin(
     dir: &Path,
     extra_env: &[(&str, &str)],
     args: &[&str],
     stdin: Option<&str>,
 ) -> std::process::Output {
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    // Spawned by its own name so the harness pin sees this spawn paired
-    // with the two config env lines below.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
+    let mut cmd = Command::new(built_binary());
+    base_env(&mut cmd, dir);
     cmd.args(args)
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir.join("home"))
-        .env("TERM", "xterm-256color")
-        .env("PATH", path)
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR")
         .envs(extra_env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -6812,6 +6798,18 @@ mod cold_start {
         assert_full_screen_ui_then_ctrl_d(&mut pty, "--tui over COYOTE_UI=repl");
     }
 
+    /// `--repl` overrides `COYOTE_UI=tui`.
+    #[test]
+    #[serial]
+    fn the_repl_flag_beats_a_tui_env() {
+        let dir = fresh_config_dir("repl-flag-over-env");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui_with_args(&dir, &[], &["--repl"]);
+
+        assert_plain_repl_then_ctrl_d(&mut pty, "--repl over COYOTE_UI=tui");
+    }
+
     /// `COYOTE_UI=headless` is not a shell choice, so the config key
     /// still decides.
     #[test]
@@ -7415,6 +7413,295 @@ mod cold_start {
                 info_ui_row(&out),
                 "repl",
                 "the rows from {file} did not resolve to repl"
+            );
+        }
+    }
+
+    /// `echo | coyote` gives the binary a pipe, not a tty, on stdin. With
+    /// nothing on the pipe the run is still an interactive start, and the
+    /// full-screen UI refuses it the same way it refuses `/dev/null`:
+    /// `No TTY for TUI` on stderr, exit 1, nothing on stdout.
+    #[test]
+    #[serial]
+    fn the_full_screen_ui_refuses_an_empty_pipe_on_stdin() {
+        let dir = fresh_config_dir("tui-empty-stdin-pipe");
+        let _guard = TempDirGuard(dir.clone());
+
+        write_dry_run_config(&dir);
+        let by_flag = run_with_stdin(&dir, &[("COYOTE_UI", "")], &["--tui"], Some(""));
+        write_config(&dir, "save_session: false\nui: tui\n");
+        let by_key = run_with_stdin(&dir, &[("COYOTE_UI", "")], &[], Some(""));
+        write_dry_run_config(&dir);
+        let by_env = run_with_stdin(&dir, &[("COYOTE_UI", "tui")], &[], Some(""));
+
+        for (what, out) in [
+            ("--tui", by_flag),
+            ("ui: tui", by_key),
+            ("COYOTE_UI=tui", by_env),
+        ] {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{what} with an empty stdin pipe did not exit 1:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("No TTY for TUI"),
+                "{what} with an empty stdin pipe gave no tty refusal:\n{stderr}"
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "{what} with an empty stdin pipe wrote to stdout: {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(
+                !stderr.contains("Welcome to"),
+                "{what} with an empty stdin pipe fell through to the REPL:\n{stderr}"
+            );
+        }
+    }
+
+    /// [`WAIT_WRAPPER`] with the binary's stdout and stderr sent to files
+    /// in the working directory while stdin keeps the tty: the shape of
+    /// `coyote > out.txt` typed at a terminal.
+    const STDOUT_TO_FILE_WRAPPER: &str = "'{coyote}'{args} <{stdin} >stdout.txt 2>stderr.txt & \
+         cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
+
+    /// A tty on stdin alone is not enough: with stdout redirected to a
+    /// file the full-screen UI refuses to start (`No TTY for TUI`, exit 1),
+    /// writes nothing to the file, and never opens `/dev/tty` behind the
+    /// redirect to paint there instead.
+    #[test]
+    #[serial]
+    fn the_full_screen_ui_refuses_a_redirected_stdout_with_a_tty_on_stdin() {
+        let dir = fresh_config_dir("tui-stdout-redirect");
+        let _guard = TempDirGuard(dir.clone());
+
+        for (what, config, args) in [
+            ("--tui", "save_session: false\n", " --tui"),
+            ("ui: tui", "save_session: false\nui: tui\n", ""),
+        ] {
+            write_config(&dir, config);
+            let _ = fs::remove_file(dir.join("stdout.txt"));
+            let _ = fs::remove_file(dir.join("stderr.txt"));
+            let mut pty = spawn_binary_under(
+                built_binary(),
+                &dir,
+                &[("COYOTE_UI", "")],
+                STDOUT_TO_FILE_WRAPPER,
+                "/dev/tty",
+                args,
+            );
+            let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+            assert_eq!(
+                exit_code(&transcript),
+                1,
+                "{what} with stdout redirected did not exit 1:\n{transcript}"
+            );
+            assert!(
+                find(pty.raw(), ENTER_ALT, 0).is_none(),
+                "{what} with stdout redirected painted on the tty anyway:\n{transcript}"
+            );
+            assert_tty_restored(&transcript);
+
+            let stdout = fs::read(dir.join("stdout.txt")).unwrap();
+            let stderr = fs::read_to_string(dir.join("stderr.txt")).unwrap();
+            assert!(
+                stdout.is_empty(),
+                "{what} with stdout redirected wrote to the file: {:?}",
+                String::from_utf8_lossy(&stdout)
+            );
+            assert!(
+                stderr.contains("No TTY for TUI"),
+                "{what} with stdout redirected gave no tty refusal on stderr:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("Welcome to"),
+                "{what} with stdout redirected fell through to the REPL:\n{stderr}"
+            );
+        }
+    }
+
+    /// A prompt piped in (`echo prompt | coyote`) is a one-shot run, so a
+    /// shell preference from the env or the file is ignored for it just as
+    /// for a positional prompt: the reply arrives on stdout, exit 0, and
+    /// neither the tty check nor the shell-flag refusal fires.
+    #[test]
+    #[serial]
+    fn a_tui_preference_never_blocks_a_prompt_on_stdin() {
+        let dir = fresh_config_dir("tui-pref-stdin-prompt");
+        let _guard = TempDirGuard(dir.clone());
+
+        for (config, env_value) in [
+            ("save_session: false\n", "tui"),
+            ("save_session: false\nui: tui\n", ""),
+        ] {
+            write_config(&dir, config);
+            let out = run_with_stdin(
+                &dir,
+                &[("COYOTE_UI", env_value)],
+                &[],
+                Some("say hello-sentinel\n"),
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let all = format!("{stdout}\n{stderr}");
+            let what = format!("a stdin prompt under COYOTE_UI={env_value:?} with {config:?}");
+            assert!(out.status.success(), "{what} failed:\n{all}");
+            assert!(
+                stdout.contains("hello-sentinel"),
+                "{what} never reached the model:\n{all}"
+            );
+            assert!(
+                find(&out.stdout, ENTER_ALT, 0).is_none()
+                    && find(&out.stderr, ENTER_ALT, 0).is_none(),
+                "{what} entered the alternate screen:\n{all}"
+            );
+            assert!(
+                !all.contains("No TTY") && !all.contains("requires the interactive mode"),
+                "{what} was refused:\n{all}"
+            );
+        }
+    }
+
+    /// With no `ui:` key, no `COYOTE_UI` and no flag, an interactive start
+    /// is the plain REPL it always was.
+    #[test]
+    #[serial]
+    fn an_interactive_start_with_no_preference_is_the_plain_repl() {
+        let dir = fresh_config_dir("no-ui-preference");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "")]);
+
+        assert_plain_repl_then_ctrl_d(&mut pty, "no ui preference");
+    }
+
+    /// The shell is chosen before the REPL is up, so `ui` is not a `.set`
+    /// key: `.set ui tui` is refused as an unknown key, the session stays
+    /// on the normal screen, and the REPL keeps running.
+    #[test]
+    #[serial]
+    fn the_ui_key_is_not_a_dot_set_key_in_the_repl() {
+        let dir = fresh_config_dir("set-ui-key");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "")], &["--repl"]);
+
+        pty.wait_for("Welcome to", PTY_DEADLINE).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let from = pty.raw().len();
+        pty.send(b".set ui tui\r").unwrap();
+        let since = pty
+            .wait_for_after("Unknown key 'ui'", from, PTY_DEADLINE)
+            .unwrap();
+        assert!(
+            find(pty.raw(), ENTER_ALT, 0).is_none(),
+            ".set ui tui entered the alternate screen:\n{since}"
+        );
+
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\x04").unwrap();
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+        assert_tty_restored(&transcript);
+    }
+
+    /// YAML spellings of the key: a quoted scalar is the same value as a
+    /// bare one, while an absent value (`ui:` or `ui: null`) is not a
+    /// shell and is refused by name with the accepted values, like any
+    /// other typo, rather than silently falling back to the default.
+    #[test]
+    #[serial]
+    fn a_quoted_ui_value_loads_and_an_absent_one_is_refused_by_name() {
+        let dir = fresh_config_dir("ui-yaml-spellings");
+        let _guard = TempDirGuard(dir.clone());
+
+        write_config(&dir, "save_session: false\nui: \"tui\"\n");
+        let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--info"]);
+        assert_eq!(
+            info_ui_row(&out),
+            "tui",
+            "a quoted `ui: \"tui\"` did not load"
+        );
+
+        for (row, shown) in [("ui:", ""), ("ui: null", "null")] {
+            write_config(&dir, &format!("save_session: false\n{row}\n"));
+            let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--info"]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "`{row}` was accepted:\n{stdout}");
+            assert!(
+                stderr.contains(&format!(
+                    "Invalid value '{shown}', expected one of: repl, tui"
+                )),
+                "`{row}` was not refused by name:\n{stderr}"
+            );
+        }
+    }
+
+    /// `COYOTE_UI` holds one shell name: a list, or a value with a stray
+    /// character, is refused by name with the accepted values before
+    /// `--info` prints; no run guesses which half was meant.
+    #[test]
+    #[serial]
+    fn a_coyote_ui_list_or_misspelling_is_refused_by_name() {
+        let dir = fresh_config_dir("ui-env-shapes");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+
+        for value in ["repl,tui", "tui.", "--tui"] {
+            let out = run_piped(&dir, &[("COYOTE_UI", value)], &["--info"]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success(),
+                "COYOTE_UI={value:?} was accepted:\n{stdout}"
+            );
+            assert!(
+                stderr.contains(&format!(
+                    "Invalid value '{value}', expected one of: repl, tui"
+                )),
+                "COYOTE_UI={value:?} was not refused by name:\n{stderr}"
+            );
+            assert!(
+                !stdout
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some("ui")),
+                "--info still printed a ui row under COYOTE_UI={value:?}:\n{stdout}"
+            );
+        }
+    }
+
+    /// `--version` and `--completions` answer before any shell is chosen,
+    /// so a shell flag beside them is harmless: exit 0 and the usual
+    /// output, without a tty and without touching the config.
+    #[test]
+    #[serial]
+    fn the_shell_flags_do_not_disturb_version_or_completions() {
+        let dir = fresh_config_dir("shell-flag-inspection");
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, "save_session: false\nui: bogus\n");
+
+        for (flag, args, needle) in [
+            ("--tui", &["--version"][..], "coyote "),
+            ("--repl", &["--version"][..], "coyote "),
+            ("--tui", &["--completions", "bash"][..], "--tui"),
+            ("--repl", &["--completions", "bash"][..], "--repl"),
+        ] {
+            let mut full = vec![flag];
+            full.extend_from_slice(args);
+            let out = run_piped(&dir, &[("COYOTE_UI", "")], &full);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{full:?} failed:\n{stdout}\n{stderr}");
+            assert!(
+                stdout.contains(needle),
+                "{full:?} did not print the expected output:\n{stdout}"
+            );
+            assert!(
+                !stderr.contains("No TTY") && !stderr.contains("Invalid value"),
+                "{full:?} reached the shell or the config:\n{stderr}"
             );
         }
     }
