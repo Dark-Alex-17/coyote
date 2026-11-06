@@ -6832,7 +6832,7 @@ mod cold_start {
             "--tui with a prompt exited 0 instead of refusing:\n{all}"
         );
         assert!(
-            all.contains("--tui takes no prompt argument"),
+            all.contains("--tui requires the interactive mode; drop the prompt"),
             "the refusal did not name the flag and the prompt:\n{all}"
         );
         assert!(

@@ -130,9 +130,7 @@ async fn async_main() -> Result<()> {
         WorkingMode::Cmd
     };
     if cli.tui && !working_mode.is_repl() {
-        bail!(
-            "--tui takes no prompt argument; it starts the full-screen UI for an interactive run"
-        );
+        bail!("--tui requires the interactive mode; drop the prompt");
     }
 
     if cli.headless || cli.acp_server {
