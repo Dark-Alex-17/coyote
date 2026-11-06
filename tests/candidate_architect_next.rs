@@ -5451,6 +5451,58 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
     );
 }
 
+/// The delegate's variables travel through `inputs:`, so no gate writes a
+/// `mode-degraded` ledger line any more.
+#[test]
+fn gates_write_no_mode_degraded_ledger_line() {
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    assert!(
+        !gates.contains("mode-degraded"),
+        "gates.py names mode-degraded again; the delegate inputs replace it"
+    );
+}
+
+/// A delegated sisyphus-next run that parks for discussion ends with one
+/// `Discussion data: <json>` line; architect-next relays the question from
+/// that line. Both sides name the same prefix and the same JSON keys.
+#[test]
+fn relay_reads_the_discussion_data_line_sisyphus_next_writes() {
+    let ours = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let child = fs::read_to_string(agents_dir().join("sisyphus-next/scripts/gates.py")).unwrap();
+    assert!(
+        child.contains("DISCUSSION_DATA_PREFIX = \"Discussion data: \""),
+        "sisyphus-next no longer writes the `Discussion data: ` prefix"
+    );
+    assert!(
+        ours.contains(
+            "DISCUSSION_DATA_RE = re.compile(r\"(?m)^Discussion data: (\\{.*\\})[ \\t]*$\")"
+        ),
+        "architect-next no longer reads the `Discussion data: ` line"
+    );
+    for key in [
+        "kind",
+        "question",
+        "options",
+        "recommended",
+        "reply",
+        "run_id",
+    ] {
+        let quoted = format!("\"{key}\"");
+        assert!(child.contains(&quoted), "sisyphus-next writes no {quoted}");
+        assert!(ours.contains(&quoted), "architect-next reads no {quoted}");
+    }
+    assert!(
+        ours.contains(
+            "DISCUSSION_SENTINEL_RE = re.compile(r\"(?m)^\\s*SISYPHUS_AWAITING_DISCUSSION\\b\")"
+        ),
+        "the relay must key on a line-anchored SISYPHUS_AWAITING_DISCUSSION"
+    );
+    assert!(
+        ours.contains("\"delegate_discussion\": (\"answer\",),"),
+        "delegate_discussion must accept the verbatim `answer` instruction"
+    );
+}
+
 /// The README subsection under `### <title>`, up to the next `##` or `###`
 /// heading, with every whitespace run folded to one space so a pinned clause
 /// survives rewrapping.

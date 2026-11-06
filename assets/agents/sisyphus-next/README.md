@@ -235,6 +235,10 @@ and passes.
 `config.yaml` for a `spawnable_agents` entry, a `session.chat.agent` value or an `agent:`
 key naming `sisyphus-next` or `architect-next`, and every `instructions.md` and
 `config.yaml` for prose containing either name, pinning the candidate status above.
+The candidates' own files are swept too: the one allowed edge is an `agent:
+sisyphus-next` node in `architect-next/graph.yaml` (its implementer delegate), which
+the sweep also requires to exist; any other candidate reference, from a candidate or
+not, fails it.
 
 Measured 2026-11-06 after the adjustments above, from a fresh scratch dir: audit
 `PROBLEMS: none`; smoke `547/547 checks passed`; session check ok (mikefarah yq
