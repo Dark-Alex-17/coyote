@@ -6805,7 +6805,7 @@ mod cold_start {
         let dir = fresh_config_dir("repl-flag-over-env");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
-        let mut pty = spawn_tui_with_args(&dir, &[], &["--repl"]);
+        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "tui")], &["--repl"]);
 
         assert_plain_repl_then_ctrl_d(&mut pty, "--repl over COYOTE_UI=tui");
     }
@@ -7056,6 +7056,55 @@ mod cold_start {
             assert!(
                 !all.contains("Welcome to"),
                 "{args:?} started the REPL:\n{all}"
+            );
+        }
+    }
+
+    /// The sandbox relaunch forwards no flags, so a shell flag next to
+    /// `--sandbox` (named or not, with or without `--fresh`, in either
+    /// order) is a usage error at the parser: exit 2, the conflict named,
+    /// and no relaunch attempted (nothing about `sbx` is said, no shell
+    /// starts). `--fresh` on its own is refused the same way.
+    #[test]
+    #[serial]
+    fn the_shell_flags_conflict_with_the_sandbox_relaunch_in_clap() {
+        let dir = fresh_config_dir("shell-flag-sandbox-conflict");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+
+        for args in [
+            &["--sandbox", "--tui"][..],
+            &["--sandbox", "--repl"],
+            &["--sandbox", "box", "--tui"],
+            &["--sandbox", "box", "--repl"],
+            &["--sandbox", "--fresh", "--tui"],
+            &["--sandbox", "--fresh", "--repl"],
+            &["--tui", "--sandbox"],
+            &["--repl", "--sandbox"],
+            &["--fresh", "--tui"],
+        ] {
+            let out = run_piped(&dir, &[], args);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+            let all = format!("{stdout}\n{stderr}");
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{args:?} did not exit with clap's usage error code:\n{all}"
+            );
+            assert!(
+                stderr.contains("cannot be used with")
+                    && (stderr.contains("--sandbox") || stderr.contains("--fresh"))
+                    && (stderr.contains("--tui") || stderr.contains("--repl")),
+                "{args:?} was not reported as a conflict between the sandbox flags and the shell flag:\n{all}"
+            );
+            assert!(
+                !all.contains("sbx"),
+                "{args:?} reached the sandbox relaunch:\n{all}"
+            );
+            assert!(
+                !all.contains("Welcome to") && find(&out.stdout, ENTER_ALT, 0).is_none(),
+                "{args:?} started a shell:\n{all}"
             );
         }
     }

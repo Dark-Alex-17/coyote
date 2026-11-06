@@ -100,4 +100,16 @@ mod tests {
             assert_eq!(name.parse::<UiMode>().unwrap().to_string(), name);
         }
     }
+
+    /// The value a parent exports to a nested coyote as `COYOTE_UI` is the
+    /// value the child parses back: the two shell kinds round-trip through
+    /// `UiMode` unchanged.
+    #[test]
+    fn the_exported_shell_kinds_parse_back_unchanged() {
+        use crate::config::UiKind;
+        for kind in [UiKind::Repl, UiKind::Tui] {
+            let name = kind.as_str();
+            assert_eq!(name.parse::<UiMode>().unwrap().to_string(), name);
+        }
+    }
 }

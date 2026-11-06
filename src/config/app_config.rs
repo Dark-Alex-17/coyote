@@ -1217,7 +1217,10 @@ mod tests {
         assert_eq!(AppConfig::ui_from_env("repl").unwrap(), Some(UiMode::Repl));
         assert_eq!(AppConfig::ui_from_env(" tui ").unwrap(), Some(UiMode::Tui));
         assert_eq!(AppConfig::ui_from_env("").unwrap(), None);
-        assert_eq!(AppConfig::ui_from_env("headless").unwrap(), None);
+        assert_eq!(
+            AppConfig::ui_from_env(UiKind::Headless.as_str()).unwrap(),
+            None
+        );
         let err = AppConfig::ui_from_env("bogus").unwrap_err().to_string();
         assert_eq!(err, "Invalid value 'bogus', expected one of: repl, tui");
     }
