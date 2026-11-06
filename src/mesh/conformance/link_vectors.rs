@@ -93,8 +93,9 @@ enum Case {
     /// A link that never comes up ends the request in `LinkActivationTimeout` at the link
     /// timeout.
     LinkTimeout,
-    /// A destination the transport has no path to ends the request in `LinkFailed` at once,
-    /// naming the destination truncated.
+    /// A destination the transport has no path to is asked for once within the link
+    /// deadline; with no answer the request ends in `LinkFailed` naming the full
+    /// destination.
     NoKnownPath,
     /// A wire version refusal with this window marks the peer `Incompatible { found: marked }`.
     VersionMark {

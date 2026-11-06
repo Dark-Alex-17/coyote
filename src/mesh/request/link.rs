@@ -312,7 +312,8 @@ pub(crate) async fn link_to(
 /// (a held description whose path expired, or one never heard) is asked for once over
 /// the network, for up to `PATH_REQUEST_TIMEOUT` or what is left of the deadline, and the
 /// link is tried once more if a path arrived. A deadline whose caller already sent a path
-/// request fails at once instead, so one request never stacks two waits. Either way a
+/// request, or one already spent, fails at once instead, so one request never stacks two
+/// waits and no request is sent that nothing would wait on. Either way a
 /// destination still without a path fails as `LinkFailed` naming no known path.
 pub(crate) async fn open_link(
     transport: &Transport,
@@ -331,7 +332,9 @@ pub(crate) async fn open_link(
         .await?
     {
         Ok(link) => link,
-        Err(RnsError::NoPath) if deadline.path_requested => return Err(no_path()),
+        Err(RnsError::NoPath) if deadline.path_requested || deadline.remaining().is_zero() => {
+            return Err(no_path());
+        }
         Err(RnsError::NoPath) => {
             let wait = PATH_REQUEST_TIMEOUT.min(deadline.remaining());
             debug!(

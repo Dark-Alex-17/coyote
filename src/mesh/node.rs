@@ -1542,7 +1542,7 @@ impl MeshRuntime {
         let asked =
             request_path_to_node(&transport, node, &cancel, PropagationError::Cancelled).await?;
         let options = PropagationOptions {
-            path_requested: asked,
+            path_requested: options.path_requested || asked,
             ..*options
         };
         propagation::propagate(
@@ -16469,6 +16469,70 @@ mod tests {
                 matches!(outcome, Err(PropagationError::Cancelled)),
                 "{outcome:?}"
             );
+            assert!(
+                stopping.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                stopping.elapsed()
+            );
+            relay.stop().await;
+        }
+
+        /// The fetch side of the same gone node: the one path request the fetch makes
+        /// before its link goes unanswered, so the fetch fails as a link with no known path
+        /// after that one `PATH_REQUEST_TIMEOUT` without the link asking again, and a fetch
+        /// caught in that wait ends promptly with `Cancelled` when the node is stopped.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fetch_from_a_persisted_node_that_does_not_answer_waits_one_path_request_and_a_stop_ends_it()
+         {
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-fetch-persisted-node-gone");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let gone = crate::mesh::propagation::propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            );
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: gone,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+            let runtime = start_on(&tmp, relay.port).await;
+            let sink = Arc::new(CountingSink::default());
+
+            let asked = Instant::now();
+            let err = runtime.fetch_propagated(&*sink).await.unwrap_err();
+            let waited = asked.elapsed();
+
+            assert!(
+                matches!(&err, FetchError::Link(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+                "{err:?}"
+            );
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                "the fetch waited {waited:?} for the path request"
+            );
+
+            let waiting = tokio::spawn({
+                let runtime = runtime.clone();
+                let sink = sink.clone();
+                async move { runtime.fetch_propagated(&*sink).await }
+            });
+            sleep(Duration::from_secs(1)).await;
+            let stopping = Instant::now();
+            stop(&runtime).await;
+            let outcome = tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .expect("stopping the node must end the fetch's path-request wait")
+                .unwrap();
+            assert!(matches!(outcome, Err(FetchError::Cancelled)), "{outcome:?}");
             assert!(
                 stopping.elapsed() < Duration::from_secs(3),
                 "{:?}",
