@@ -344,6 +344,11 @@ struct TurnStatus {
     /// Index of the turn's first cell; tool output never merges into a
     /// cell before it.
     first_cell: usize,
+    /// Whether a request reached the model: the first sign of a reply, or
+    /// the busy indicator and stream end that the transports raise only
+    /// once the request is on the wire. The session records an exchange
+    /// for every such request, reply or not.
+    requested: bool,
 }
 
 struct PendingPrompt {
@@ -467,21 +472,23 @@ fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
 /// opening one: `Session::add_message` appends to the last assistant
 /// message for `.continue` and replaces it for `.regenerate`, so the
 /// exchange `.undo` removes after either is the one before the command.
-/// Every other command that got a reply (`.file`, `.run`, `.starter`,
-/// `.prompt`, a macro, ...) recorded a fresh exchange the way a prompt
-/// does.
+/// Every other command whose request reached the model (`.file`, `.run`,
+/// `.starter`, `.prompt`, a macro, ...) recorded a fresh exchange the
+/// way a prompt does.
 const EXCHANGE_MODIFYING_COMMANDS: [&str; 2] = [".continue", ".regenerate"];
 
 /// Whether the cell opened an exchange `.undo` would take back: a user
-/// line, or a command turn that got as far as a reply and is not in
-/// `EXCHANGE_MODIFYING_COMMANDS`. One that bailed on usage (bare `.file`,
+/// line, or a command turn whose request reached the model and is not in
+/// `EXCHANGE_MODIFYING_COMMANDS`. A request that failed or was interrupted
+/// before any reply still counts: the session keeps the user message with
+/// an interrupted-response marker. One that bailed on usage (bare `.file`,
 /// nothing to `.continue`) or never asks the model (`.info`) recorded
 /// nothing, so it is looked past.
-fn opens_exchange(cell: &Cell, answered: bool, prefix: crate::config::CommandPrefix) -> bool {
+fn opens_exchange(cell: &Cell, prefix: crate::config::CommandPrefix) -> bool {
     match cell {
         Cell::User { .. } => true,
-        Cell::Command { name, .. } => {
-            answered
+        Cell::Command { name, opened, .. } => {
+            *opened
                 && command_word(name, prefix)
                     .is_some_and(|word| !EXCHANGE_MODIFYING_COMMANDS.contains(&word.as_str()))
         }
@@ -492,14 +499,9 @@ fn opens_exchange(cell: &Cell, answered: bool, prefix: crate::config::CommandPre
 /// Index of the cell that opened the exchange a `.undo` at `undo` takes
 /// back: the latest opener before it, scanning back past any reply.
 fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix) -> Option<usize> {
-    let mut answered = false;
-    cells[..undo].iter().rposition(|cell| {
-        if matches!(cell, Cell::Assistant { .. }) {
-            answered = true;
-            return false;
-        }
-        opens_exchange(cell, answered, prefix)
-    })
+    cells[..undo]
+        .iter()
+        .rposition(|cell| opens_exchange(cell, prefix))
 }
 
 /// Something the loop, not the app, has to do.
@@ -643,29 +645,33 @@ impl App {
             thinking_since: None,
             tool: None,
             first_cell,
+            requested: false,
         });
         self.schedule_frame();
     }
 
     /// Commits what the work task brought back.
     pub(crate) fn end_turn(&mut self, command: bool, outcome: &TurnOutcome) {
-        let first_cell = self.turn.take().map(|turn| turn.first_cell);
+        let turn = self.turn.take();
         self.close_stream();
-        if let Some(first_cell) = first_cell {
-            self.fail_unreported_tools(first_cell);
+        if let Some(turn) = &turn {
+            self.fail_unreported_tools(turn.first_cell);
         }
         if command {
-            let index = first_cell.expect("end_turn follows begin_turn");
+            let turn = turn.expect("end_turn follows begin_turn");
+            let index = turn.first_cell;
             let prefix = self.config.command_prefix;
             let Some(Cell::Command {
                 name,
                 output,
+                opened,
                 cache,
             }) = self.transcript.cell_mut(index)
             else {
                 panic!("begin_turn pushed a Command cell for a command turn");
             };
             *output = outcome.captured.clone();
+            *opened = turn.requested;
             *cache = LineCache::default();
             // `.undo` took the last exchange out of the context; the
             // transcript drops it too, back to the cell that opened it,
@@ -921,6 +927,19 @@ impl App {
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
+        if let Some(turn) = self.turn.as_mut()
+            && matches!(
+                msg,
+                UiMsg::TextDelta(_)
+                    | UiMsg::StreamDone
+                    | UiMsg::AssistantText(_)
+                    | UiMsg::ThinkingStarted
+                    | UiMsg::ToolNarration { .. }
+                    | UiMsg::Busy(Some(_))
+            )
+        {
+            turn.requested = true;
+        }
         match msg {
             UiMsg::TextDelta(delta) => match self.transcript.stream_cell_mut() {
                 Some(Cell::Assistant { source, .. }) => source.push_str(&delta),
@@ -1270,10 +1289,15 @@ impl App {
         }
         let first_cell = self.turn_first_cell();
         // Output of a call the transcript has a row for (or has folded
-        // into a job's or agent's row) belongs to that row.
-        if let Some(id) = call_id.as_deref()
-            && let Some(target) = self.tool_output_target(first_cell, id)
-        {
+        // into a job's or agent's row) belongs to that row. The pump of a
+        // call the model gave no id reports `None`; its row is the one
+        // the narration opened with an empty id.
+        let target = match call_id.as_deref() {
+            Some(id) => self.tool_output_target(first_cell, id),
+            None if self.turn.is_some() => self.anonymous_tool_output_target(first_cell),
+            None => None,
+        };
+        if let Some(target) = target {
             append_output(target, bytes);
             return;
         }
@@ -1320,6 +1344,26 @@ impl App {
                 *index >= first_cell || matches!(cell, Cell::Job { .. } | Cell::Agent { .. })
             })
             .find_map(|(_, cell)| cell.output_for(call_id))
+    }
+
+    /// The output lines of a call without an id, within this turn: the
+    /// newest running tool row without one (a finished one has had all
+    /// its output), or the newest such call folded into a job's or
+    /// agent's row.
+    fn anonymous_tool_output_target(&mut self, first_cell: usize) -> Option<OutputTarget<'_>> {
+        let cells = self.transcript.cells();
+        let index = (first_cell..cells.len())
+            .rev()
+            .find(|&index| match &cells[index] {
+                Cell::Tool {
+                    call_id, status, ..
+                } => call_id.is_empty() && matches!(status, ToolStatus::Running { .. }),
+                Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
+                    calls.iter().any(|call| call.call_id.is_empty())
+                }
+                _ => false,
+            })?;
+        self.transcript.cell_mut(index)?.output_for("")
     }
 
     /// Gives every queued prompt its unattended answer; used when the UI
@@ -4661,6 +4705,72 @@ mod tests {
         ));
     }
 
+    /// The output pump of a call without an id reports `None` rather
+    /// than an empty id; the bytes still reach the newest running row
+    /// without one, and a row that has finished takes no more of them.
+    #[test]
+    fn anonymous_tool_output_lands_in_the_newest_running_anonymous_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("anonymous", false);
+        narrate(&mut harness, "", "Call fs_read {\"path\":\"a\"}");
+        start_tool(&mut harness, "", "fs_read", None);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"from read\n".to_vec(),
+        });
+        narrate(&mut harness, "", "Call fs_write {\"path\":\"b\"}");
+        start_tool(&mut harness, "", "fs_write", None);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"from write\n".to_vec(),
+        });
+        finish_tool(&mut harness, "", true, None);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"late read\n".to_vec(),
+        });
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 3, "the output took no cell of its own");
+        assert!(matches!(
+            &cells[1],
+            Cell::Tool { name, output, status: ToolStatus::Running { .. }, .. }
+                if name == "fs_read" && output == &["from read", "late read"]
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Tool { name, output, status: ToolStatus::Ok { .. }, .. }
+                if name == "fs_write" && output == &["from write"]
+        ));
+    }
+
+    /// Once a call without an id has folded into the job row it started,
+    /// its output follows it there.
+    #[test]
+    fn anonymous_tool_output_follows_its_call_into_a_job_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("background", false);
+        narrate(
+            &mut harness,
+            "",
+            "Call job__start {\"tool\":\"execute_command\"}",
+        );
+        start_tool(&mut harness, "", "job__start", None);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"started\n".to_vec(),
+        });
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 2, "the output took no cell of its own");
+        let Cell::Job { calls, .. } = &cells[1] else {
+            panic!("the job did not take the start call's row");
+        };
+        assert_eq!(calls[0].output, ["started"]);
+    }
+
     #[test]
     fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
         let mut harness = Harness::standalone(80, 24);
@@ -4827,6 +4937,38 @@ mod tests {
         harness.app.begin_turn(".undo", true);
         harness.app.end_turn(true, &TurnOutcome::default());
         assert!(harness.draw().contains("Tip: Press"));
+    }
+
+    /// A `.file` whose request reached the model and failed before any
+    /// reply (the connection dropped, Esc before the first delta) left
+    /// the session holding an exchange with an interrupted reply, so the
+    /// `.undo` after it takes that exchange and not the one before.
+    #[test]
+    fn an_undo_after_a_file_command_whose_request_got_no_reply_stops_at_that_command_cell() {
+        for began in [UiMsg::ThinkingStarted, UiMsg::StreamDone] {
+            let mut harness = Harness::standalone(80, 24);
+            exchange(&mut harness);
+            harness.app.begin_turn(".file notes.md -- summarize", true);
+            harness.app.handle_msg(began);
+            harness.app.end_turn(
+                true,
+                &TurnOutcome {
+                    error: Some("connection reset".to_string()),
+                    ..TurnOutcome::default()
+                },
+            );
+            assert_eq!(harness.app.transcript.len(), 5);
+            assert!(matches!(
+                &harness.app.transcript.cells()[3],
+                Cell::Command { opened: true, .. }
+            ));
+            harness.app.begin_turn(".undo", true);
+            harness.app.end_turn(true, &TurnOutcome::default());
+            let cells = harness.app.transcript.cells();
+            assert_eq!(cells.len(), 3, "the file command and its error are gone");
+            assert!(matches!(&cells[0], Cell::User { text, .. } if text == "first question"));
+            assert!(matches!(&cells[2], Cell::Assistant { .. }));
+        }
     }
 
     /// A `.file` that bailed on usage opened nothing in the session, so

@@ -109,6 +109,10 @@ pub(super) enum Cell {
     Command {
         name: String,
         output: String,
+        /// Whether the command's turn got a request off to the model, so
+        /// the session holds an exchange under it even if no reply came
+        /// back; `.undo` takes that exchange and this cell with it.
+        opened: bool,
         cache: LineCache,
     },
     /// Dim lines: tool output that belongs to no tool row, such as a
@@ -230,6 +234,7 @@ impl Cell {
         Self::Command {
             name: name.to_string(),
             output: String::new(),
+            opened: false,
             cache: LineCache::default(),
         }
     }
@@ -331,6 +336,7 @@ impl Cell {
                 name,
                 output,
                 cache,
+                ..
             } => cache.get(width, || {
                 // The header is the typed line; scrubbed like a User
                 // cell's, so a pasted escape cannot paint through it.

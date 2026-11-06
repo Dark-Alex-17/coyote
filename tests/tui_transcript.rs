@@ -22,6 +22,14 @@
 //!   an emoji/VS16 prompt leave the UI alive and quitting cleanly;
 //! - undoing the only exchange stops at the command cell before it and
 //!   leaves that cell in place.
+//! - a finished tool row reads `name(args)  elapsed  ok`, folds its output
+//!   away, and opens/closes on `Enter` once `Ctrl+Up` focused it; `Esc`
+//!   drops the focus and a draft makes `Enter` submit instead;
+//! - a failed tool row says `failed` without the error in its header; the
+//!   opened row carries the error;
+//! - cells that land while the view is scrolled up count on the follow
+//!   chip and `End` brings them into view;
+//! - `todo__*` calls never take a transcript row; the Todo panel shows them.
 #![cfg(unix)]
 
 mod common;
@@ -45,6 +53,8 @@ const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 const F2: &[u8] = b"\x1bOQ";
 const PAGE_UP: &[u8] = b"\x1b[5~";
 const END: &[u8] = b"\x1b[F";
+const CTRL_UP: &[u8] = b"\x1b[1;5A";
+const ESC: &[u8] = b"\x1b";
 const CTRL_L: &[u8] = b"\x0c";
 const CTRL_D: &[u8] = b"\x04";
 const CTRL_C: &[u8] = b"\x03";
@@ -105,6 +115,12 @@ fn write_dry_run_config(dir: &Path) {
 /// The dry-run config with its only client pointed at `fake` instead, so
 /// a turn is answered by the scripted endpoint and recorded in the session.
 fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
+    write_fake_llm_config_with(dir, fake, "");
+}
+
+/// [`write_fake_llm_config`] with `extra` top-level YAML lines appended
+/// (each line newline-terminated).
+fn write_fake_llm_config_with(dir: &Path, fake: &FakeLlm, extra: &str) {
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
     fs::write(
@@ -125,9 +141,10 @@ fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
              \x20       max_input_tokens: 100000\n\
              \x20       supports_function_calling: true\n\
              workspace_instructions: false\n\
-             memory: false\n",
+             memory: false\n{extra}",
             vault_pass = vault_pass.display(),
             api_base = fake.api_base(),
+            extra = extra,
         ),
     )
     .unwrap();
@@ -502,6 +519,391 @@ fn undo_removes_the_last_exchange_and_keeps_the_one_before() {
     quit(pty);
 }
 
+// =====================================================================
+// Collapsed rows and the focus cursor: what a finished tool looks like
+// folded, how it opens, and what wins when a draft is in the composer.
+// =====================================================================
+
+/// The squeezed text strictly between the first `start` and the first
+/// `end` after it.
+fn between<'a>(frame: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let from = frame.find(start)? + start.len();
+    let to = frame[from..].find(end)? + from;
+    Some(&frame[from..to])
+}
+
+/// Checks a folded tool header squeezed to `name(args)<elapsed><status>`:
+/// the piece after the closing paren must be a duration (`0.4s`, `12s`,
+/// `350ms`) and nothing else, which is also what keeps an error message
+/// out of the header.
+fn assert_header_is_name_args_elapsed(header: &str, name: &str) {
+    let args_end = header
+        .rfind(')')
+        .unwrap_or_else(|| panic!("no closing paren in the {name} header {header:?}"));
+    let elapsed = &header[args_end + 1..];
+    let digits = elapsed.trim_end_matches("ms").trim_end_matches('s');
+    assert!(
+        !digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && (elapsed.ends_with('s')),
+        "the {name} header should read name(args) elapsed status, got {header:?} \
+         (after the args: {elapsed:?})"
+    );
+}
+
+/// Same shape as `SLEEP_TOOL`, but it writes an error and exits non-zero
+/// once it has marked its start.
+const FAIL_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Fail on purpose.\n\
+    # @option --marker! Path prefix for the start file.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   local marker\n\
+    \x20   marker=\"$(jq -r '.marker' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   : > \"${marker}-started\"\n\
+    \x20   echo \"boom-error-q8x\" >&2\n\
+    \x20   exit 1\n\
+    }\n";
+
+// ---------------------------------------------------------------------
+// A finished tool row is one folded line, `name(args)  elapsed  ok`, with
+// the tool's output out of sight. Ctrl+Up focuses it, Enter opens it
+// (output visible), Enter folds it again, Esc drops the focus so a bare
+// Enter opens nothing, and with a draft typed Enter submits the draft
+// even while a row is focused.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_finished_tool_row_is_one_folded_line_that_opens_on_enter_when_focused() {
+    let dir = fresh_config_dir("tool-focus");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_sleep".to_string(),
+            arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+        },
+        Reply::Text("fixture done tail-m4e".to_string()),
+        Reply::Text("after focus reply-n2p".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"call the sleep tool\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-started"),
+        "the tool's start marker",
+    );
+    fs::write(dir.join("tool-release"), b"").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "fixture done tail-m4e",
+        0,
+        "the reply after the tool",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    let folded = repaint(&mut pty);
+    let header = between(&folded, "fixture_sleep(", "ok")
+        .unwrap_or_else(|| panic!("no `fixture_sleep(...) ... ok` header on screen:\n{folded}"));
+    assert_header_is_name_args_elapsed(header, "fixture_sleep");
+    let output = squeezed("fixture slept p3t");
+    assert!(
+        !folded.contains(&output),
+        "the folded tool row still shows the tool's output:\n{folded}"
+    );
+
+    // Focus the row and open it.
+    pty.read_for(HOTKEY_GAP);
+    pty.send(CTRL_UP).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let opened = repaint(&mut pty);
+    assert!(
+        opened.contains(&output),
+        "Enter on the focused tool row did not open it (no tool output on screen):\n{opened}"
+    );
+    assert!(
+        opened.contains("fixture_sleep("),
+        "the opened row lost its header:\n{opened}"
+    );
+
+    // Enter again folds it.
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let refolded = repaint(&mut pty);
+    assert!(
+        !refolded.contains(&output),
+        "a second Enter did not fold the opened row:\n{refolded}"
+    );
+
+    // Esc drops the focus: a bare Enter now opens nothing.
+    pty.send(ESC).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let unfocused = repaint(&mut pty);
+    assert!(
+        !unfocused.contains(&output),
+        "Enter after Esc still toggled the row, so Esc did not clear the focus:\n{unfocused}"
+    );
+    assert!(
+        !unfocused.contains("fakellm:noreplyscripted"),
+        "a bare Enter on the empty composer submitted a turn:\n{unfocused}"
+    );
+
+    // A focused row plus a draft: Enter submits the draft.
+    pty.send(CTRL_UP).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b"draft wins k7q\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "after focus reply-n2p",
+        before,
+        "the reply to the draft sent over a focused row",
+    );
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains(">draftwinsk7q"),
+        "the draft did not become a user cell:\n{frame}"
+    );
+    assert!(
+        !frame.contains(&output),
+        "Enter with a draft toggled the focused row instead of only submitting:\n{frame}"
+    );
+    assert_eq!(fake.served(), 3, "{frame}");
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// A tool that exits non-zero folds to `name(args)  elapsed  failed`; the
+// error text is not in that header but is there once the row is opened.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_failed_tool_row_says_failed_and_keeps_the_error_for_the_opened_row() {
+    let dir = fresh_config_dir("tool-failed");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_fail".to_string(),
+            arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+        },
+        Reply::Text("after failure reply-f3w".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_fail.sh", FAIL_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"call the failing tool\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "after failure reply-f3w",
+        0,
+        "the reply after the failed tool",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    let folded = repaint(&mut pty);
+    let header = between(&folded, "fixture_fail(", "failed")
+        .unwrap_or_else(|| panic!("no `fixture_fail(...) ... failed` header on screen:\n{folded}"));
+    assert!(
+        !header.contains("boom"),
+        "the folded header carries the error text:\n{folded}"
+    );
+    assert_header_is_name_args_elapsed(header, "fixture_fail");
+    let errors_folded = folded.matches("boom-error-q8x").count();
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(CTRL_UP).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let opened = repaint(&mut pty);
+    assert!(
+        opened.matches("boom-error-q8x").count() > errors_folded,
+        "the opened failed row does not show the tool's error (folded: {errors_folded}):\n{opened}"
+    );
+
+    pty.send(ESC).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// With the view scrolled up during a turn, the cells that land (the
+// tool's end, the reply) do not drag the view down: the follow chip
+// counts them as new, and End brings them into view and clears the chip.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn cells_landing_while_scrolled_up_count_on_the_follow_chip_until_end() {
+    let dir = fresh_config_dir("new-chip");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let mut replies: Vec<Reply> = (1..=5)
+        .map(|n| Reply::Text(format!("fillerreply{n:02}")))
+        .collect();
+    replies.push(Reply::ToolCall {
+        name: "fixture_sleep".to_string(),
+        arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+    });
+    replies.push(Reply::Text("late reply tail-v6c".to_string()));
+    let fake = FakeLlm::start(replies);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.resize(14, 100).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    for n in 1..=5 {
+        let before = pty.raw().len();
+        pty.send(format!("fillerline{n:02}\r").as_bytes()).unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            &format!("fillerreply{n:02}"),
+            before,
+            "a filler reply",
+        );
+        pty.read_for(Duration::from_millis(300));
+    }
+
+    pty.send(b"call the sleep tool\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-started"),
+        "the tool's start marker",
+    );
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(PAGE_UP).unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "End = follow",
+        before,
+        "the follow chip after scrolling up mid-turn",
+    );
+
+    fs::write(dir.join("tool-release"), b"").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let late = squeezed("late reply tail-v6c");
+    let scrolled = loop {
+        pty.read_for(Duration::from_millis(300));
+        let frame = repaint(&mut pty);
+        if frame.contains("new") {
+            break frame;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the follow chip never counted the cells that landed while scrolled up:\n{frame}"
+        );
+    };
+    assert!(
+        scrolled.contains("End=follow"),
+        "the view stopped following the scroll position when new cells landed:\n{scrolled}"
+    );
+    assert!(
+        !scrolled.contains(&late),
+        "the reply pulled the scrolled view down to the bottom:\n{scrolled}"
+    );
+
+    pty.send(END).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains(&late),
+        "End did not bring the late reply into view:\n{frame}"
+    );
+    assert!(
+        !frame.contains("End=follow"),
+        "End did not clear the follow chip:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// todo__* calls take no transcript row of their own; what they set shows
+// up in the Todo panel (F2).
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn todo_calls_take_no_transcript_row_and_fill_the_todo_panel() {
+    let dir = fresh_config_dir("todo-hidden");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "todo__init".to_string(),
+            arguments: "{\"goal\": \"walk the dog w7k\"}".to_string(),
+        },
+        Reply::ToolCall {
+            name: "todo__add".to_string(),
+            arguments: "{\"task\": \"feed the cat z3r\"}".to_string(),
+        },
+        Reply::Text("todo noted r4d".to_string()),
+    ]);
+    write_fake_llm_config_with(&dir, &fake, "auto_continue: true\nmax_auto_continues: 0\n");
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"plan the chores\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "todo noted r4d",
+        0,
+        "the reply after the todo calls",
+    );
+    pty.read_for(Duration::from_millis(800));
+
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains("todo__init") && !frame.contains("todo__add"),
+        "a todo call took a transcript row:\n{frame}"
+    );
+    assert!(
+        !frame.contains("feedthecatz3r"),
+        "the todo item is on screen before the panel is opened:\n{frame}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(F2).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let panel = repaint(&mut pty);
+    assert!(
+        panel.contains("Todo"),
+        "F2 did not open the Todo panel:\n{panel}"
+    );
+    assert!(
+        panel.contains("feedthecatz3r"),
+        "the Todo panel does not list the item the todo__add call set:\n{panel}"
+    );
+
+    pty.send(F2).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit(pty);
+}
+
 // ---------------------------------------------------------------------
 // With the reasoning delta held open on the wire, the "Thinking for Ns"
 // status row is on screen well before the hold limit, and it is gone
@@ -660,7 +1062,9 @@ fn follow_chip_appears_on_scroll_up_and_clears_on_end() {
 // =====================================================================
 
 /// A tool that marks its start at `<marker>-started`, then waits (at most
-/// eight seconds) for `<marker>-release` to appear before finishing.
+/// eight seconds) for `<marker>-release` to appear before finishing. Its
+/// result goes to `LLM_OUTPUT` (a file the runner reads back for the
+/// model); the progress line on stderr is what the transcript can show.
 const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Wait until released.\n\
@@ -676,6 +1080,7 @@ const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20       [ -e \"${marker}-release\" ] && break\n\
     \x20       sleep 0.05\n\
     \x20   done\n\
+    \x20   echo \"fixture slept p3t\" >&2\n\
     \x20   echo \"fixture slept p3t\" >> \"$LLM_OUTPUT\"\n\
     }\n";
 
