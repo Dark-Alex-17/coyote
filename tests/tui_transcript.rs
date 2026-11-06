@@ -237,7 +237,7 @@ fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str)
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "{what}: {marker:?} never appeared on screen:\n{text}"
+            "{what}: {marker:?} never appeared on screen; searched since offset {from}:\n{since}\nlast read:\n{text}"
         );
     }
 }
@@ -801,10 +801,10 @@ fn undo_with_nothing_to_undo_leaves_the_ui_alive() {
 // widgets are drawn again and the draft typed along the way is
 // submitted whole.
 //
-// Known and out of this task's scope: after a shrink the composer's own
-// viewport (ratatui-textarea) may stay scrolled right, so the draft can
-// look blank until it is edited or sent; the draft itself is intact,
-// which is what the submitted user cell asserts.
+// After a shrink the composer's own viewport (ratatui-textarea) may stay
+// scrolled right, so the draft can look blank until it is edited or
+// sent; the draft itself is intact, which is what the submitted user
+// cell asserts.
 // ---------------------------------------------------------------------
 
 #[test]

@@ -463,25 +463,27 @@ fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
     command_word(line, prefix).as_deref() == Some(".undo")
 }
 
-/// Commands whose turn records a new exchange in the session the way a
-/// prompt does, so `.undo` takes it back: the REPL's `.file`, `.recover`
-/// and `.run` arms each hand `ask` a fresh `Input`. `.continue` and
-/// `.regenerate` are not here: their reply extends or replaces the last
-/// assistant message, so the exchange `.undo` removes is the one they
-/// followed.
-const EXCHANGE_OPENING_COMMANDS: [&str; 3] = [".file", ".recover", ".run"];
+/// Commands whose reply rewrites the exchange they follow instead of
+/// opening one: `Session::add_message` appends to the last assistant
+/// message for `.continue` and replaces it for `.regenerate`, so the
+/// exchange `.undo` removes after either is the one before the command.
+/// Every other command that got a reply (`.file`, `.run`, `.starter`,
+/// `.prompt`, a macro, ...) recorded a fresh exchange the way a prompt
+/// does.
+const EXCHANGE_MODIFYING_COMMANDS: [&str; 2] = [".continue", ".regenerate"];
 
 /// Whether the cell opened an exchange `.undo` would take back: a user
-/// line, or a command turn from `EXCHANGE_OPENING_COMMANDS` that got as
-/// far as a reply. One that bailed on usage (bare `.file`, nothing to
-/// `.continue`) recorded nothing, so it is looked past.
+/// line, or a command turn that got as far as a reply and is not in
+/// `EXCHANGE_MODIFYING_COMMANDS`. One that bailed on usage (bare `.file`,
+/// nothing to `.continue`) or never asks the model (`.info`) recorded
+/// nothing, so it is looked past.
 fn opens_exchange(cell: &Cell, answered: bool, prefix: crate::config::CommandPrefix) -> bool {
     match cell {
         Cell::User { .. } => true,
         Cell::Command { name, .. } => {
             answered
                 && command_word(name, prefix)
-                    .is_some_and(|word| EXCHANGE_OPENING_COMMANDS.contains(&word.as_str()))
+                    .is_some_and(|word| !EXCHANGE_MODIFYING_COMMANDS.contains(&word.as_str()))
         }
         _ => false,
     }
@@ -4226,6 +4228,38 @@ mod tests {
         assert!(frame.contains("println!(\"hi\");"));
     }
 
+    /// The start hook's compact JSON and the narration's text after the
+    /// name are the same arguments, so the header reads the same from
+    /// either.
+    #[test]
+    fn the_hooks_arguments_render_the_same_header_as_the_narration() {
+        let mut from_narration = Harness::standalone(80, 24);
+        running_fs_read(&mut from_narration);
+        let mut from_hook = Harness::standalone(80, 24);
+        from_hook.app.begin_turn("read it", false);
+        narrate(
+            &mut from_hook,
+            "call-1",
+            "Call fs_read {\"path\":\"src/main.rs\"}",
+        );
+        start_tool(
+            &mut from_hook,
+            "call-1",
+            "fs_read",
+            Some(serde_json::json!({"path": "src/main.rs"})),
+        );
+        tool_output(&mut from_hook, "call-1", "fn main() {\n");
+        tool_output(&mut from_hook, "call-1", "    println!(\"hi\");\n}\n");
+        let header = |harness: &mut Harness| {
+            let frame = harness.draw();
+            let row = screen_row(harness, "fs_read(");
+            frame.lines().nth(usize::from(row)).unwrap().to_string()
+        };
+        let expected = header(&mut from_narration);
+        assert!(expected.contains("fs_read({\"path\":\"src/main.rs\"})  running"));
+        assert_eq!(header(&mut from_hook), expected);
+    }
+
     #[test]
     fn a_finished_tool_row_collapses_and_opens_from_the_keyboard() {
         let mut harness = Harness::standalone(80, 24);
@@ -4762,6 +4796,28 @@ mod tests {
         assert!(matches!(&cells[2], Cell::Assistant { .. }));
     }
 
+    /// Any answered command outside the modifying pair opened an
+    /// exchange, whichever REPL arm handled it.
+    #[test]
+    fn an_undo_after_an_answered_starter_or_prompt_command_stops_at_that_command_cell() {
+        for command in [".starter 1", ".prompt x y"] {
+            let mut harness = Harness::standalone(80, 24);
+            exchange(&mut harness);
+            harness.app.begin_turn(command, true);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("a reply".to_string()));
+            harness.app.end_turn(true, &TurnOutcome::default());
+            assert_eq!(harness.app.transcript.len(), 5);
+            harness.app.begin_turn(".undo", true);
+            harness.app.end_turn(true, &TurnOutcome::default());
+            let cells = harness.app.transcript.cells();
+            assert_eq!(cells.len(), 3, "{command}: the command's exchange is gone");
+            assert!(matches!(&cells[0], Cell::User { text, .. } if text == "first question"));
+            assert!(matches!(&cells[2], Cell::Assistant { .. }));
+        }
+    }
+
     #[test]
     fn an_undo_looks_past_a_command_that_opened_no_exchange() {
         let mut harness = Harness::standalone(80, 24);
@@ -4865,7 +4921,23 @@ mod tests {
         }
         let frame = harness.draw();
         insta::assert_snapshot!("follow_chip_80x24", &frame);
-        assert!(frame.contains("3 new below  End = follow"), "{frame}");
+        let chip = "3 new below  End = follow";
+        let buffer = harness.terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let row = (0..buffer.area.height)
+            .find(|y| row_text(*y).ends_with(chip))
+            .unwrap_or_else(|| panic!("no right-aligned chip:\n{frame}"));
+        let column = buffer.area.width - u16::try_from(chip.len()).unwrap();
+        let modifier = |x: u16| buffer[(x, row)].modifier;
+        assert!(modifier(column).contains(Modifier::REVERSED), "{frame}");
+        assert!(
+            !modifier(column - 1).contains(Modifier::REVERSED),
+            "{frame}"
+        );
         assert!(!frame.contains("late line 2"), "the view moved:\n{frame}");
         assert_eq!(
             frame.lines().take(18).collect::<Vec<_>>(),
@@ -4894,6 +4966,105 @@ mod tests {
         assert!(!frame.contains("new below"), "{frame}");
         harness.press(KeyCode::End);
         assert!(!harness.draw().contains("End = follow"));
+    }
+
+    /// Every custom widget draws only inside the buffer it is given, so
+    /// a layout handing one an area the frame does not cover (a resize
+    /// mid-draw, a zero-height pane) cannot panic or write out of range.
+    #[test]
+    fn every_custom_widget_clamps_its_area_to_the_buffer() {
+        type Draw<'a> = Box<dyn FnMut(Rect, &mut Buffer) + 'a>;
+        let mut welcome = Harness::standalone(80, 24);
+        let mut plain = Harness::standalone(80, 24);
+        exchange(&mut plain);
+        let mut chip = Harness::standalone(80, 24);
+        fill_the_view(&mut chip);
+        chip.app.transcript.scroll_lines(-5);
+        let mut todo = TodoPanel::default();
+        todo.set("ship it".to_string(), todo_items());
+        let (reply, _answers) = mpsc::channel();
+        let confirm = PendingPrompt {
+            req: confirm_request(Some("fs_write")),
+            reply: reply.clone(),
+            field: None,
+        };
+        let input = PendingPrompt {
+            req: PromptRequest::new(PromptAction::Input, "Name?", Origin::detached()),
+            reply,
+            field: Some(new_textarea()),
+        };
+        let mut widgets: Vec<(&str, Draw<'_>)> = vec![
+            (
+                "transcript (welcome)",
+                Box::new(|area, buf| {
+                    welcome
+                        .app
+                        .transcript
+                        .view(area, &mut welcome.app.renderer)
+                        .render(area, buf);
+                }),
+            ),
+            (
+                "transcript",
+                Box::new(|area, buf| {
+                    plain
+                        .app
+                        .transcript
+                        .view(area, &mut plain.app.renderer)
+                        .render(area, buf);
+                }),
+            ),
+            (
+                "transcript (follow chip)",
+                Box::new(|area, buf| {
+                    let view = chip.app.transcript.view(area, &mut chip.app.renderer);
+                    assert!(chip.app.transcript.scrolled());
+                    view.render(area, buf);
+                }),
+            ),
+            (
+                "status strip",
+                Box::new(|area, buf| {
+                    StatusStrip(Some("thinking for 3s".to_string())).render(area, buf);
+                }),
+            ),
+            (
+                "footer bar",
+                Box::new(|area, buf| {
+                    FooterBar {
+                        left: "openai:test-model . no session".to_string(),
+                        right: Line::from("in 10 out 20"),
+                    }
+                    .render(area, buf);
+                }),
+            ),
+            (
+                "confirm modal",
+                Box::new(|area, buf| PromptModal(&confirm).render(area, buf)),
+            ),
+            (
+                "input modal",
+                Box::new(|area, buf| PromptModal(&input).render(area, buf)),
+            ),
+            (
+                "todo panel",
+                Box::new(|area, buf| (&todo).render(area, buf)),
+            ),
+        ];
+        let screen = Rect::new(0, 0, 10, 3);
+        for (name, render) in &mut widgets {
+            let mut buf = Buffer::empty(screen);
+            render(Rect::new(0, 0, 40, 10), &mut buf);
+            assert_ne!(buf, Buffer::empty(screen), "{name}: nothing drawn");
+
+            let mut buf = Buffer::empty(screen);
+            render(Rect::new(20, 20, 5, 5), &mut buf);
+            assert_eq!(
+                buf,
+                Buffer::empty(screen),
+                "{name}: drew outside the buffer"
+            );
+        }
     }
 
     /// A line sent while scrolled up would otherwise land out of sight.

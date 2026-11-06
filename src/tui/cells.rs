@@ -270,7 +270,11 @@ impl Cell {
 
     pub(super) fn toggle(&mut self) {
         match self {
-            Cell::Tool { expanded, .. }
+            Cell::Tool {
+                expanded,
+                bookkeeping: false,
+                ..
+            }
             | Cell::Job { expanded, .. }
             | Cell::Agent { expanded, .. } => {
                 *expanded = !*expanded;
@@ -357,8 +361,9 @@ impl Cell {
                 };
                 // The header is one row; the view clips what does not
                 // fit. The narration below it is what the user approves,
-                // so that wraps and is shown whole.
-                let header = format!("{name}({args})  {state}");
+                // so that wraps and is shown whole. The error in the
+                // header is the tool's own text, so it is scrubbed.
+                let header = render::plain_text(&format!("{name}({args})  {state}"));
                 let mut lines = vec![Line::from(Span::styled(header, DIM))];
                 let open = matches!(status, ToolStatus::Running { .. }) || *expanded;
                 if open && !*bookkeeping {
@@ -384,8 +389,12 @@ impl Cell {
                     JobStatus::Failed(error) => format!("failed: {}", first_line(error)),
                     JobStatus::Cancelled => "cancelled".to_string(),
                 };
+                let error = match status {
+                    JobStatus::Failed(error) => Some(error.as_str()),
+                    _ => None,
+                };
                 let header = format!("job {tool} {job_id}  {state}");
-                dim_wrapped(row_lines(header, calls, *expanded), width)
+                row_lines(header, error, calls, *expanded, width)
             }
             Cell::Agent {
                 agent_id,
@@ -400,8 +409,12 @@ impl Cell {
                     AgentStatus::Failed(error) => format!("failed: {}", first_line(error)),
                     AgentStatus::Interrupted => "interrupted".to_string(),
                 };
+                let error = match status {
+                    AgentStatus::Failed(error) => Some(error.as_str()),
+                    _ => None,
+                };
                 let header = format!("agent {name} {agent_id}  {state}");
-                dim_wrapped(row_lines(header, calls, *expanded), width)
+                row_lines(header, error, calls, *expanded, width)
             }
             Cell::Welcome {
                 model,
@@ -434,21 +447,33 @@ fn dim_wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A job's or agent's row: the header with its folded calls summarised,
-/// then each folded call's output when open. The header is the row's
-/// own text, so it is scrubbed rather than parsed for colour.
-fn row_lines(header: String, calls: &[FoldedCall], expanded: bool) -> Vec<Line<'static>> {
+/// A job's or agent's row: one header line with its folded calls
+/// summarised, clipped by the view rather than wrapped; when open, the
+/// whole error and then each folded call's output. The header is the
+/// row's own text, so it is scrubbed rather than parsed for colour.
+fn row_lines(
+    header: String,
+    error: Option<&str>,
+    calls: &[FoldedCall],
+    expanded: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
     let summary = folded_summary(calls);
     let header = if summary.is_empty() {
         header
     } else {
         format!("{header}  {summary}")
     };
-    let mut lines = vec![Line::from(render::plain_text(&header))];
+    let mut lines = vec![Line::from(Span::styled(render::plain_text(&header), DIM))];
     if expanded {
-        for call in calls {
-            lines.extend(output_lines(&call.output));
+        let mut body = Vec::new();
+        if let Some(error) = error {
+            body.extend(render::preformatted_lines(&format!("error: {error}")));
         }
+        for call in calls {
+            body.extend(output_lines(&call.output));
+        }
+        lines.extend(dim_wrapped(body, width));
     }
     lines
 }
@@ -794,6 +819,98 @@ mod tests {
         for line in &lines[1..] {
             assert!(line.width() <= 80, "{line:?} is wider than the view");
         }
+    }
+
+    /// The error a tool reports is its own text; a bidi override or an
+    /// escape sequence in it reaches neither the header nor the body.
+    #[test]
+    fn a_failed_tool_header_drops_format_characters_and_escapes_from_the_error() {
+        let mut renderer = renderer();
+        let mut cell = Cell::tool(
+            "c1".to_string(),
+            "Call fs_read {\"path\":\"x\"}".to_string(),
+            Instant::now(),
+        );
+        let Cell::Tool { status, .. } = &mut cell else {
+            unreachable!();
+        };
+        *status = ToolStatus::Failed {
+            elapsed: Duration::from_millis(100),
+            error: "no such \u{202E}elif\x1b[31m red\x1b[0m".to_string(),
+        };
+        let lines = cell.lines(80, &mut renderer);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].to_string(),
+            "fs_read({\"path\":\"x\"})  0.1s  failed: no such elif red"
+        );
+        cell.toggle();
+        let text: Vec<String> = cell
+            .lines(80, &mut renderer)
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        let text = text.join("\n");
+        assert!(!text.contains('\u{202E}'), "{text:?}");
+        assert!(!text.contains('\x1b'), "{text:?}");
+    }
+
+    /// A job's or agent's failure keeps the collapsed row to one line
+    /// however long the message; opening the row shows it whole.
+    #[test]
+    fn a_long_failure_stays_on_one_collapsed_line_and_opens_whole() {
+        let mut renderer = renderer();
+        let error = "e".repeat(300);
+        let mut rows = [
+            Cell::Job {
+                job_id: "job-1".to_string(),
+                tool: "execute_command".to_string(),
+                status: JobStatus::Failed(error.clone()),
+                calls: vec![FoldedCall::new("c1".to_string(), "job__check".to_string())],
+                expanded: false,
+            },
+            Cell::Agent {
+                agent_id: "agent-1".to_string(),
+                name: "reviewer".to_string(),
+                status: AgentStatus::Failed(error.clone()),
+                calls: Vec::new(),
+                expanded: false,
+            },
+        ];
+        for cell in &mut rows {
+            let lines = cell.lines(40, &mut renderer);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].to_string().contains("failed: eee"));
+            cell.toggle();
+            let lines = cell.lines(40, &mut renderer);
+            let body: String = lines[1..].iter().map(Line::to_string).collect();
+            assert_eq!(body, format!("error: {error}"));
+            for line in &lines[1..] {
+                assert!(line.width() <= 40, "{line:?} is wider than the view");
+            }
+        }
+    }
+
+    /// A bookkeeping row has no body, so toggling it leaves it closed
+    /// and one line tall.
+    #[test]
+    fn toggling_a_bookkeeping_row_does_nothing() {
+        let mut renderer = renderer();
+        let mut cell = Cell::tool(
+            "c1".to_string(),
+            "Call memory__search {\"query\":\"x\"}".to_string(),
+            Instant::now(),
+        );
+        assert!(!cell.collapsible());
+        cell.toggle();
+        assert!(matches!(
+            cell,
+            Cell::Tool {
+                expanded: false,
+                ..
+            }
+        ));
+        assert_eq!(cell.lines(80, &mut renderer).len(), 1);
     }
 
     #[test]

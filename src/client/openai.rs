@@ -927,10 +927,10 @@ pub async fn openai_responses_streaming(
 
 fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Result<bool> {
     match data["type"].as_str() {
-        // A reasoning item is done before the message item that follows it
-        // is added, so the phase opened here is closed when the item is
-        // done; the text-delta stop only catches a reasoning item the
-        // server never finished.
+        // The phase opened here closes when the reasoning item is done,
+        // and again at the first text delta or finished function call,
+        // so a reasoning item the server never finished still closes
+        // before whatever follows it.
         Some("response.output_item.added") => {
             if data["item"]["type"].as_str() == Some("reasoning") {
                 handler.thinking_started();
@@ -946,6 +946,7 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
             let item = &data["item"];
             match item["type"].as_str() {
                 Some("function_call") => {
+                    handler.thinking_stopped();
                     if let (Some(name), Some(arguments_str), Some(call_id)) = (
                         item["name"].as_str(),
                         item["arguments"].as_str(),
@@ -2351,6 +2352,32 @@ mod tests {
                 }),
             ]);
             assert_eq!(events, detached_pair());
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_function_call_finishing_while_reasoning_is_open_closes_it_first() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "fs_read",
+                        "arguments": "{\"path\":\"x\"}"
+                    }
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (_, calls, _, _) = handler.take();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "fs_read");
         }
 
         #[test]

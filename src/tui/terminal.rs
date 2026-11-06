@@ -315,9 +315,11 @@ fn draw_and_repaint_uncertain<B: ratatui::backend::Backend>(
 
 /// Every cell, in x order, of each row whose symbols include an emoji
 /// presentation sequence (U+FE0F), a ZWJ sequence (U+200D), a symbol from
-/// the U+2600..=U+27BF blocks, or anything at U+1F000 and above. Cells
-/// hidden under a wide grapheme are left out the way ratatui's own diff
-/// leaves them out, so the repaint never splits a grapheme.
+/// the U+2600..=U+27BF blocks, one of the Emoji_Presentation characters
+/// scattered below them (watches, media controls, squares, stars), or
+/// anything at U+1F000 and above. Cells hidden under a wide grapheme are
+/// left out the way ratatui's own diff leaves them out, so the repaint
+/// never splits a grapheme.
 fn uncertain_rows(buffer: &Buffer) -> Vec<(u16, u16, Cell)> {
     let area = buffer.area;
     let mut cells = Vec::new();
@@ -346,7 +348,23 @@ fn uncertain_rows(buffer: &Buffer) -> Vec<(u16, u16, Cell)> {
 }
 
 fn is_width_uncertain(c: char) -> bool {
-    matches!(c, '\u{FE0F}' | '\u{200D}' | '\u{2600}'..='\u{27BF}') || c >= '\u{1F000}'
+    matches!(
+        c,
+        '\u{FE0F}'
+            | '\u{200D}'
+            | '\u{231A}'..='\u{231B}'
+            | '\u{23E9}'..='\u{23F3}'
+            | '\u{23F8}'..='\u{23FA}'
+            | '\u{25FD}'..='\u{25FE}'
+            | '\u{2600}'..='\u{27BF}'
+            | '\u{2B1B}'..='\u{2B1C}'
+            | '\u{2B50}'
+            | '\u{2B55}'
+            | '\u{3030}'
+            | '\u{303D}'
+            | '\u{3297}'
+            | '\u{3299}'
+    ) || c >= '\u{1F000}'
 }
 
 /// Clears the terminal and forgets both of ratatui's buffers so the next
@@ -770,10 +788,11 @@ mod tests {
 
     #[test]
     fn every_uncertain_row_is_marked() {
-        let buffer = Buffer::with_lines(["\u{1F600} hi", "plain", "\u{2705} ok"]);
+        let buffer = Buffer::with_lines(["\u{1F600} hi", "plain", "\u{2705} ok", "\u{2B50} star"]);
         let cells = uncertain_rows(&buffer);
         let mut expected = whole_row(&buffer, 0, 0);
         expected.extend(whole_row(&buffer, 2, 0));
+        expected.extend(whole_row(&buffer, 3, 0));
         assert_eq!(positions(&cells), expected);
     }
 
