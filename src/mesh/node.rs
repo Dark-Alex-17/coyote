@@ -2094,7 +2094,7 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 }
 
 /// Arms a session destination with the responder's caps on what it accepts and what it
-/// sends. With `MAX_REQUEST_PAYLOAD_BYTES`, coyote-rns-transport 0.18.0 refuses an oversize
+/// sends. With `MAX_REQUEST_PAYLOAD_BYTES`, coyote-rns-transport 0.18.1 refuses an oversize
 /// request at the advertisement, before it reaches a handler (a request that travels as a
 /// resource; a packet-form one over the cap is dropped). With `MAX_FETCH_RESPONSE_BYTES`,
 /// the widest bound any requester accepts, a reply no peer could take is refused before it
