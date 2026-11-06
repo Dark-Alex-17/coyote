@@ -1630,6 +1630,7 @@ impl Default for PeerSendOptions {
             request: RequestOptions {
                 request_timeout: PEER_REQUEST_TIMEOUT,
                 link_timeout: PEER_LINK_TIMEOUT,
+                path_requested: false,
             },
             propagation: PropagationOptions::default(),
         }
@@ -2088,10 +2089,11 @@ impl MeshRuntime {
     /// announce. It is answered at once when the transport already holds a description or
     /// a path for it; otherwise a single path request is sent and waited on for up to
     /// `PATH_REQUEST_TIMEOUT`. The kept description is returned whether or not a path
-    /// arrived: without one the direct attempt fails fast at the link, and `send` then
-    /// holds the message on a propagation node, which needs only the key. Without such a
-    /// key the transport's description is used: one it holds is answered at once with no
-    /// request, even when its path has expired, and one it does not hold is asked for once
+    /// arrived: an unanswered request is noted, so the request that follows fails at its
+    /// link without asking again, and `send` then holds the message on a propagation node,
+    /// which needs only the key. Without such a key the transport's description is used:
+    /// one it holds is answered at once with no request, even when its path has expired
+    /// (the link then asks for the path itself), and one it does not hold is asked for once
     /// over the network and waited for up to `PATH_REQUEST_TIMEOUT`. `None` otherwise.
     pub(crate) async fn resolve_destination(
         &self,
@@ -2113,8 +2115,9 @@ impl MeshRuntime {
                         .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
                         .await
                 {
+                    self.note_unanswered_path_request(&destination);
                     debug!(
-                        "Mesh found no path to {} within {} s; using its stored key, so a send can fall back to a propagation node",
+                        "Mesh found no path to {} within {} s; using its stored key, so a send can fall back to a propagation node without asking again",
                         short(&destination),
                         PATH_REQUEST_TIMEOUT.as_secs()
                     );
@@ -2768,6 +2771,7 @@ mod no_answer_tests {
             request: RequestOptions {
                 request_timeout: Duration::from_secs(2),
                 link_timeout: Duration::from_secs(2),
+                path_requested: false,
             },
             propagation: PropagationOptions::default(),
         }

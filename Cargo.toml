@@ -155,7 +155,10 @@ arc-swap = "1.9.2"
 # sent for a handler), `SingleInputDestination::set_max_request_size` and
 # `SingleInputDestination::set_max_response_size` (the responder's caps on what it accepts
 # and what it sends), and `SharedInstanceOptions::with_state_events` with
-# `SharedInstanceEvent` (the shared instance client's connection state).
+# `SharedInstanceEvent` (the shared instance client's connection state), and
+# `Transport::interface_connect_count` with its synchronous twin
+# `TcpRuntimeStatusHandle::connected_streams` (how many streams an interface's client
+# has established since it was spawned, every reconnect included).
 #
 # `lxmf-wire` still comes from upstream LXMF-rs, so its version no longer matches the
 # fork's. What ties the two is `reticulum-rs-core`: the fork depends on
@@ -182,7 +185,7 @@ arc-swap = "1.9.2"
 # re-exports surface this crate does not use, and it covers only the `rns-*` crates and
 # not `lxmf-wire`, so it cannot replace both entries anyway. Depending on the two
 # directly keeps one mechanism instead of two.
-coyote-rns-transport = "0.18.0"
+coyote-rns-transport = "0.18.1"
 lxmf-wire = "0.14.0"
 # Its `Value` appears in `rns_transport`'s `Link::request_payload` and
 # `unpack_response_envelope` signatures, so it must stay semver-unified with the

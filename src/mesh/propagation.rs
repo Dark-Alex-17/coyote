@@ -311,11 +311,14 @@ pub(crate) struct MinedStamp {
     pub value: u32,
 }
 
+/// `path_requested` says the caller already sent a path request for the node during this
+/// post, so a link that finds no path fails without asking again.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PropagationOptions {
     pub link_timeout: Duration,
     pub transfer_timeout: Duration,
     pub reject_window: Duration,
+    pub path_requested: bool,
 }
 
 impl Default for PropagationOptions {
@@ -324,6 +327,7 @@ impl Default for PropagationOptions {
             link_timeout: DEFAULT_LINK_TIMEOUT,
             transfer_timeout: PROPAGATION_TRANSFER_TIMEOUT,
             reject_window: PROPAGATION_REJECT_WINDOW,
+            path_requested: false,
         }
     }
 }
@@ -550,7 +554,7 @@ pub(crate) async fn send_envelope(
         transport,
         &node.destination,
         PROPAGATION_PATH_LABEL,
-        Deadline::after(options.link_timeout),
+        Deadline::after(options.link_timeout).with_path_requested(options.path_requested),
     )
     .await?;
     send_on_link(transport, node, &link, prepared, cancel, options).await

@@ -134,10 +134,13 @@ pub(crate) const REQUIRED_DELIVERY_STAMP_COST: u32 = 0;
 
 type TransientId = [u8; 32];
 
+/// `path_requested` says the caller already sent a path request for the node during this
+/// fetch, so a link that finds no path fails without asking again.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchOptions {
     pub link_timeout: Duration,
     pub request_timeout: Duration,
+    pub path_requested: bool,
 }
 
 impl Default for FetchOptions {
@@ -145,6 +148,7 @@ impl Default for FetchOptions {
         Self {
             link_timeout: DEFAULT_LINK_TIMEOUT,
             request_timeout: FETCH_REQUEST_TIMEOUT,
+            path_requested: false,
         }
     }
 }
@@ -1559,7 +1563,7 @@ pub(crate) async fn fetch(
             identity,
             &node.destination,
             GET_PATH,
-            options.link_timeout,
+            Deadline::after(options.link_timeout).with_path_requested(options.path_requested),
         ),
         failed,
     )
@@ -3878,6 +3882,7 @@ mod tests {
                 let options = FetchOptions {
                     link_timeout: DEFAULT_LINK_TIMEOUT,
                     request_timeout,
+                    path_requested: false,
                 };
                 timeout(
                     FETCH_DEADLINE,

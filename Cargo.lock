@@ -1834,9 +1834,9 @@ dependencies = [
 
 [[package]]
 name = "coyote-rns-transport"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0861b3ffb915a11119f9074cba287dc37a8873c8a9435835da493e2ee9f5cfaa"
+checksum = "72b745eb5da122513d702bbba69490bc35dfeab32f4a4afe00aaebac10dfeb22"
 dependencies = [
  "aes",
  "base64 0.22.1",

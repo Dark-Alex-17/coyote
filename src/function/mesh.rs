@@ -962,6 +962,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         let options = RequestOptions {
             request_timeout: STATUS_REQUEST_TIMEOUT,
             link_timeout: STATUS_REQUEST_TIMEOUT,
+            path_requested: false,
         };
         let cards: Vec<_> = stream::iter(status_lookups)
             .map(|(index, desc)| async move {
@@ -6477,6 +6478,7 @@ mod tests {
             let sweep = RequestOptions {
                 request_timeout: Duration::from_secs(5),
                 link_timeout: Duration::from_secs(5),
+                path_requested: false,
             };
             assert_eq!(
                 runtime.requests_made(),

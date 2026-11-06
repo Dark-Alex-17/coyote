@@ -424,6 +424,7 @@ pub(crate) mod network {
         ValidAccess, decode_access_message, validate_access,
     };
     use crate::mesh::announce::AnnounceAppData;
+    use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
     use crate::mesh::brief::Digest;
     use crate::mesh::card::{
         BRANCH_MAX_CHARS, CardSource, DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS,
@@ -1584,6 +1585,17 @@ pub(crate) mod network {
             let stopped_in = stopping.elapsed();
             self.responder.stop().await;
             stopped_in
+        }
+
+        /// Takes node B off the network while node A, and anything else A joined, stays
+        /// up: B's listener stops, so nothing answers for B any more.
+        pub(crate) async fn stop_b(&self) {
+            self.responder
+                .transport
+                .iface_manager()
+                .lock()
+                .await
+                .stop_interface(self.responder.iface);
         }
 
         /// Node A's config dir, where its global share list lives.
@@ -10393,6 +10405,7 @@ pub(crate) mod network {
         let year = RequestOptions {
             request_timeout: Duration::from_secs(MAX_TIMEOUT_SECS),
             link_timeout: Duration::from_secs(MAX_TIMEOUT_SECS),
+            path_requested: false,
         };
         assert_eq!(
             pair.node_a.requests_made(),
@@ -10510,6 +10523,90 @@ pub(crate) mod network {
             }))
         );
         node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// Node A holds node B's description but its path to B has expired. B is still up,
+    /// so the send's link asks the network once, B answers, and the message goes over the
+    /// link: delivered directly, with nothing stored on the propagation node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_path_expired_is_asked_for_and_the_message_goes_direct() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-expired-direct", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_hash = pair.responder.desc.address_hash;
+        let b_instance = b_hash.to_hex_string();
+        let transport = pair.node_a.transport_handle().await.unwrap();
+        assert!(transport.expire_path(&b_hash).await, "A held a path to B");
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&message.id))));
+
+        let asked = Instant::now();
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap();
+        let waited = asked.elapsed();
+
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: message.id.clone(),
+                via: PeerVia::Direct,
+            }
+        );
+        assert!(
+            waited < PATH_REQUEST_TIMEOUT,
+            "B answered the path request: {waited:?}"
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 1);
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// The same expired path with node B gone while node A and the propagation node stay
+    /// up: the send's one path request goes unanswered, so the message is stored with the
+    /// propagation node after one `PATH_REQUEST_TIMEOUT`, not at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_path_expired_and_who_is_gone_is_stored_after_one_path_request() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-expired-stored", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_hash = pair.responder.desc.address_hash;
+        let b_instance = b_hash.to_hex_string();
+        pair.stop_b().await;
+        let transport = pair.node_a.transport_handle().await.unwrap();
+        assert!(transport.expire_path(&b_hash).await, "A held a path to B");
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+
+        let asked = Instant::now();
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap();
+        let waited = asked.elapsed();
+
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: message.id.clone(),
+                via: PeerVia::StoreAndForward,
+            }
+        );
+        assert!(
+            waited >= PATH_REQUEST_TIMEOUT
+                && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "the send waited {waited:?} before storing the message"
+        );
+        node.next_received().await;
+        assert_eq!(pair.recorder_b.seen_count(), 0, "nothing reached node B");
         pair.stop_node_a().await;
         node.stop().await;
     }
@@ -11892,6 +11989,7 @@ pub(crate) mod network {
             RequestOptions {
                 request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
                 link_timeout: PEER_LINK_TIMEOUT,
+                path_requested: false,
             },
         )
         .await
@@ -11937,6 +12035,7 @@ pub(crate) mod network {
                 RequestOptions {
                     request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
                     link_timeout: PEER_LINK_TIMEOUT,
+                    path_requested: false,
                 },
             )
         };

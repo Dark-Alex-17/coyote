@@ -261,7 +261,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        name: "destination-without-a-known-path-fails-the-link-at-once",
+        name: "destination-without-a-known-path-fails-the-link-after-one-path-request",
         kind: Kind::Invalid,
         case: Case::NoKnownPath,
         known_divergence: None,
@@ -1095,6 +1095,7 @@ mod loopback {
             RequestOptions {
                 link_timeout: SHORT_LINK_TIMEOUT,
                 request_timeout: SHORT_REQUEST_TIMEOUT,
+                path_requested: false,
             },
         )
         .await
@@ -1109,7 +1110,9 @@ mod loopback {
     }
 
     /// A destination nobody serves and the requester has never heard announced, so the
-    /// transport holds no path to it and the request fails before a link is attempted.
+    /// transport holds no path to it: the link asks the network once, for what is left of
+    /// the link deadline since that is shorter than `PATH_REQUEST_TIMEOUT`, hears nothing,
+    /// and the request fails as a link with no known path at about the link deadline.
     async fn no_known_path() {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, _desc) = pair(recorder.clone()).await;
@@ -1120,6 +1123,7 @@ mod loopback {
         .desc;
         let ghost_hex = ghost.address_hash.to_hex_string();
 
+        let asked = std::time::Instant::now();
         let err = request(
             &requester.transport,
             &requester.identity,
@@ -1129,14 +1133,22 @@ mod loopback {
             RequestOptions {
                 link_timeout: SHORT_LINK_TIMEOUT,
                 request_timeout: SHORT_REQUEST_TIMEOUT,
+                path_requested: false,
             },
         )
         .await
         .unwrap_err();
+        let waited = asked.elapsed();
 
         let RequestError::LinkFailed(reason) = err else {
             panic!("expected LinkFailed for a destination without a path, got {err:?}");
         };
+        assert!(reason.contains("no known path"), "{reason}");
+        assert!(
+            waited >= SHORT_LINK_TIMEOUT - Duration::from_millis(100)
+                && waited < SHORT_LINK_TIMEOUT + Duration::from_secs(2),
+            "the path request is bounded by the {SHORT_LINK_TIMEOUT:?} link deadline: waited {waited:?}"
+        );
         assert!(
             reason.contains(&ghost_hex),
             "the error value keeps the full destination for the human; redaction belongs to the log sinks: {reason}"

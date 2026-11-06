@@ -1971,13 +1971,19 @@ enum Unrouted {
 
 /// The route the verb's request links over. A route the transport already holds is
 /// taken at once; otherwise the user is told the network is being asked, since the wait
-/// runs up to `PATH_REQUEST_TIMEOUT` and Ctrl-C ends it like the request that follows.
+/// runs up to `PATH_REQUEST_TIMEOUT` and Ctrl-C ends it like the request that follows. A
+/// held description whose path expired is returned at once too, but the request's link
+/// asks for the path, so the same line is printed before that wait.
 async fn route_to(
     runtime: &MeshRuntime,
     destination: &str,
     abort_signal: &AbortSignal,
 ) -> Result<DestinationDesc, Unrouted> {
     if let Some(desc) = runtime.resolve_destination_cached(destination).await {
+        if !runtime.path_known(destination).await {
+            out_text(&route_request_line(destination));
+            result_follows();
+        }
         return Ok(desc);
     }
     out_text(&route_request_line(destination));
@@ -30574,6 +30580,59 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(notice < knocking && knocking < landed, "{out:?}");
                     assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+
+            /// A held peer whose route expired resolves at once, but the knock's link has
+            /// to ask the network for the path, so the user is told before that wait; the
+            /// stub answers and the knock still lands directly.
+            #[test]
+            #[serial]
+            fn knock_to_a_held_peer_whose_route_expired_announces_the_path_request() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-expired-route");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-knock-expired-route-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started =
+                        started_runtime_on("repl-mesh-knock-expired-route", stub.port()).await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    stub.know_identity(started.runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    let peers = started.runtime.peers();
+                    stub.wait_to_be_filed(&peers, &peer).await;
+                    assert!(crate::mesh::test_support::expire_path(&started.runtime, &peer).await);
+                    assert!(!started.runtime.path_known(&peer).await);
+
+                    run(
+                        &mut ctx,
+                        &format!(".mesh knock {peer} --yes --intro \"hi\""),
+                    )
+                    .await
+                    .unwrap();
+
+                    let out = stdout_lines();
+                    let asked = index_of(&out, &route_request_line(&peer));
+                    let knocking = index_of(&out, &format!("Knocking on {}", short(&peer)));
+                    let landed = index_of(
+                        &out,
+                        &format!(
+                            "Knocked on {} directly; the peer decides whether to trust this instance.",
+                            short(&peer)
+                        ),
+                    );
+                    assert!(asked < knocking && knocking < landed, "{out:?}");
+                    assert!(started.runtime.path_known(&peer).await);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

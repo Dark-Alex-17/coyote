@@ -641,6 +641,7 @@ mod no_answer_tests {
         let options = RequestOptions {
             request_timeout: Duration::from_secs(2),
             link_timeout: Duration::from_secs(2),
+            path_requested: false,
         };
 
         let err = runtime

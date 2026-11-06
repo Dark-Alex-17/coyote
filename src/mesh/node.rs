@@ -222,6 +222,7 @@ impl Default for KnockOptions {
             request: RequestOptions {
                 request_timeout: KNOCK_REQUEST_TIMEOUT,
                 link_timeout: KNOCK_LINK_TIMEOUT,
+                path_requested: false,
             },
             propagation: PropagationOptions::default(),
         }
@@ -257,6 +258,7 @@ impl RequestTimeouts {
             link_timeout: self.link.map_or(defaults.link_timeout, |configured| {
                 configured.max(defaults.link_timeout)
             }),
+            path_requested: defaults.path_requested,
         }
     }
 }
@@ -739,6 +741,11 @@ pub(crate) struct MeshRuntime {
     /// for the same node serialised, so a second poster waits here rather than sharing
     /// the out-link.
     posting: Mutex<()>,
+    /// Destinations a resolve by stored key asked the network for and heard no path to,
+    /// with when the wait ended. The next request to one within `PATH_REQUEST_TIMEOUT`
+    /// takes its entry and opens its link as one whose path was already asked for, so a
+    /// resolve and the request after it pay one path-request wait, not two.
+    unanswered_path_requests: parking_lot::Mutex<HashMap<String, tokio::time::Instant>>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
     /// Every request's path and deadlines in the order they were made, for the tests
@@ -1015,6 +1022,7 @@ impl MeshRuntime {
             last_announce_at,
             fetching: Mutex::new(()),
             posting: Mutex::new(()),
+            unanswered_path_requests: parking_lot::Mutex::new(HashMap::new()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
             #[cfg(all(test, unix))]
@@ -1538,6 +1546,10 @@ impl MeshRuntime {
         let origin = self.destination.lock().await.origin;
         let cancel = self.cancellation_token();
         request_path_to_node(&transport, node, &cancel, PropagationError::Cancelled).await?;
+        let options = PropagationOptions {
+            path_requested: true,
+            ..*options
+        };
         propagation::propagate(
             &transport,
             &sender,
@@ -1545,7 +1557,7 @@ impl MeshRuntime {
             node,
             &build(&origin),
             cancel,
-            options,
+            &options,
         )
         .await?;
         Ok(())
@@ -1584,6 +1596,10 @@ impl MeshRuntime {
         }
         let dest_hex = destination.address_hash.to_hex_string();
         refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
+        let options = RequestOptions {
+            path_requested: options.path_requested || self.take_unanswered_path_request(&dest_hex),
+            ..options
+        };
         let transport = self
             .transport
             .lock()
@@ -1613,6 +1629,24 @@ impl MeshRuntime {
     /// request so a rekeyed node claims its new instance and never a cached one.
     async fn envelope(&self, body: rmpv::Value) -> Envelope {
         Envelope::new(self.destination.lock().await.origin, body)
+    }
+
+    /// Records that a path request for `destination_hex` (lowercase hex) just went
+    /// unanswered, for the request that follows it to take.
+    pub(super) fn note_unanswered_path_request(&self, destination_hex: &str) {
+        let now = tokio::time::Instant::now();
+        let mut asked = self.unanswered_path_requests.lock();
+        asked.retain(|_, at| now.duration_since(*at) < PATH_REQUEST_TIMEOUT);
+        asked.insert(destination_hex.to_string(), now);
+    }
+
+    /// Whether a path request for `destination_hex` went unanswered within the last
+    /// `PATH_REQUEST_TIMEOUT`, removing the record so only one request takes it.
+    fn take_unanswered_path_request(&self, destination_hex: &str) -> bool {
+        self.unanswered_path_requests
+            .lock()
+            .remove(destination_hex)
+            .is_some_and(|at| at.elapsed() < PATH_REQUEST_TIMEOUT)
     }
 
     /// Asks `destination` to trust this node's current instance, with `intro` as the
@@ -1783,7 +1817,10 @@ impl MeshRuntime {
             &self.trust,
             &mut store,
             &routing,
-            &FetchOptions::default(),
+            &FetchOptions {
+                path_requested: true,
+                ..FetchOptions::default()
+            },
             cancel,
         )
         .await
@@ -3553,7 +3590,9 @@ async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
 /// transport does not rebroadcast announces, so the path comes only from an answered
 /// request. One request, waited on for `PATH_REQUEST_TIMEOUT`; without an answer the link
 /// fails as it would have. Stopping the node ends the wait with `cancelled`, the caller's
-/// own error for a stop.
+/// own error for a stop. This is the one path request of the post or fetch that follows:
+/// its link is opened as one whose path was already asked for, so it never waits again
+/// outside this cancellable wait.
 async fn request_path_to_node<E>(
     transport: &Transport,
     node: &PropagationNode,
@@ -5986,6 +6025,7 @@ mod no_answer_tests {
             request: RequestOptions {
                 request_timeout: Duration::from_secs(2),
                 link_timeout: Duration::from_secs(2),
+                path_requested: false,
             },
             propagation: PropagationOptions::default(),
         };
@@ -6082,6 +6122,7 @@ mod tests {
         let list = RequestOptions {
             request_timeout: PEER_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
+            path_requested: false,
         };
         let access = AccessOptions::default().request;
         let status = RequestOptions::default();
@@ -6146,6 +6187,7 @@ mod tests {
                 RequestOptions {
                     request_timeout: Duration::from_secs(90),
                     link_timeout: Duration::from_secs(45),
+                    path_requested: false,
                 }
             );
         }
@@ -11887,7 +11929,10 @@ mod tests {
     /// A trusted peer the table knows but nothing on the network can route to: the send
     /// asks for a path once, waits out `PATH_REQUEST_TIMEOUT` and no longer, and the
     /// refusal says so in plain words with the number the constant renders. The peer
-    /// announced just now, so the refusal adds that it may have left the mesh.
+    /// announced just now, so the refusal adds that it may have left the mesh. A peer
+    /// whose key the table kept is asked for the same one time: its send still waits one
+    /// `PATH_REQUEST_TIMEOUT`, since the link that follows the unanswered request does not
+    /// ask again.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_destination_is_refused_within_the_path_request_timeout_with_the_new_wording()
@@ -11936,6 +11981,48 @@ mod tests {
             format!(
                 "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
             )
+        );
+
+        let keyed = SingleInputDestination::new(
+            TransportIdentity::new_from_rand(OsRng),
+            session_destination_name("node-send-unreachable-keyed"),
+        )
+        .desc;
+        let keyed_destination = keyed.address_hash.to_hex_string();
+        runtime.peers().observe(
+            PeerSighting {
+                destination_hash: keyed_destination.clone(),
+                identity_hash: keyed.identity.address_hash.to_hex_string(),
+                name_hash: hex_lower(keyed.name.as_name_hash_slice()),
+                public_key: Some(keyed.identity.to_hex_string()),
+                display_name: Some("Kay".to_string()),
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &keyed_destination,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let asked = Instant::now();
+        let err = runtime
+            .send_peer(&keyed_destination, &message)
+            .await
+            .unwrap_err();
+        let waited = asked.elapsed();
+
+        assert_eq!(err, SendError::NoPropagationNode);
+        assert!(
+            waited >= PATH_REQUEST_TIMEOUT
+                && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "the keyed send waited {waited:?}, one path request and no second"
         );
         slot.stop().await.unwrap();
         relay.stop().await;
@@ -12479,26 +12566,55 @@ mod tests {
         slot.stop().await.unwrap();
     }
 
-    /// The current contract for a destination whose description is held but whose path
-    /// has expired: resolving answers at once with the description and asks nothing,
-    /// and a request to it fails at once as `LinkFailed` naming no known path rather
-    /// than waiting out a deadline. The node's transport sends no path request of its
-    /// own on the way to the link.
+    /// A filed peer, trusted both ways, whose path this node's transport has dropped while
+    /// it keeps the description: what a held peer looks like once its route has expired.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_held_destination_whose_path_expired_resolves_at_once_and_its_request_fails_fast() {
-        let stub = PeerStub::listen("node-resolve-stale-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
-        let started = started_runtime_on("node-resolve-stale", stub.port()).await;
+    async fn held_peer_whose_path_expired(
+        tag: &str,
+    ) -> (PeerStub, StartedRuntime, Arc<MeshSlot>, DestinationDesc) {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on(tag, stub.port()).await;
         let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         stub.wait_to_be_filed(&runtime.peers(), &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
         let desc = runtime.resolve_destination(&to).await.unwrap();
         let transport = runtime.transport_handle().await.unwrap();
         assert!(
             transport.expire_path(&desc.address_hash).await,
             "the announce left a path to expire"
         );
+        assert!(!transport.has_path(&desc.address_hash).await);
+        (stub, started, slot, desc)
+    }
+
+    /// A held description whose path expired still resolves at once and asks nothing, and
+    /// the request to it asks the network for the path once, inside its link: the peer
+    /// answers, the link is tried again and the message is delivered directly, well
+    /// inside one `PATH_REQUEST_TIMEOUT`. The peer is resolved by its stored key, which
+    /// asked nothing because the description was held, so the link is the one that asks.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_destination_whose_path_expired_resolves_at_once_and_its_request_asks_for_the_path()
+     {
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-resolve-stale-reachable").await;
+        let runtime = started.runtime.clone();
+        let to = stub.destination_hex();
 
         let asked = Instant::now();
         let resolved = runtime.resolve_destination(&to).await;
@@ -12509,23 +12625,55 @@ mod tests {
         );
         assert_eq!(resolved.unwrap().address_hash, desc.address_hash);
 
+        let message = OutboundPeer::new(PeerKind::Message, "still here", None, None, None).unwrap();
+        let asked = Instant::now();
+        let sent = runtime.send_peer(&to, &message).await.unwrap();
+        let waited = asked.elapsed();
+
+        assert_eq!(sent.via, PeerVia::Direct);
+        assert!(
+            waited < PATH_REQUEST_TIMEOUT,
+            "one answered path request, not a timed-out one: {waited:?}"
+        );
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(transport.has_path(&desc.address_hash).await);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].content, "still here");
+
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// The same held peer with nothing left to answer for it: the request's one path
+    /// request goes unanswered, so it fails as `LinkFailed` naming no known path after
+    /// one `PATH_REQUEST_TIMEOUT`, not at once and not after a second wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_destination_whose_path_expired_and_whose_peer_is_gone_fails_after_one_path_request()
+     {
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-resolve-stale-unreachable").await;
+        let runtime = started.runtime.clone();
+        stub.stop().await;
+
         let asked = Instant::now();
         let result = runtime
             .request(&desc, "/echo", rmpv::Value::Nil, RequestOptions::default())
             .await;
-        assert!(
-            asked.elapsed() < Duration::from_secs(1),
-            "the request fails without waiting: {:?}",
-            asked.elapsed()
-        );
+        let waited = asked.elapsed();
+
         assert!(
             matches!(&result, Err(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
             "{result:?}"
         );
+        assert!(
+            waited >= PATH_REQUEST_TIMEOUT
+                && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "the request waited {waited:?} for the path request"
+        );
 
-        let slot = Arc::new(MeshSlot::default());
-        slot.install(runtime.clone()).unwrap();
-        slot.stop().await.unwrap();
+        assert!(slot.stop().await.unwrap());
     }
 
     /// After a restart the runtime has heard no announce, so its transport holds neither
@@ -16269,9 +16417,98 @@ mod tests {
             node.stop().await;
         }
 
+        /// The persisted node is gone: nothing answers the one path request the post makes
+        /// before opening its link, so the post fails as a link with no known path after
+        /// that one `PATH_REQUEST_TIMEOUT`, and the link does not ask a second time. A
+        /// post caught in that wait still ends promptly with `Cancelled` when the node is
+        /// stopped.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_post_to_a_persisted_node_that_does_not_answer_waits_one_path_request_and_a_stop_ends_it()
+         {
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-post-persisted-node-gone");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let gone = crate::mesh::propagation::propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            );
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: gone,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, relay.port).await;
+            let selected = runtime.propagation_nodes().select().unwrap();
+            let recipient = *TransportIdentity::new_from_rand(OsRng).as_identity();
+            let options = PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..PropagationOptions::default()
+            };
+            let build = |_: &OriginName| OutboundMessage {
+                title: None,
+                content: b"posted to a node that is gone".to_vec(),
+                fields: None,
+            };
+
+            let asked = Instant::now();
+            let err = runtime
+                .post_to_node(&recipient, &selected, build, &options)
+                .await
+                .unwrap_err();
+            let waited = asked.elapsed();
+
+            assert!(
+                matches!(&err, PropagationError::Link(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+                "{err:?}"
+            );
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                "the post waited {waited:?} for the path request"
+            );
+
+            let waiting = tokio::spawn({
+                let runtime = runtime.clone();
+                let selected = selected.clone();
+                async move {
+                    runtime
+                        .post_to_node(&recipient, &selected, build, &options)
+                        .await
+                }
+            });
+            sleep(Duration::from_secs(1)).await;
+            let stopping = Instant::now();
+            stop(&runtime).await;
+            let outcome = tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .expect("stopping the node must end the post's path-request wait")
+                .unwrap();
+            assert!(
+                matches!(outcome, Err(PropagationError::Cancelled)),
+                "{outcome:?}"
+            );
+            assert!(
+                stopping.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                stopping.elapsed()
+            );
+            relay.stop().await;
+        }
+
         /// A restarted runtime knows an offline peer only from its kept row and key: the
         /// transport holds no description for it and nothing answers its path request. The
-        /// stored key is still enough to hold the message on the persisted propagation node.
+        /// stored key is still enough to hold the message on the persisted propagation node,
+        /// and the send pays the resolve's one path-request wait: the link that follows
+        /// fails without asking again, so the fallback comes after one
+        /// `PATH_REQUEST_TIMEOUT` plus the post, not two.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_message_to_an_offline_peer_known_by_its_stored_key_is_held_on_a_propagation_node()
          {
@@ -16337,9 +16574,16 @@ mod tests {
 
             let message =
                 OutboundPeer::new(PeerKind::Message, "held for later", None, None, None).unwrap();
+            let asked = Instant::now();
             let outcome = runtime.send_peer(&destination, &message).await.unwrap();
+            let waited = asked.elapsed();
 
             assert_eq!(outcome.via, PeerVia::StoreAndForward);
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                "the send waited {waited:?} before falling back"
+            );
             node.next_received().await;
 
             assert!(slot.stop().await.unwrap());
@@ -20005,6 +20249,7 @@ mod tests {
     const RAISED: RequestOptions = RequestOptions {
         request_timeout: Duration::from_secs(90),
         link_timeout: Duration::from_secs(45),
+        path_requested: false,
     };
 
     /// With both timers unset every path hands the client its own constants: 15 s / 10 s
@@ -20028,6 +20273,7 @@ mod tests {
         let peer = RequestOptions {
             request_timeout: Duration::from_secs(15),
             link_timeout: Duration::from_secs(10),
+            path_requested: false,
         };
         assert_eq!(
             runtime.requests_made(),
@@ -20041,6 +20287,7 @@ mod tests {
                     RequestOptions {
                         request_timeout: Duration::from_secs(30),
                         link_timeout: Duration::from_secs(10),
+                        path_requested: false,
                     }
                 ),
                 (
@@ -20048,6 +20295,7 @@ mod tests {
                     RequestOptions {
                         request_timeout: Duration::from_secs(120),
                         link_timeout: Duration::from_secs(10),
+                        path_requested: false,
                     }
                 ),
             ]
@@ -20114,6 +20362,7 @@ mod tests {
             RequestOptions {
                 request_timeout: Duration::from_secs(20),
                 link_timeout: Duration::from_secs(10),
+                path_requested: false,
             }
         );
         assert_eq!(
@@ -20121,6 +20370,7 @@ mod tests {
             RequestOptions {
                 request_timeout: Duration::from_secs(30),
                 link_timeout: Duration::from_secs(10),
+                path_requested: false,
             }
         );
         assert_eq!(
@@ -20128,6 +20378,7 @@ mod tests {
             RequestOptions {
                 request_timeout: Duration::from_secs(20),
                 link_timeout: Duration::from_secs(10),
+                path_requested: false,
             }
         );
     }
@@ -20142,6 +20393,7 @@ mod tests {
             RequestOptions {
                 request_timeout: Duration::from_secs(120),
                 link_timeout: Duration::from_secs(10),
+                path_requested: false,
             }
         );
     }
@@ -20160,6 +20412,7 @@ mod tests {
         let sweep = RequestOptions {
             request_timeout: Duration::from_secs(5),
             link_timeout: Duration::from_secs(5),
+            path_requested: false,
         };
 
         runtime.request_status_with(&desc, sweep).await.unwrap_err();

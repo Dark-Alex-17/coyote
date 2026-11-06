@@ -1042,6 +1042,19 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Drops `runtime`'s path to `destination_hex` while its transport keeps the
+    /// description, as an expired route leaves a held peer. Whether there was a path.
+    #[cfg(unix)]
+    pub(crate) async fn expire_path(runtime: &MeshRuntime, destination_hex: &str) -> bool {
+        let hash = AddressHash::new_from_hex_string(destination_hex).unwrap();
+        runtime
+            .transport_handle()
+            .await
+            .unwrap()
+            .expire_path(&hash)
+            .await
+    }
+
     /// Reticulum ingress control on an interface younger than two hours holds every
     /// announce for an unknown destination for 360 s once announces arrive faster than
     /// 3.5 a second. The relay echoes a node's start announce back at it, so a fresh peer's

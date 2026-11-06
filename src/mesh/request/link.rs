@@ -1,3 +1,4 @@
+use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
 use crate::mesh::protocol::VersionRefusal;
 use crate::mesh::request::dispatch::{
     FETCH_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES,
@@ -28,10 +29,13 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling on link establishment, before the request itself is sent.
 pub(crate) const DEFAULT_LINK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `path_requested` says the caller already sent a path request for the destination
+/// during this request, so a link that finds no path fails without asking again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestOptions {
     pub request_timeout: Duration,
     pub link_timeout: Duration,
+    pub path_requested: bool,
 }
 
 impl Default for RequestOptions {
@@ -39,17 +43,21 @@ impl Default for RequestOptions {
         Self {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             link_timeout: DEFAULT_LINK_TIMEOUT,
+            path_requested: false,
         }
     }
 }
 
 /// When one phase of a request gives up, and the option that set it, which the timeout
 /// errors report. Every wait against the transport or a link lock runs under one, and
-/// each wait names the error its expiry stands for.
+/// each wait names the error its expiry stands for. It also carries whether a path
+/// request for the destination was already sent within it, so `open_link` asks at most
+/// once per request.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
     at: Instant,
     after: Duration,
+    path_requested: bool,
 }
 
 impl Deadline {
@@ -57,6 +65,16 @@ impl Deadline {
         Self {
             at: Instant::now() + after,
             after,
+            path_requested: false,
+        }
+    }
+
+    /// This deadline, marked as one whose caller already sent a path request for the
+    /// destination when `requested` holds.
+    pub(crate) fn with_path_requested(self, requested: bool) -> Self {
+        Self {
+            path_requested: self.path_requested || requested,
+            ..self
         }
     }
 
@@ -140,7 +158,9 @@ pub(crate) async fn request(
     envelope: Envelope,
     options: RequestOptions,
 ) -> Result<Value, RequestError> {
-    let link = link_to(transport, identity, destination, path, options.link_timeout).await?;
+    let deadline =
+        Deadline::after(options.link_timeout).with_path_requested(options.path_requested);
+    let link = link_to(transport, identity, destination, path, deadline).await?;
     request_on_link(
         transport,
         &link,
@@ -274,23 +294,26 @@ fn unanswered(receipt: &RequestReceipt, path: &str, after: Duration) -> RequestE
 }
 
 /// Opens (or reuses) the link to `destination` and proves `identity` on it, both within
-/// `link_timeout`. Exposed so a multi-round exchange can identify once and run every round
+/// `deadline`. Exposed so a multi-round exchange can identify once and run every round
 /// on the one link, as `LXMRouter` does with `request_receipt.link` (`LXMRouter.py:1535`).
 pub(crate) async fn link_to(
     transport: &Transport,
     identity: &TransportIdentity,
     destination: &DestinationDesc,
     path: &str,
-    link_timeout: Duration,
+    deadline: Deadline,
 ) -> Result<Arc<tokio::sync::Mutex<Link>>, RequestError> {
-    let deadline = Deadline::after(link_timeout);
     let link = open_link(transport, destination, path, deadline).await?;
     identify(transport, &link, identity, path, deadline).await?;
     Ok(link)
 }
 
 /// Links to `destination` and waits for activation. A destination without a known path
-/// fails at once rather than waiting out the deadline.
+/// (a held description whose path expired, or one never heard) is asked for once over
+/// the network, for up to `PATH_REQUEST_TIMEOUT` or what is left of the deadline, and the
+/// link is tried once more if a path arrived. A deadline whose caller already sent a path
+/// request fails at once instead, so one request never stacks two waits. Either way a
+/// destination still without a path fails as `LinkFailed` naming no known path.
 pub(crate) async fn open_link(
     transport: &Transport,
     destination: &DestinationDesc,
@@ -298,21 +321,44 @@ pub(crate) async fn open_link(
     deadline: Deadline,
 ) -> Result<Arc<tokio::sync::Mutex<Link>>, RequestError> {
     let destination_hex = destination.address_hash.to_hex_string();
+    let no_path =
+        || RequestError::LinkFailed(format!("no known path to destination {destination_hex}"));
+    let no_link = |err: RnsError| {
+        RequestError::LinkFailed(format!("no link to destination {destination_hex}: {err}"))
+    };
     let link = match deadline
         .bound_activation(path, transport.link(*destination))
         .await?
     {
         Ok(link) => link,
+        Err(RnsError::NoPath) if deadline.path_requested => return Err(no_path()),
         Err(RnsError::NoPath) => {
-            return Err(RequestError::LinkFailed(format!(
-                "no known path to destination {destination_hex}"
-            )));
+            let wait = PATH_REQUEST_TIMEOUT.min(deadline.remaining());
+            debug!(
+                "Mesh has no path to {}; asking the network for a path to it (up to {} ms)",
+                short(&destination_hex),
+                wait.as_millis()
+            );
+            if !transport
+                .await_path(&destination.address_hash, wait, None)
+                .await
+            {
+                debug!(
+                    "Mesh heard no path to {} within {} ms; the request fails for want of one",
+                    short(&destination_hex),
+                    wait.as_millis()
+                );
+                return Err(no_path());
+            }
+            // The retry runs under the same deadline, and its expiry still reads as the
+            // missing path it was waiting on rather than a link that never came up.
+            match timeout_at(deadline.at, transport.link(*destination)).await {
+                Ok(Ok(link)) => link,
+                Ok(Err(RnsError::NoPath)) | Err(_) => return Err(no_path()),
+                Ok(Err(err)) => return Err(no_link(err)),
+            }
         }
-        Err(err) => {
-            return Err(RequestError::LinkFailed(format!(
-                "no link to destination {destination_hex}: {err}"
-            )));
-        }
+        Err(err) => return Err(no_link(err)),
     };
     let activation = deadline
         .bound_activation(
