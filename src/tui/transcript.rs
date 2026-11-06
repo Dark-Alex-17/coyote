@@ -1,10 +1,12 @@
 //! The transcript: its cells in order, where the view sits in them and
 //! which row holds the focus. Following the bottom is the rest state; a
 //! scroll away from it holds the view still while new cells arrive
-//! below, and a chip counts them until the view follows again.
+//! below, and a chip offers the way back (and counts them) until the
+//! view follows again.
 
 use super::cells::Cell;
 use super::render::Renderer;
+use crate::config::CommandPrefix;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -25,6 +27,10 @@ struct RowSpan {
 
 pub(super) struct Transcript {
     cells: Vec<Cell>,
+    /// What the greeting names; it is drawn whenever the transcript has
+    /// no turn in it, on boot and again after an undo empties it.
+    model: String,
+    prefix: CommandPrefix,
     /// Lines between the bottom of the view and the bottom of the
     /// transcript; zero while the view follows new output.
     offset_from_bottom: usize,
@@ -45,9 +51,11 @@ pub(super) struct Transcript {
 }
 
 impl Transcript {
-    pub(super) fn new(welcome: Cell) -> Self {
+    pub(super) fn new(model: String, prefix: CommandPrefix) -> Self {
         Self {
-            cells: vec![welcome],
+            cells: vec![Cell::welcome(model.clone(), prefix)],
+            model,
+            prefix,
             offset_from_bottom: 0,
             unseen: 0,
             focus: None,
@@ -129,10 +137,14 @@ impl Transcript {
         if self.stream.is_some_and(|stream| stream >= len) {
             self.stream = None;
         }
+        if self.cells.is_empty() {
+            self.cells
+                .push(Cell::welcome(self.model.clone(), self.prefix));
+        }
     }
 
-    /// Drops the greeting; it never comes back. Called ahead of reading
-    /// `len` as a cell index so the index survives the next push.
+    /// Drops the greeting. Called ahead of reading `len` as a cell index
+    /// so the index survives the next push.
     pub(super) fn clear_welcome(&mut self) {
         if matches!(self.cells.first(), Some(Cell::Welcome { .. })) {
             self.remove(0);
@@ -251,6 +263,14 @@ impl Transcript {
     /// the rows each cell received are kept so a click can find its cell.
     pub(super) fn view(&mut self, area: Rect, renderer: &mut Renderer) -> TranscriptView {
         self.last_area = area;
+        if area.is_empty() {
+            self.last_layout.clear();
+            return TranscriptView {
+                lines: Vec::new(),
+                centre: false,
+                chip: None,
+            };
+        }
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut owners: Vec<Option<usize>> = Vec::new();
         let mut headers: Vec<usize> = Vec::with_capacity(self.cells.len());
@@ -300,8 +320,13 @@ impl Transcript {
             }
         }
 
-        let chip = (self.offset_from_bottom > 0 && self.unseen > 0)
-            .then(|| format!("{} new below  End = follow", self.unseen));
+        let chip = (self.offset_from_bottom > 0).then(|| {
+            if self.unseen > 0 {
+                format!("{} new below  End = follow", self.unseen)
+            } else {
+                "End = follow".to_string()
+            }
+        });
         TranscriptView {
             lines: lines.drain(start..end).collect(),
             centre: self.welcome_only(),
@@ -321,9 +346,9 @@ impl Transcript {
     }
 }
 
-/// The rows of the transcript the view shows, with the follow chip when
-/// cells arrived below a scrolled view. The greeting alone sits in the
-/// middle of the area rather than at its bottom.
+/// The rows of the transcript the view shows, with the follow chip while
+/// the view is scrolled away from the bottom. The greeting alone sits in
+/// the middle of the area rather than at its bottom.
 pub(super) struct TranscriptView {
     lines: Vec<Line<'static>>,
     centre: bool,
@@ -371,7 +396,7 @@ mod tests {
             ..Default::default()
         };
         let renderer = Renderer::new(config.render_options().unwrap()).unwrap();
-        let mut transcript = Transcript::new(Cell::welcome("m".to_string(), CommandPrefix::Dot));
+        let mut transcript = Transcript::new("m".to_string(), CommandPrefix::Dot);
         transcript.clear_welcome();
         (transcript, renderer)
     }
@@ -454,14 +479,71 @@ mod tests {
         let view = transcript.view(area(5), &mut renderer);
         assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
         transcript.scroll_page(1);
-        transcript.view(area(5), &mut renderer);
+        let view = transcript.view(area(5), &mut renderer);
         assert_eq!(transcript.offset_from_bottom, 9);
         assert_eq!(transcript.unseen, 1, "a partial scroll forgot the count");
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
         transcript.scroll_to_bottom();
         let view = transcript.view(area(5), &mut renderer);
         assert_eq!(transcript.offset_from_bottom, 0);
         assert_eq!(view.chip, None);
         assert_eq!(transcript.unseen, 0);
+    }
+
+    /// Scrolled away with nothing new below, the chip still offers the
+    /// way back; it is the only sign the view is not following.
+    #[test]
+    fn a_scrolled_view_with_nothing_new_still_offers_the_way_back() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-3);
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(view.chip.as_deref(), Some("End = follow"));
+        transcript.scroll_lines(3);
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(view.chip, None);
+    }
+
+    /// Truncating everything away brings the greeting back; the next
+    /// turn clears it as on boot.
+    #[test]
+    fn truncating_to_nothing_reseeds_the_greeting() {
+        let (mut transcript, _) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.push(Cell::assistant("hello".to_string(), true));
+        transcript.truncate(0);
+        assert!(matches!(transcript.cells(), [Cell::Welcome { .. }]));
+        assert!(transcript.welcome_only());
+        transcript.clear_welcome();
+        assert!(transcript.cells().is_empty());
+        transcript.push(Cell::user("again"));
+        transcript.truncate(1);
+        assert_eq!(
+            transcript.len(),
+            1,
+            "a truncation that leaves cells adds nothing"
+        );
+    }
+
+    /// A zero-sized area (the todo panel has the whole width) lays
+    /// nothing out and leaves no rows for a click to land on.
+    #[test]
+    fn an_empty_area_lays_nothing_out() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.push(tool("c1"));
+        transcript.view(area(10), &mut renderer);
+        assert_eq!(transcript.last_layout.len(), 2);
+        let view = transcript.view(Rect::ZERO, &mut renderer);
+        assert!(view.lines.is_empty());
+        assert_eq!(view.chip, None);
+        assert!(transcript.last_layout.is_empty());
+        assert_eq!(transcript.last_area, Rect::ZERO);
+        transcript.click(0, 0);
+        assert_eq!(transcript.focus, None);
     }
 
     /// Focusing a row that is scrolled out of view brings its header

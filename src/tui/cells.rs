@@ -147,8 +147,8 @@ pub(super) enum Cell {
         calls: Vec<FoldedCall>,
         expanded: bool,
     },
-    /// The boxed greeting an empty transcript shows until the first line
-    /// is submitted.
+    /// The boxed greeting an empty transcript shows until a line is
+    /// submitted.
     Welcome {
         model: String,
         prefix: CommandPrefix,
@@ -156,10 +156,17 @@ pub(super) enum Cell {
     },
 }
 
-/// Whether `name` is a tool whose call is housekeeping rather than work:
-/// its row never opens and never shows output.
+/// Whether `name` is a tool whose call is housekeeping rather than work
+/// (memory and skill lookups, listings, the inbox): its row never opens
+/// and never shows output.
 pub(super) fn is_bookkeeping(name: &str) -> bool {
-    name.starts_with("memory__") || name.starts_with("skill__") || name.starts_with("agent__list_")
+    name.starts_with("memory__")
+        || name.starts_with("skill__")
+        || name.starts_with("agent__list_")
+        || matches!(
+            name,
+            "job__list" | "agent__task_list" | "agent__check_inbox"
+        )
 }
 
 /// The tool name a narration line names, after `Call `.
@@ -689,6 +696,29 @@ mod tests {
         );
         assert_eq!(narrated_tool_name("Call todo__add {}"), "todo__add");
         assert_eq!(narrated_tool_name(""), "");
+    }
+
+    #[test]
+    fn bookkeeping_covers_lookups_listings_and_the_inbox() {
+        for name in [
+            "memory__search",
+            "skill__load",
+            "agent__list_skills",
+            "job__list",
+            "agent__task_list",
+            "agent__check_inbox",
+        ] {
+            assert!(is_bookkeeping(name), "{name} should be bookkeeping");
+        }
+        for name in [
+            "fs_read",
+            "job__start",
+            "job__check",
+            "agent__spawn",
+            "agent__collect",
+        ] {
+            assert!(!is_bookkeeping(name), "{name} is work, not bookkeeping");
+        }
     }
 
     /// A character cut in two by the pipe read boundary decodes once its

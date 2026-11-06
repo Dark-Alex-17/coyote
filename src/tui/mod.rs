@@ -521,7 +521,7 @@ impl App {
     ) -> Result<Self> {
         let renderer = Renderer::new(config.render_options()?)?;
         Ok(Self {
-            transcript: Transcript::new(Cell::welcome(footer.model.clone(), config.command_prefix)),
+            transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
             composer: new_composer(),
             prompts: VecDeque::new(),
@@ -581,9 +581,11 @@ impl App {
 
     /// Records that a line left for the work task. A command gets its cell
     /// now, so the transcript shows what is running under a modal the
-    /// command raises; the output fills in when the turn ends.
+    /// command raises; the output fills in when the turn ends. The view
+    /// follows again so the line just sent is not out of sight.
     pub(crate) fn begin_turn(&mut self, line: &str, command: bool) {
         self.transcript.clear_welcome();
+        self.transcript.scroll_to_bottom();
         let first_cell = self.transcript.len();
         self.transcript.push(if command {
             Cell::command(line)
@@ -604,6 +606,9 @@ impl App {
     pub(crate) fn end_turn(&mut self, command: bool, outcome: &TurnOutcome) {
         let first_cell = self.turn.take().map(|turn| turn.first_cell);
         self.close_stream();
+        if let Some(first_cell) = first_cell {
+            self.fail_unreported_tools(first_cell);
+        }
         if command {
             let index = first_cell.expect("end_turn follows begin_turn");
             let prefix = self.config.command_prefix;
@@ -660,6 +665,24 @@ impl App {
     fn close_stream(&mut self) {
         if let Some(Cell::Assistant { done, .. }) = self.transcript.close_stream() {
             *done = true;
+        }
+    }
+
+    /// A tool row still running when its turn ends never got its
+    /// finish hook: the turn was interrupted or the task died under it.
+    /// Job and agent rows are left alone; their work goes on in the
+    /// background.
+    fn fail_unreported_tools(&mut self, first_cell: usize) {
+        let now = self.clock.now();
+        for cell in self.transcript.cells_mut().iter_mut().skip(first_cell) {
+            if let Cell::Tool { status, .. } = cell
+                && let ToolStatus::Running { since } = *status
+            {
+                *status = ToolStatus::Failed {
+                    elapsed: now.duration_since(since),
+                    error: "interrupted".to_string(),
+                };
+            }
         }
     }
 
@@ -1238,15 +1261,19 @@ impl App {
         append_output((lines, open_line, pending), bytes);
     }
 
-    /// The output lines of the call `call_id` in this turn: a tool row's
-    /// own, or those of a call folded into a job's or agent's row.
+    /// The output lines of the call `call_id`: a tool row's own, within
+    /// this turn, or those of a call folded into a job's or agent's row,
+    /// which a later turn's check reaches back to.
     fn tool_output_target(&mut self, first_cell: usize, call_id: &str) -> Option<OutputTarget<'_>> {
-        let cells = self.transcript.cells_mut();
-        let first_cell = first_cell.min(cells.len());
-        cells[first_cell..]
+        self.transcript
+            .cells_mut()
             .iter_mut()
+            .enumerate()
             .rev()
-            .find_map(|cell| cell.output_for(call_id))
+            .filter(|(index, cell)| {
+                *index >= first_cell || matches!(cell, Cell::Job { .. } | Cell::Agent { .. })
+            })
+            .find_map(|(_, cell)| cell.output_for(call_id))
     }
 
     /// Gives every queued prompt its unattended answer; used when the UI
@@ -2130,7 +2157,7 @@ mod tests {
     use crate::events::{Event, Origin};
     use crate::prompt::Prompter;
     use crate::testing::TestConfigDirGuard;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent};
     use events::ManualClock;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -4057,7 +4084,12 @@ mod tests {
         });
     }
 
+    /// Sends what the sink sends for a tool's start hook: the status
+    /// row's name first, then the row's own message.
     fn start_tool(harness: &mut Harness, call_id: &str, name: &str, args: Option<Value>) {
+        harness
+            .app
+            .handle_msg(UiMsg::ToolRunning(Some(name.to_string())));
         harness.app.handle_msg(UiMsg::ToolStarted {
             call_id: call_id.to_string(),
             name: name.to_string(),
@@ -4073,6 +4105,7 @@ mod tests {
     }
 
     fn finish_tool(harness: &mut Harness, call_id: &str, ok: bool, error: Option<&str>) {
+        harness.app.handle_msg(UiMsg::ToolRunning(None));
         harness.app.handle_msg(UiMsg::ToolFinished {
             call_id: call_id.to_string(),
             ok,
@@ -4107,19 +4140,25 @@ mod tests {
         ]
     }
 
-    /// The modifiers on the first cell of the first screen row that
-    /// starts with `prefix`.
-    fn row_modifier(harness: &Harness, prefix: &str) -> Modifier {
+    /// The first screen row of the last frame that starts with `prefix`.
+    fn screen_row(harness: &Harness, prefix: &str) -> u16 {
         let buffer = harness.terminal.backend().buffer();
         for y in 0..buffer.area.height {
             let text: String = (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect();
             if text.starts_with(prefix) {
-                return buffer[(0, y)].modifier;
+                return y;
             }
         }
         panic!("no row starts with {prefix:?}:\n{buffer:?}");
+    }
+
+    /// The modifiers on the first cell of the first screen row that
+    /// starts with `prefix`.
+    fn row_modifier(harness: &Harness, prefix: &str) -> Modifier {
+        let row = screen_row(harness, prefix);
+        harness.terminal.backend().buffer()[(0, row)].modifier
     }
 
     #[test]
@@ -4236,6 +4275,94 @@ mod tests {
         harness.press(KeyCode::Enter);
         let frame = harness.draw();
         assert!(frame.contains("still running"), "{frame}");
+    }
+
+    /// A check on a job from a later turn folds into the job's row, and
+    /// its output goes with it rather than into a loose text cell.
+    #[test]
+    fn a_later_turns_check_on_a_job_lands_on_the_jobs_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("build it", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call job__start {\"tool\":\"execute_command\"}",
+        );
+        start_tool(&mut harness, "call-1", "job__start", None);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        finish_tool(&mut harness, "call-1", true, None);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("Started it.".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        assert_eq!(harness.app.transcript.len(), 3);
+
+        harness.app.begin_turn("how is it going", false);
+        narrate(
+            &mut harness,
+            "call-2",
+            "Call job__check {\"id\":\"job_1a2b3c4d\"}",
+        );
+        start_tool(
+            &mut harness,
+            "call-2",
+            "job__check",
+            Some(serde_json::json!({"id": "job_1a2b3c4d"})),
+        );
+        tool_output(&mut harness, "call-2", "still running\n");
+        finish_tool(&mut harness, "call-2", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 4, "the check added only its user line");
+        let Cell::Job { calls, .. } = &cells[1] else {
+            panic!("the job row moved");
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].name, "job__check");
+        assert_eq!(calls[1].output, ["still running"]);
+        assert!(matches!(&cells[3], Cell::User { .. }));
+    }
+
+    /// A tool row still running when its turn ends (interrupted, or the
+    /// task died under it) is marked failed rather than left spinning;
+    /// a job row, whose work goes on, is not.
+    #[test]
+    fn a_turn_ending_fails_its_unreported_tool_rows_and_spares_jobs() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.clock.advance(Duration::from_secs(3));
+        harness.app.end_turn(
+            false,
+            &TurnOutcome {
+                error: Some("interrupted".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(
+            &cells[1],
+            Cell::Tool {
+                status: ToolStatus::Failed { elapsed, error },
+                ..
+            } if error == "interrupted" && *elapsed == Duration::from_secs(3)
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Job {
+                status: JobStatus::Running,
+                ..
+            }
+        ));
+        let frame = harness.draw();
+        assert!(frame.contains("3.0s  failed: interrupted"), "{frame}");
     }
 
     #[test]
@@ -4525,9 +4652,29 @@ mod tests {
         assert!(matches!(&cells[1], Cell::Command { name, .. } if name == ".undo"));
     }
 
+    /// Undoing the only exchange empties the transcript; the greeting
+    /// comes back and the next turn clears it as on boot.
     #[test]
-    fn cells_arriving_below_a_scrolled_view_are_counted_on_a_chip() {
+    fn undoing_the_only_exchange_brings_the_greeting_back() {
         let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        assert!(!harness.draw().contains("Tip: Press"));
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let frame = harness.draw();
+        assert!(frame.contains("Tip: Press"), "{frame}");
+        assert!(!frame.contains(".undo"), "{frame}");
+        harness.app.begin_turn("second question", false);
+        let frame = harness.draw();
+        assert!(!frame.contains("Tip: Press"), "{frame}");
+        assert!(matches!(
+            harness.app.transcript.cells(),
+            [Cell::User { text, .. }] if text == "second question"
+        ));
+    }
+
+    /// A turn's worth of filler, enough to overflow the 80x24 view.
+    fn fill_the_view(harness: &mut Harness) {
         harness.app.begin_turn("fill", false);
         for i in 0..20 {
             harness
@@ -4537,6 +4684,12 @@ mod tests {
         }
         harness.app.end_turn(false, &TurnOutcome::default());
         harness.draw();
+    }
+
+    #[test]
+    fn cells_arriving_below_a_scrolled_view_are_counted_on_a_chip() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
         assert!(harness.press(KeyCode::PageUp).is_none());
         assert!(harness.app.transcript.scrolled());
         for i in 0..3 {
@@ -4554,7 +4707,88 @@ mod tests {
         assert!(!harness.app.transcript.scrolled());
         let frame = harness.draw();
         assert!(!frame.contains("new below"), "{frame}");
+        assert!(!frame.contains("End = follow"), "{frame}");
         assert!(frame.contains("late line 2"), "{frame}");
+    }
+
+    /// Scrolled up with nothing new yet, the chip already offers the way
+    /// back, so a held view is never mistaken for a following one.
+    #[test]
+    fn a_scrolled_view_offers_the_way_back_before_anything_new_arrives() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
+        harness.press(KeyCode::PageUp);
+        let frame = harness.draw();
+        insta::assert_snapshot!("follow_chip_idle_80x24", &frame);
+        assert!(frame.contains("End = follow"), "{frame}");
+        assert!(!frame.contains("new below"), "{frame}");
+        harness.press(KeyCode::End);
+        assert!(!harness.draw().contains("End = follow"));
+    }
+
+    /// A line sent while scrolled up would otherwise land out of sight.
+    #[test]
+    fn a_submitted_line_brings_the_view_back_to_the_bottom() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
+        harness.press(KeyCode::PageUp);
+        assert!(harness.app.transcript.scrolled());
+        harness.app.begin_turn("late question", false);
+        assert!(!harness.app.transcript.scrolled());
+        let frame = harness.draw();
+        assert!(frame.contains("> late question"), "{frame}");
+        assert!(!frame.contains("End = follow"), "{frame}");
+    }
+
+    /// The wheel moves the view; a left click on a row that opens
+    /// focuses and opens it, mapped through the rows of the last frame.
+    #[test]
+    fn the_mouse_scrolls_the_view_and_opens_the_row_it_clicks() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.draw();
+        let mouse = |kind: MouseEventKind, column: u16, row: u16| {
+            TermInput::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let row = screen_row(&harness, "Call fs_read");
+        assert!(
+            harness
+                .app
+                .handle_input(mouse(MouseEventKind::Down(MouseButton::Left), 4, row))
+                .is_none()
+        );
+        assert!(harness.app.transcript.focused());
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Tool { expanded: true, .. }
+        ));
+        let frame = harness.draw();
+        assert!(frame.contains("fn main()"), "{frame}");
+        assert!(
+            row_modifier(&harness, "Call fs_read").contains(Modifier::REVERSED),
+            "the clicked header is not reversed"
+        );
+
+        fill_the_view(&mut harness);
+        assert!(
+            harness
+                .app
+                .handle_input(mouse(MouseEventKind::ScrollUp, 0, 0))
+                .is_none()
+        );
+        assert!(harness.app.transcript.scrolled());
+        assert!(harness.draw().contains("End = follow"));
+        harness
+            .app
+            .handle_input(mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert!(!harness.app.transcript.scrolled());
     }
 
     #[test]
