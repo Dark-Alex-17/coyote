@@ -3149,6 +3149,10 @@ struct TcpWatch {
     /// Whether the client has connected since start, or was connected at start; its
     /// next connect is then a reconnect rather than its first.
     has_connected: bool,
+    /// The streams the client had established when the watcher last read its count,
+    /// `status.connected_streams()`. A higher count read while the client is still
+    /// marked connected is a drop and redial whose events the watcher never read.
+    connect_count: u64,
 }
 
 impl TcpWatch {
@@ -3167,9 +3171,22 @@ impl TcpWatch {
                 status: status.clone(),
                 connected: *connected_at_start,
                 has_connected: *connected_at_start,
+                // A client connected at start has a stream up even while its count,
+                // bumped just after the stream is marked up, still reads one behind.
+                connect_count: status
+                    .connected_streams()
+                    .max(u64::from(*connected_at_start)),
             }),
             WatchedInterface::Local { .. } => None,
         }
+    }
+
+    /// Folds a fresh read of the client's stream count into the one kept and returns
+    /// whether it rose.
+    fn recount(&mut self, streams: u64) -> bool {
+        let rose = streams > self.connect_count;
+        self.connect_count = self.connect_count.max(streams);
+        rose
     }
 
     /// Records a connect and returns what it is to the user; `None` for a client already
@@ -3234,7 +3251,10 @@ fn follow_tcp_event(
 ) -> Option<(AddressHash, Transition)> {
     let watch = watches.iter_mut().find(|watch| watch.hash == hash)?;
     match kind {
-        InterfaceEventKind::Connected => watch.connect().map(|transition| (hash, transition)),
+        InterfaceEventKind::Connected => {
+            watch.recount(watch.status.connected_streams());
+            watch.connect().map(|transition| (hash, transition))
+        }
         InterfaceEventKind::Disconnected { reason } => {
             watch.connected = false;
             debug!(
@@ -3249,9 +3269,12 @@ fn follow_tcp_event(
 
 /// Catches the TCP clients up after the watcher fell `missed` interface events behind,
 /// from each client's status: a client whose stream is up and is not marked connected
-/// gets the transition its missed `Connected` would have brought, and one marked
-/// connected whose stream is down is unmarked, so its next `Connected` counts as a
-/// reconnect.
+/// gets the transition its missed `Connected` would have brought, one marked connected
+/// whose stream is up and whose stream count rose dropped and redialed inside the gap
+/// and gets a reconnect, and one marked connected whose stream is down is unmarked, so
+/// its next `Connected` counts as a reconnect. A count that did not move tells nothing:
+/// the client bumps it just after marking a stream up, and the `Connected` that follows
+/// the bump is still on its way.
 fn reconcile_tcp_after_lag(
     watches: &mut [TcpWatch],
     missed: u64,
@@ -3262,9 +3285,16 @@ fn reconcile_tcp_after_lag(
     watches
         .iter_mut()
         .filter_map(|watch| {
+            // Read before the state: the client marks a stream up before it counts it,
+            // so every stream this count includes was up before the state is read.
+            let streams = watch.status.connected_streams();
             if watch.status.to_json()["stream_state"].as_str() == Some("connected") {
+                if watch.recount(streams) && watch.connected {
+                    return Some((watch.hash, Transition::Reconnect));
+                }
                 watch.connect().map(|transition| (watch.hash, transition))
             } else {
+                watch.recount(streams);
                 watch.connected = false;
                 None
             }
@@ -3291,8 +3321,9 @@ fn reconcile_tcp_after_lag(
 /// see `reconcile_tcp_after_lag`. The `local` rnsd's shared-instance client's state
 /// events drive its row, see `follow_local_event`. That client re-announces and redials
 /// by itself, so no line is printed and no announce sent for an rnsd. The watcher holds
-/// no peer-controlled state: a fixed list from the node's own config, two flags per
-/// client and one dial failure for the rnsd. Ends when the node or its slot is gone.
+/// no peer-controlled state: a fixed list from the node's own config, two flags and a
+/// stream count per client and one dial failure for the rnsd. Ends when the node or its
+/// slot is gone.
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -15268,6 +15299,7 @@ mod tests {
             status: status.clone(),
             connected,
             has_connected,
+            connect_count: status.connected_streams().max(u64::from(connected)),
         };
         let down = TcpClient::new("127.0.0.1:1").runtime_status_handle();
         let mut watches = [
@@ -15293,6 +15325,108 @@ mod tests {
             follow_tcp_event(&mut watches, hashes[3], InterfaceEventKind::Connected),
             Some((hashes[3], Transition::Reconnect))
         );
+        handle.abort();
+    }
+
+    /// A relay that drops and redials while the watcher is not reading leaves the same
+    /// `connected` state behind, so only its stream count shows what happened. Before
+    /// any drop, a relay connected at start reads nothing after a lag. The listener then
+    /// drops the client past what the interface-event broadcast holds, the watcher reads
+    /// `Lagged`, and its catch-up tells exactly one reconnect for the relay it held
+    /// connected and one first connect for a client it never saw connect. A second
+    /// catch-up with the count unmoved tells nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_watcher_tells_one_reconnect_for_drops_and_redials_it_never_read() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpStream;
+        use tokio::time::timeout;
+
+        /// Overflows the 1024-event broadcast: each drop publishes three events.
+        const DROPS: u64 = 400;
+        const WAIT: Duration = Duration::from_secs(5);
+
+        async fn accept(listener: &TcpListener) -> TcpStream {
+            timeout(WAIT, listener.accept())
+                .await
+                .expect("the client to redial")
+                .unwrap()
+                .0
+        }
+        // Shut down and read to the client's EOF, so it reads a FIN, not a reset.
+        async fn close_orderly(mut stream: TcpStream) {
+            stream.shutdown().await.unwrap();
+            let mut sink = [0u8; 1024];
+            timeout(WAIT, async {
+                while stream.read(&mut sink).await.unwrap_or(0) > 0 {}
+            })
+            .await
+            .expect("the client to close its side");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = Transport::new(TransportConfig::new(
+            SCOPE_APP_NAME,
+            &TransportIdentity::new_from_rand(OsRng),
+            false,
+        ));
+        let mut events = transport.interface_events();
+        let client = TcpClient::new(listener.local_addr().unwrap().to_string())
+            .with_reconnect_wait(Duration::from_millis(1));
+        let status = client.runtime_status_handle();
+        let context = transport.iface_manager().lock().await.new_context(client);
+        let hash = *context.channel.address();
+        let handle = tokio::spawn(TcpClient::spawn(context));
+        let mut stream = accept(&listener).await;
+        timeout(WAIT, async {
+            while !matches!(
+                next_interface_event(&mut events).await,
+                Ok(event) if event.iface() == hash && event.kind() == InterfaceEventKind::Connected
+            ) {}
+        })
+        .await
+        .expect("the first Connected");
+        let watched = |hash, connected_at_start| WatchedInterface::Tcp {
+            index: 0,
+            label: "relay".into(),
+            hash,
+            status: status.clone(),
+            connected_at_start,
+        };
+        let never = AddressHash::new_from_rand(OsRng);
+        let mut watches = [
+            TcpWatch::of(&watched(hash, true)).unwrap(),
+            TcpWatch::of(&watched(never, false)).unwrap(),
+        ];
+
+        assert_eq!(
+            reconcile_tcp_after_lag(&mut watches[..1], 1),
+            vec![],
+            "a relay connected at start that never dropped"
+        );
+
+        for _ in 0..DROPS {
+            close_orderly(stream).await;
+            stream = accept(&listener).await;
+        }
+        wait_until("every redial to be counted", || {
+            status.connected_streams() == 1 + DROPS
+                && status.to_json()["stream_state"].as_str() == Some("connected")
+        })
+        .await;
+        let missed = match next_interface_event(&mut events).await {
+            Err(missed) => missed,
+            Ok(event) => panic!("a watcher behind {DROPS} drops reads a lag, got {event:?}"),
+        };
+
+        assert_eq!(
+            reconcile_tcp_after_lag(&mut watches, missed),
+            vec![
+                (hash, Transition::Reconnect),
+                (never, Transition::FirstConnect)
+            ]
+        );
+        assert_eq!(reconcile_tcp_after_lag(&mut watches, missed), vec![]);
         handle.abort();
     }
 
