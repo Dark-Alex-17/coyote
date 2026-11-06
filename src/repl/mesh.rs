@@ -25,8 +25,8 @@ use crate::mesh::knock::{
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
-    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, SendError, is_wire_id,
-    left_mesh_hint, unreachable_head,
+    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, Route, SendError,
+    is_wire_id, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
@@ -68,7 +68,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use inquire::{Confirm, Text};
 use log::debug;
-use rns_transport::destination::DestinationDesc;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -771,8 +770,8 @@ async fn status(
             else {
                 return Ok(());
             };
-            let desc = match route_to(&runtime, &destination, abort_signal).await {
-                Ok(desc) => desc,
+            let route = match route_to(&runtime, &destination, abort_signal).await {
+                Ok(route) => route,
                 Err(Unrouted::NoAnswer) => bail!(
                     "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
                     unreachable_head(&destination),
@@ -789,7 +788,7 @@ async fn status(
             ));
             result_follows();
             let card = tokio::select! {
-                outcome = runtime.request_status(&desc) => outcome.map_err(quoted_status_failure)?,
+                outcome = runtime.request_status(route) => outcome.map_err(quoted_status_failure)?,
                 _ = wait_user_interrupt(Some(abort_signal)) => {
                     out_text("Status request interrupted.");
                     return Ok(());
@@ -1978,18 +1977,18 @@ async fn route_to(
     runtime: &MeshRuntime,
     destination: &str,
     abort_signal: &AbortSignal,
-) -> Result<DestinationDesc, Unrouted> {
+) -> Result<Route, Unrouted> {
     if let Some(desc) = runtime.resolve_destination_cached(destination).await {
         if !runtime.path_known(destination).await {
             out_text(&route_request_line(destination));
             result_follows();
         }
-        return Ok(desc);
+        return Ok(Route::from(desc));
     }
     out_text(&route_request_line(destination));
     result_follows();
     tokio::select! {
-        resolved = runtime.resolve_destination(destination) => resolved.ok_or(Unrouted::NoAnswer),
+        resolved = runtime.resolve_route(destination) => resolved.ok_or(Unrouted::NoAnswer),
         _ = wait_user_interrupt(Some(abort_signal)) => Err(Unrouted::Interrupted),
     }
 }
@@ -2500,8 +2499,8 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         out_path_text(&NoticeText::from("Nothing was sent.").render(live_prefix()));
         return Ok(());
     }
-    let desc = match route_to(&runtime, &destination, abort_signal).await {
-        Ok(desc) => desc,
+    let route = match route_to(&runtime, &destination, abort_signal).await {
+        Ok(route) => route,
         Err(Unrouted::NoAnswer) => bail!(
             "{}{} Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
             unreachable_head(&destination),
@@ -2521,7 +2520,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     );
     result_follows();
     let outcome = tokio::select! {
-        outcome = runtime.knock(&desc, &intro) => outcome,
+        outcome = runtime.knock(route, &intro) => outcome,
         _ = wait_user_interrupt(Some(abort_signal)) => {
             out_path_text(&NoticeText::from("Knock interrupted.").render(live_prefix()));
             return Ok(());
@@ -2663,10 +2662,10 @@ async fn send_request(
     valid: &ValidAccess,
     reason: &str,
 ) -> Result<()> {
-    // Only the wait is wanted here: `request_access` resolves the destination itself,
-    // which is immediate once the route is held.
-    match route_to(runtime, destination, abort_signal).await {
-        Ok(_) => {}
+    // The route is handed to `request_access`, so the destination is resolved (and its
+    // path asked for) once.
+    let route = match route_to(runtime, destination, abort_signal).await {
+        Ok(route) => route,
         Err(Unrouted::NoAnswer) => bail!(
             "{}{} Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard.",
             unreachable_head(destination),
@@ -2678,7 +2677,7 @@ async fn send_request(
             );
             return Ok(());
         }
-    }
+    };
     let d8 = short(destination);
     out_path_text(
         &NoticeText::from(format!(
@@ -2699,7 +2698,8 @@ async fn send_request(
         valid.paths.clone(),
         reason.to_string(),
     );
-    let mut handle = tokio::spawn(async move { mesh.request_access(&to, &paths, &why).await });
+    let mut handle =
+        tokio::spawn(async move { mesh.request_access(&to, &paths, &why, Some(route)).await });
     let joined = tokio::select! {
         joined = &mut handle => joined,
         _ = wait_user_interrupt(Some(abort_signal)) => {
@@ -2854,8 +2854,8 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             )),
         ));
     }
-    let desc = match route_to(&runtime, &destination, abort_signal).await {
-        Ok(desc) => desc,
+    let route = match route_to(&runtime, &destination, abort_signal).await {
+        Ok(route) => route,
         Err(Unrouted::NoAnswer) => bail!(
             "{}{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
             unreachable_head(&destination),
@@ -2874,7 +2874,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     ));
     result_follows();
     let outcome = tokio::select! {
-        outcome = runtime.fetch_file(&desc, &args.path, args.if_sha256) => outcome,
+        outcome = runtime.fetch_file(route, &args.path, args.if_sha256) => outcome,
         _ = wait_user_interrupt(Some(abort_signal)) => {
             out_path_text(&format!("Fetch of `{shown}` interrupted; nothing was staged."));
             return Ok(());
@@ -23388,6 +23388,81 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ctx.app.mesh.correlations().list().is_empty(),
                         "{:?}",
                         ctx.app.mesh.correlations().list()
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A trusted peer known only by the key its row kept, with nothing on the
+            /// network to answer for it: `.mesh request` resolves it once, and the route
+            /// it found travels with the request, so the one unanswered path request is
+            /// the only wait before the request fails, not one for the route and another
+            /// for the link.
+            #[test]
+            #[serial]
+            fn request_to_an_unroutable_peer_known_by_its_key_waits_for_one_path_request() {
+                use crate::mesh::PATH_REQUEST_TIMEOUT;
+                use crate::mesh::hex_lower;
+                use crate::mesh::session_destination_name;
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::{LiveMesh, TrustOptions};
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-request-keyed-unroutable");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-request-keyed-unroutable").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let name = session_destination_name("probe");
+                    let announced =
+                        SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
+                    let trusted = announced.desc.address_hash.to_hex_string();
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: trusted.clone(),
+                            identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                            name_hash: hex_lower(name.as_name_hash_slice()),
+                            display_name: Some("Tia".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                            public_key: Some(announced.desc.identity.to_hex_string()),
+                        },
+                        now,
+                    );
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    started
+                        .runtime
+                        .trust()
+                        .trust_destination(slot, &trusted, TrustOptions::default(), now)
+                        .unwrap();
+
+                    let asked = std::time::Instant::now();
+                    run(
+                        &mut ctx,
+                        &format!(".mesh request {trusted} docs/a.md --yes"),
+                    )
+                    .await
+                    .unwrap_err();
+                    let waited = asked.elapsed();
+
+                    assert!(
+                        waited >= PATH_REQUEST_TIMEOUT
+                            && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                        "the request waited {waited:?}, one path request and no second"
+                    );
+                    let out = stdout_lines();
+                    assert_eq!(
+                        out.iter()
+                            .filter(|line| **line == route_request_line(&trusted))
+                            .count(),
+                        1,
+                        "{out:?}"
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());

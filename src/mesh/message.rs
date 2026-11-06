@@ -1804,6 +1804,41 @@ pub(crate) fn unix_now() -> f64 {
         .as_secs_f64()
 }
 
+/// The description a request links to, with whether the resolve that found it already
+/// sent a path request for it during this request. A link opened on a route that asked
+/// fails at once for want of a path instead of asking a second time.
+#[derive(Clone, Copy)]
+pub(crate) struct Route {
+    pub(crate) desc: DestinationDesc,
+    pub(crate) path_requested: bool,
+}
+
+impl Route {
+    /// `options` for a request over this route.
+    pub(crate) fn options(self, options: RequestOptions) -> RequestOptions {
+        RequestOptions {
+            path_requested: options.path_requested || self.path_requested,
+            ..options
+        }
+    }
+}
+
+/// A description held without asking the network for it.
+impl From<DestinationDesc> for Route {
+    fn from(desc: DestinationDesc) -> Self {
+        Self {
+            desc,
+            path_requested: false,
+        }
+    }
+}
+
+impl From<&DestinationDesc> for Route {
+    fn from(desc: &DestinationDesc) -> Self {
+        Self::from(*desc)
+    }
+}
+
 impl MeshRuntime {
     /// Sends `message` to the trusted instance at `destination_hex`. The link is tried
     /// first; a peer that cannot be reached gets the message held by a propagation node
@@ -1900,13 +1935,13 @@ impl MeshRuntime {
         {
             return Err(not_trusted());
         }
-        let desc = self
-            .resolve_destination(&destination)
-            .await
-            .ok_or_else(|| SendError::UnknownDestination {
+        let route = self.resolve_route(&destination).await.ok_or_else(|| {
+            SendError::UnknownDestination {
                 destination: destination.clone(),
                 recently_seen: !peer.is_stale(SystemTime::now()),
-            })?;
+            }
+        })?;
+        let desc = route.desc;
         let dest8 = short(&destination);
         let (kind, id) = (message.kind, message.id.as_str());
         let unreachable = match self
@@ -1914,7 +1949,7 @@ impl MeshRuntime {
                 &desc,
                 MESSAGE_PATH,
                 to_request_body(message, unix_now()),
-                options.request,
+                route.options(options.request),
             )
             .await
         {
@@ -2083,22 +2118,32 @@ impl MeshRuntime {
         }
     }
 
-    /// The description a request to `destination_hex` links to, with `name` the announce's
-    /// truncated name hash. A key the peer table kept from an earlier announce comes first,
-    /// once it proves it derives the destination, so a restart does not wait on a fresh
-    /// announce. It is answered at once when the transport already holds a description or
-    /// a path for it; otherwise a single path request is sent and waited on for up to
-    /// `PATH_REQUEST_TIMEOUT`. The kept description is returned whether or not a path
-    /// arrived: an unanswered request is noted, so the request that follows fails at its
-    /// link without asking again, and `send` then holds the message on a propagation node,
-    /// which needs only the key. Without such a key the transport's description is used:
-    /// one it holds is answered at once with no request, even when its path has expired
-    /// (the link then asks for the path itself), and one it does not hold is asked for once
-    /// over the network and waited for up to `PATH_REQUEST_TIMEOUT`. `None` otherwise.
+    /// The description `resolve_route` finds, for the tests that check what a resolve
+    /// returns rather than link over it.
+    #[cfg(test)]
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
     ) -> Option<DestinationDesc> {
+        self.resolve_route(destination_hex)
+            .await
+            .map(|route| route.desc)
+    }
+
+    /// The route a request to `destination_hex` links over, with `name` the announce's
+    /// truncated name hash. A key the peer table kept from an earlier announce comes first,
+    /// once it proves it derives the destination, so a restart does not wait on a fresh
+    /// announce. It is answered at once when the transport already holds a description or
+    /// a path for it; otherwise a single path request is sent and waited on for up to
+    /// `PATH_REQUEST_TIMEOUT`, and the route says so, so the request that follows fails at
+    /// its link without asking again. The kept description is returned whether or not a
+    /// path arrived: `send` then holds the message on a propagation node, which needs only
+    /// the key. Without such a key the transport's description is used: one it holds is
+    /// answered at once with no request, even when its path has expired (the link then
+    /// asks for the path itself), and one it does not hold is asked for once over the
+    /// network and waited for up to `PATH_REQUEST_TIMEOUT`, coming back only with the path
+    /// that answered. `None` otherwise.
+    pub(crate) async fn resolve_route(&self, destination_hex: &str) -> Option<Route> {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
         let transport = self.transport_handle().await?;
@@ -2106,7 +2151,7 @@ impl MeshRuntime {
             .peers()
             .get(&destination)
             .and_then(|record| record.verified_destination());
-        let desc = match persisted {
+        let route = match persisted {
             Some(desc) => {
                 let known = transport.destination_desc(&address_hash).await.is_some()
                     || transport.has_path(&address_hash).await;
@@ -2115,25 +2160,26 @@ impl MeshRuntime {
                         .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
                         .await
                 {
-                    self.note_unanswered_path_request(&destination);
                     debug!(
                         "Mesh found no path to {} within {} s; using its stored key, so a send can fall back to a propagation node without asking again",
                         short(&destination),
                         PATH_REQUEST_TIMEOUT.as_secs()
                     );
                 }
-                Some(desc)
+                Some(Route {
+                    desc,
+                    path_requested: !known,
+                })
             }
-            None => {
-                transport
-                    .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
-                    .await
-            }
+            None => transport
+                .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
+                .await
+                .map(Route::from),
         };
-        if desc.is_none() {
+        if route.is_none() {
             debug!("Mesh found no route to {}", short(&destination));
         }
-        desc
+        route
     }
 
     /// The peer table's row for `destination_hex`. A destination without one is asked for

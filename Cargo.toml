@@ -155,10 +155,11 @@ arc-swap = "1.9.2"
 # sent for a handler), `SingleInputDestination::set_max_request_size` and
 # `SingleInputDestination::set_max_response_size` (the responder's caps on what it accepts
 # and what it sends), and `SharedInstanceOptions::with_state_events` with
-# `SharedInstanceEvent` (the shared instance client's connection state), and
-# `Transport::interface_connect_count` with its synchronous twin
+# `SharedInstanceEvent` (the shared instance client's connection state). The 0.18.1
+# release adds `Transport::interface_connect_count` with its synchronous twin
 # `TcpRuntimeStatusHandle::connected_streams` (how many streams an interface's client
-# has established since it was spawned, every reconnect included).
+# has established since it was spawned, every reconnect included); Coyote does not read
+# them yet.
 #
 # `lxmf-wire` still comes from upstream LXMF-rs, so its version no longer matches the
 # fork's. What ties the two is `reticulum-rs-core`: the fork depends on

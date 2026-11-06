@@ -335,18 +335,18 @@ pub(crate) async fn open_link(
         Err(RnsError::NoPath) => {
             let wait = PATH_REQUEST_TIMEOUT.min(deadline.remaining());
             debug!(
-                "Mesh has no path to {}; asking the network for a path to it (up to {} ms)",
+                "Mesh is asking the network for a path to {} (up to {:.1} s)",
                 short(&destination_hex),
-                wait.as_millis()
+                wait.as_secs_f64()
             );
             if !transport
                 .await_path(&destination.address_hash, wait, None)
                 .await
             {
                 debug!(
-                    "Mesh heard no path to {} within {} ms; the request fails for want of one",
+                    "Mesh heard no path to {} within {:.1} s; the request fails for want of one",
                     short(&destination_hex),
-                    wait.as_millis()
+                    wait.as_secs_f64()
                 );
                 return Err(no_path());
             }

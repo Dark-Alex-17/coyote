@@ -13,7 +13,7 @@ use crate::mesh::fetch::{
     spent_attachment_tool_message,
 };
 use crate::mesh::message::{
-    OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, SendError,
+    OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, Route, SendError,
     collect_next_action, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::pending::{
@@ -34,7 +34,6 @@ use anyhow::{Result, anyhow, bail};
 use futures_util::{StreamExt, stream};
 use indexmap::IndexMap;
 use log::debug;
-use rns_transport::destination::DestinationDesc;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::path::Path;
@@ -654,17 +653,14 @@ async fn trusted_peer(runtime: &MeshRuntime, peer: &str) -> Result<(String, Peer
 async fn trusted_destination(
     runtime: &MeshRuntime,
     peer: &str,
-) -> Result<(PeerRecord, DestinationDesc), Value> {
+) -> Result<(PeerRecord, Route), Value> {
     let (destination, record) = trusted_peer(runtime, peer).await?;
     Ok((record, resolved_destination(runtime, &destination).await?))
 }
 
-async fn resolved_destination(
-    runtime: &MeshRuntime,
-    destination: &str,
-) -> Result<DestinationDesc, Value> {
-    match runtime.resolve_destination(destination).await {
-        Some(desc) => Ok(desc),
+async fn resolved_destination(runtime: &MeshRuntime, destination: &str) -> Result<Route, Value> {
+    match runtime.resolve_route(destination).await {
+        Some(route) => Ok(route),
         None => Err(unreachable_live(runtime, destination)),
     }
 }
@@ -1386,11 +1382,11 @@ async fn handle_list(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     let peer = required_str(args, "peer")?;
     let prefix = optional_str(args, "prefix");
     let cursor = optional_str(args, "cursor");
-    let (record, desc) = match trusted_destination(runtime, peer).await {
+    let (record, route) = match trusted_destination(runtime, peer).await {
         Ok(trusted) => trusted,
         Err(refusal) => return Ok(refusal),
     };
-    let outcome = runtime.list_shares(&desc, prefix, cursor).await;
+    let outcome = runtime.list_shares(route, prefix, cursor).await;
     Ok(list_result(&record.destination_hash, prefix, outcome))
 }
 
@@ -1414,11 +1410,11 @@ async fn handle_fetch(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     ) {
         return Ok(spent_attachment_result(&destination, path, &reason).await);
     }
-    let desc = match resolved_destination(runtime, &destination).await {
-        Ok(desc) => desc,
+    let route = match resolved_destination(runtime, &destination).await {
+        Ok(route) => route,
         Err(refusal) => return Ok(refusal),
     };
-    let outcome = runtime.fetch_file(&desc, path, if_sha256).await;
+    let outcome = runtime.fetch_file(route, path, if_sha256).await;
     let peer = &record.destination_hash;
     let reason = match outcome {
         Ok(Fetched::NotShared) => not_shared_reason(
@@ -1447,7 +1443,7 @@ async fn handle_request_access(slot: &MeshSlot, args: &Value) -> Result<Value> {
         })
         .ok_or_else(|| anyhow!("'paths' must be an array of path strings"))?;
     Ok(access_result(
-        slot.request_access(peer, &paths, reason).await,
+        slot.request_access(peer, &paths, reason, None).await,
     ))
 }
 

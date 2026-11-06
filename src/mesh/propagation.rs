@@ -542,7 +542,9 @@ pub(crate) async fn propagate(
 /// Puts a prepared envelope in front of `node` and waits for its verdict. The link events
 /// are subscribed right before the send so no answer to it can slip past. The envelope is
 /// borrowed so a retry can resend the same transient id and stamp, as the reference does
-/// by caching its encrypted form across attempts (`LXMessage.py:426-428`).
+/// by caching its encrypted form across attempts (`LXMessage.py:426-428`). A node with no
+/// path is asked for one inside the link, a wait `cancel` does not end; a caller that must
+/// stay cancellable asks first and sets `path_requested` in `options`.
 pub(crate) async fn send_envelope(
     transport: &Transport,
     node: &PropagationNode,

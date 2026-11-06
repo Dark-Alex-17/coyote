@@ -1821,6 +1821,35 @@ fn cargo_toml_dependency_version(cargo_toml: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("Cargo.toml has no `{name} = \"<version>\"` line"))
 }
 
+/// The comment above the `coyote-rns-transport` pin lists the fork-only surface the pinned
+/// release brings, the per-interface connect counter and its synchronous twin included.
+#[test]
+fn the_transport_pin_comment_names_the_fork_connect_counter() {
+    let cargo_toml = read(repo_root().join("Cargo.toml"));
+    let comment: String = cargo_toml
+        .split_once("\ncoyote-rns-transport = \"")
+        .map(|(before, _)| before)
+        .expect("Cargo.toml pins `coyote-rns-transport`")
+        .lines()
+        .rev()
+        .take_while(|line| line.starts_with('#'))
+        .map(|line| line.trim_start_matches('#').trim())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for name in [
+        "`Transport::interface_connect_count`",
+        "`TcpRuntimeStatusHandle::connected_streams`",
+    ] {
+        assert!(
+            comment.contains(name),
+            "the comment above the `coyote-rns-transport` pin must name {name}"
+        );
+    }
+}
+
 /// A `[[package]]` entry of `Cargo.lock`: its version and the source it resolves from
 /// (`None` for a workspace member, which carries no `source` line).
 struct LockPackage {

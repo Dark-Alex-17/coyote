@@ -423,8 +423,7 @@ pub(crate) mod network {
         AccessError, AccessMessage, AccessOptions, AccessOutcome, AccessRequestOutcome, GrantKind,
         ValidAccess, decode_access_message, validate_access,
     };
-    use crate::mesh::announce::AnnounceAppData;
-    use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
+    use crate::mesh::announce::{AnnounceAppData, PATH_REQUEST_TIMEOUT};
     use crate::mesh::brief::Digest;
     use crate::mesh::card::{
         BRANCH_MAX_CHARS, CardSource, DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS,
@@ -872,6 +871,12 @@ pub(crate) mod network {
         }
 
         pub(crate) async fn stop(self) {
+            self.stop_listening().await;
+        }
+
+        /// Stops this responder's listener without consuming it, so nothing answers for
+        /// its destination any more.
+        pub(crate) async fn stop_listening(&self) {
             self.transport
                 .iface_manager()
                 .lock()
@@ -1590,12 +1595,7 @@ pub(crate) mod network {
         /// Takes node B off the network while node A, and anything else A joined, stays
         /// up: B's listener stops, so nothing answers for B any more.
         pub(crate) async fn stop_b(&self) {
-            self.responder
-                .transport
-                .iface_manager()
-                .lock()
-                .await
-                .stop_interface(self.responder.iface);
+            self.responder.stop_listening().await;
         }
 
         /// Node A's config dir, where its global share list lives.
@@ -10539,6 +10539,7 @@ pub(crate) mod network {
         let b_instance = b_hash.to_hex_string();
         let transport = pair.node_a.transport_handle().await.unwrap();
         assert!(transport.expire_path(&b_hash).await, "A held a path to B");
+        assert!(!transport.has_path(&b_hash).await);
         let message =
             OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
         pair.recorder_b
@@ -10609,6 +10610,39 @@ pub(crate) mod network {
         assert_eq!(pair.recorder_b.seen_count(), 0, "nothing reached node B");
         pair.stop_node_a().await;
         node.stop().await;
+    }
+
+    /// A link opened on a deadline whose caller already sent a path request does not ask
+    /// again: a destination without a path fails as `LinkFailed` naming no known path at
+    /// once, long before the link deadline a second path request would have waited on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_whose_path_was_already_asked_for_fails_at_once_without_asking_again() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, _) = pair(recorder.clone()).await;
+        let (_, ghost) = ghost_destination();
+        let ghost_hex = ghost.address_hash.to_hex_string();
+
+        let asked = Instant::now();
+        let opened = open_link(
+            &requester.transport,
+            &ghost,
+            TEST_PATH,
+            Deadline::after(Duration::from_secs(3)).with_path_requested(true),
+        )
+        .await;
+        let waited = asked.elapsed();
+
+        let Err(RequestError::LinkFailed(reason)) = opened else {
+            panic!("expected LinkFailed for a destination without a path");
+        };
+        assert_eq!(reason, format!("no known path to destination {ghost_hex}"));
+        assert!(
+            waited < Duration::from_millis(500),
+            "a link whose path was already asked for does not wait: {waited:?}"
+        );
+        assert_eq!(recorder.seen_count(), 0);
+        requester.stop().await;
+        responder.stop().await;
     }
 
     mod stalled_upload_fallback_tests {

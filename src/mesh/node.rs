@@ -36,7 +36,7 @@ use crate::mesh::message::{
     CHECK_INBOX_NEXT_ACTION, Disposition, INBOX_FULL_TEXT_POINTER, ModelNotes, OutboundPeer,
     PEER_INBOX_CAPACITY, PEER_LINE_MAX_CHARS, Part, PartLimits, PeerAdmission, PeerInbox, PeerKind,
     PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPart, RawPeerMessage,
-    SendError, SendOutcome, collect_next_action, is_wire_id, unix_now,
+    Route, SendError, SendOutcome, collect_next_action, is_wire_id, unix_now,
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
@@ -741,11 +741,6 @@ pub(crate) struct MeshRuntime {
     /// for the same node serialised, so a second poster waits here rather than sharing
     /// the out-link.
     posting: Mutex<()>,
-    /// Destinations a resolve by stored key asked the network for and heard no path to,
-    /// with when the wait ended. The next request to one within `PATH_REQUEST_TIMEOUT`
-    /// takes its entry and opens its link as one whose path was already asked for, so a
-    /// resolve and the request after it pay one path-request wait, not two.
-    unanswered_path_requests: parking_lot::Mutex<HashMap<String, tokio::time::Instant>>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
     /// Every request's path and deadlines in the order they were made, for the tests
@@ -1022,7 +1017,6 @@ impl MeshRuntime {
             last_announce_at,
             fetching: Mutex::new(()),
             posting: Mutex::new(()),
-            unanswered_path_requests: parking_lot::Mutex::new(HashMap::new()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
             #[cfg(all(test, unix))]
@@ -1545,9 +1539,10 @@ impl MeshRuntime {
         let sender = to_core_private_identity(&self.transport_identity);
         let origin = self.destination.lock().await.origin;
         let cancel = self.cancellation_token();
-        request_path_to_node(&transport, node, &cancel, PropagationError::Cancelled).await?;
+        let asked =
+            request_path_to_node(&transport, node, &cancel, PropagationError::Cancelled).await?;
         let options = PropagationOptions {
-            path_requested: true,
+            path_requested: asked,
             ..*options
         };
         propagation::propagate(
@@ -1596,10 +1591,6 @@ impl MeshRuntime {
         }
         let dest_hex = destination.address_hash.to_hex_string();
         refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
-        let options = RequestOptions {
-            path_requested: options.path_requested || self.take_unanswered_path_request(&dest_hex),
-            ..options
-        };
         let transport = self
             .transport
             .lock()
@@ -1631,35 +1622,18 @@ impl MeshRuntime {
         Envelope::new(self.destination.lock().await.origin, body)
     }
 
-    /// Records that a path request for `destination_hex` (lowercase hex) just went
-    /// unanswered, for the request that follows it to take.
-    pub(super) fn note_unanswered_path_request(&self, destination_hex: &str) {
-        let now = tokio::time::Instant::now();
-        let mut asked = self.unanswered_path_requests.lock();
-        asked.retain(|_, at| now.duration_since(*at) < PATH_REQUEST_TIMEOUT);
-        asked.insert(destination_hex.to_string(), now);
-    }
-
-    /// Whether a path request for `destination_hex` went unanswered within the last
-    /// `PATH_REQUEST_TIMEOUT`, removing the record so only one request takes it.
-    fn take_unanswered_path_request(&self, destination_hex: &str) -> bool {
-        self.unanswered_path_requests
-            .lock()
-            .remove(destination_hex)
-            .is_some_and(|at| at.elapsed() < PATH_REQUEST_TIMEOUT)
-    }
-
     /// Asks `destination` to trust this node's current instance, with `intro` as the
     /// words. The link is tried first; a peer that cannot be reached gets the knock held
     /// by a propagation node until it next fetches.
     pub(crate) async fn knock(
         &self,
-        destination: &DestinationDesc,
+        destination: impl Into<Route>,
         intro: &KnockIntro,
     ) -> Result<KnockOutcome, KnockError> {
+        let route = destination.into();
         let mut options = KnockOptions::default();
-        options.request = self.request_timeouts.raise(options.request);
-        self.knock_with(destination, intro, options).await
+        options.request = route.options(self.request_timeouts.raise(options.request));
+        self.knock_with(&route.desc, intro, options).await
     }
 
     /// `knock` with its timeouts chosen. The dispatcher answers a knock with `NoAccess` by
@@ -1794,7 +1768,7 @@ impl MeshRuntime {
         let node = self.propagation_nodes.select()?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
         let cancel = self.cancellation_token();
-        request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
+        let asked = request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
         let peers = PeerRouting {
             trust: &self.trust,
             surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
@@ -1818,7 +1792,7 @@ impl MeshRuntime {
             &mut store,
             &routing,
             &FetchOptions {
-                path_requested: true,
+                path_requested: asked,
                 ..FetchOptions::default()
             },
             cancel,
@@ -3590,18 +3564,18 @@ async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
 /// transport does not rebroadcast announces, so the path comes only from an answered
 /// request. One request, waited on for `PATH_REQUEST_TIMEOUT`; without an answer the link
 /// fails as it would have. Stopping the node ends the wait with `cancelled`, the caller's
-/// own error for a stop. This is the one path request of the post or fetch that follows:
-/// its link is opened as one whose path was already asked for, so it never waits again
+/// own error for a stop. Whether a request was sent: the post or fetch that follows opens
+/// its link as one whose path was already asked for when it was, so it never waits again
 /// outside this cancellable wait.
 async fn request_path_to_node<E>(
     transport: &Transport,
     node: &PropagationNode,
     cancel: &CancellationToken,
     cancelled: E,
-) -> Result<(), E> {
+) -> Result<bool, E> {
     let hash = node.destination.address_hash;
     if transport.has_path(&hash).await {
-        return Ok(());
+        return Ok(false);
     }
     debug!(
         "Mesh has no path to propagation node {}; asking the mesh for one",
@@ -3620,7 +3594,7 @@ async fn request_path_to_node<E>(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn persist_tables_periodically(
@@ -20226,7 +20200,7 @@ mod tests {
                 runtime.list_shares(desc, None, None).await.unwrap_err();
             }
             ACCESS_PATH => {
-                slot.request_access(to, &["docs/a.md".to_string()], "")
+                slot.request_access(to, &["docs/a.md".to_string()], "", None)
                     .await
                     .unwrap_err();
             }

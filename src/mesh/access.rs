@@ -23,7 +23,7 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
     Disposition, FirstContactMiss, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia,
-    RawPart, SendError, SendOutcome, is_wire_id, left_mesh_hint_when, propagation_remedy,
+    RawPart, Route, SendError, SendOutcome, is_wire_id, left_mesh_hint_when, propagation_remedy,
     unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
@@ -493,12 +493,14 @@ impl MeshSlot {
     /// settles, and closed again unless the peer left the request pending: a grant or
     /// refusal on the wire is the whole answer, and a failed send asked nothing. The
     /// paths stay with the caller; the pending record keeps only the first words of
-    /// what was asked.
+    /// what was asked. `route` is the one the caller already resolved for the peer, if
+    /// any, so the destination is not resolved (and asked for) a second time.
     pub(crate) async fn request_access(
         &self,
         peer_destination: &str,
         paths: &[String],
         reason: &str,
+        route: Option<Route>,
     ) -> Result<AccessRequestOutcome, AccessError> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let request = validate_access(&id, paths.to_vec(), reason).map_err(AccessError::Invalid)?;
@@ -527,12 +529,14 @@ impl MeshSlot {
         {
             return Err(AccessError::Untrusted);
         }
-        let desc = runtime
-            .resolve_destination(&destination)
-            .await
-            .ok_or_else(|| AccessError::UnknownDestination {
-                recently_seen: !peer.is_stale(SystemTime::now()),
-            })?;
+        let route = match route {
+            Some(route) => route,
+            None => runtime.resolve_route(&destination).await.ok_or_else(|| {
+                AccessError::UnknownDestination {
+                    recently_seen: !peer.is_stale(SystemTime::now()),
+                }
+            })?,
+        };
         let now = SystemTime::now();
         self.correlations()
             .open(PendingRecord {
@@ -559,8 +563,10 @@ impl MeshSlot {
             &request.paths,
         );
         let mut options = AccessOptions::default();
-        options.request = runtime.request_timeouts().raise(options.request);
-        let outcome = runtime.request_access_wire(&desc, &request, options).await;
+        options.request = route.options(runtime.request_timeouts().raise(options.request));
+        let outcome = runtime
+            .request_access_wire(&route.desc, &request, options)
+            .await;
         match &outcome {
             Ok(AccessRequestOutcome {
                 status: AccessOutcome::Pending,
@@ -6140,7 +6146,7 @@ mod tests {
 
         let pending = installed
             .slot
-            .request_access(&to, &paths, "need the struct")
+            .request_access(&to, &paths, "need the struct", None)
             .await
             .unwrap();
 
@@ -6205,7 +6211,7 @@ mod tests {
         }));
         let granted = installed
             .slot
-            .request_access(&to, &paths[..1], "")
+            .request_access(&to, &paths[..1], "", None)
             .await
             .unwrap();
         assert_eq!(
@@ -6238,7 +6244,7 @@ mod tests {
         )));
         let refused = installed
             .slot
-            .request_access(&to, &paths, "")
+            .request_access(&to, &paths, "", None)
             .await
             .unwrap();
         assert_eq!(
@@ -6250,7 +6256,7 @@ mod tests {
         responder.set(Script::Refuse(RefusalCode::InvalidData));
         let err = installed
             .slot
-            .request_access(&to, &paths, "")
+            .request_access(&to, &paths, "", None)
             .await
             .unwrap_err();
         assert_eq!(err, AccessError::Refused(RefusalCode::InvalidData));
@@ -6325,7 +6331,7 @@ mod tests {
 
         let pending = installed
             .slot
-            .request_access(&to, &paths, "need the struct")
+            .request_access(&to, &paths, "need the struct", None)
             .await
             .unwrap();
 
@@ -6367,19 +6373,19 @@ mod tests {
         let slot = &installed.slot;
 
         let invalid = slot
-            .request_access(&to, &strings(&["../x.rs"]), "")
+            .request_access(&to, &strings(&["../x.rs"]), "", None)
             .await
             .unwrap_err();
         assert_eq!(invalid, AccessError::Invalid("a path is not a wire path"));
 
         let stranger = hex_lower(&[0x5a; 16]);
         let unknown = slot
-            .request_access(&stranger, &paths, "")
+            .request_access(&stranger, &paths, "", None)
             .await
             .unwrap_err();
         assert_eq!(unknown, AccessError::Untrusted);
         let garbled = slot
-            .request_access("not a hash", &paths, "")
+            .request_access("not a hash", &paths, "", None)
             .await
             .unwrap_err();
         assert_eq!(garbled, AccessError::Untrusted);
@@ -6399,7 +6405,7 @@ mod tests {
             .unwrap();
         let asked = std::time::Instant::now();
         let unannounced = slot
-            .request_access(&silent_destination, &paths, "")
+            .request_access(&silent_destination, &paths, "", None)
             .await
             .unwrap_err();
         let waited = asked.elapsed();
@@ -6427,7 +6433,10 @@ mod tests {
         let store = pending_store(&installed);
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), "not a pending question\n").unwrap();
-        let not_filed = slot.request_access(&to, &paths, "").await.unwrap_err();
+        let not_filed = slot
+            .request_access(&to, &paths, "", None)
+            .await
+            .unwrap_err();
         let AccessError::NotFiled(reason) = not_filed else {
             panic!("{not_filed:?}");
         };
@@ -6439,7 +6448,10 @@ mod tests {
             .trust()
             .untrust_destination(slot.as_ref(), &to, false)
             .unwrap();
-        let withdrawn = slot.request_access(&to, &paths, "").await.unwrap_err();
+        let withdrawn = slot
+            .request_access(&to, &paths, "", None)
+            .await
+            .unwrap_err();
         assert_eq!(withdrawn, AccessError::Untrusted);
 
         assert!(responder.asked().is_empty());

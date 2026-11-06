@@ -15,7 +15,9 @@ use crate::mesh::card::StatusCard;
 use crate::mesh::events::{AccessDecision, MeshEvent, MeshHooks};
 use crate::mesh::grants::GrantStore;
 use crate::mesh::inbox::StageError;
-use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION, Part};
+use crate::mesh::message::{
+    PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION, Part, Route,
+};
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::notify::NoticeText;
 use crate::mesh::request::{
@@ -1629,10 +1631,12 @@ impl MeshRuntime {
     /// all. A page that was read is remembered for `last_listing`.
     pub(crate) async fn list_shares(
         &self,
-        destination: &DestinationDesc,
+        destination: impl Into<Route>,
         prefix: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<SharesPage, FetchError> {
+        let route = destination.into();
+        let destination = &route.desc;
         let body = Value::Map(vec![
             (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
             (
@@ -1644,11 +1648,11 @@ impl MeshRuntime {
                 cursor.map_or(Value::Nil, Value::from),
             ),
         ]);
-        let options = self.request_timeouts().raise(RequestOptions {
+        let options = route.options(self.request_timeouts().raise(RequestOptions {
             request_timeout: PEER_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
             path_requested: false,
-        });
+        }));
         let reply = self
             .request(destination, LIST_PATH, body, options)
             .await
@@ -1681,10 +1685,12 @@ impl MeshRuntime {
     /// holds, so an unchanged file comes back as `NotModified` without its bytes.
     pub(crate) async fn fetch_file(
         &self,
-        destination: &DestinationDesc,
+        destination: impl Into<Route>,
         path: &str,
         if_sha256: Option<[u8; 32]>,
     ) -> Result<Fetched, FetchError> {
+        let route = destination.into();
+        let destination = &route.desc;
         let wire_path = match WirePath::parse(path) {
             Ok(wire_path) => wire_path,
             Err(invalid) => {
@@ -1701,11 +1707,11 @@ impl MeshRuntime {
                 if_sha256.map_or(Value::Nil, |hash| Value::Binary(hash.to_vec())),
             ),
         ]);
-        let options = RequestOptions {
+        let options = route.options(RequestOptions {
             request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
             path_requested: false,
-        };
+        });
         let reply = self
             .request(destination, FETCH_PATH, body, options)
             .await

@@ -1,5 +1,6 @@
 use crate::mesh::brief::{Digest, digest_objective_for};
 use crate::mesh::display_text;
+use crate::mesh::message::Route;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::request::{
     AdmittedRequest, DispatchError, Handler, NoAnswer, RemoteRefusal, Reply, RequestError,
@@ -584,10 +585,11 @@ impl MeshRuntime {
     /// raised by the configured ones.
     pub(crate) async fn request_status(
         &self,
-        destination: &DestinationDesc,
+        destination: impl Into<Route>,
     ) -> Result<StatusCard, StatusError> {
-        let options = self.request_timeouts().raise(RequestOptions::default());
-        self.request_status_with(destination, options).await
+        let route = destination.into();
+        let options = route.options(self.request_timeouts().raise(RequestOptions::default()));
+        self.request_status_with(&route.desc, options).await
     }
 
     /// `request_status` with the caller's timeouts. The request goes to the peer directly
