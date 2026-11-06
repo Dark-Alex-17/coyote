@@ -69,8 +69,8 @@ GO_WORDS = frozenset((
 GO_AHEAD_FILLER = frozenset((
     "ok", "okay", "k", "yes", "yeah", "yep", "yup", "sure", "alright", "right", "great", "cool", "good", "sounds",
     "perfect", "fine", "please", "pls", "and", "then", "now", "so", "get", "it", "that", "this", "let", "lets",
-    "let's", "us", "with", "the", "a", "on", "ahead", "off", "away", "thanks", "thank", "you", "just", "work",
-    "handoff", "brief", "make", "happen", "all", "set", "we", "can", "i", "think", "is", "ready",
+    "let's", "us", "with", "the", "a", "on", "ahead", "off", "away", "thanks", "thank", "you", "work",
+    "handoff", "brief", "all", "set", "we", "can", "i", "think", "is", "ready",
 ))
 
 # The graph variables; a run restored from a discussion park keeps the live values of these.
