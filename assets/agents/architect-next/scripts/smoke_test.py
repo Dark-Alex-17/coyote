@@ -3804,10 +3804,11 @@ check("entry script: intake through GRAPH_STATE", p.returncode == 0 and json.loa
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1",
                                 task_granularity="micro"))
-check("wave_claim: micro -> every item carries review_cadence=batch; wave_delegate renders it with parallel=1 and the item's worktree",
-      len(u["wave"]) == 2 and all(w.get("review_cadence") == "batch" for w in u["wave"])
-      and all(render_inputs("wave_delegate", {"wtask": w}) == {"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch"} for w in u["wave"])
-      and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])), [render_inputs("wave_delegate", {"wtask": w}) for w in u["wave"]])
+micro_wave = [render_inputs("wave_delegate", {"wtask": w}) for w in u["wave"]]
+micro_wave_ok = (len(u["wave"]) == 2 and all(w.get("review_cadence") == "batch" for w in u["wave"])
+                 and micro_wave == [{"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch"} for w in u["wave"]]
+                 and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])))
+check("wave_claim: micro -> every item carries review_cadence=batch; wave_delegate renders it with parallel=1 and the item's worktree", micro_wave_ok, micro_wave)
 
 # ---------------------------------------------------------------- summary
 fails = [n for n, ok, _ in RESULTS if not ok]
