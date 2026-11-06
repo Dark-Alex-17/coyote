@@ -15,13 +15,14 @@ use crate::mesh::node::{
     session_destination_name,
 };
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
+use crate::mesh::propagation_nodes::PROPAGATION_NODE_TABLE_FILE;
 use crate::mesh::request::FETCH_PATH;
 use crate::mesh::test_support::{
     Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
     private_config, snapshot_fixture, wait_until,
 };
 use crate::mesh::trust::TrustOptions;
-use crate::mesh::{decode_hex, hex_lower, mesh_config_dir, short};
+use crate::mesh::{decode_hex, hex_lower, mesh_cache_dir, mesh_config_dir, short};
 use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
@@ -1191,6 +1192,29 @@ async fn wait_for_pn_count(reference: &mut Reference, expected: u64) {
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoins_without_a_command()
  {
+    spooled_message_is_delivered_after_the_rejoin(NodeTableAtRejoin::Kept).await;
+}
+
+/// The same with the saved node table gone while the receiver is off: the join-time sync
+/// finds no propagation node, and what fetches the held message is the driver's retry once
+/// the node announces itself again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn a_spooled_message_is_delivered_after_a_rejoin_with_no_node_on_file_once_the_node_announces()
+ {
+    spooled_message_is_delivered_after_the_rejoin(NodeTableAtRejoin::Forgotten).await;
+}
+
+/// What the receiver's propagation-node table holds when it rejoins.
+#[derive(Clone, Copy, PartialEq)]
+enum NodeTableAtRejoin {
+    /// The table saved at stop, loaded again at start.
+    Kept,
+    /// The saved table removed while the receiver was off, so it starts empty.
+    Forgotten,
+}
+
+async fn spooled_message_is_delivered_after_the_rejoin(table: NodeTableAtRejoin) {
     let Some(mut reference) = Reference::spawn().await else {
         return;
     };
@@ -1208,9 +1232,10 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
     app.mesh
         .set_notifier(Arc::clone(&printed) as Arc<dyn NotificationSink>);
     let (session, _) = session_with_instance_id();
-    // The rejoin's own sync screens the held message before any call could trust the
-    // sender on the live node, so the receiver's trust file names the sender from the
-    // start; the sender's destination survives its restart below.
+    // With the node kept, the rejoin's own sync screens the held message before any call
+    // could trust the sender on the live node, and an untrusted signer's message is
+    // discarded, so the receiver's trust file names the sender from the start; the
+    // sender's destination survives its restart below.
     let trusts_sender = TrustList::default().destination(
         &sender.runtime.current_destination_hash(),
         sender.runtime.fingerprint(),
@@ -1225,7 +1250,7 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
     .await;
     let receiver_destination = receiver.runtime.current_destination_hash();
     // Announces reach only the nodes joined when they are sent: the sender, up first, hears
-    // the receiver's; the receiver hears the sender's after both have restarted below.
+    // the receiver's.
     trust_peer(&sender, &receiver_destination).await;
 
     let pn = reference
@@ -1265,29 +1290,47 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
     );
     wait_for_pn_count(&mut reference, 1).await;
 
+    if table == NodeTableAtRejoin::Forgotten {
+        fs::remove_file(
+            mesh_cache_dir(&mesh_paths(&parked.tmp).cache_dir).join(PROPAGATION_NODE_TABLE_FILE),
+        )
+        .expect("the stop saved the node table");
+    }
     let receiver = parked.rejoin().await;
     assert!(app.mesh.get().is_some());
-    // The node table is saved at stop and loaded at start, so the rejoined node already
-    // knows the propagation node. Heard no later than the stop means it came from disk: a
-    // delayed self-announce from the reference landing after the rejoin would carry a later
-    // `last_seen`, and nothing below announces the node again.
     let filed = receiver.runtime.propagation_nodes().snapshot();
-    assert!(
-        filed.len() == 1
-            && filed[0].node.destination.address_hash.to_hex_string() == pn_hash
-            && filed[0].last_seen <= left_at,
-        "the rejoined node starts with only the propagation node it saved at stop: {:?}",
-        filed
-            .iter()
-            .map(|record| (
+    let on_file: Vec<_> = filed
+        .iter()
+        .map(|record| {
+            (
                 record.node.destination.address_hash.to_hex_string(),
-                record.last_seen
-            ))
-            .collect::<Vec<_>>()
-    );
-    // The rejoined transport knows no identities yet; the sender's start announce brings
-    // back the key the held message was signed with.
+                record.last_seen,
+            )
+        })
+        .collect();
+    match table {
+        // The node table is saved at stop and loaded at start. Heard no later than the
+        // stop means the node came from disk: a delayed self-announce from the reference
+        // landing after the rejoin would carry a later `last_seen`, and nothing below
+        // announces the node again.
+        NodeTableAtRejoin::Kept => assert!(
+            on_file.len() == 1 && on_file[0].0 == pn_hash && on_file[0].1 <= left_at,
+            "the rejoined node starts with only the propagation node it saved at stop: {on_file:?}"
+        ),
+        NodeTableAtRejoin::Forgotten => assert!(
+            on_file.is_empty(),
+            "with no table on file, a node filed this early means the reference's delayed self-announce landed inside the off-window: {on_file:?}"
+        ),
+    }
+    // The rejoined transport knows no identities yet; the sender's start announce, or the
+    // sync's own ask of the mesh, brings back the key the held message was signed with.
     let sender = sender.leave().await.rejoin().await;
+    if table == NodeTableAtRejoin::Forgotten {
+        reference
+            .send("pn_announce", json!({}), REQUEST_TIMEOUT)
+            .await;
+        wait_for_propagation_node(&receiver, &pn_hash).await;
+    }
 
     let inbox = app.mesh.peer_inbox();
     let deadline = Instant::now() + AUTOMATIC_SYNC_TIMEOUT;
