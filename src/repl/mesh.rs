@@ -8513,10 +8513,10 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
             Some(match &status.state {
                 InterfaceState::Connected => return None,
                 // A `local` rnsd is only unreachable when the attach failed or its client
-                // stopped reporting before it connected, and nothing retries it: rnsd
-                // starting later is not enough, the node must start again.
+                // stopped reporting before it connected (a down rnsd reads `Connecting`),
+                // and nothing retries it: whatever the fix, the node must start again.
                 InterfaceState::Unreachable { reason, .. } if status.kind == "local" => format!(
-                    "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until the local rnsd is running and the mesh is restarted with `.mesh off`, then `.mesh on`."
+                    "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until that is fixed (start rnsd or fix mesh.interfaces) and the mesh is restarted with `.mesh off`, then `.mesh on`."
                 ),
                 InterfaceState::Unreachable { reason, .. } if status.is_loopback() => {
                     format!(
@@ -11411,7 +11411,7 @@ mod tests {
                 "WARNING: local rnsd at @rns/default has not finished connecting; mesh traffic through it waits until it does".to_string(),
                 "WARNING: local rnsd at @rns/default lost its connection: rnsd closed the socket; the transport is redialing it, and `.mesh info` shows when it reconnects".to_string(),
                 "WARNING: local rnsd at @rns/default lost its connection: the connection ended; the transport is redialing it, and `.mesh info` shows when it reconnects".to_string(),
-                "WARNING: local rnsd at 127.0.0.1:37428 is unreachable (attach to the shared instance failed: InvalidArgument); sessions on this machine cannot reach each other until the local rnsd is running and the mesh is restarted with `.mesh off`, then `.mesh on`.".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is unreachable (attach to the shared instance failed: InvalidArgument); sessions on this machine cannot reach each other until that is fixed (start rnsd or fix mesh.interfaces) and the mesh is restarted with `.mesh off`, then `.mesh on`.".to_string(),
             ]
         );
     }
