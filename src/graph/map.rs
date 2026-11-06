@@ -2371,6 +2371,67 @@ nodes:
         assert_eq!(output, Some(json!("1")));
     }
 
+    const MAP_ITEM_INPUTS_GRAPH: &str = r#"
+name: t
+start: fan_out
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: worker
+    output_key: output
+    collect_into: results
+  worker:
+    type: agent
+    agent: echo-inputs
+    prompt: "p"
+    inputs:
+      width: "{{item.field}}"
+    state_updates:
+      output: "{{output}}"
+"#;
+
+    /// A map node binds each item under its `as` name in the item's fork,
+    /// and an agent step's `inputs:` resolve against that fork: a lone
+    /// `{{item.field}}` reaches the child graph as that item's value.
+    #[test]
+    #[serial]
+    fn map_item_field_reaches_the_child_through_agent_node_inputs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new("graph-map-tests");
+        materialize_echo_inputs_agent();
+
+        let results = block_on_deep_stack(|| async {
+            let h = Harness::new(MAP_ITEM_INPUTS_GRAPH);
+            let NodeType::Map(map_node) = &h.graph.get_node("fan_out").unwrap().node_type else {
+                panic!("fan_out should be a map node");
+            };
+            let script = ScriptExecutor::new(&h.ws.dir);
+            let step_ctx = StepContext {
+                graph: Arc::clone(&h.graph),
+                script_executor: &script,
+                max_concurrency: 4,
+                abort_signal: &h.abort,
+                branch_mode: false,
+            };
+            let items = json!([{"field": 7}, {"field": 9}]);
+            let mut parent = StateManager::new(HashMap::from([("items".to_string(), items)]));
+            let mut ctx = silent_ctx();
+
+            MapNodeExecutor::execute(map_node, &mut parent, &mut ctx, &step_ctx, "fan_out")
+                .await
+                .unwrap_or_else(|e| panic!("map failed: {e:#}"));
+
+            parent.state().get("results").cloned()
+        });
+
+        assert_eq!(results, Some(json!(["7", "9"])));
+    }
+
     #[tokio::test]
     async fn run_item_chain_reaches_flagged_agent_after_script_step() {
         if !cmd_available("python3") {
