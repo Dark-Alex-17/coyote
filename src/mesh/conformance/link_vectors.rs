@@ -444,7 +444,7 @@ mod tests {
 #[cfg(unix)]
 mod loopback {
     use super::{Case, Direction, KnockRefusal, Len, Mark, OtherReply, VECTORS, Vector};
-    use crate::mesh::announce::AnnounceAppData;
+    use crate::mesh::announce::{AnnounceAppData, PATH_REQUEST_TIMEOUT};
     use crate::mesh::knock::{KnockError, KnockIntro};
     use crate::mesh::message::{OutboundPeer, PeerKind, SendError, received_reply};
     use crate::mesh::node::{KnockOptions, MeshRuntime, MeshSlot};
@@ -1145,10 +1145,11 @@ mod loopback {
             panic!("expected LinkFailed for a destination without a path, got {err:?}");
         };
         assert!(reason.contains("no known path"), "{reason}");
+        let wait = SHORT_LINK_TIMEOUT.min(PATH_REQUEST_TIMEOUT);
         assert!(
-            waited >= SHORT_LINK_TIMEOUT - Duration::from_millis(100)
-                && waited < SHORT_LINK_TIMEOUT + Duration::from_secs(2),
-            "the path request is bounded by the {SHORT_LINK_TIMEOUT:?} link deadline: waited {waited:?}"
+            waited >= wait.saturating_sub(Duration::from_millis(100))
+                && waited < wait + Duration::from_secs(2),
+            "the path request is bounded by the shorter of the {SHORT_LINK_TIMEOUT:?} link deadline and {PATH_REQUEST_TIMEOUT:?}: waited {waited:?}"
         );
         assert!(
             reason.contains(&ghost_hex),

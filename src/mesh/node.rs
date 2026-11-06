@@ -1622,15 +1622,14 @@ impl MeshRuntime {
         Envelope::new(self.destination.lock().await.origin, body)
     }
 
-    /// Asks `destination` to trust this node's current instance, with `intro` as the
-    /// words. The link is tried first; a peer that cannot be reached gets the knock held
-    /// by a propagation node until it next fetches.
+    /// Asks the peer `route` leads to to trust this node's current instance, with `intro`
+    /// as the words. The link is tried first; a peer that cannot be reached gets the knock
+    /// held by a propagation node until it next fetches.
     pub(crate) async fn knock(
         &self,
-        destination: impl Into<Route>,
+        route: Route,
         intro: &KnockIntro,
     ) -> Result<KnockOutcome, KnockError> {
-        let route = destination.into();
         let mut options = KnockOptions::default();
         options.request = route.options(self.request_timeouts.raise(options.request));
         self.knock_with(&route.desc, intro, options).await
@@ -16856,7 +16855,7 @@ mod tests {
                 .resolve_destination(&answerer.current_destination_hash())
                 .await
                 .expect("the answerer's destination resolves from its announce");
-            asker.request_status(&desc).await
+            asker.request_status(Route::unasked(desc)).await
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20227,7 +20226,7 @@ mod tests {
                 config.link_timeout_secs = timers.1;
             })
             .await;
-        drive(&runtime, &slot, &desc, &to, path).await;
+        drive(&runtime, &slot, Route::unasked(desc), &to, path).await;
         let recorded = runtime.requests_made();
         let options = recorded
             .iter()
@@ -20240,12 +20239,12 @@ mod tests {
     }
 
     /// Makes one request on `path` through the entry point a caller of the runtime uses,
-    /// so the recorded deadlines are the ones that entry point chose.
+    /// over `route`, so the recorded options are the ones that entry point chose.
     #[cfg(unix)]
     async fn drive(
         runtime: &Arc<MeshRuntime>,
         slot: &Arc<MeshSlot>,
-        desc: &DestinationDesc,
+        route: Route,
         to: &str,
         path: &str,
     ) {
@@ -20256,24 +20255,24 @@ mod tests {
             }
             KNOCK_PATH => {
                 runtime
-                    .knock(desc, &KnockIntro::new("hi").unwrap())
+                    .knock(route, &KnockIntro::new("hi").unwrap())
                     .await
                     .unwrap_err();
             }
             LIST_PATH => {
-                runtime.list_shares(desc, None, None).await.unwrap_err();
+                runtime.list_shares(route, None, None).await.unwrap_err();
             }
             ACCESS_PATH => {
-                slot.request_access(to, &["docs/a.md".to_string()], "", None)
+                slot.request_access(to, &["docs/a.md".to_string()], "", Some(route))
                     .await
                     .unwrap_err();
             }
             STATUS_PATH => {
-                runtime.request_status(desc).await.unwrap_err();
+                runtime.request_status(route).await.unwrap_err();
             }
             FETCH_PATH => {
                 runtime
-                    .fetch_file(desc, "docs/a.md", None)
+                    .fetch_file(route, "docs/a.md", None)
                     .await
                     .unwrap_err();
             }
@@ -20305,7 +20304,7 @@ mod tests {
             STATUS_PATH,
             FETCH_PATH,
         ] {
-            drive(&runtime, &slot, &desc, &to, path).await;
+            drive(&runtime, &slot, Route::unasked(desc), &to, path).await;
         }
 
         let peer = RequestOptions {
@@ -20338,6 +20337,41 @@ mod tests {
                 ),
             ]
         );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// A route whose resolve already sent a path request reaches the request options of
+    /// every verb that takes a route, so none of their links asks a second time.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_route_that_asked_for_its_path_reaches_every_verbs_request_options() {
+        let (stub, runtime, slot, desc, to, _, _tmp) =
+            marked_incompatible_stub("node-route-asked").await;
+        let asked = Route {
+            desc,
+            path_requested: true,
+        };
+        let paths = [KNOCK_PATH, LIST_PATH, ACCESS_PATH, STATUS_PATH, FETCH_PATH];
+        for path in paths {
+            drive(&runtime, &slot, asked, &to, path).await;
+        }
+
+        let recorded = runtime.requests_made();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|(made, _)| made.as_str())
+                .collect::<Vec<_>>(),
+            paths,
+            "{recorded:?}"
+        );
+        for (path, options) in &recorded {
+            assert!(
+                options.path_requested,
+                "{path} dropped the route's path request: {options:?}"
+            );
+        }
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
     }

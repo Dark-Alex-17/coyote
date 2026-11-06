@@ -581,13 +581,9 @@ impl fmt::Display for StatusError {
 impl std::error::Error for StatusError {}
 
 impl MeshRuntime {
-    /// Asks `destination` for its status card over a live link with the default timeouts,
-    /// raised by the configured ones.
-    pub(crate) async fn request_status(
-        &self,
-        destination: impl Into<Route>,
-    ) -> Result<StatusCard, StatusError> {
-        let route = destination.into();
+    /// Asks the peer `route` leads to for its status card over a live link with the
+    /// default timeouts, raised by the configured ones.
+    pub(crate) async fn request_status(&self, route: Route) -> Result<StatusCard, StatusError> {
         let options = route.options(self.request_timeouts().raise(RequestOptions::default()));
         self.request_status_with(&route.desc, options).await
     }

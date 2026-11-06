@@ -1983,7 +1983,7 @@ async fn route_to(
             out_text(&route_request_line(destination));
             result_follows();
         }
-        return Ok(Route::from(desc));
+        return Ok(Route::unasked(desc));
     }
     out_text(&route_request_line(destination));
     result_follows();

@@ -5201,8 +5201,9 @@ fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_
 /// While a `local` entry beside a relay keeps failing its
 /// dial with the same reason, Coyote's own log names that reason once, not once per 2 s
 /// redial. Two log reads ~8 s apart (four redials) must show no new Coyote line naming
-/// the endpoint. The transport library's own per-dial `couldn't connect` warning is not
-/// Coyote's line and is left out of the count.
+/// the endpoint. The transport library's own `couldn't connect ... (attempt N)` warning
+/// (first attempt, a change of failure kind, then every 30th attempt) is not Coyote's
+/// line and is left out of the count.
 #[test]
 fn a_dialing_local_entry_logs_its_unchanged_dial_failure_once_not_every_redial() {
     let relay = SilentRelay::start();

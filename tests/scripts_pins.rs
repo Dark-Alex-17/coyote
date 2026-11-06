@@ -1821,15 +1821,16 @@ fn cargo_toml_dependency_version(cargo_toml: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("Cargo.toml has no `{name} = \"<version>\"` line"))
 }
 
-/// The comment above the `coyote-rns-transport` pin lists the fork-only surface the pinned
-/// release brings, the per-interface connect counter and its synchronous twin included.
+/// The run of comment lines directly above the `coyote-rns-transport` pin (every paragraph
+/// of it, not only the fork-surface one) names the per-interface connect counter the pinned
+/// release brings and its synchronous twin.
 #[test]
 fn the_transport_pin_comment_names_the_fork_connect_counter() {
     let cargo_toml = read(repo_root().join("Cargo.toml"));
     let comment: String = cargo_toml
-        .split_once("\ncoyote-rns-transport = \"")
+        .split_once(&format!("\n{TRANSPORT_CRATE} = \""))
         .map(|(before, _)| before)
-        .expect("Cargo.toml pins `coyote-rns-transport`")
+        .unwrap_or_else(|| panic!("Cargo.toml pins `{TRANSPORT_CRATE}`"))
         .lines()
         .rev()
         .take_while(|line| line.starts_with('#'))
@@ -1845,7 +1846,7 @@ fn the_transport_pin_comment_names_the_fork_connect_counter() {
     ] {
         assert!(
             comment.contains(name),
-            "the comment above the `coyote-rns-transport` pin must name {name}"
+            "the comment above the `{TRANSPORT_CRATE}` pin must name {name}"
         );
     }
 }

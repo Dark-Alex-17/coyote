@@ -1627,15 +1627,14 @@ impl MeshRuntime {
         }
     }
 
-    /// One page of the files `destination` shares with this node, answered live or not at
-    /// all. A page that was read is remembered for `last_listing`.
+    /// One page of the files the peer `route` leads to shares with this node, answered live
+    /// or not at all. A page that was read is remembered for `last_listing`.
     pub(crate) async fn list_shares(
         &self,
-        destination: impl Into<Route>,
+        route: Route,
         prefix: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<SharesPage, FetchError> {
-        let route = destination.into();
         let destination = &route.desc;
         let body = Value::Map(vec![
             (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
@@ -1685,11 +1684,10 @@ impl MeshRuntime {
     /// holds, so an unchanged file comes back as `NotModified` without its bytes.
     pub(crate) async fn fetch_file(
         &self,
-        destination: impl Into<Route>,
+        route: Route,
         path: &str,
         if_sha256: Option<[u8; 32]>,
     ) -> Result<Fetched, FetchError> {
-        let route = destination.into();
         let destination = &route.desc;
         let wire_path = match WirePath::parse(path) {
             Ok(wire_path) => wire_path,

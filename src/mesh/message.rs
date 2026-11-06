@@ -1814,6 +1814,15 @@ pub(crate) struct Route {
 }
 
 impl Route {
+    /// A route to `desc` whose resolve sent no path request: a description held at
+    /// once, or one that came back only with the path that answered.
+    pub(crate) fn unasked(desc: DestinationDesc) -> Self {
+        Self {
+            desc,
+            path_requested: false,
+        }
+    }
+
     /// `options` for a request over this route.
     pub(crate) fn options(self, options: RequestOptions) -> RequestOptions {
         RequestOptions {
@@ -1823,19 +1832,13 @@ impl Route {
     }
 }
 
-/// A description held without asking the network for it.
-impl From<DestinationDesc> for Route {
-    fn from(desc: DestinationDesc) -> Self {
-        Self {
-            desc,
-            path_requested: false,
-        }
-    }
-}
-
-impl From<&DestinationDesc> for Route {
-    fn from(desc: &DestinationDesc) -> Self {
-        Self::from(*desc)
+/// The destination by its address hash; `DestinationDesc` itself has no `Debug`.
+impl fmt::Debug for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Route")
+            .field("destination", &self.desc.address_hash.to_hex_string())
+            .field("path_requested", &self.path_requested)
+            .finish()
     }
 }
 
@@ -2174,7 +2177,7 @@ impl MeshRuntime {
             None => transport
                 .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
                 .await
-                .map(Route::from),
+                .map(Route::unasked),
         };
         if route.is_none() {
             debug!("Mesh found no route to {}", short(&destination));

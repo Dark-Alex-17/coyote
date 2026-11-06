@@ -1107,7 +1107,7 @@ async fn status(runtime: &MeshRuntime, destination: &str) -> Result<Value, Strin
         .await
         .ok_or_else(|| format!("{destination} is not a filed peer"))?;
     let card = runtime
-        .request_status(&desc)
+        .request_status(crate::mesh::message::Route::unasked(desc))
         .await
         .map_err(|err| format!("{err:?}"))?;
     Ok(json!({

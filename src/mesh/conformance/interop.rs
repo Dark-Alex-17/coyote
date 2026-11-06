@@ -1730,7 +1730,11 @@ async fn our_requests_are_decoded_by_the_reference() {
         .resolve_destination(&reference.ready.destination_hash)
         .await
         .expect("the reference's announce gives the node a description");
-    let card = node.runtime.request_status(&desc).await.unwrap();
+    let card = node
+        .runtime
+        .request_status(crate::mesh::message::Route::unasked(desc))
+        .await
+        .unwrap();
     assert_eq!(card.state.code, 1);
     assert!(card.served_at_secs > 1_700_000_000);
     let heard = reference.next_event("request", REQUEST_TIMEOUT).await;
@@ -1996,7 +2000,10 @@ async fn two_local_clients_of_one_rnsd_knock_through_it_and_follow_it_down_and_b
     let b_desc = a.runtime.resolve_destination(&b_hash).await.unwrap();
     let outcome = a
         .runtime
-        .knock(&b_desc, &KnockIntro::new("hi from A").unwrap())
+        .knock(
+            crate::mesh::message::Route::unasked(b_desc),
+            &KnockIntro::new("hi from A").unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -2084,7 +2091,10 @@ async fn two_local_clients_of_one_rnsd_knock_through_it_and_follow_it_down_and_b
     .await;
     let again = a
         .runtime
-        .knock(&b_desc, &KnockIntro::new("hi again from A").unwrap())
+        .knock(
+            crate::mesh::message::Route::unasked(b_desc),
+            &KnockIntro::new("hi again from A").unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(

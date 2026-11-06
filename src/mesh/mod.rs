@@ -807,7 +807,7 @@ pub(crate) mod test_support {
             .await
             .expect("the answerer's destination resolves from its announce");
         asking
-            .request_status(&desc)
+            .request_status(crate::mesh::message::Route::unasked(desc))
             .await
             .unwrap_or_else(|err| panic!("the status request failed: {err:?}"))
     }

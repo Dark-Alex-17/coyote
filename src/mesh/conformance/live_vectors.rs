@@ -984,7 +984,11 @@ mod loopback {
 
         let fetched = pair
             .node_a
-            .fetch_file(&pair.responder.desc, "docs/c.md", None)
+            .fetch_file(
+                crate::mesh::message::Route::unasked(pair.responder.desc),
+                "docs/c.md",
+                None,
+            )
             .await;
 
         match (expect, fetched) {

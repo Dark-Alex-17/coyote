@@ -444,7 +444,7 @@ pub(crate) mod network {
     use crate::mesh::limits::{PeerRefusal, RefusalReason};
     use crate::mesh::message::{
         Disposition, LxmfPeer, OutboundPeer, PEER_LINK_TIMEOUT, PEER_WIRE_VERSION, Part,
-        PartLimits, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RawPart, RecipientOutcome,
+        PartLimits, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RawPart, RecipientOutcome, Route,
         SendError, SendOutcome, decode_peer_lxmf, from_request_body, is_received_reply,
         received_reply, to_request_body,
     };
@@ -5876,7 +5876,10 @@ pub(crate) mod network {
 
         let outcome = pair
             .node_a
-            .knock(&pair.responder.desc, &KnockIntro::new("hi from A").unwrap())
+            .knock(
+                Route::unasked(pair.responder.desc),
+                &KnockIntro::new("hi from A").unwrap(),
+            )
             .await
             .unwrap();
 
@@ -5913,7 +5916,10 @@ pub(crate) mod network {
 
         let again = pair
             .node_a
-            .knock(&pair.responder.desc, &KnockIntro::new("").unwrap())
+            .knock(
+                Route::unasked(pair.responder.desc),
+                &KnockIntro::new("").unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(again.via, KnockVia::Direct);
@@ -7754,7 +7760,7 @@ pub(crate) mod network {
         let outcome = pair
             .node_a
             .knock(
-                &pair.responder.desc,
+                Route::unasked(pair.responder.desc),
                 &KnockIntro::new("already in").unwrap(),
             )
             .await
@@ -9078,7 +9084,7 @@ pub(crate) mod network {
         );
         let card = pair
             .node_a
-            .request_status(&pair.responder.desc)
+            .request_status(Route::unasked(pair.responder.desc))
             .await
             .unwrap();
         assert_eq!(handler.calls(), 1);
@@ -9112,7 +9118,7 @@ pub(crate) mod network {
             .set_handler(Arc::new(Dispatcher::new(trust, Arc::new(LoggingKnockSink))));
         let err = pair
             .node_a
-            .request_status(&pair.responder.desc)
+            .request_status(Route::unasked(pair.responder.desc))
             .await
             .unwrap_err();
         assert_eq!(
@@ -9127,7 +9133,7 @@ pub(crate) mod network {
         assert!(slot.stop().await.unwrap());
         let err = pair
             .node_a
-            .request_status(&pair.responder.desc)
+            .request_status(Route::unasked(pair.responder.desc))
             .await
             .unwrap_err();
         assert_eq!(err, StatusError::Transport(RequestError::NotRunning));
@@ -9226,12 +9232,12 @@ pub(crate) mod network {
 
         let listed = pair
             .node_a
-            .list_shares(&pair.responder.desc, Some("docs/"), None)
+            .list_shares(Route::unasked(pair.responder.desc), Some("docs/"), None)
             .await
             .unwrap_err();
         let fetched = pair
             .node_a
-            .fetch_file(&pair.responder.desc, "docs/a.md", None)
+            .fetch_file(Route::unasked(pair.responder.desc), "docs/a.md", None)
             .await
             .unwrap_err();
 
@@ -10397,7 +10403,7 @@ pub(crate) mod network {
             .queue(Script::Reply(Reply::Value(served.to_value())));
         let status = pair
             .node_a
-            .request_status(&pair.responder.desc)
+            .request_status(Route::unasked(pair.responder.desc))
             .await
             .unwrap();
         assert_eq!(timeless(status), timeless(served));
@@ -10639,6 +10645,38 @@ pub(crate) mod network {
         assert!(
             waited < Duration::from_millis(500),
             "a link whose path was already asked for does not wait: {waited:?}"
+        );
+        assert_eq!(recorder.seen_count(), 0);
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// A link deadline already spent sends no path request nothing would wait on: a
+    /// destination without a path fails at once with the same no-known-path text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_on_a_spent_deadline_fails_at_once_naming_no_known_path() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, _) = pair(recorder.clone()).await;
+        let (_, ghost) = ghost_destination();
+        let ghost_hex = ghost.address_hash.to_hex_string();
+
+        let asked = Instant::now();
+        let opened = open_link(
+            &requester.transport,
+            &ghost,
+            TEST_PATH,
+            Deadline::after(Duration::ZERO),
+        )
+        .await;
+        let waited = asked.elapsed();
+
+        let Err(RequestError::LinkFailed(reason)) = opened else {
+            panic!("expected LinkFailed for a destination without a path");
+        };
+        assert_eq!(reason, format!("no known path to destination {ghost_hex}"));
+        assert!(
+            waited < Duration::from_millis(500),
+            "a spent deadline does not wait: {waited:?}"
         );
         assert_eq!(recorder.seen_count(), 0);
         requester.stop().await;
@@ -12135,7 +12173,7 @@ pub(crate) mod network {
             .queue(Script::Reply(Reply::Value(ok_body(digest))));
         let fetched = pair
             .node_a
-            .fetch_file(b_desc, "docs/a.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/a.md", None)
             .await
             .unwrap();
         let Fetched::Staged { path, size, sha256 } = fetched else {
@@ -12183,7 +12221,7 @@ pub(crate) mod network {
         )));
         let err = pair
             .node_a
-            .fetch_file(b_desc, "docs/a.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/a.md", None)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::NotServed), "{err:?}");
@@ -12196,7 +12234,7 @@ pub(crate) mod network {
             ]))));
         let err = pair
             .node_a
-            .fetch_file(b_desc, "docs/a.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/a.md", None)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::UnknownStatus), "{err:?}");
@@ -12206,7 +12244,7 @@ pub(crate) mod network {
             .queue(Script::Reply(Reply::Value(ok_body([0; 32]))));
         let err = pair
             .node_a
-            .fetch_file(b_desc, "docs/a.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/a.md", None)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Corrupt), "{err:?}");
@@ -12225,7 +12263,11 @@ pub(crate) mod network {
                 ),
                 ("next", Value::Nil),
             ]))));
-        let page = pair.node_a.list_shares(b_desc, None, None).await.unwrap();
+        let page = pair
+            .node_a
+            .list_shares(Route::unasked(*b_desc), None, None)
+            .await
+            .unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].path, "docs/a.md");
         assert_eq!(page.next, None);
@@ -12241,7 +12283,11 @@ pub(crate) mod network {
         );
 
         let seen = pair.recorder_b.seen_count();
-        let refused = pair.node_a.fetch_file(b_desc, "../x", None).await.unwrap();
+        let refused = pair
+            .node_a
+            .fetch_file(Route::unasked(*b_desc), "../x", None)
+            .await
+            .unwrap();
         assert_eq!(
             refused,
             Fetched::InvalidPath {
@@ -12295,7 +12341,7 @@ pub(crate) mod network {
             ]))));
         let err = pair
             .node_a
-            .fetch_file(b_desc, "docs/a.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/a.md", None)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Stage(_)), "{err:?}");
@@ -12494,7 +12540,7 @@ pub(crate) mod network {
                 .queue(Script::Reply(Reply::Value(answer.clone())));
             let fetched = pair
                 .node_a
-                .fetch_file(b_desc, "docs/c.md", Some(digest))
+                .fetch_file(Route::unasked(*b_desc), "docs/c.md", Some(digest))
                 .await
                 .unwrap();
             assert_eq!(fetched, expected, "{answer:?}");
@@ -12521,7 +12567,7 @@ pub(crate) mod network {
             ]))));
         let err = pair
             .node_a
-            .fetch_file(b_desc, "docs/c.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/c.md", None)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Corrupt), "{err:?}");
@@ -12538,7 +12584,7 @@ pub(crate) mod network {
         )));
         let err = pair
             .node_a
-            .fetch_file(b_desc, "docs/c.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/c.md", None)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::NotServed), "{err:?}");
@@ -12556,7 +12602,7 @@ pub(crate) mod network {
                 .queue(Script::Reply(Reply::Value(refusal.to_value())));
             let err = pair
                 .node_a
-                .list_shares(b_desc, Some("docs/"), None)
+                .list_shares(Route::unasked(*b_desc), Some("docs/"), None)
                 .await
                 .unwrap_err();
             assert!(matches!(err, FetchError::NotServed), "{err:?}");
@@ -12579,7 +12625,7 @@ pub(crate) mod network {
             ]))));
         let fetched = pair
             .node_a
-            .fetch_file(b_desc, "docs/c.md", None)
+            .fetch_file(Route::unasked(*b_desc), "docs/c.md", None)
             .await
             .unwrap();
         assert_eq!(
