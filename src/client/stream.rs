@@ -471,7 +471,80 @@ impl JsonStreamParser {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::{SseEvent, SseHandler};
+    use crate::events::{Event, EventSink, Origin, SubscriptionId, bus};
+
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, ThreadId};
+
+    pub(crate) fn new_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        (SseHandler::new(sender, abort_signal), receiver)
+    }
+
+    /// Records only what this thread publishes: the bus is shared with
+    /// every other test handing over thinking blocks at the same time, and
+    /// `publish` runs each sink on the publishing thread. Unsubscribes on
+    /// drop so a failed assertion leaves no sink behind on the bus.
+    struct ThisThreadSink {
+        thread: ThreadId,
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl EventSink for ThisThreadSink {
+        fn on_event(&self, event: &Event) {
+            if thread::current().id() == self.thread {
+                self.events.lock().unwrap().push(event.clone());
+            }
+        }
+    }
+
+    pub(crate) struct ThisThreadRecording {
+        sink: Arc<ThisThreadSink>,
+        subscription: SubscriptionId,
+    }
+
+    impl ThisThreadRecording {
+        /// Subscribes to the process-wide bus, so it runs under
+        /// `#[serial]`: the bus's own `sink_count` pins in `events::tests`
+        /// must not see a second subscriber.
+        pub(crate) fn install() -> Self {
+            let sink = Arc::new(ThisThreadSink {
+                thread: thread::current().id(),
+                events: Mutex::new(Vec::new()),
+            });
+            let subscription = bus().subscribe(Arc::clone(&sink) as Arc<dyn EventSink>);
+            Self { sink, subscription }
+        }
+
+        pub(crate) fn events(&self) -> Vec<Event> {
+            self.sink.events.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for ThisThreadRecording {
+        fn drop(&mut self) {
+            bus().unsubscribe(self.subscription);
+        }
+    }
+
+    pub(crate) fn detached_pair() -> Vec<Event> {
+        vec![
+            Event::ThinkingStarted {
+                origin: Origin::detached(),
+            },
+            Event::ThinkingStopped {
+                origin: Origin::detached(),
+            },
+        ]
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{ThisThreadRecording, detached_pair, new_handler};
     use super::*;
 
     use bytes::Bytes;
@@ -559,12 +632,6 @@ mod tests {
         assert!(format!("{err:#}").starts_with("Failed to read json stream"));
     }
 
-    fn new_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let abort_signal = crate::utils::create_abort_signal();
-        (SseHandler::new(sender, abort_signal), receiver)
-    }
-
     #[test]
     fn test_has_received_content_text() {
         let (mut handler, _rx) = new_handler();
@@ -613,51 +680,6 @@ mod tests {
         assert!(handler.has_received_visible_output());
     }
 
-    /// Records only what this thread publishes: the bus is shared with
-    /// every other test handing over thinking blocks at the same time, and
-    /// `publish` runs each sink on the publishing thread. Unsubscribes on
-    /// drop so a failed assertion leaves no sink behind on the bus.
-    struct ThisThreadSink {
-        thread: std::thread::ThreadId,
-        events: std::sync::Mutex<Vec<Event>>,
-    }
-
-    impl crate::events::EventSink for ThisThreadSink {
-        fn on_event(&self, event: &Event) {
-            if std::thread::current().id() == self.thread {
-                self.events.lock().unwrap().push(event.clone());
-            }
-        }
-    }
-
-    struct ThisThreadRecording {
-        sink: std::sync::Arc<ThisThreadSink>,
-        subscription: crate::events::SubscriptionId,
-    }
-
-    impl ThisThreadRecording {
-        /// Subscribes to the process-wide bus, so it runs under
-        /// `#[serial]`: the bus's own `sink_count` pins in `events::tests`
-        /// must not see a second subscriber.
-        fn install() -> Self {
-            let sink = std::sync::Arc::new(ThisThreadSink {
-                thread: std::thread::current().id(),
-                events: std::sync::Mutex::new(Vec::new()),
-            });
-            let subscription =
-                bus()
-                    .subscribe(std::sync::Arc::clone(&sink)
-                        as std::sync::Arc<dyn crate::events::EventSink>);
-            Self { sink, subscription }
-        }
-    }
-
-    impl Drop for ThisThreadRecording {
-        fn drop(&mut self) {
-            bus().unsubscribe(self.subscription);
-        }
-    }
-
     #[test]
     #[serial_test::serial]
     fn a_thinking_block_publishes_started_then_stopped() {
@@ -667,18 +689,7 @@ mod tests {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         });
-        assert_eq!(*recording.sink.events.lock().unwrap(), detached_pair());
-    }
-
-    fn detached_pair() -> Vec<Event> {
-        vec![
-            Event::ThinkingStarted {
-                origin: Origin::detached(),
-            },
-            Event::ThinkingStopped {
-                origin: Origin::detached(),
-            },
-        ]
+        assert_eq!(recording.events(), detached_pair());
     }
 
     #[test]
@@ -691,7 +702,7 @@ mod tests {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         });
-        assert_eq!(*recording.sink.events.lock().unwrap(), detached_pair());
+        assert_eq!(recording.events(), detached_pair());
     }
 
     #[test]
@@ -701,7 +712,7 @@ mod tests {
         let (mut handler, _rx) = new_handler();
         handler.thinking_started();
         handler.done();
-        assert_eq!(*recording.sink.events.lock().unwrap(), detached_pair());
+        assert_eq!(recording.events(), detached_pair());
     }
 
     #[test]
@@ -717,7 +728,7 @@ mod tests {
         handler.thinking_started();
         handler.thinking_stopped();
         assert_eq!(
-            *recording.sink.events.lock().unwrap(),
+            recording.events(),
             vec![
                 Event::ThinkingStarted {
                     origin: origin.clone()
@@ -736,7 +747,7 @@ mod tests {
         handler.thinking_started();
         handler.thinking_stopped();
         handler.thinking_stopped();
-        assert_eq!(*recording.sink.events.lock().unwrap(), detached_pair());
+        assert_eq!(recording.events(), detached_pair());
     }
 
     #[test]
@@ -749,7 +760,7 @@ mod tests {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         });
-        assert!(recording.sink.events.lock().unwrap().is_empty());
+        assert!(recording.events().is_empty());
         let (_, _, thinking, _) = handler.take();
         assert_eq!(thinking.len(), 1);
     }

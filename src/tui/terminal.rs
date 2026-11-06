@@ -17,6 +17,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use std::io::{self, Write};
 use std::sync::Once;
 #[cfg(unix)]
@@ -282,15 +283,70 @@ pub(crate) fn leave(writer: &mut impl Write) -> io::Result<()> {
 }
 
 /// One frame bracketed by a synchronized update so the terminal paints it
-/// atomically.
+/// atomically. Rows holding emoji or VS16/ZWJ graphemes are re-emitted
+/// whole after ratatui's cell diff, since terminals disagree on how many
+/// columns those take and a partial repaint leaves ghost cells behind.
 pub(crate) fn draw_frame<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     render: impl FnOnce(&mut ratatui::Frame),
 ) -> io::Result<()> {
     execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-    let drawn = terminal.draw(render).map(|_| ());
+    let drawn = draw_and_repaint_uncertain(terminal, render);
     let ended = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
     drawn.and(ended)
+}
+
+/// Draws the frame, then writes every cell of each row `uncertain_rows`
+/// picks straight to the backend. The hardware cursor is hidden for the
+/// whole UI (nothing sets a cursor position), so the extra draw cannot
+/// leave it somewhere ratatui does not expect.
+fn draw_and_repaint_uncertain<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    render: impl FnOnce(&mut ratatui::Frame),
+) -> Result<(), B::Error> {
+    let cells = uncertain_rows(terminal.draw(render)?.buffer);
+    if cells.is_empty() {
+        return Ok(());
+    }
+    let backend = terminal.backend_mut();
+    backend.draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+    backend.flush()
+}
+
+/// Every cell, in x order, of each row whose symbols include an emoji
+/// presentation sequence (U+FE0F), a ZWJ sequence (U+200D), a symbol from
+/// the U+2600..=U+27BF blocks, or anything at U+1F000 and above. Cells
+/// hidden under a wide grapheme are left out the way ratatui's own diff
+/// leaves them out, so the repaint never splits a grapheme.
+fn uncertain_rows(buffer: &Buffer) -> Vec<(u16, u16, Cell)> {
+    let area = buffer.area;
+    let mut cells = Vec::new();
+    for y in area.top()..area.bottom() {
+        let row = (area.left()..area.right()).map(|x| &buffer[(x, y)]);
+        if !row
+            .clone()
+            .any(|cell| cell.symbol().chars().any(is_width_uncertain))
+        {
+            continue;
+        }
+        let mut hidden = 0u16;
+        for (x, cell) in (area.left()..area.right()).zip(row) {
+            if hidden > 0 {
+                hidden -= 1;
+                continue;
+            }
+            if matches!(cell.diff_option, CellDiffOption::Skip) {
+                continue;
+            }
+            hidden = cell.cell_width().saturating_sub(1);
+            cells.push((x, y, cell.clone()));
+        }
+    }
+    cells
+}
+
+fn is_width_uncertain(c: char) -> bool {
+    matches!(c, '\u{FE0F}' | '\u{200D}' | '\u{2600}'..='\u{27BF}') || c >= '\u{1F000}'
 }
 
 /// Clears the terminal and forgets both of ratatui's buffers so the next
@@ -444,7 +500,8 @@ impl Drop for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::layout::Rect;
+    use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
+    use ratatui::layout::{Position, Rect, Size};
     use ratatui::widgets::Paragraph;
     use ratatui::{TerminalOptions, Viewport};
     use serial_test::serial;
@@ -672,6 +729,150 @@ mod tests {
         let bytes = out.take();
         assert!(bytes.starts_with("\x1b[?2026h"), "{bytes:?}");
         assert!(bytes.ends_with("\x1b[?2026l"), "{bytes:?}");
+    }
+
+    fn positions(cells: &[(u16, u16, Cell)]) -> Vec<(u16, u16)> {
+        cells.iter().map(|(x, y, _)| (*x, *y)).collect()
+    }
+
+    /// Every column of row `y` except the ones hidden under the wide
+    /// grapheme at `wide_x`.
+    fn whole_row(buffer: &Buffer, y: u16, wide_x: u16) -> Vec<(u16, u16)> {
+        let hidden = wide_x + 1..wide_x + buffer[(wide_x, y)].cell_width();
+        (0..buffer.area.width)
+            .filter(|x| !hidden.contains(x))
+            .map(|x| (x, y))
+            .collect()
+    }
+
+    #[test]
+    fn plain_rows_are_never_uncertain() {
+        let buffer = Buffer::with_lines(["plain text", "more text "]);
+        assert!(uncertain_rows(&buffer).is_empty());
+    }
+
+    #[test]
+    fn a_vs16_grapheme_marks_its_whole_row_in_x_order() {
+        let buffer = Buffer::with_lines(["ok \u{2714}\u{fe0f} done", "plain     "]);
+        let cells = uncertain_rows(&buffer);
+        assert_eq!(positions(&cells), whole_row(&buffer, 0, 3));
+        assert_eq!(cells[3].2.symbol(), "\u{2714}\u{fe0f}");
+    }
+
+    #[test]
+    fn a_zwj_sequence_marks_its_whole_row() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let buffer = Buffer::with_lines([format!("{family} fam"), "plain ".to_string()]);
+        let cells = uncertain_rows(&buffer);
+        assert_eq!(positions(&cells), whole_row(&buffer, 0, 0));
+        assert_eq!(cells[0].2.symbol(), family);
+    }
+
+    #[test]
+    fn every_uncertain_row_is_marked() {
+        let buffer = Buffer::with_lines(["\u{1F600} hi", "plain", "\u{2705} ok"]);
+        let cells = uncertain_rows(&buffer);
+        let mut expected = whole_row(&buffer, 0, 0);
+        expected.extend(whole_row(&buffer, 2, 0));
+        assert_eq!(positions(&cells), expected);
+    }
+
+    /// A backend that keeps every `draw` it receives, so a test can tell
+    /// what ratatui's diff emitted from what the repaint added.
+    struct RecordingBackend {
+        inner: TestBackend,
+        draws: Vec<Vec<(u16, u16, Cell)>>,
+    }
+
+    impl Backend for RecordingBackend {
+        type Error = std::convert::Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            let cells: Vec<_> = content.map(|(x, y, c)| (x, y, c.clone())).collect();
+            self.inner.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)))?;
+            self.draws.push(cells);
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+            self.inner.append_lines(n)
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    /// The frame after a one-cell change in each row: ratatui's diff emits
+    /// the two changed cells, and the repaint adds the rest of the emoji
+    /// row and nothing from the plain row.
+    #[test]
+    fn a_changed_emoji_row_is_repainted_whole_and_a_plain_row_is_not() {
+        let mut terminal = Terminal::new(RecordingBackend {
+            inner: TestBackend::new(12, 2),
+            draws: Vec::new(),
+        })
+        .unwrap();
+        let paint = |lines: [&'static str; 2]| {
+            move |frame: &mut ratatui::Frame| {
+                frame.render_widget(Paragraph::new(lines.join("\n")), frame.area());
+            }
+        };
+        draw_and_repaint_uncertain(&mut terminal, paint(["\u{1F600} smile ok", "plain row"]))
+            .unwrap();
+        let first_frame_draws = terminal.backend().draws.len();
+
+        draw_and_repaint_uncertain(&mut terminal, paint(["\u{1F600} smilE ok", "plain roW"]))
+            .unwrap();
+
+        let draws = &terminal.backend().draws[first_frame_draws..];
+        let diff = positions(&draws[0]);
+        assert_eq!(diff, vec![(7, 0), (8, 1)]);
+        let repaint = positions(&draws[1]);
+        assert_eq!(repaint, whole_row(terminal.backend().inner.buffer(), 0, 0));
+        assert_eq!(draws.len(), 2);
+        terminal
+            .backend()
+            .inner
+            .assert_buffer_lines(["\u{1F600} smilE ok", "plain roW   "]);
     }
 
     #[test]

@@ -229,115 +229,132 @@ pub async fn claude_chat_completions_streaming(
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
-    let mut thinking_text = String::new();
-    let mut thinking_signature = String::new();
+    let mut state = ClaudeStreamState::default();
     let handle = |message: SseMessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-        if let Some(typ) = data["type"].as_str() {
-            match typ {
-                "content_block_start" => {
-                    if data["content_block"]["type"].as_str() == Some("thinking") {
-                        handler.thinking_started();
-                    }
-                    if let (Some("redacted_thinking"), Some(redacted_data)) = (
-                        data["content_block"]["type"].as_str(),
-                        data["content_block"]["data"].as_str(),
-                    ) {
-                        handler.thinking_block(ThinkingBlock::RedactedThinking {
-                            data: redacted_data.to_string(),
-                        });
-                    }
-                    if let (Some("tool_use"), Some(name), Some(id)) = (
-                        data["content_block"]["type"].as_str(),
-                        data["content_block"]["name"].as_str(),
-                        data["content_block"]["id"].as_str(),
-                    ) {
-                        if !function_name.is_empty() {
-                            let arguments: Value = if function_arguments.is_empty() {
-                                json!({})
-                            } else {
-                                function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
-                                })?
-                            };
-                            handler.tool_call(ToolCall::new(
-                                function_name.clone(),
-                                arguments,
-                                Some(function_id.clone()),
-                            ))?;
-                        }
-                        function_name = name.into();
-                        function_arguments.clear();
-                        function_id = id.into();
-                    }
-                }
-                "content_block_delta" => {
-                    if let Some(text) = data["delta"]["text"].as_str() {
-                        handler.text(text)?;
-                    } else if let Some(text) = data["delta"]["thinking"].as_str() {
-                        if reasoning_state == 0 {
-                            handler.thinking_started();
-                        }
-                        reasoning_state = 1;
-                        thinking_text.push_str(text);
-                    } else if let Some(signature) = data["delta"]["signature"].as_str() {
-                        thinking_signature.push_str(signature);
-                    } else if let (true, Some(partial_json)) = (
-                        !function_name.is_empty(),
-                        data["delta"]["partial_json"].as_str(),
-                    ) {
-                        function_arguments.push_str(partial_json);
-                    }
-                }
-                "content_block_stop" => {
-                    if reasoning_state == 1 {
-                        reasoning_state = 0;
-                        handler.thinking_block(ThinkingBlock::Thinking {
-                            thinking: mem::take(&mut thinking_text),
-                            signature: mem::take(&mut thinking_signature),
-                        });
-                    }
-                    handler.thinking_stopped();
-                    if !function_name.is_empty() {
-                        let arguments: Value = if function_arguments.is_empty() {
-                            json!({})
-                        } else {
-                            function_arguments.parse().with_context(|| {
-                                format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
-                            })?
-                        };
-                        handler.tool_call(ToolCall::new(
-                            mem::take(&mut function_name),
-                            arguments,
-                            Some(mem::take(&mut function_id)),
-                        ))?;
-                        function_arguments.clear();
-                    }
-                }
-                "message_start" => {
-                    if let Some(usage) = claude_parse_usage(&data["message"]["usage"]) {
-                        debug!("token-usage: {usage:?}");
-                        handler.usage(usage);
-                    }
-                }
-                "message_delta" => {
-                    if let Some(usage) = claude_parse_usage(&data["usage"]) {
-                        debug!("token-usage: {usage:?}");
-                        handler.usage(usage);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(false)
+        claude_handle_stream_data(&data, &mut state, handler)
     };
 
     sse_stream(builder, handle).await
+}
+
+/// What a Claude stream carries between frames: the tool call and the
+/// thinking block being assembled from their deltas.
+#[derive(Default)]
+struct ClaudeStreamState {
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_open: bool,
+    thinking_text: String,
+    thinking_signature: String,
+}
+
+impl ClaudeStreamState {
+    fn parse_arguments(&self) -> Result<Value> {
+        if self.function_arguments.is_empty() {
+            return Ok(json!({}));
+        }
+        self.function_arguments.parse().with_context(|| {
+            format!(
+                "Tool call '{}' has non-JSON arguments '{}'",
+                self.function_name, self.function_arguments
+            )
+        })
+    }
+}
+
+fn claude_handle_stream_data(
+    data: &Value,
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+) -> Result<bool> {
+    if let Some(typ) = data["type"].as_str() {
+        match typ {
+            "content_block_start" => {
+                if data["content_block"]["type"].as_str() == Some("thinking") {
+                    handler.thinking_started();
+                }
+                if let (Some("redacted_thinking"), Some(redacted_data)) = (
+                    data["content_block"]["type"].as_str(),
+                    data["content_block"]["data"].as_str(),
+                ) {
+                    handler.thinking_block(ThinkingBlock::RedactedThinking {
+                        data: redacted_data.to_string(),
+                    });
+                }
+                if let (Some("tool_use"), Some(name), Some(id)) = (
+                    data["content_block"]["type"].as_str(),
+                    data["content_block"]["name"].as_str(),
+                    data["content_block"]["id"].as_str(),
+                ) {
+                    if !state.function_name.is_empty() {
+                        let arguments = state.parse_arguments()?;
+                        handler.tool_call(ToolCall::new(
+                            state.function_name.clone(),
+                            arguments,
+                            Some(state.function_id.clone()),
+                        ))?;
+                    }
+                    state.function_name = name.into();
+                    state.function_arguments.clear();
+                    state.function_id = id.into();
+                }
+            }
+            "content_block_delta" => {
+                if let Some(text) = data["delta"]["text"].as_str() {
+                    handler.text(text)?;
+                } else if let Some(text) = data["delta"]["thinking"].as_str() {
+                    if !state.reasoning_open {
+                        handler.thinking_started();
+                    }
+                    state.reasoning_open = true;
+                    state.thinking_text.push_str(text);
+                } else if let Some(signature) = data["delta"]["signature"].as_str() {
+                    state.thinking_signature.push_str(signature);
+                } else if let (true, Some(partial_json)) = (
+                    !state.function_name.is_empty(),
+                    data["delta"]["partial_json"].as_str(),
+                ) {
+                    state.function_arguments.push_str(partial_json);
+                }
+            }
+            "content_block_stop" => {
+                if state.reasoning_open {
+                    state.reasoning_open = false;
+                    handler.thinking_block(ThinkingBlock::Thinking {
+                        thinking: mem::take(&mut state.thinking_text),
+                        signature: mem::take(&mut state.thinking_signature),
+                    });
+                }
+                handler.thinking_stopped();
+                if !state.function_name.is_empty() {
+                    let arguments = state.parse_arguments()?;
+                    handler.tool_call(ToolCall::new(
+                        mem::take(&mut state.function_name),
+                        arguments,
+                        Some(mem::take(&mut state.function_id)),
+                    ))?;
+                    state.function_arguments.clear();
+                }
+            }
+            "message_start" => {
+                if let Some(usage) = claude_parse_usage(&data["message"]["usage"]) {
+                    debug!("token-usage: {usage:?}");
+                    handler.usage(usage);
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = claude_parse_usage(&data["usage"]) {
+                    debug!("token-usage: {usage:?}");
+                    handler.usage(usage);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
 }
 
 pub fn claude_build_chat_completions_body(
@@ -1614,5 +1631,138 @@ mod tests {
             is_stock,
             "bundled models.yaml must not carry a claude oauth block: it would silently drop the Claude Code spoof for stock Pro/Max users"
         );
+    }
+
+    mod thinking_events {
+        use super::*;
+        use crate::client::stream::test_support::{
+            ThisThreadRecording, detached_pair, new_handler,
+        };
+        use crate::events::{Event, Origin};
+
+        fn feed(frames: &[Value]) -> (Vec<Event>, SseHandler) {
+            let recording = ThisThreadRecording::install();
+            let (mut handler, _rx) = new_handler();
+            let mut state = ClaudeStreamState::default();
+            for frame in frames {
+                claude_handle_stream_data(frame, &mut state, &mut handler).unwrap();
+            }
+            (recording.events(), handler)
+        }
+
+        fn started() -> Event {
+            Event::ThinkingStarted {
+                origin: Origin::detached(),
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_thinking_block_start_opens_the_phase_before_any_delta() {
+            let (events, _) = feed(&[json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" }
+            })]);
+            assert_eq!(events, vec![started()]);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_thinking_delta_without_a_start_opens_the_phase_once() {
+            let (events, _) = feed(&[
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "thinking_delta", "thinking": "let me" }
+                }),
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "thinking_delta", "thinking": " think" }
+                }),
+            ]);
+            assert_eq!(events, vec![started()]);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_thinking_block_stop_closes_the_phase_once() {
+            let (events, handler) = feed(&[
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "thinking_delta", "thinking": "hmm" }
+                }),
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "sig" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+                json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": { "type": "text_delta", "text": "answer" }
+                }),
+                json!({ "type": "content_block_stop", "index": 1 }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, thinking, _) = handler.take();
+            assert_eq!(text, "answer");
+            assert!(matches!(
+                &thinking[0],
+                ThinkingBlock::Thinking { thinking, signature }
+                    if thinking == "hmm" && signature == "sig"
+            ));
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_redacted_block_publishes_one_pair_around_it() {
+            let (events, handler) = feed(&[
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "redacted_thinking", "data": "b64" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (_, _, thinking, _) = handler.take();
+            assert!(matches!(
+                &thinking[0],
+                ThinkingBlock::RedactedThinking { data } if data == "b64"
+            ));
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_text_only_stream_publishes_nothing() {
+            let (events, _) = feed(&[
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": "plain" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ]);
+            assert!(events.is_empty());
+        }
     }
 }

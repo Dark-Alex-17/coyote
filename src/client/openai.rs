@@ -338,104 +338,117 @@ pub async fn openai_chat_completions_streaming(
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut call_id = String::new();
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
-    let handle = |message: SseMessage| -> Result<bool> {
-        if message.data == "[DONE]" {
-            if !function_name.is_empty() {
-                if function_arguments.is_empty() {
-                    function_arguments = String::from("{}");
-                }
-                let arguments: Value = function_arguments.parse().with_context(|| {
-                    format!(
-                        "Tool call '{function_name}' has non-JSON arguments '{function_arguments}'"
-                    )
-                })?;
-                handler.tool_call(ToolCall::new(
-                    function_name.clone(),
-                    arguments,
-                    normalize_function_id(&function_id),
-                ))?;
-            }
-            return Ok(true);
-        }
-        let data: Value = serde_json::from_str(&message.data)?;
-        debug!("stream-data: {data}");
-        if let Some(text) = data["choices"][0]["delta"]["content"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-                handler.thinking_stopped();
-            }
-            handler.text(text)?;
-        } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
-            .as_str()
-            .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 0 {
-                handler.thinking_started();
-                handler.text("<think>\n")?;
-                reasoning_state = 1;
-            }
-            handler.text(text)?;
-        }
-        if let (Some(function), index, id) = (
-            data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
-            data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
-            data["choices"][0]["delta"]["tool_calls"][0]["id"]
-                .as_str()
-                .filter(|v| !v.is_empty()),
-        ) {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-                handler.thinking_stopped();
-            }
-            let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
-            if maybe_call_id != call_id && maybe_call_id.len() >= call_id.len() {
-                if !function_name.is_empty() {
-                    if function_arguments.is_empty() {
-                        function_arguments = String::from("{}");
-                    }
-                    let arguments: Value = function_arguments.parse().with_context(|| {
-                        format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
-                    })?;
-                    handler.tool_call(ToolCall::new(
-                        function_name.clone(),
-                        arguments,
-                        normalize_function_id(&function_id),
-                    ))?;
-                }
-                function_name.clear();
-                function_arguments.clear();
-                function_id.clear();
-                call_id = maybe_call_id;
-            }
-            if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                if name.starts_with(&function_name) {
-                    function_name = name.to_string();
-                } else {
-                    function_name.push_str(name);
-                }
-            }
-            if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
-                function_arguments.push_str(arguments);
-            }
-            if let Some(id) = id {
-                function_id = id.to_string();
-            }
-        }
-        Ok(false)
-    };
+    let mut state = OpenAiChatStreamState::default();
+    let handle =
+        |message: SseMessage| -> Result<bool> { openai_chat_handle_chunk(&message.data, &mut state, handler) };
 
     sse_stream(builder, handle).await
+}
+
+/// What a chat-completions stream carries between chunks: the tool call
+/// being assembled from its deltas and whether a `<think>` span is open.
+#[derive(Default)]
+struct OpenAiChatStreamState {
+    call_id: String,
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_open: bool,
+}
+
+impl OpenAiChatStreamState {
+    fn flush_tool_call(&mut self, handler: &mut SseHandler) -> Result<()> {
+        if self.function_name.is_empty() {
+            return Ok(());
+        }
+        if self.function_arguments.is_empty() {
+            self.function_arguments = String::from("{}");
+        }
+        let arguments: Value = self.function_arguments.parse().with_context(|| {
+            format!(
+                "Tool call '{}' has non-JSON arguments '{}'",
+                self.function_name, self.function_arguments
+            )
+        })?;
+        handler.tool_call(ToolCall::new(
+            self.function_name.clone(),
+            arguments,
+            normalize_function_id(&self.function_id),
+        ))
+    }
+
+    fn close_reasoning(&mut self, handler: &mut SseHandler) -> Result<()> {
+        if self.reasoning_open {
+            handler.text("\n</think>\n\n")?;
+            self.reasoning_open = false;
+            handler.thinking_stopped();
+        }
+        Ok(())
+    }
+}
+
+/// Handles one SSE data payload, `[DONE]` included; returns whether the
+/// stream is finished.
+fn openai_chat_handle_chunk(
+    payload: &str,
+    state: &mut OpenAiChatStreamState,
+    handler: &mut SseHandler,
+) -> Result<bool> {
+    if payload == "[DONE]" {
+        state.flush_tool_call(handler)?;
+        return Ok(true);
+    }
+    let data: Value = serde_json::from_str(payload)?;
+    debug!("stream-data: {data}");
+    if let Some(text) = data["choices"][0]["delta"]["content"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+    {
+        state.close_reasoning(handler)?;
+        handler.text(text)?;
+    } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
+        .as_str()
+        .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
+        .filter(|v| !v.is_empty())
+    {
+        if !state.reasoning_open {
+            handler.thinking_started();
+            handler.text("<think>\n")?;
+            state.reasoning_open = true;
+        }
+        handler.text(text)?;
+    }
+    if let (Some(function), index, id) = (
+        data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
+        data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
+        data["choices"][0]["delta"]["tool_calls"][0]["id"]
+            .as_str()
+            .filter(|v| !v.is_empty()),
+    ) {
+        state.close_reasoning(handler)?;
+        let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
+        if maybe_call_id != state.call_id && maybe_call_id.len() >= state.call_id.len() {
+            state.flush_tool_call(handler)?;
+            state.function_name.clear();
+            state.function_arguments.clear();
+            state.function_id.clear();
+            state.call_id = maybe_call_id;
+        }
+        if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+            if name.starts_with(&state.function_name) {
+                state.function_name = name.to_string();
+            } else {
+                state.function_name.push_str(name);
+            }
+        }
+        if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
+            state.function_arguments.push_str(arguments);
+        }
+        if let Some(id) = id {
+            state.function_id = id.to_string();
+        }
+    }
+    Ok(false)
 }
 
 pub async fn openai_embeddings(
@@ -913,7 +926,17 @@ pub async fn openai_responses_streaming(
 
 fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Result<bool> {
     match data["type"].as_str() {
+        // A reasoning item is done before the message item that follows it
+        // is added, so the phase opened here is closed by that item's
+        // `thinking_block`; the text-delta stop only catches a reasoning
+        // item the server never finished.
+        Some("response.output_item.added") => {
+            if data["item"]["type"].as_str() == Some("reasoning") {
+                handler.thinking_started();
+            }
+        }
         Some("response.output_text.delta") => {
+            handler.thinking_stopped();
             if let Some(delta) = data["delta"].as_str().filter(|v| !v.is_empty()) {
                 handler.text(delta)?;
             }
@@ -2142,5 +2165,183 @@ mod tests {
         client.patch_request_data(&mut request_data);
 
         assert_eq!(request_data.body, body_before, "a chat-shaped model patch must not merge into a responses body");
+    }
+
+    mod thinking_events {
+        use super::*;
+        use crate::client::stream::test_support::{
+            ThisThreadRecording, detached_pair, new_handler,
+        };
+        use crate::events::{Event, Origin};
+
+        fn started() -> Event {
+            Event::ThinkingStarted {
+                origin: Origin::detached(),
+            }
+        }
+
+        fn feed_chat(payloads: &[String]) -> (Vec<Event>, SseHandler) {
+            let recording = ThisThreadRecording::install();
+            let (mut handler, _rx) = new_handler();
+            let mut state = OpenAiChatStreamState::default();
+            for payload in payloads {
+                openai_chat_handle_chunk(payload, &mut state, &mut handler).unwrap();
+            }
+            (recording.events(), handler)
+        }
+
+        fn chat_delta(delta: Value) -> String {
+            json!({ "choices": [{ "index": 0, "delta": delta }] }).to_string()
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_first_reasoning_chunk_opens_the_phase_once() {
+            let (events, _) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "let me" })),
+                chat_delta(json!({ "reasoning_content": " think" })),
+            ]);
+            assert_eq!(events, vec![started()]);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_first_content_chunk_after_reasoning_closes_the_phase() {
+            let (events, handler) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "hmm" })),
+                chat_delta(json!({ "content": "answer" })),
+                chat_delta(json!({ "content": "!" })),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "<think>\nhmm\n</think>\n\nanswer!");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_tool_call_after_reasoning_closes_the_phase() {
+            let (events, handler) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "hmm" })),
+                chat_delta(json!({ "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": { "name": "fs_read", "arguments": "{\"path\":\"x\"}" }
+                }] })),
+                "[DONE]".to_string(),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, calls, _, _) = handler.take();
+            assert_eq!(text, "<think>\nhmm\n</think>\n\n");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "fs_read");
+        }
+
+        fn feed_responses(events: &[Value]) -> (Vec<Event>, SseHandler) {
+            let recording = ThisThreadRecording::install();
+            let (mut handler, _rx) = new_handler();
+            for event in events {
+                openai_responses_handle_event(event, &mut handler).unwrap();
+            }
+            (recording.events(), handler)
+        }
+
+        fn reasoning_item() -> Value {
+            json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{ "type": "summary_text", "text": "thinking" }],
+                "encrypted_content": "enc123",
+            })
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_reasoning_item_opens_the_phase_when_added() {
+            let (events, _) = feed_responses(&[json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+            })]);
+            assert_eq!(events, vec![started()]);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_reasoning_item_added_then_done_then_text_publishes_one_pair() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "delta": "thinking"
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning_item()
+                }),
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": { "type": "message", "id": "msg_1", "role": "assistant", "content": [] }
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 1,
+                    "delta": "answer"
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, thinking, _) = handler.take();
+            assert_eq!(text, "answer");
+            assert_eq!(thinking.len(), 1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn text_arriving_while_reasoning_is_open_closes_it_first() {
+            let (events, _) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 1,
+                    "delta": "answer"
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_stream_without_reasoning_publishes_nothing() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "message", "id": "msg_1", "role": "assistant", "content": [] }
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "plain"
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": { "type": "message", "id": "msg_1", "role": "assistant", "content": [] }
+                }),
+            ]);
+            assert!(events.is_empty());
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "plain");
+        }
     }
 }
