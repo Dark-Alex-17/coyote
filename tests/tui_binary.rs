@@ -11,7 +11,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
@@ -96,6 +96,20 @@ fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
     spawn_tui_under(dir, extra_env, WAIT_WRAPPER, "/dev/tty")
 }
 
+/// [`spawn_tui`] with command-line flags after the binary; `args` are
+/// plain ASCII flags, so they go into the wrapper unquoted.
+fn spawn_tui_with_args(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> Pty {
+    let args = format!(" {}", args.join(" "));
+    spawn_binary_under(
+        built_binary(),
+        dir,
+        extra_env,
+        WAIT_WRAPPER,
+        "/dev/tty",
+        &args,
+    )
+}
+
 /// Report line emitted by both wrappers once the binary has exited. The
 /// alternate screen leaves no newline behind once escapes are stripped,
 /// so the report starts a fresh line first.
@@ -107,7 +121,7 @@ const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
 /// orphaned, and the kernel discards SIGTSTP for orphaned groups, so this
 /// wrapper cannot observe a suspend.
 const WAIT_WRAPPER: &str =
-    "'{coyote}' <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
+    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
 
 /// A job-control wrapper that behaves like the user's shell: the binary
 /// runs as the foreground job in its own process group; when it stops the
@@ -115,7 +129,7 @@ const WAIT_WRAPPER: &str =
 /// and after a moment resumes the job with `fg` as a user would. (`fg`
 /// must keep its own stdout: redirecting it stops bash handing the tty
 /// over.)
-const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}' <{stdin}; rc=$?; \
+const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}'{args} <{stdin}; rc=$?; \
      while [ -n \"$(jobs -s)\" ]; do echo; echo job-stopped; \
      echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
      sleep 1; fg %1; rc=$?; done; {report}";
@@ -128,17 +142,19 @@ fn built_binary() -> &'static Path {
 /// The one place the binary is launched: `wrapper` is one of the two bash
 /// scripts above and `stdin` the path the binary's stdin is redirected from.
 fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin: &str) -> Pty {
-    spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin)
+    spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin, "")
 }
 
 /// [`spawn_tui_under`] for a copy of the binary living elsewhere (the
-/// self-update path classifies the install by where the executable is).
+/// self-update path classifies the install by where the executable is);
+/// `args` fills the wrapper's `{args}` slot right after the binary.
 fn spawn_binary_under(
     binary: &Path,
     dir: &Path,
     extra_env: &[(&str, &str)],
     wrapper: &str,
     stdin: &str,
+    args: &str,
 ) -> Pty {
     let home = dir.join("home");
     let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
@@ -156,6 +172,7 @@ fn spawn_binary_under(
         .arg(
             wrapper
                 .replace("{coyote}", binary.to_str().unwrap())
+                .replace("{args}", args)
                 .replace("{stdin}", stdin)
                 .replace("{report}", TTY_REPORT),
         )
@@ -171,6 +188,37 @@ fn spawn_binary_under(
         .env_remove("NO_COLOR")
         .envs(extra_env.iter().copied());
     Pty::spawn(cmd).unwrap()
+}
+
+/// The binary with no terminal at all (stdin from /dev/null, stdout and
+/// stderr piped), the way a script runs it.
+fn run_piped(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
+    let path = env::join_paths(
+        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
+    // Spawned by its own name so the harness pin sees this spawn paired
+    // with the two config env lines below.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("COYOTE_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.args(args)
+        .current_dir(dir)
+        .env("COYOTE_CONFIG_DIR", dir)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("HOME", dir.join("home"))
+        .env("TERM", "xterm-256color")
+        .env("PATH", path)
+        .env_remove("IS_SANDBOX")
+        .envs(extra_env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.output().unwrap()
 }
 
 fn tty_flag_tokens(transcript: &str) -> Vec<&str> {
@@ -1383,11 +1431,11 @@ fn a_window_resize_repaints_the_screen_and_keys_still_work() {
     assert_tty_restored(&transcript);
 }
 
-/// The TUI is a provisional `COYOTE_UI=tui` branch: any other value leaves
-/// the existing REPL in charge, which never touches the alternate screen.
+/// `COYOTE_UI=repl` picks the plain REPL for an interactive run, which
+/// never touches the alternate screen.
 #[test]
 #[serial]
-fn any_other_coyote_ui_value_starts_the_plain_repl() {
+fn coyote_ui_repl_starts_the_plain_repl() {
     let dir = fresh_config_dir("repl-branch");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
@@ -4120,6 +4168,7 @@ fn assert_refused_through_the_prompt_gate(flow: &GatedFlow) {
         &[("EDITOR", &editor), ("VISUAL", &editor)],
         WAIT_WRAPPER,
         "/dev/tty",
+        "",
     );
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -5578,6 +5627,7 @@ fn a_stdout_loader_reading_stdin_returns_in_command_mode_on_a_tty() {
         &[("COYOTE_UI", "repl")],
         &wrapper,
         "/dev/tty",
+        "",
     );
     let transcript = pty
         .wait_for("tty-probe-done", PTY_DEADLINE)
@@ -6645,4 +6695,208 @@ fn dot_exit_saving_the_session_on_y_carries_the_saved_line_to_the_normal_screen(
             .any(|p| p.file_name().is_some_and(|n| n == "probe-r9-exit.yaml")),
         "no probe-r9-exit.yaml was written under {dir:?}:\n{transcript}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Cold start: which shell an interactive run gets is decided by the
+// `ui:` key, then `COYOTE_UI`, then `--tui` / `--repl`, in that order of
+// increasing precedence; a prompt run never starts the full-screen UI.
+// ---------------------------------------------------------------------
+mod cold_start {
+    use super::*;
+
+    /// "no session" is the status line the full-screen UI paints once up.
+    fn assert_full_screen_ui_then_ctrl_d(pty: &mut Pty, what: &str) {
+        let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        assert!(
+            find(pty.raw(), ENTER_ALT, 0).is_some(),
+            "{what} did not enter the alternate screen:\n{transcript}"
+        );
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\x04").unwrap();
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+        assert_tty_restored(&transcript);
+    }
+
+    /// "Welcome to" opens the REPL banner.
+    fn assert_plain_repl_then_ctrl_d(pty: &mut Pty, what: &str) {
+        let transcript = pty.wait_for("Welcome to", PTY_DEADLINE).unwrap();
+        assert!(
+            find(pty.raw(), ENTER_ALT, 0).is_none(),
+            "{what} entered the alternate screen:\n{transcript}"
+        );
+        pty.read_for(Duration::from_millis(500));
+        pty.send(b"\x04").unwrap();
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+        assert!(
+            find(pty.raw(), ENTER_ALT, 0).is_none(),
+            "{what} entered the alternate screen:\n{transcript}"
+        );
+        assert_tty_restored(&transcript);
+    }
+
+    /// `--tui` alone picks the full-screen UI; an empty `COYOTE_UI` states
+    /// no preference, so nothing else is choosing here.
+    #[test]
+    #[serial]
+    fn the_tui_flag_starts_the_full_screen_ui_without_the_env() {
+        let dir = fresh_config_dir("tui-flag");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "")], &["--tui"]);
+
+        assert_full_screen_ui_then_ctrl_d(&mut pty, "--tui");
+    }
+
+    /// `ui: tui` in the config picks the full-screen UI with no env and
+    /// no flag.
+    #[test]
+    #[serial]
+    fn a_tui_config_key_starts_the_full_screen_ui() {
+        let dir = fresh_config_dir("tui-key");
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, "save_session: false\nui: tui\n");
+        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "")]);
+
+        assert_full_screen_ui_then_ctrl_d(&mut pty, "ui: tui");
+    }
+
+    /// `--repl` overrides `ui: tui` in the config.
+    #[test]
+    #[serial]
+    fn the_repl_flag_beats_a_tui_config_key() {
+        let dir = fresh_config_dir("repl-flag");
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, "save_session: false\nui: tui\n");
+        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "")], &["--repl"]);
+
+        assert_plain_repl_then_ctrl_d(&mut pty, "--repl over ui: tui");
+    }
+
+    /// `COYOTE_UI=repl` overrides `ui: tui` in the config.
+    #[test]
+    #[serial]
+    fn the_env_beats_the_config_key() {
+        let dir = fresh_config_dir("env-over-key");
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, "save_session: false\nui: tui\n");
+        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "repl")]);
+
+        assert_plain_repl_then_ctrl_d(&mut pty, "COYOTE_UI=repl over ui: tui");
+    }
+
+    /// `--tui` overrides `COYOTE_UI=repl`.
+    #[test]
+    #[serial]
+    fn the_tui_flag_beats_the_env() {
+        let dir = fresh_config_dir("flag-over-env");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "repl")], &["--tui"]);
+
+        assert_full_screen_ui_then_ctrl_d(&mut pty, "--tui over COYOTE_UI=repl");
+    }
+
+    /// `COYOTE_UI=headless` is not a shell choice, so the config key
+    /// still decides.
+    #[test]
+    #[serial]
+    fn a_headless_env_value_leaves_the_config_key_in_charge() {
+        let dir = fresh_config_dir("headless-env");
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, "save_session: false\nui: tui\n");
+        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "headless")]);
+
+        assert_full_screen_ui_then_ctrl_d(&mut pty, "ui: tui under COYOTE_UI=headless");
+    }
+
+    /// A positional prompt makes the run a one-shot command, which the
+    /// full-screen UI cannot host: `--tui` with a prompt is refused before
+    /// the config is read, and neither shell starts.
+    #[test]
+    #[serial]
+    fn the_tui_flag_with_a_prompt_is_refused_before_anything_starts() {
+        let dir = fresh_config_dir("tui-prompt");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+
+        let out = run_piped(&dir, &[], &["--tui", "hello"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let all = format!("{stdout}\n{stderr}");
+
+        assert!(
+            !out.status.success(),
+            "--tui with a prompt exited 0 instead of refusing:\n{all}"
+        );
+        assert!(
+            all.contains("--tui takes no prompt argument"),
+            "the refusal did not name the flag and the prompt:\n{all}"
+        );
+        assert!(
+            find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
+            "--tui with a prompt entered the alternate screen:\n{all}"
+        );
+        assert!(
+            !all.contains("Welcome to"),
+            "--tui with a prompt started the REPL:\n{all}"
+        );
+    }
+
+    /// The shell flags exclude the non-interactive modes and each other at
+    /// the parser, so the clash is a usage error rather than a late bail.
+    #[test]
+    #[serial]
+    fn the_tui_flag_conflicts_with_execute_in_clap() {
+        let dir = fresh_config_dir("tui-conflict");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+
+        for args in [&["--tui", "-e"][..], &["--tui", "--repl"][..]] {
+            let out = run_piped(&dir, &[], args);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let all = format!("{stdout}\n{stderr}");
+
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{args:?} did not exit with clap's usage error code:\n{all}"
+            );
+            assert!(
+                all.contains("cannot be used with"),
+                "{args:?} was not reported as a clap conflict:\n{all}"
+            );
+        }
+    }
+
+    /// `--info` shows the `ui` the run resolved to, whichever source set it.
+    #[test]
+    #[serial]
+    fn info_reports_the_resolved_ui() {
+        fn ui_row(out: &std::process::Output) -> String {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "--info failed:\n{stdout}");
+            let row = stdout
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some("ui"))
+                .unwrap_or_else(|| panic!("no ui row in --info:\n{stdout}"));
+            row.split_whitespace().last().unwrap().to_string()
+        }
+
+        let dir = fresh_config_dir("info-ui");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let out = run_piped(&dir, &[("COYOTE_UI", "tui")], &["--info"]);
+        assert_eq!(ui_row(&out), "tui", "COYOTE_UI=tui was not reported");
+
+        let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--info"]);
+        assert_eq!(ui_row(&out), "repl", "the default ui was not reported");
+
+        write_config(&dir, "save_session: false\nui: tui\n");
+        let out = run_piped(&dir, &[("COYOTE_UI", "")], &["--repl", "--info"]);
+        assert_eq!(ui_row(&out), "repl", "--repl over ui: tui was not reported");
+    }
 }
