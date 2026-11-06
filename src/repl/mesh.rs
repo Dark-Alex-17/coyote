@@ -48,13 +48,14 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    AddressName, AlreadyClosed, FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS,
-    HUMAN_DECLINED, InterfaceState, InterfaceStatus, LocalEndpoint, LoggingInboundSink,
-    MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NameTarget, NodeOptions,
-    PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord,
-    PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
-    display_text, hex_lower, human_size, loopback_endpoint, owner_label, parse_rfc3339,
-    redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
+    AddressName, AlreadyClosed, DialAdvice, DialFailure, FetchError, FetchReport,
+    HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED, InterfaceState, InterfaceStatus,
+    LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
+    MeshRuntime, NameTarget, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL,
+    PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
+    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
+    loopback_endpoint, owner_label, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
+    short, span_text,
 };
 use crate::render::{QuotingError, error_notice};
 use crate::repl::printer::terminal_width;
@@ -8511,11 +8512,12 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
             let label = &status.label;
             Some(match &status.state {
                 InterfaceState::Connected => return None,
-                // A `local` rnsd is only unreachable when nothing retries it, so the
-                // loopback promise of recovering once rnsd listens would not hold for it.
-                InterfaceState::Unreachable { reason, .. }
-                    if status.is_loopback() && status.kind != "local" =>
-                {
+                // A `local` rnsd is only unreachable when the attach failed, and nothing
+                // retries it: rnsd starting later is not enough, the node must start again.
+                InterfaceState::Unreachable { reason, .. } if status.kind == "local" => format!(
+                    "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until the local rnsd is running and the mesh is restarted with `.mesh off`, then `.mesh on`."
+                ),
+                InterfaceState::Unreachable { reason, .. } if status.is_loopback() => {
                     format!(
                         "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
                     )
@@ -8526,10 +8528,25 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                 InterfaceState::Unreachable { reason, .. } => format!(
                     "WARNING: {label} is unreachable ({reason}); peers behind that relay are out of reach."
                 ),
-                InterfaceState::Connecting { reason: Some(reason) } => format!(
+                InterfaceState::Connecting {
+                    dial_failure:
+                        Some(DialFailure {
+                            reason,
+                            advice: DialAdvice::StartRnsd,
+                        }),
+                } => format!(
                     "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
                 ),
-                InterfaceState::Connecting { reason: None } => format!(
+                InterfaceState::Connecting {
+                    dial_failure:
+                        Some(DialFailure {
+                            reason,
+                            advice: DialAdvice::Redialing,
+                        }),
+                } => format!(
+                    "WARNING: {label} is not reachable yet: {reason}; the transport keeps redialing it, and `.mesh info` shows when it connects"
+                ),
+                InterfaceState::Connecting { dial_failure: None } => format!(
                     "WARNING: {label} has not finished connecting; mesh traffic through it waits until it does"
                 ),
                 InterfaceState::Disconnected { reason } => format!(
@@ -11285,10 +11302,12 @@ mod tests {
         );
     }
 
-    /// The `local` rows cover both shapes of `Connecting`: the client's last dial failure
-    /// while nothing listens, and no reason while the attached client has neither
-    /// connected nor failed a dial (which must not tell the user to start rnsd);
-    /// `Disconnected` carries the sentence for the client's drop.
+    /// The `local` rows cover every shape of `Connecting`: a dial failure whose kind says
+    /// nothing listens (start rnsd), one the client's redials may get past (no answer in
+    /// time), and no reason while the attached client has neither connected nor failed a
+    /// dial (neither tells the user to start rnsd); `Disconnected` carries the sentence
+    /// for the client's drop; an unreachable `local`, which nothing retries, asks for the
+    /// restart, never for the relay tail.
     #[test]
     fn interface_warnings_name_the_tail_for_lan_a_remote_relay_and_a_loopback_relay() {
         let states = [
@@ -11330,14 +11349,28 @@ mod tests {
                 kind: "local",
                 endpoint: Some("127.0.0.1:37428".into()),
                 state: InterfaceState::Connecting {
-                    reason: Some("nothing is listening at 127.0.0.1:37428".into()),
+                    dial_failure: Some(DialFailure {
+                        reason: "nothing is listening at 127.0.0.1:37428".into(),
+                        advice: DialAdvice::StartRnsd,
+                    }),
+                },
+            },
+            InterfaceStatus {
+                label: "local rnsd at 127.0.0.1:37428".into(),
+                kind: "local",
+                endpoint: Some("127.0.0.1:37428".into()),
+                state: InterfaceState::Connecting {
+                    dial_failure: Some(DialFailure {
+                        reason: "rnsd did not answer".into(),
+                        advice: DialAdvice::Redialing,
+                    }),
                 },
             },
             InterfaceStatus {
                 label: "local rnsd at @rns/default".into(),
                 kind: "local",
                 endpoint: Some("@rns/default".into()),
-                state: InterfaceState::Connecting { reason: None },
+                state: InterfaceState::Connecting { dial_failure: None },
             },
             InterfaceStatus {
                 label: "local rnsd at @rns/default".into(),
@@ -11365,9 +11398,10 @@ mod tests {
                 "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: rnsd did not answer; the transport keeps redialing it, and `.mesh info` shows when it connects".to_string(),
                 "WARNING: local rnsd at @rns/default has not finished connecting; mesh traffic through it waits until it does".to_string(),
                 "WARNING: local rnsd at @rns/default dropped the connection: rnsd closed the socket; it is being redialed".to_string(),
-                "WARNING: local rnsd at 127.0.0.1:37428 is unreachable (attach to the shared instance failed: InvalidArgument); peers behind that relay are out of reach.".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is unreachable (attach to the shared instance failed: InvalidArgument); sessions on this machine cannot reach each other until the local rnsd is running and the mesh is restarted with `.mesh off`, then `.mesh on`.".to_string(),
             ]
         );
     }
@@ -21937,7 +21971,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let runtime = ctx.app.mesh.get().unwrap();
                     let states = runtime.interface_states();
                     let InterfaceState::Connecting {
-                        reason: Some(reason),
+                        dial_failure:
+                            Some(DialFailure {
+                                reason,
+                                advice: DialAdvice::StartRnsd,
+                            }),
                     } = &states[1].state
                     else {
                         panic!("{states:?}");

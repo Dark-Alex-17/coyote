@@ -358,8 +358,8 @@ impl fmt::Display for LocalEndpoint {
 /// the user: a TCP client the transport keeps reconnecting, or a `local` rnsd endpoint
 /// the shared-instance client keeps redialing.
 /// `Unreachable` without it is a `lan` bind that failed and will not be tried again.
-/// `Connecting` is a `local` rnsd not connected yet: with the sentence for the client's
-/// last dial failure, without one while no dial has failed;
+/// `Connecting` is a `local` rnsd not connected yet: with the client's last dial failure,
+/// without one while no dial has failed;
 /// `Disconnected` one that dropped the socket after the node attached, which the
 /// transport is redialing. An attached rnsd's row follows the shared-instance client's
 /// state events.
@@ -367,8 +367,38 @@ impl fmt::Display for LocalEndpoint {
 pub(crate) enum InterfaceState {
     Connected,
     Unreachable { reason: String, retrying: bool },
-    Connecting { reason: Option<String> },
+    Connecting { dial_failure: Option<DialFailure> },
     Disconnected { reason: String },
+}
+
+/// What a `local` rnsd's failed dial leaves to the user. `StartRnsd`: nothing answered
+/// at the endpoint, so no rnsd runs there. `Redialing`: the dial failed another way
+/// (no answer in time, an I/O error) and the client's next redial may get past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialAdvice {
+    StartRnsd,
+    Redialing,
+}
+
+/// A `local` rnsd client's last failed dial: the row's sentence for it and the advice
+/// its kind carries, both read off the transport's typed `DialFailureKind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DialFailure {
+    pub reason: String,
+    pub advice: DialAdvice,
+}
+
+impl DialFailure {
+    fn of(kind: DialFailureKind, endpoint: &LocalEndpoint) -> Self {
+        let advice = match kind {
+            DialFailureKind::Refused | DialFailureKind::NotFound => DialAdvice::StartRnsd,
+            _ => DialAdvice::Redialing,
+        };
+        Self {
+            reason: dial_failure_sentence(kind, endpoint),
+            advice,
+        }
+    }
 }
 
 impl fmt::Display for InterfaceState {
@@ -383,9 +413,9 @@ impl fmt::Display for InterfaceState {
                 reason,
                 retrying: false,
             } => write!(f, "unreachable: {reason}"),
-            Self::Connecting { reason: None } => f.write_str("connecting"),
+            Self::Connecting { dial_failure: None } => f.write_str("connecting"),
             Self::Connecting {
-                reason: Some(reason),
+                dial_failure: Some(DialFailure { reason, .. }),
             } => write!(f, "connecting, retrying: {reason}"),
             Self::Disconnected { reason } => write!(f, "lost, retrying: {reason}"),
         }
@@ -476,14 +506,14 @@ enum Joined {
         events: mpsc::Receiver<SharedInstanceEvent>,
     },
     /// `Attached`, but the client had not connected when the start wait ran out: it
-    /// keeps dialing, the row starts at `connecting` with `dial_failure`, the sentence for
-    /// the last dial that failed (`None` when none had), and the watcher moves it on the
-    /// client's first `Connected`.
+    /// keeps dialing, the row starts at `connecting` with `dial_failure`, the last dial
+    /// that failed (`None` when none had), and the watcher moves it on the client's first
+    /// `Connected`.
     Dialing {
         label: String,
         endpoint: LocalEndpoint,
         events: mpsc::Receiver<SharedInstanceEvent>,
-        dial_failure: Option<String>,
+        dial_failure: Option<DialFailure>,
         reason: String,
         message: String,
     },
@@ -514,7 +544,7 @@ impl Joined {
         match self {
             Self::Connected(_) | Self::Attached { .. } => InterfaceState::Connected,
             Self::Dialing { dial_failure, .. } => InterfaceState::Connecting {
-                reason: dial_failure.clone(),
+                dial_failure: dial_failure.clone(),
             },
             Self::Pending { reason, .. } => InterfaceState::Unreachable {
                 reason: reason.clone(),
@@ -2423,7 +2453,8 @@ async fn join_local(
         }
     };
     let reason = dial_failure
-        .clone()
+        .as_ref()
+        .map(|failure| failure.reason.clone())
         .unwrap_or_else(|| format!("the client did not connect within {connect_timeout:?}"));
     Joined::Dialing {
         label: local_label(endpoint),
@@ -2440,9 +2471,9 @@ async fn join_local(
 enum LocalStart {
     Connected,
     /// The wait ran out, or the first dial failed while the rnsd is the only interface;
-    /// `dial_failure` is the sentence for the last dial that failed, `None` when none had.
+    /// `dial_failure` is the last dial that failed, `None` when none had.
     NotConnected {
-        dial_failure: Option<String>,
+        dial_failure: Option<DialFailure>,
     },
     /// The client's state stream ended before it connected.
     StoppedReporting,
@@ -2462,7 +2493,7 @@ async fn await_local_start(
         match timeout_at(deadline, events.recv()).await {
             Ok(Some(SharedInstanceEvent::Connected)) => return LocalStart::Connected,
             Ok(Some(SharedInstanceEvent::DialFailed { reason })) => {
-                dial_failure = Some(dial_failure_sentence(reason, endpoint));
+                dial_failure = Some(DialFailure::of(reason, endpoint));
                 if alone {
                     return LocalStart::NotConnected { dial_failure };
                 }
@@ -2512,9 +2543,14 @@ fn disconnect_sentence(reason: DisconnectReason) -> String {
         DisconnectReason::Reset => "the connection was reset".to_string(),
         DisconnectReason::Timeout => "the connection timed out".to_string(),
         DisconnectReason::Io(kind) => kind.to_string(),
-        _ => "the connection ended".to_string(),
+        _ => CONNECTION_ENDED.to_string(),
     }
 }
+
+/// The row's reason for a `local` rnsd whose stream ended for a reason the client did
+/// not name: a kind this build does not know, or a plain `Disconnected`. It claims no
+/// cause, as nothing says rnsd was the side that closed.
+const CONNECTION_ENDED: &str = "the connection ended";
 
 /// The row's reason for a `local` rnsd whose last dial to `endpoint` failed with `kind`.
 fn dial_failure_sentence(kind: DialFailureKind, endpoint: &LocalEndpoint) -> String {
@@ -3419,10 +3455,8 @@ fn follow_local_event(
         ..
     } = watch;
     let index = *index;
-    let lose = |reason: DisconnectReason| {
-        let state = InterfaceState::Disconnected {
-            reason: disconnect_sentence(reason),
-        };
+    let lose = |reason: String| {
+        let state = InterfaceState::Disconnected { reason };
         if runtime.mark_interface_state(index, state).is_some() {
             warn!("Mesh interface {label} lost rnsd; the transport is redialing it");
         }
@@ -3436,11 +3470,14 @@ fn follow_local_event(
                 debug!("Mesh interface {label} reported its connection to rnsd");
             }
         }
-        SharedInstanceEvent::DisconnectedWithReason { reason } => lose(reason),
-        SharedInstanceEvent::Disconnected => lose(DisconnectReason::PeerClosed),
+        SharedInstanceEvent::DisconnectedWithReason { reason } => {
+            lose(disconnect_sentence(reason));
+        }
+        // The attach opts in to reasoned drops, so a plain one names no cause.
+        SharedInstanceEvent::Disconnected => lose(CONNECTION_ENDED.to_string()),
         SharedInstanceEvent::Connecting => {}
         SharedInstanceEvent::DialFailed { reason } => {
-            let sentence = dial_failure_sentence(reason, endpoint);
+            let failure = DialFailure::of(reason, endpoint);
             let connecting = matches!(
                 runtime
                     .interface_states
@@ -3453,13 +3490,16 @@ fn follow_local_event(
                 runtime.mark_interface_state(
                     index,
                     InterfaceState::Connecting {
-                        reason: Some(sentence.clone()),
+                        dial_failure: Some(failure.clone()),
                     },
                 );
             }
-            if logged_dial_failure.as_deref() != Some(sentence.as_str()) {
-                debug!("Mesh interface {label} could not dial rnsd: {sentence}");
-                *logged_dial_failure = Some(sentence);
+            if logged_dial_failure.as_deref() != Some(failure.reason.as_str()) {
+                debug!(
+                    "Mesh interface {label} could not dial rnsd: {}",
+                    failure.reason
+                );
+                *logged_dial_failure = Some(failure.reason);
             }
         }
         // Guard for future variants.
@@ -12981,16 +13021,21 @@ mod tests {
             "unreachable: x"
         );
         assert_eq!(
-            InterfaceState::Connecting { reason: None }.to_string(),
+            InterfaceState::Connecting { dial_failure: None }.to_string(),
             "connecting"
         );
-        assert_eq!(
-            InterfaceState::Connecting {
-                reason: Some("x".to_string()),
-            }
-            .to_string(),
-            "connecting, retrying: x"
-        );
+        for advice in [DialAdvice::StartRnsd, DialAdvice::Redialing] {
+            assert_eq!(
+                InterfaceState::Connecting {
+                    dial_failure: Some(DialFailure {
+                        reason: "x".to_string(),
+                        advice,
+                    }),
+                }
+                .to_string(),
+                "connecting, retrying: x"
+            );
+        }
         assert_eq!(
             InterfaceState::Disconnected {
                 reason: "x".to_string(),
@@ -13074,7 +13119,7 @@ mod tests {
                 endpoint: endpoint.clone()
             }]
         );
-        let status = plans[0].status(InterfaceState::Connecting { reason: None });
+        let status = plans[0].status(InterfaceState::Connecting { dial_failure: None });
         assert_eq!(status.kind, "local");
         assert_eq!(status.label, format!("local rnsd at {endpoint}"));
         assert_eq!(status.endpoint, Some(endpoint.to_string()));
@@ -13669,7 +13714,7 @@ mod tests {
         let states = states_of(&runtime);
         assert_eq!(states[1].0, label);
         assert!(
-            matches!(&states[1].1, InterfaceState::Connecting { reason: Some(reason) } if names_nothing_listening(reason, &endpoint)),
+            matches!(&states[1].1, InterfaceState::Connecting { dial_failure: Some(DialFailure { reason, advice: DialAdvice::StartRnsd }) } if names_nothing_listening(reason, &endpoint)),
             "{states:?}"
         );
         assert_eq!(runtime.interface_kinds(), vec!["private"]);
@@ -13843,12 +13888,14 @@ mod tests {
         .await
         .unwrap();
         let InterfaceState::Connecting {
-            reason: Some(reason),
+            dial_failure: Some(failure),
         } = states_of(&runtime)[1].1.clone()
         else {
             panic!("{:?}", states_of(&runtime));
         };
+        let reason = failure.reason.clone();
         assert!(names_nothing_listening(&reason, &endpoint), "{reason}");
+        assert_eq!(failure.advice, DialAdvice::StartRnsd);
         let dial_line = format!("Mesh interface {label} could not dial rnsd: {reason}");
         let slot = Arc::new(MeshSlot::default());
         let notifier = Arc::new(RecordingSink::default());
@@ -13866,7 +13913,7 @@ mod tests {
         assert_eq!(
             states_of(&runtime)[1].1,
             InterfaceState::Connecting {
-                reason: Some(reason.clone()),
+                dial_failure: Some(failure.clone()),
             },
             "{:?}",
             states_of(&runtime)
@@ -14151,7 +14198,7 @@ mod tests {
         assert_eq!(
             states_of(&runtime)[1].1,
             InterfaceState::Connecting {
-                reason: Some(dial_failure_sentence(DialFailureKind::Refused, &endpoint)),
+                dial_failure: Some(DialFailure::of(DialFailureKind::Refused, &endpoint)),
             }
         );
         (runtime, endpoint)
@@ -18085,9 +18132,10 @@ mod tests {
     /// A `local` client's events fold into the row with the renderers' sentences: a
     /// `DialFailed` puts its reason on a `connecting` row and leaves a connected or lost
     /// row alone, a drop is `lost, retrying` with its reason's sentence and a plain
-    /// `Disconnected` reads as the orderly close, `Connecting` never moves a lost row, and
-    /// the end of the stream lets the client go. No watcher runs, since the slot is never
-    /// installed, so the started node's one row stands in for the `local` one.
+    /// `Disconnected` reads as a connection that ended, never as rnsd closing it,
+    /// `Connecting` never moves a lost row, and the end of the stream lets the client go.
+    /// No watcher runs, since the slot is never installed, so the started node's one row
+    /// stands in for the `local` one.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_clients_reasoned_events_fold_like_their_plain_counterparts() {
@@ -18110,14 +18158,35 @@ mod tests {
         let lost = |reason: &str| InterfaceState::Disconnected {
             reason: reason.to_string(),
         };
-        runtime.mark_interface_state(0, InterfaceState::Connecting { reason: None });
+        runtime.mark_interface_state(0, InterfaceState::Connecting { dial_failure: None });
 
         follow_local_event(runtime, &mut local, refused());
         assert_eq!(
             row(runtime),
             InterfaceState::Connecting {
-                reason: Some("nothing is listening at 127.0.0.1:37428".to_string()),
+                dial_failure: Some(DialFailure {
+                    reason: "nothing is listening at 127.0.0.1:37428".to_string(),
+                    advice: DialAdvice::StartRnsd,
+                }),
             }
+        );
+
+        follow_local_event(
+            runtime,
+            &mut local,
+            Some(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Timeout,
+            }),
+        );
+        assert_eq!(
+            row(runtime),
+            InterfaceState::Connecting {
+                dial_failure: Some(DialFailure {
+                    reason: "rnsd did not answer".to_string(),
+                    advice: DialAdvice::Redialing,
+                }),
+            },
+            "a later dial failure of another kind replaces the reason and its advice"
         );
 
         follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
@@ -18142,6 +18211,16 @@ mod tests {
 
         follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
         follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Disconnected));
+        assert_eq!(row(runtime), lost("the connection ended"));
+
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
+        follow_local_event(
+            runtime,
+            &mut local,
+            Some(SharedInstanceEvent::DisconnectedWithReason {
+                reason: DisconnectReason::PeerClosed,
+            }),
+        );
         assert_eq!(row(runtime), lost("rnsd closed the socket"));
 
         follow_local_event(runtime, &mut local, None);
@@ -18198,6 +18277,31 @@ mod tests {
         );
     }
 
+    /// The advice follows the dial failure's typed kind, never its sentence: a refusal or
+    /// a missing socket means no rnsd runs at the endpoint, a timeout or an I/O error is
+    /// left to the client's redials.
+    #[test]
+    fn a_dial_failures_advice_follows_its_kind() {
+        let endpoint = LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap());
+        for (kind, advice) in [
+            (DialFailureKind::Refused, DialAdvice::StartRnsd),
+            (DialFailureKind::NotFound, DialAdvice::StartRnsd),
+            (DialFailureKind::Timeout, DialAdvice::Redialing),
+            (
+                DialFailureKind::Io(std::io::ErrorKind::PermissionDenied),
+                DialAdvice::Redialing,
+            ),
+        ] {
+            let failure = DialFailure::of(kind, &endpoint);
+            assert_eq!(failure.advice, advice, "{kind:?}");
+            assert_eq!(
+                failure.reason,
+                dial_failure_sentence(kind, &endpoint),
+                "{kind:?}"
+            );
+        }
+    }
+
     fn start_wait_endpoint() -> LocalEndpoint {
         LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap())
     }
@@ -18235,7 +18339,10 @@ mod tests {
         assert_eq!(
             outcome,
             LocalStart::NotConnected {
-                dial_failure: Some("nothing is listening at 127.0.0.1:37428".to_string()),
+                dial_failure: Some(DialFailure {
+                    reason: "nothing is listening at 127.0.0.1:37428".to_string(),
+                    advice: DialAdvice::StartRnsd,
+                }),
             }
         );
         assert!(tokio::time::Instant::now() >= deadline);
@@ -18264,7 +18371,10 @@ mod tests {
         assert_eq!(
             outcome,
             LocalStart::NotConnected {
-                dial_failure: Some("no rnsd socket at 127.0.0.1:37428".to_string()),
+                dial_failure: Some(DialFailure {
+                    reason: "no rnsd socket at 127.0.0.1:37428".to_string(),
+                    advice: DialAdvice::StartRnsd,
+                }),
             }
         );
         drop(sender);

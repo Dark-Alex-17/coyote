@@ -3335,9 +3335,10 @@ fn method_body(path: &str, name: &str) -> String {
 }
 
 /// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
-/// did not come up as the code formats it: the five `WARNING:` lines, the `Mesh relay` and
-/// `Local rnsd` failure texts, the hint appended when every configured interface is a
-/// loopback relay, the `lan` bind failure and the six `InterfaceState` rows of `.mesh info`.
+/// did not come up as the code formats it: the eight `WARNING:` lines (seven `.mesh on`
+/// prints and the lost-rnsd one), the `Mesh relay` and `Local rnsd` failure texts, the hint
+/// appended when every configured interface is a loopback relay, the `lan` bind failure
+/// and the six `InterfaceState` rows of `.mesh info`.
 /// Every piece of text around a placeholder is on both pages byte for byte. The code side
 /// is checked on every run.
 #[test]
@@ -3355,8 +3356,8 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
         .collect();
     assert_eq!(
         warnings.len(),
-        6,
-        "interface_warnings in src/repl/mesh.rs does not format exactly six WARNING lines: {warnings:?}"
+        8,
+        "interface_warnings in src/repl/mesh.rs does not format exactly eight WARNING lines: {warnings:?}"
     );
     let failures: Vec<String> = string_literals(&fn_body("src/mesh/node.rs", "join_tcp"))
         .into_iter()
