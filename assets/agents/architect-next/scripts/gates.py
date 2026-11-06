@@ -1480,25 +1480,78 @@ def compose_delegation(state):
     if not task:
         raise RuntimeError(f"compose_delegation: unknown task {state.get('current_task')!r}")
     kind = state.get("delegation_kind") or "implement"
-    text = _delegation_text(state, task, kind, as_list(state.get("fix_items")), state.get("fix_note") or "")
+    # A task that still has its wave worktree (a wave member retried or resumed sequentially) is delegated there.
+    pd = task.get("worktree") or state.get("code_repo_path", "")
+    if kind == "resume":
+        # the child's own parent-resume form: its run id, then the owner's answer as a continue line
+        run_id = state.get("resume_run_id") or task.get("sisyphus_run_id") or ""
+        text = f"Sisyphus run id: {run_id}\ncontinue: {state.get('resume_answer') or ''}"
+    else:
+        text = _delegation_text(state, task, kind, as_list(state.get("fix_items")), state.get("fix_note") or "", project_dir=pd)
     u["delegation_prompt"] = text
     u["delegate_review_cadence"] = "batch" if is_micro(state) else "task"
     u["delegate_parallel"] = "0"
-    u["delegate_project_dir"] = state.get("code_repo_path", "")
+    u["delegate_project_dir"] = pd
     ledger(state, u, f"delegate: {task['id']} kind={kind}" + (f" items={len(as_list(state.get('fix_items')))}" if kind == "fix" else ""))
     snapshot(state, u, f"task {task['id']} delegated")
     return u
 
 
+# A sisyphus-next end node opens its output with its sentinel on a line of its own; REDIRECT ends the run before any
+# work lands (a plan-shaped brief). A sentinel quoted mid-line in a successful report is prose, never a verdict.
+FAILURE_SENTINEL_RE = re.compile(r"(?m)^\s*SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\b")
+DISCUSSION_SENTINEL_RE = re.compile(r"(?m)^\s*SISYPHUS_AWAITING_DISCUSSION\b")
+DISCUSSION_DATA_RE = re.compile(r"(?m)^Discussion data: (\{.*\})[ \t]*$")
+LEDGER_SECTION_RE = re.compile(r"(?im)^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions)\s*:")
+
+
 def _report_failed(text):
     if not text or text.startswith("Agent node failed"):
         return True
-    # REDIRECT and AWAITING_DISCUSSION end a sisyphus-next run before any work lands
-    if re.search(r"SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT|AWAITING_DISCUSSION)", text):
+    if FAILURE_SENTINEL_RE.search(text):
         return True
-    head = "\n".join(text.splitlines()[:30] + text.splitlines()[-30:])
+    if SISYPHUS_RUN_RE.search(text):
+        return False  # a sisyphus-next report: only its sentinel says it failed
+    # A report with no run id is not a sisyphus-next end node: its opening lines say whether it stopped.
+    head = "\n".join(text.splitlines()[:5])
     return bool(re.search(r"(?im)^\W*(STOP(PED)?|BLOCKED|FAILED)\b.*\b(plan|scope|cannot|could not|unable)", head)
-                or re.search(r"(?i)\b(cannot|could not|unable to)\s+(complete|implement|proceed|finish)\b", head))
+                or re.search(r"(?im)^\W*(cannot|could not|unable to)\s+(complete|implement|proceed|finish)\b", head))
+
+
+def _answer_shaped(text):
+    """A sisyphus-next run that ended as an answer (end_answer): a run id, but no HEAD SHA and no ledger section."""
+    return bool(SISYPHUS_RUN_RE.search(text or "")) and not re.search(r"(?i)HEAD(?: SHA)?[:\s]+[0-9a-f]{7,40}", text) \
+        and not LEDGER_SECTION_RE.search(text)
+
+
+def _child_discussion(text):
+    """The parked question a delegated sisyphus-next run relays: its `Discussion data:` line, else the run id alone."""
+    d = {}
+    if m := DISCUSSION_DATA_RE.search(text or ""):
+        try:
+            d = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            d = {}
+    d = d if isinstance(d, dict) else {}
+    run = SISYPHUS_RUN_RE.search(text or "")
+    opts = [o for o in as_list(d.get("options")) if isinstance(o, dict) and str(o.get("text", "")).strip()]
+    return {"kind": str(d.get("kind") or ""), "question": str(d.get("question") or "").strip() or tail(text or "", 1500),
+            "options": [{"text": str(o["text"]), "recommended": truthy(o.get("recommended"))} for o in opts],
+            "reply": str(d.get("reply") or ""), "run_id": str(d.get("run_id") or (run.group(1) if run else ""))}
+
+
+def _relay_escalation(state, task, d):
+    """delegate_discussion: the child's parked question, its options and run id, relayed to the owner."""
+    tid = task.get("id", "")
+    key = hashlib.sha1(f"{tid}\n{d['question']}".encode("utf-8", "replace")).hexdigest()[:12]
+    return escalation(
+        "delegate_discussion", f"{tid}'s implementer asks ({d['kind'] or 'question'}): {d['question']}",
+        [option(o["text"], recommended=o["recommended"]) for o in d["options"]],
+        evidence=f"The implementer parked its run on this question for discussion. Its reply so far: {d['reply'] or '(none)'}",
+        hard_trigger=True, tier3_ok=False,
+        data={"task": tid, "child_run_id": d["run_id"], "child_kind": d["kind"], "question": d["question"],
+              "reply": d["reply"], "relay_pending": True, "park_key": f"delegate_discussion#{key}",
+              "delegation_kind": state.get("delegation_kind") or "implement"})
 
 
 def _parse_report(text):
@@ -1537,6 +1590,11 @@ def route_delegate(state):
     write_artifact(state.get("run_dir", ""), os.path.join("reports", f"{task['id']}-r{n + 1}.md"), text or "(empty)")
     parsed = _parse_report(text)
     u["report_parsed"] = parsed
+    kind = state.get("delegation_kind") or "implement"
+    if kind == "resume":
+        # the relayed answer went to the child; its run continues the delegation the discussion interrupted
+        kind = state.get("resume_after_kind") or "implement"
+        u.update({"delegation_kind": kind, "resume_run_id": "", "resume_answer": "", "resume_after_kind": ""})
     if parsed["pr_number"]:
         task["pr_number"], task["pr_url"] = parsed["pr_number"], parsed["pr_url"]
         prs = dict(as_dict(state.get("pr_numbers")))
@@ -1547,16 +1605,34 @@ def route_delegate(state):
     if parsed["sisyphus_run_id"]:
         task["sisyphus_run_id"] = parsed["sisyphus_run_id"]
     save_tasks(state, u, tasks)
+    if text and not text.startswith("Agent node failed") and DISCUSSION_SENTINEL_RE.search(text):
+        d = _child_discussion(text)
+        if d["run_id"]:
+            ledger(state, u, f"relay: {task['id']}: the implementer (run {d['run_id']}) parked on a {d['kind'] or 'question'} "
+                             "discussion -> relayed to the owner")
+            raise_escalation(state, u, _relay_escalation({**state, **u}, task, d))
+            u["last_answer_text"] = d["reply"]
+            return u
+        u["failure_evidence"] = tail(text, 4000)
+        ledger(state, u, f"delegate: {task['id']} parked on a discussion with no run id to resume -> oracle diagnosis")
+        u["_next"] = "oracle_diagnose"
+        return u
     if _report_failed(text):
         u["failure_evidence"] = tail(text, 4000)
         ledger(state, u, f"delegate: {task['id']} reported failure / STOP -> oracle diagnosis")
         u["_next"] = "oracle_diagnose"
         return u
+    if _answer_shaped(text):
+        u["failure_evidence"] = tail(text, 4000)
+        ledger(state, u, f"delegate: {task['id']} returned an answer (a run id, no HEAD SHA, no ledger section), not an "
+                         "implementation report -> oracle diagnosis")
+        u["_next"] = "oracle_diagnose"
+        return u
     ledger(state, u, f"delegate: {task['id']} returned (report r{n + 1}; shas={len(parsed['shas'])}; pr={parsed['pr_number'] or '-'})")
-    if (state.get("delegation_kind") == "fix" and state.get("fix_source") in ("probe_adopt",)):
+    if (kind == "fix" and state.get("fix_source") in ("probe_adopt",)):
         u["_next"] = "post_round"
         return u
-    u["verify_scope"] = "hygiene" if state.get("delegation_kind") == "hygiene" else "task"
+    u["verify_scope"] = "hygiene" if kind == "hygiene" else "task"
     u["_next"] = "verify_gate"
     return u
 
@@ -2273,7 +2349,17 @@ def wave_route(state):
     real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
     result = {"task": w.get("task"), "worktree": w.get("worktree"), "branch": w.get("branch"), "base_sha": w.get("base_sha"),
               "report": tail(report, 12000), "verdict": verdict, "lanes": lanes, "review": tail(text, 6000)}
-    if _report_failed(report):
+    if report and not report.startswith("Agent node failed") and DISCUSSION_SENTINEL_RE.search(report):
+        # a wave member's discussion is not relayed: the member fails with the question and the child's run id
+        d = _child_discussion(report)
+        opts = "\n".join(f"  - {o['text']}" + (" (recommended)" if o["recommended"] else "") for o in d["options"])
+        result.update({"status": "failed", "escalation": {
+            "kind": "task_failed", "discussion": True,
+            "evidence": tail(f"The implementer parked on a {d['kind'] or 'question'} discussion (not relayed in a wave):\n"
+                             f"{d['question']}\n" + (f"Options:\n{opts}\n" if opts else "")
+                             + f"Its reply so far: {d['reply'] or '(none)'}\nSisyphus run id: {d['run_id'] or '(none)'}", 2000)}})
+        return {"wave_result": result}
+    if _report_failed(report) or _answer_shaped(report):
         result.update({"status": "failed", "escalation": {"kind": "task_failed", "evidence": tail(report, 2000)}})
         return {"wave_result": result}
     if verdict == "PASS" and not real:
@@ -2281,6 +2367,7 @@ def wave_route(state):
         return {"wave_result": result}
     if real and not plan_root and as_int(state.get("wave_fix_rounds")) < RERUN_ONCE:
         fixed = dict(w)
+        fixed.setdefault("review_cadence", "batch" if is_micro(state) else "task")  # a wave item from an older snapshot
         fixed["prompt"] = (w.get("prompt", "") + "\n\n## FIX ROUND 1\nFix these plan-conformance / review failures (verbatim):\n"
                            + "\n".join(f"- {b}" for b in real) + "\n\n### Your prior report (verbatim)\n" + tail(report, 8000))
         return {"wtask": fixed, "wave_fix_rounds": as_int(state.get("wave_fix_rounds")) + 1, "_next": "wave_delegate"}
@@ -2330,6 +2417,9 @@ def wave_integrate(state):
         task["status"] = "parked"
         save_tasks(state, u, tasks)
         ledger(state, u, f"wave: {r.get('task')} {status} -> escalation {esc.get('kind')} (deferred to the wave boundary, E7)")
+        if esc.get("discussion"):
+            ledger(state, u, f"relay: {r.get('task')}: a wave member's discussion is not relayed; raised as a failed member "
+                             "with the question and the child's run id in the evidence")
         return raise_escalation(state, u, escalation(
             "wave_escalation", f"Parallel task {r.get('task')} ended {status} ({esc.get('kind')}). How to proceed?",
             [option("Retry the task sequentially (one fix round with the evidence)", recommended=True),
@@ -2551,6 +2641,12 @@ def escalate_gate(state):
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "unknown")
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
+    data = as_dict(esc.get("data"))
+    if kind == "delegate_discussion" and data.get("relay_pending"):
+        # the owner was already discussing this with the child: park this run on it, never ask or rule it here
+        u["escalation"] = {**esc, "data": {**data, "relay_pending": False}}
+        u["_next"] = "choice_park"
+        return u
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
     failed_once = _autonomy_key(esc) in as_list(state.get("autonomous_kinds"))
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
@@ -2713,7 +2809,11 @@ def parse_answer(state):
             return u
     else:
         typed_path = esc.get("kind") == "need_design_doc" and _typed_doc_path(text)
-        choice = text if typed_path else match_option(text, options)
+        if esc.get("kind") == "delegate_discussion":
+            # relayed verbatim to the child: an option only by its number or its exact text, never a prefix
+            choice = (text or None) if not options else _exact_option(text, options)
+        else:
+            choice = text if typed_path else match_option(text, options)
         if choice is None and text and not truthy(state.get("reply_interpreted")):
             # the first typed reply that names no option is interpreted once, never re-asked blind
             u["reply_accepts"] = _accepts_text(esc.get("kind", ""))
@@ -2750,6 +2850,7 @@ ACCEPTED_INSTRUCTIONS = {
     "task_failed": ("rescope",),
     "probe_gap": ("recipe",),
     "mode_invalid": ("mode_values",),
+    "delegate_discussion": ("answer",),
 }
 INSTRUCTION_HELP = {
     "base_branch": "cut the run branch from a different base branch; value: that branch name",
@@ -2761,12 +2862,13 @@ INSTRUCTION_HELP = {
     "rescope": "re-scope the failed task as described; value: the new scope",
     "recipe": "supply the local-run recipe for the probe; value: the recipe",
     "mode_values": "set run mode values; value: key=value pairs",
+    "answer": "answer the implementer's question in your own words; value: the answer",
 }
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
 # the owner's own words verbatim; only mode_values takes the interpreter's extracted value.
 INSTRUCTION_ANSWERS = {"revision": "Revise the breakdown: {}", "answers": "{}", "rescope": "Re-scope: {}",
-                       "recipe": "Supply the recipe: {}", "mode_values": "{}"}
-FREE_FORM_SHAPES = ("revision", "answers", "rescope", "recipe")
+                       "recipe": "Supply the recipe: {}", "mode_values": "{}", "answer": "{}"}
+FREE_FORM_SHAPES = ("revision", "answers", "rescope", "recipe", "answer")
 
 
 def _accepts_text(kind):
@@ -2905,7 +3007,7 @@ def choice_park(state):
     data = as_dict(esc.get("data"))
     mc = bool(data.get("multiple_choice"))
     queue, idx = (as_list(state.get("choice_queue")), as_int(state.get("choice_index"))) if mc else ([], 0)
-    key = str(idx) if mc else esc.get("kind", "")
+    key = str(idx) if mc else (data.get("park_key") or esc.get("kind", ""))
     where = f"question {idx + 1}/{len(queue)}" if mc else "the question"
     parks = dict(as_dict(state.get("choice_parks")))
     count = as_int(parks.get(key))
@@ -3328,6 +3430,14 @@ def apply_answer(state):
             save_tasks(state, u, tasks)
             u["fix_origin_return"] = ""
             u["_next"] = "wave_cleanup"
+    elif kind == "delegate_discussion":
+        data = as_dict(esc.get("data"))
+        tid = data.get("task") or task.get("id", "")
+        u.update({"current_task": tid, "delegation_kind": "resume", "resume_run_id": data.get("child_run_id") or "",
+                  "resume_answer": answer, "resume_after_kind": data.get("delegation_kind") or "implement"})
+        ledger(state, u, f"relay: {tid}: the owner answered {tail(answer, 200)!r} -> resuming the implementer's run "
+                         f"{data.get('child_run_id')}")
+        u["_next"] = "compose_delegation"
     elif kind in ("integration_conflict", "integration_red"):
         a = _answered(state, {"stop": ["stop"], "round": ["one more", "cycle", "round"], "abort": ["abort"]}, "stop")
         rounds = dict(as_dict(state.get("task_rounds")))
