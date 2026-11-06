@@ -927,9 +927,9 @@ pub async fn openai_responses_streaming(
 fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Result<bool> {
     match data["type"].as_str() {
         // A reasoning item is done before the message item that follows it
-        // is added, so the phase opened here is closed by that item's
-        // `thinking_block`; the text-delta stop only catches a reasoning
-        // item the server never finished.
+        // is added, so the phase opened here is closed when the item is
+        // done; the text-delta stop only catches a reasoning item the
+        // server never finished.
         Some("response.output_item.added") => {
             if data["item"]["type"].as_str() == Some("reasoning") {
                 handler.thinking_started();
@@ -964,6 +964,7 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
                     if let Some(block) = reasoning_thinking_block(item) {
                         handler.thinking_block(block);
                     }
+                    handler.thinking_stopped();
                 }
                 _ => {}
             }
@@ -2299,6 +2300,26 @@ mod tests {
             let (text, _, thinking, _) = handler.take();
             assert_eq!(text, "answer");
             assert_eq!(thinking.len(), 1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_reasoning_item_done_without_an_id_still_closes_the_phase() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "summary": [] }
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (_, _, thinking, _) = handler.take();
+            assert!(thinking.is_empty());
         }
 
         #[test]

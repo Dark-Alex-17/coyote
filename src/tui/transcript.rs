@@ -34,6 +34,10 @@ pub(super) struct Transcript {
     /// Lines between the bottom of the view and the bottom of the
     /// transcript; zero while the view follows new output.
     offset_from_bottom: usize,
+    /// Lines the transcript had at the last frame; what it has grown by
+    /// since is added to a non-zero offset so a scrolled view keeps the
+    /// same lines on screen while output lands below it.
+    last_total: usize,
     /// Cells appended while the view was scrolled away from the bottom.
     unseen: usize,
     /// The row Ctrl+Up/Down or a click put the cursor on; only a cell
@@ -57,6 +61,7 @@ impl Transcript {
             model,
             prefix,
             offset_from_bottom: 0,
+            last_total: 0,
             unseen: 0,
             focus: None,
             stream: None,
@@ -292,6 +297,10 @@ impl Transcript {
 
         let total = lines.len();
         let height = usize::from(area.height);
+        if self.offset_from_bottom > 0 {
+            self.offset_from_bottom += total.saturating_sub(self.last_total);
+        }
+        self.last_total = total;
         self.offset_from_bottom = self.offset_from_bottom.min(total.saturating_sub(height));
         if std::mem::take(&mut self.reveal_focus)
             && let Some(header) = self.focus.map(|focus| headers[focus])
@@ -462,7 +471,8 @@ mod tests {
     }
 
     /// The offset is clamped to the lines above the view, a push while
-    /// scrolled counts as unseen, and reaching the bottom forgets it.
+    /// scrolled counts as unseen and grows the offset by what it added,
+    /// and reaching the bottom forgets the count.
     #[test]
     fn scrolling_clamps_and_counts_what_arrives_below() {
         let (mut transcript, mut renderer) = transcript();
@@ -478,9 +488,10 @@ mod tests {
         assert_eq!(transcript.unseen, 1);
         let view = transcript.view(area(5), &mut renderer);
         assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
+        assert_eq!(transcript.offset_from_bottom, 16, "the view slid");
         transcript.scroll_page(1);
         let view = transcript.view(area(5), &mut renderer);
-        assert_eq!(transcript.offset_from_bottom, 9);
+        assert_eq!(transcript.offset_from_bottom, 11);
         assert_eq!(transcript.unseen, 1, "a partial scroll forgot the count");
         assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
         transcript.scroll_to_bottom();
@@ -488,6 +499,33 @@ mod tests {
         assert_eq!(transcript.offset_from_bottom, 0);
         assert_eq!(view.chip, None);
         assert_eq!(transcript.unseen, 0);
+    }
+
+    /// Cells landing below a scrolled view leave the lines on screen
+    /// where they were; only the chip's count tells they arrived.
+    #[test]
+    fn a_scrolled_view_keeps_its_lines_while_cells_arrive_below() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-6);
+        let before = transcript.view(area(5), &mut renderer);
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let after = transcript.view(area(5), &mut renderer);
+        assert_eq!(
+            after.lines[0].to_string(),
+            before.lines[0].to_string(),
+            "the first visible line moved"
+        );
+        assert_eq!(after.chip.as_deref(), Some("3 new below  End = follow"));
+        transcript.scroll_to_bottom();
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(view.chip, None);
+        assert_eq!(view.lines.last().unwrap().to_string(), "> late 2");
     }
 
     /// Scrolled away with nothing new below, the chip still offers the

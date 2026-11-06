@@ -685,6 +685,20 @@ pub async fn call_chat_completions(
                 thinking,
                 usage,
             } = ret;
+            // The non-streaming transport only learns of thinking after the
+            // fact; the back-to-back pair, published ahead of the text, keeps
+            // bus consumers consistent with what a streamed reply would have
+            // published. OpenAI-compatible replies fold `reasoning_content`
+            // into the text as a `<think>` span and leave `thinking` empty.
+            let carried_thinking = !thinking.is_empty() || text.trim_start().starts_with("<think>");
+            if carried_thinking && ctx.render_mode != RenderMode::Silent {
+                bus().publish(Event::ThinkingStarted {
+                    origin: Origin::from(&*ctx),
+                });
+                bus().publish(Event::ThinkingStopped {
+                    origin: Origin::from(&*ctx),
+                });
+            }
             if !text.is_empty() {
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
@@ -694,17 +708,6 @@ pub async fn call_chat_completions(
                 }
             }
             ctx.record_token_usage(usage, client.model());
-            // The non-streaming transport only learns of thinking after the
-            // fact; the back-to-back pair keeps bus consumers consistent with
-            // what a streamed reply would have published.
-            if !thinking.is_empty() && ctx.render_mode != RenderMode::Silent {
-                bus().publish(Event::ThinkingStarted {
-                    origin: Origin::from(&*ctx),
-                });
-                bus().publish(Event::ThinkingStopped {
-                    origin: Origin::from(&*ctx),
-                });
-            }
             finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => {
@@ -2359,6 +2362,86 @@ mod tests {
         .unwrap();
 
         assert!(thinking_pair_for(&sink, "thinking-origin-silent").is_empty());
+    }
+
+    /// An OpenAI-compatible reply through the real extractor: its
+    /// `reasoning_content` ends up as a `<think>` span in the text while
+    /// the `thinking` blocks stay empty.
+    fn openai_reasoning_reply() -> test_fakes::FixedReplyClient {
+        let output = crate::client::openai::openai_extract_chat_completions(&json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer!",
+                    "reasoning_content": "hmm",
+                }
+            }]
+        }))
+        .unwrap();
+        assert!(output.thinking.is_empty());
+        test_fakes::FixedReplyClient::new(&output.text)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plain_transport_publishes_one_thinking_pair_ahead_of_an_openai_think_span() {
+        let mut ctx = bus_probe_ctx();
+        ctx.self_agent_id = Some("thinking-origin-think-span".into());
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = openai_reasoning_reply();
+        let sink = RecordingSink::install();
+
+        call_chat_completions(
+            &input,
+            true,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let recorded: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(|event| match event {
+                Event::ThinkingStarted { origin } | Event::ThinkingStopped { origin } => {
+                    origin.agent_id.as_deref() == Some("thinking-origin-think-span")
+                }
+                Event::AssistantText { text, .. } => text.contains("answer!"),
+                _ => false,
+            })
+            .collect();
+        let mut expected = thinking_pair("thinking-origin-think-span");
+        expected.push(Event::AssistantText {
+            text: "<think>\nhmm\n</think>\n\nanswer!".to_string(),
+            markdown: true,
+        });
+        assert_eq!(recorded, expected);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plain_transport_publishes_no_thinking_pair_for_a_reply_without_thinking() {
+        let mut ctx = bus_probe_ctx();
+        ctx.self_agent_id = Some("thinking-origin-none".into());
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = test_fakes::FixedReplyClient::new("answer!");
+        let sink = RecordingSink::install();
+
+        call_chat_completions(
+            &input,
+            true,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        assert!(thinking_pair_for(&sink, "thinking-origin-none").is_empty());
     }
 
     #[tokio::test]

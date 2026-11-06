@@ -16,6 +16,12 @@
 //! - `F2` shows and hides the Todo panel;
 //! - scrolling up raises the follow chip, `End` and a submitted line
 //!   clear it.
+//! - a tool call is one cell that finishes in place (its start and end
+//!   events pair up), never a running cell plus a finished one;
+//! - `.undo` with nothing to undo, a terminal shrunk to a few cells, and
+//!   an emoji/VS16 prompt leave the UI alive and quitting cleanly;
+//! - undoing the only exchange stops at the command cell before it and
+//!   leaves that cell in place.
 #![cfg(unix)]
 
 mod common;
@@ -642,4 +648,292 @@ fn follow_chip_appears_on_scroll_up_and_clears_on_end() {
     );
 
     quit(pty);
+}
+
+// =====================================================================
+// Edge cases: tool-cell pairing, invalid input, tiny terminals, wide
+// graphemes, undo to an empty transcript.
+// =====================================================================
+
+/// A tool that marks its start at `<marker>-started`, then waits (at most
+/// eight seconds) for `<marker>-release` to appear before finishing.
+const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Wait until released.\n\
+    # @option --marker! Path prefix for the start and release files.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   local marker\n\
+    \x20   marker=\"$(jq -r '.marker' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   : > \"${marker}-started\"\n\
+    \x20   for _ in $(seq 1 160); do\n\
+    \x20       [ -e \"${marker}-release\" ] && break\n\
+    \x20       sleep 0.05\n\
+    \x20   done\n\
+    \x20   echo \"fixture slept p3t\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// Drops one bash tool into the config's `functions/tools` dir; the binary
+/// builds its shim on startup.
+fn write_tool(dir: &Path, file: &str, body: &str) {
+    let tools = dir.join("functions").join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(tools.join(file), body).unwrap();
+}
+
+/// Pumps the pty until `path` exists, so the child's output never backs up
+/// while the test waits on a side effect.
+fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    while !path.exists() {
+        let text = pty.read_for(Duration::from_millis(100));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} ({}) never appeared:\n{text}",
+            path.display()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Criterion: "tool/job/agent cells pair with their terminal event by
+// COYOTE_TOOL_CALL_ID". Observable from the outside: while the tool runs
+// its cell names it; once it has finished and the model replied, the
+// same name is on screen exactly once (the end event landed in the cell
+// that the start event opened, not in a second one).
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_tool_call_is_one_cell_that_finishes_in_place() {
+    let dir = fresh_config_dir("tool-cell");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_sleep".to_string(),
+            arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+        },
+        Reply::Text("fixture done tail-r7q".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"call the sleep tool\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-started"),
+        "the tool's start marker",
+    );
+    pty.read_for(Duration::from_millis(500));
+    let running = repaint(&mut pty);
+    assert!(
+        running.contains("fixture_sleep"),
+        "no cell names the running tool:\n{running}"
+    );
+
+    fs::write(dir.join("tool-release"), b"").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "fixture done tail-r7q",
+        0,
+        "the reply after the tool",
+    );
+    pty.read_for(Duration::from_millis(500));
+    let finished = repaint(&mut pty);
+    let names = finished.matches("fixture_sleep").count();
+    assert_eq!(
+        names, 1,
+        "the finished tool should be one cell naming it once (saw {names}); \
+         while running the frame was:\n{running}\nafter:\n{finished}"
+    );
+    assert!(
+        finished.contains(&squeezed("fixture done tail-r7q")),
+        "the model's reply after the tool is missing:\n{finished}"
+    );
+    assert_eq!(fake.served(), 2, "{finished}");
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// Invalid input: `.undo` on an empty transcript (nothing recorded) must
+// not take the UI down; the process is still there, still takes keys,
+// and still quits with the tty restored.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn undo_with_nothing_to_undo_leaves_the_ui_alive() {
+    let (_guard, mut pty) = boot("undo-empty", &[]);
+
+    pty.send(b".undo\r").unwrap();
+    pty.read_for(Duration::from_secs(1));
+    pty.send(b".undo\r").unwrap();
+    pty.read_for(Duration::from_secs(1));
+
+    let before = pty.raw().len();
+    pty.send(b"still-alive-marker\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "still-alive-marker",
+        before,
+        "a prompt after a refused .undo",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// Checklist item 6: "every custom widget clamps to the buffer". With the
+// welcome block up and the Todo panel open, the terminal is shrunk to a
+// handful of cells and then to a single cell; nothing may panic, a key
+// typed under every size still reaches the composer, and once the
+// terminal grows back both widgets are drawn again and the draft typed
+// along the way is submitted whole.
+//
+// Known and out of this task's scope: after a shrink the composer's own
+// viewport (ratatui-textarea) may stay scrolled right, so the draft can
+// look blank until it is edited or sent; the draft itself is intact,
+// which is what the submitted user cell asserts.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn tiny_terminal_sizes_clamp_the_welcome_block_and_todo_panel() {
+    let (_guard, mut pty) = boot("tiny", &[]);
+
+    pty.send(F2).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains("Todo"),
+        "F2 did not open the Todo panel:\n{frame}"
+    );
+
+    // One distinct digit per size, the first a control resize that is
+    // not tiny at all.
+    for (digit, rows, cols) in [
+        (b"1", 20u16, 70u16),
+        (b"2", 6, 20),
+        (b"3", 3, 8),
+        (b"4", 2, 4),
+        (b"5", 1, 1),
+        (b"6", 5, 40),
+    ] {
+        pty.resize(rows, cols).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        pty.send(digit).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let since = strip_ansi(&String::from_utf8_lossy(pty.raw()));
+        assert!(
+            !since.contains("panicked") && !since.contains("exit="),
+            "the UI died at {rows}x{cols}:\n{since}"
+        );
+    }
+
+    pty.resize(24, 80).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains(&squeezed("Tip: Press Ctrl-C")),
+        "the welcome block did not come back after growing the terminal:\n{frame}"
+    );
+    assert!(
+        frame.contains("Todo"),
+        "the Todo panel did not come back after growing the terminal:\n{frame}"
+    );
+
+    let before = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        ">123456",
+        before,
+        "the draft typed across the resizes, as the user cell",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// Checklist item 6: "rows with VS16/emoji graphemes repaint whole". A
+// prompt carrying a VS16 sequence and a wide emoji reaches the user cell
+// and the dry-run echo intact.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn emoji_and_vs16_prompts_echo_whole() {
+    let (_guard, mut pty) = boot("emoji", &[]);
+
+    let before = pty.raw().len();
+    pty.send("\u{2714}\u{FE0F} check \u{1F44D} emoji-marker-v5\r".as_bytes())
+        .unwrap();
+    wait_for_squeezed_after(&mut pty, "emoji-marker-v5", before, "the emoji prompt");
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains('\u{2714}') && frame.contains('\u{1F44D}'),
+        "the emoji graphemes did not survive into the transcript:\n{frame}"
+    );
+    assert!(
+        frame.matches("emoji-marker-v5").count() >= 2,
+        "the user cell and the echo should both carry the prompt:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// "Undo removes cells back to the last user cell", at the boundary where
+// the previous user cell is a command (`.session scratch`) rather than a
+// prompt: the only exchange goes, the command cell stays, and the undone
+// prompt is handed back to the composer. The welcome block does not
+// return: a submitted line (the command) is still in the transcript.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn undoing_the_only_exchange_stops_at_the_command_cell_before_it() {
+    let fake = FakeLlm::start(vec![Reply::Text("reply-solo-zz".to_string())]);
+    let (_guard, mut pty) = boot_with_fake("undo-to-empty", &fake);
+
+    pty.send(b".session scratch\r").unwrap();
+    pty.read_for(Duration::from_secs(1));
+
+    let before = pty.raw().len();
+    pty.send(b"solomarker one\r").unwrap();
+    wait_for_squeezed_after(&mut pty, "reply-solo-zz", before, "the only reply");
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(&squeezed("Tip: Press Ctrl-C")),
+        "the welcome block is up with a turn on screen:\n{frame}"
+    );
+
+    pty.send(b".undo\r").unwrap();
+    pty.read_for(Duration::from_secs(1));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains("reply-solo-zz") && !frame.contains(">solomarkerone"),
+        ".undo left the only exchange on screen:\n{frame}"
+    );
+    assert!(
+        frame.contains(">.sessionscratch"),
+        ".undo removed the command cell before the exchange:\n{frame}"
+    );
+    assert!(
+        frame.contains("solomarkerone"),
+        ".undo did not hand the undone prompt back to the composer:\n{frame}"
+    );
+
+    drop(pty);
 }

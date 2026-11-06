@@ -157,16 +157,14 @@ pub(super) enum Cell {
 }
 
 /// Whether `name` is a tool whose call is housekeeping rather than work
-/// (memory and skill lookups, listings, the inbox): its row never opens
-/// and never shows output.
+/// (memory and skill lookups, listings): its row never opens and never
+/// shows output. Reading the inbox is not: what a sibling agent wrote is
+/// a prompt-injection carrier the human has to be able to see.
 pub(super) fn is_bookkeeping(name: &str) -> bool {
     name.starts_with("memory__")
         || name.starts_with("skill__")
         || name.starts_with("agent__list_")
-        || matches!(
-            name,
-            "job__list" | "agent__task_list" | "agent__check_inbox"
-        )
+        || matches!(name, "job__list" | "agent__task_list")
 }
 
 /// The tool name a narration line names, after `Call `.
@@ -449,6 +447,8 @@ fn folded_summary(calls: &[FoldedCall]) -> String {
 fn folded_verb(name: &str) -> &str {
     let action = name.split_once("__").map_or(name, |(_, action)| action);
     match action {
+        "start" => "started",
+        "spawn" => "spawned",
         "check" => "checked",
         "collect" => "collected",
         "cancel" => "cancelled",
@@ -699,14 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn bookkeeping_covers_lookups_listings_and_the_inbox() {
+    fn bookkeeping_covers_lookups_and_listings_but_not_the_inbox() {
         for name in [
             "memory__search",
             "skill__load",
             "agent__list_skills",
             "job__list",
             "agent__task_list",
-            "agent__check_inbox",
         ] {
             assert!(is_bookkeeping(name), "{name} should be bookkeeping");
         }
@@ -716,6 +715,7 @@ mod tests {
             "job__check",
             "agent__spawn",
             "agent__collect",
+            "agent__check_inbox",
         ] {
             assert!(!is_bookkeeping(name), "{name} is work, not bookkeeping");
         }

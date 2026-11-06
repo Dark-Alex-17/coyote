@@ -450,11 +450,52 @@ fn row_count(lines: usize) -> u16 {
     u16::try_from(lines).unwrap_or(u16::MAX)
 }
 
-/// Whether a submitted command line is `.undo` under the active prefix.
-fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
+/// The command word of a submitted line under the active prefix, in its
+/// dot form.
+fn command_word(line: &str, prefix: crate::config::CommandPrefix) -> Option<String> {
     prefix
         .normalize(line.trim())
-        .is_some_and(|command| command.split_whitespace().next() == Some(".undo"))
+        .and_then(|command| command.split_whitespace().next().map(str::to_string))
+}
+
+/// Whether a submitted command line is `.undo` under the active prefix.
+fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
+    command_word(line, prefix).as_deref() == Some(".undo")
+}
+
+/// Commands whose turn records an exchange in the session the way a
+/// prompt does, so `.undo` takes it back: the REPL's `.file`, `.continue`,
+/// `.recover`, `.regenerate` and `.run` arms each hand an `Input` to `ask`.
+const EXCHANGE_OPENING_COMMANDS: [&str; 5] =
+    [".file", ".continue", ".recover", ".regenerate", ".run"];
+
+/// Whether the cell opened an exchange `.undo` would take back: a user
+/// line, or a command turn from `EXCHANGE_OPENING_COMMANDS` that got as
+/// far as a reply. One that bailed on usage (bare `.file`, nothing to
+/// `.continue`) recorded nothing, so it is looked past.
+fn opens_exchange(cell: &Cell, answered: bool, prefix: crate::config::CommandPrefix) -> bool {
+    match cell {
+        Cell::User { .. } => true,
+        Cell::Command { name, .. } => {
+            answered
+                && command_word(name, prefix)
+                    .is_some_and(|word| EXCHANGE_OPENING_COMMANDS.contains(&word.as_str()))
+        }
+        _ => false,
+    }
+}
+
+/// Index of the cell that opened the exchange a `.undo` at `undo` takes
+/// back: the latest opener before it, scanning back past any reply.
+fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix) -> Option<usize> {
+    let mut answered = false;
+    cells[..undo].iter().rposition(|cell| {
+        if matches!(cell, Cell::Assistant { .. }) {
+            answered = true;
+            return false;
+        }
+        opens_exchange(cell, answered, prefix)
+    })
 }
 
 /// Something the loop, not the app, has to do.
@@ -623,16 +664,13 @@ impl App {
             *output = outcome.captured.clone();
             *cache = LineCache::default();
             // `.undo` took the last exchange out of the context; the
-            // transcript drops it too, back to the user line that opened
-            // it, and the command cell with it.
-            if outcome.error.is_none() && is_undo(name, prefix) {
-                let cells = self.transcript.cells();
-                if let Some(user) = cells[..index]
-                    .iter()
-                    .rposition(|cell| matches!(cell, Cell::User { .. }))
-                {
-                    self.transcript.truncate(user);
-                }
+            // transcript drops it too, back to the cell that opened it,
+            // and the command cell with it.
+            if outcome.error.is_none()
+                && is_undo(name, prefix)
+                && let Some(opener) = undo_opener(self.transcript.cells(), index, prefix)
+            {
+                self.transcript.truncate(opener);
             }
         } else if !outcome.captured.trim().is_empty() {
             self.transcript.push(Cell::notice(
@@ -2108,6 +2146,13 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     };
                     match joined {
                         Ok((mut returned, outcome)) => {
+                            // The select is unbiased: a tool's last report
+                            // may still sit in the channel next to the join
+                            // that won, and the end-of-turn sweep would
+                            // otherwise fail its row as unreported.
+                            while let Ok(msg) = rx.try_recv() {
+                                app.handle_msg(msg);
+                            }
                             app.end_turn(command, &outcome);
                             app.sync_from_ctx(&mut returned);
                             if outcome.exit {
@@ -2307,7 +2352,7 @@ mod tests {
     /// would otherwise shift with the version's length.
     fn assert_welcome_snapshot(name: &str, frame: &str) {
         insta::with_settings!(
-            { filters => vec![(r"coyote \d+\.\d+\.\d+ +", "coyote X.Y.Z ")] },
+            { filters => vec![(r"coyote \S+ +", "coyote X.Y.Z ")] },
             { insta::assert_snapshot!(name, frame) }
         );
     }
@@ -4267,7 +4312,7 @@ mod tests {
         let frame = harness.draw();
         insta::assert_snapshot!("job_row_80x24", &frame);
         assert!(
-            frame.contains("job execute_command job_1a2b3c4d  done  start, checked"),
+            frame.contains("job execute_command job_1a2b3c4d  done  started, checked"),
             "{frame}"
         );
         assert!(!frame.contains("still running"), "{frame}");
@@ -4365,6 +4410,34 @@ mod tests {
         assert!(frame.contains("3.0s  failed: interrupted"), "{frame}");
     }
 
+    /// The loop drains the channel before `end_turn`, the way the Work arm
+    /// does, so a report that lost the select to the join still lands
+    /// ahead of the sweep.
+    #[test]
+    fn a_tool_report_queued_before_the_turn_ends_beats_the_sweep() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(UiMsg::ToolFinished {
+            call_id: "call-1".to_string(),
+            ok: true,
+            error: None,
+            duration_ms: Some(1200),
+        })
+        .unwrap();
+        while let Ok(msg) = rx.try_recv() {
+            harness.app.handle_msg(msg);
+        }
+        harness.app.end_turn(false, &TurnOutcome::default());
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Tool {
+                status: ToolStatus::Ok { elapsed },
+                ..
+            } if *elapsed == Duration::from_millis(1200)
+        ));
+    }
+
     #[test]
     fn an_agent_takes_its_spawn_calls_row_and_folds_the_collect_in() {
         let mut harness = Harness::standalone(80, 24);
@@ -4410,7 +4483,7 @@ mod tests {
         let frame = harness.draw();
         insta::assert_snapshot!("agent_row_80x24", &frame);
         assert!(
-            frame.contains("agent coder agent_coder_1a2b3c4d  completed  spawn, collected"),
+            frame.contains("agent coder agent_coder_1a2b3c4d  completed  spawned, collected"),
             "{frame}"
         );
     }
@@ -4652,6 +4725,62 @@ mod tests {
         assert!(matches!(&cells[1], Cell::Command { name, .. } if name == ".undo"));
     }
 
+    #[test]
+    fn an_undo_after_a_file_command_stops_at_the_command_cell_that_opened_the_exchange() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".file notes.md -- summarize", true);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("a summary".to_string()));
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert_eq!(harness.app.transcript.len(), 5);
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let cells = harness.app.transcript.cells();
+        assert_eq!(
+            cells.len(),
+            3,
+            "the file exchange and the command cell are gone"
+        );
+        assert!(matches!(&cells[0], Cell::User { text, .. } if text == "first question"));
+        assert!(matches!(&cells[2], Cell::Assistant { .. }));
+    }
+
+    #[test]
+    fn an_undo_looks_past_a_command_that_opened_no_exchange() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".info", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert!(harness.draw().contains("Tip: Press"));
+    }
+
+    /// A `.file` that bailed on usage opened nothing in the session, so
+    /// the `.undo` after it takes back the exchange before it.
+    #[test]
+    fn an_undo_looks_past_a_file_command_that_bailed_before_a_reply() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".file", true);
+        harness.app.end_turn(
+            true,
+            &TurnOutcome {
+                error: Some("usage: .file <path>".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        assert!(matches!(
+            harness.app.transcript.cells().last(),
+            Some(Cell::Error { .. })
+        ));
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert!(harness.draw().contains("Tip: Press"));
+    }
+
     /// Undoing the only exchange empties the transcript; the greeting
     /// comes back and the next turn clears it as on boot.
     #[test]
@@ -4692,6 +4821,7 @@ mod tests {
         fill_the_view(&mut harness);
         assert!(harness.press(KeyCode::PageUp).is_none());
         assert!(harness.app.transcript.scrolled());
+        let held = harness.draw();
         for i in 0..3 {
             harness
                 .app
@@ -4702,6 +4832,11 @@ mod tests {
         insta::assert_snapshot!("follow_chip_80x24", &frame);
         assert!(frame.contains("3 new below  End = follow"), "{frame}");
         assert!(!frame.contains("late line 2"), "the view moved:\n{frame}");
+        assert_eq!(
+            frame.lines().take(18).collect::<Vec<_>>(),
+            held.lines().take(18).collect::<Vec<_>>(),
+            "the view slid under the new cells:\n{frame}"
+        );
 
         assert!(harness.press(KeyCode::End).is_none());
         assert!(!harness.app.transcript.scrolled());

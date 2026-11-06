@@ -4,7 +4,7 @@ expression: "&frame"
 ---
 "> build it                                                                      "
 "                                                                                "
-"job execute_command job_1a2b3c4d  done  start, checked                          "
+"job execute_command job_1a2b3c4d  done  started, checked                        "
 "                                                                                "
 "                                                                                "
 "                                                                                "
