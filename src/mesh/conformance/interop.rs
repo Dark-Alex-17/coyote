@@ -1184,8 +1184,9 @@ async fn wait_for_pn_count(reference: &mut Reference, expected: u64) {
 }
 
 /// The receiver runs under an `AppState` with the REPL's idle-time driver on its slot, so
-/// what fetches the held message is the sync the driver runs when the node joins and its
-/// retry once a propagation node is heard, not a call from the test.
+/// what fetches the held message is the sync the driver runs when the node joins, against
+/// the propagation node its table kept across the stop, and the retries that sync arms,
+/// not a call from the test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoins_without_a_command()
@@ -1207,12 +1208,19 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
     app.mesh
         .set_notifier(Arc::clone(&printed) as Arc<dyn NotificationSink>);
     let (session, _) = session_with_instance_id();
+    // The rejoin's own sync screens the held message before any call could trust the
+    // sender on the live node, so the receiver's trust file names the sender from the
+    // start; the sender's destination survives its restart below.
+    let trusts_sender = TrustList::default().destination(
+        &sender.runtime.current_destination_hash(),
+        sender.runtime.fingerprint(),
+    );
     let receiver = Node::start_on(
         Arc::clone(&app.mesh),
         "interop-sync-receiver",
         reference.ready.relay_port,
         session,
-        &TrustList::default(),
+        &trusts_sender,
     )
     .await;
     let receiver_destination = receiver.runtime.current_destination_hash();
@@ -1228,6 +1236,7 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
     wait_for_propagation_node(&receiver, &pn_hash).await;
 
     let parked = receiver.leave().await;
+    let left_at = SystemTime::now();
     assert!(app.mesh.get().is_none());
 
     let message = OutboundPeer {
@@ -1258,18 +1267,27 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
 
     let receiver = parked.rejoin().await;
     assert!(app.mesh.get().is_some());
+    // The node table is saved at stop and loaded at start, so the rejoined node already
+    // knows the propagation node. Heard no later than the stop means it came from disk: a
+    // delayed self-announce from the reference landing after the rejoin would carry a later
+    // `last_seen`, and nothing below announces the node again.
+    let filed = receiver.runtime.propagation_nodes().snapshot();
     assert!(
-        receiver.runtime.propagation_nodes().snapshot().is_empty(),
-        "the node table is in-memory; a PN filed this early means the reference's delayed self-announce landed inside the off-window"
+        filed.len() == 1
+            && filed[0].node.destination.address_hash.to_hex_string() == pn_hash
+            && filed[0].last_seen <= left_at,
+        "the rejoined node starts with only the propagation node it saved at stop: {:?}",
+        filed
+            .iter()
+            .map(|record| (
+                record.node.destination.address_hash.to_hex_string(),
+                record.last_seen
+            ))
+            .collect::<Vec<_>>()
     );
     // The rejoined transport knows no identities yet; the sender's start announce brings
     // back the key the held message was signed with.
     let sender = sender.leave().await.rejoin().await;
-    trust_peer(&receiver, &sender.runtime.current_destination_hash()).await;
-    reference
-        .send("pn_announce", json!({}), REQUEST_TIMEOUT)
-        .await;
-    wait_for_propagation_node(&receiver, &pn_hash).await;
 
     let inbox = app.mesh.peer_inbox();
     let deadline = Instant::now() + AUTOMATIC_SYNC_TIMEOUT;
