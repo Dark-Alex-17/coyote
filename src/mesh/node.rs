@@ -3478,6 +3478,7 @@ fn follow_local_event(
         SharedInstanceEvent::Connecting => {}
         SharedInstanceEvent::DialFailed { reason } => {
             let failure = DialFailure::of(reason, endpoint);
+            let sentence = failure.reason.clone();
             let connecting = matches!(
                 runtime
                     .interface_states
@@ -3490,16 +3491,13 @@ fn follow_local_event(
                 runtime.mark_interface_state(
                     index,
                     InterfaceState::Connecting {
-                        dial_failure: Some(failure.clone()),
+                        dial_failure: Some(failure),
                     },
                 );
             }
-            if logged_dial_failure.as_deref() != Some(failure.reason.as_str()) {
-                debug!(
-                    "Mesh interface {label} could not dial rnsd: {}",
-                    failure.reason
-                );
-                *logged_dial_failure = Some(failure.reason);
+            if logged_dial_failure.as_deref() != Some(sentence.as_str()) {
+                debug!("Mesh interface {label} could not dial rnsd: {sentence}");
+                *logged_dial_failure = Some(sentence);
             }
         }
         // Guard for future variants.
