@@ -2123,7 +2123,7 @@ impl MeshRuntime {
 
     /// The description `resolve_route` finds, for the tests that check what a resolve
     /// returns rather than link over it.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
