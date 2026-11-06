@@ -21,7 +21,9 @@ use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, bail};
-use cells::{AgentStatus, Cell, FoldedCall, JobStatus, LineCache, ToolStatus, append_output};
+use cells::{
+    AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
+};
 use crossterm::event::{EventStream, KeyEvent, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
@@ -656,7 +658,7 @@ impl App {
     }
 
     fn close_stream(&mut self) {
-        if let Some(Cell::Assistant { done, .. }) = self.transcript.last_mut() {
+        if let Some(Cell::Assistant { done, .. }) = self.transcript.close_stream() {
             *done = true;
         }
     }
@@ -855,21 +857,17 @@ impl App {
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
         match msg {
-            UiMsg::TextDelta(delta) => match self.transcript.last_mut() {
-                Some(Cell::Assistant {
-                    source,
-                    done: false,
-                    ..
-                }) => source.push_str(&delta),
-                _ => self.transcript.push(Cell::assistant(delta, false)),
+            UiMsg::TextDelta(delta) => match self.transcript.stream_cell_mut() {
+                Some(Cell::Assistant { source, .. }) => source.push_str(&delta),
+                _ => self.transcript.open_stream(Cell::assistant(delta, false)),
             },
             UiMsg::StreamDone => self.close_stream(),
-            UiMsg::AssistantText(text) => match self.transcript.last_mut() {
+            UiMsg::AssistantText(text) => match self.transcript.close_stream() {
                 Some(Cell::Assistant {
                     source,
                     done,
                     cache,
-                }) if !*done => {
+                }) => {
                     *source = text;
                     *done = true;
                     *cache = RenderCache::default();
@@ -1078,6 +1076,7 @@ impl App {
                     name,
                     output,
                     open_line,
+                    pending,
                     ..
                 } = self.transcript.replace(index, row)
                 else {
@@ -1091,6 +1090,7 @@ impl App {
                         name,
                         output,
                         open_line,
+                        pending,
                     });
                 }
             }
@@ -1199,14 +1199,13 @@ impl App {
         if bytes.is_empty() {
             return;
         }
-        let text = String::from_utf8_lossy(bytes);
         let first_cell = self.turn_first_cell();
         // Output of a call the transcript has a row for (or has folded
         // into a job's or agent's row) belongs to that row.
         if let Some(id) = call_id.as_deref()
-            && let Some((lines, open_line)) = self.tool_output_target(first_cell, id)
+            && let Some(target) = self.tool_output_target(first_cell, id)
         {
-            append_output(lines, open_line, &text);
+            append_output(target, bytes);
             return;
         }
         // Inside a turn the output never merges into a cell from before
@@ -1224,24 +1223,24 @@ impl App {
                 call_id,
                 lines: Vec::new(),
                 open_line: false,
+                pending: Vec::new(),
             });
         }
         let Some(Cell::Text {
-            lines, open_line, ..
+            lines,
+            open_line,
+            pending,
+            ..
         }) = self.transcript.last_mut()
         else {
             return;
         };
-        append_output(lines, open_line, &text);
+        append_output((lines, open_line, pending), bytes);
     }
 
     /// The output lines of the call `call_id` in this turn: a tool row's
     /// own, or those of a call folded into a job's or agent's row.
-    fn tool_output_target(
-        &mut self,
-        first_cell: usize,
-        call_id: &str,
-    ) -> Option<(&mut Vec<String>, &mut bool)> {
+    fn tool_output_target(&mut self, first_cell: usize, call_id: &str) -> Option<OutputTarget<'_>> {
         let cells = self.transcript.cells_mut();
         let first_cell = first_cell.min(cells.len());
         cells[first_cell..]
@@ -3916,6 +3915,67 @@ mod tests {
         assert_eq!(harness.app.transcript.len(), 3);
     }
 
+    /// A cell pushed while the reply streams (a background job's output
+    /// here) lands after the reply, and the next delta still extends the
+    /// reply rather than opening a second one.
+    #[test]
+    fn a_stream_survives_a_cell_pushed_between_deltas() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hi", false);
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("Hello".to_string()));
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"job noise\n".to_vec(),
+        });
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta(" world".to_string()));
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 3);
+        assert!(matches!(
+            &cells[1],
+            Cell::Assistant { source, done: false, .. } if source == "Hello world"
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Text { call_id: None, lines, .. } if lines == &["job noise"]
+        ));
+        harness.app.handle_msg(UiMsg::StreamDone);
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Assistant { done: true, .. }
+        ));
+        harness.app.handle_msg(UiMsg::TextDelta("next".to_string()));
+        assert_eq!(harness.app.transcript.len(), 4);
+    }
+
+    /// Undoing past the streaming cell forgets it; a later delta opens a
+    /// fresh cell instead of writing into whatever took its index.
+    #[test]
+    fn truncating_past_the_stream_cell_forgets_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hi", false);
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("partial".to_string()));
+        harness.app.transcript.truncate(1);
+        harness.app.transcript.push(Cell::notice(
+            NoticeKind::ToolWarning,
+            "took the slot".to_string(),
+        ));
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("fresh".to_string()));
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(&cells[1], Cell::Notice { .. }));
+        assert!(matches!(
+            &cells[2],
+            Cell::Assistant { source, done: false, .. } if source == "fresh"
+        ));
+    }
+
     #[test]
     fn chrome_colours_are_dropped_under_no_color_but_attributes_stay() {
         for kind in [
@@ -4292,6 +4352,39 @@ mod tests {
             &cells[2],
             Cell::Tool { call_id, output, .. } if call_id == "call-2" && output == &["from b"]
         ));
+    }
+
+    /// A multi-byte character the pipe split across two reads renders
+    /// whole; a lone byte no sequence can hold still shows as U+FFFD.
+    #[test]
+    fn tool_output_split_mid_character_decodes_whole() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("accents", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call execute_command {\"command\":\"menu\"}",
+        );
+        start_tool(&mut harness, "call-1", "execute_command", None);
+        for chunk in [
+            &b"caf"[..],
+            &[0xC3][..],
+            &[0xA9, b'\n'][..],
+            &[0xFF, b'\n'][..],
+        ] {
+            harness.app.handle_msg(UiMsg::ToolOutput {
+                call_id: Some("call-1".to_string()),
+                bytes: chunk.to_vec(),
+            });
+        }
+        let Some(Cell::Tool {
+            output, pending, ..
+        }) = harness.app.transcript.cells().get(1)
+        else {
+            panic!("the tool row is gone");
+        };
+        assert_eq!(output, &["caf\u{e9}", "\u{FFFD}"]);
+        assert!(pending.is_empty());
     }
 
     /// A model that names no call id leaves the hooks with an empty one;

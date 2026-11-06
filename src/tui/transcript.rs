@@ -33,6 +33,10 @@ pub(super) struct Transcript {
     /// The row Ctrl+Up/Down or a click put the cursor on; only a cell
     /// that opens and closes can hold it.
     focus: Option<usize>,
+    /// The Assistant cell the reply streams into. A cell pushed
+    /// mid-stream (a background job's output, a notice) lands after it
+    /// and the next delta still finds it.
+    stream: Option<usize>,
     /// Set when the focus moved; the next frame scrolls so the focused
     /// row's header is in view.
     reveal_focus: bool,
@@ -47,6 +51,7 @@ impl Transcript {
             offset_from_bottom: 0,
             unseen: 0,
             focus: None,
+            stream: None,
             reveal_focus: false,
             last_layout: Vec::new(),
             last_area: Rect::ZERO,
@@ -83,6 +88,21 @@ impl Transcript {
         self.cells.push(cell);
     }
 
+    /// Appends the cell a reply streams into and remembers where it is.
+    pub(super) fn open_stream(&mut self, cell: Cell) {
+        self.push(cell);
+        self.stream = Some(self.cells.len() - 1);
+    }
+
+    pub(super) fn stream_cell_mut(&mut self) -> Option<&mut Cell> {
+        self.cells.get_mut(self.stream?)
+    }
+
+    /// Forgets the streaming cell and hands it over to be finalised.
+    pub(super) fn close_stream(&mut self) -> Option<&mut Cell> {
+        self.cells.get_mut(self.stream.take()?)
+    }
+
     /// Puts `cell` where another was; the row keeps its place and its
     /// focus.
     pub(super) fn replace(&mut self, index: usize, cell: Cell) -> Cell {
@@ -91,11 +111,13 @@ impl Transcript {
 
     pub(super) fn remove(&mut self, index: usize) -> Cell {
         let removed = self.cells.remove(index);
-        self.focus = match self.focus {
-            Some(focus) if focus == index => None,
-            Some(focus) if focus > index => Some(focus - 1),
+        let shift = |held: Option<usize>| match held {
+            Some(held) if held == index => None,
+            Some(held) if held > index => Some(held - 1),
             other => other,
         };
+        self.focus = shift(self.focus);
+        self.stream = shift(self.stream);
         removed
     }
 
@@ -103,6 +125,9 @@ impl Transcript {
         self.cells.truncate(len);
         if self.focus.is_some_and(|focus| focus >= len) {
             self.focus = None;
+        }
+        if self.stream.is_some_and(|stream| stream >= len) {
+            self.stream = None;
         }
     }
 

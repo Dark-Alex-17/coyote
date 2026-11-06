@@ -70,6 +70,7 @@ pub(super) struct FoldedCall {
     pub(super) name: String,
     pub(super) output: Vec<String>,
     pub(super) open_line: bool,
+    pub(super) pending: Vec<u8>,
 }
 
 impl FoldedCall {
@@ -79,6 +80,7 @@ impl FoldedCall {
             name,
             output: Vec::new(),
             open_line: false,
+            pending: Vec::new(),
         }
     }
 }
@@ -115,6 +117,7 @@ pub(super) enum Cell {
         call_id: Option<String>,
         lines: Vec<String>,
         open_line: bool,
+        pending: Vec<u8>,
     },
     /// A tool call: its narration line, then the tail of its output while
     /// it runs or when opened. A bookkeeping tool (memory, skills, agent
@@ -126,6 +129,7 @@ pub(super) enum Cell {
         status: ToolStatus,
         output: Vec<String>,
         open_line: bool,
+        pending: Vec<u8>,
         expanded: bool,
         bookkeeping: bool,
     },
@@ -212,6 +216,7 @@ impl Cell {
             status: ToolStatus::Running { since },
             output: Vec::new(),
             open_line: false,
+            pending: Vec::new(),
             expanded: false,
             bookkeeping,
         }
@@ -247,20 +252,21 @@ impl Cell {
 
     /// Where the output of call `call_id` goes: this tool row's own
     /// lines, or those of the call folded into this job or agent row.
-    pub(super) fn output_for(&mut self, call_id: &str) -> Option<(&mut Vec<String>, &mut bool)> {
+    pub(super) fn output_for(&mut self, call_id: &str) -> Option<OutputTarget<'_>> {
         match self {
             Cell::Tool {
                 call_id: id,
                 output,
                 open_line,
+                pending,
                 ..
-            } if id == call_id => Some((output, open_line)),
+            } if id == call_id => Some((output, open_line, pending)),
             Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
                 let call = calls
                     .iter_mut()
                     .rev()
                     .find(|call| call.call_id == call_id)?;
-                Some((&mut call.output, &mut call.open_line))
+                Some((&mut call.output, &mut call.open_line, &mut call.pending))
             }
             _ => None,
         }
@@ -508,10 +514,53 @@ pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> V
     lines
 }
 
+/// The lines a tool's output lands in, whether the last one is still
+/// open, and the bytes of a character the last read cut in two.
+pub(super) type OutputTarget<'a> = (&'a mut Vec<String>, &'a mut bool, &'a mut Vec<u8>);
+
+/// Decodes one read of a byte stream, carrying an incomplete trailing
+/// character over in `pending` so a sequence split across two reads
+/// still decodes. Only a sequence that can never complete becomes U+FFFD.
+pub(super) fn push_utf8_chunk(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    pending.extend_from_slice(bytes);
+    let mut text = String::new();
+    let mut rest: &[u8] = pending;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                text.push_str(valid);
+                rest = &[];
+                break;
+            }
+            Err(error) => {
+                let (valid, tail) = rest.split_at(error.valid_up_to());
+                text.push_str(std::str::from_utf8(valid).expect("prefix reported valid"));
+                match error.error_len() {
+                    Some(invalid) => {
+                        text.push('\u{FFFD}');
+                        rest = &tail[invalid..];
+                    }
+                    None => {
+                        rest = tail;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    *pending = rest.to_vec();
+    text
+}
+
 /// Appends one read of a tool's output to its lines. The read may end
-/// mid-line (`open_line`), in which case the next read continues it. The
-/// lines kept are bounded in count and in bytes, oldest dropped first.
-pub(super) fn append_output(lines: &mut Vec<String>, open_line: &mut bool, text: &str) {
+/// mid-line (`open_line`), in which case the next read continues it, or
+/// mid-character (`pending`). The lines kept are bounded in count and in
+/// bytes, oldest dropped first.
+pub(super) fn append_output((lines, open_line, pending): OutputTarget<'_>, bytes: &[u8]) {
+    let text = push_utf8_chunk(pending, bytes);
+    if text.is_empty() {
+        return;
+    }
     let pieces: Vec<&str> = text.split('\n').collect();
     for (i, piece) in pieces.iter().enumerate() {
         let last_is_open = i == pieces.len() - 1;
@@ -640,5 +689,47 @@ mod tests {
         );
         assert_eq!(narrated_tool_name("Call todo__add {}"), "todo__add");
         assert_eq!(narrated_tool_name(""), "");
+    }
+
+    /// A character cut in two by the pipe read boundary decodes once its
+    /// second half arrives; a byte that can never start a character is
+    /// replaced on the spot.
+    #[test]
+    fn output_reads_decode_across_a_split_character() {
+        let mut lines = Vec::new();
+        let mut open_line = false;
+        let mut pending = Vec::new();
+        append_output((&mut lines, &mut open_line, &mut pending), b"caf\xC3");
+        assert_eq!(lines, ["caf"]);
+        assert_eq!(pending, [0xC3]);
+        append_output((&mut lines, &mut open_line, &mut pending), b"\xA9\n");
+        assert_eq!(lines, ["caf\u{e9}"]);
+        assert!(pending.is_empty());
+        assert!(!open_line);
+
+        let mut pending = Vec::new();
+        assert_eq!(push_utf8_chunk(&mut pending, b"a\xFFb"), "a\u{FFFD}b");
+        assert!(pending.is_empty());
+        assert_eq!(push_utf8_chunk(&mut pending, b"\xE2\x9C"), "");
+        assert_eq!(pending, [0xE2, 0x9C]);
+        assert_eq!(push_utf8_chunk(&mut pending, b"\x94 done"), "\u{2714} done");
+        assert!(pending.is_empty());
+    }
+
+    /// A read that holds only the start of a character leaves the open
+    /// line as it was; nothing has arrived to extend or close it.
+    #[test]
+    fn a_pending_only_read_keeps_the_line_open() {
+        let mut lines = Vec::new();
+        let mut open_line = false;
+        let mut pending = Vec::new();
+        append_output((&mut lines, &mut open_line, &mut pending), b"half");
+        assert!(open_line);
+        append_output((&mut lines, &mut open_line, &mut pending), b"\xF0\x9F");
+        assert!(open_line);
+        assert_eq!(lines, ["half"]);
+        append_output((&mut lines, &mut open_line, &mut pending), b"\x98\x80\n");
+        assert_eq!(lines, ["half\u{1F600}"]);
+        assert!(!open_line);
     }
 }
