@@ -352,6 +352,7 @@ nodes:
     script: scripts/intake.py
     timeout: 60
     fallback: end_failure
+    next: assess
 
   confirm_handoff:
     id: confirm_handoff

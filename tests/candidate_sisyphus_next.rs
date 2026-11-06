@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 482;
+const SMOKE_FLOOR: usize = 532;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -1484,7 +1484,14 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
              each cached False",
         ),
     ];
-    for (label, old, new, row) in sabotages {
+    run_smoke_sabotages(&python, &sabotages);
+}
+
+/// Applies each `(label, old, new, row)` sabotage to a scratch copy of
+/// gates.py (`old` must occur exactly once) and requires the battery to fail
+/// with a `FAIL <row>` line.
+fn run_smoke_sabotages(python: &Path, sabotages: &[(&str, &str, &str, &str)]) {
+    for &(label, old, new, row) in sabotages {
         let scratch = scratch_dir(&format!("sabotage-{label}"));
         let copy = scratch_candidate_copy(&scratch);
         let gates = copy.join("scripts").join("gates.py");
@@ -1495,7 +1502,7 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "{label}: {old:?} must occur exactly once in gates.py"
         );
         fs::write(&gates, text.replacen(old, new, 1)).unwrap();
-        let output = battery(&python, &scratch)
+        let output = battery(python, &scratch)
             .current_dir(&copy)
             .arg("scripts/smoke_test.py")
             .output()
@@ -1514,6 +1521,139 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "{label}: no `{fail}` line:\n{report}"
         );
     }
+}
+
+/// The guards behind the bare go-ahead intake and the typed escalation
+/// replies: only a top-level run picks up a handoff, only a `vehicle:
+/// sisyphus` one, the handoff is consumed only after assess succeeds, its
+/// confirmation is a hard trigger, a draft fault falls back to assess, the
+/// first unmatched reply is interpreted, only accepted instructions apply,
+/// free-form instructions keep the owner's words, stop and abort are read
+/// from the whole reply, the interpreter's option must match exactly, an
+/// interpreter fault re-asks, a discussion parks, the park cap holds, only
+/// `continue:` with a colon carries an answer, one park is resumed once, and
+/// the live variables survive a resume.
+#[test]
+#[ignore = "sixteen smoke battery runs take about three minutes; run with -- --ignored"]
+fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    run_smoke_sabotages(
+        &python,
+        &[
+            (
+                "go-ahead-top-level",
+                "    if not m and u[\"top_level\"] and bare_go_ahead(brief):\n",
+                "    if not m and bare_go_ahead(brief):\n",
+                "delegated run (parallel): never picks up a handoff or drafts -> assess",
+            ),
+            (
+                "vehicle-filter",
+                "if fm.get(\"status\") != \"ready\" or fm.get(\"vehicle\") != \"sisyphus\":",
+                "if fm.get(\"status\") != \"ready\":",
+                "handoff pickup: vehicle architect (and a seed with no vehicle) left alone -> \
+                 assess, files untouched",
+            ),
+            (
+                "consume-after-assess",
+                "    if not truthy(state.get(\"assess_faulted\")):\n",
+                "    if True:\n",
+                "handoff pickup: an assess fault leaves the handoff ready",
+            ),
+            (
+                "confirm-hard-trigger",
+                "hard_trigger=True, tier3_ok=False, data={\"handoff_path\": handoff}))",
+                "hard_trigger=False, tier3_ok=False, data={\"handoff_path\": handoff}))",
+                "handoff pickup: the confirmation escalates even under \
+                 escalation_policy=autonomous",
+            ),
+            (
+                "draft-fault-fallback",
+                "assess classifies the message as is\")\n    u[\"_next\"] = \"assess\"\n    \
+                 return u\n\n\ndef record_subtasks",
+                "assess classifies the message as is\")\n    u[\"_next\"] = \"end_failure\"\n    \
+                 return u\n\n\ndef record_subtasks",
+                "draft: a draft fault falls back to assess on the message as is",
+            ),
+            (
+                "interpret-first-try",
+                "        if choice is None and text and not \
+                 truthy(state.get(\"reply_interpreted\")):\n",
+                "        if False:\n",
+                "parse_answer: the first unmatched typed reply -> interpret_reply with the kind's \
+                 accepted instructions",
+            ),
+            (
+                "instruction-accepted-only",
+                "        if shape not in ACCEPTED_INSTRUCTIONS.get(kind, ()):\n",
+                "        if False:\n",
+                "interpret_route: an instruction the kind does not accept -> unclear, never \
+                 applied, ledgered",
+            ),
+            (
+                "verbatim-free-form",
+                "INSTRUCTION_ANSWERS[shape].format(text.strip()) if text.strip() else \"\"",
+                "INSTRUCTION_ANSWERS[shape].format(value.strip()) if value.strip() else \"\"",
+                "interpret_route -> apply_answer: an accepted free-form instruction keeps the \
+                 owner's words verbatim, never a stop",
+            ),
+            (
+                "stop-whole-reply",
+                "    return bare in STOP_REPLIES or bool(",
+                "    return any(w in bare for w in STOP_REPLIES) or bool(",
+                "apply_answer: a rescope that mentions abort proceeds with the owner's words, \
+                 never an abort",
+            ),
+            (
+                "exact-option",
+                "choice = _exact_option(str(state.get(\"reply_option\") or \"\"), \
+                 esc.get(\"options\") or [])",
+                "choice = match_option(str(state.get(\"reply_option\") or \"\"), \
+                 esc.get(\"options\") or [])",
+                "interpret_route: a loose option name is no pick -> one clarifying question",
+            ),
+            (
+                "interpret-fault-reask",
+                "(interpreter fault) -> re-ask\")\n    u[\"_next\"] = \"parse_answer\"\n",
+                "(interpreter fault) -> re-ask\")\n    u[\"_next\"] = \"choice_park\"\n",
+                "interpret_route: an interpreter fault -> parse_answer's re-ask, the fault \
+                 ledgered; the run never sticks",
+            ),
+            (
+                "discussion-park",
+                "-> park for discussion\")\n        u[\"_next\"] = \"choice_park\"\n",
+                "-> park for discussion\")\n        u[\"_next\"] = \"apply_answer\"\n",
+                "interpret_route: discussion -> choice_park, nothing recorded, ledgered",
+            ),
+            (
+                "park-cap",
+                "    if count >= DISCUSSION_PARKS_MAX:\n",
+                "    if False:\n",
+                "choice_park: at the park cap -> choice_reask; its next reply is matched, never \
+                 interpreted",
+            ),
+            (
+                "continue-colon-only",
+                "    cont = CONTINUE_RE.match(",
+                "    cont = re.compile(r\"(?is)^(?:continue|resume)\\W*(.*)$\").match(",
+                "intake: other prose starting with continue is a fresh run, the key cleared, the \
+                 left discussion ledgered",
+            ),
+            (
+                "park-one-resume",
+                "os.remove(os.path.join(u[\"run_dir\"], PARKED_STATE))",
+                "None",
+                "intake: the parked state is spent by one resume -> a second continue starts a \
+                 fresh run",
+            ),
+            (
+                "variables-live",
+                "PARK_FRESH_KEYS = frozenset(RUN_VARIABLES) | {",
+                "PARK_FRESH_KEYS = frozenset() | {",
+                "intake: 'continue: <answer>' with the carried id -> choice_resume on the restored \
+                 run, the key cleared",
+            ),
+        ],
+    );
 }
 
 /// The shipped `debt_scan` node lifted verbatim into a two-node graph with
@@ -2671,6 +2811,8 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("debt_scan", "timeout", 120),
     ("diagnose_failure", "max_iterations", 20),
     ("diagnose_failure", "timeout", 1800),
+    ("draft_brief", "max_iterations", 10),
+    ("draft_brief", "timeout", 600),
     ("explore_slice_solo", "max_attempts", 2),
     ("explore_slice_solo", "timeout", 1800),
     ("explore_slice_team", "max_attempts", 2),
@@ -2679,6 +2821,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("git_ops", "max_iterations", 20),
     ("git_ops", "timeout", 1800),
     ("intake", "timeout", 60),
+    ("interpret_reply", "timeout", 120),
     ("ladder_judge", "timeout", 300),
     ("librarian_question", "max_attempts", 2),
     ("librarian_question", "timeout", 1800),
@@ -2725,6 +2868,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "debris_reruns",
     "debt_rounds",
     "design_ask_rounds",
+    "draft_rounds",
     "fix_round",
     "fix_strikes",
     "obs_rounds",
@@ -2753,7 +2897,10 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CI_POLL_SLEEP", "60"),
     ("CI_WALL_SECS", "14400"),
     ("CLARIFY_MAX", "STRIKE_LIMIT"),
+    ("DISCUSSION_PARKS_MAX", "3"),
+    ("DRAFT_ROUNDS_MAX", "STRIKE_LIMIT"),
     ("GH_CALL_SECS", "90"),
+    ("GO_AHEAD_WORDS_MAX", "12"),
     ("OWNER_POLL_MAX", "2"),
     ("OWNER_POLL_MINUTES", "25"),
     ("OWNER_WAIT_MINUTES", "30"),
@@ -3070,7 +3217,9 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("ci_diagnose", AnomaliesChannel::Plain),
     ("compose_brief", AnomaliesChannel::Plain),
     ("diagnose_failure", AnomaliesChannel::Plain),
+    ("draft_brief", AnomaliesChannel::Plain),
     ("git_ops", AnomaliesChannel::NoSchema),
+    ("interpret_reply", AnomaliesChannel::Plain),
     ("ladder_judge", AnomaliesChannel::Plain),
     ("observability_pass", AnomaliesChannel::Plain),
     ("plan_research", AnomaliesChannel::Plain),
@@ -4923,4 +5072,169 @@ fn a_forged_report_boundary_in_the_lane_reasons_keeps_the_real_blockers() {
         assert_eq!(routed["_next"], json!("triage_findings"), "{routed}");
         assert_eq!(routed["gauntlet_blockers"], json!(blockers), "{routed}");
     }
+}
+
+/// The text between `open` and the next `<!-- end -->` in the engineer's
+/// instructions, whitespace-flattened.
+fn engineer_block(open: &str) -> String {
+    let text = fs::read_to_string(agents_dir().join("engineer/instructions.md")).unwrap();
+    let start = text.find(open).unwrap_or_else(|| panic!("no {open} block")) + open.len();
+    let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    block.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The run's handoff pickup reads what the attached engineer writes, and the
+/// standalone handoff paragraph is hidden in attached mode, so the
+/// sisyphus-attachment block itself must state the handoff contract.
+#[test]
+fn engineer_sisyphus_block_states_the_handoff_contract() {
+    let flat = engineer_block("<!-- when:chat_agent_for=sisyphus -->");
+    for needle in [
+        "When the user describes task-sized work the run should execute",
+        "plans/engineer-handoffs/",
+        "status: ready",
+        "project:",
+        "created:",
+        "vehicle: sisyphus",
+        "a bare \"go ahead\" in the run lane picks up the newest ready handoff after they confirm it",
+        "(an explicit \"execute the handoff at <path>\" still works)",
+        "the run drafts a brief from this conversation and confirms that instead",
+        "`status: consumed` once it has classified it",
+        "never edit a handoff whose status is `consumed`",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the sisyphus-attachment block does not state {needle:?}:\n{flat}"
+        );
+    }
+}
+
+/// A run parked on a discussion hands the question to the chat lane, so the
+/// sisyphus-attachment block must say how to use it and how the user resumes.
+#[test]
+fn engineer_sisyphus_block_states_the_discussion_contract() {
+    let flat = engineer_block("<!-- when:chat_agent_for=sisyphus -->");
+    for needle in [
+        "When the last run's exposed `discussion` is non-empty, the run is parked on that question",
+        "(`discussion.kind` names the escalation kind, any of them)",
+        "the recommended one is marked",
+        "the user's `reply` that parked it",
+        "Do not edit code and do not answer for the user",
+        "`continue: <settled answer>`",
+        "(or `continue` to be asked again)",
+        "the run resumes at that question",
+        "`resume` works the same as `continue`",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the sisyphus-attachment block does not state {needle:?}:\n{flat}"
+        );
+    }
+}
+
+/// The standalone engineer recommends sisyphus for task-sized work, so its
+/// handoff paragraph must say a bare go-ahead starts a `vehicle: sisyphus`
+/// handoff and that the explicit path still works.
+#[test]
+fn engineer_standalone_block_states_the_sisyphus_go_ahead() {
+    let flat = engineer_block("<!-- when:!chat_agent_for -->");
+    for needle in [
+        "A sisyphus run started with a bare go-ahead only picks handoffs with `vehicle: sisyphus`",
+        "A `vehicle: sisyphus` handoff can also be started with a bare \"go ahead\" in a sisyphus \
+         session",
+        "(an explicit path still works)",
+        "\"execute the handoff at <path>\"",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the standalone block does not state {needle:?}:\n{flat}"
+        );
+    }
+}
+
+/// A bare go-ahead after a conversation about work and a "continue" after a
+/// discussion park both start runs, so the session router must send them to
+/// RUN.
+#[test]
+fn route_instructions_send_a_bare_go_ahead_and_a_discussion_continue_to_run() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let route = doc["session"]["route"]["instructions"]
+        .as_str()
+        .expect("graph.yaml has session.route.instructions");
+    let flat = route.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "A bare go-ahead (\"okay, go ahead and get started\", \"do it\")",
+        "routes RUN; the run picks up the engineer's ready sisyphus handoff or drafts a brief",
+        "confirms it with the user before any write to the repo",
+        "After the last run parked on a discussion (any escalation it asked)",
+        "\"continue\" or \"continue: <answer>\" routes RUN",
+        "the run resumes at the parked question",
+        "other prose that starts with continue or resume starts a fresh run",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "the route instructions do not state {needle:?}:\n{route}"
+        );
+    }
+}
+
+/// The chat lane only sees what the graph exposes, the resume only finds the
+/// parked run through the carried id, and the handoff and draft confirmations
+/// are the fixed-option prompts `_terminal_prompt` routes to.
+#[test]
+fn graph_exposes_the_discussion_carries_its_run_id_and_declares_the_confirmations() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let expose = doc["session"]["expose"]
+        .as_sequence()
+        .expect("graph.yaml has session.expose");
+    assert!(
+        expose.iter().any(|k| k.as_str() == Some("discussion")),
+        "session.expose does not list discussion: {expose:?}"
+    );
+    let carry: Vec<&str> = doc["carry"]
+        .as_sequence()
+        .expect("graph.yaml has carry")
+        .iter()
+        .filter_map(|k| k.as_str())
+        .collect();
+    assert_eq!(carry, ["discussion_run_id"]);
+    assert_eq!(doc["initial_state"]["discussion_run_id"].as_str(), Some(""));
+    for (node, options) in [
+        (
+            "confirm_handoff",
+            &[
+                "Use this handoff",
+                "Give a handoff path instead",
+                "Draft a brief from this conversation instead",
+                "Abort the run",
+            ][..],
+        ),
+        (
+            "confirm_draft",
+            &["Use this draft", "Edit the draft", "Abort the run"][..],
+        ),
+    ] {
+        let n = &doc["nodes"][node];
+        assert_eq!(n["type"].as_str(), Some("approval"), "{node}");
+        let listed: Vec<&str> = n["options"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.as_str())
+            .collect();
+        assert_eq!(listed, options, "{node} options");
+        assert_eq!(n["on_other"].as_str(), Some("parse_answer"), "{node}");
+    }
+    assert!(
+        doc["nodes"]["draft_brief"]["prompt"]
+            .as_str()
+            .is_some_and(|p| p.contains("{{previous_turns}}")),
+        "draft_brief must read the engine-seeded previous_turns"
+    );
+    assert_eq!(
+        doc["nodes"]["end_discussion"]["output"].as_str(),
+        Some("{{discussion_message}}\n")
+    );
 }
