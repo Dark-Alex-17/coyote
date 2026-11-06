@@ -6116,9 +6116,10 @@ mod tests {
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, StartedRuntime, TransportRelay, held_port, loopback_relay, serve_as_daemon,
-        serve_as_sink, started_runtime, started_runtime_on, started_runtime_on_with,
-        started_runtime_with, started_runtime_with_options, status_round_trip,
+        PeerStub, StartedRuntime, TransportRelay, closed_port, held_port, loopback_relay,
+        serve_as_daemon, serve_as_sink, started_runtime, started_runtime_on,
+        started_runtime_on_with, started_runtime_with, started_runtime_with_options,
+        status_round_trip,
     };
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
@@ -10982,14 +10983,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn closed_port() -> u16 {
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
-    }
-
-    #[cfg(unix)]
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
         while !condition() {
@@ -12081,7 +12074,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolving_a_peer_known_only_from_the_persisted_table_asks_for_a_path_and_files_the_answer_as_a_route()
      {
-        use crate::mesh::test_support::{closed_port, wait_for_peer};
+        use crate::mesh::test_support::wait_for_peer;
         use crate::mesh::trust::TrustOptions;
 
         let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;

@@ -463,6 +463,8 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use std::sync::Arc;
     #[cfg(unix)]
+    use std::sync::atomic::AtomicU16;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -1022,12 +1024,34 @@ pub(crate) mod test_support {
         }
     }
 
+    /// The ports `closed_port` hands out.
+    #[cfg(unix)]
+    const CLOSED_PORT_POOL: std::ops::Range<u16> = 20_000..30_000;
+
+    /// A loopback port nothing listens on, never handed out twice in one process. The
+    /// pool sits below every OS ephemeral range (Linux 32768-60999, macOS 49152-65535),
+    /// so a later `bind` to port 0 anywhere in the process cannot be given a port a test
+    /// holds back to bind itself later. The walk through the pool starts at an offset
+    /// taken from the process id, so test processes running side by side on one host
+    /// draw from different stretches of it. A port something else has bound right now
+    /// is passed over.
     #[cfg(unix)]
     pub(crate) async fn closed_port() -> u16 {
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
+        static DRAWN: AtomicU16 = AtomicU16::new(0);
+        let span = CLOSED_PORT_POOL.end - CLOSED_PORT_POOL.start;
+        let offset = u16::try_from(std::process::id() % 1000).unwrap() * 10;
+        loop {
+            let drawn = DRAWN.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                drawn < span,
+                "every port in {CLOSED_PORT_POOL:?} was handed out"
+            );
+            let port = CLOSED_PORT_POOL.start + (offset + drawn) % span;
+            if let Ok(probe) = TcpListener::bind(("127.0.0.1", port)).await {
+                drop(probe);
+                return port;
+            }
+        }
     }
 
     #[cfg(unix)]
