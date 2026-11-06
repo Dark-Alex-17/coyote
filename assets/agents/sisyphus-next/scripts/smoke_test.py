@@ -598,6 +598,27 @@ check("intake: 'continue: <answer>' with the carried id -> choice_resume on the 
       and r["escalation"]["kind"] == "plan_defect" and r["settled_answer"].startswith("Continue; treat")
       and r["discussion_run_id"] == "" and r["escalation_policy"] == "interactive" and r["initial_prompt"].startswith("continue:")
       and not os.path.exists(os.path.join(pst["run_dir"], gates.PARKED_STATE)))
+check("choice_park: a top-level park carries no `Discussion data:` line",
+      gates.DISCUSSION_DATA_PREFIX not in s2["discussion_message"])
+# A delegated run's park ends with one machine-readable line the parent orchestrator relays; the parent resumes it with
+# the run id plus a continue line and no carried id.
+dst = dict(pst, run_id="20261101T000000-bbbbbbbb", run_dir=_lib.ensure_run_dir("20261101T000000-bbbbbbbb"), delegated=True)
+s3, u = chain(dst, "choice_park")
+data_lines = [l for l in s3["discussion_message"].splitlines() if l.startswith(gates.DISCUSSION_DATA_PREFIX)]
+ddata = json.loads(data_lines[-1][len(gates.DISCUSSION_DATA_PREFIX):]) if len(data_lines) == 1 else {}
+check("choice_park: a delegated park ends with one `Discussion data: <json>` line - kind, question, options with the "
+      "recommended flag, the reply and the run id",
+      u["_next"] == "end_discussion" and s3["discussion_message"].splitlines()[-1] == data_lines[0]
+      and ddata.get("kind") == "plan_defect" and ddata.get("question") == s3["discussion"]["question"]
+      and [o["text"] for o in ddata.get("options", [])] == [o["text"] for o in s3["discussion"]["options"]]
+      and [o["recommended"] for o in ddata.get("options", [])] == [o["recommended"] for o in s3["discussion"]["options"]]
+      and ddata.get("reply") == "why is the plan wrong?" and ddata.get("run_id") == dst["run_id"], s3["discussion_message"][-600:])
+r, u = chain({"initial_prompt": f"Sisyphus run id: {dst['run_id']}\ncontinue: drop AC2", "project_dir": TMP,
+              "escalation_policy": "interactive"}, "intake")
+check("intake: the parent's resume form `Sisyphus run id: <id>\\ncontinue: <answer>` -> choice_resume on the parked run "
+      "with the settled answer and the live project_dir",
+      u["_next"] == "choice_resume" and r["run_id"] == dst["run_id"] and r["settled_answer"] == "drop AC2"
+      and r["delegated"] is True and r["project_dir"] == os.path.abspath(TMP))
 r2, u = chain(r, "choice_resume", "parse_answer")
 r3, u3 = chain({**r2, "reply_verdict": "instruction", "reply_instruction": "amendment", "reply_value": "drop AC2"},
                "interpret_route", "apply_answer")

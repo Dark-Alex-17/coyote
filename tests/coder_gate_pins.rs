@@ -203,6 +203,45 @@ fn resolve_paths_records_whether_project_dir_was_defaulted() {
     assert_eq!(out["project_dir_defaulted"], Value::Bool(false), "{out}");
 }
 
+/// A parent graph's `inputs: project_dir` seeds the coder's state; that
+/// value wins over the inherited agent variable, which may name the parent's
+/// tree. With no seeded value (the graph's own empty seed, or no key at all)
+/// the variable is used as before.
+#[test]
+fn resolve_paths_prefers_a_seeded_state_project_dir_over_the_variable() {
+    if tools_missing() {
+        return;
+    }
+    let parent = temp_dir("resolve-parent");
+    let worktree = temp_dir("resolve-worktree");
+    let parent_dir = parent.0.canonicalize().unwrap();
+    let worktree_dir = worktree.0.canonicalize().unwrap();
+    let env_value = parent_dir.to_string_lossy().into_owned();
+    let envs = [("LLM_AGENT_VAR_PROJECT_DIR", env_value.as_str())];
+
+    let seeded = serde_json::json!({ "project_dir": worktree_dir.to_string_lossy() });
+    let out = run_script("coder/scripts/resolve_paths.sh", &parent.0, &seeded, &envs);
+    assert_eq!(
+        Path::new(str_field(&out, "project_dir")).canonicalize().unwrap(),
+        worktree_dir,
+        "the seeded state project_dir must win over the variable: {out}"
+    );
+    assert_eq!(out["project_dir_defaulted"], Value::Bool(false), "{out}");
+
+    for state in [
+        serde_json::json!({ "project_dir": "" }),
+        serde_json::json!({}),
+        Value::Null,
+    ] {
+        let out = run_script("coder/scripts/resolve_paths.sh", &worktree.0, &state, &envs);
+        assert_eq!(
+            Path::new(str_field(&out, "project_dir")).canonicalize().unwrap(),
+            parent_dir,
+            "{state}: with no seeded project_dir the variable is used: {out}"
+        );
+    }
+}
+
 /// A spawned coder whose project_dir defaulted to the engine's working
 /// directory (the orchestrator's checkout) runs its gates in the work tree
 /// the plan edits. An explicit project_dir, or a working directory already
