@@ -297,6 +297,7 @@ async fn chat_completions_streaming(
                                     signature: mem::take(&mut thinking_signature),
                                 });
                             }
+                            handler.thinking_stopped();
                             if !function_name.is_empty() {
                                 if function_arguments.is_empty() {
                                     function_arguments = String::from("{}");

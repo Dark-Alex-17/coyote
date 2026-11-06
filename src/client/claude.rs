@@ -302,6 +302,7 @@ pub async fn claude_chat_completions_streaming(
                             signature: mem::take(&mut thinking_signature),
                         });
                     }
+                    handler.thinking_stopped();
                     if !function_name.is_empty() {
                         let arguments: Value = if function_arguments.is_empty() {
                             json!({})
