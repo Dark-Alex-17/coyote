@@ -64,13 +64,13 @@ QUALITY_RE = re.compile(r"Quality bar:\s*rigor=([A-Za-z]+)(?:[,;]?\s*surfaces=([
 GO_AHEAD_WORDS_MAX = 12
 GO_WORDS = frozenset((
     "go", "proceed", "start", "started", "begin", "do", "run", "execute", "implement", "build", "ship", "kick",
-    "lgtm", "approved",
+    "lgtm", "approved", "send",
 ))
 GO_AHEAD_FILLER = frozenset((
     "ok", "okay", "k", "yes", "yeah", "yep", "yup", "sure", "alright", "right", "great", "cool", "good", "sounds",
     "perfect", "fine", "please", "pls", "and", "then", "now", "so", "get", "it", "that", "this", "let", "lets",
     "let's", "us", "with", "the", "a", "on", "ahead", "off", "away", "thanks", "thank", "you", "work",
-    "handoff", "brief", "all", "set", "we", "can", "i", "think", "is", "ready",
+    "handoff", "brief", "all", "set", "we", "can", "i", "think", "is", "ready", "for",
 ))
 
 # The graph variables; a run restored from a discussion park keeps the live values of these.
@@ -80,9 +80,10 @@ RUN_VARIABLES = ("project_dir", "observability_agent", "parallel", "auto_confirm
 
 def bare_go_ahead(text):
     """True for an empty message or a short go-ahead that names no work ("okay, go ahead and get started")."""
-    words = re.findall(r"[a-z]+(?:'[a-z]+)?", (text or "").lower())
+    text = (text or "").replace("\u2019", "'").replace("\u2018", "'")
+    words = re.findall(r"[a-z]+(?:'[a-z]+)?", text.lower())
     if not words:
-        return not re.search(r"\S", text or "")
+        return not re.search(r"\S", text)
     return (len(words) <= GO_AHEAD_WORDS_MAX and any(w in GO_WORDS for w in words)
             and all(w in GO_WORDS or w in GO_AHEAD_FILLER for w in words))
 
@@ -411,21 +412,42 @@ def frontmatter(text):
     return fm, text[end + 4:].lstrip("\n")
 
 
-def set_frontmatter(path, key, value):
-    """Set or insert one flat frontmatter key in place."""
-    text = read_file(path)
-    if not text.startswith("---") or text.find("\n---", 3) < 0:
-        text = f"---\n{key}: {value}\n---\n\n" + text
-    else:
-        end = text.find("\n---", 3)
-        head, rest = text[3:end], text[end:]
-        if re.search(rf"(?m)^{re.escape(key)}:", head):
-            head = re.sub(rf"(?m)^{re.escape(key)}:.*$", lambda _m: f"{key}: {value}", head)
+def set_frontmatter(path, pairs):
+    """Set or insert flat frontmatter keys in one atomic rewrite; False (nothing written) when the read fails,
+    the file is empty or it has no frontmatter block closed by a whole `---` line. Line endings are kept."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        return False
+    close = next((i for i in range(1, len(lines)) if lines[i].rstrip("\r\n") == "---"), None)
+    if close is None:
+        return False
+    eol = "\r\n" if lines[0].endswith("\r\n") else "\n"
+    head = lines[1:close]
+    for key, value in pairs.items():
+        row = f"{key}: {value}{eol}"
+        at = next((i for i, l in enumerate(head) if re.match(rf"{re.escape(key)}:", l)), None)
+        if at is None:
+            head.append(row)
         else:
-            head = head.rstrip("\n") + f"\n{key}: {value}\n"
-        text = "---" + head + rest
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+            head[at] = row
+    out = "".join([lines[0], *head, *lines[close:]])
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(out)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 # ---------------------------------------------------------------- git

@@ -8,6 +8,7 @@ and declare their degradation instead.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -109,20 +110,53 @@ def _handoff_question(path):
 
 
 def _consume_handoff(state, u):
-    """Mark the picked-up handoff consumed if it is an engineer handoff still ready; runs once assess has succeeded."""
+    """Mark the picked-up handoff consumed if it is a ready `vehicle: sisyphus` engineer handoff; runs once work starts.
+
+    Any other file the owner typed (an architect seed, a handoff with no vehicle) served as the brief but stays ready.
+    """
     path = state.get("handoff_path") or ""
     if not path or os.path.basename(os.path.dirname(os.path.realpath(path))) != "engineer-handoffs" or not os.path.isfile(path):
         return
-    if frontmatter(read_file(path))[0].get("status") == "ready":
-        for k, v in (("status", "consumed"), ("consumed_by", state.get("run_id", "")), ("consumed_at", now_iso())):
-            set_frontmatter(path, k, v)
+    fm = frontmatter(read_file(path))[0]
+    if fm.get("status") != "ready":
+        return
+    if fm.get("vehicle") != "sisyphus":
+        ledger(state, u, f"handoff: {path} served as the brief but is not a vehicle: sisyphus handoff "
+                         f"(vehicle {fm.get('vehicle') or 'none'}); left ready")
+        return
+    if set_frontmatter(path, {"status": "consumed", "consumed_by": state.get("run_id", ""), "consumed_at": now_iso()}):
         ledger(state, u, f"handoff: {path} consumed as the brief")
+    else:
+        ledger(state, u, f"handoff: {path} could not be marked consumed (unreadable or no frontmatter); left as is")
 
 
-def _typed_path(answer):
-    """The absolute path of an existing file named by the reply's first token, or ""."""
-    p = os.path.expanduser(answer.strip().split()[0]) if answer.strip() else ""
-    return os.path.abspath(p) if p and os.path.isfile(p) else ""
+def _typed_path(answer, state):
+    """The real path of the `.md` handoff a reply names as its whole text, or "".
+
+    A relative path resolves against project_dir, then git_root; the file must sit under the project's plans/ or
+    in an engineer-handoffs directory inside the project. Anything else is no path (the reply is interpreted).
+    """
+    reply = (answer or "").strip()
+    if not reply or len(reply.split()) != 1 or not reply.endswith(".md"):
+        return ""
+    roots = [os.path.realpath(r) for r in (state.get("project_dir"), state.get("git_root")) if r]
+    raw = os.path.expanduser(reply)
+    cands = [raw] if os.path.isabs(raw) else [os.path.join(r, raw) for r in roots]
+    for cand in cands:
+        real = os.path.realpath(cand)
+        if not os.path.isfile(real):
+            continue
+        for root in roots:
+            try:
+                rel = os.path.relpath(real, root)
+            except ValueError:  # another drive on Windows
+                continue
+            parts = rel.split(os.sep)
+            if rel.startswith("..") or os.path.isabs(rel):
+                continue
+            if parts[0] == "plans" or "engineer-handoffs" in parts[:-1]:
+                return real
+    return ""
 
 
 def _adopt_brief(state, u, text, source):
@@ -166,6 +200,12 @@ def intake(state):
     if parked:
         u = {k: v for k, v in parked.items() if k not in PARK_FRESH_KEYS}
         u.update({"run_id": resume_id, "run_dir": ensure_run_dir(resume_id), "discussion_run_id": ""})
+        # project_dir is a live variable (never restored): made absolute, and checked against the parked git root
+        u["project_dir"] = os.path.abspath(os.path.expanduser(str(var(state, "project_dir", ".") or ".")))
+        top = git_out(u["project_dir"], "rev-parse", "--show-toplevel", default="")
+        if top and u.get("git_root") and os.path.realpath(top) != os.path.realpath(u["git_root"]):
+            ledger(state, u, f"resume: project_dir {u['project_dir']} resolves to git root {top}, not the parked "
+                             f"{u['git_root']}; the parked git root is kept")
         try:
             os.remove(os.path.join(u["run_dir"], PARKED_STATE))  # one resume per park; a later run id starts over
         except OSError:
@@ -314,12 +354,24 @@ def assess_fault(state):
     return u
 
 
+# route_intent targets that start work; only these spend a picked-up handoff
+WORK_STARTS = ("next_subtask", "plan_subtasks", "architecture_review", "run_step")
+
+
 def route_intent(state):
     u = {}
     harvest_anomalies(state, u, "assess")
-    if not truthy(state.get("assess_faulted")):
-        # the run got past assess, so the picked-up handoff is spent; an assess fault leaves it ready
-        _consume_handoff(state, u)
+    _route_intent(state, u)
+    if state.get("handoff_path"):
+        if u.get("_next") in WORK_STARTS and not truthy(state.get("assess_faulted")):
+            _consume_handoff(state, u)
+        else:
+            ledger(state, u, f"handoff: {state['handoff_path']} left ready (route_intent -> {u.get('_next')}, "
+                             "no work started)")
+    return u
+
+
+def _route_intent(state, u):
     intent = state.get("intent") or "ambiguous"
     sizing = state.get("sizing") or "simple"
     cadence = var(state, "review_cadence", "task")
@@ -355,7 +407,11 @@ def route_intent(state):
         opts = [option(o.get("text", ""), o.get("recommended", False), o.get("evidence", ""))
                 for o in as_list(q.get("options")) if isinstance(o, dict)]
         u["clarify_rounds"] = rounds + 1
-        return raise_escalation(state, u, escalation("clarify", q.get("question", ""), opts))
+        # only the fixed Abort option assess_fault adds is a stop; an assessed option such as "Stop using the
+        # in-memory cache" is an answer
+        stops = ["Abort"] if truthy(state.get("assess_faulted")) else []
+        return raise_escalation(state, u, escalation("clarify", q.get("question", ""), opts,
+                                                     data={"stop_options": stops}))
 
     if intent in ("exploration", "design_question"):
         u["_next"] = "research_answer"
@@ -729,7 +785,7 @@ def parse_answer(state):
     if kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
-    elif kind in ("handoff_confirm", "handoff_path") and _typed_path(text):
+    elif kind in ("handoff_confirm", "handoff_path") and _typed_path(text, state):
         choice = text
     else:
         choice = match_option(text, options)
@@ -785,10 +841,10 @@ def _accepts_text(kind):
     return "\n".join(f"- {s}: {INSTRUCTION_HELP[s]}" for s in shapes) or "(none: this question accepts no instructions)"
 
 
-def _apply_instruction(shape, value, text):
+def _apply_instruction(state, shape, value, text):
     """The answer apply_answer acts on for an accepted instruction, or "" when it cannot be applied."""
     if shape == "path":
-        return _typed_path(value)
+        return _typed_path(value, state)
     if shape in FREE_FORM_SHAPES:
         return INSTRUCTION_ANSWERS[shape].format(text.strip()) if text.strip() else ""
     return ""
@@ -836,7 +892,7 @@ def interpret_route(state):
         if shape not in ACCEPTED_INSTRUCTIONS.get(kind, ()):
             ledger(state, u, f"interpret: {kind}: {said!r} reads as the instruction {shape or '(unnamed)'}, which this "
                              f"question does not accept; unclear")
-        elif answer := _apply_instruction(shape, value, text):
+        elif answer := _apply_instruction(state, shape, value, text):
             return decide(answer, f"the instruction {shape}={tail(value, 120)!r}, applied as {tail(answer, 120)!r}")
         else:
             ledger(state, u, f"interpret: {kind}: the instruction {shape}={tail(value, 120)!r} could not be applied; unclear")
@@ -870,17 +926,25 @@ def _discussion_message(d):
     return "\n".join(lines)
 
 
+def _question_key(esc):
+    """A stable id for one question: its kind plus a hash of the text it was first asked with."""
+    asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
+    return hashlib.sha1(str(asked).encode("utf-8", "replace")).hexdigest()[:12]
+
+
 def choice_park(state):
     """End the run parked on the current escalation so the user can discuss it in the chat lane.
 
     A question parked DISCUSSION_PARKS_MAX times is asked again instead, and its next typed reply is matched to an
-    option without interpreting it again.
+    option without interpreting it again. The budget is per question (kind plus question text), so a new escalation
+    of the same kind gets its own.
     """
     u = {}
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "")
     parks = dict(as_dict(state.get("choice_parks")))
-    count = as_int(parks.get(kind))
+    key = f"{kind}#{_question_key(esc)}"
+    count = as_int(parks.get(key))
     if count >= DISCUSSION_PARKS_MAX:
         u["reply_interpreted"] = True
         ledger(state, u, f"discussion: {kind}: the question already parked {count} time(s) for discussion "
@@ -888,7 +952,7 @@ def choice_park(state):
                          "without interpreting it")
         u["_next"] = "choice_reask"
         return u
-    parks[kind] = count + 1
+    parks[key] = count + 1
     run_id = state.get("run_id") or ""
     data = as_dict(esc.get("data"))
     u["discussion"] = {
@@ -904,7 +968,7 @@ def choice_park(state):
               "discussion_message": _discussion_message(u["discussion"])})
     ledger(state, u, f"discussion: {kind}: parked for discussion ({count + 1}/{DISCUSSION_PARKS_MAX})")
     snapshot(state, u, DISCUSSION_PARKED)
-    full = {k: v for k, v in {**state, **u}.items() if k not in ("_next", "discussion_message")}
+    full = {k: v for k, v in {**state, **u}.items() if k not in PARK_FRESH_KEYS and k != "discussion_message"}
     write_artifact(state.get("run_dir") or "", PARKED_STATE, json.dumps(full, indent=1, default=str))
     u["_next"] = "end_discussion"
     return u
@@ -912,11 +976,11 @@ def choice_park(state):
 
 def choice_resume(state):
     """Resume a run parked on a discussion: a settled answer goes through parse_answer, else the question is asked again."""
-    u = {"discussion": {}, "settled_answer": "", "parked": "", "reply_interpreted": False}
+    u = {"discussion": {}, "settled_answer": "", "parked": "", "reply_interpreted": False, "reask_rounds": 0}
     esc = as_dict(state.get("escalation"))
     settled = str(state.get("settled_answer") or "").strip()
     if settled:
-        u.update({"last_answer_text": settled, "reask_rounds": 0})
+        u["last_answer_text"] = settled
         ledger(state, u, f"discussion: {esc.get('kind')}: resumed with the settled answer {tail(settled, 200)!r}")
         u["_next"] = "parse_answer"
     else:
@@ -957,10 +1021,15 @@ def _answered(state, choices, default=None):
 STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and report", "stop and report")
 
 
-def _whole_reply_stop(answer, options=()):
-    """A reply that IS a stop or an abort: a stop/abort option it names, or the bare words; never a substring of prose."""
+def _whole_reply_stop(answer, options=(), stop_options=None):
+    """A reply that IS a stop or an abort: a stop/abort option it names, or the bare words; never a substring of prose.
+
+    With `stop_options`, only those option texts count as a stop (an escalation whose options another node wrote).
+    """
     bare = re.sub(r"[\W_]+$", "", (answer or "").strip().lower())
     picked = _exact_option(answer or "", list(options)) if options else None
+    if stop_options is not None:
+        return bare in STOP_REPLIES or bool(picked and picked in stop_options)
     return bare in STOP_REPLIES or bool(picked and picked.lower().startswith(("stop", "abort")))
 
 
@@ -972,6 +1041,8 @@ def apply_answer(state):
     u["parked"] = ""
     options = esc.get("options") or []
     stop = _whole_reply_stop(answer, options)
+    if kind == "clarify":
+        stop = _whole_reply_stop(answer, options, as_list(as_dict(esc.get("data")).get("stop_options")))
 
     if kind == "draft_confirm":
         # matched before any abort check: an edit such as "do not abort, add a flag" must not abort
@@ -1007,7 +1078,7 @@ def apply_answer(state):
         elif a == "use" and os.path.isfile(handoff):
             u["handoff_path"] = handoff
             _adopt_brief(state, u, _handoff_brief(handoff), f"the handoff {handoff}; consumed once assess succeeds")
-        elif typed := _typed_path(answer):
+        elif typed := _typed_path(answer, state):
             u["handoff_path"] = typed
             _adopt_brief(state, u, _handoff_brief(typed), f"the typed handoff path {typed} ({handoff} left ready)")
         else:
@@ -1017,7 +1088,7 @@ def apply_answer(state):
                 "handoff_path", "Which handoff file should this run execute? Reply with its path, or abort.",
                 [option("Abort the run")], hard_trigger=True, tier3_ok=False))
     elif kind == "handoff_path":
-        if typed := _typed_path(answer):
+        if typed := _typed_path(answer, state):
             u["handoff_path"] = typed
             _adopt_brief(state, u, _handoff_brief(typed), f"the typed handoff path {typed}")
         else:
@@ -1111,7 +1182,8 @@ def apply_answer(state):
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
             u["_next"] = "end_aborted"
     elif kind in ("strikeout", "lane_stuck", "review_exhausted"):
-        a = _answered(state, {"abort": ["abort"], "round": ["apply", "one more", "round"], "accept": ["accept"]}, "abort")
+        a = "abort" if stop else _answered(state, {"round": ["apply", "one more", "round"], "accept": ["accept"]},
+                                           "abort")
         if a == "round" and as_int(state.get("strikeout_rounds")) < RERUN_ONCE:
             u["strikeout_rounds"] = as_int(state.get("strikeout_rounds")) + 1
             u["fix_strikes"] = 0
@@ -1206,7 +1278,7 @@ def apply_answer(state):
         u["_next"] = "final_report"
     elif kind == "pr_review_owner_judgment" and as_list(as_dict(esc.get("data")).get("untrusted")):
         untrusted = [i for i in as_list(as_dict(esc.get("data")).get("untrusted")) if isinstance(i, dict)]
-        if _answered(state, {"skip": ["skip"]}, "stop") == "skip":
+        if not stop and _answered(state, {"skip": ["skip"]}, "stop") == "skip":
             ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {len(untrusted)} untrusted item(s) skipped")
             u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
                 {"id": i.get("id"), "kind": i.get("kind"), "url": i.get("url", ""),
@@ -1227,7 +1299,8 @@ def apply_answer(state):
         queue = [q for q in as_list(state.get("pr_review_queue")) if isinstance(q, dict)]
         judged = [j for j in as_list(data.get("judgment")) if isinstance(j, dict)]
         noaction = [n for n in as_list(data.get("noaction")) if isinstance(n, dict)]
-        a = _answered(state, {"stop": ["stop"], "skip": ["skip"], "fix": ["fix"]}, "stop")
+        # a stop is the whole reply or the stop option; "please address these, don't stop" is a fix
+        a = "stop" if stop else _answered(state, {"skip": ["skip"], "fix": ["fix", "address"]}, "stop")
         skipped = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
                     "reason": "skipped at the owner's say-so"} for j in judged]
         if a == "fix":
