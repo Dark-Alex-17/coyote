@@ -395,6 +395,7 @@ fn openai_chat_handle_chunk(
     handler: &mut SseHandler,
 ) -> Result<bool> {
     if payload == "[DONE]" {
+        state.close_reasoning(handler)?;
         state.flush_tool_call(handler)?;
         return Ok(true);
     }
@@ -2235,6 +2236,18 @@ mod tests {
             assert_eq!(text, "<think>\nhmm\n</think>\n\n");
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "fs_read");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_stream_that_ends_inside_reasoning_still_closes_the_phase() {
+            let (events, handler) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "hmm" })),
+                "[DONE]".to_string(),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, _, _) = handler.take();
+            assert!(text.trim_end().ends_with("</think>"), "{text:?}");
         }
 
         fn feed_responses(events: &[Value]) -> (Vec<Event>, SseHandler) {

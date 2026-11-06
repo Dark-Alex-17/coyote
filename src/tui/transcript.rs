@@ -267,6 +267,7 @@ impl Transcript {
     /// The scroll offset is clamped to what the transcript can show, and
     /// the rows each cell received are kept so a click can find its cell.
     pub(super) fn view(&mut self, area: Rect, renderer: &mut Renderer) -> TranscriptView {
+        let resized = area.width != self.last_area.width;
         self.last_area = area;
         if area.is_empty() {
             self.last_layout.clear();
@@ -297,7 +298,9 @@ impl Transcript {
 
         let total = lines.len();
         let height = usize::from(area.height);
-        if self.offset_from_bottom > 0 {
+        // A new width re-wraps every cell; that change in the line count
+        // is not output arriving below, so it leaves the offset alone.
+        if self.offset_from_bottom > 0 && !resized {
             self.offset_from_bottom += total.saturating_sub(self.last_total);
         }
         self.last_total = total;
@@ -528,6 +531,33 @@ mod tests {
         assert_eq!(view.lines.last().unwrap().to_string(), "> late 2");
     }
 
+    /// A narrower view re-wraps every cell onto more lines; that is not
+    /// output arriving below and must not push the offset up. Cells
+    /// pushed after the resize still do.
+    #[test]
+    fn a_resize_does_not_inflate_a_scrolled_offset() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i} {}", "x".repeat(30))));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-6);
+        transcript.view(area(5), &mut renderer);
+        assert_eq!(transcript.offset_from_bottom, 6);
+        let narrow = Rect::new(0, 0, 20, 5);
+        transcript.view(narrow, &mut renderer);
+        assert_eq!(
+            transcript.offset_from_bottom, 6,
+            "the re-wrap counted as new output"
+        );
+        transcript.push(Cell::user("late"));
+        transcript.view(narrow, &mut renderer);
+        assert_eq!(
+            transcript.offset_from_bottom, 8,
+            "the cell and its separator"
+        );
+    }
+
     /// Scrolled away with nothing new below, the chip still offers the
     /// way back; it is the only sign the view is not following.
     #[test]
@@ -603,14 +633,17 @@ mod tests {
         );
         transcript.focus_prev();
         transcript.view(area(4), &mut renderer);
-        // 12 cells, 11 separators: 23 lines; the first row's header is
-        // line 0 and the view must start there.
-        assert_eq!(transcript.offset_from_bottom, 19);
+        // 12 cells, 11 separators and a second line on each running tool
+        // row: 25 lines; the first row's header is line 0 and the view
+        // must start there.
+        assert_eq!(transcript.offset_from_bottom, 21);
         assert_eq!(transcript.last_layout[0].cell, 0);
         assert_eq!(transcript.last_layout[0].first_row, 0);
         transcript.focus_next();
         transcript.view(area(4), &mut renderer);
-        assert_eq!(transcript.offset_from_bottom, 0);
+        // The last row's header is line 23; the view stops once that is
+        // its bottom line, leaving the row's own second line below.
+        assert_eq!(transcript.offset_from_bottom, 1);
     }
 
     /// A click lands on the cell that took that screen row in the last

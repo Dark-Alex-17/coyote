@@ -463,11 +463,13 @@ fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
     command_word(line, prefix).as_deref() == Some(".undo")
 }
 
-/// Commands whose turn records an exchange in the session the way a
-/// prompt does, so `.undo` takes it back: the REPL's `.file`, `.continue`,
-/// `.recover`, `.regenerate` and `.run` arms each hand an `Input` to `ask`.
-const EXCHANGE_OPENING_COMMANDS: [&str; 5] =
-    [".file", ".continue", ".recover", ".regenerate", ".run"];
+/// Commands whose turn records a new exchange in the session the way a
+/// prompt does, so `.undo` takes it back: the REPL's `.file`, `.recover`
+/// and `.run` arms each hand `ask` a fresh `Input`. `.continue` and
+/// `.regenerate` are not here: their reply extends or replaces the last
+/// assistant message, so the exchange `.undo` removes is the one they
+/// followed.
+const EXCHANGE_OPENING_COMMANDS: [&str; 3] = [".file", ".recover", ".run"];
 
 /// Whether the cell opened an exchange `.undo` would take back: a user
 /// line, or a command turn from `EXCHANGE_OPENING_COMMANDS` that got as
@@ -1065,12 +1067,16 @@ impl App {
             if let Some(index) = self.tool_row(&call_id)
                 && let Some(Cell::Tool {
                     name: current,
+                    args: short,
                     bookkeeping,
                     ..
                 }) = self.transcript.cell_mut(index)
             {
                 *bookkeeping = cells::is_bookkeeping(&name);
                 *current = name;
+                if let Some(args) = &args {
+                    *short = cells::short_args(&args.to_string());
+                }
             }
             return;
         };
@@ -4212,7 +4218,11 @@ mod tests {
         running_fs_read(&mut harness);
         let frame = harness.draw();
         insta::assert_snapshot!("tool_running_80x24", &frame);
-        assert!(frame.contains("Call fs_read {\"path\":\"src/main.rs\"}  running"));
+        assert!(frame.contains("fs_read({\"path\":\"src/main.rs\"})  running"));
+        assert!(
+            frame.contains("Call fs_read {\"path\":\"src/main.rs\"}"),
+            "{frame}"
+        );
         assert!(frame.contains("println!(\"hi\");"));
     }
 
@@ -4226,6 +4236,7 @@ mod tests {
         insta::assert_snapshot!("tool_collapsed_ok_80x24", &frame);
         assert!(frame.contains("1.2s  ok"), "{frame}");
         assert!(!frame.contains("fn main()"), "{frame}");
+        assert!(!frame.contains("Call fs_read"), "{frame}");
 
         assert!(harness.app.handle_key(ctrl(KeyCode::Up)).is_none());
         assert!(harness.app.transcript.focused());
@@ -4234,7 +4245,11 @@ mod tests {
         insta::assert_snapshot!("tool_expanded_80x24", &frame);
         assert!(frame.contains("fn main()"), "{frame}");
         assert!(
-            row_modifier(&harness, "Call fs_read").contains(Modifier::REVERSED),
+            frame.contains("Call fs_read {\"path\":\"src/main.rs\"}"),
+            "{frame}"
+        );
+        assert!(
+            row_modifier(&harness, "fs_read(").contains(Modifier::REVERSED),
             "the focused header is not reversed"
         );
     }
@@ -4509,7 +4524,7 @@ mod tests {
         let frame = harness.draw();
         insta::assert_snapshot!("bookkeeping_line_80x24", &frame);
         assert!(
-            frame.contains("Call memory__search {\"query\":\"tui\"}  1.2s  ok"),
+            frame.contains("memory__search({\"query\":\"tui\"})  1.2s  ok"),
             "{frame}"
         );
         assert!(!frame.contains("3 hits"), "{frame}");
@@ -4781,6 +4796,26 @@ mod tests {
         assert!(harness.draw().contains("Tip: Press"));
     }
 
+    /// `.regenerate` replaces the last reply inside the exchange it
+    /// follows, so the `.undo` after it takes that whole exchange, user
+    /// line included, as the session does.
+    #[test]
+    fn an_undo_after_a_regenerate_takes_the_original_exchange_too() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".regenerate", true);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("second answer".to_string()));
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert_eq!(harness.app.transcript.len(), 5);
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let frame = harness.draw();
+        assert!(frame.contains("Tip: Press"), "{frame}");
+        assert!(!frame.contains("first question"), "{frame}");
+    }
+
     /// Undoing the only exchange empties the transcript; the greeting
     /// comes back and the next turn clears it as on boot.
     #[test]
@@ -4892,7 +4927,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             })
         };
-        let row = screen_row(&harness, "Call fs_read");
+        let row = screen_row(&harness, "fs_read(");
         assert!(
             harness
                 .app
@@ -4907,7 +4942,7 @@ mod tests {
         let frame = harness.draw();
         assert!(frame.contains("fn main()"), "{frame}");
         assert!(
-            row_modifier(&harness, "Call fs_read").contains(Modifier::REVERSED),
+            row_modifier(&harness, "fs_read(").contains(Modifier::REVERSED),
             "the clicked header is not reversed"
         );
 

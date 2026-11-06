@@ -119,12 +119,17 @@ pub(super) enum Cell {
         open_line: bool,
         pending: Vec<u8>,
     },
-    /// A tool call: its narration line, then the tail of its output while
-    /// it runs or when opened. A bookkeeping tool (memory, skills, agent
-    /// listing) is only ever its narration line.
+    /// A tool call: a one-line `name(args)` header, then the narration
+    /// line and the tail of its output while it runs or when opened. A
+    /// bookkeeping tool (memory, skills, agent listing) is only ever its
+    /// header.
     Tool {
         call_id: String,
         name: String,
+        /// The arguments cut to `SHORT_ARGS_BUDGET` for the header: the
+        /// start hook's compact JSON once it has arrived, the narration
+        /// line's text after the name until then.
+        args: String,
         summary: String,
         status: ToolStatus,
         output: Vec<String>,
@@ -167,16 +172,34 @@ pub(super) fn is_bookkeeping(name: &str) -> bool {
         || matches!(name, "job__list" | "agent__task_list")
 }
 
+/// The tool name and the arguments a narration line names, after `Call `.
+fn narrated_call(line: &str) -> (String, String) {
+    let plain = render::plain_text(line);
+    let call = plain.strip_prefix("Call ").unwrap_or(&plain).trim_start();
+    let (name, args) = call.split_once(char::is_whitespace).unwrap_or((call, ""));
+    (name.to_string(), args.trim().to_string())
+}
+
 /// The tool name a narration line names, after `Call `.
 pub(super) fn narrated_tool_name(line: &str) -> String {
-    let plain = render::plain_text(line);
-    plain
-        .strip_prefix("Call ")
-        .unwrap_or(&plain)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    narrated_call(line).0
+}
+
+/// Width in characters of the arguments in a tool row's header, the
+/// closing `...` of a cut argument string included.
+const SHORT_ARGS_BUDGET: usize = 48;
+
+/// The first line of `args` cut to the header's budget, so a header
+/// with a file's contents in it stays one row.
+pub(super) fn short_args(args: &str) -> String {
+    let line = render::plain_text(args);
+    let line = line.lines().next().unwrap_or_default();
+    if line.chars().count() <= SHORT_ARGS_BUDGET {
+        return line.to_string();
+    }
+    let mut short: String = line.chars().take(SHORT_ARGS_BUDGET - 3).collect();
+    short.push_str("...");
+    short
 }
 
 impl Cell {
@@ -212,11 +235,12 @@ impl Cell {
     }
 
     pub(super) fn tool(call_id: String, summary: String, since: Instant) -> Self {
-        let name = narrated_tool_name(&summary);
+        let (name, args) = narrated_call(&summary);
         let bookkeeping = is_bookkeeping(&name);
         Self::Tool {
             call_id,
             name,
+            args: short_args(&args),
             summary,
             status: ToolStatus::Running { since },
             output: Vec::new(),
@@ -315,6 +339,8 @@ impl Cell {
             }),
             Cell::Text { lines, .. } => dim_wrapped(output_lines(lines), width),
             Cell::Tool {
+                name,
+                args,
                 summary,
                 status,
                 output,
@@ -329,15 +355,21 @@ impl Cell {
                         format!("{}  failed: {}", elapsed_text(*elapsed), first_line(error))
                     }
                 };
-                let mut lines = vec![render::styled_line(&format!("{summary}  {state}"))];
+                // The header is one row; the view clips what does not
+                // fit. The narration below it is what the user approves,
+                // so that wraps and is shown whole.
+                let header = format!("{name}({args})  {state}");
+                let mut lines = vec![Line::from(Span::styled(header, DIM))];
                 let open = matches!(status, ToolStatus::Running { .. }) || *expanded;
                 if open && !*bookkeeping {
+                    let mut body = vec![render::styled_line(summary)];
                     if let ToolStatus::Failed { error, .. } = status {
-                        lines.extend(render::preformatted_lines(error));
+                        body.extend(render::preformatted_lines(error));
                     }
-                    lines.extend(output_lines(output));
+                    body.extend(output_lines(output));
+                    lines.extend(dim_wrapped(body, width));
                 }
-                dim_wrapped(lines, width)
+                lines
             }
             Cell::Job {
                 job_id,
@@ -604,7 +636,16 @@ pub(super) fn append_output((lines, open_line, pending): OutputTarget<'_>, bytes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
     use std::cell::Cell as Counter;
+
+    fn renderer() -> Renderer {
+        let config = AppConfig {
+            highlight: false,
+            ..Default::default()
+        };
+        Renderer::new(config.render_options().unwrap()).unwrap()
+    }
 
     /// Same width: the cached lines come back without a render. A new
     /// width renders once and is kept beside the previous one; only a
@@ -699,6 +740,63 @@ mod tests {
     }
 
     #[test]
+    fn short_args_cut_at_the_budget_and_keep_a_short_line_whole() {
+        assert_eq!(short_args("{\"path\":\"x\"}"), "{\"path\":\"x\"}");
+        assert_eq!(short_args(""), "");
+        let content = "x".repeat(2048);
+        let args = serde_json::json!({ "path": "src/x.rs", "content": content }).to_string();
+        let short = short_args(&args);
+        assert_eq!(
+            short,
+            "{\"path\":\"src/x.rs\",\"content\":\"xxxxxxxxxxxxxxx..."
+        );
+        assert_eq!(short.chars().count(), SHORT_ARGS_BUDGET);
+        assert_eq!(short_args("a\x1b[31mb\x1b[0m\nc"), "ab");
+    }
+
+    /// A `content` argument of kilobytes leaves the collapsed row one
+    /// line; the whole narration waits in the body for the row to open.
+    #[test]
+    fn a_large_argument_keeps_the_header_to_one_line_and_the_narration_in_the_body() {
+        let mut renderer = renderer();
+        let content = "x".repeat(2048);
+        let narration =
+            format!("Call fs_write {{\"path\":\"src/x.rs\",\"content\":\"{content}\"}}");
+        let mut cell = Cell::tool("c1".to_string(), narration.clone(), Instant::now());
+        let header = "fs_write({\"path\":\"src/x.rs\",\"content\":\"xxxxxxxxxxxxxxx...)";
+
+        let lines = cell.lines(80, &mut renderer);
+        assert_eq!(lines[0].to_string(), format!("{header}  running"));
+        let body: String = lines[1..].iter().map(Line::to_string).collect();
+        assert_eq!(
+            body, narration,
+            "the running row does not show the narration whole"
+        );
+
+        let Cell::Tool { status, .. } = &mut cell else {
+            unreachable!();
+        };
+        *status = ToolStatus::Ok {
+            elapsed: Duration::from_millis(1200),
+        };
+        let lines = cell.lines(80, &mut renderer);
+        assert_eq!(lines.len(), 1, "a collapsed row took more than one line");
+        assert_eq!(lines[0].to_string(), format!("{header}  1.2s  ok"));
+
+        cell.toggle();
+        let lines = cell.lines(80, &mut renderer);
+        assert_eq!(lines[0].to_string(), format!("{header}  1.2s  ok"));
+        let body: String = lines[1..].iter().map(Line::to_string).collect();
+        assert_eq!(
+            body, narration,
+            "the opened row does not show the narration whole"
+        );
+        for line in &lines[1..] {
+            assert!(line.width() <= 80, "{line:?} is wider than the view");
+        }
+    }
+
+    #[test]
     fn bookkeeping_covers_lookups_and_listings_but_not_the_inbox() {
         for name in [
             "memory__search",
@@ -761,5 +859,22 @@ mod tests {
         append_output((&mut lines, &mut open_line, &mut pending), b"\x98\x80\n");
         assert_eq!(lines, ["half\u{1F600}"]);
         assert!(!open_line);
+    }
+
+    #[test]
+    fn output_keeps_only_the_newest_tail_of_lines_in_order() {
+        let mut lines = Vec::new();
+        let mut open_line = false;
+        let mut pending = Vec::new();
+        for n in 0..25u8 {
+            let line = format!("{}\n", char::from(b'a' + n));
+            append_output((&mut lines, &mut open_line, &mut pending), line.as_bytes());
+        }
+        assert_eq!(lines.len(), TOOL_OUTPUT_TAIL);
+        let kept: String = lines.concat();
+        assert_eq!(
+            kept, "fghijklmnopqrstuvwxy",
+            "the oldest lines were not the ones dropped"
+        );
     }
 }

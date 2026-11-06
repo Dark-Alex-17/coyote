@@ -47,6 +47,7 @@ const PAGE_UP: &[u8] = b"\x1b[5~";
 const END: &[u8] = b"\x1b[F";
 const CTRL_L: &[u8] = b"\x0c";
 const CTRL_D: &[u8] = b"\x04";
+const CTRL_C: &[u8] = b"\x03";
 
 struct TempDirGuard(PathBuf);
 
@@ -494,8 +495,11 @@ fn undo_removes_the_last_exchange_and_keeps_the_one_before() {
         ".undo did not hand the undone prompt back to the composer:\n{frame}"
     );
 
-    // The composer holds the undone prompt; Ctrl+D would not quit over it.
-    drop(pty);
+    // Ctrl+C clears the undone prompt out of the composer; Ctrl+D would
+    // not quit over it.
+    pty.send(CTRL_C).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit(pty);
 }
 
 // ---------------------------------------------------------------------
@@ -698,11 +702,10 @@ fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
 }
 
 // ---------------------------------------------------------------------
-// Criterion: "tool/job/agent cells pair with their terminal event by
-// COYOTE_TOOL_CALL_ID". Observable from the outside: while the tool runs
-// its cell names it; once it has finished and the model replied, the
-// same name is on screen exactly once (the end event landed in the cell
-// that the start event opened, not in a second one).
+// A tool call is one cell: its start and end events land in the same
+// row. Observable from the outside: while the tool runs its cell names
+// it; once it has finished and the model replied, the same name is on
+// screen exactly once, not in a second cell.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -791,12 +794,12 @@ fn undo_with_nothing_to_undo_leaves_the_ui_alive() {
 }
 
 // ---------------------------------------------------------------------
-// Checklist item 6: "every custom widget clamps to the buffer". With the
-// welcome block up and the Todo panel open, the terminal is shrunk to a
-// handful of cells and then to a single cell; nothing may panic, a key
-// typed under every size still reaches the composer, and once the
-// terminal grows back both widgets are drawn again and the draft typed
-// along the way is submitted whole.
+// Every widget clamps to the buffer. With the welcome block up and the
+// Todo panel open, the terminal is shrunk to a handful of cells and then
+// to a single cell; nothing may panic, a key typed under every size
+// still reaches the composer, and once the terminal grows back both
+// widgets are drawn again and the draft typed along the way is
+// submitted whole.
 //
 // Known and out of this task's scope: after a shrink the composer's own
 // viewport (ratatui-textarea) may stay scrolled right, so the draft can
@@ -864,9 +867,8 @@ fn tiny_terminal_sizes_clamp_the_welcome_block_and_todo_panel() {
 }
 
 // ---------------------------------------------------------------------
-// Checklist item 6: "rows with VS16/emoji graphemes repaint whole". A
-// prompt carrying a VS16 sequence and a wide emoji reaches the user cell
-// and the dry-run echo intact.
+// A prompt carrying a VS16 sequence and a wide emoji reaches the user
+// cell and the dry-run echo with both graphemes intact.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -931,9 +933,15 @@ fn undoing_the_only_exchange_stops_at_the_command_cell_before_it() {
         ".undo removed the command cell before the exchange:\n{frame}"
     );
     assert!(
+        !frame.contains(&squeezed("Tip: Press Ctrl-C")),
+        "the welcome block came back over the command cell:\n{frame}"
+    );
+    assert!(
         frame.contains("solomarkerone"),
         ".undo did not hand the undone prompt back to the composer:\n{frame}"
     );
 
-    drop(pty);
+    pty.send(CTRL_C).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit(pty);
 }

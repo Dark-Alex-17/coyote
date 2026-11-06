@@ -4,7 +4,7 @@ expression: "&frame"
 ---
 "> remember                                                                      "
 "                                                                                "
-"Call memory__search {"query":"tui"}  1.2s  ok                                   "
+"memory__search({"query":"tui"})  1.2s  ok                                       "
 "                                                                                "
 "                                                                                "
 "                                                                                "
