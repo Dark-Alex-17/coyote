@@ -281,6 +281,8 @@ mod tests {
     fn an_unknown_command_is_red() {
         let buf = render(".nosuch", CommandPrefix::Dot, &[], false);
         assert!(painted(&buf, 7, UNKNOWN_COLOR), "{:?}", first_row(&buf));
+        let buf = render(".infox", CommandPrefix::Dot, &[], false);
+        assert!(painted(&buf, 6, UNKNOWN_COLOR), "{:?}", first_row(&buf));
     }
 
     #[test]

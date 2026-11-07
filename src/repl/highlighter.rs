@@ -4,7 +4,7 @@ use crate::config::{CommandPrefix, RequestContext};
 use crate::utils::NO_COLOR;
 
 use nu_ansi_term::{Color, Style};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use reedline::{Highlighter, StyledText};
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,13 +13,43 @@ const DEFAULT_COLOR: Color = Color::Default;
 const MATCH_COLOR: Color = Color::Green;
 const UNKNOWN_COLOR: Color = Color::Red;
 
+/// The macro names the highlighter paints as known. Listing them scans
+/// the macro directories, so the REPL refreshes the list once per line
+/// and a repaint only reads it.
+#[derive(Debug, Clone, Default)]
+pub struct MacroNames(Arc<Mutex<Vec<String>>>);
+
+impl MacroNames {
+    pub fn refresh(&self, ctx: &RequestContext) {
+        *self.0.lock() = ctx
+            .visible_macro_completions()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+    }
+}
+
 pub struct ReplHighlighter {
     ctx: Arc<RwLock<RequestContext>>,
+    macro_names: MacroNames,
 }
 
 impl ReplHighlighter {
-    pub fn new(ctx: Arc<RwLock<RequestContext>>) -> Self {
-        Self { ctx }
+    pub fn new(ctx: Arc<RwLock<RequestContext>>, macro_names: MacroNames) -> Self {
+        Self { ctx, macro_names }
+    }
+
+    /// The command word in `line`; the cached macro names are consulted
+    /// only for a word no built-in claims.
+    fn command_span(&self, line: &str) -> Option<CommandSpan> {
+        let prefix = self.ctx.read().command_prefix();
+        let span = classify_command(line, prefix, &[]);
+        if !matches!(span, Some(CommandSpan { known: false, .. })) {
+            return span;
+        }
+        let macros = self.macro_names.0.lock();
+        let names: Vec<&str> = macros.iter().map(String::as_str).collect();
+        classify_command(line, prefix, &names)
     }
 }
 
@@ -32,16 +62,7 @@ impl Highlighter for ReplHighlighter {
             return styled_text;
         }
 
-        let prefix = self.ctx.read().command_prefix();
-        let mut span = classify_command(line, prefix, &[]);
-        if matches!(span, Some(CommandSpan { known: false, .. })) {
-            // Macro names come from a directory scan, so they are only
-            // consulted for a word no built-in claims.
-            let macros = self.ctx.read().visible_macro_completions();
-            let names: Vec<&str> = macros.iter().map(|(name, _)| name.as_str()).collect();
-            span = classify_command(line, prefix, &names);
-        }
-        match span {
+        match self.command_span(line) {
             Some(CommandSpan { range, known }) => {
                 let colour = if known { MATCH_COLOR } else { UNKNOWN_COLOR };
                 styled_text.push((
@@ -71,10 +92,11 @@ pub(crate) struct CommandSpan {
 
 /// Classifies the command in `line`, if any. Known is the longest built-in
 /// name, or a name from `extra_known`, that starts with an accepted sigil
-/// at the start of the line or right after whitespace. Unknown is a sigil
-/// opening the line followed by a word that matches nothing: that is the
-/// only place the line is dispatched as a command, so a path or a dotted
-/// word later in a sentence is left alone.
+/// at the start of the line or right after whitespace and ends at the end
+/// of the line or before whitespace, so `.roles` is not `.role`. Unknown
+/// is a sigil opening the line followed by a word that matches nothing:
+/// that is the only place the line is dispatched as a command, so a path
+/// or a dotted word later in a sentence is left alone.
 pub(crate) fn classify_command(
     line: &str,
     prefix: CommandPrefix,
@@ -109,16 +131,17 @@ fn known_match(line: &str, prefix: CommandPrefix, extra_known: &[&str]) -> Optio
         .flat_map(|(i, sigil)| {
             let name_start = i + sigil.len();
             let rest = &line[name_start..];
+            let whole_word = move |name: &str| {
+                rest.strip_prefix(name)
+                    .is_some_and(|after| after.chars().next().is_none_or(char::is_whitespace))
+            };
             let builtin = REPL_COMMANDS
                 .iter()
-                .filter(move |cmd| rest.starts_with(&cmd.name[1..]))
+                .filter(move |cmd| whole_word(&cmd.name[1..]))
                 .map(move |cmd| i..name_start + cmd.name.len() - 1);
             let extra = extra_known
                 .iter()
-                .filter(move |name| {
-                    rest.strip_prefix(*name)
-                        .is_some_and(|after| after.chars().next().is_none_or(char::is_whitespace))
-                })
+                .filter(move |name| whole_word(name))
                 .map(move |name| i..name_start + name.len());
             builtin.chain(extra)
         })
@@ -131,6 +154,9 @@ fn known_match(line: &str, prefix: CommandPrefix, extra_known: &[&str]) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::testing::TestConfigDirGuard;
+    use serial_test::serial;
 
     fn matched(line: &str, prefix: CommandPrefix) -> Option<&str> {
         classify_command(line, prefix, &[])
@@ -192,6 +218,58 @@ mod tests {
                 known: true
             })
         );
+    }
+
+    #[test]
+    fn a_known_command_ends_at_a_word_boundary() {
+        assert_eq!(
+            matched(".info tools", CommandPrefix::Dot),
+            Some(".info tools")
+        );
+        assert_eq!(matched(".info x", CommandPrefix::Dot), Some(".info"));
+        assert_eq!(matched(".role", CommandPrefix::Dot), Some(".role"));
+        assert_eq!(matched(".roles", CommandPrefix::Dot), None);
+        assert_eq!(
+            classify_command(".infox", CommandPrefix::Dot, &[]),
+            Some(CommandSpan {
+                range: 0..6,
+                known: false
+            })
+        );
+    }
+
+    /// A repaint reads the names the REPL refreshed and never the macro
+    /// directory: the cached name stays known after the directory is gone.
+    #[test]
+    #[serial]
+    fn a_repaint_reads_the_cached_macro_names() {
+        let _guard = TestConfigDirGuard::new("highlighter-macro-cache");
+        let path = crate::config::paths::macro_file("cached-macro");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "isolated: false\nsteps:\n  - \".info\"\n").unwrap();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Dot,
+            ..Default::default()
+        });
+        let ctx = Arc::new(RwLock::new(RequestContext::new(
+            Arc::new(app),
+            WorkingMode::Repl,
+        )));
+        let names = MacroNames::default();
+        let highlighter = ReplHighlighter::new(Arc::clone(&ctx), names.clone());
+        let span = |known| {
+            Some(CommandSpan {
+                range: 0..13,
+                known,
+            })
+        };
+
+        assert_eq!(highlighter.command_span(".cached-macro"), span(false));
+        names.refresh(&ctx.read());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert_eq!(highlighter.command_span(".cached-macro"), span(true));
+        assert_eq!(highlighter.command_span(".cached-macro x"), span(true));
     }
 
     #[test]

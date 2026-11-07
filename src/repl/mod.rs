@@ -4,8 +4,8 @@ mod prompt;
 mod replay;
 
 pub(crate) use self::completer::{ReplCompleter, command_candidates, split_line};
-use self::highlighter::ReplHighlighter;
 pub(crate) use self::highlighter::{CommandSpan, classify_command};
+use self::highlighter::{MacroNames, ReplHighlighter};
 use self::prompt::ReplPrompt;
 
 use crate::client::{
@@ -463,13 +463,15 @@ pub struct Repl {
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
+    macro_names: MacroNames,
 }
 
 impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
         let ctx = Arc::new(RwLock::new(ctx));
-        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
+        let macro_names = MacroNames::default();
+        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), macro_names.clone())?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
 
@@ -478,6 +480,7 @@ impl Repl {
             editor,
             prompt,
             abort_signal,
+            macro_names,
         })
     }
 
@@ -549,6 +552,7 @@ impl Repl {
             }
             // Drain stale ESC[6n replies so reedline anchors the prompt on the real row.
             resync_cursor_queries();
+            self.macro_names.refresh(&self.ctx.read());
             let sig = self.editor.read_line(&self.prompt);
             match sig {
                 Ok(Signal::Success(line)) => {
@@ -616,9 +620,13 @@ impl Repl {
         exit_result
     }
 
-    fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
+    fn create_editor(
+        ctx: Arc<RwLock<RequestContext>>,
+        app: &AppConfig,
+        macro_names: MacroNames,
+    ) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
-        let highlighter = ReplHighlighter::new(Arc::clone(&ctx));
+        let highlighter = ReplHighlighter::new(Arc::clone(&ctx), macro_names);
         let menu = Self::create_menu();
         let edit_mode = Self::create_edit_mode(app);
         let cursor_config = CursorConfig {
