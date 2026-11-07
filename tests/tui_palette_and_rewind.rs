@@ -629,10 +629,20 @@ fn two_drafts_while_a_tool_sleeps_show_pending_two_and_drain_after_release() {
             "the queue strip outlived the turn:\n{repainted}"
         );
     }
+    // Both drafts sat on the queue when the tool round ended, so the
+    // request after it carries both and nothing is left to run as a
+    // turn of its own.
+    let bodies = fake.bodies();
+    assert_eq!(fake.served(), 2, "served count:\n{bodies:#?}");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the queued drafts should ride the tool-round request, not open turns:\n{bodies:#?}"
+    );
     assert!(
-        fake.served() >= 2,
-        "the queued lines never reached the model (served {})",
-        fake.served()
+        bodies[1].contains("draft-one-r12") && bodies[1].contains("draft-two-r12"),
+        "the request after the tool round is missing a queued draft:\n{}",
+        bodies[1]
     );
     quit_and_check(&mut pty);
 }

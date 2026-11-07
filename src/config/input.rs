@@ -1361,6 +1361,7 @@ mod tests {
     /// Under the full-screen UI a document command that reads stdin gets
     /// none, so `cat -` returns at once with nothing instead of waiting on
     /// a tty the event stream owns.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn a_document_command_under_the_tui_reads_no_stdin() {
@@ -1375,6 +1376,55 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Dropping the future that waits on a document command under the
+    /// TUI, which is what an aborted turn does, kills the command instead
+    /// of leaving it to finish on its own.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn dropping_a_document_command_under_the_tui_kills_it() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = env::temp_dir().join(format!(
+            "coyote-input-test-kill-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let script = format!("echo $$ > '{}'; sleep 30", pid_file.display());
+        let pid = run_async(async {
+            let command = run_document_command(&script);
+            tokio::pin!(command);
+            loop {
+                tokio::select! {
+                    output = &mut command => panic!("the command finished early: {output}"),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                        if let Some(pid) = fs::read_to_string(&pid_file)
+                            .ok()
+                            .and_then(|text| text.trim().parse::<i32>().ok())
+                        {
+                            break pid;
+                        }
+                    }
+                }
+            }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // A reaped pid answers ESRCH to a null signal; a zombie or a
+        // still-running child answers 0.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the document command (pid {pid}) outlived its future"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
