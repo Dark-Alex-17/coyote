@@ -955,10 +955,12 @@ fn the_editor_shrinking_the_line_under_an_open_palette_does_not_crash_enter() {
         "Enter on the palette after the editor shrank the line ended the session:\n{after}"
     );
 
-    let cleared_at = pty.raw().len();
-    pty.send(b"\x03").unwrap();
-    pty.read_for(Duration::from_millis(400));
-    assert_composer_takes_keys(&mut pty, cleared_at, "Enter on the stale palette");
+    // The palette was rebuilt for `.i` with no row highlighted, so that
+    // Enter submitted `.i` as a command turn (an unknown one) and left
+    // the composer empty; Ctrl+C here would be a quit.
+    let settled_at = pty.raw().len();
+    pty.read_for(Duration::from_millis(600));
+    assert_composer_takes_keys(&mut pty, settled_at, "Enter on the stale palette");
     quit_and_check(&mut pty);
 }
 

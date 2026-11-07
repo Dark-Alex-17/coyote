@@ -747,6 +747,20 @@ fn key(pty: &mut Pty, bytes: &[u8]) {
     pty.read_for(Duration::from_millis(250));
 }
 
+/// The composer's text in a repainted frame: what sits between the
+/// field's rule and the footer, runs of blanks folded to one space.
+fn composer_row(frame: &str) -> String {
+    let rule = frame
+        .rfind('\u{2500}')
+        .map_or(0, |at| at + '\u{2500}'.len_utf8());
+    let after = &frame[rule..];
+    let footer = after.find("dryrun:dry-model").unwrap_or(after.len());
+    after[..footer]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `keybindings: vi`: Esc leaves insert mode; `0 x` deletes the first
 /// character, `$ x` the last, `A` appends, `dd` clears the line, `i`
 /// returns to insert. Every step is observed before the verdict so one
@@ -779,47 +793,31 @@ fn vi_keybindings_edit_the_composer_in_normal_mode() {
         ));
     }
 
+    // From here the checks read the composer row itself: squeezing the
+    // whole frame glues the row to the footer that follows it, so
+    // `ello worl` + `dryrun` would read as `elloworld`.
     // `$` in vi lands ON the last character, so `x` deletes it.
     key(&mut pty, b"$");
     key(&mut pty, b"x");
     let frame = next_frame(&mut pty, &mut toggle);
-    let flat = squeezed(&frame);
-    let dollar_x_deleted = flat.contains("elloworl") && !flat.contains("elloworld");
-    if !dollar_x_deleted {
+    if composer_row(&frame) != "ello worl" {
         misses.push(format!("$ x did not delete the last character:\n{frame}"));
     }
-    let expected_after_dollar = if dollar_x_deleted {
-        "elloworl"
-    } else {
-        "elloworld"
-    };
 
     // `h` then `x`: one left of the cursor, deletes that character.
     key(&mut pty, b"h");
     key(&mut pty, b"x");
     let frame = next_frame(&mut pty, &mut toggle);
-    let flat = squeezed(&frame);
-    let mut text: Vec<char> = expected_after_dollar.chars().collect();
-    // After `$ x` (vi) the cursor sits on the new last char; `h` moves
-    // one left and `x` removes it. If `$` overshot to the end, `h` lands
-    // on the last char instead.
-    let removed = if dollar_x_deleted {
-        text.len() - 2
-    } else {
-        text.len() - 1
-    };
-    text.remove(removed);
-    let expected_after_h: String = text.into_iter().collect();
-    if !flat.contains(&expected_after_h) {
+    if composer_row(&frame) != "ello wol" {
         misses.push(format!(
-            "h x did not delete the character left of the cursor (expected `{expected_after_h}`):\n{frame}"
+            "h x did not delete the character left of the cursor (expected `ello wol`):\n{frame}"
         ));
     }
 
     key(&mut pty, b"A");
     key(&mut pty, b"!");
     let frame = next_frame(&mut pty, &mut toggle);
-    if !squeezed(&frame).contains(&format!("{expected_after_h}!")) {
+    if composer_row(&frame) != "ello wol!" {
         misses.push(format!("A did not append at the end of the line:\n{frame}"));
     }
 

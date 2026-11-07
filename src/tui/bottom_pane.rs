@@ -781,7 +781,9 @@ mod tests {
         assert_eq!(palette.accept(".i"), None);
         palette.token_range = 2..3;
         assert_eq!(palette.accept(".\u{e9}"), None, "inside a multi-byte char");
-        palette.token_range = 2..1;
+        // An inverted range is the case under test; spelled as a struct so
+        // the lint for an accidental one does not fire.
+        palette.token_range = std::ops::Range { start: 2, end: 1 };
         assert_eq!(palette.accept(".info"), None);
     }
 
