@@ -8057,6 +8057,23 @@ local_hello() {\n\
         );
     }
 
+    /// With no human to fill them in, the missing arguments end the call
+    /// before anything reaches the server.
+    #[test]
+    fn missing_prompt_args_with_no_human_end_the_call() {
+        let mut ctx = repl_ctx();
+        ctx.prompter = Arc::new(crate::prompt::HeadlessPrompter);
+
+        let err =
+            prompt_missing_args(&ctx, "srv", "summarize", vec!["path".to_string()]).unwrap_err();
+
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "The input prompt needs a human and none is attached to this run"
+        );
+    }
+
     #[test]
     fn parse_repl_install_routes_categories_to_builtins() {
         assert_eq!(

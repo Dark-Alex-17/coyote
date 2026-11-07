@@ -1,7 +1,7 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::hooks::{self, HookEvent};
-use crate::prompt::{PromptAction, PromptAnswer, PromptRequest};
+use crate::prompt::{NeedsHuman, PromptAction, PromptAnswer, PromptRequest, headless_reply};
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
 use crate::utils::{ACP_SERVER, HEADLESS, queue_acp_permission};
 
@@ -141,8 +141,7 @@ pub async fn handle_user_tool(
     )?;
 
     if ACP_SERVER.load(Ordering::SeqCst) {
-        let answer = ctx.prompt(headless_request(ctx, action, args))?;
-        let result = headless_value(answer)?;
+        let result = headless_value(ctx, headless_request(ctx, action, args))?;
         queue_acp_permission(json!({
             "action": action.name(),
             "question": result["question"],
@@ -153,7 +152,7 @@ pub async fn handle_user_tool(
     }
 
     if HEADLESS.load(Ordering::SeqCst) {
-        return headless_value(ctx.prompt(headless_request(ctx, action, args))?);
+        return headless_value(ctx, headless_request(ctx, action, args));
     }
 
     let depth = ctx.current_depth;
@@ -219,11 +218,17 @@ fn headless_request(ctx: &RequestContext, action: UserAction, args: &Value) -> P
     ctx.prompt_request(action.into(), question, options, None)
 }
 
-/// Decodes the structured reply a headless prompter carries as text.
-fn headless_value(answer: PromptAnswer) -> Result<Value> {
-    match answer {
-        PromptAnswer::Text(json) => Ok(serde_json::from_str(&json)?),
-        other => bail!("Unexpected answer to a headless prompt: {other:?}"),
+/// The structured reply a run with no human hands the model. The prompter
+/// carries it as text for a confirm and refuses every other kind; the
+/// refusal becomes the same reply here, since the model is the one party
+/// that can act on it.
+fn headless_value(ctx: &RequestContext, req: PromptRequest) -> Result<Value> {
+    let reply = headless_reply(&req);
+    match ctx.prompt(req) {
+        Ok(PromptAnswer::Text(json)) => Ok(serde_json::from_str(&json)?),
+        Ok(other) => bail!("Unexpected answer to a headless prompt: {other:?}"),
+        Err(err) if err.is::<NeedsHuman>() => Ok(reply),
+        Err(err) => Err(err),
     }
 }
 

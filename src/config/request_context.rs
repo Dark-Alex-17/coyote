@@ -12083,6 +12083,28 @@ mod tests {
         assert_eq!(err.to_string(), "Operation was canceled by the user");
     }
 
+    /// With no human to name it, saving the temp role fails instead of
+    /// writing a role under whatever the headless prompter answered.
+    #[test]
+    #[serial]
+    fn save_role_with_no_human_writes_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.use_temp_role(&app, "a temporary role").unwrap();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+
+        let err = ctx.save_role(None).unwrap_err();
+
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        let roles = paths::roles_dir();
+        let written: Vec<_> = fs::read_dir(&roles)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(written.is_empty(), "{written:?}");
+        assert_eq!(ctx.role.as_ref().unwrap().name(), TEMP_ROLE_NAME);
+    }
+
     /// A seeded child hands out the very signal `agent__cancel` sets; the
     /// root, with nothing seeded, gets a fresh one each time.
     #[test]

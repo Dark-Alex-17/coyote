@@ -323,13 +323,32 @@ impl Prompter for InquirePrompter {
     }
 }
 
-/// Answers for a run with no human: the reply is the structured
-/// `needs_human` JSON the model is expected to act on, carried as text.
-/// Only `handle_user_tool` knows how to read that text; every other Input
-/// consumer must gate on [`human_present`] or it will take the JSON as the
-/// human's answer.
+/// Answers for a run with no human. A confirm is answered with the
+/// structured `needs_human` JSON the model is expected to act on, carried
+/// as text; only `handle_user_tool` knows how to read it, and every other
+/// confirm consumer rejects it as the wrong shape. Every other kind is
+/// refused with [`NeedsHuman`], because a text-shaped answer would be
+/// taken as the human's: a role would be saved under the JSON, or an MCP
+/// server would receive it as an argument.
 #[derive(Debug, Default)]
 pub struct HeadlessPrompter;
+
+/// The refusal a run with no human gives a prompt whose answer would
+/// otherwise be read as text.
+#[derive(Debug)]
+pub(crate) struct NeedsHuman(pub(crate) PromptAction);
+
+impl fmt::Display for NeedsHuman {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "The {} prompt needs a human and none is attached to this run",
+            self.0.name()
+        )
+    }
+}
+
+impl std::error::Error for NeedsHuman {}
 
 /// The JSON a headless run hands back in place of a human answer.
 pub(crate) fn headless_reply(req: &PromptRequest) -> Value {
@@ -344,7 +363,10 @@ pub(crate) fn headless_reply(req: &PromptRequest) -> Value {
 
 impl Prompter for HeadlessPrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
-        Ok(PromptAnswer::Text(headless_reply(&req).to_string()))
+        match req.action {
+            PromptAction::Confirm => Ok(PromptAnswer::Text(headless_reply(&req).to_string())),
+            action => Err(NeedsHuman(action).into()),
+        }
     }
 
     #[cfg(test)]
@@ -618,11 +640,31 @@ mod tests {
     }
 
     #[test]
-    fn headless_prompter_carries_the_reply_as_text() {
-        let req = request(PromptAction::Select, None);
+    fn headless_prompter_carries_the_confirm_reply_as_text() {
+        let req = request(PromptAction::Confirm, None);
         let expected = headless_reply(&req).to_string();
         let answer = HeadlessPrompter.prompt(req).unwrap();
         assert_eq!(answer, PromptAnswer::Text(expected));
+    }
+
+    #[test]
+    fn headless_prompter_refuses_every_text_shaped_kind() {
+        for (action, name) in [
+            (PromptAction::Input, "input"),
+            (PromptAction::Password, "password"),
+            (PromptAction::Select, "select"),
+            (PromptAction::Checkbox, "checkbox"),
+        ] {
+            let err = HeadlessPrompter.prompt(request(action, None)).unwrap_err();
+            let refusal = err
+                .downcast_ref::<NeedsHuman>()
+                .unwrap_or_else(|| panic!("{name}: {err}"));
+            assert_eq!(refusal.0, action);
+            assert_eq!(
+                err.to_string(),
+                format!("The {name} prompt needs a human and none is attached to this run")
+            );
+        }
     }
 
     #[test]
