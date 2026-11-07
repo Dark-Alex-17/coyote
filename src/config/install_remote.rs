@@ -2218,11 +2218,12 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
     // The full-screen UI cannot show the menu either; the refusal names
     // the same flags as the non-tty one and where else it can be answered.
     if !*IS_STDOUT_TERMINAL || crate::tui::active() {
-        bail!(
+        let refusal = format!(
             "MCP server '{name}' already exists locally. Refusing to merge non-interactively. \
              {}, with --install-force (installs), or with --yes (updates).",
-            conflict::rerun_hint() // TASK-388
+            conflict::rerun_hint()
         );
+        bail!("{refusal}"); // TASK-388
     }
     // The refusal above already covers the UI; defence in depth.
     ensure_prompts_available()?;

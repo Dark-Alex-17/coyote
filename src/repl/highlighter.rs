@@ -90,26 +90,26 @@ pub(crate) struct CommandSpan {
     pub(crate) known: bool,
 }
 
-/// Classifies the command in `line`, if any. Known is the longest built-in
-/// name, or a name from `extra_known`, that starts with an accepted sigil
-/// at the start of the line or right after whitespace and ends at the end
-/// of the line or before whitespace, so `.roles` is not `.role`. Unknown
-/// is a sigil opening the line followed by a word that matches nothing:
-/// that is the only place the line is dispatched as a command, so a path
-/// or a dotted word later in a sentence is left alone.
+/// Classifies the command in `line`, if any. The command word opens the
+/// line, after any leading whitespace: that is the only place the line
+/// is dispatched as a command, so a path or a dotted word later in a
+/// sentence is left alone. Known is the longest built-in name, or a
+/// name from `extra_known`, after the sigil that ends at the end of the
+/// line or before whitespace, so `.roles` is not `.role`. Unknown is a
+/// sigil followed by a word that matches nothing.
 pub(crate) fn classify_command(
     line: &str,
     prefix: CommandPrefix,
     extra_known: &[&str],
 ) -> Option<CommandSpan> {
-    if let Some(range) = known_match(line, prefix, extra_known) {
-        return Some(CommandSpan { range, known: true });
-    }
     let start = line.len() - line.trim_start().len();
     let sigil = line[start..]
         .chars()
         .next()
         .filter(|&c| prefix.accepts(c))?;
+    if let Some(range) = known_match(line, start, sigil, extra_known) {
+        return Some(CommandSpan { range, known: true });
+    }
     let word_start = start + sigil.len_utf8();
     let word_len = line[word_start..]
         .find(char::is_whitespace)
@@ -120,35 +120,29 @@ pub(crate) fn classify_command(
     })
 }
 
-fn known_match(line: &str, prefix: CommandPrefix, extra_known: &[&str]) -> Option<Range<usize>> {
-    line.match_indices(|c: char| prefix.accepts(c))
-        .filter(|&(i, _)| {
-            line[..i]
-                .chars()
-                .next_back()
-                .is_none_or(char::is_whitespace)
-        })
-        .flat_map(|(i, sigil)| {
-            let name_start = i + sigil.len();
-            let rest = &line[name_start..];
-            let whole_word = move |name: &str| {
-                rest.strip_prefix(name)
-                    .is_some_and(|after| after.chars().next().is_none_or(char::is_whitespace))
-            };
-            let builtin = REPL_COMMANDS
-                .iter()
-                .filter(move |cmd| whole_word(&cmd.name[1..]))
-                .map(move |cmd| i..name_start + cmd.name.len() - 1);
-            let extra = extra_known
-                .iter()
-                .filter(move |name| whole_word(name))
-                .map(move |name| i..name_start + name.len());
-            builtin.chain(extra)
-        })
-        .fold(None, |acc: Option<Range<usize>>, item| match acc {
-            Some(acc) if acc.len() >= item.len() => Some(acc),
-            _ => Some(item),
-        })
+/// The longest known name following the sigil at `start`, as a range of
+/// `line` that includes the sigil.
+fn known_match(
+    line: &str,
+    start: usize,
+    sigil: char,
+    extra_known: &[&str],
+) -> Option<Range<usize>> {
+    let name_start = start + sigil.len_utf8();
+    let rest = &line[name_start..];
+    let whole_word = |name: &str| {
+        rest.strip_prefix(name)
+            .is_some_and(|after| after.chars().next().is_none_or(char::is_whitespace))
+    };
+    let builtin = REPL_COMMANDS
+        .iter()
+        .map(|cmd| &cmd.name[1..])
+        .filter(|name| whole_word(name));
+    let extra = extra_known.iter().copied().filter(|name| whole_word(name));
+    builtin
+        .chain(extra)
+        .map(|name| start..name_start + name.len())
+        .max_by_key(|range| range.len())
 }
 
 #[cfg(test)]
@@ -175,6 +169,10 @@ mod tests {
 
     #[test]
     fn prefers_the_longest_command_name() {
+        assert_eq!(matched(".help", CommandPrefix::Dot), Some(".help"));
+        assert_eq!(matched("/help", CommandPrefix::Slash), Some("/help"));
+        assert_eq!(matched(".help", CommandPrefix::Both), Some(".help"));
+        assert_eq!(matched("/help", CommandPrefix::Both), Some("/help"));
         assert_eq!(
             matched("/exit rag", CommandPrefix::Slash),
             Some("/exit rag")
@@ -188,6 +186,7 @@ mod tests {
     #[test]
     fn requires_the_command_to_start_at_a_token_boundary() {
         assert_eq!(matched("see /tmp/exit", CommandPrefix::Slash), None);
+        assert_eq!(matched("see /exit", CommandPrefix::Slash), None);
         assert_eq!(matched("/exit", CommandPrefix::Slash), Some("/exit"));
         assert_eq!(
             matched("  /exit rag", CommandPrefix::Slash),
@@ -195,10 +194,7 @@ mod tests {
         );
         assert_eq!(
             classify_command("x/exit /exit", CommandPrefix::Slash, &[]),
-            Some(CommandSpan {
-                range: 7..12,
-                known: true
-            })
+            None
         );
     }
 

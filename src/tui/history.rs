@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::utils::fs::write_private_atomic;
+use crate::utils::fs::{create_private_dir_all, write_private_atomic};
 
 const CAPACITY: usize = 1000;
 const NEWLINE_ESCAPE: &str = "<\\n>";
@@ -59,7 +59,7 @@ pub(crate) fn append(path: &Path, line: &str) -> io::Result<()> {
     let mut entries = read_entries(path)?;
     push_entry(&mut entries, line);
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        create_private_dir_all(dir)?;
     }
     let mut text = String::new();
     for entry in &entries {

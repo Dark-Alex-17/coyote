@@ -354,6 +354,8 @@ mod tests {
         assert!(painted(&buf, 5, KNOWN_COLOR), "{:?}", first_row(&buf));
         let buf = render("/info x", CommandPrefix::Slash, &[], false);
         assert!(painted(&buf, 5, KNOWN_COLOR), "{:?}", first_row(&buf));
+        let buf = render(".help", CommandPrefix::Both, &[], false);
+        assert!(painted(&buf, 5, KNOWN_COLOR), "{:?}", first_row(&buf));
     }
 
     #[test]

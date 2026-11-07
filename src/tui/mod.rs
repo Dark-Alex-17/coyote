@@ -222,9 +222,9 @@ const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
 const SELECT_HINT: &str = "Up/Down = move  Enter = choose  Esc = cancel";
 const CHECKBOX_HINT: &str = "Space = tick  Up/Down = move  Enter = answer  Esc = cancel";
-/// The last row of a select: the REPL's prompter appends the same entry,
-/// and choosing it opens a free-text field in the list's place.
-const CUSTOM_CHOICE_ROW: &str = "Other (custom)";
+/// The last row of a select, the entry the REPL's prompter appends too;
+/// choosing it opens a free-text field in the list's place.
+const CUSTOM_CHOICE_ROW: &str = crate::prompt::CUSTOM_MULTI_CHOICE_ANSWER_OPTION;
 /// The confirm legend while part of the question is off screen: nothing
 /// clipped may be approved, so the approving keys are not offered. Esc
 /// leads so a narrow wrap never splits it from its meaning.
@@ -8519,7 +8519,7 @@ mod tests {
                 "src/config/install_remote.rs",
                 "return Ok(ObsoleteAction::Keep);",
             ),
-            ("src/config/install_remote.rs", "conflict::rerun_hint()"),
+            ("src/config/install_remote.rs", "bail!(\"{refusal}\");"),
             (
                 "src/config/install_remote.rs",
                 "Ok((Vec::new(), missing.to_vec()))",

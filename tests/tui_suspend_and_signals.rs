@@ -456,8 +456,8 @@ fn assert_repainted_after(
 /// and the text) and never ends the turn or the process. Once the tool
 /// is released the driver hands the queued line to the model at the
 /// tool-round boundary, so the fake serves exactly two requests, the
-/// strip is gone and the composer is empty. The fake does not record
-/// request bodies, so the count plus the vanished strip is the pin.
+/// second carrying the draft, the strip is gone and the composer is
+/// empty.
 #[test]
 #[serial]
 fn enter_on_a_draft_while_a_tool_sleeps_queues_it_and_the_model_gets_it_next_round() {

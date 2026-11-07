@@ -52,10 +52,11 @@ fn step_highlight(highlight: usize, delta: i32, len: usize) -> usize {
     usize::try_from(moved.max(0)).unwrap_or(last).min(last)
 }
 
-/// A multi-line entry shows its first line and how much follows.
-fn first_line(text: &str) -> (&str, String) {
+/// A multi-line entry shows its first line, scrubbed of escape
+/// sequences, and how much follows.
+fn first_line(text: &str) -> (String, String) {
     let mut lines = text.lines();
-    let first = lines.next().unwrap_or_default();
+    let first = super::render::plain_text(lines.next().unwrap_or_default());
     let rest = lines.count();
     let tail = match rest {
         0 => String::new(),
@@ -481,10 +482,10 @@ impl Widget for SearchView<'_> {
             buf.set_style(rows_area.intersection(*buf.area()), DIM);
             return;
         }
-        let titles: Vec<(&str, String)> = self.0.matches.iter().map(|m| first_line(m)).collect();
+        let titles: Vec<(String, String)> = self.0.matches.iter().map(|m| first_line(m)).collect();
         let rows: Vec<(&str, &str)> = titles
             .iter()
-            .map(|(first, tail)| (*first, tail.as_str()))
+            .map(|(first, tail)| (first.as_str(), tail.as_str()))
             .collect();
         render_rows(&rows, Some(self.0.highlight), rows_area, buf);
     }
@@ -497,7 +498,7 @@ pub(super) struct RewindView<'a>(pub(super) &'a RewindState);
 impl Widget for RewindView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let rows_area = render_header(Line::from(Span::styled(REWIND_HEADER, DIM)), area, buf);
-        let titles: Vec<(&str, String)> = self
+        let titles: Vec<(String, String)> = self
             .0
             .rows
             .iter()
@@ -505,7 +506,7 @@ impl Widget for RewindView<'_> {
             .collect();
         let rows: Vec<(&str, &str)> = titles
             .iter()
-            .map(|(first, tail)| (*first, tail.as_str()))
+            .map(|(first, tail)| (first.as_str(), tail.as_str()))
             .collect();
         render_rows(&rows, Some(self.0.highlight), rows_area, buf);
     }

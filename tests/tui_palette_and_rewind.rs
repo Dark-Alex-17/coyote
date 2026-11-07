@@ -859,6 +859,12 @@ fn palette_set_equals_the_repl_completer_set_under_both() {
 
 #[test]
 #[serial]
+fn palette_set_equals_the_repl_completer_set_under_both_with_a_dot() {
+    assert_palette_matches_completer("command_prefix: both\n", '.', "palette-both-dot");
+}
+
+#[test]
+#[serial]
 fn palette_set_equals_the_repl_completer_set_under_dot() {
     assert_palette_matches_completer("", '.', "palette-dot");
 }

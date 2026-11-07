@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
+pub(crate) const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 const YES_FOR_SESSION: &str = "Yes for this session";
 
 /// Whether a human can answer a prompt in this run. A headless run and the

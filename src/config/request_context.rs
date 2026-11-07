@@ -4128,6 +4128,7 @@ impl RequestContext {
         if self.macro_flag {
             bail!("No role");
         }
+        crate::tui::ensure_terminal_lendable()?;
         let ans = self
             .prompt(self.prompt_request(
                 PromptAction::Confirm,
@@ -11998,11 +11999,18 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
-        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]));
+        let prompter = Arc::new(ScriptedPrompter::new(Vec::new()));
+        ctx.prompter = prompter.clone();
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
 
         assert_no_lender_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
+        assert_no_lender_under_the_tui(ctx.new_role(&app, "tui-refused-role").unwrap_err());
         assert_no_lender_under_the_tui(ctx.new_macro(&app, "tui-refused-macro").unwrap_err());
+        assert!(
+            prompter.requests().is_empty(),
+            "the refused lend still asked: {:?}",
+            prompter.requests()
+        );
 
         for dir in [paths::roles_dir(), paths::macros_dir()] {
             let written: Vec<PathBuf> = read_dir(&dir)
