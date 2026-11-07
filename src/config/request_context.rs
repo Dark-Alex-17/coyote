@@ -57,8 +57,8 @@ use crate::turn::{StdoutSink, UiSink};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    ensure_prompts_available, estimate_token_length, fuzzy_filter, get_env_name,
-    list_file_names, now, render_prompt, temp_file,
+    ensure_prompts_available, estimate_token_length, fuzzy_filter, get_env_name, list_file_names,
+    now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;

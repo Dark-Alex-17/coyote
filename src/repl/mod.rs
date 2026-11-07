@@ -5,6 +5,7 @@ mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
+pub(crate) use self::highlighter::{CommandSpan, classify_command};
 use self::prompt::ReplPrompt;
 
 use crate::client::{

@@ -6,6 +6,7 @@
 //! just another frame.
 
 mod cells;
+mod composer;
 mod events;
 mod keys;
 mod redirect;
@@ -24,6 +25,7 @@ use anyhow::{Result, anyhow, bail};
 use cells::{
     AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
 };
+use composer::{Composer, field_background};
 use crossterm::event::{EventStream, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
@@ -43,9 +45,9 @@ use sink::{AgentOutcome, LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use terminal::Screen;
 use todo::TodoPanel;
@@ -72,7 +74,9 @@ static LENDER: Mutex<Option<UnboundedSender<UiMsg>>> = Mutex::new(None);
 static TTY_OUT: OnceLock<Option<std::os::fd::OwnedFd>> = OnceLock::new();
 
 fn set_lender(tx: Option<UnboundedSender<UiMsg>>) {
-    *LENDER.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = tx;
+    *LENDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = tx;
 }
 
 fn lender() -> Option<UnboundedSender<UiMsg>> {
@@ -174,8 +178,6 @@ const TOOL_OUTPUT_TAIL: usize = 20;
 /// Most text one cell of late command output holds; a leftover child that
 /// keeps writing sees its oldest lines dropped rather than the transcript grow.
 const LATE_OUTPUT_LIMIT: usize = 64 * 1024;
-const COMPOSER_MIN_ROWS: u16 = 3;
-const COMPOSER_MAX_ROWS: u16 = 8;
 /// Transcript rows a modal's question may not take from the frame, so the
 /// narration being approved stays in view above it. A question that still
 /// does not fit is clipped with a marker and cannot be approved until the
@@ -191,7 +193,6 @@ const CUSTOM_CHOICE_ROW: &str = "Other (custom)";
 /// clipped may be approved, so the approving keys are not offered. Esc
 /// leads so a narrow wrap never splits it from its meaning.
 const CLIPPED_HINT: &str = "Esc = cancel  enlarge the terminal to answer";
-const COMPOSER_PLACEHOLDER: &str = "Type a prompt or a .command; Enter sends";
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
 /// How long `flush_typeahead` waits for one more queued event, and how
@@ -810,20 +811,11 @@ fn new_field(masked: bool) -> TextArea<'static> {
     field
 }
 
-/// An empty composer with its placeholder; the modal's input field is a
-/// bare `new_textarea`.
-fn new_composer() -> TextArea<'static> {
-    let mut composer = new_textarea();
-    composer.set_placeholder_text(COMPOSER_PLACEHOLDER);
-    composer.set_placeholder_style(DIM);
-    composer
-}
-
 /// Everything drawn, and the rules for changing it.
 pub(crate) struct App {
     transcript: Transcript,
     todo: TodoPanel,
-    composer: TextArea<'static>,
+    composer: Composer,
     prompts: VecDeque<PendingPrompt>,
     /// Work waiting for the terminal to be released to it; the loop runs
     /// each after the step that queued it.
@@ -847,6 +839,12 @@ pub(crate) struct App {
     clock: Arc<dyn Clock>,
     frames: FrameScheduler,
     renderer: Renderer,
+    /// Read once at start: `NO_COLOR` drops the UI's own colours while the
+    /// attributes stay.
+    no_color: bool,
+    /// The macros the typed-command highlight accepts as known, refreshed
+    /// with the context since a turn can enable or shadow one.
+    macro_names: Vec<String>,
     config: Arc<AppConfig>,
     prompt_memory: Arc<PromptMemory>,
 }
@@ -858,11 +856,13 @@ impl App {
         prompt_memory: Arc<PromptMemory>,
         footer: FooterInfo,
     ) -> Result<Self> {
-        let renderer = Renderer::new(config.render_options()?)?;
+        let options = config.render_options()?;
+        let background = field_background(&config, &options);
+        let renderer = Renderer::new(options)?;
         Ok(Self {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
-            composer: new_composer(),
+            composer: Composer::new(background),
             prompts: VecDeque::new(),
             lend_requests: Vec::new(),
             turn: None,
@@ -876,6 +876,8 @@ impl App {
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
+            no_color: *crate::utils::NO_COLOR,
+            macro_names: Vec::new(),
             config,
             prompt_memory,
         })
@@ -885,18 +887,17 @@ impl App {
         self.frames.schedule_frame();
     }
 
+    #[cfg(test)]
+    fn set_no_color(&mut self, no_color: bool) {
+        self.no_color = no_color;
+    }
+
     pub(crate) fn composer_text(&self) -> String {
-        self.composer.lines().join("\n")
+        self.composer.text()
     }
 
     pub(crate) fn set_composer_text(&mut self, text: &str) {
-        let mut composer = TextArea::new(text.split('\n').map(str::to_string).collect());
-        composer.set_cursor_line_style(Style::new());
-        composer.set_placeholder_text(COMPOSER_PLACEHOLDER);
-        composer.set_placeholder_style(DIM);
-        composer.move_cursor(ratatui_textarea::CursorMove::Bottom);
-        composer.move_cursor(ratatui_textarea::CursorMove::End);
-        self.composer = composer;
+        self.composer.set_text(text);
         self.schedule_frame();
     }
 
@@ -904,9 +905,21 @@ impl App {
     /// called whenever the context is back in the UI's hands.
     pub(crate) fn sync_from_ctx(&mut self, ctx: &mut RequestContext) {
         self.footer = FooterInfo::from_ctx(ctx);
+        self.macro_names = ctx
+            .visible_macro_completions()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         if !Arc::ptr_eq(&self.config, &ctx.app.config) {
-            match ctx.app.config.render_options().and_then(Renderer::new) {
-                Ok(renderer) => self.renderer = renderer,
+            let config = &ctx.app.config;
+            match config.render_options().and_then(|options| {
+                let background = field_background(config, &options);
+                Renderer::new(options).map(|renderer| (renderer, background))
+            }) {
+                Ok((renderer, background)) => {
+                    self.renderer = renderer;
+                    self.composer.set_background(background);
+                }
                 Err(err) => warn!("Keeping the previous render options: {err}"),
             }
             self.config = Arc::clone(&ctx.app.config);
@@ -1086,7 +1099,7 @@ impl App {
                         }
                     }
                     None => {
-                        self.composer.insert_str(text);
+                        self.composer.insert_str(&text);
                     }
                 }
                 self.schedule_frame();
@@ -1131,7 +1144,7 @@ impl App {
                 if text.trim().is_empty() {
                     None
                 } else {
-                    self.composer = new_composer();
+                    self.composer.clear();
                     self.transcript.clear_focus();
                     Some(Command::Submit(text.trim().to_string()))
                 }
@@ -1801,9 +1814,7 @@ impl App {
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
         match self.prompts.front() {
             Some(prompt) => prompt.rows(area.width, area.height),
-            None => u16::try_from(self.composer.lines().len())
-                .unwrap_or(COMPOSER_MAX_ROWS)
-                .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS),
+            None => self.composer.rows(),
         }
     }
 
@@ -1846,7 +1857,12 @@ impl App {
                 Some(question)
             }
             None => {
-                frame.render_widget(&self.composer, bottom);
+                let macro_names: Vec<&str> = self.macro_names.iter().map(String::as_str).collect();
+                frame.render_widget(
+                    self.composer
+                        .view(self.config.command_prefix, &macro_names, self.no_color),
+                    bottom,
+                );
                 None
             }
         };
@@ -2520,11 +2536,12 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::Suspend) => {
                         #[cfg(unix)]
                         {
-                            let released = with_terminal_released(screen, stream, termination, || {
-                                // SAFETY: raise takes a signal number and no pointers.
-                                unsafe { libc::raise(libc::SIGTSTP) };
-                            })
-                            .await;
+                            let released =
+                                with_terminal_released(screen, stream, termination, || {
+                                    // SAFETY: raise takes a signal number and no pointers.
+                                    unsafe { libc::raise(libc::SIGTSTP) };
+                                })
+                                .await;
                             if let Err(err) = released {
                                 warn!("Failed to re-enter the alternate screen: {err}");
                             }
@@ -2535,10 +2552,11 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         let text = app.composer_text();
                         match app.config.editor() {
                             Ok(editor) => {
-                                let edited = with_terminal_released(screen, stream, termination, || {
-                                    edit_in_editor(&editor, &text)
-                                })
-                                .await;
+                                let edited =
+                                    with_terminal_released(screen, stream, termination, || {
+                                        edit_in_editor(&editor, &text)
+                                    })
+                                    .await;
                                 match edited {
                                     Ok(Ok(edited)) => app.set_composer_text(&edited),
                                     Ok(Err(err)) => app.handle_msg(UiMsg::Notice {
@@ -3470,7 +3488,10 @@ mod tests {
     #[test]
     fn a_select_modal_moves_its_marker_and_sends_the_row() {
         let mut harness = Harness::standalone(80, 24);
-        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, Some("ask")));
+        let asker = ask_on_a_thread(
+            &mut harness,
+            list_request(PromptAction::Select, Some("ask")),
+        );
         assert_eq!(harness.press(KeyCode::Down), None);
         let frame = harness.draw();
         assert_welcome_snapshot("select_modal_80x24", &frame);
@@ -3637,9 +3658,21 @@ mod tests {
             }
         }
         let cases = [
-            (asked_by(Some("call-1"), None), tool_finished("call-1"), true),
-            (asked_by(Some("call-1"), None), tool_finished("call-2"), false),
-            (asked_by(Some("call-1"), None), job_finished("call-1"), false),
+            (
+                asked_by(Some("call-1"), None),
+                tool_finished("call-1"),
+                true,
+            ),
+            (
+                asked_by(Some("call-1"), None),
+                tool_finished("call-2"),
+                false,
+            ),
+            (
+                asked_by(Some("call-1"), None),
+                job_finished("call-1"),
+                false,
+            ),
             (asked_by(None, Some("job-1")), job_finished("job-1"), true),
             (asked_by(None, Some("job-1")), job_cancelled("job-1"), true),
             (asked_by(None, Some("job-1")), job_finished("job-2"), false),
@@ -5869,7 +5902,10 @@ mod tests {
             PromptRequest::new(PromptAction::Input, "Name?", Origin::detached()),
             reply.clone(),
         );
-        let select = PendingPrompt::new(list_request(PromptAction::Select, Some("ask")), reply.clone());
+        let select = PendingPrompt::new(
+            list_request(PromptAction::Select, Some("ask")),
+            reply.clone(),
+        );
         let checkbox = PendingPrompt::new(list_request(PromptAction::Checkbox, None), reply);
         let mut widgets: Vec<(&str, Draw<'_>)> = vec![
             (
@@ -6028,6 +6064,72 @@ mod tests {
         assert!(!harness.app.transcript.scrolled());
         harness.type_text("d");
         assert_eq!(harness.app.composer_text(), "abcd");
+    }
+
+    /// Where the composer lands at 80x24 with a one-line draft: the rule
+    /// above its three text rows, with the footer under them.
+    const COMPOSER_RULE_ROW: u16 = 19;
+    const COMPOSER_TEXT_ROW: u16 = 20;
+
+    fn composer_cell(harness: &Harness, x: u16) -> (Color, bool) {
+        let cell = &harness.terminal.backend().buffer()[(x, COMPOSER_TEXT_ROW)];
+        (cell.fg, cell.modifier.contains(Modifier::BOLD))
+    }
+
+    #[test]
+    fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".info tools");
+        let frame = harness.draw();
+        assert_welcome_snapshot("composer_command_80x24", &frame);
+        let buffer = harness.terminal.backend().buffer();
+        assert_eq!(
+            buffer[(0, COMPOSER_RULE_ROW)].symbol(),
+            ratatui::symbols::line::HORIZONTAL
+        );
+        assert!(
+            buffer[(0, COMPOSER_RULE_ROW)]
+                .modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            (0..11).all(|x| composer_cell(&harness, x) == (Color::Green, true)),
+            "{frame}"
+        );
+        assert_eq!(composer_cell(&harness, 11), (Color::Reset, false));
+        assert_eq!(buffer[(0, COMPOSER_TEXT_ROW)].bg, Color::Indexed(236));
+        assert_eq!(buffer[(79, COMPOSER_TEXT_ROW + 2)].bg, Color::Indexed(236));
+    }
+
+    #[test]
+    fn no_color_keeps_the_command_bold_without_colour_or_surface() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(true);
+        harness.type_text(".info tools");
+        let frame = harness.draw();
+        assert_welcome_snapshot("composer_command_no_color_80x24", &frame);
+        assert!(
+            (0..11).all(|x| composer_cell(&harness, x) == (Color::Reset, true)),
+            "{frame}"
+        );
+        let buffer = harness.terminal.backend().buffer();
+        assert!((0..80).all(|x| buffer[(x, COMPOSER_TEXT_ROW)].bg == Color::Reset));
+    }
+
+    /// The textarea draws its cursor as a reversed cell; after the draft
+    /// it has to sit on the field's text rows, not on the rule.
+    #[test]
+    fn the_cursor_sits_inside_the_field_under_the_rule() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        harness.render();
+        let buffer = harness.terminal.backend().buffer();
+        let cursor = buffer
+            .area
+            .positions()
+            .find(|position| buffer[*position].modifier.contains(Modifier::REVERSED))
+            .expect("the composer draws its cursor");
+        assert_eq!((cursor.x, cursor.y), (5, COMPOSER_TEXT_ROW));
     }
 
     #[test]

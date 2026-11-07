@@ -676,7 +676,11 @@ mod tests {
                     busy_typing,
                     Action::Answer(PromptAnswer::Cancelled),
                 ),
-                (ctrl('c'), busy_typing, Action::Answer(PromptAnswer::Cancelled)),
+                (
+                    ctrl('c'),
+                    busy_typing,
+                    Action::Answer(PromptAnswer::Cancelled),
+                ),
             ];
             for (key, ctx, expected) in cases {
                 assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
@@ -728,7 +732,11 @@ mod tests {
             (plain(KeyCode::Char('2')), select_clipped, Action::Nothing),
             (plain(KeyCode::Char('2')), checkbox, Action::Nothing),
             (plain(KeyCode::Char(' ')), checkbox, Action::ModalToggle),
-            (plain(KeyCode::Char(' ')), checkbox_busy, Action::ModalToggle),
+            (
+                plain(KeyCode::Char(' ')),
+                checkbox_busy,
+                Action::ModalToggle,
+            ),
             (plain(KeyCode::Char(' ')), select, Action::Nothing),
             (plain(KeyCode::Enter), select, Action::SubmitModalChoice),
             (plain(KeyCode::Enter), checkbox, Action::SubmitModalChoice),
