@@ -6386,9 +6386,10 @@ mod tests {
             source.remove_dir();
         }
 
-        /// A message with no words and one staged file reaches the envoy as its
-        /// `attached:` line alone inside the fence, and a plain acknowledgement from the
-        /// model goes back as an answered reply: nothing is escalated to the human.
+        /// A message with no words and one staged file reaches the envoy with its
+        /// `attached:` line inside the fence and never the absolute staged path, and a
+        /// plain acknowledgement from the model goes back as an answered reply: nothing
+        /// is escalated to the human.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn an_attachment_only_message_carries_its_attached_line_and_a_plain_reply_is_answered()
@@ -6456,6 +6457,8 @@ mod tests {
                 .find(&attached)
                 .unwrap_or_else(|| panic!("no attached line in {sent}"));
             assert!(begin < line && line < end, "{sent}");
+            let absolute = serde_json::to_string(&staged).unwrap();
+            assert!(!sent.contains(absolute.trim_matches('"')), "{sent}");
             assert!(
                 sent.contains("only carries an attachment and asks nothing needs no escalation"),
                 "{sent}"
@@ -6473,8 +6476,9 @@ mod tests {
                 idle.texts()
             );
             assert!(!idle.has("envoy escalated"), "{:?}", idle.texts());
-            // The inbox keeps the words only; what the peer hears on the wire is the
-            // reply built from the classified outcome.
+            // The checks above show the runner answered rather than escalated; the inbox
+            // keeps the words only, so the disposition the peer hears on the wire is
+            // pinned on the reply built from the classified outcome.
             let outcome = classify_answer(acknowledgement);
             assert!(
                 matches!(&outcome, EnvoyOutcome::Answered(text) if text == acknowledgement),
