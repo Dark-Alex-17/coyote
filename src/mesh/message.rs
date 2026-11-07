@@ -45,6 +45,7 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -85,6 +86,15 @@ const PATH_RESPONSE_FILING_POLL: Duration = Duration::from_millis(25);
 /// Recipients a broadcast sends to at once. Each open link costs the transport a handler
 /// lock round; a trust list of dozens must not open dozens of links in one burst.
 pub(crate) const BROADCAST_MAX_CONCURRENCY: usize = 4;
+/// The whole fan-out of a farewell: a node leaving the mesh waits on it no longer.
+pub(crate) const FAREWELL_BUDGET: Duration = Duration::from_secs(2);
+/// Farewell recipients sent to at once. Higher than a broadcast's, since every recipient
+/// shares the one short budget.
+const FAREWELL_MAX_CONCURRENCY: usize = 16;
+/// The words a farewell carries beside its `fields.presence`.
+pub(crate) const FAREWELL_CONTENT: &str = "leaving the mesh";
+/// The `fields.presence` of a farewell bulletin.
+pub(crate) const PRESENCE_LEAVING: &str = "leaving";
 /// The one-line rendering a message earns on the terminal.
 pub(crate) const PEER_LINE_MAX_CHARS: usize = 160;
 /// Appended to an idle line whose peer text was cut, outside the line's budget, so the
@@ -1617,11 +1627,13 @@ pub(crate) struct SendOutcome {
     pub via: PeerVia,
 }
 
-/// Timeouts for one send: the direct attempt, then the fallback post.
+/// Timeouts for one send: the direct attempt, then the fallback post, which
+/// `store_and_forward: false` rules out: a peer the link cannot reach is then told nothing.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PeerSendOptions {
     pub request: RequestOptions,
     pub propagation: PropagationOptions,
+    pub store_and_forward: bool,
 }
 
 impl Default for PeerSendOptions {
@@ -1633,8 +1645,39 @@ impl Default for PeerSendOptions {
                 path_requested: false,
             },
             propagation: PropagationOptions::default(),
+            store_and_forward: true,
         }
     }
+}
+
+/// What a farewell's fan-out came to: how many trusted peers it was sent to and how many
+/// acknowledged it within `FAREWELL_BUDGET`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FarewellOutcome {
+    pub audience: usize,
+    pub delivered: usize,
+}
+
+/// Whether a message of `kind` carrying `fields` is a farewell: a bulletin whose
+/// `fields.presence` is `leaving`. It is presence, not a message: it marks the sending
+/// instance as gone and is never filed.
+pub(crate) fn is_farewell(kind: PeerKind, fields: Option<&serde_json::Value>) -> bool {
+    kind == PeerKind::Bulletin
+        && fields
+            .and_then(|fields| fields.get("presence"))
+            .and_then(serde_json::Value::as_str)
+            == Some(PRESENCE_LEAVING)
+}
+
+/// The farewell bulletin: fixed words, `fields.presence: leaving`, a fresh id.
+fn farewell_message() -> Result<OutboundPeer, SendError> {
+    OutboundPeer::new(
+        PeerKind::Bulletin,
+        FAREWELL_CONTENT,
+        None,
+        None,
+        Some(serde_json::json!({ "presence": PRESENCE_LEAVING })),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2012,6 +2055,13 @@ impl MeshRuntime {
                 return Err(SendError::Direct(err));
             }
         };
+        if !options.store_and_forward {
+            debug!(
+                "Mesh {kind} {id} to {dest8} could not be delivered over a link ({}); it goes over a link or not at all, so it is not stored",
+                redact_hashes(&unreachable.to_string())
+            );
+            return Err(SendError::Direct(unreachable));
+        }
         // Selected before queueing behind another post: a sender with no node to fall
         // back on is told so at once rather than after someone else's transfer.
         let node =
@@ -2066,7 +2116,31 @@ impl MeshRuntime {
         message: &OutboundPeer,
         options: PeerSendOptions,
     ) -> Result<BroadcastOutcome, SendError> {
-        let transport = self.transport_handle().await.ok_or(SendError::NotRunning)?;
+        let recipients = self
+            .bulletin_audience()
+            .await
+            .ok_or(SendError::NotRunning)?;
+        let mut recipients: Vec<RecipientReport> = stream::iter(recipients)
+            .map(|peer| self.report_send(peer, message, options))
+            .buffer_unordered(BROADCAST_MAX_CONCURRENCY)
+            .collect()
+            .await;
+        recipients.sort_by(|a, b| a.destination.cmp(&b.destination));
+        let outcome = BroadcastOutcome {
+            id: message.id.clone(),
+            recipients,
+        };
+        self.hooks().fire(MeshEvent::BulletinSent {
+            id: outcome.id.clone(),
+            tally: outcome.tally(),
+        });
+        Ok(outcome)
+    }
+
+    /// Every trusted instance this node holds a path to: who a bulletin goes to. `None`
+    /// once the node has stopped.
+    async fn bulletin_audience(&self) -> Option<Vec<PeerRecord>> {
+        let transport = self.transport_handle().await?;
         let trust = self.trust();
         let mut recipients = Vec::new();
         for peer in self.peers().snapshot() {
@@ -2084,22 +2158,76 @@ impl MeshRuntime {
                 recipients.push(peer);
             }
         }
-        drop(transport);
-        let mut recipients: Vec<RecipientReport> = stream::iter(recipients)
-            .map(|peer| self.report_send(peer, message, options))
-            .buffer_unordered(BROADCAST_MAX_CONCURRENCY)
-            .collect()
-            .await;
-        recipients.sort_by(|a, b| a.destination.cmp(&b.destination));
-        let outcome = BroadcastOutcome {
-            id: message.id.clone(),
-            recipients,
+        Some(recipients)
+    }
+
+    /// Tells every trusted instance this node holds a path to that it is leaving the mesh:
+    /// one farewell bulletin each, over a link only, the whole fan-out cut off at
+    /// `FAREWELL_BUDGET` so a leave never waits longer on it. A peer the link does not reach
+    /// is told nothing, since a held farewell would arrive after this node's next announce,
+    /// and so is one that has said it left itself. No hook fires: the farewell is presence,
+    /// not a bulletin the owner sent.
+    pub(crate) async fn send_farewell(&self) -> FarewellOutcome {
+        let Some(audience) = self.bulletin_audience().await else {
+            return FarewellOutcome::default();
         };
-        self.hooks().fire(MeshEvent::BulletinSent {
-            id: outcome.id.clone(),
-            tally: outcome.tally(),
-        });
-        Ok(outcome)
+        let audience: Vec<PeerRecord> = audience
+            .into_iter()
+            .filter(|peer| peer.left_at.is_none())
+            .collect();
+        if audience.is_empty() {
+            return FarewellOutcome::default();
+        }
+        let message = match farewell_message() {
+            Ok(message) => message,
+            Err(err) => {
+                warn!(
+                    "Mesh farewell could not be built, so no peer is told this node is leaving: {}",
+                    redact_hashes(&err.to_string())
+                );
+                return FarewellOutcome::default();
+            }
+        };
+        let options = PeerSendOptions {
+            request: RequestOptions {
+                request_timeout: FAREWELL_BUDGET,
+                link_timeout: FAREWELL_BUDGET,
+                path_requested: false,
+            },
+            propagation: PropagationOptions::default(),
+            store_and_forward: false,
+        };
+        let delivered = AtomicUsize::new(0);
+        let fan_out =
+            stream::iter(&audience).for_each_concurrent(FAREWELL_MAX_CONCURRENCY, |peer| {
+                let (delivered, message) = (&delivered, &message);
+                async move {
+                    if self
+                        .send_peer_inner(&peer.destination_hash, message, options)
+                        .await
+                        .is_ok()
+                    {
+                        delivered.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        let finished = tokio::time::timeout(FAREWELL_BUDGET, fan_out).await.is_ok();
+        let outcome = FarewellOutcome {
+            audience: audience.len(),
+            delivered: delivered.load(Ordering::Relaxed),
+        };
+        debug!(
+            "Mesh farewell {} acknowledged by {} of {} trusted peer(s){}",
+            message.id,
+            outcome.delivered,
+            outcome.audience,
+            if finished {
+                ""
+            } else {
+                "; the rest were cut off by its budget"
+            }
+        );
+        outcome
     }
 
     async fn report_send(
@@ -2346,6 +2474,7 @@ mod left_mesh_hint_tests {
             hops: 1,
             first_seen: now - ago,
             last_seen: now - ago,
+            left_at: None,
         }
     }
 
@@ -2448,6 +2577,18 @@ pub(crate) struct PeerAdmission<'a> {
     pub via: PeerVia,
 }
 
+/// A farewell admitted on a link: the instance at `source_destination` said it is leaving
+/// the mesh. `received_at` is this node's clock when the request arrived, taken before
+/// anything else ran, so an announce the instance sent afterwards is never mistaken for
+/// one it sent before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Farewell {
+    pub source_identity: String,
+    pub source_destination: String,
+    pub message_id: String,
+    pub received_at: SystemTime,
+}
+
 /// Where inbound peer messages land. Held weakly by the handler and the runtime: the
 /// slot owns the runtime that owns both. `deliver_peer` may write the pending store, so
 /// the request path runs it on a blocking thread; the fetch task calls it in place.
@@ -2462,6 +2603,9 @@ pub(crate) trait PeerSurface: Send + Sync {
     /// The inbox path only, for a message admission refused: the human still sees it,
     /// the envoy never does.
     fn file_peer(&self, message: PeerMessage);
+    /// A farewell: the sender is marked as having left, and nothing is filed, counted or
+    /// handed to the envoy.
+    fn note_farewell(&self, farewell: Farewell);
     /// Lower-hex of the destination this node receives on right now; `None` while off.
     fn local_destination(&self) -> Option<String>;
     fn part_limits(&self) -> PartLimits {
@@ -2479,7 +2623,8 @@ pub(crate) trait PeerSurface: Send + Sync {
 /// it never earns an acknowledgement and nothing is filed. A surface that is gone means
 /// the node is stopping, and a message nobody will read is left unacknowledged so the
 /// sender falls back to storing it; so is one whose delivery thread failed, since nothing
-/// says it landed.
+/// says it landed. A farewell is acknowledged and noted before admission: it is presence,
+/// so it is neither counted against the sender nor filed.
 pub(crate) struct PeerMessageHandler {
     surface: Weak<dyn PeerSurface>,
 }
@@ -2493,6 +2638,7 @@ impl PeerMessageHandler {
 #[async_trait]
 impl Handler for PeerMessageHandler {
     async fn handle(&self, request: AdmittedRequest) -> Reply {
+        let received_at = SystemTime::now();
         let identity_hex = request.identity.address_hash.to_hex_string();
         let destination_hex = request.destination_hash.to_hex_string();
         let (id8, dest8) = (short(&identity_hex), short(&destination_hex));
@@ -2514,6 +2660,20 @@ impl Handler for PeerMessageHandler {
             );
             return Reply::Silent;
         };
+        if is_farewell(body.kind, body.fields.as_ref()) {
+            debug!(
+                "Mesh farewell {} from {id8} (instance {dest8}) received on link {link}",
+                body.id
+            );
+            let reply = Reply::Value(received_reply(&body.id));
+            surface.note_farewell(Farewell {
+                source_identity: identity_hex,
+                source_destination: destination_hex,
+                message_id: body.id,
+                received_at,
+            });
+            return reply;
+        }
         let admission = PeerAdmission {
             source_identity: &identity_hex,
             source_destination: &destination_hex,
@@ -2674,6 +2834,13 @@ impl InboundSink for PeerRouting<'_> {
         }
         if verdict.decision != Decision::Allow {
             debug!("Propagated {kind} from {id8} dropped: instance {dest8} is not trusted");
+            return;
+        }
+        if is_farewell(kind, raw.fields.as_ref()) {
+            debug!(
+                "Propagated farewell {} from {id8} (instance {dest8}) dropped: a farewell counts only over a link, since a held one can be older than the instance's latest announce",
+                raw.message_id
+            );
             return;
         }
         let Some(surface) = &self.surface else {
@@ -2847,6 +3014,7 @@ mod no_answer_tests {
                 path_requested: false,
             },
             propagation: PropagationOptions::default(),
+            store_and_forward: true,
         }
     }
 
@@ -4533,6 +4701,7 @@ mod tests {
     struct RecordingSurface {
         delivered: Mutex<Vec<PeerMessage>>,
         filed: Mutex<Vec<PeerMessage>>,
+        farewells: Mutex<Vec<Farewell>>,
         offered: Mutex<Vec<(String, String, String, PeerVia)>>,
         admit_up_to: usize,
         staging_root: Option<PathBuf>,
@@ -4549,6 +4718,7 @@ mod tests {
             Self {
                 delivered: Mutex::new(Vec::new()),
                 filed: Mutex::new(Vec::new()),
+                farewells: Mutex::new(Vec::new()),
                 offered: Mutex::new(Vec::new()),
                 admit_up_to,
                 staging_root: None,
@@ -4589,6 +4759,10 @@ mod tests {
 
         fn file_peer(&self, message: PeerMessage) {
             self.filed.lock().push(message);
+        }
+
+        fn note_farewell(&self, farewell: Farewell) {
+            self.farewells.lock().push(farewell);
         }
 
         fn local_destination(&self) -> Option<String> {
@@ -4733,6 +4907,82 @@ mod tests {
             1,
             "a peer message never falls through to the inner sink"
         );
+    }
+
+    /// A farewell from a trusted instance that arrives store-and-forward is dropped: it is
+    /// neither filed, nor offered for admission, nor noted as a departure, since a held
+    /// farewell may be older than the instance's latest announce. A plain bulletin on the
+    /// same route still lands.
+    #[test]
+    fn a_stored_farewell_is_dropped_and_a_plain_stored_bulletin_still_lands() {
+        let identity = hash_of("id-stored-farewell");
+        let origin = OriginName([5u8; NAME_HASH_LEN]);
+        let destination = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&identity).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .destination(&destination, &identity)
+            .open("peer-routing-farewell");
+        let surface = Arc::new(RecordingSurface::default());
+        let inner = CountingSink::default();
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let farewell = farewell_message().unwrap();
+        assert!(is_farewell(farewell.kind, farewell.fields.as_ref()));
+        let stored = peer_lxmf_message(&farewell, &origin);
+
+        routing.deliver(inbound(
+            stored.fields.clone(),
+            None,
+            Some(stored.content.clone()),
+            &identity,
+        ));
+
+        assert!(surface.delivered.lock().is_empty());
+        assert!(surface.filed.lock().is_empty());
+        assert!(surface.farewells.lock().is_empty());
+        assert_eq!(surface.offered(), 0, "a dropped farewell is not counted");
+        assert!(inner.messages.lock().is_empty());
+
+        let bulletin = peer_lxmf_message(&outbound(PeerKind::Bulletin, "news"), &origin);
+        routing.deliver(inbound(
+            bulletin.fields.clone(),
+            None,
+            Some(bulletin.content.clone()),
+            &identity,
+        ));
+        assert_eq!(surface.delivered.lock().len(), 1);
+    }
+
+    /// Only a bulletin whose `fields.presence` is `leaving` is a farewell; the farewell
+    /// this node sends is one, with its fixed words.
+    #[test]
+    fn a_farewell_is_a_bulletin_whose_presence_is_leaving() {
+        let leaving = serde_json::json!({ "presence": "leaving" });
+        assert!(is_farewell(PeerKind::Bulletin, Some(&leaving)));
+        for kind in [PeerKind::Message, PeerKind::Ask, PeerKind::Reply] {
+            assert!(!is_farewell(kind, Some(&leaving)), "{kind:?}");
+        }
+        assert!(!is_farewell(PeerKind::Bulletin, None));
+        assert!(!is_farewell(
+            PeerKind::Bulletin,
+            Some(&serde_json::json!({ "presence": "arriving" }))
+        ));
+        assert!(!is_farewell(
+            PeerKind::Bulletin,
+            Some(&serde_json::json!({ "presence": ["leaving"] }))
+        ));
+
+        let farewell = farewell_message().unwrap();
+        assert_eq!(farewell.kind, PeerKind::Bulletin);
+        assert_eq!(farewell.content, "leaving the mesh");
+        assert_eq!(farewell.fields, Some(leaving));
+        assert_eq!(FAREWELL_BUDGET, Duration::from_secs(2));
     }
 
     /// A trust list holding `identity` for all destinations and binding `origin` to
@@ -5569,6 +5819,53 @@ mod tests {
         assert_eq!(delivered[0].message_id, out.id);
         assert_eq!(delivered[0].content, "no clock");
         assert_eq!(delivered[0].timestamp, 0.0);
+    }
+
+    /// A farewell on a link is acknowledged by id and noted with its sender and the time
+    /// it arrived, before admission: a surface that would refuse every sender still takes
+    /// it, and nothing is delivered, filed or counted.
+    #[tokio::test]
+    async fn a_link_farewell_is_acked_and_noted_before_admission_and_never_filed() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let surface = Arc::new(RecordingSurface::admitting(0));
+        let handler = PeerMessageHandler::new(Arc::downgrade(&surface) as Weak<dyn PeerSurface>);
+        let out = farewell_message().unwrap();
+        let request = AdmittedRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: *identity.as_identity(),
+            destination_hash: AddressHash::new_from_hex_string(&destination).unwrap(),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(MESSAGE_PATH),
+            body: to_request_body(&out, 1_700_000_000.0),
+        };
+        let before = SystemTime::now();
+
+        match handler.handle(request).await {
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &out.id), "{value}")
+            }
+            Reply::Code(code) => panic!("a farewell is refused: {code:?}"),
+            Reply::Silent => panic!("a farewell is not acknowledged"),
+        }
+        let farewells = surface.farewells.lock();
+        assert_eq!(farewells.len(), 1, "{farewells:#?}");
+        assert_eq!(
+            farewells[0].source_identity,
+            identity.address_hash().to_hex_string()
+        );
+        assert_eq!(farewells[0].source_destination, destination);
+        assert_eq!(farewells[0].message_id, out.id);
+        assert!(farewells[0].received_at >= before);
+        assert!(farewells[0].received_at <= SystemTime::now());
+        assert_eq!(
+            surface.offered(),
+            0,
+            "a farewell is not admitted or counted"
+        );
+        assert!(surface.delivered.lock().is_empty());
+        assert!(surface.filed.lock().is_empty());
     }
 
     /// A link reply that names no `in_reply_to` is refused with `InvalidData` before the

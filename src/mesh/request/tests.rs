@@ -9424,6 +9424,7 @@ pub(crate) mod network {
                 reject_window: Duration::from_millis(300),
                 ..Default::default()
             },
+            store_and_forward: true,
         }
     }
 
@@ -11000,6 +11001,7 @@ pub(crate) mod network {
                 reject_window: Duration::from_millis(300),
                 ..Default::default()
             },
+            store_and_forward: true,
         };
         let before = pair.recorder_b.seen_count();
 

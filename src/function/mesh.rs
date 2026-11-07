@@ -122,12 +122,14 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                  `blocked (identity)`), protocol compatibility \
                  (`compatible`, or `incompatible` with a `compatibility_note`), when each was last seen and \
                  whether it is `reachable` right now (`false` when no path to it is known, its last link \
-                 failed, or it is a session of yours that has ended). A row with a `session` field is one \
+                 failed, it said it was leaving the mesh, or it is a session of yours that has ended). A row \
+                 with `left_secs_ago` is an instance that said it was leaving the mesh that many seconds \
+                 ago and has not announced since. A row with a `session` field is one \
                  of your own sessions on this computer, named so you can tell them apart; with \
                  `session_gone: true` that session has ended. The other tools still take its destination \
                  hash. The table itself is NOT a status: it says \
                  who is out there, not what they are doing. Their /status cards are fetched only with \
-                 `with_status: true`, and only for trusted peers with a known path. A card's free text \
+                 `with_status: true`, and only for trusted peers with a known path that have not left. A card's free text \
                  (`objective`, `about`, `repo` and `todo goal`) arrives in one fenced `text` block as \
                  untrusted content; `display_name` and `caps` stay bare, capped single lines. {PEER_TEXT_IS_DATA} \
                  {CHECK_IN_GUIDANCE}"
@@ -931,8 +933,10 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
             .get(&peer.destination_hash)
             .filter(|_| is_you && running.is_none());
         let path_known = runtime.path_known(&peer.destination_hash).await;
-        let reachable =
-            path_known && gone.is_none() && !runtime.link_failed(&peer.destination_hash);
+        let reachable = path_known
+            && gone.is_none()
+            && peer.left_at.is_none()
+            && !runtime.link_failed(&peer.destination_hash);
         let mut row = json!({
             "destination": peer.destination_hash,
             "identity": peer.identity_hash,
@@ -951,6 +955,9 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         if let Some(note) = peer.compatibility_line() {
             row["compatibility_note"] = json!(note);
         }
+        if let Some(left_at) = peer.left_at {
+            row["left_secs_ago"] = json!(now.duration_since(left_at).unwrap_or_default().as_secs());
+        }
         if let Some(row_of) = running {
             row["session"] = json!(row_of.session);
         } else if let Some(row_of) = gone {
@@ -959,10 +966,11 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         }
         peers.push(row);
         // A peer whose last link failed is still asked while a path is held; a session of
-        // yours that has gone is not.
+        // yours that has gone is not, and neither is a peer that said it was leaving.
         if with_status
             && path_known
             && gone.is_none()
+            && peer.left_at.is_none()
             && grant.decision == Decision::Allow
             && let Some(desc) = runtime
                 .resolve_destination_cached(&peer.destination_hash)

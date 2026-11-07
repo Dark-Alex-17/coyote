@@ -1511,6 +1511,42 @@ async fn reference_requests_hear_the_specified_replies() {
         "a status request after the dropped path is answered: {card}"
     );
 
+    // The reference's farewell, a bulletin whose `fields.presence` is `leaving`, is
+    // acknowledged by id and marks its row left; nothing is filed or counted, and its
+    // next announce lifts the mark.
+    let identity = reference.ready.identity_hash.clone();
+    let messages = || {
+        node.slot
+            .limits()
+            .window_of(&identity, Instant::now())
+            .map_or(0, |window| window.messages)
+    };
+    let counted = messages();
+    let farewell = json!({
+        "v": 1,
+        "kind": "bulletin",
+        "id": "py-farewell",
+        "content": "leaving the mesh",
+        "fields": { "presence": "leaving" },
+        "ts": unix_now(),
+    });
+    let received = reference
+        .request(&node, "/message", reference.envelope(farewell))
+        .await;
+    assert_eq!(received, json!({ "received": true, "id": "py-farewell" }));
+    let peers = node.runtime.peers();
+    let reference_destination = reference.ready.destination_hash.clone();
+    let left_at = || {
+        peers
+            .get(&reference_destination)
+            .and_then(|row| row.left_at)
+    };
+    assert!(left_at().is_some(), "the farewell marks the reference left");
+    assert_eq!(node.slot.peer_inbox().len(), 0, "a farewell is not filed");
+    assert_eq!(messages(), counted, "a farewell is not counted");
+    reference.announce(Some("Reference")).await;
+    wait_until("the announce to lift the left mark", || left_at().is_none()).await;
+
     node.stop().await;
     drop(reference);
 }
@@ -1742,7 +1778,24 @@ async fn our_requests_are_decoded_by_the_reference() {
     assert_eq!(heard["envelope"]["name_hash"], json!(node.name_hash()));
     assert_eq!(heard["envelope"]["body"], Value::Null, "{heard}");
 
+    // Leaving says goodbye to the trusted reference over the link: a bulletin whose
+    // `fields.presence` is `leaving` and whose words are fixed.
+    let node_identity = node.runtime.fingerprint().to_string();
+    let stopping = Instant::now();
     node.stop().await;
+    let heard = reference.next_event("request", REQUEST_TIMEOUT).await;
+    assert_eq!(heard["path"], json!("/message"), "{heard}");
+    assert_eq!(heard["remote_identity"], json!(node_identity));
+    let body = &heard["envelope"]["body"];
+    assert_eq!(body["v"], json!(1), "{heard}");
+    assert_eq!(body["kind"], json!("bulletin"), "{heard}");
+    assert_eq!(body["content"], json!("leaving the mesh"), "{heard}");
+    assert_eq!(body["fields"], json!({ "presence": "leaving" }), "{heard}");
+    assert!(
+        stopping.elapsed() < REQUEST_TIMEOUT,
+        "the farewell never holds the leave up: {:?}",
+        stopping.elapsed()
+    );
     drop(reference);
 }
 

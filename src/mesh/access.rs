@@ -3837,6 +3837,12 @@ mod tests {
         /// inbound store, the grants and the trust list are keyed by.
         async fn restart(self, stub: &PeerStub) -> Self {
             assert!(self.slot.stop().await.unwrap());
+            let farewells = stub.take_farewells();
+            assert_eq!(
+                farewells.len(),
+                1,
+                "stopping says goodbye to the trusted stub once: {farewells:?}"
+            );
             let Self {
                 tmp, session, port, ..
             } = self;
@@ -5678,6 +5684,8 @@ mod tests {
         fn file_peer(&self, message: PeerMessage) {
             self.0.lock().push(message);
         }
+
+        fn note_farewell(&self, _farewell: crate::mesh::message::Farewell) {}
 
         fn local_destination(&self) -> Option<String> {
             Some(hex_lower(&[0x77; 16]))

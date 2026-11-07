@@ -2071,6 +2071,22 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
             .contains("None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),"),
         "render_peers no longer puts the no-route marker in place of stale, below superseded"
     );
+    let left_template = string_literals(&fn_body("src/repl/mesh.rs", "left_state"))
+        .into_iter()
+        .next()
+        .expect("left_state formats the left marker");
+    let left_pieces: Vec<&str> = left_template.split("{}").collect();
+    assert_eq!(left_pieces.len(), 2, "{left_template:?}");
+    let render = fn_body("src/repl/mesh.rs", "render_peers");
+    let left_arm = render
+        .find("None if peer.left_at.is_some() =>")
+        .expect("render_peers puts the left marker in place of the others, below superseded");
+    assert!(
+        render
+            .find("None if facts.no_route =>")
+            .is_some_and(|at| at > left_arm),
+        "the left marker outranks no route"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
@@ -2236,6 +2252,23 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
                     "a no-route row with a successor in view would be superseded: {sample}"
                 );
             }
+            Some(marker) if marker.starts_with(left_pieces[0]) => {
+                let age = marker
+                    .strip_prefix(left_pieces[0])
+                    .and_then(|rest| rest.strip_suffix(left_pieces[1]))
+                    .and_then(|age| age.strip_suffix(" ago"))
+                    .unwrap_or_else(|| {
+                        panic!("the left marker as left_state formats it: {marker:?}")
+                    });
+                assert!(
+                    age_secs(age) <= age_secs(row.age),
+                    "a row cannot have left before it was last heard: {sample}"
+                );
+                assert!(
+                    successor.is_none(),
+                    "a left row with a successor in view would be superseded: {sample}"
+                );
+            }
             Some(marker) => {
                 assert_eq!(
                     marker, stale_marker,
@@ -2268,7 +2301,10 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
                 .is_some_and(|m| m.starts_with("(stale: ")))
             && rows
                 .iter()
-                .any(|row| row.marker.is_some_and(|m| m == no_route_marker)),
+                .any(|row| row.marker.is_some_and(|m| m == no_route_marker))
+            && rows
+                .iter()
+                .any(|row| row.marker.is_some_and(|m| m.starts_with(left_pieces[0]))),
         "the sample shows one row of each marker:\n{sample}"
     );
 }
@@ -5633,7 +5669,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     );
     let tools = read(repo_root().join("src").join("function").join("mesh.rs"));
     let mesh_page = read(wiki.join("Mesh.md"));
-    for needle in ["`session_gone: true`", "`reachable`"] {
+    for needle in ["`session_gone: true`", "`reachable`", "`left_secs_ago`"] {
         assert!(
             tools.contains(needle) && mesh_page.contains(needle),
             "the mesh__peers description and Mesh.md's mesh__peers row do not both name {needle}"

@@ -4197,6 +4197,7 @@ fn code_vectors() -> Vec<Vector> {
                         hops: 1,
                         first_seen: UNIX_EPOCH,
                         last_seen: UNIX_EPOCH,
+                        left_at: None,
                     },
                 )?;
                 refuses_an_unknown_key(

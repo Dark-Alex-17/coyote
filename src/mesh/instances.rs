@@ -95,7 +95,9 @@ pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {
 }
 
 /// Every row by the destination it serves, running or gone. A registry that cannot be
-/// used reads as empty, with a warning, and is left for the next write to deal with.
+/// used reads as empty, with a warning, and is left for the next write to deal with; one
+/// an older Coyote wrote is cache this build replaces, so it reads as empty with a debug
+/// line only.
 pub(crate) fn by_destination(cache_dir: &Path) -> Sessions {
     let path = registry_path(cache_dir);
     match read_judged_rows(&path, SystemTime::now()) {
@@ -119,6 +121,10 @@ pub(crate) fn by_destination(cache_dir: &Path) -> Sessions {
                 }
             }
             sessions
+        }
+        Err(RegistryRead::Older(found)) => {
+            debug!("{}", older_registry(&path, found));
+            Sessions::default()
         }
         Err(RegistryRead::Version(found)) => {
             warn!(
@@ -156,6 +162,10 @@ pub(crate) fn sessions_by_instance(cache_dir: &Path) -> HashMap<String, Instance
     let path = registry_path(cache_dir);
     let rows = match read_judged_rows(&path, SystemTime::now()) {
         Ok(rows) => rows,
+        Err(RegistryRead::Older(found)) => {
+            debug!("{}", older_registry(&path, found));
+            return HashMap::new();
+        }
         Err(RegistryRead::Version(found)) => {
             debug!("{}", refusal(&path, found));
             return HashMap::new();
@@ -204,6 +214,10 @@ fn rewrite(path: &Path, change: impl FnOnce(&mut BTreeMap<String, InstanceRow>))
     )?;
     let mut rows = match read_judged_rows(path, SystemTime::now()) {
         Ok(rows) => rows,
+        Err(RegistryRead::Older(found)) => {
+            set_aside_older(path, found);
+            BTreeMap::new()
+        }
         Err(RegistryRead::Version(found)) => return Err(anyhow!(refusal(path, found))),
         Err(RegistryRead::Corrupt { cause, error }) => {
             set_aside_corrupt(path, &cause, &error);
@@ -232,13 +246,14 @@ fn refusal(path: &Path, found: u64) -> String {
 }
 
 enum RegistryRead {
+    /// A version below `INSTANCES_VERSION`: an earlier Coyote's registry, which the next
+    /// write sets aside and starts afresh.
+    Older(u64),
+    /// A version above `INSTANCES_VERSION`: a newer Coyote's registry, never overwritten.
     Version(u64),
     /// `cause` says in plain words what is wrong with the file; `error` is the parser's
     /// own account.
-    Corrupt {
-        cause: String,
-        error: String,
-    },
+    Corrupt { cause: String, error: String },
 }
 
 /// The rows at `path` as of `now`: a row whose process is gone reads as a tombstone gone
@@ -299,6 +314,9 @@ fn parse_instances(bytes: &[u8]) -> Result<InstancesFile, RegistryRead> {
             cause: unversioned_cause(INSTANCES_VERSION),
             error: err.to_string(),
         })?;
+    if probe.version < INSTANCES_VERSION {
+        return Err(RegistryRead::Older(probe.version));
+    }
     if probe.version != INSTANCES_VERSION {
         return Err(RegistryRead::Version(probe.version));
     }
@@ -306,6 +324,39 @@ fn parse_instances(bytes: &[u8]) -> Result<InstancesFile, RegistryRead> {
         cause: format!("is not a version-{INSTANCES_VERSION} instance registry"),
         error: err.to_string(),
     })
+}
+
+/// Where a registry an older Coyote wrote is moved: `instances.json.v<found>`.
+fn older_path(path: &Path, found: u64) -> PathBuf {
+    path.with_extension(format!("json.v{found}"))
+}
+
+fn older_registry(path: &Path, found: u64) -> String {
+    format!(
+        "Mesh instance registry '{}' is version {found}, written by an earlier Coyote; this one writes version {INSTANCES_VERSION}, so it names no session until the next `.mesh on` sets the file aside as '{}' and starts afresh",
+        path.display(),
+        older_path(path, found).display()
+    )
+}
+
+/// Moves a registry an older Coyote wrote to `older_path` (replacing any earlier one), so
+/// the write that found it starts a fresh one. The file is cache: an earlier build's
+/// sessions re-register as each runs `.mesh on`, so this is logged at debug level only.
+fn set_aside_older(path: &Path, found: u64) {
+    let aside = older_path(path, found);
+    debug!(
+        "Mesh instance registry '{}' is version {found}, written by an earlier Coyote; moved to '{}' and started afresh at version {INSTANCES_VERSION}",
+        path.display(),
+        aside.display()
+    );
+    if let Err(err) = fs::rename(path, &aside) {
+        debug!(
+            "Mesh instance registry '{}' could not be moved to '{}' ({}), so it is replaced in place",
+            path.display(),
+            aside.display(),
+            redact_hashes(&err.to_string())
+        );
+    }
 }
 
 /// Warns about a registry that cannot be used and renames it to `<path>.corrupt`
@@ -709,10 +760,10 @@ mod tests {
     }
 
     #[test]
-    fn another_version_is_refused_and_left_as_it_was() {
+    fn a_newer_version_is_refused_and_left_as_it_was() {
         install_log_collector();
         let tmp = TempDir::new("instances-version");
-        let bytes = br#"{"version":1,"instances":{}}"#;
+        let bytes = br#"{"version":3,"instances":{}}"#;
         let path = write_raw(&tmp, bytes);
 
         register(&tmp.path, ID_A, row(&"aa".repeat(16), "temp"));
@@ -728,9 +779,53 @@ mod tests {
         let warns = warn_snapshot();
         assert!(
             warns.iter().any(|message| message.contains(&path_text)
-                && message.contains("is version 1 but this Coyote writes version 2")
+                && message.contains("is version 3 but this Coyote writes version 2")
+                && message.contains("A newer Coyote wrote it")
                 && message.contains("was not updated")),
             "no refusal names {path_text}; captured: {warns:#?}"
+        );
+    }
+
+    /// A registry an earlier Coyote wrote (version 1, before tombstones) reads as empty
+    /// with a debug line, not a warning, and the next write moves it to
+    /// `instances.json.v1` and files the new row, so name addressing works at once.
+    #[test]
+    fn an_older_version_is_set_aside_with_a_debug_line_and_the_next_write_starts_afresh() {
+        install_log_collector();
+        let tmp = TempDir::new("instances-older");
+        let bytes = br#"{"version":1,"instances":{"0123456789abcdef0123456789abcdef":{"destination":"aa","session":"old","agent":null,"process":{"pid":1,"start":0},"started":{"secs_since_epoch":0,"nanos_since_epoch":0}}}}"#;
+        let path = write_raw(&tmp, bytes);
+        let path_text = path.display().to_string();
+
+        assert!(live(&tmp.path).is_empty());
+        assert!(sessions_by_instance(&tmp.path).is_empty());
+        assert!(path.exists(), "a read does not move the file");
+        let destination = "bb".repeat(16);
+        register(&tmp.path, ID_A, row(&destination, "temp"));
+
+        let aside = path.with_extension("json.v1");
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            bytes,
+            "the old file is kept aside"
+        );
+        assert!(!path.with_extension("json.corrupt").exists());
+        let file = written(&tmp);
+        assert_eq!(file.version, INSTANCES_VERSION);
+        assert_eq!(file.instances.len(), 1, "only the new row is filed");
+        assert!(live(&tmp.path).contains_key(&destination));
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|message| message.contains(&path_text)),
+            "an older registry is cache replaced quietly"
+        );
+        let debugs = crate::testing::debug_snapshot();
+        assert!(
+            debugs.iter().any(|message| message.contains(&path_text)
+                && message.contains("is version 1, written by an earlier Coyote")
+                && message.contains("moved to")),
+            "no debug line names {path_text}; captured: {debugs:#?}"
         );
     }
 

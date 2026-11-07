@@ -386,7 +386,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::hex_lower;
     #[cfg(unix)]
-    use super::message::{PeerBody, from_request_body, received_reply};
+    use super::message::{PeerBody, from_request_body, is_farewell, received_reply};
     use super::node::MeshPaths;
     #[cfg(all(test, unix))]
     pub(crate) use super::node::RecordingEnvoy;
@@ -1581,6 +1581,18 @@ pub(crate) mod test_support {
         /// Every well-formed `/message` body received so far, in arrival order.
         pub(crate) fn seen(&self) -> Vec<PeerBody> {
             self.recorder.seen.lock().clone()
+        }
+
+        /// Takes the farewells received so far out of what `seen` returns, in arrival
+        /// order, so a test that stops a node beside the stub can check the goodbye and
+        /// read every other message as before.
+        pub(crate) fn take_farewells(&self) -> Vec<PeerBody> {
+            let mut seen = self.recorder.seen.lock();
+            let (farewells, rest) = seen
+                .drain(..)
+                .partition(|body| is_farewell(body.kind, body.fields.as_ref()));
+            *seen = rest;
+            farewells
         }
 
         pub(crate) async fn stop(self) {

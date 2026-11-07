@@ -158,6 +158,9 @@ pub(crate) enum MeshEvent {
         destination: String,
         title: Option<String>,
         via: PeerVia,
+        /// The bulletin's `fields.presence` when it is one this node acts on: `leaving`
+        /// on a farewell. `None` on every other bulletin.
+        presence: Option<&'static str>,
     },
     BulletinSent {
         id: String,
@@ -206,6 +209,7 @@ const MESSAGE_KIND: &str = "COYOTE_MESH_MESSAGE_KIND";
 const MESSAGE_ID: &str = "COYOTE_MESH_MESSAGE_ID";
 const IN_REPLY_TO: &str = "COYOTE_MESH_IN_REPLY_TO";
 const MESSAGE_TITLE: &str = "COYOTE_MESH_MESSAGE_TITLE";
+const PRESENCE: &str = "COYOTE_MESH_PRESENCE";
 const ROUTED: &str = "COYOTE_MESH_ROUTED";
 const ERROR_CLASS: &str = "COYOTE_MESH_ERROR_CLASS";
 const ERROR: &str = "COYOTE_MESH_ERROR";
@@ -293,6 +297,7 @@ pub(crate) const MESH_HOOK_ENVS: &[(HookEvent, &[&str])] = &[
             PEER_DESTINATION,
             MESSAGE_TITLE,
             VIA,
+            PRESENCE,
         ],
     ),
     (
@@ -518,6 +523,7 @@ impl MeshEvent {
                 destination,
                 title,
                 via,
+                presence,
             } => {
                 envs.push((MESSAGE_KIND, PeerKind::Bulletin.to_string()));
                 envs.push((MESSAGE_ID, id.clone()));
@@ -530,6 +536,7 @@ impl MeshEvent {
                     PEER_TITLE_MAX_CHARS,
                 );
                 envs.push((VIA, peer_via(*via).to_string()));
+                push_opt(&mut envs, PRESENCE, presence.map(str::to_string));
             }
             Self::BulletinSent { id, tally } => {
                 envs.push((MESSAGE_ID, id.clone()));
@@ -746,6 +753,7 @@ mod tests {
                 destination: destination.clone(),
                 title: Some("news".to_string()),
                 via: PeerVia::Direct,
+                presence: Some("leaving"),
             },
             MeshEvent::BulletinSent {
                 id: "b-2".to_string(),

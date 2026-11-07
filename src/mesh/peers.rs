@@ -71,6 +71,11 @@ pub(crate) struct PeerRecord {
     pub hops: u8,
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
+    /// When this node received the instance's farewell (`fields.presence: leaving`), by
+    /// this node's clock; `None` once it announces again, and on every row it has not
+    /// said goodbye from. Advisory: the row, its trust and its open questions stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_at: Option<SystemTime>,
 }
 
 impl PeerRecord {
@@ -256,7 +261,8 @@ impl PeerTable {
         })
     }
 
-    /// The announce clears any failed-link mark the row had.
+    /// The announce clears any failed-link mark the row had, and any farewell: an instance
+    /// that announces is back.
     pub(crate) fn observe(&self, sighting: PeerSighting, now: SystemTime) -> PeerChange {
         self.link_failed.lock().remove(&sighting.destination_hash);
         let mut peers = self.inner.lock();
@@ -264,6 +270,7 @@ impl PeerTable {
             Some(record) => {
                 record.follow(sighting);
                 record.last_seen = now;
+                record.left_at = None;
                 PeerChange::Refreshed
             }
             None => {
@@ -280,6 +287,7 @@ impl PeerTable {
                         hops: sighting.hops,
                         first_seen: now,
                         last_seen: now,
+                        left_at: None,
                     },
                 );
                 PeerChange::Added
@@ -342,6 +350,24 @@ impl PeerTable {
     /// neither linked nor announced since.
     pub(crate) fn link_failed(&self, destination_hash: &str) -> bool {
         self.link_failed.lock().contains(destination_hash)
+    }
+
+    /// Marks the row of `destination_hash` as having said it is leaving the mesh, at
+    /// `received_at`: this node's clock when the farewell arrived. A farewell received
+    /// before the row's latest announce is ignored, since the instance has announced
+    /// since, and so is one for a destination the table does not know. `true` when the
+    /// row was marked.
+    pub(crate) fn mark_left(&self, destination_hash: &str, received_at: SystemTime) -> bool {
+        let mut peers = self.inner.lock();
+        let Some(record) = peers.get_mut(destination_hash) else {
+            return false;
+        };
+        if received_at < record.last_seen {
+            return false;
+        }
+        record.left_at = Some(received_at);
+        self.dirty.store(true, Ordering::Release);
+        true
     }
 
     pub(crate) fn sweep(&self, now: SystemTime) -> Vec<String> {
@@ -537,6 +563,7 @@ mod public_key_tests {
             hops: 1,
             first_seen: SystemTime::UNIX_EPOCH,
             last_seen: SystemTime::UNIX_EPOCH,
+            left_at: None,
         };
         assert!(row.verified_destination().is_some());
 
@@ -656,6 +683,7 @@ mod tests {
             hops: 1,
             first_seen: at,
             last_seen: at,
+            left_at: None,
         }
     }
 
@@ -777,6 +805,52 @@ mod tests {
         assert!(
             !table.link_failed("aa"),
             "an aged-out row takes its mark with it"
+        );
+    }
+
+    /// A farewell marks a known row at its receive time and the mark is written to the
+    /// file; a farewell received before the row's latest announce is ignored, as is one
+    /// for a destination the table does not know; the next announce clears the mark. A
+    /// row with no mark writes no `left_at`, so a table written before the field existed
+    /// reads the same.
+    #[test]
+    fn a_farewell_marks_the_row_left_until_its_next_announce_and_a_stale_one_is_ignored() {
+        let (table, tmp) = table("peers-left");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        table.observe(sighting("aa", None), t0);
+        table.persist_if_dirty().unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            written["peers"][0].get("left_at").is_none(),
+            "an unmarked row writes no left_at: {written}"
+        );
+
+        assert!(!table.mark_left("unknown", t0));
+        assert!(
+            !table.mark_left("aa", t0 - Duration::from_secs(1)),
+            "a farewell received before the latest announce is ignored"
+        );
+        assert_eq!(table.get("aa").unwrap().left_at, None);
+
+        let left = t0 + Duration::from_secs(5);
+        assert!(table.mark_left("aa", left));
+        let row = table.get("aa").unwrap();
+        assert_eq!(row.left_at, Some(left));
+        assert_eq!(row.last_seen, t0, "a farewell is not an announce");
+        table.persist_if_dirty().unwrap();
+        let reloaded = PeerTable::load(path.clone(), left).unwrap();
+        assert_eq!(reloaded.get("aa").unwrap().left_at, Some(left));
+
+        table.observe(sighting("aa", None), left + Duration::from_secs(60));
+        assert_eq!(
+            table.get("aa").unwrap().left_at,
+            None,
+            "the next announce clears the mark"
+        );
+        assert!(
+            !table.mark_left("aa", left),
+            "the farewell is older than the announce that followed it"
         );
     }
 

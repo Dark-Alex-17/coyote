@@ -8834,6 +8834,10 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
                     ));
                 }
                 let marker = match successor {
+                    None if facts.own_gone => Some(NO_ROUTE_STATE.to_string()),
+                    None if peer.left_at.is_some() => {
+                        peer.left_at.map(|left_at| left_state(now, left_at))
+                    }
                     None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),
                     _ => row_state(peer, successor, now),
                 };
@@ -8985,6 +8989,80 @@ mod peers_route_tests {
         assert!(state.starts_with("(superseded by 11111111"), "{text}");
         assert!(!state.contains("no route"), "{text}");
     }
+
+    /// A row whose instance said goodbye reads `left <age>` by its receive time, in place
+    /// of `no route` and `stale`; a superseded row still says where its identity went;
+    /// the legend says what `left` means.
+    #[test]
+    fn a_row_that_said_goodbye_reads_left_with_its_age_over_no_route_and_stale() {
+        let now = SystemTime::now();
+        let left = |row: PeerRecord, secs_ago: u64| PeerRecord {
+            left_at: Some(now - Duration::from_secs(secs_ago)),
+            ..row
+        };
+        let rows = vec![
+            heard(left(at("11", 30, now), 3), HeardFacts::default()),
+            heard(left(at("22", 30, now), 7_200), NO_PATH),
+            heard(
+                PeerRecord {
+                    identity_hash: "ef".repeat(16),
+                    ..left(at("33", PEER_STALE_AFTER.as_secs(), now), 60)
+                },
+                HeardFacts::default(),
+            ),
+        ];
+
+        let text = render_peers(&rows, now).plain();
+
+        let cells = table_rows(&text);
+        assert_eq!(
+            cells[0][6], "(left 3s ago: it said it was leaving the mesh)",
+            "{text}"
+        );
+        assert_eq!(
+            cells[1][6], "(left 2h ago: it said it was leaving the mesh)",
+            "{text}"
+        );
+        assert_eq!(
+            cells[2][6], "(left 1m ago: it said it was leaving the mesh)",
+            "{text}"
+        );
+        assert!(
+            peers_legend().contains(
+                "left = the instance said it was leaving the mesh, until it announces again"
+            ),
+            "{text}"
+        );
+
+        let superseded = vec![
+            heard(at("44", 5, now), HeardFacts::default()),
+            heard(
+                left(at("55", PEER_STALE_AFTER.as_secs(), now), 60),
+                HeardFacts::default(),
+            ),
+        ];
+        let text = render_peers(&superseded, now).plain();
+        assert!(
+            table_rows(&text)[1][6].starts_with("(superseded by 44444444"),
+            "{text}"
+        );
+
+        let own_gone = vec![heard(
+            left(at("66", 5, now), 1),
+            HeardFacts {
+                no_route: true,
+                is_you: true,
+                own_gone: true,
+                ..HeardFacts::default()
+            },
+        )];
+        let text = render_peers(&own_gone, now).plain();
+        assert_eq!(
+            table_rows(&text)[0][6],
+            NO_ROUTE_STATE,
+            "a session of yours that has ended reads no route, farewell or not: {text}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9118,6 +9196,18 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
 /// says where the identity went.
 const NO_ROUTE_STATE: &str = "(no route: this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh)";
 
+/// The `state` of a heard row whose instance said it was leaving the mesh, `left_at` by
+/// this node's clock. It outranks `no route` and `stale`, being the peer's own word, and
+/// yields to `superseded`, which says where the identity went, and to a session of yours
+/// that has ended, which the registry already names gone and reads `no route`. The row's
+/// next announce lifts it.
+fn left_state(now: SystemTime, left_at: SystemTime) -> String {
+    format!(
+        "(left {}: it said it was leaving the mesh)",
+        age_text(now, left_at)
+    )
+}
+
 /// How `.mesh peers` names a session of yours on this computer that has stopped or whose
 /// process has gone, while the instance registry still keeps its tombstone.
 const GONE_SESSION_NAME: &str = "(you, gone)";
@@ -9142,7 +9232,7 @@ fn trust_legend() -> &'static str {
 /// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -10287,6 +10377,7 @@ mod tests {
             hops: 2,
             first_seen: now - Duration::from_secs(3600),
             last_seen: now - Duration::from_secs(seen_secs_ago),
+            left_at: None,
         }
     }
 
@@ -11720,7 +11811,7 @@ mod tests {
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                 NAME_ADDRESSING_LINE,
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
             ],
             "{text}"
         );
@@ -11864,7 +11955,7 @@ mod tests {
 6 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
 
     /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
     #[test]
