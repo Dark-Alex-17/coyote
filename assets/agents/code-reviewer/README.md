@@ -54,32 +54,45 @@ trip it), and the report is always emitted: the verdict script's own crash guard
 `PIPELINE-FAULT` NEEDS-HUMAN, and render bypasses its "No changes to review." stub for fault
 verdicts — a fault renders as a full report, never silence.
 
-**Unverified findings never block.** A 🔴/🟡 finding whose verification did not complete (a dead
-verifier, a verifier that verified nothing, a faulted per-finding verdict, or no verdict at all)
-moves to an `Unverified findings (verification incomplete)` section, stays out of the critical
-count, and the verdict reason opens with `review incomplete:`. A degraded round reads as an
-incomplete review, never as a list of defects to fix; the review gauntlet names the lane on its
-`GAUNTLET_REVIEW_INCOMPLETE:` line.
+**Unverified findings never block.** A 🔴/🟡 finding whose verification did not complete moves to
+an `Unverified findings (verification incomplete)` section and stays out of the critical count.
+Two severities: when verification failed as a whole (a dead verifier, or one that verified
+nothing) the verdict reason opens with `review incomplete:` and the review gauntlet names the lane
+on its `GAUNTLET_REVIEW_INCOMPLETE:` line; when single findings went unverified (a per-finding
+fault, or no verdict returned for them) the round is NEEDS-HUMAN with the count in the reason and
+an attention line, never blocking and never an incomplete review.
 
 **Findings are anchored in the diff.** `anchor_gate` runs between synthesis and verification and
-keeps a finding only when its file is a reviewed changed file (relative to the checkout) and its
-lines lie inside the file and within 3 lines of a changed hunk. Everything else (a path outside
-the diff, a generated file, a line past the end of the file, a range far from every change, no
-range) is listed under `Could not anchor` with the reason; a dropped 🔴 keeps the round
-NEEDS-HUMAN. A consumer-impact finding in another repository is anchored at the changed line in
-this diff and cites the external caller as evidence. Prior-art incident notes are context: they
+keeps a finding only when its file is a reviewed changed file (relative to the checkout) and one
+of its cited ranges lies inside the file and within 3 lines of a changed hunk, or within 3 lines
+of deleted lines by their old-side numbers. Everything else (a path outside the diff or outside
+the checkout, a generated file, a line past the end of the file, a range far from every change,
+no range) is listed under `Could not anchor` with the reason; a dropped 🔴 keeps the round
+NEEDS-HUMAN and becomes a named attention line in the gauntlet. A caller, consumer or unchanged
+twin outside the diff, in this repository or another, is anchored at the changed line with the
+external location cited as evidence. Prior-art incident notes are context: they
 become a finding only when the diff deletes or weakens the guard they name.
 
 **Generated files are not reviewed.** `facts` drops files marked `linguist-generated` in
-`.gitattributes`, files whose head carries `Code generated ... DO NOT EDIT.`, and the generated
-path shapes `gen/`, `*_pb.*`, `*.pb.go`, `*_gen.go`, `*.connect.go` before grouping; the report
-lists them under `Generated, not reviewed`.
+`.gitattributes`, files with a whole comment line `Code generated ... DO NOT EDIT.` in their head,
+and the generated path shapes `gen/<go|es|ts|py|proto>/`, `*_pb.*`, `*.pb.go`, `*_gen.go`,
+`*.connect.go` before grouping; the report always lists them under `Generated, not reviewed`. The
+marks cannot launder a change: a diff that edits `.gitattributes` is reviewed without its linguist
+marks, and a file that existed on the base without the header but carries it now is reviewed;
+both raise an attention line. A diff of generated files only is NEEDS-HUMAN, never the "No changes
+to review." stub. Paths are read verbatim (`core.quotePath=false`) and a rename is a deletion plus
+an addition, so the anchor gate sees the same paths as the reviewers.
 
 **Reads go to the checkout under review.** The review agents declare `review_grounding` (default
-`'1'`), which makes the read-only fs tools resolve a relative path against `project_dir` and
-refuse a read inside another clone of the same origin repository, naming the checkout path
-instead. Reads in other repositories (callers, shared libraries, the consumer sweep) are
-unaffected. The guard lives in `functions/utils/review-paths.sh`.
+`'1'`), which makes the read-only tools (`fs_read`, `fs_cat`, `fs_grep`, `fs_glob`, `fs_ls`,
+`ast_grep`) resolve a relative path against `project_dir` and refuse a read of tracked code inside
+another clone of the same origin repository, naming the checkout path instead. The guard is inert
+when `project_dir` is the default `.` (the caller named no checkout) or lies in the working
+directory's own checkout. Reads in other repositories (callers, shared libraries, the consumer
+sweep) and untracked local files of another clone are unaffected. The guard lives in
+`functions/utils/review-paths.sh`. The `probe` lane is not grounded: it boots the system, writes
+files and runs commands in the checkout it is given, so a read-path guard on its fs tools would
+cover none of what it does.
 
 A CodeRabbit-style code review orchestrator that coordinates per-file reviews and synthesizes findings into a unified 
 report.

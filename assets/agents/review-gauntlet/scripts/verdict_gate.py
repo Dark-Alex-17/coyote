@@ -26,11 +26,13 @@ re-reads, no judgment. The gate's hard rules:
     of the lane's own verdict line — derived from render.py's deterministic
     summary line (`*Reviewed N files, found X critical, …*`); the raw 🔴
     count is used only when that summary line is missing;
-  - a code-review lane whose OWN verdict line opens a `review incomplete:`
-    reason (finding verification did not complete, so its unverified
-    findings sit in a separate section and count as no 🔴) is an incomplete
-    review: the row blocks and the lane is named on the
+  - a code-review lane whose OWN verdict line opens its reason with
+    `review incomplete:` (finding verification failed as a whole, so its
+    unverified findings sit in a separate section and count as no 🔴) is an
+    incomplete review: the row blocks and the lane is named on the
     GAUNTLET_REVIEW_INCOMPLETE: machine line, never routed as findings to fix;
+    single unverified findings and criticals the anchor gate could not anchor
+    are named attention lines, never blockers;
   - NEEDS-HUMAN without 🔴 passes but is surfaced as attention required;
   - probe INCONCLUSIVE blocks with an ENVIRONMENT note — it is never
     treated as PASS or FAIL (fix the environment per the plan's local-run
@@ -229,22 +231,39 @@ def main():
             re.MULTILINE,
         )
         reds = int(sums[-1]) if sums else cr.count("🔴")
-        # CONTRACT: code-reviewer/verdict.py emits this reason when finding
-        # verification did not complete; same first-verdict-line scoping.
-        m_incomplete = verdict_line and re.search(
-            r"^\*\*Verdict: NEEDS-HUMAN\*\* .*review incomplete: (\d+) finding",
-            verdict_line.group(0),
+        # CONTRACT: code-reviewer/verdict.py. Verification that failed as a
+        # whole OPENS the reason with "review incomplete:" and is an
+        # incomplete review; single unverified findings and unanchored
+        # criticals are attention items, never blockers. Same
+        # first-verdict-line scoping as the fault anchor.
+        line = verdict_line.group(0) if verdict_line else ""
+        m_incomplete = re.search(
+            r"^\*\*Verdict: NEEDS-HUMAN\*\* \u2014 review incomplete: finding verification "
+            r"failed, (\d+) finding",
+            line,
         )
-        if m_incomplete and not m_fault:
+        m_unverified = re.search(r"(\d+) finding\(s\) unverified, listed separately", line)
+        m_unanchored = re.search(r"(\d+) 🔴 finding\(s\) could not be anchored", line)
+        if m_incomplete:
             n_unverified = m_incomplete.group(1)
             incomplete_detail["code-review"] = (
-                f"code-review: finding verification did not complete; {n_unverified} "
-                "unverified finding(s) are listed separately in the lane report"
+                f"code-review: finding verification failed; {n_unverified} unverified "
+                "finding(s) are listed separately in the lane report"
             )
             blockers.append(
-                f"code-review: review incomplete - finding verification did not complete; "
+                "code-review: review incomplete \u2014 finding verification failed; "
                 f"{n_unverified} unverified finding(s) are listed separately in the lane report "
                 "and are not blocking defects"
+            )
+        elif m_unverified:
+            attention.append(
+                f"code-review: {m_unverified.group(1)} unverified finding(s) listed separately "
+                "for a human; not blocking"
+            )
+        if m_unanchored:
+            attention.append(
+                f"code-review: {m_unanchored.group(1)} critical finding(s) could not be "
+                "anchored; listed for a human"
             )
         if m_fault:
             blockers.append(
@@ -273,7 +292,10 @@ def main():
                 "code-review: NEEDS-HUMAN — see the lane report's "
                 "'Human attention required' section"
             )
-            record("code-review", "GREEN (attention)", "NEEDS-HUMAN, no 🔴")
+            unverified_note = (
+                f"; {m_unverified.group(1)} unverified finding(s)" if m_unverified else ""
+            )
+            record("code-review", "GREEN (attention)", f"NEEDS-HUMAN, no 🔴{unverified_note}")
         else:
             blockers.append(
                 "code-review: no Review Verdict sentinel found — the lane failed; "

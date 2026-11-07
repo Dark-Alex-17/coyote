@@ -540,7 +540,7 @@ nodes:
   anchor_gate:
     id: anchor_gate
     type: script
-    description: Mechanical anchor check before verification and reporting. Keeps a finding only when its file is a reviewed changed file of the diff and its lines lie inside the file and within 3 lines of a changed hunk; every other finding moves to `unanchored` with the reason and is listed under "Could not anchor". A crash keeps the findings and records anchor_error, which verdict.py reports as a pipeline fault.
+    description: Mechanical anchor check before verification and reporting. Keeps a finding only when its file is a reviewed changed file of the diff and one of its cited ranges lies inside the file and within 3 lines of a changed hunk, or within 3 lines of deleted lines by their old-side numbers; every other finding moves to `unanchored` with the reason and is listed under "Could not anchor". A crash keeps the findings and records anchor_error, which verdict.py reports as a pipeline fault.
     script: scripts/anchor_gate.py
     timeout: 120
     next: verify

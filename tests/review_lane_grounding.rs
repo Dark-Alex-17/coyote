@@ -736,15 +736,11 @@ fn review_round(mut state: Value) -> (Value, String, Value) {
     (verdict, report, gauntlet)
 }
 
+/// No unverified finding is blocking, the report lists them separately, and
+/// the gauntlet never routes them as findings to fix.
 fn no_blocking_criticals(label: &str, verdict: &Value, report: &str, gauntlet: &Value) {
     assert_eq!(verdict["counts"]["🔴"], 0, "{label}: {verdict}");
-    assert!(
-        verdict["reason"]
-            .as_str()
-            .unwrap()
-            .starts_with("review incomplete:"),
-        "{label}: the reason must open with review incomplete: {verdict}"
-    );
+    assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{label}: {verdict}");
     assert!(
         verdict["findings_final"]
             .as_array()
@@ -774,15 +770,22 @@ fn no_blocking_criticals(label: &str, verdict: &Value, report: &str, gauntlet: &
         !text.contains("🔴 CRITICAL finding(s)"),
         "{label}: the gauntlet must not route unverified criticals as findings to fix: {text}"
     );
-    assert_eq!(
-        gauntlet["gauntlet_verdict"], "BLOCKED",
-        "{label}: {gauntlet}"
-    );
+}
+
+fn code_review_row(gauntlet: &Value) -> String {
+    gauntlet["gauntlet_report"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("| code-review |"))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The #1001 failure: the verifier faulted and the unverified criticals were
-/// posted as blockers. Every way verification can fail to complete yields no
-/// blocking finding and an explicit review incomplete.
+/// posted as blockers. A verification that failed as a whole is an
+/// incomplete review; single unverified findings are attention. Neither is
+/// ever a blocking finding. Each row pins its exact signal.
 #[test]
 fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
     if !python_available() {
@@ -805,45 +808,85 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
         verdict["reason"]
             .as_str()
             .unwrap()
-            .starts_with("review incomplete: 1 finding(s) unverified"),
+            .starts_with("1 finding(s) unverified, listed separately and not blocking"),
         "{verdict}"
     );
     assert!(report.contains("## Unverified findings (verification incomplete)"));
-    assert!(
-        gauntlet["gauntlet_incomplete_line"]
-            .as_str()
-            .unwrap()
-            .contains("GAUNTLET_REVIEW_INCOMPLETE: code-review"),
-        "an incomplete code review is named on the machine line: {gauntlet}"
+    assert_eq!(gauntlet["gauntlet_incomplete_line"], "", "{gauntlet}");
+    assert_eq!(
+        code_review_row(&gauntlet),
+        "| code-review | BLOCKED | 1 🔴 finding(s) |",
+        "{gauntlet}"
     );
 
-    for (label, verifier_output) in [
+    // (label, verifier output, reason prefix, gauntlet verdict, incomplete
+    // line, code-review row)
+    let whole = "review incomplete: finding verification failed, 2 finding(s) unverified";
+    let incomplete_line = "\nGAUNTLET_REVIEW_INCOMPLETE: code-review";
+    let degraded_row = "| code-review | BLOCKED | PIPELINE-FAULT (degraded lane) |";
+    let attention_row = "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴; 2 unverified finding(s) |";
+    for (label, verifier_output, reason, gauntlet_verdict, machine, row) in [
         (
             "per-finding faults",
             json!(
                 r#"[{"id":"f1","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"},{"id":"f2","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"}]"#
             ),
+            "2 finding(s) unverified, listed separately and not blocking",
+            "PASS",
+            "",
+            attention_row,
         ),
-        ("dead verifier", json!("Agent node failed: timed out")),
+        (
+            "no verdicts returned",
+            json!("[]"),
+            "2 finding(s) unverified, listed separately and not blocking",
+            "PASS",
+            "",
+            attention_row,
+        ),
+        (
+            "dead verifier",
+            json!("Agent node failed: timed out"),
+            whole,
+            "BLOCKED",
+            incomplete_line,
+            degraded_row,
+        ),
         (
             "verified nothing",
             json!(
                 r#"FINDING_VERIFIER_RESULTS
 [{"id":"pipeline-fault","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: parse failed"}]"#
             ),
+            whole,
+            "BLOCKED",
+            incomplete_line,
+            degraded_row,
         ),
-        ("no verdicts returned", json!("[]")),
     ] {
         let mut state = base.clone();
         state["verifier_output"] = verifier_output;
         let (verdict, report, gauntlet) = review_round(state);
         no_blocking_criticals(label, &verdict, &report, &gauntlet);
-        let machine = gauntlet["gauntlet_incomplete_line"].as_str().unwrap();
-        let text = gauntlet["gauntlet_report"].as_str().unwrap();
         assert!(
-            machine.contains("code-review") || text.contains("internal PIPELINE-FAULT"),
-            "{label}: the lane must read as incomplete or degraded, never as findings: {gauntlet}"
+            verdict["reason"].as_str().unwrap().starts_with(reason),
+            "{label}: {verdict}"
         );
+        assert_eq!(gauntlet["gauntlet_verdict"], gauntlet_verdict, "{label}: {gauntlet}");
+        assert_eq!(gauntlet["gauntlet_incomplete_line"], machine, "{label}: {gauntlet}");
+        assert_eq!(code_review_row(&gauntlet), row, "{label}: {gauntlet}");
+        let text = gauntlet["gauntlet_report"].as_str().unwrap();
+        if gauntlet_verdict == "PASS" {
+            assert!(
+                text.contains("- code-review: 2 unverified finding(s) listed separately for a human; not blocking"),
+                "{label}: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("- code-review: review incomplete \u{2014} finding verification failed; 2 unverified finding(s)"),
+                "{label}: {text}"
+            );
+        }
     }
 }
 
@@ -1150,7 +1193,7 @@ fn anchor_gate_faults_and_drops_reach_the_verdict() {
         "file": "internal/plan.go", "lines": "45-50",
         "reason": "lines 45-50 are outside internal/plan.go (38 lines)"
     }]);
-    let (verdict, report, _) = review_round(state);
+    let (verdict, report, gauntlet) = review_round(state);
     assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{verdict}");
     assert!(
         verdict["reason"]
@@ -1168,6 +1211,14 @@ fn anchor_gate_faults_and_drops_reach_the_verdict() {
         "{report}"
     );
     assert!(report.contains("found 0 critical"), "{report}");
+    assert!(
+        gauntlet["gauntlet_report"]
+            .as_str()
+            .unwrap()
+            .contains("- code-review: 1 critical finding(s) could not be anchored; listed for a human"),
+        "{gauntlet}"
+    );
+    assert_eq!(code_review_row(&gauntlet), "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |");
 }
 
 /// The #1001 round end to end: a stale clone of the same repository sits in
@@ -1292,15 +1343,24 @@ fn synthesis_and_reviewer_wording_is_in_place() {
         );
     }
     for rel in ["domain-reviewer/config.yaml", "file-reviewer/config.yaml"] {
-        let text = read(rel);
+        let text = read(rel).split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
             "**Anchor every finding in the diff.**",
-            "cited in the Description as evidence",
+            "A caller, consumer or unchanged twin outside the diff, in this repository or another, is anchored at the changed line with the external location (repo + path:line) cited as evidence.",
+            "or lines within 3 of it",
             "**Read the checkout under review.**",
         ] {
             assert!(text.contains(needle), "{rel} lacks {needle:?}");
         }
     }
+    let security = read("security-reviewer/instructions.md");
+    assert!(security.contains("**Read the checkout under review.**"));
+    let gate = fs::read_to_string(manifest().join("assets/agents/code-reviewer/scripts/anchor_gate.py")).unwrap();
+    assert!(gate.contains("\nADJACENT = 3\n"), "the adjacency the wording names");
+    assert!(gate.contains("not within {ADJACENT} lines of a change"));
+    assert!(graph.contains("within 3 lines of a changed hunk"));
+    let readme = read("code-reviewer/README.md");
+    assert!(readme.contains("The `probe` lane is not grounded"));
 }
 
 /// A repository whose head renames-and-edits a file, adds files whose names

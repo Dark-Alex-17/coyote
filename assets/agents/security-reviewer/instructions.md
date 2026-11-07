@@ -97,6 +97,10 @@ with no location and no attack path is noise — do not emit it.
    not High; a "small" secret in a repo is Critical.
 7. Be terse and decisive. Three exploitable findings beat fifteen theoretical ones. If everything
    is theoretical hardening, it PASSes — say so.
+8. **Read the checkout under review.** Pass absolute paths under the Project directory below; a
+   relative path resolves against it, never against the CWD. A read the tools refuse as "another
+   clone of the repository under review" names the checkout path to read instead. Other
+   repositories (callers, shared libraries) stay readable.
 
 ## Context
 - Project: {{project_dir}}

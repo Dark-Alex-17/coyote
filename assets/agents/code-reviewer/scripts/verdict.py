@@ -11,11 +11,15 @@ The model that wrote the findings never grades its own homework:
 Fail-closed: any PIPELINE-FAULT recorded upstream (dead domain lane, dead
 verifier, verifier verdicts carrying a PIPELINE-FAULT note or the
 `pipeline-fault` sentinel id, dead synthesis, missing domain reports)
-forces NEEDS-HUMAN. A 🔴/🟡 finding whose verification did not complete (a
-dead or degraded verifier, a faulted verdict, no verdict at all) is never
-blocking: it moves to the `unverified` section and the reason opens with
-`review incomplete:`, so a degraded round cannot read as a list of defects
-to fix, and a degraded run can never read MERGE-READY. Faults
+forces NEEDS-HUMAN. A 🔴/🟡 finding whose verification did not complete is
+never blocking: it moves to the `unverified` section. Two severities:
+  - verification failed as a whole (the verifier died, or verified nothing):
+    the reason opens with `review incomplete:` and the review gauntlet names
+    the lane as an incomplete review;
+  - single findings went unverified (a per-finding fault, or no verdict
+    returned for them): the round is NEEDS-HUMAN with the count in the reason
+    and an attention line, never blocking and never an incomplete review.
+A degraded run can never read MERGE-READY. Faults
 always lead the attention list; the display cap applies only to the
 non-fault entries so a degraded run can never hide a fault.
 The gate never crashes into a silent verdict: any internal error emits
@@ -264,22 +268,32 @@ def main():
     # faults go FIRST and uncapped so the display cap can never hide one;
     # the trigger reason keys off the human-facing triggers alone
     has_triggers = bool(attention)
+    verification_failed = verifier_dead or verified_nothing
     incomplete_notes = []
-    if unverified:
+    if unverified and verification_failed:
         incomplete_notes.append(
-            f"Review incomplete: finding verification did not complete, so {len(unverified)} "
+            f"Review incomplete: finding verification failed, so {len(unverified)} "
             "finding(s) are listed under 'Unverified findings (verification incomplete)' and "
             "are NOT blocking defects; re-run the review or check each one by hand"
+        )
+    elif unverified:
+        incomplete_notes.append(
+            f"Unverified: {len(unverified)} finding(s) could not be verified and are listed "
+            "under 'Unverified findings (verification incomplete)', not as blocking; check "
+            "each one by hand"
         )
     attention = faults + incomplete_notes + soft_notes + anchor_notes + coverage_notes + attention[:5]
 
     reasons = []
-    if unverified:
-        # CONTRACT: review-gauntlet/verdict_gate.py anchors on "review incomplete:"
+    # CONTRACT: review-gauntlet/verdict_gate.py anchors on both wordings; the
+    # whole-failure one must OPEN the reason.
+    if unverified and verification_failed:
         reasons.append(
-            f"review incomplete: {len(unverified)} finding(s) unverified, listed "
-            "separately and not blocking"
+            f"review incomplete: finding verification failed, {len(unverified)} finding(s) "
+            "unverified, listed separately and not blocking"
         )
+    elif unverified:
+        reasons.append(f"{len(unverified)} finding(s) unverified, listed separately and not blocking")
     if counts["🔴"]:
         reasons.append(f"{counts['🔴']} 🔴 CRITICAL finding(s)")
     if yellow_correctness:

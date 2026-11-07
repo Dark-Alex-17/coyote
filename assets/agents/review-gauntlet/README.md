@@ -65,10 +65,12 @@ those rules are *structure*:
   code-review report's summary line (raw 🔴 count if absent) blocks
   regardless of its verdict line; a code-review lane whose own verdict line
   records a pipeline fault blocks (a degraded review is never a pass); a
-  code-review lane whose own verdict line opens a `review incomplete:` reason
-  (finding verification did not complete, so its unverified findings sit in a
-  separate section and count as no 🔴) blocks as an incomplete review and is
-  named on the incomplete line, never routed as findings to fix; the
+  code-review lane whose own verdict reason opens with `review incomplete:`
+  (finding verification failed as a whole, so its unverified findings sit in
+  a separate section and count as no 🔴) blocks as an incomplete review and is
+  named on the incomplete line, never routed as findings to fix; single
+  unverified findings and criticals the anchor gate could not anchor are named
+  attention lines on a GREEN (attention) row, never blockers; the
   adversary's own degraded-run header (the `Criteria: …` line directly under
   its sentinel recording a pipeline fault, died criterion checks, or its
   verdict script's crash stub) blocks as a pipeline fault,
@@ -165,7 +167,7 @@ builder, the retry gate, the default-lanes fallback, or the verdict gate
 itself (the default-lanes fallback's crash still runs the widened lanes, so
 `pipeline` appears alongside real lane rows), plus `debris` when the lint
 crashed, was killed, its module could not be imported, or its findings
-arrived malformed, plus `code-review` when its own verdict line reports
+arrived malformed, plus `code-review` when its own verdict reason opens with
 `review incomplete:`. The report gains a
 `## Review incomplete` section naming each exhausted lane with its
 attempt count; `PIPELINE-FAULT` lane rows carry ` ×N` when the lane was
@@ -177,7 +179,7 @@ still appear under `## Blockers` and must be fixed as usual.
 
 | Lane | Sentinel | Blocks on |
 |------|----------|-----------|
-| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault; own verdict line opens `review incomplete:` (incomplete review) |
+| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault; own verdict reason opens with `review incomplete:` (incomplete review) |
 | adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; INCONCLUSIVE (environment note); missing sentinel |

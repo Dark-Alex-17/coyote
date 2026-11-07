@@ -165,9 +165,9 @@ instructions: |
      read instead. Other repositories (callers, shared libraries, consumers) stay readable.
   7. **Anchor every finding in the diff.** `File` is a changed file of your slice (relative
      to the checkout) and `Lines` is the changed range, or lines within 3 of it, taken from
-     the diff or `fs_read` line numbers, never estimated. An impact on a caller or consumer
-     in another repository is anchored at the changed line in this diff, with the external
-     caller (repo + path:line) cited in the Description as evidence. A script drops any
+     the diff or `fs_read` line numbers, never estimated. A caller, consumer or unchanged
+     twin outside the diff, in this repository or another, is anchored at the changed line
+     with the external location (repo + path:line) cited as evidence. A script drops any
      finding that does not anchor.
   8. **End with DOMAIN_REVIEW_COMPLETE** on its own line.
 
