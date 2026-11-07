@@ -65,6 +65,18 @@ import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
+# Under PYTHONSAFEPATH sys.path[0] is not this directory; report_text must
+# still resolve here, ahead of anything of the same name in .shared.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# A missing helper module or name must still end in the BLOCKED stub below,
+# so the import error is kept here and raised inside the crash guard by main().
+try:
+    from report_text import one_line, table_cell
+
+    helper_import_error = None
+except Exception as e:  # noqa: BLE001 - any helper failure must reach the stub
+    helper_import_error = e
 
 # Duplicated verbatim in the sibling gate script — the two copies must stay identical.
 ADVERSARY_DEGRADED_HEADER = re.compile(
@@ -95,7 +107,25 @@ def adversary_degraded(report):
     return False
 
 
+def selection_lines(summary):
+    # build_items writes one `- ` bullet per reason; a continuation line from
+    # any other writer joins the item above it instead of starting a line,
+    # and a leading non-bullet line gets the bullet so no line starts bare.
+    items = []
+    for line in summary.splitlines():
+        if line.startswith("- "):
+            items.append(line[2:])
+        elif line.strip() and items:
+            items[-1] += " " + line
+        elif line.strip():
+            items.append(line)
+    folded = (one_line(text) for text in items)
+    return ["- " + text for text in folded if text]
+
+
 def main():
+    if helper_import_error:
+        raise helper_import_error
     state = load_state()
     blockers, attention, reports = [], [], []
     rows = {}
@@ -404,40 +434,51 @@ def main():
     for name in sorted(incomplete):
         if name == "pipeline":
             incomplete_lines.append(
-                f"- pipeline: {signals_error}"
+                f"pipeline: {signals_error}"
                 if pipeline_fault
-                else "- pipeline: review incomplete (no fault text recorded)"
+                else "pipeline: review incomplete (no fault text recorded)"
             )
         elif name == "debris" and debris_incomplete is not None:
-            incomplete_lines.append(f"- debris: {debris_incomplete}")
+            incomplete_lines.append(f"debris: {debris_incomplete}")
         elif n := attempt_count(name):
-            incomplete_lines.append(f"- {name}: no completed review after {n} attempt(s)")
+            incomplete_lines.append(f"{name}: no completed review after {n} attempt(s)")
         else:
-            incomplete_lines.append(f"- {name}: no completed review")
+            incomplete_lines.append(f"{name}: no completed review")
     incomplete_line = (
-        "\nGAUNTLET_REVIEW_INCOMPLETE: " + ", ".join(sorted(incomplete))
+        "\nGAUNTLET_REVIEW_INCOMPLETE: " + ", ".join(one_line(n) for n in sorted(incomplete))
         if incomplete
         else ""
     )
 
+    # Above `## Full lane reports` every interpolated value goes through
+    # report_text, so no state-sourced text can start a header line of its own.
     md = "\n".join(
         ["| lane | status | detail |", "|------|--------|--------|"]
-        + [f"| {lane} | {status} | {detail} |" for lane, (status, detail) in rows.items()]
+        + [
+            f"| {table_cell(lane)} | {status} | {table_cell(detail)} |"
+            for lane, (status, detail) in rows.items()
+        ]
     )
-    md += "\n\n## Lane selection\n" + (state.get("lanes_summary") or "(none recorded)")
+    md += "\n\n## Lane selection\n" + (
+        "\n".join(selection_lines(state.get("lanes_summary") or "")) or "(none recorded)"
+    )
     _notes = state.get("retry_notes")
     if isinstance(_notes, list):
         _shown = [n for n in _notes if isinstance(n, str)][:8]
         if _shown:
-            md += "\n\n## Pipeline notes\n" + "\n".join(f"- {n}" for n in _shown)
+            md += "\n\n## Pipeline notes\n" + "\n".join(f"- {one_line(n)}" for n in _shown)
     if blockers:
-        md += "\n\n## Blockers\n" + "\n".join(f"- {b}" for b in blockers)
+        md += "\n\n## Blockers\n" + "\n".join(f"- {one_line(b)}" for b in blockers)
     if attention:
-        md += "\n\n## Human attention required\n" + "\n".join(f"- {a}" for a in attention)
+        md += "\n\n## Human attention required\n" + "\n".join(
+            f"- {one_line(a)}" for a in attention
+        )
     if state.get("signals_error"):
-        md += f"\n\n> {state['signals_error']}"
+        md += f"\n\n> {one_line(state['signals_error'])}"
     if incomplete_lines:
-        md += "\n\n## Review incomplete\n" + "\n".join(incomplete_lines)
+        md += "\n\n## Review incomplete\n" + "\n".join(
+            f"- {one_line(x)}" for x in incomplete_lines
+        )
     md += "\n\n## Full lane reports\n"
     for lane, rep in reports:
         md += f"\n<details><summary>{lane}</summary>\n\n{rep}\n\n</details>\n"
@@ -456,11 +497,14 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — the gate must never crash into a silent pass
+    # Without the helper the error is the helper's own, which may span lines;
+    # splitlines() splits on exactly the boundaries one_line folds.
+    error = " ".join(str(e).splitlines()) if helper_import_error else one_line(e)
     print(
         json.dumps(
             {
                 "gauntlet_verdict": "BLOCKED",
-                "gauntlet_report": f"verdict gate error: {e} — treat as a failed gate, not a pass.",
+                "gauntlet_report": f"verdict gate error: {error} \u2014 treat as a failed gate, not a pass.",
                 "gauntlet_incomplete_line": "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
             }
         )

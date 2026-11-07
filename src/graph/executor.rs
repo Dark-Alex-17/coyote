@@ -2094,6 +2094,10 @@ nodes:
             "fix_loop_gate.sh",
             &shipped_script("assets/agents/coder/scripts/fix_loop_gate.sh"),
         );
+        ws.write_script(
+            "gate_lib.sh",
+            &shipped_script("assets/agents/coder/scripts/gate_lib.sh"),
+        );
 
         let yaml = r#"
 name: t

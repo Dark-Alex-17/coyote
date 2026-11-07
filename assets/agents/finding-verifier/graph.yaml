@@ -33,10 +33,28 @@ initial_state:
   gate_feedback: ''
   gate_attempts: 0
   parse_failure: ''
+  parse_script_note: ''
 
-start: parse
+start: parse_script
 
 nodes:
+  parse_script:
+    id: parse_script
+    type: script
+    description: >-
+      Deterministic parse of the structured findings JSON the code-reviewer
+      verify node (this graph's sole caller) embeds in the spawn prompt - the
+      findings are already JSON, so the common case needs no LLM. ANY anomaly
+      (unparseable JSON, missing/mistyped fields, unclassifiable severity)
+      routes _next to the legacy LLM parse node instead - fail-open, byte-for-
+      byte today's behavior - and a crash in this script falls forward to the
+      same LLM parse via the node's fallback edge. Runs once, forward edges
+      only: no loops introduced.
+    script: scripts/parse_findings.py
+    timeout: 30
+    next: parse
+    fallback: parse
+
   parse:
     id: parse
     type: llm

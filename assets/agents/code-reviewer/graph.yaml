@@ -97,6 +97,7 @@ initial_state:
   final_report: ''
   gate_feedback: ''
   gate_attempts: 0
+  gate_prior_report: ''
   parse_failure: ''
   refine_failure: ''
   aux_failure: ''
@@ -296,6 +297,8 @@ nodes:
       Linter output (extract the lines for your files):
       {{linter_notes}}
       {{extra_context}}
+
+      {{gate_prior_report}}
     max_attempts: 2
     state_updates:
       domain_report: '{{output}}'

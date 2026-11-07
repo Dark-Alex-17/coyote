@@ -138,6 +138,18 @@ fn install_stub_sbx_with(root: &Path, version_line: &str, sandbox_rows: &[&str])
     log
 }
 
+/// Removes every inherited `COYOTE_*` variable, so a developer's own
+/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
+/// reaches the child; the harness then sets the ones it needs.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &Path)]) -> Output {
     let home = root.join("home");
     let path = format!(
@@ -146,7 +158,7 @@ fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &Pa
         env::var("PATH").unwrap_or_default()
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    command
+    scrub_coyote_env(&mut command)
         .args(args)
         .current_dir(cwd)
         .env("COYOTE_CONFIG_DIR", root.join("config"))
