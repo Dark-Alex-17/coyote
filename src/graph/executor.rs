@@ -7,7 +7,7 @@ use super::script::ScriptExecutor;
 use super::staging::BranchWrites;
 use super::state::StateManager;
 use super::types::{EndNode, Graph, Node, NodeType};
-use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
+use super::user_interaction::{ApprovalNodeExecutor, HeadlessAnswerGuard, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
 use super::{
     GraphRunResult, SCRIPT_FALLBACK_ERROR_KEY, SCRIPT_FALLBACK_ERROR_MAX_BYTES, TraceOutcome,
@@ -150,6 +150,7 @@ impl GraphExecutor {
             );
         }
         let graph = Arc::new(graph);
+        let headless_answers = HeadlessAnswerGuard::default();
         let start = Instant::now();
 
         // Maps a user interrupt (SIGINT, or the enclosing turn aborting) onto
@@ -291,6 +292,7 @@ impl GraphExecutor {
                 let current = node_id.clone();
                 let sem_clone = semaphore.clone();
                 let abort_clone = abort_signal.clone();
+                let headless_answers_clone = headless_answers.clone();
                 #[cfg(test)]
                 let observer = frontier_observer.clone();
 
@@ -338,6 +340,7 @@ impl GraphExecutor {
                         max_concurrency,
                         abort_signal: &abort_clone,
                         branch_mode: false,
+                        headless_answers: headless_answers_clone,
                     };
                     let result = step(&node, &mut state, &mut ctx, &step_ctx, &current).await;
                     drop(retire);
@@ -678,6 +681,7 @@ pub(super) struct StepContext<'a> {
     pub max_concurrency: usize,
     pub abort_signal: &'a AbortSignal,
     pub branch_mode: bool,
+    pub headless_answers: HeadlessAnswerGuard,
 }
 
 impl StepContext<'_> {
@@ -753,12 +757,27 @@ pub(super) async fn step(
             Ok(StepResult::Continue(targets))
         }
         NodeType::Approval(approval_node) => {
-            let next = ApprovalNodeExecutor::execute(approval_node, state, ctx).await?;
+            let next = ApprovalNodeExecutor::execute(
+                current,
+                approval_node,
+                state,
+                ctx,
+                &step_ctx.headless_answers,
+            )
+            .await?;
             Ok(StepResult::Continue(vec![next]))
         }
         NodeType::Input(input_node) => {
             let next_id = first_next_target(node);
-            let next = InputNodeExecutor::execute(input_node, next_id, state, ctx).await?;
+            let next = InputNodeExecutor::execute(
+                current,
+                input_node,
+                next_id,
+                state,
+                ctx,
+                &step_ctx.headless_answers,
+            )
+            .await?;
             Ok(StepResult::Continue(vec![next]))
         }
         NodeType::Llm(llm_node) => {
@@ -1687,6 +1706,7 @@ nodes:
             max_concurrency: 1,
             abort_signal: &abort,
             branch_mode: false,
+            headless_answers: HeadlessAnswerGuard::default(),
         };
         let mut ctx = make_ctx();
 
@@ -3253,6 +3273,45 @@ nodes:
             .unwrap_or_else(|e| panic!("max_loop_iterations: 0 should not cap visits: {e:#}"));
 
         assert_eq!(result, stop.to_string());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_repeat_counts_do_not_carry_over_between_graph_runs() {
+        let _mode = crate::function::user_interaction::HeadlessModeGuard::set(true, false);
+        let yaml = r#"
+name: headless_repeat
+start: gate
+settings:
+  validate_before_run: false
+initial_state:
+  trail: ""
+nodes:
+  gate:
+    type: approval
+    question: "Retry?"
+    options: [retry, stop]
+    routes:
+      retry: gate
+      stop: done
+    on_other: done
+    state_updates:
+      trail: "{{trail}}{{choice}},"
+  done:
+    type: end
+    output: "{{trail}}"
+"#;
+        let ws = TestWorkspace::new();
+
+        for run in 0..2 {
+            let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+            let result = GraphExecutor::new(graph, &ws.dir)
+                .execute(&mut make_ctx(), create_abort_signal())
+                .await
+                .unwrap_or_else(|e| panic!("run {run} failed: {e:#}"));
+
+            assert_eq!(result, "retry,retry,stop,", "run {run}");
+        }
     }
 
     #[tokio::test]
