@@ -2344,9 +2344,11 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 /// A reasoning model's stream renders progressively too: with the
 /// reasoning delta held open on the wire the turn is visibly busy (the
-/// status row offers the interrupt), the reasoning text is already on
-/// screen and the answer is not; once released the answer lands and the
-/// status row stops ticking (it repaints once a second while it lives).
+/// live `Thinking for Ns` status row offers the interrupt), the reasoning
+/// text itself stays hidden like the REPL hides a think span, and the
+/// answer is not on screen; once released the answer lands without the
+/// reasoning text and the status row stops ticking (it repaints once a
+/// second while it lives).
 #[test]
 #[serial]
 fn a_reasoning_stream_keeps_the_turn_busy_until_the_answer_is_sent() {
@@ -2364,20 +2366,20 @@ fn a_reasoning_stream_keeps_the_turn_busy_until_the_answer_is_sent() {
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b"think about it\r").unwrap();
     let started = std::time::Instant::now();
-    let transcript = wait_for_squeezed(
-        &mut pty,
-        "pondering the question v5w",
-        "the reasoning delta",
-    );
+    let transcript = wait_for_squeezed(&mut pty, "Thinking for", "the live thinking row");
     assert!(
         started.elapsed() < HOLD_LIMIT,
-        "the reasoning delta was painted only after the fake gave up holding the stream"
+        "the Thinking row appeared only after the fake gave up holding the stream"
     );
     assert!(
         transcript.contains("Esc to interrupt"),
         "no busy status row was shown while the model was reasoning:\n{transcript}"
     );
     let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !squeezed.contains("ponderingthequestionv5w"),
+        "the reasoning text was painted into the transcript:\n{transcript}"
+    );
     assert!(
         !squeezed.contains("thought-outreplyc3d"),
         "the answer was on screen before the fake sent it:\n{transcript}"
@@ -2405,6 +2407,14 @@ fn a_reasoning_stream_keeps_the_turn_busy_until_the_answer_is_sent() {
     assert!(
         !since.contains("Esc to interrupt") && !since.contains("Working"),
         "the busy status row kept repainting after the answer arrived:\n{since}"
+    );
+    let whole: String = strip_ansi(&String::from_utf8_lossy(pty.raw()))
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        !whole.contains("ponderingthequestionv5w"),
+        "the reasoning text reached the screen at some point during the turn"
     );
     assert_eq!(fake.served(), 1);
 
