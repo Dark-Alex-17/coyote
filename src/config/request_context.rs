@@ -20,8 +20,8 @@ use super::{
     CommandPrefix, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME,
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT,
     ResolvedMacro, Role, RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT,
-    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, UiKind, WORKSPACE_COYOTE_DIR_NAME, WorkingMode,
-    bundles, ensure_parent_exists, list_agents_with_descriptions, memory, paths,
+    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, UiKind, UiMode, WORKSPACE_COYOTE_DIR_NAME,
+    WorkingMode, bundles, ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
@@ -1066,11 +1066,22 @@ impl RequestContext {
         self.app.config.command_prefix
     }
 
-    /// What kind of surface answers this run's prompts, exported to tools as
-    /// `COYOTE_UI`: headless when no human is present, the full-screen UI
-    /// while it owns the terminal, the REPL otherwise.
+    /// What kind of surface answers this run's prompts, exported to tools
+    /// as `COYOTE_UI`: headless when no human is present, the full-screen
+    /// UI while it owns the terminal, the REPL otherwise. An interactive
+    /// run configured for the full-screen UI already counts as `Tui`
+    /// before the loop takes the terminal, so the dispatch in `main` and
+    /// the tools it starts on the way agree with what is about to start.
+    /// A prompt run with a human present stays `Repl` whatever the config
+    /// says. Who owns the interrupt is a separate question, answered by
+    /// `interrupt_policy` from the terminal's actual owner.
     pub(crate) fn ui_kind(&self) -> UiKind {
-        UiKind::current()
+        match UiKind::current() {
+            UiKind::Repl if self.working_mode.is_repl() && self.app.config.ui == UiMode::Tui => {
+                UiKind::Tui
+            }
+            kind => kind,
+        }
     }
 
     pub fn render_hints<'a>(&self, text: &'a str) -> Cow<'a, str> {
@@ -1093,6 +1104,9 @@ impl RequestContext {
     /// The full-screen UI reads the keyboard itself and turns Esc into an
     /// abort, so the derivation says `NotOwned` while it runs; the spinner
     /// entry point enforces the same rule for sites that pass a literal.
+    /// Until the loop has taken the terminal nothing else answers a key,
+    /// so a run merely configured for the full-screen UI keeps SIGINT
+    /// armed on the spinners it starts on the way in.
     pub(crate) fn interrupt_policy(&self) -> UserInterrupt {
         if self.user_interrupts_here() && !crate::tui::active() {
             UserInterrupt::Owned
@@ -3360,6 +3374,7 @@ impl RequestContext {
             ("save", app.save.to_string()),
             ("keybindings", app.keybindings.clone()),
             ("command_prefix", app.command_prefix.to_string()),
+            ("ui", app.ui.to_string()),
             ("wrap", wrap),
             ("wrap_code", app.wrap_code.to_string()),
             ("highlight", app.highlight.to_string()),
@@ -8785,6 +8800,40 @@ mod tests {
         assert_eq!(names, ["dot", "slash", "both"]);
     }
 
+    /// The shell is chosen before the REPL exists, so `.set ui` would only
+    /// take effect on the next start; it is not offered at all.
+    #[test]
+    #[serial]
+    fn set_ui_is_refused_and_not_completed() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        assert_eq!(ctx.app.config.ui, UiMode::Repl);
+
+        let err = run_async(ctx.update("ui tui", utils::create_abort_signal()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "Unknown key 'ui'");
+        assert_eq!(ctx.app.config.ui, UiMode::Repl);
+        assert!(!SET_COMPLETION_KEYS.contains(&"ui"));
+    }
+
+    #[test]
+    #[serial]
+    fn sysinfo_reports_the_configured_ui() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let ui_row = |ctx: &RequestContext| {
+            let info = ctx.sysinfo(&ctx.app.config).unwrap();
+            info.lines()
+                .find(|line| line.split_whitespace().next() == Some("ui"))
+                .unwrap_or_else(|| panic!("ui row missing from:\n{info}"))
+                .to_string()
+        };
+        assert!(ui_row(&ctx).ends_with("repl"), "{}", ui_row(&ctx));
+        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        assert!(ui_row(&ctx).ends_with("tui"), "{}", ui_row(&ctx));
+    }
+
     #[test]
     fn memory_config_app_some_false_disables_via_cascade() {
         let mut ctx = create_test_ctx();
@@ -11756,6 +11805,38 @@ mod tests {
         assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         assert_eq!(root.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// An interactive run configured for the full-screen UI is `Tui` from
+    /// the start, but the spinners it runs before the loop takes the
+    /// terminal (the MCP start, the models refresh) still paint the normal
+    /// screen with nobody reading Esc, so they keep SIGINT armed until the
+    /// UI is actually up.
+    #[test]
+    #[serial]
+    fn interrupt_policy_stays_owned_until_the_configured_tui_takes_the_terminal() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
+        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        assert!(!crate::tui::active());
+        assert_eq!(ctx.ui_kind(), UiKind::Tui);
+        assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert_eq!(ctx.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// A prompt run never starts the full-screen UI, so the config value
+    /// does not change its surface or who owns its interrupt.
+    #[test]
+    #[serial]
+    fn configured_tui_is_ignored_on_the_command_path() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        assert_eq!(ctx.ui_kind(), UiKind::Repl);
+        assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
     }
 
     /// `.skill <name>` under the full-screen UI is refused before the

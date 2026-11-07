@@ -33,9 +33,9 @@ use crate::client::{
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
-    RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
-    install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
-    sync_models,
+    RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, UiMode, WorkingMode,
+    ensure_parent_exists, install_builtins, list_agents, load_env_file, macro_execute,
+    maybe_spawn_models_refresh, sync_models,
 };
 use crate::config::{memory, memory_migrate, paths};
 use crate::graph::llm::CompletionFuture;
@@ -129,6 +129,10 @@ async fn async_main() -> Result<()> {
     } else {
         WorkingMode::Cmd
     };
+    if (cli.tui || cli.repl) && !working_mode.is_repl() {
+        let flag = if cli.tui { "--tui" } else { "--repl" };
+        bail!("{flag} requires the interactive mode; drop the prompt");
+    }
 
     if cli.headless || cli.acp_server {
         if cli.headless && !cli.acp_server && text.is_none() && cli.file.is_empty() {
@@ -341,6 +345,11 @@ async fn async_main() -> Result<()> {
     }
     if cli.no_workspace_macros {
         app_config.no_workspace_macros = true;
+    }
+    if cli.tui {
+        app_config.ui = UiMode::Tui;
+    } else if cli.repl {
+        app_config.ui = UiMode::Repl;
     }
     let app_config: Arc<AppConfig> = Arc::new(app_config);
     let app_state: Arc<AppState> = Arc::new(
@@ -678,9 +687,8 @@ async fn run(
             result
         }
         true => {
-            let wants_tui =
-                env::var(config::UiKind::ENV).as_deref() == Ok(config::UiKind::Tui.as_str());
-            if wants_tui {
+            let full_screen = ctx.ui_kind() == config::UiKind::Tui;
+            if full_screen {
                 // Refused here, before the models refresh and the REPL
                 // setup are started on the UI's behalf; `tui::run` checks
                 // again so it holds on its own, whoever calls it.
@@ -690,7 +698,7 @@ async fn run(
             }
             maybe_spawn_models_refresh(&ctx.app.config);
             config::child_sessions::sweep_orphans();
-            if wants_tui {
+            if full_screen {
                 return tui::run(ctx).await;
             }
             start_interactive(ctx).await

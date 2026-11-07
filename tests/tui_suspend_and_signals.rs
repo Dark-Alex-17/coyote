@@ -555,13 +555,10 @@ fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
 
 /// `COYOTE_UI=bogus coyote --info` reports
 /// `Invalid value 'bogus', expected one of: repl, tui` and exits non-zero
-/// without touching the alternate screen. The parsed `COYOTE_UI` (with
-/// `--tui`/`--repl` and the `ui:` key) is not wired yet; until it is, the
-/// provisional env branch lets any other value fall through to the plain
-/// REPL (pinned by `tui_binary.rs`), so this stays ignored.
+/// without touching the alternate screen: the config layer parses the
+/// variable on startup, so a typo never falls through to either shell.
 #[test]
 #[serial]
-#[ignore = "COYOTE_UI is not parsed yet; an unknown value falls through to the plain REPL"] // TASK-314
 fn an_unknown_coyote_ui_value_is_reported_by_name_with_the_accepted_values() {
     let dir = fresh_config_dir("bogus-ui");
     let _guard = TempDirGuard(dir.clone());
@@ -581,12 +578,8 @@ fn an_unknown_coyote_ui_value_is_reported_by_name_with_the_accepted_values() {
         "COYOTE_UI=bogus --info exited 0 instead of refusing the value:\n{all}"
     );
     assert!(
-        all.contains("Invalid value 'bogus'"),
-        "the unknown value was not named in the refusal:\n{all}"
-    );
-    assert!(
-        all.contains("repl") && all.contains("tui"),
-        "the refusal did not list the accepted values (repl, tui):\n{all}"
+        all.contains("Invalid value 'bogus', expected one of: repl, tui"),
+        "the refusal did not name the value and the accepted values:\n{all}"
     );
 }
 
