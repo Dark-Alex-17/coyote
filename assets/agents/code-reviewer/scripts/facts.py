@@ -119,7 +119,62 @@ try:
 except Exception as e:  # noqa: BLE001
     notes.append(f"diff resolution failed for spec {spec!r}: {e}")
 
+# --- generated files ------------------------------------------------------------
+# Generated code is never grouped, reviewed or anchored: the report lists it as
+# "generated, not reviewed". A file is generated when .gitattributes marks it
+# linguist-generated, its head carries the `Code generated ... DO NOT EDIT.`
+# marker, or its path has a generated shape.
+GENERATED_PATH_RE = re.compile(r"(^|/)gen/|_pb\.[^/]*$|\.pb\.go$|_gen\.go$|\.connect\.go$")
+GENERATED_HEADER_RE = re.compile(r"Code generated .* DO NOT EDIT\.")
+
+
+def linguist_generated(root, paths):
+    if not paths:
+        return set()
+    r = subprocess.run(
+        ["git", "-C", root, "check-attr", "-z", "--stdin", "linguist-generated"],
+        input="\0".join(paths),
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:300])
+    fields = r.stdout.split("\0")
+    return {
+        fields[i]
+        for i in range(0, len(fields) - 2, 3)
+        if fields[i + 2] in ("set", "true")
+    }
+
+
+def generated_header(root, path):
+    try:
+        with open(os.path.join(root, path), encoding="utf-8", errors="replace") as f:
+            head = [f.readline() for _ in range(10)]
+    except OSError:
+        return False
+    return any(GENERATED_HEADER_RE.search(line) for line in head)
+
+
+generated = []
+try:
+    top = git("rev-parse", "--show-toplevel").strip() if files else proj
+    by_attr = linguist_generated(top, files)
+    generated = [
+        f
+        for f in files
+        if f in by_attr or GENERATED_PATH_RE.search(f) or generated_header(top, f)
+    ]
+except Exception as e:  # noqa: BLE001
+    notes.append(f"generated-file detection failed, every changed file is reviewed: {e}")
+if generated:
+    files = [f for f in files if f not in set(generated)]
+    notes.append(f"{len(generated)} generated file(s) excluded from review")
+
 out["resolved_diff_spec"] = resolved
+out["generated_files"] = generated
 out["changed_files"] = files[:300]
 out["file_count"] = len(files)
 if len(files) > 300:

@@ -15,7 +15,7 @@ forces NEEDS-HUMAN. A 🔴/🟡 finding whose verification did not complete (a
 dead or degraded verifier, a faulted verdict, no verdict at all) is never
 blocking: it moves to the `unverified` section and the reason opens with
 `review incomplete:`, so a degraded round cannot read as a list of defects
-to fix — a degraded run can never read MERGE-READY. Faults
+to fix, and a degraded run can never read MERGE-READY. Faults
 always lead the attention list; the display cap applies only to the
 non-fault entries so a degraded run can never hide a fault.
 The gate never crashes into a silent verdict: any internal error emits
@@ -234,6 +234,25 @@ def main():
         if len(detail) > MAX_DETAIL_CHARS:
             detail = detail[: MAX_DETAIL_CHARS - 1] + "…"
         faults.append(f"PIPELINE-FAULT: synthesis failed — findings unavailable; {detail}")
+    # anchor_gate.py marks a completed run; initial_state seeds False, so a
+    # gate that never ran is a fault rather than an unchecked pass.
+    anchor_error = state.get("anchor_error")
+    if isinstance(anchor_error, str) and anchor_error.startswith("PIPELINE-FAULT:"):
+        faults.append(anchor_error.strip().replace("\n", " ")[:MAX_DETAIL_CHARS])
+    elif state.get("anchor_checked") is False and findings:
+        faults.append(
+            "PIPELINE-FAULT: the anchor check did not run, so the findings were not "
+            "checked against the diff"
+        )
+    unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
+    unanchored_red = sum(1 for u in unanchored if sev_icon(u.get("severity")) == "🔴")
+    anchor_notes = []
+    if unanchored:
+        anchor_notes.append(
+            f"Could not anchor: {len(unanchored)} finding(s) name a file or lines outside "
+            "this diff; they are listed under 'Could not anchor' and were not reported as "
+            "findings"
+        )
     if changed and not reports:
         faults.append(
             "PIPELINE-FAULT: the diff is non-empty but no domain reports were produced — "
@@ -249,7 +268,7 @@ def main():
             "finding(s) are listed under 'Unverified findings (verification incomplete)' and "
             "are NOT blocking defects; re-run the review or check each one by hand"
         )
-    attention = faults + incomplete_notes + soft_notes + coverage_notes + attention[:5]
+    attention = faults + incomplete_notes + soft_notes + anchor_notes + coverage_notes + attention[:5]
 
     reasons = []
     if unverified:
@@ -270,6 +289,8 @@ def main():
         # unverified findings are a human-attention item, not a re-runnable
         # lane fault.
         reasons.append(f"{len(soft_fv)} finding(s) unverified (verifier branch fault)")
+    if unanchored_red:
+        reasons.append(f"{unanchored_red} 🔴 finding(s) could not be anchored in the diff")
     if coverage_notes:
         reasons.append(f"{total_files - len(changed)} changed file(s) not reviewed (file cap)")
     if has_triggers:
@@ -286,6 +307,7 @@ def main():
                     "counts": counts,
                     "deferred_count": len(deferred),
                     "unverified_count": len(unverified),
+                    "unanchored_count": len(unanchored),
                     "dropped_count": len(dropped_titles),
                     "dropped_titles": dropped_titles,
                     "attention": attention,

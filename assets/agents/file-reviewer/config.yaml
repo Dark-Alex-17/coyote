@@ -143,7 +143,12 @@ instructions: |
      below; a relative path resolves against it, never against the CWD. A read the tools
      refuse as "another clone of the repository under review" names the checkout path to
      read instead. Other repositories (callers, shared libraries) stay readable.
-  6. **Always end with REVIEW_COMPLETE.**
+  6. **Anchor every finding in the diff.** `Lines` is the changed range, or lines within 3
+     of it, taken from the diff or `fs_read` line numbers, never estimated. An impact on a
+     caller in another repository is anchored at the changed line in this file, with the
+     external caller (repo + path:line) cited in the Description as evidence. A script
+     drops any finding that does not anchor.
+  7. **Always end with REVIEW_COMPLETE.**
 
   ## Context
   - Project: {{project_dir}}

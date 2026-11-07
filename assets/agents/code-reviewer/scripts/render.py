@@ -96,6 +96,28 @@ def main():
         for x in unverified:
             lines += [x.get("block", ""), ""]
 
+    unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
+    if unanchored:
+        lines += [
+            "## Could not anchor",
+            "",
+            "These findings name a file or lines that are not part of this diff, so they were "
+            "dropped before verification and are not reported as findings:",
+            "",
+        ]
+        lines += [
+            f"- {one_line(u.get('severity', ''))} {one_line(u.get('title', ''))} -- "
+            f"`{one_line(u.get('file', ''))}:{one_line(u.get('lines', ''))}` "
+            f"({one_line(u.get('reason', ''))})"
+            for u in unanchored
+        ]
+        lines += [""]
+    generated = [g for g in (state.get("generated_files") or []) if isinstance(g, str)]
+    if generated:
+        lines += ["## Generated, not reviewed", ""]
+        lines += [f"- `{one_line(g)}`" for g in generated]
+        lines += [""]
+
     lines += ["## Cross-File Concerns", state.get("cross_file") or "None", ""]
     if (state.get("operational_history") or "").strip():
         lines += ["## Operational history", state["operational_history"], ""]

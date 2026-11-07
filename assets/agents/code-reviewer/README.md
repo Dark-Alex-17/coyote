@@ -32,7 +32,8 @@ flowchart TD
     F -. "fallback" .-> AF["aux_fault (script): PIPELINE-FAULT lane-skip note"]
     AF --> I
     G --> I
-    I --> J["verify: finding-verifier (agent node, unskippable, max_attempts: 2)"]
+    I --> AG["anchor_gate (script): drop findings not anchored in the diff"]
+    AG --> J["verify: finding-verifier (agent node, unskippable, max_attempts: 2)"]
     I -. "fallback" .-> K
     J --> K["verdict (script): FALSE-drops, rigor folding, fault accounting, MERGE-READY / NEEDS-HUMAN arithmetic"]
     J -. "fallback" .-> K
@@ -52,6 +53,33 @@ never blocks. Fault detection is prefix-anchored (a report that merely *quotes* 
 trip it), and the report is always emitted: the verdict script's own crash guard emits a
 `PIPELINE-FAULT` NEEDS-HUMAN, and render bypasses its "No changes to review." stub for fault
 verdicts — a fault renders as a full report, never silence.
+
+**Unverified findings never block.** A 🔴/🟡 finding whose verification did not complete (a dead
+verifier, a verifier that verified nothing, a faulted per-finding verdict, or no verdict at all)
+moves to an `Unverified findings (verification incomplete)` section, stays out of the critical
+count, and the verdict reason opens with `review incomplete:`. A degraded round reads as an
+incomplete review, never as a list of defects to fix; the review gauntlet names the lane on its
+`GAUNTLET_REVIEW_INCOMPLETE:` line.
+
+**Findings are anchored in the diff.** `anchor_gate` runs between synthesis and verification and
+keeps a finding only when its file is a reviewed changed file (relative to the checkout) and its
+lines lie inside the file and within 3 lines of a changed hunk. Everything else (a path outside
+the diff, a generated file, a line past the end of the file, a range far from every change, no
+range) is listed under `Could not anchor` with the reason; a dropped 🔴 keeps the round
+NEEDS-HUMAN. A consumer-impact finding in another repository is anchored at the changed line in
+this diff and cites the external caller as evidence. Prior-art incident notes are context: they
+become a finding only when the diff deletes or weakens the guard they name.
+
+**Generated files are not reviewed.** `facts` drops files marked `linguist-generated` in
+`.gitattributes`, files whose head carries `Code generated ... DO NOT EDIT.`, and the generated
+path shapes `gen/`, `*_pb.*`, `*.pb.go`, `*_gen.go`, `*.connect.go` before grouping; the report
+lists them under `Generated, not reviewed`.
+
+**Reads go to the checkout under review.** The review agents declare `review_grounding` (default
+`'1'`), which makes the read-only fs tools resolve a relative path against `project_dir` and
+refuse a read inside another clone of the same origin repository, naming the checkout path
+instead. Reads in other repositories (callers, shared libraries, the consumer sweep) are
+unaffected. The guard lives in `functions/utils/review-paths.sh`.
 
 A CodeRabbit-style code review orchestrator that coordinates per-file reviews and synthesizes findings into a unified 
 report.

@@ -36,6 +36,15 @@ connection is the default, not a lucky message.
 
 ## Notes
 
+- Findings are anchored in the diff: `File` is a changed file of the slice and
+  `Lines` the changed range or lines within 3 of it. A caller or consumer in
+  another repository is cited as evidence on the changed line. The code-reviewer
+  graph's anchor gate drops findings that do not anchor.
+- The fs read tools are grounded in the checkout under review
+  (`review_grounding`, default `'1'`): relative paths resolve against
+  `project_dir`, and a read in another clone of the same repository is refused
+  with the checkout path. Other repositories stay readable.
+
 - Read-only; severities per the standard 🔴/🟡/🟢/💡 mapping; never rewrites a
   file-reviewer's severity; dedups identical findings (aspect skill's copy wins).
 - Normally spawned by the `code-reviewer` graph, not directly — but a direct

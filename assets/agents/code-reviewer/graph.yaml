@@ -70,6 +70,7 @@ initial_state:
   bar_provenance: detected-default
   resolved_diff_spec: ''
   changed_files: []
+  generated_files: []
   file_count: 0
   facts_note: ''
   conventions: ''
@@ -90,6 +91,9 @@ initial_state:
   walkthrough: ''
   changes_rows: []
   findings: []
+  unanchored: []
+  anchor_checked: false
+  anchor_error: ''
   cross_file: ''
   operational_history: ''
   org_context_section: ''
@@ -349,7 +353,9 @@ nodes:
       lessons tied to these paths, with dates and links — especially any GUARD present
       in the past that this diff deletes or weakens." Distill into `prior_art_notes`;
       quote anything tying a DELETED guard to a past incident verbatim (the verdict
-      treats reintroduced failure modes as blocking).
+      treats reintroduced failure modes as blocking). Label the notes as context: an
+      incident is a requirement only when the diff deletes or weakens the guard it
+      names, never because the incident exists.
 
       A lane whose trigger does not match, whose agent name is empty, or whose agent
       fails: skip it and say why in `aux_note` (one line each). Never invent lane
@@ -421,17 +427,29 @@ nodes:
         - a diff that contradicts a recorded org decision (org_context_notes) → a
           🔴 CRITICAL finding quoting the decision;
         - a downstream consumer hit on a changed/removed contract element
-          (downstream_notes) → a 🔴 CRITICAL finding naming the consuming repo + file:line;
+          (downstream_notes) -> a 🔴 CRITICAL finding ANCHORED AT THE CHANGED LINE IN THIS
+          DIFF (`file` = the changed file, `lines` = the changed contract element), naming
+          the consuming repo + file:line as evidence in the description;
         - repo-level linter residue that maps to no single file → a finding under the
           owning surface (severity per the linter's own level; buf breaking = 🔴).
+      - **Anchor every finding in the diff.** `file` is a changed file of this diff,
+        relative to the checkout, and `lines` is a range inside or next to a changed hunk,
+        copied from the domain report. Never invent or widen a line range, and never move a
+        finding onto a file the diff did not change: a script drops any finding that does
+        not anchor and lists it under "Could not anchor". Generated files are not reviewed.
+      - **Prior-art and incident notes are context, not requirements.** An incident, alert
+        or prior-PR note from the operational-history lane never becomes a "guard that must
+        remain intact", a finding or an attention flag on its own; it does only when the
+        diff itself deletes or weakens that guard (cite the diff line) or the intent/plan
+        names it. An incident id that appears nowhere in the diff is context only.
       - **Every finding needs**: id (f1, f2, …), severity (icon + word verbatim, e.g.
         "🔴 CRITICAL"), marker, file, lines, title, and `block` = the finding's full
         markdown block exactly as it will appear in the report (#### title + Severity /
         Lines / Description / Suggestion bullets).
       - **attention_flags** (ADDITIVE-ONLY human-attention triggers; scripts add the
         deterministic ones — migrations, auth — separately): money movement or
-        billing-amount computation changes; secrets/cryptography/key handling; a deleted
-        guard the operational-history lane tied to a past incident; a reintroduced
+        billing-amount computation changes; secrets/cryptography/key handling; a guard
+        the diff deletes that the operational-history lane tied to a past incident; a reintroduced
         incident failure mode; a contradicted recorded decision. One short line each.
       - **The placement question**: when the diff adds tolerance for a state its own
         comments/errors call impossible ("should never happen", "defensive"), name the
@@ -516,6 +534,14 @@ nodes:
     state_updates:
       synth_failure: '{{output}}'
     fallback: verdict
+    next: anchor_gate
+
+  anchor_gate:
+    id: anchor_gate
+    type: script
+    description: Mechanical anchor check before verification and reporting. Keeps a finding only when its file is a reviewed changed file of the diff and its lines lie inside the file and within 3 lines of a changed hunk; every other finding moves to `unanchored` with the reason and is listed under "Could not anchor". A crash keeps the findings and records anchor_error, which verdict.py reports as a pipeline fault.
+    script: scripts/anchor_gate.py
+    timeout: 120
     next: verify
 
   verify:
