@@ -32,6 +32,18 @@
 # written to $LLM_OUTPUT=/dev/stdout is never captured as the path). On refusal
 # the message is appended to $LLM_OUTPUT and the function returns 1.
 
+# Runs git inside directory $1. The directory is never passed to git as an
+# argument: Git Bash rewrites an MSYS path argument (/c/x) for the native
+# git.exe only when the argument holds no quote or glob character, so a
+# checkout under /c/it's/x would reach git unconverted and the lookup would
+# fail. `cd` is a shell builtin and hands git a native working directory
+# whatever the path holds.
+_review_git() {
+    local dir="$1"
+    shift
+    (cd "$dir" 2>/dev/null && git "$@")
+}
+
 # Windows drive paths (C:\x, C:/x) become MSYS paths (/c/x) so every
 # comparison below works on one form.
 _review_posix() {
@@ -62,14 +74,14 @@ _review_origin_of() {
     [[ -d "$cache_dir" ]] || mkdir -m 700 "$cache_dir" 2>/dev/null || true
     # Only a cache directory this user owns is used.
     [[ -n "$key" && -O "$cache_dir" ]] || cache_dir=""
-    common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || common=""
+    common=$(_review_git "$root" rev-parse --git-common-dir 2>/dev/null) || common=""
     [[ -z "$common" || "$common" == /* || "$common" =~ ^[A-Za-z]: ]] || common="$root/$common"
     config="$common/config"
     if [[ -n "$cache_dir" && -f "$cache_dir/$key" && ! "$config" -nt "$cache_dir/$key" ]]; then
         cat "$cache_dir/$key"
         return 0
     fi
-    url=$(git -C "$root" config --get remote.origin.url 2>/dev/null || true)
+    url=$(_review_git "$root" config --get remote.origin.url 2>/dev/null || true)
     url=$(_review_normalize_url "$url")
     if [[ -n "$cache_dir" ]]; then
         printf '%s' "$url" > "$cache_dir/$key.$$" 2>/dev/null &&
@@ -105,7 +117,7 @@ _review_checkout_root() {
     while [[ ! -d "$dir" && "$dir" != "/" && "$dir" != "." ]]; do
         dir=$(dirname "$dir")
     done
-    top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+    top=$(_review_git "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
     [[ -n "$top" ]] || return 1
     top=$(_review_posix "$top")
     (cd "$top" 2>/dev/null && pwd -P)
@@ -180,7 +192,7 @@ review_ground_path() {
     if [[ ! -e "$counterpart" ]]; then
         # Not in the review checkout: refuse only what the other clone tracks
         # (stale code), never its untracked local files.
-        [[ -n "$rel" && -n "$(git -C "$target_root" ls-files -- "$rel" 2>/dev/null | head -n 1)" ]] || return 0
+        [[ -n "$rel" && -n "$(_review_git "$target_root" ls-files -- "$rel" 2>/dev/null | head -n 1)" ]] || return 0
         counterpart="$review_root"
     fi
     {
