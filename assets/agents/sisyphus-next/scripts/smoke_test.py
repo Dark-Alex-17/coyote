@@ -196,7 +196,7 @@ check("record_subtasks: B2 >3 -> end_redirect (plan-shaped)", u["_next"] == "end
 u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="cross-PR"))
 check("record_subtasks: empty -> end_redirect with reason", u["_next"] == "end_redirect" and "cross-PR" in u["redirect_reason"])
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=0, intent="implementation"))
-check("next_subtask: first -> plan_research, counters reset", u["_next"] == "plan_research" and u["fix_strikes"] == 0 and u["task_number"] == 1 and "Subtask 1/3" in u["current_task"])
+check("next_subtask: first -> plan_research, counters reset", u["_next"] == "plan_research" and u["fix_strikes"] == 0 and u["task_number"] == 1 and f"Subtask 1/{SUBTASK_MAX}" in u["current_task"])
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=SUBTASK_MAX))
 check("next_subtask: B3 exhausted -> final_report", u["_next"] == "final_report")
 u = gates.next_subtask(base_state(subtasks=subs[:1], subtask_index=0, intent="trivial"))
@@ -568,6 +568,78 @@ check("apply_answer: strikeout / lane_stuck replies that mention abort are no ab
           for k in ("strikeout", "lane_stuck") for t in ("one more round, not abort", "not abort, one more round"))
       and gates.apply_answer(base_state(escalation=escalation("lane_stuck", "q", so), last_answer="Abort and report"))["_next"] == "end_aborted"
       and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="whatever"))["_next"] == "end_aborted")
+
+# ---------------------------------------------------------------- multiple-choice prompts
+mc_opts = [option("Proceed without the oracle"), option("Retry the consult", True, "one retry is in bounds"),
+           option("Abort this task")]
+u = gates.raise_escalation(base_state(), {}, escalation("oracle_fault", "The consult failed. How to proceed?", mc_opts))
+mce = u["escalation"]
+check("choice: 2-4 options with one recommended -> multiple choice, the recommended option first, ask_choice_N",
+      mce["data"]["multiple_choice"] is True
+      and [o["text"] for o in mce["options"]] == ["Retry the consult", "Proceed without the oracle", "Abort this task"]
+      and gates.ask_dispatch(base_state(escalation=mce))["_next"] == "ask_choice_3"
+      and "Option 1 (recommended): Retry the consult" in u["ask_question"]
+      and "    Evidence: one retry is in bounds" in u["ask_question"] and "Option 3: Abort this task" in u["ask_question"]
+      and '"Other (custom)"' in u["ask_question"])
+s2, u = chain(base_state(escalation=mce, last_answer="Option 2", last_answer_text="Option 2", oracle_retries=0),
+              "parse_answer", "apply_answer")
+check("choice: a pick ('Option 2') -> that option's text through apply_answer",
+      s2["last_answer"] == "Proceed without the oracle" and u["_next"] == "design_gate")
+check("choice: 'Option 1 (recommended)', a number and the option text are picks too",
+      all(gates.parse_answer(base_state(escalation=mce, last_answer_text=t))["last_answer"] == "Retry the consult"
+          for t in ("Option 1 (recommended)", "1", "Retry the consult.")))
+u = gates.parse_answer(base_state(escalation=mce, last_answer_text="Option 2, but only after lunch"))
+check("choice: a qualified pick ('Option 2, but ...') names no option -> interpret_reply, the reply kept in full",
+      u["_next"] == "interpret_reply" and "last_answer" not in u)
+s2, u = chain(base_state(escalation=mce, last_answer_text="Option 2, but only after lunch", reply_verdict="unclear",
+                         reply_clarify="Proceed now or later?"), "interpret_route")
+check("choice: an unclear Other reply keeps the multiple-choice prompt for its one clarifying question",
+      u["_next"] == "ask_dispatch" and gates.ask_dispatch(s2)["_next"] == "ask_choice_3"
+      and "Option 1 (recommended): Retry the consult" in s2["ask_question"])
+dup = gates.raise_escalation(base_state(), {}, escalation(
+    "design_choice", "Which cache?", [option("Keep the cache"), option("keep the CACHE", True), option("Drop it")]))
+check("choice: options that differ only in case collapse to one, the recommended copy kept, ledgered -> ask_choice_2",
+      [o["text"] for o in dup["escalation"]["options"]] == ["keep the CACHE", "Drop it"]
+      and gates.ask_dispatch(base_state(escalation=dup["escalation"]))["_next"] == "ask_choice_2"
+      and any("1 duplicate option(s) dropped" in d for d in dup["decisions"]))
+u = gates.parse_answer(base_state(escalation=mce, last_answer_text="", reask_rounds=0))
+check("choice: an empty reply within the re-asks -> asked again at the same multiple-choice prompt",
+      u["_next"] == "ask_choice_3" and u["reask_rounds"] == 1)
+u = gates.parse_answer(base_state(escalation=mce, last_answer_text="", reask_rounds=REASK_MAX))
+check("choice: an empty picker reply after the re-asks takes the recommended option, ledgered",
+      u["_next"] == "apply_answer" and u["last_answer"] == "Retry the consult"
+      and any("empty reply after" in d and "the recommended option" in d for d in u["decisions"]))
+u = gates.parse_answer(base_state(escalation=esc, last_answer_text="", reask_rounds=REASK_MAX))
+check("choice: an empty typed-prompt reply after the re-asks stays empty (no recommended option taken)",
+      u["last_answer"] == "")
+u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "Which module?", "options": [
+    {"text": "auth"}, {"text": "billing", "recommended": True, "evidence": "the issue names billing"}]}]))
+check("choice: clarify's LLM-written options -> multiple choice, recommended first, stop_options kept",
+      u["escalation"]["kind"] == "clarify" and [o["text"] for o in u["escalation"]["options"]] == ["billing", "auth"]
+      and u["escalation"]["data"]["stop_options"] == [] and gates.ask_dispatch(base_state(escalation=u["escalation"]))["_next"] == "ask_choice_2")
+s2, u = chain(base_state(escalation=u["escalation"], last_answer_text="Option 2"), "parse_answer", "apply_answer")
+check("choice: a clarify pick re-runs assess with the picked text", u["_next"] == "assess" and "A: auth" in s2["clarifications"])
+u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "Which?", "options": [
+    {"text": "a"}, {"text": "b"}]}]))
+check("choice: options with none recommended keep the typed prompt (ask_user), order kept",
+      "multiple_choice" not in u["escalation"]["data"] and [o["text"] for o in u["escalation"]["options"]] == ["a", "b"]
+      and gates.ask_dispatch(base_state(escalation=u["escalation"]))["_next"] == "ask_user")
+five = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("o1"), option("o2", True)] + [option(f"o{i}") for i in range(3, 6)]))
+one = gates.raise_escalation(base_state(), {}, escalation("handoff_path", "q", [option("Abort the run", True)]))
+check("choice: more than 4 or fewer than 2 options keep the typed prompt (ask_user), nothing trimmed",
+      gates.ask_dispatch(base_state(escalation=five["escalation"]))["_next"] == "ask_user" and len(five["escalation"]["options"]) == 5
+      and gates.ask_dispatch(base_state(escalation=one["escalation"]))["_next"] == "ask_user")
+own = [gates.raise_escalation(base_state(), {}, escalation(k, "q", [option("A", True), option("B")]))["escalation"]
+       for k in ("handoff_confirm", "draft_confirm", "review_incomplete")]
+check("choice: handoff_confirm, draft_confirm and review_incomplete keep their own approval nodes",
+      [gates.ask_dispatch(base_state(escalation=e))["_next"] for e in own]
+      == ["confirm_handoff", "confirm_draft", "ask_review_incomplete"]
+      and not any(e["data"].get("multiple_choice") for e in own))
+u = gates.scope_check(base_state(roster_scope={"TASK-001": ["src/a/"], "TASK-002": ["src/b/"]}, own_scope=["src/a/"],
+                                 expected_files=["src/b/x.py"], delegated=True, parallel_mode=True, coder_brief={}))
+check("choice: the scope_breach escalation set outside raise_escalation is a multiple choice too",
+      u.get("_next") == "send_breach_notice" and u["escalation"]["data"].get("multiple_choice") is True
+      and u["escalation"]["options"][0]["text"].startswith("Serialize") and "Option 1 (recommended)" in u["ask_question"])
 oj = escalation("pr_review_owner_judgment", "q", [option("Fix them as the reviewer asks"), option("Skip them and keep watching"),
                                                   option("Stop watching and report")],
                 data={"judgment": [{"id": "c1", "kind": "comment", "url": "u", "body": "b", "question": "q"}], "noaction": []})
@@ -1089,7 +1161,7 @@ check("pr_tracking ci: pr_gate with pending review items -> the normal publish t
 _esc = gates.ci_apply(base_state(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))["escalation"]
 check("pr_tracking ci: ci_apply exhausted keeps its question and options",
       _esc["question"] == f"CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?"
-      and [o["text"] for o in _esc["options"]] == ["Resume with one more coder fix round", "Leave the PR in draft and report"])
+      and [o["text"] for o in _esc["options"]] == ["Leave the PR in draft and report", "Resume with one more coder fix round"])
 _esc = gates.ci_apply(base_state(ci_verdict="infra"))["escalation"]
 check("pr_tracking ci: ci_apply infra keeps its question",
       _esc["question"] == "CI failed for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or leave in draft?")
@@ -1209,8 +1281,8 @@ check("pr_tracking review: pr_review_resolve on a head mismatch -> push_unconfir
       u.get("escalation", {}).get("kind") == "pr_review_push_unconfirmed" and not os.path.exists(_RESOLVED)
       and not os.path.exists(_REPLIED)
       and f"review-watch: PR #7 push not confirmed (remote 0000000000000000000000000000000000000000, local {_HEAD})" in u["decisions"]
-      and [o["text"] for o in u["escalation"]["options"]] == ["Retry the push check", "Stop watching and report"]
-      and u["escalation"]["options"][1]["recommended"] and "pr_review_pending" not in u)
+      and [o["text"] for o in u["escalation"]["options"]] == ["Stop watching and report", "Retry the push check"]
+      and u["escalation"]["options"][0]["recommended"] and "pr_review_pending" not in u)
 os.environ["SISYPHUS_GH_HEAD_CMD"] = "exit 1"
 u = gates.pr_review_resolve(rs(pr_review_pending=_round["pr_review_pending"], pr_review_rounds=1))
 check("pr_tracking review: pr_review_resolve on a failed head read -> push_unconfirmed, nothing replied or resolved",
@@ -1310,15 +1382,15 @@ u = gates.ci_apply(rs(ci_verdict="unsure"))
 check("pr_tracking review: CI unsure after the flip -> ci_unsure, review text, stop: ci_unsure",
       u["escalation"]["kind"] == "ci_unsure"
       and u["escalation"]["question"] == "Review watch stopped: CI diagnosis is unsure (unsure defaults up, never to a re-run). How to proceed?"
-      and [o["text"] for o in u["escalation"]["options"]] == ["Re-run the failing checks once", "Resume with a coder fix round", "Stop watching and report"]
-      and u["escalation"]["options"][2]["recommended"] and "review-watch: PR #7 stop: ci_unsure" in u["decisions"])
+      and [o["text"] for o in u["escalation"]["options"]] == ["Stop watching and report", "Re-run the failing checks once", "Resume with a coder fix round"]
+      and u["escalation"]["options"][0]["recommended"] and "review-watch: PR #7 stop: ci_unsure" in u["decisions"])
 for _st in ("timeout", "poll_error"):
     u = gates.ci_route(rs(ci_status=_st))
     check(f"pr_tracking review: ci_route {_st} after the flip -> ci_exhausted, review text, stop: ci_{_st}",
           u["escalation"]["kind"] == "ci_exhausted"
           and u["escalation"]["question"] == f"Review watch stopped: CI watch ended without a verdict ({_st}). Keep waiting, or stop watching?"
-          and [o["text"] for o in u["escalation"]["options"]] == ["Keep waiting (re-run the watch)", "Stop watching and report"]
-          and u["escalation"]["options"][1]["recommended"] and f"review-watch: PR #7 stop: ci_{_st}" in u["decisions"])
+          and [o["text"] for o in u["escalation"]["options"]] == ["Stop watching and report", "Keep waiting (re-run the watch)"]
+          and u["escalation"]["options"][0]["recommended"] and f"review-watch: PR #7 stop: ci_{_st}" in u["decisions"])
 u = gates.ci_route(base_state(ci_status="timeout"))
 check("pr_tracking ci: ci_route timeout keeps the draft text",
       u["escalation"]["question"] == "CI watch ended without a verdict (timeout). Keep waiting, or leave the PR in draft and report?")
@@ -1755,9 +1827,11 @@ for _label, _kind, _stop in _watch_stops:
           _stop["_next"] == "escalate_gate" and _stop["escalation"]["kind"] == _kind
           and _stop["escalation"]["hard_trigger"] is True
           and gates.escalate_gate(rs(**_esc_state))["_next"] == "ask_dispatch")
-    check(f"pr_tracking review: {_label} reaches ask_user from a subagent and from the top level",
-          gates.ask_dispatch(rs(**{**_esc_state, "top_level": False, "owner_away": True}))["_next"] == "ask_user"
-          and gates.ask_dispatch(rs(**{**_esc_state, "top_level": True, "owner_away": True}))["_next"] == "ask_user")
+    _prompt = gates._terminal_prompt(_stop["escalation"])
+    check(f"pr_tracking review: {_label} reaches its terminal prompt from a subagent and from the top level",
+          _prompt in ("ask_user", "ask_choice_2", "ask_choice_3", "ask_choice_4")
+          and gates.ask_dispatch(rs(**{**_esc_state, "top_level": False, "owner_away": True}))["_next"] == _prompt
+          and gates.ask_dispatch(rs(**{**_esc_state, "top_level": True, "owner_away": True}))["_next"] == _prompt)
 check("pr_tracking review: upstream has no remote owner channel, so the top-level owner prompt is the terminal ask_user",
       _lib.OWNER_REMOTE_INPUT is False and gates.OWNER_REMOTE_INPUT is False)
 u = gates.ci_apply(base_state(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))

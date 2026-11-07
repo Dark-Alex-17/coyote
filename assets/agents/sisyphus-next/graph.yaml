@@ -1212,13 +1212,88 @@ nodes:
       last_answer: '{{choice}}'
       last_answer_text: '{{choice}}'
 
+  ask_choice_2:
+    id: ask_choice_2
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with two options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label, the recommended one first. The engine's own "Other (custom)"
+      choice goes to parse_answer, which sends typed text that names no option to
+      interpret_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  ask_choice_3:
+    id: ask_choice_3
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with three options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label, the recommended one first. The engine's own "Other (custom)"
+      choice goes to parse_answer, which sends typed text that names no option to
+      interpret_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+      - 'Option 3'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+      'Option 3': parse_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  ask_choice_4:
+    id: ask_choice_4
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with four options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label, the recommended one first. The engine's own "Other (custom)"
+      choice goes to parse_answer, which sends typed text that names no option to
+      interpret_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+      - 'Option 3'
+      - 'Option 4'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+      'Option 3': parse_answer
+      'Option 4': parse_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
   parse_answer:
     id: parse_answer
     type: script
     description: >-
-      Number or text -> option; the first typed reply that names no option goes to
-      interpret_reply; after that, unparseable re-asks (B14) then the free text
-      stands; clears the parked marker; ledgers the decision.
+      Number or text -> option (at a multiple-choice prompt, an option label, number
+      or text with nothing but punctuation after it); the first typed reply that
+      names no option goes to interpret_reply; after that, unparseable re-asks (B14)
+      then the free text stands, except that an empty reply to a multiple-choice
+      prompt takes the recommended option; clears the parked marker; ledgers the
+      decision.
     script: scripts/parse_answer.py
     fallback: end_failure
 
@@ -1232,7 +1307,7 @@ nodes:
       A user was asked a question with fixed options and typed their own text
       instead of picking one. Decide what the text is:
       - option: the text means one of the offered options. Set reply_option to
-        that option's exact text.
+        that option's exact text (never its "Option N" label).
       - instruction: the text asks for something this question accepts (listed
         under "Accepted instructions"). Set reply_instruction to that shape's
         name and reply_value to its value, taken from the user's words.

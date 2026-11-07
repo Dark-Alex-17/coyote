@@ -19,7 +19,8 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
-    CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
+    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP,
+    CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
     DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, GH_CALL_SECS, OWNER_POLL_MAX, OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
@@ -28,9 +29,10 @@ from _lib import (  # noqa: E402
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, ledger, load_state, match_option,
-    note_script_error, now_iso, option, raise_escalation, read_artifact, run_dir_for, snapshot,
+    note_script_error, now_iso, option, read_artifact, run_dir_for, snapshot,
     tail, truthy, var, write_artifact,
 )
+from _lib import raise_escalation as _raise_escalation  # noqa: E402
 
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 
@@ -646,6 +648,59 @@ def design_gate(state):
 
 
 # ====================================================================== 2.3
+# escalation kinds whose fixed options have an approval node of their own, never a multiple-choice prompt
+OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm", "review_incomplete")
+
+
+def normalize_choices(state, u, esc):
+    """`esc` as a multiple-choice escalation, or None when it keeps the typed prompt.
+
+    Askable: a kind without its own approval node whose options, once texts that differ only in case collapse to one
+    (the recommended copy kept), number CHOICE_OPTIONS_MIN to CHOICE_OPTIONS_MAX with at least one recommended. Several
+    recommended keep the first; the recommended option moves first. Nothing is trimmed: a kind with more options, or
+    with no recommended one, keeps today's typed prompt and its options as they were.
+    """
+    if esc.get("kind") in OWN_PROMPT_KINDS:
+        return None
+    opts = [{"text": str(o.get("text")).strip(), "recommended": truthy(o.get("recommended")),
+             "evidence": str(o.get("evidence") or "").strip()}
+            for o in as_list(esc.get("options")) if isinstance(o, dict) and str(o.get("text") or "").strip()]
+    distinct = {}
+    for o in opts:
+        key = o["text"].casefold()
+        if key not in distinct or (o["recommended"] and not distinct[key]["recommended"]):
+            distinct[key] = o
+    picked = list(distinct.values())
+    recommended = [i for i, o in enumerate(picked) if o["recommended"]]
+    if not recommended or not CHOICE_OPTIONS_MIN <= len(picked) <= CHOICE_OPTIONS_MAX:
+        return None
+    asked = tail(esc.get("question", ""), 120)
+    if len(picked) < len(opts):
+        ledger(state, u, f"choice: {len(opts) - len(picked)} duplicate option(s) dropped on {asked!r}")
+    if len(recommended) > 1:
+        for i in recommended[1:]:
+            picked[i]["recommended"] = False
+        ledger(state, u, f"choice: {len(recommended)} recommended options on {asked!r}; kept the first: "
+                         f"{picked[recommended[0]]['text']}")
+    picked.insert(0, picked.pop(recommended[0]))
+    return {**esc, "options": picked, "data": {**as_dict(esc.get("data")), "multiple_choice": True}}
+
+
+def raise_escalation(state, u, esc):
+    """Raise `esc`; one normalize_choices can ask as a multiple choice goes to the ask_choice_N prompts."""
+    return _raise_escalation(state, u, normalize_choices(state, u, esc) or esc)
+
+
+def _choice_pick(text, options):
+    """The option text a reply names ("Option 2", "2", or the option's text), or None.
+
+    Only the label's own "(recommended)" and trailing punctuation may follow the reference: "Option 2, but only for
+    reads" qualifies the pick, so it is interpreted and recorded in full.
+    """
+    m = re.match(r"(?i)^\s*option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", text or "")
+    return match_option(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
+
+
 def escalate_gate(state):
     u = {}
     esc = as_dict(state.get("escalation"))
@@ -717,10 +772,13 @@ def consult_route(state):
 
 
 _TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "handoff_confirm": "confirm_handoff",
-                     "draft_confirm": "confirm_draft"}
+                     "draft_confirm": "confirm_draft",
+                     "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
 
 
 def _terminal_prompt(esc):
+    if as_dict(esc.get("data")).get("multiple_choice"):
+        return _TERMINAL_PROMPTS.get(f"choice_{len(esc.get('options') or [])}", "ask_user")
     return _TERMINAL_PROMPTS.get(esc.get("kind"), "ask_user")
 
 
@@ -782,13 +840,15 @@ def parse_answer(state):
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
     kind = esc.get("kind", "")
+    picker = truthy(as_dict(esc.get("data")).get("multiple_choice"))
     if kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
     elif kind in ("handoff_confirm", "handoff_path") and _typed_path(text, state):
         choice = text
     else:
-        choice = match_option(text, options)
+        # at a multiple-choice prompt a qualified pick ("Option 2, but ...") names no option and is interpreted
+        choice = _choice_pick(text, options) if picker else match_option(text, options)
         if choice is None and text and not truthy(state.get("reply_interpreted")):
             # the first typed reply that names no option is interpreted once, never re-asked blind
             u["reply_accepts"] = _accepts_text(kind)
@@ -802,7 +862,12 @@ def parse_answer(state):
                                  f"free text stands after {REASK_MAX} tries).\n\n" + state.get("ask_question", ""))
             u["_next"] = _terminal_prompt(esc)
             return u
-        choice = text
+        if not text and options and picker:
+            choice = options[0].get("text", "")
+            ledger(state, u, f"choice: {kind}: empty reply after {REASK_MAX} re-asks -> the recommended option: "
+                             f"{tail(choice, 200)}")
+        else:
+            choice = text
     u.update({"last_answer": choice, "last_answer_text": text, "parked": "", "reply_interpreted": False})
     ledger(state, u, f"decision: {kind}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
@@ -1358,7 +1423,7 @@ def scope_check(state):
                 owners = {f: [t for t, paths in roster.items() if any(_in_scope(f, p) for p in paths)] for f in outside}
                 breach = "; ".join(f"{f} (owned by {', '.join(o) or 'nobody declared'})" for f, o in owners.items())
                 u["scope_breach"] = breach
-                u["escalation"] = escalation(
+                esc = escalation(
                     "scope_breach",
                     f"Scope breach: correct implementation needs files outside this task's declared scope: {breach}. "
                     "Nothing was edited. How should the parent resolve it?",
@@ -1367,6 +1432,7 @@ def scope_check(state):
                      option("Proceed: scope re-declared to include these files"),
                      option("Abort this task")],
                     hard_trigger=True)
+                u["escalation"] = normalize_choices(state, u, esc) or esc
                 u["ask_question"] = __import__("_lib").render_question(u["escalation"])
                 u["_next"] = "send_breach_notice"
                 return u
