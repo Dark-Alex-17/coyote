@@ -3706,6 +3706,72 @@ mod tests {
         assert_eq!(harness.app.composer_text(), "draft");
     }
 
+    /// The gate holds for every modal kind and its answer key: the key
+    /// pressed before the question arrives is typing, the key one
+    /// millisecond short of the idle second is dropped (and re-arms the
+    /// gate), and the key at the full second answers. A fresh modal
+    /// answered exactly at the second pins the boundary itself.
+    #[test]
+    fn checklist_8_typeahead_and_idle_gate_guard_the_modal() {
+        let input_request = || PromptRequest::new(PromptAction::Input, "Name?", Origin::detached());
+        let cases: [(&str, fn() -> PromptRequest, KeyCode, PromptAnswer); 3] = [
+            (
+                "confirm",
+                || confirm_request(None),
+                KeyCode::Char('y'),
+                PromptAnswer::Confirmed(true),
+            ),
+            (
+                "input",
+                input_request,
+                KeyCode::Enter,
+                PromptAnswer::Text(String::new()),
+            ),
+            (
+                "select",
+                || list_request(PromptAction::Select, None),
+                KeyCode::Char('1'),
+                PromptAnswer::Selected("alpha".to_string()),
+            ),
+        ];
+        for (kind, request, key, expected) in cases {
+            let mut harness = Harness::standalone(80, 24);
+            harness.clock.advance(10 * HOTKEY_IDLE);
+            assert_eq!(harness.press(key), None, "{kind}");
+            let asker = ask_on_a_thread(&mut harness, request());
+            assert_eq!(
+                harness.app.prompts.len(),
+                1,
+                "{kind}: the early key answered"
+            );
+            assert!(!asker.is_finished(), "{kind}");
+            harness
+                .clock
+                .advance(HOTKEY_IDLE - Duration::from_millis(1));
+            assert_eq!(harness.press(key), None);
+            assert_eq!(
+                harness.app.prompts.len(),
+                1,
+                "{kind}: answered a millisecond early"
+            );
+            assert!(!asker.is_finished(), "{kind}");
+            harness.clock.advance(HOTKEY_IDLE);
+            assert_eq!(harness.press(key), None);
+            assert_eq!(asker.join().unwrap().unwrap(), expected, "{kind}");
+
+            let mut harness = Harness::standalone(80, 24);
+            harness.clock.advance(10 * HOTKEY_IDLE);
+            let asker = ask_on_a_thread(&mut harness, request());
+            harness.clock.advance(HOTKEY_IDLE);
+            assert_eq!(harness.press(key), None);
+            assert_eq!(
+                asker.join().unwrap().unwrap(),
+                expected,
+                "{kind}: the full second did not answer"
+            );
+        }
+    }
+
     /// Answering one question re-arms the idle gate for the next queued
     /// one: a `y` held down or pressed twice answers only the first.
     #[test]
@@ -6461,6 +6527,14 @@ mod tests {
         (cell.fg, cell.modifier.contains(Modifier::BOLD))
     }
 
+    /// The symbols of the last drawn frame's row `y`, unquoted.
+    fn row_text(harness: &Harness, y: u16) -> String {
+        let buffer = harness.terminal.backend().buffer();
+        (0..buffer.area().width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
     #[test]
     fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
         let mut harness = Harness::standalone(80, 24);
@@ -6625,7 +6699,13 @@ mod tests {
         harness.press_with_ctx(KeyCode::Char(' '), Some(&ctx));
         let palette = palette(&harness).expect("the settable keys are rows");
         assert!(palette.rows.iter().all(|row| !row.value.starts_with('.')));
-        assert!(palette.rows.iter().any(|row| row.value == "highlight"));
+        // Argument values keep the completer's trailing space, so the
+        // accepted token ends ready for the next one.
+        assert!(
+            palette.rows.iter().any(|row| row.value == "highlight "),
+            "{:?}",
+            palette.rows
+        );
         assert_eq!(palette.token_range, 5..5);
         harness.press_with_ctx(KeyCode::Tab, Some(&ctx));
         let first = palette_first_value(&harness);
@@ -6682,22 +6762,39 @@ mod tests {
         let mut harness = Harness::standalone(80, 24);
         harness.type_text(".");
         harness.render();
-        let rows = usize::from(harness.app.band_rows(Rect::new(0, 0, 80, 24)));
-        assert_eq!(rows, usize::from(bottom_pane::BAND_MAX_ROWS));
+        let rows = harness.app.band_rows(Rect::new(0, 0, 80, 24));
+        assert_eq!(rows, bottom_pane::BAND_MAX_ROWS);
         let frame = harness.terminal.backend().to_string();
-        let lines: Vec<&str> = frame.lines().collect();
-        let rule_row = usize::from(COMPOSER_RULE_ROW);
-        assert!(lines[rule_row].contains(ratatui::symbols::line::HORIZONTAL));
-        assert!(lines[rule_row - 1].contains("(+"), "{frame}");
+        assert!(row_text(&harness, COMPOSER_RULE_ROW).contains(ratatui::symbols::line::HORIZONTAL));
         assert!(
-            lines[rule_row - rows].trim_start().starts_with('.'),
+            row_text(&harness, COMPOSER_RULE_ROW - 1).contains("(+"),
             "{frame}"
+        );
+        assert!(
+            row_text(&harness, COMPOSER_RULE_ROW - rows).starts_with('.'),
+            "{frame}"
+        );
+        assert_eq!(
+            row_text(&harness, COMPOSER_RULE_ROW - rows - 1).trim(),
+            "",
+            "the status row sits between the transcript and the band\n{frame}"
         );
 
         harness.resize(80, 12);
         harness.render();
         let room = 12 - (harness.app.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
         assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 12)), room);
+        let frame = harness.terminal.backend().to_string();
+        let band_top = 12 - 1 - harness.app.composer.rows() - room;
+        assert!(row_text(&harness, band_top).starts_with('.'), "{frame}");
+        assert!(
+            row_text(&harness, band_top + room - 1).contains("(+"),
+            "the hidden count is the band's last row\n{frame}"
+        );
+        assert!(
+            row_text(&harness, band_top + room).contains(ratatui::symbols::line::HORIZONTAL),
+            "the rule follows the band\n{frame}"
+        );
     }
 
     fn submit(harness: &mut Harness, line: &str) {
@@ -7515,9 +7612,32 @@ mod tests {
                 "edit_mcp_config",
                 VIA_EDIT_GATE,
             ),
-            ("src/config/request_context.rs", "new_macro", PROMPT_GATED),
-            ("src/config/request_context.rs", "new_role", PROMPT_GATED),
-            ("src/config/request_context.rs", "save_role", PROMPT_GATED),
+            (
+                "src/config/request_context.rs",
+                "edit_session",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_agent_config",
+                VIA_EDIT_GATE,
+            ),
+            ("src/config/request_context.rs", "new_macro", VIA_EDIT_GATE),
+            (
+                "src/config/request_context.rs",
+                "upsert_role",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "upsert_skill",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_rag_docs",
+                VIA_EDIT_GATE,
+            ),
             ("src/config/update.rs", "run_self_update", PROMPT_GATED),
             ("src/main.rs", "shell_execute", CLI_ONLY),
             ("src/main.rs", "resolve_oauth_client", PROMPT_GATED),
@@ -7538,11 +7658,6 @@ mod tests {
             (
                 "src/rag/mod.rs",
                 "resolve_or_create_api_key_secret",
-                PROMPT_GATED,
-            ),
-            (
-                "src/repl/mod.rs",
-                "run_repl_command_with_prefix",
                 PROMPT_GATED,
             ),
             ("src/repl/mod.rs", "handle_shell_passthrough", VIA_RUN_GATE),

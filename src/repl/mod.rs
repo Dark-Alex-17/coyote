@@ -21,6 +21,7 @@ use crate::config::{AssetCategory, paths};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
+use crate::prompt::PromptAction;
 use crate::render::render_error;
 use crate::supervisor::Supervisor;
 use crate::turn::driver::{
@@ -29,8 +30,7 @@ use crate::turn::driver::{
 use crate::turn::{TurnDriver, TurnMode};
 use crate::utils::{
     AbortSignal, SHELL, UserInterrupt, abortable_run_with_spinner, create_abort_signal,
-    dimmed_text, drain_stale_tty_input, ensure_prompts_available, resync_cursor_queries,
-    run_command, set_text, temp_file,
+    dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -39,7 +39,6 @@ use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
 use indoc::indoc;
-use inquire::Text;
 use log::warn;
 use parking_lot::RwLock;
 use reedline::CursorConfig;
@@ -974,17 +973,7 @@ pub async fn run_repl_command_with_prefix(
                             .arguments
                             .unwrap_or_default();
                         let (mut arguments, missing) = resolve_prompt_args(&declared, provided);
-                        if !missing.is_empty() {
-                            ensure_prompts_available()?;
-                        }
-                        for key in missing {
-                            let value = Text::new(&prompt_arg_inquire_label(server, name, &key))
-                                .prompt()
-                                .with_context(|| {
-                                    format!("Failed to read prompt argument '{key}'")
-                                })?;
-                            arguments.insert(key, value);
-                        }
+                        arguments.extend(prompt_missing_args(ctx, server, name, missing)?);
                         let result = ctx
                             .tool_scope
                             .mcp_runtime
@@ -2188,6 +2177,31 @@ fn prompt_arg_inquire_label(server: &str, prompt: &str, arg: &str) -> String {
     )
 }
 
+/// Asks for each required argument the `.prompt` call left out, one
+/// Input question per key in the order the prompt declares them.
+fn prompt_missing_args(
+    ctx: &RequestContext,
+    server: &str,
+    prompt: &str,
+    missing: Vec<String>,
+) -> Result<Vec<(String, String)>> {
+    missing
+        .into_iter()
+        .map(|key| {
+            let value = ctx
+                .prompt(ctx.prompt_request(
+                    PromptAction::Input,
+                    prompt_arg_inquire_label(server, prompt, &key),
+                    Vec::new(),
+                    None,
+                ))?
+                .into_text()
+                .with_context(|| format!("Failed to read prompt argument '{key}'"))?;
+            Ok((key, value))
+        })
+        .collect()
+}
+
 pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -2275,6 +2289,7 @@ mod tests {
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::prompt::{PromptAnswer, ScriptedPrompter};
     use crate::turn::driver::{
         auto_compress_session, compress_for_error_retry, compression_failure_notice,
         dim_notice_color, interrupted_turn_notice, maybe_auto_compress, pause_banner_text,
@@ -7985,6 +8000,60 @@ local_hello() {\n\
         assert_eq!(
             prompt_arg_inquire_label("s\u{1b}[31mrv", "sum\u{1b}]0;x\u{7}marize", "pa\u{7}th"),
             "Prompt 'summarize' on 'srv' requires 'pa th':"
+        );
+    }
+
+    /// The arguments a `.prompt` call leaves out are asked for through
+    /// the context's prompter, one Input question per key in declaration
+    /// order; a cancel on any of them ends the call with the key named.
+    #[test]
+    fn missing_prompt_args_are_asked_through_the_prompter() {
+        let mut ctx = repl_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Text("notes.txt".to_string()),
+            PromptAnswer::Text("terse".to_string()),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        let filled = prompt_missing_args(
+            &ctx,
+            "srv",
+            "summarize",
+            vec!["path".to_string(), "style".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            filled,
+            vec![
+                ("path".to_string(), "notes.txt".to_string()),
+                ("style".to_string(), "terse".to_string()),
+            ]
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|req| req.action == PromptAction::Input));
+        assert_eq!(
+            requests[0].question,
+            "Prompt 'summarize' on 'srv' requires 'path':"
+        );
+        assert_eq!(
+            requests[1].question,
+            "Prompt 'summarize' on 'srv' requires 'style':"
+        );
+        assert!(
+            prompt_missing_args(&ctx, "srv", "summarize", Vec::new())
+                .unwrap()
+                .is_empty()
+        );
+
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err =
+            prompt_missing_args(&ctx, "srv", "summarize", vec!["path".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "Failed to read prompt argument 'path'");
+        assert_eq!(
+            err.root_cause().to_string(),
+            "Operation was canceled by the user"
         );
     }
 

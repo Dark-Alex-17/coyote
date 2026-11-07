@@ -115,7 +115,10 @@ impl PaletteState {
     /// command under `prefix` or nothing matches it. Argument rows and
     /// macros need the context, so a line typed mid-turn gets command
     /// rows only. `.prompt` arguments are never offered: listing them
-    /// blocks on an MCP round trip.
+    /// blocks on an MCP round trip. Once the first token is a command on
+    /// its own and a space follows it, the palette is at the argument
+    /// position: the command rows are not offered again, and the group's
+    /// sub-verbs (`.info tools` after `.info `) come as argument rows.
     pub(super) fn build(
         line: &str,
         prefix: CommandPrefix,
@@ -132,9 +135,17 @@ impl PaletteState {
             return None;
         }
         let with_sigil = |name: &str| format!("{sigil}{}", &name[1..]);
+        let candidates =
+            |filter: &str| command_candidates(snapshot.state, snapshot.model_has_reasoning, filter);
+        let at_arguments =
+            parts.len() > 1 && candidates(cmd).iter().any(|command| command.name() == cmd);
 
         let mut rows = Vec::new();
-        let mut token_range = cmd_start..line.len();
+        let mut token_range = if at_arguments {
+            parts[parts.len() - 1].1..line.len()
+        } else {
+            cmd_start..line.len()
+        };
         if parts.len() > 1
             && let Some(ctx) = ctx
         {
@@ -151,22 +162,31 @@ impl PaletteState {
             }
         }
 
-        if rows.is_empty() {
-            let command_filter = std::iter::once(cmd)
-                .chain(parts.iter().skip(1).take(1).map(|(v, _)| *v))
-                .collect::<Vec<&str>>()
-                .join(" ");
+        let command_filter = std::iter::once(cmd)
+            .chain(parts.iter().skip(1).take(1).map(|(v, _)| *v))
+            .collect::<Vec<&str>>()
+            .join(" ");
+        if rows.is_empty() && at_arguments && parts.len() == 2 {
+            let group = format!("{cmd} ");
             rows.extend(
-                command_candidates(
-                    snapshot.state,
-                    snapshot.model_has_reasoning,
-                    &command_filter,
-                )
-                .into_iter()
-                .map(|command| PaletteRow {
-                    value: format!("{} ", with_sigil(command.name())),
-                    description: command.description().to_string(),
-                }),
+                candidates(&command_filter)
+                    .into_iter()
+                    .filter_map(|command| {
+                        let verb = command.name().strip_prefix(group.as_str())?;
+                        Some(PaletteRow {
+                            value: format!("{verb} "),
+                            description: command.description().to_string(),
+                        })
+                    }),
+            );
+        } else if rows.is_empty() && !at_arguments {
+            rows.extend(
+                candidates(&command_filter)
+                    .into_iter()
+                    .map(|command| PaletteRow {
+                        value: format!("{} ", with_sigil(command.name())),
+                        description: command.description().to_string(),
+                    }),
             );
             if ctx.is_some() {
                 let macros: Vec<(String, &str)> = macros
@@ -616,6 +636,50 @@ mod tests {
         assert!(set.contains("highlight"), "{set:?}");
     }
 
+    /// `.info` is a command and the head of a group: with a space after
+    /// it the group's verbs are argument rows replacing the second token,
+    /// not command rows replacing the line. A third token is past them.
+    #[test]
+    fn a_complete_command_offers_its_group_verbs_as_arguments() {
+        let ctx = ctx_with(CommandPrefix::Dot, false);
+        let snapshot = PaletteSnapshot::from_ctx(&ctx);
+        let info = PaletteState::build(".info ", CommandPrefix::Dot, snapshot, &[], Some(&ctx))
+            .expect("the group's verbs are rows");
+        assert!(
+            info.rows.iter().any(|row| row.value == "mcp-server "),
+            "{info:?}"
+        );
+        assert!(info.rows.iter().all(|row| !row.value.starts_with('.')));
+        assert_eq!(info.token_range, 6..6);
+        assert_eq!(
+            info.rows
+                .iter()
+                .map(|row| &row.value)
+                .collect::<HashSet<_>>(),
+            PaletteState::build(".info ", CommandPrefix::Dot, snapshot, &[], None)
+                .expect("the verbs need no context")
+                .rows
+                .iter()
+                .map(|row| &row.value)
+                .collect::<HashSet<_>>()
+        );
+        let typed = PaletteState::build(".info mc", CommandPrefix::Dot, snapshot, &[], None)
+            .expect("a typed verb narrows them");
+        assert_eq!(typed.token_range, 6..8);
+        assert_eq!(typed.rows[0].value, "mcp-server ");
+        assert!(
+            PaletteState::build(
+                ".info mcp-server srv ",
+                CommandPrefix::Dot,
+                snapshot,
+                &[],
+                Some(&ctx)
+            )
+            .is_none()
+        );
+        assert!(PaletteState::build(".help ", CommandPrefix::Dot, snapshot, &[], None).is_none());
+    }
+
     #[test]
     fn prompt_arguments_are_not_offered() {
         let ctx = ctx_with(CommandPrefix::Dot, false);
@@ -664,7 +728,9 @@ mod tests {
     fn accept_replaces_the_token_range() {
         let mut palette = rows(&[".agent", ".alias"]);
         assert_eq!(palette.accept(".a"), None);
-        palette.move_highlight(2);
+        palette.move_highlight(1);
+        assert_eq!(palette.accept(".a").as_deref(), Some(".agent "));
+        palette.move_highlight(1);
         assert_eq!(palette.accept(".a").as_deref(), Some(".alias "));
         palette.token_range = 6..7;
         palette.rows[1] = PaletteRow {
@@ -693,7 +759,9 @@ mod tests {
     #[test]
     fn rows_pad_the_name_column_and_reverse_the_highlight() {
         let mut palette = rows(&[".a", ".bbb"]);
-        palette.move_highlight(2);
+        palette.move_highlight(1);
+        palette.move_highlight(1);
+        assert_eq!(palette.highlight, Some(1));
         let (buf, lines) = rendered(&palette, 2);
         assert_eq!(lines, vec![".a    about .a", ".bbb  about .bbb"]);
         assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));

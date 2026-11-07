@@ -381,6 +381,19 @@ mod tests {
             turn_running: true,
             ..IDLE
         };
+        let running_vi_insert = KeyContext {
+            vi: Some(ViMode::Insert),
+            ..running
+        };
+        let running_with = |popup: PopupKind| KeyContext {
+            popup: Some(popup),
+            ..running
+        };
+        let under = |modal: ModalKind| KeyContext {
+            modal: Some(modal),
+            ..running
+        };
+        let cancelled = Action::Answer(PromptAnswer::Cancelled);
         let cases = [
             (ctrl('c'), IDLE, Action::Quit),
             (ctrl('c'), typing, Action::ClearComposer),
@@ -391,6 +404,55 @@ mod tests {
             (plain(KeyCode::Esc), IDLE, Action::IdleEsc),
             (plain(KeyCode::Esc), typing, Action::Nothing),
             (plain(KeyCode::Esc), running, Action::Interrupt),
+            (plain(KeyCode::Esc), running_vi_insert, Action::Interrupt),
+            (
+                plain(KeyCode::Esc),
+                running_with(PopupKind::Palette),
+                Action::ClosePopup,
+            ),
+            (
+                plain(KeyCode::Esc),
+                running_with(PopupKind::Rewind),
+                Action::ClosePopup,
+            ),
+            (
+                plain(KeyCode::Esc),
+                running_with(PopupKind::HistorySearch),
+                Action::ClosePopup,
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Confirm {
+                    default: true,
+                    tool: true,
+                }),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Input),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Select {
+                    custom_field_open: false,
+                }),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Select {
+                    custom_field_open: true,
+                }),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Checkbox),
+                cancelled.clone(),
+            ),
+            (plain(KeyCode::Esc), under(ModalKind::Password), cancelled),
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");

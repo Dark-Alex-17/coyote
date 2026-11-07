@@ -77,7 +77,6 @@ use gman::providers::SupportedProvider;
 use hooks::{McpServerHooks, RagSyncHooks};
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{Confirm, Text, validator::Validation};
 use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
@@ -4129,10 +4128,14 @@ impl RequestContext {
         if self.macro_flag {
             bail!("No role");
         }
-        ensure_prompts_available()?;
-        let ans = Confirm::new("Create a new role?")
-            .with_default(true)
-            .prompt()?;
+        let ans = self
+            .prompt(self.prompt_request(
+                PromptAction::Confirm,
+                "Create a new role?",
+                Vec::new(),
+                Some(serde_json::json!(true)),
+            ))?
+            .into_confirmed()?;
         if ans {
             self.upsert_role(app, name)?;
         } else {
@@ -4155,19 +4158,26 @@ impl RequestContext {
             None => bail!("No role"),
         };
         if role_name == TEMP_ROLE_NAME {
-            ensure_prompts_available()?;
-            role_name = Text::new("Role name:")
-                .with_validator(|input: &str| {
-                    let input = input.trim();
-                    if input.is_empty() {
-                        Ok(Validation::Invalid("This name is required".into()))
-                    } else if input == TEMP_ROLE_NAME {
-                        Ok(Validation::Invalid("This name is reserved".into()))
-                    } else {
-                        Ok(Validation::Valid)
-                    }
-                })
-                .prompt()?;
+            role_name = loop {
+                let input = self
+                    .prompt(self.prompt_request(
+                        PromptAction::Input,
+                        "Role name:",
+                        Vec::new(),
+                        None,
+                    ))?
+                    .into_text()?;
+                let input = input.trim();
+                if input.is_empty() {
+                    eprintln!("This name is required");
+                    continue;
+                }
+                if input == TEMP_ROLE_NAME {
+                    eprintln!("This name is reserved");
+                    continue;
+                }
+                break input.to_string();
+            };
         }
         let role_path = paths::role_file(&role_name);
         if let Some(role) = self.role.as_mut() {
@@ -4241,10 +4251,14 @@ impl RequestContext {
         if self.macro_flag {
             bail!("No macro");
         }
-        ensure_prompts_available()?;
-        let ans = Confirm::new("Create a new macro?")
-            .with_default(true)
-            .prompt()?;
+        let ans = self
+            .prompt(self.prompt_request(
+                PromptAction::Confirm,
+                "Create a new macro?",
+                Vec::new(),
+                Some(serde_json::json!(true)),
+            ))?
+            .into_confirmed()?;
         if ans {
             let macro_path = paths::macro_file(name);
             ensure_parent_exists(&macro_path)?;
@@ -11968,66 +11982,97 @@ mod tests {
         );
     }
 
-    /// `.role new` and `.macro new` create their parent directory before
-    /// the editor opens; the refusal leaves neither the directory nor the
-    /// file behind.
+    /// `.macro new` asks `Create a new macro?` through the prompter; a
+    /// `no` leaves neither the file nor its directory behind.
     #[test]
     #[serial]
-    fn upsert_role_and_new_macro_under_the_tui_refuse_before_creating_anything() {
+    fn new_macro_declined_through_the_prompter_creates_nothing() {
         let _guard = TestConfigDirGuard::new();
-        let ctx = create_test_ctx();
-        let role_path = paths::role_file("tui-refused-role");
-        let macro_path = paths::macro_file("tui-refused-macro");
-        for path in [&role_path, &macro_path] {
-            assert!(
-                !path.parent().unwrap().exists(),
-                "{} exists before the refusal",
-                path.parent().unwrap().display()
-            );
-        }
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
-        assert_refused_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
-        assert_refused_under_the_tui(ctx.new_macro(&app, "tui-refused-macro").unwrap_err());
-        for path in [&role_path, &macro_path] {
-            assert!(
-                !path.exists() && !path.parent().unwrap().exists(),
-                "the refusal created {} or its directory",
-                path.display()
-            );
-        }
+        let macro_path = paths::macro_file("declined-macro");
+        assert!(!macro_path.parent().unwrap().exists());
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+
+        let err = ctx.new_macro(&app, "declined-macro").unwrap_err();
+
+        assert_eq!(err.to_string(), "No macro");
+        assert!(
+            !macro_path.exists() && !macro_path.parent().unwrap().exists(),
+            "the declined macro created {} or its directory",
+            macro_path.display()
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Create a new macro?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(true)));
     }
 
-    /// `.role <new>` asks `Create a new role?` and `.save role` on a temp
-    /// role asks for its name, both on the raw tty; under the full-screen
-    /// UI each is refused before the question is built and no role file
-    /// appears.
+    /// `.role <new>` asks `Create a new role?` through the prompter, with
+    /// yes as the default; a `no` is `No role`, a cancel is the
+    /// prompter's cancel error, and neither leaves a role file. The yes
+    /// path opens the configured editor, a process-wide choice a unit
+    /// test cannot stub, so it is not driven here.
     #[test]
     #[serial]
-    fn new_role_and_save_role_under_the_tui_refuse_before_asking() {
+    fn new_role_asks_through_the_prompter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+
+        let err = ctx.new_role(&app, "declined-role").unwrap_err();
+
+        assert_eq!(err.to_string(), "No role");
+        assert!(!paths::role_file("declined-role").exists());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Create a new role?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(true)));
+
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err = ctx.new_role(&app, "cancelled-role").unwrap_err();
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+        assert!(!paths::role_file("cancelled-role").exists());
+    }
+
+    /// `.save role` on the temp role asks for a name through the prompter
+    /// and asks again after an empty or the reserved one; the role is
+    /// saved under the first usable answer, trimmed.
+    #[test]
+    #[serial]
+    fn save_role_re_asks_until_the_name_is_usable() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         ctx.use_temp_role(&app, "a temporary role").unwrap();
-        let roles_dir = paths::role_file("tui-refused-new-role")
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        assert!(
-            !roles_dir.exists(),
-            "{} exists before the refusal",
-            roles_dir.display()
-        );
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
-        let err = ctx.new_role(&app, "tui-refused-new-role").unwrap_err();
-        assert_refused_under_the_tui(err);
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
+            PromptAnswer::Text(TEMP_ROLE_NAME.to_string()),
+            PromptAnswer::Text(" mine ".to_string()),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        ctx.save_role(None).unwrap();
+
+        assert!(paths::role_file("mine").exists());
+        assert!(!paths::role_file(TEMP_ROLE_NAME).exists());
+        assert_eq!(ctx.role.as_ref().unwrap().name(), "mine");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 3);
+        for req in &requests {
+            assert_eq!(req.action, PromptAction::Input);
+            assert_eq!(req.question, "Role name:");
+        }
+
+        ctx.use_temp_role(&app, "another temporary role").unwrap();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
         let err = ctx.save_role(None).unwrap_err();
-        assert_refused_under_the_tui(err);
-        assert!(
-            !roles_dir.exists(),
-            "the refusal created {}",
-            roles_dir.display()
-        );
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
     }
 
     /// A seeded child hands out the very signal `agent__cancel` sets; the
