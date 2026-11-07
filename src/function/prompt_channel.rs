@@ -387,6 +387,12 @@ fn deliver_lines(
                 }
             },
         };
+        // A wake issued before this instance existed found nothing to
+        // connect to, so the flag has to be re-read now that it does.
+        if shared.delivery.lock().unwrap().closed {
+            win::disconnect(&pipe);
+            return;
+        }
         if let Err(err) = win::connect(&pipe) {
             debug!("Prompt reply client left before it was accepted: {err}");
             win::disconnect(&pipe);
