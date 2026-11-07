@@ -71,6 +71,11 @@ question, or any other escalation the user replied to with a question, such as
 `plan_defect`. The record carries the question, its options with the
 recommended one marked and the user's `reply` that parked it; architect-next's
 also carries the answers so far and the plan path, sisyphus-next's the task.
+When architect-next's sisyphus-next implementer parks on a question,
+architect-next relays it: its own record has `discussion.kind`
+`delegate_discussion` and carries the implementer's question, options and
+reply, and `continue: <answer>` to architect-next hands the answer to that
+same implementer run, so the user never talks to the implementer directly.
 The engineer discusses it without editing the plan or the code or answering
 for the user, then tells
 the user to say `continue: <settled answer>` (or `continue` to be asked again)

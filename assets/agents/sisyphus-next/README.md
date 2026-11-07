@@ -185,9 +185,16 @@ at `end_discussion` with a `SISYPHUS_AWAITING_DISCUSSION`
 message naming the run id. The next message `continue` restores the parked run and asks the
 question again; `continue: <answer>` takes the answer through `parse_answer` like a fresh
 reply; `resume` is an alias; a parent orchestrator resumes with `Sisyphus run id: <id>` plus
-the continue line. The live graph variables are never restored from the park (`project_dir`
-is made absolute, and a git root that no longer matches the parked one is ledgered while the
-parked one is kept), the re-ask count starts over, and the parked state is removed on resume,
+the continue line. A delegated run ends that message with one more line for the parent,
+`Discussion data: <json>`: a single-line JSON object with `kind`, `question`, `options` (each
+a `text` and a `recommended` flag), the `reply` that parked it and the `run_id`, so the
+parent can relay the question without parsing the prose. architect-next relays it this way:
+it parks its own run on the question, and on the owner's `continue: <answer>` it resumes
+this run with exactly `Sisyphus run id: <id>` and `continue: <answer>` on two lines (its
+README's Delegated discussions paragraph). The live graph variables are never restored from
+the park (`project_dir` is made absolute, and a git root that no longer matches the parked
+one is ledgered while the parked one is kept), the re-ask count starts over, and the parked
+state is removed on resume,
 so a later continue starts fresh. Any other message, prose such as `continue please`
 included, starts a fresh run and leaves the park. One question (its kind plus the text it was
 first asked with) parks at most `DISCUSSION_PARKS_MAX` (3) times, so a new escalation of the
