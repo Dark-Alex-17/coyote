@@ -657,9 +657,11 @@ struct Candidate {
 /// stops at the terminal's height, so the pty grows past the set first.
 fn repl_completer_candidates(dir: &Path, sigil: char) -> Vec<Candidate> {
     let mut pty = spawn_ui(dir, "repl", &[]);
+    // Grown before the line editor starts reading: a resize mid-read is
+    // a signal the editor repaints on, and the keys behind it are lost.
+    pty.resize(100, 100).unwrap();
     pty.wait_for(")> ", PTY_DEADLINE)
         .expect("the REPL prompt never appeared");
-    pty.resize(100, 100).unwrap();
     pty.read_for(Duration::from_millis(500));
     let menu_at = pty.raw().len();
     pty.send(sigil.to_string().as_bytes()).unwrap();
