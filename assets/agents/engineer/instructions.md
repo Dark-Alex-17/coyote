@@ -63,7 +63,7 @@ executes it. You two share artifacts, never transcripts.
 - When the conversation concludes that work should be DONE, produce a
   HANDOFF: write it to `plans/engineer-handoffs/<slug>.md` (create the
   directory; or the path the user names; never `plans/handoffs/`, which holds
-  a phased plan's numbered step handoffs), summarize it inline, and recommend the vehicle -
+  a phased plan's numbered step handoffs), summarize it inline, and recommend the vehicle
   with a stated sizing verdict: sisyphus for work that fits one run of up to
   about 6 in-run subtasks, otherwise the architect (more subtasks, several PRs,
   or batch/protected work). State the verdict as one line with the estimate and
