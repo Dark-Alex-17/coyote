@@ -6,7 +6,7 @@ use super::rag_cache::{RagCache, RagKey};
 use super::session::{
     AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
     KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget, labeled_session_names,
-    merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
+    list_session_names, merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -52,8 +52,7 @@ use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    estimate_token_length, fuzzy_filter, get_env_name, list_file_names, now, render_prompt,
-    temp_file,
+    estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -4787,7 +4786,7 @@ impl RequestContext {
         [SessionScope::Workspace, SessionScope::Global]
             .into_iter()
             .flat_map(|scope| {
-                list_file_names(self.sessions_dir_for(scope), ".yaml")
+                list_session_names(&self.sessions_dir_for(scope))
                     .into_iter()
                     .map(move |name| (name, scope))
             })
@@ -17124,6 +17123,52 @@ mod tests {
                 SessionScope::Global
             )
         );
+    }
+
+    #[test]
+    #[serial]
+    fn nested_sessions_are_listed_completed_and_deletable() {
+        let _config = HelperConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "top", SessionScope::Global, "messages: []\n");
+        write_session_file(
+            &ctx,
+            "oncall/incident-1",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        write_session_file(&ctx, "oncall/deep/x", SessionScope::Workspace, "");
+        write_session_file(
+            &ctx,
+            &format!("{AUTONAME_PLACEHOLDER}/auto"),
+            SessionScope::Global,
+            "",
+        );
+
+        assert_eq!(
+            ctx.list_sessions(),
+            vec!["oncall/deep/x", "oncall/incident-1", "top"]
+        );
+        assert_eq!(
+            ctx.labeled_sessions(),
+            vec![
+                ("oncall/deep/x".to_string(), Some("workspace".to_string())),
+                ("oncall/incident-1".to_string(), Some("global".to_string())),
+                ("top".to_string(), Some("global".to_string())),
+            ]
+        );
+        assert_eq!(
+            ctx.session_delete_entries(),
+            vec![
+                ("oncall/deep/x".to_string(), SessionScope::Workspace),
+                ("oncall/incident-1".to_string(), SessionScope::Global),
+                ("top".to_string(), SessionScope::Global),
+            ]
+        );
+
+        ctx.delete_session_at("oncall/incident-1", SessionScope::Global)
+            .unwrap();
+        assert_eq!(ctx.list_sessions(), vec!["oncall/deep/x", "top"]);
     }
 
     #[test]
