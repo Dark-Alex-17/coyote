@@ -398,7 +398,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Drops CSI, OSC and two-byte escape sequences, leaving the printable
 /// text. A CSI is parameter bytes, then intermediate bytes, then one final
 /// byte; a non-CSI escape may carry one intermediate before its final.
-#[cfg(unix)]
 pub fn strip_ansi(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
