@@ -6102,10 +6102,6 @@ mod tests {
         // id of the work that removes it.
         let allowlisted: &[(&str, &str)] = &[
             (
-                "src/function/prompt_channel.rs",
-                "bail!(\"Prompt reply channel is not implemented on this platform\")",
-            ),
-            (
                 "src/utils/command.rs",
                 "bail!(\"Shell passthrough is not available in the TUI yet\")",
             ),
