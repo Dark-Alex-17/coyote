@@ -1383,6 +1383,11 @@ fn copy_tree(src: &Path, dst: &Path) {
 fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
     let agents = scratch.0.join("tree").join("agents");
     copy_tree(&agents_dir().join(".shared"), &agents.join(".shared"));
+    // the sizing rows run architect-next's own seed finder on the handoff they write
+    copy_tree(
+        &agents_dir().join("architect-next").join("scripts"),
+        &agents.join("architect-next").join("scripts"),
+    );
     let copy = agents.join(CANDIDATE);
     copy_tree(&candidate_dir(), &copy);
     copy
@@ -1771,6 +1776,92 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "    if False:\n        ledger(",
                 "handoff pickup: a typed path to a vehicle-architect handoff is the brief but stays \
                  ready, ledgered",
+            ),
+        ],
+    );
+}
+
+/// The guards behind the multiple-choice prompts and the sizing verdict: a
+/// qualified pick is interpreted, the recommended option moves first, the
+/// kinds with their own approval node keep it, more than four options keep
+/// the typed prompt, an empty reply after the re-asks takes the recommended
+/// option; only a top-level run asks the verdict, the verdict is a hard
+/// trigger, the handoff is a `vehicle: architect` seed architect-next's own
+/// `_find_seed` picks up, a planner overflow is asked about rather than
+/// redirected, and doing it here is not offered again after the overflow.
+#[test]
+#[ignore = "ten smoke battery runs take about two minutes; run with -- --ignored"]
+fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    run_smoke_sabotages(
+        &python,
+        &[
+            (
+                "choice-qualified-pick",
+                r#"option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", text"#,
+                r#"option\s+(\d+)(?:\s*\(recommended\))?[\W_]*", text"#,
+                "choice: a qualified pick ('Option 2, but ...') names no option -> interpret_reply, \
+                 the reply kept in full",
+            ),
+            (
+                "choice-recommended-first",
+                "    picked.insert(0, picked.pop(recommended[0]))\n",
+                "",
+                "choice: 2-4 options with one recommended -> multiple choice, the recommended option \
+                 first, ask_choice_N",
+            ),
+            (
+                "choice-own-kinds",
+                "    if esc.get(\"kind\") in OWN_PROMPT_KINDS:\n        return None\n",
+                "    if False:\n        return None\n",
+                "choice: handoff_confirm, draft_confirm and review_incomplete keep their own approval \
+                 nodes",
+            ),
+            (
+                "choice-no-trim",
+                "not CHOICE_OPTIONS_MIN <= len(picked) <= CHOICE_OPTIONS_MAX",
+                "len(picked) < CHOICE_OPTIONS_MIN",
+                "choice: more than 4 or fewer than 2 options keep the typed prompt (ask_user), nothing \
+                 trimmed",
+            ),
+            (
+                "choice-empty-recommended",
+                "        if not text and options and picker:\n",
+                "        if False:\n",
+                "choice: an empty picker reply after the re-asks takes the recommended option, ledgered",
+            ),
+            (
+                "sizing-top-level",
+                "    elif sizing == \"plan_shaped\" and truthy(state.get(\"top_level\")):\n",
+                "    elif sizing == \"plan_shaped\":\n",
+                "sizing: a delegated plan_shaped run keeps SISYPHUS_REDIRECT (end_redirect), never asks",
+            ),
+            (
+                "sizing-hard-trigger",
+                "\"sizing_verdict\", question, opts, evidence=\"\\n\".join(evidence), hard_trigger=True,",
+                "\"sizing_verdict\", question, opts, evidence=\"\\n\".join(evidence), hard_trigger=False,",
+                "sizing: the verdict escalates even under escalation_policy=autonomous, asked at \
+                 ask_choice_3",
+            ),
+            (
+                "seed-vehicle",
+                "\"vehicle: architect\", f\"project: {project}\"",
+                "\"vehicle: sisyphus\", f\"project: {project}\"",
+                "sizing: architect-next's own _find_seed picks the written handoff up as its ready seed",
+            ),
+            (
+                "overflow-asks",
+                "        if truthy(state.get(\"top_level\")):\n            # never silently",
+                "        if False:\n            # never silently",
+                "record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, \
+                 never trimmed",
+            ),
+            (
+                "overflow-no-here",
+                "    if planned is None:\n        opts.append(",
+                "    if True:\n        opts.append(",
+                "record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, \
+                 never trimmed",
             ),
         ],
     );
@@ -3002,7 +3093,9 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "reask_rounds",
     "rejected_rounds",
     "review_rounds",
+    "sizing_rounds",
     "strikeout_rounds",
+    "subtask_estimate",
     "subtask_index",
     "task_number",
 ];
@@ -3011,6 +3104,8 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// re-run-once family covers `debris_reruns`), as written in the baseline,
 /// plus the review-watch bounds.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
+    ("CHOICE_OPTIONS_MAX", "4"),
+    ("CHOICE_OPTIONS_MIN", "2"),
     ("CI_FLAKE_RERUNS", "2"),
     ("CI_LOG_RUNS_MAX", "3"),
     ("CI_POLL_FAILS", "3"),
@@ -3035,7 +3130,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("REVIEW_POLL_SLEEP", "600"),
     ("REVIEW_WALL_SECS", "REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP"),
     ("STRIKE_LIMIT", "3"),
-    ("SUBTASK_MAX", "3"),
+    ("SUBTASK_MAX", "6"),
     ("TAIL_CHARS", "6000"),
 ];
 
@@ -5221,6 +5316,10 @@ fn engineer_sisyphus_block_states_the_handoff_contract() {
         "the run drafts a brief from this conversation and confirms that instead",
         "`status: consumed` once it has started work on it",
         "never edit a handoff whose status is `consumed`",
+        "the run does up to about 6 in-run subtasks; beyond that the architect is the vehicle",
+        "\"about 9 subtasks across 3 modules, needs a sealed plan\"",
+        "asks the user instead of refusing: hand it to the architect",
+        "do it here in up to 6 subtasks, or narrow the scope",
     ] {
         assert!(
             flat.contains(needle),
@@ -5267,6 +5366,9 @@ fn engineer_standalone_block_states_the_sisyphus_go_ahead() {
          `vehicle: sisyphus` handoff can also be started with a bare \"go ahead\"",
         "(an explicit path still works)",
         "\"execute the handoff at <path>\"",
+        "recommend the vehicle with a stated sizing verdict: sisyphus for work that fits one run of \
+         up to about 6 in-run subtasks, otherwise the architect",
+        "State the verdict as one line with the estimate and its reason",
     ] {
         assert!(
             flat.contains(needle),
@@ -5304,7 +5406,8 @@ fn route_instructions_send_a_bare_go_ahead_and_a_discussion_continue_to_run() {
 
 /// The chat lane only sees what the graph exposes, the resume only finds the
 /// parked run through the carried id, and the handoff and draft confirmations
-/// are the fixed-option prompts `_terminal_prompt` routes to.
+/// and the multiple-choice prompts are the fixed-option prompts
+/// `_terminal_prompt` routes to; a handed-over run ends at `end_handoff`.
 #[test]
 fn graph_exposes_the_discussion_carries_its_run_id_and_declares_the_confirmations() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -5338,6 +5441,18 @@ fn graph_exposes_the_discussion_carries_its_run_id_and_declares_the_confirmation
             "confirm_draft",
             &["Use this draft", "Edit the draft", "Abort the run"][..],
         ),
+        (
+            "ask_choice_2",
+            &["Option 1 (recommended)", "Option 2"][..],
+        ),
+        (
+            "ask_choice_3",
+            &["Option 1 (recommended)", "Option 2", "Option 3"][..],
+        ),
+        (
+            "ask_choice_4",
+            &["Option 1 (recommended)", "Option 2", "Option 3", "Option 4"][..],
+        ),
     ] {
         let n = &doc["nodes"][node];
         assert_eq!(n["type"].as_str(), Some("approval"), "{node}");
@@ -5360,4 +5475,46 @@ fn graph_exposes_the_discussion_carries_its_run_id_and_declares_the_confirmation
         doc["nodes"]["end_discussion"]["output"].as_str(),
         Some("{{discussion_message}}\n")
     );
+    assert_eq!(
+        doc["nodes"]["end_handoff"]["output"].as_str(),
+        Some("SISYPHUS_HANDOFF\n{{handoff_report}}\n\nSisyphus run id: {{run_id}}\n")
+    );
+}
+
+/// Plan-shaped work is asked about with a stated verdict: unsure sizing stays
+/// compound instead of defaulting up to plan_shaped, the bound is six in-run
+/// subtasks, and assess states the reason, the estimate and the breakdown the
+/// architect handoff carries.
+#[test]
+fn assess_states_a_sizing_verdict_and_no_longer_defaults_unsure_sizing_up() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let assess = &doc["nodes"]["assess"];
+    let flat = assess["instructions"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for gone in ["Unsure defaults UP", "plan_shaped over compound", "at most 3", "more than 3"] {
+        assert!(!flat.contains(gone), "assess still says {gone:?}:\n{flat}");
+    }
+    for needle in [
+        "compound = an ordered breakdown of at most 6 subtasks in one PR",
+        "plan_shaped = more than 6 subtasks, cross-PR sequencing, or batch/protected semantics",
+        "a top-level run asks the user with your verdict",
+        "Unsure between simple and compound: compound.",
+        "Unsure between compound and plan_shaped: compound; plan_shaped only when the evidence shows it.",
+        "sizing_reason is ONE line naming the evidence",
+        "subtask_estimate the estimated number of subtasks",
+        "proposed_breakdown one short line per estimated subtask",
+    ] {
+        assert!(flat.contains(needle), "assess does not state {needle:?}:\n{flat}");
+    }
+    let props = &assess["output_schema"]["properties"];
+    assert_eq!(props["sizing_reason"]["type"].as_str(), Some("string"));
+    assert_eq!(props["subtask_estimate"]["type"].as_str(), Some("integer"));
+    assert_eq!(props["proposed_breakdown"]["type"].as_str(), Some("array"));
+    let plan = doc["nodes"]["plan_subtasks"]["prompt"].as_str().unwrap();
+    assert!(plan.contains("{{sizing_note}}"), "plan_subtasks must read the sizing note");
 }

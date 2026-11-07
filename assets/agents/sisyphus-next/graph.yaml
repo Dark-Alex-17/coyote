@@ -71,7 +71,7 @@ variables:
 settings:
   # Engine backstop only: every cycle carries its own named bound in a script. Worst legitimate visit count of the most-visited node
   # (run_gauntlet: 1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
-  # per subtask, x3 subtasks = 18); user-driven review retries ride the headroom.
+  # per subtask, x6 subtasks (SUBTASK_MAX) = 36); user-driven review retries ride the headroom.
   max_loop_iterations: 100
   log_state_snapshots: true
   validate_before_run: true

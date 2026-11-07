@@ -628,6 +628,7 @@ five = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q",
 one = gates.raise_escalation(base_state(), {}, escalation("handoff_path", "q", [option("Abort the run", True)]))
 check("choice: more than 4 or fewer than 2 options keep the typed prompt (ask_user), nothing trimmed",
       gates.ask_dispatch(base_state(escalation=five["escalation"]))["_next"] == "ask_user" and len(five["escalation"]["options"]) == 5
+      and "multiple_choice" not in five["escalation"]["data"]
       and gates.ask_dispatch(base_state(escalation=one["escalation"]))["_next"] == "ask_user")
 own = [gates.raise_escalation(base_state(), {}, escalation(k, "q", [option("A", True), option("B")]))["escalation"]
        for k in ("handoff_confirm", "draft_confirm", "review_incomplete")]
