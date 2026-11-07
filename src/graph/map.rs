@@ -93,6 +93,7 @@ async fn run_map(
         let max_concurrency = step_ctx.max_concurrency;
         let sem = semaphore.clone();
         let abort = step_ctx.abort_signal.clone();
+        let headless_answers = step_ctx.headless_answers.clone();
 
         // Cancellation net behind the chain runner's own retirement: a task
         // aborted before or during its chain still leaves the item's identity
@@ -120,6 +121,7 @@ async fn run_map(
                 max_concurrency,
                 abort_signal: &abort,
                 branch_mode: true,
+                headless_answers,
             };
             let chain = ItemChain {
                 map_id: &map_id,
@@ -759,6 +761,7 @@ mod tests {
 mod chain_tests {
     use super::super::executor::GraphExecutor;
     use super::super::script::ScriptExecutor;
+    use super::super::user_interaction::HeadlessAnswerGuard;
     use super::*;
     use crate::config::paths;
     use crate::config::{AppState, Role, WorkingMode};
@@ -1141,6 +1144,7 @@ else:
             max_concurrency: 4,
             abort_signal: &abort,
             branch_mode: false,
+            headless_answers: HeadlessAnswerGuard::default(),
         };
         let items = json!(["a", "b", "c"]);
         let mut parent = StateManager::new(HashMap::from([("items".to_string(), items.clone())]));
@@ -1717,6 +1721,7 @@ nodes:
                 max_concurrency: 4,
                 abort_signal: &self.abort,
                 branch_mode: true,
+                headless_answers: HeadlessAnswerGuard::default(),
             };
             let subgraph = self.subgraph(entry);
             let chain = ItemChain {
