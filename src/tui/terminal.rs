@@ -3,6 +3,11 @@
 //! that redirects fd 1 into its capture pipe never swallows a draw or the
 //! restore, and the panic hook writes the leave sequence through that same
 //! descriptor before the default hook prints.
+//!
+//! On Windows the descriptor is a duplicated stdout handle, written through
+//! `WriteConsoleW` when it is a console, and the console modes crossterm
+//! cannot reach through a writer (escape processing, the input flags) are
+//! kept by hand here.
 
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
@@ -25,16 +30,37 @@ use std::sync::Once;
 #[cfg(unix)]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, AtomicU64};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    ENABLE_EXTENDED_FLAGS, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+};
 
 #[cfg(unix)]
 pub(crate) type TtyWriter = std::fs::File;
-#[cfg(not(unix))]
-pub(crate) type TtyWriter = io::Stdout;
+#[cfg(windows)]
+pub(crate) type TtyWriter = io::BufWriter<console::ConsoleWriter>;
 
 /// Raw fd of the dup'd stdout the panic hook restores through; -1 until
 /// `Screen::enter` has run, and again once the `Screen` is gone.
 #[cfg(unix)]
 static PANIC_FD: AtomicI32 = AtomicI32::new(-1);
+/// Raw handle of the duplicated stdout the panic hook restores through and
+/// the escape-processing check reads; 0 (the null handle, which no open
+/// handle has, while INVALID_HANDLE_VALUE is -1) until `Screen::enter` has
+/// run, and again once the `Screen` is gone.
+#[cfg(windows)]
+static CONSOLE_HANDLE: AtomicIsize = AtomicIsize::new(0);
+/// The console input mode before raw mode first came on, taken once per
+/// `Screen::enter`; the whole u32 range is a mode, so the "never taken"
+/// sentinel lives above it at `u64::MAX`.
+#[cfg(windows)]
+static SAVED_INPUT_MODE: AtomicU64 = AtomicU64::new(NO_SAVED_INPUT_MODE);
+#[cfg(windows)]
+const NO_SAVED_INPUT_MODE: u64 = u64::MAX;
 /// Whether the keyboard enhancement flags are currently pushed, so the
 /// leave path pops them exactly when the enter path pushed them.
 static ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
@@ -141,9 +167,263 @@ pub(crate) fn open_tty_writer() -> io::Result<TtyWriter> {
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(not(unix))]
+/// A second handle on stdout, independent of what a later `SetStdHandle`
+/// makes the process's stdout.
+#[cfg(windows)]
 pub(crate) fn open_tty_writer() -> io::Result<TtyWriter> {
-    Ok(io::stdout())
+    use std::os::windows::io::AsHandle;
+    let handle = io::stdout().as_handle().try_clone_to_owned()?;
+    Ok(io::BufWriter::new(console::ConsoleWriter::new(handle)))
+}
+
+#[cfg(windows)]
+mod console {
+    use std::io::{self, Write};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
+    };
+    use windows_sys::Win32::System::Console::{GetConsoleMode, SetConsoleMode, WriteConsoleW};
+
+    /// Most UTF-16 units handed to one `WriteConsoleW`; the console host
+    /// fails larger buffers outright on some Windows versions.
+    const MAX_UNITS_PER_WRITE: usize = 8192;
+
+    /// Writes to a console through `WriteConsoleW`, so text outside the
+    /// console's code page still arrives intact, and to anything else (a
+    /// pipe, a file) through `WriteFile`. A write that ends inside a UTF-8
+    /// sequence has those bytes held back and reported as written, the
+    /// same way std's stdout treats them, since the buffer above splits
+    /// at byte counts, not character boundaries.
+    pub(crate) struct ConsoleWriter {
+        handle: OwnedHandle,
+        pending: [u8; 4],
+        pending_len: usize,
+    }
+
+    impl ConsoleWriter {
+        pub(super) fn new(handle: OwnedHandle) -> Self {
+            Self {
+                handle,
+                pending: [0; 4],
+                pending_len: 0,
+            }
+        }
+
+        pub(super) fn raw_handle(&self) -> HANDLE {
+            self.handle.as_raw_handle()
+        }
+
+        /// Finishes the sequence held back by an earlier write. The lead
+        /// byte's run of leading one bits is the sequence length, and it
+        /// is in 2..=4 because `from_utf8` classified the held bytes as
+        /// an incomplete sequence rather than invalid ones.
+        fn complete_pending(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let width = self.pending[0].leading_ones() as usize;
+            let take = buf.len().min(width - self.pending_len);
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&buf[..take]);
+            self.pending_len += take;
+            if self.pending_len < width {
+                return Ok(take);
+            }
+            self.pending_len = 0;
+            match std::str::from_utf8(&self.pending[..width]) {
+                Ok(text) => {
+                    write_console(self.raw_handle(), text)?;
+                    Ok(take)
+                }
+                Err(_) => Err(invalid_utf8()),
+            }
+        }
+    }
+
+    impl Write for ConsoleWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let handle = self.raw_handle();
+            if mode(handle).is_err() {
+                return write_file(handle, buf);
+            }
+            if self.pending_len > 0 {
+                return self.complete_pending(buf);
+            }
+            let len = buf.len().min(MAX_UNITS_PER_WRITE);
+            let text = match std::str::from_utf8(&buf[..len]) {
+                Ok(text) => text,
+                Err(err) if err.valid_up_to() == 0 && err.error_len().is_none() => {
+                    // An unfinished sequence is under four bytes, so this
+                    // is the whole of `buf`.
+                    self.pending[..buf.len()].copy_from_slice(buf);
+                    self.pending_len = buf.len();
+                    return Ok(buf.len());
+                }
+                Err(err) if err.valid_up_to() == 0 => return Err(invalid_utf8()),
+                Err(err) => std::str::from_utf8(&buf[..err.valid_up_to()])
+                    .expect("from_utf8 vouched for this prefix"),
+            };
+            write_console(handle, text)?;
+            Ok(text.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn invalid_utf8() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows console writes must be valid UTF-8",
+        )
+    }
+
+    /// Writes every unit of `text`; `WriteConsoleW` may stop short, so
+    /// the rest goes in the next call.
+    fn write_console(handle: HANDLE, text: &str) -> io::Result<()> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut rest = units.as_slice();
+        while !rest.is_empty() {
+            let mut written = 0u32;
+            let len = rest.len().min(MAX_UNITS_PER_WRITE) as u32;
+            // SAFETY: `rest` is valid for `len` units; the count out pointer
+            // is a valid local; the reserved pointer has to be null.
+            let ok =
+                unsafe { WriteConsoleW(handle, rest.as_ptr(), len, &mut written, ptr::null()) };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            rest = &rest[written as usize..];
+        }
+        Ok(())
+    }
+
+    fn write_file(handle: HANDLE, buf: &[u8]) -> io::Result<usize> {
+        let mut written = 0u32;
+        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        // SAFETY: `buf` is valid for `len` bytes; the count out pointer is
+        // a valid local; a null OVERLAPPED selects the blocking form.
+        let ok = unsafe { WriteFile(handle, buf.as_ptr(), len, &mut written, ptr::null_mut()) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(written as usize)
+    }
+
+    /// The console mode of `handle`; an error means it is not a console.
+    pub(super) fn mode(handle: HANDLE) -> io::Result<u32> {
+        let mut mode = 0u32;
+        // SAFETY: the out pointer is a valid local; the result is checked.
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(mode)
+    }
+
+    pub(super) fn set_mode(handle: HANDLE, mode: u32) -> io::Result<()> {
+        // SAFETY: SetConsoleMode takes no pointers; the result is checked.
+        if unsafe { SetConsoleMode(handle, mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The console's input buffer, whatever the process's stdin handle
+    /// points at right now.
+    pub(super) fn open_input() -> io::Result<OwnedHandle> {
+        let name: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+        // SAFETY: `name` is NUL terminated; the null attributes and
+        // template are the documented defaults.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the handle was just returned by CreateFileW and nothing
+        // else owns it.
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+}
+
+/// Switches escape processing on for the recorded console if something
+/// (a child, a `SetStdHandle` swap that made crossterm's own attempt land
+/// on a pipe) left it off. A no-op before `Screen::enter`, after the
+/// `Screen` is gone, and when the handle is not a console.
+#[cfg(windows)]
+fn ensure_vt_processing() {
+    let handle = CONSOLE_HANDLE.load(Ordering::SeqCst);
+    if handle == 0 {
+        return;
+    }
+    let handle = handle as HANDLE;
+    let Ok(current) = console::mode(handle) else {
+        return;
+    };
+    if let Some(wanted) = vt_output_mode(current) {
+        let _ = console::set_mode(handle, wanted);
+    }
+}
+
+/// `current` with escape processing fully on, or None when it already is.
+/// Only the two bits escape output needs are touched; newline handling
+/// and input flags stay whatever they are.
+#[cfg(windows)]
+fn vt_output_mode(current: u32) -> Option<u32> {
+    const WANTED: u32 = ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
+    (current & WANTED != WANTED).then_some(current | WANTED)
+}
+
+/// The mode to hand `SetConsoleMode` so that `saved` is applied whole:
+/// without ENABLE_EXTENDED_FLAGS the call leaves quick-edit and insert
+/// mode as they are instead of restoring them.
+#[cfg(windows)]
+fn restored_input_mode(saved: u32) -> u32 {
+    saved | ENABLE_EXTENDED_FLAGS
+}
+
+/// Reads the console input mode and records it for every later restore,
+/// or None (recording nothing) when there is no console to ask.
+#[cfg(windows)]
+fn snapshot_input_mode() -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let input = console::open_input().ok()?;
+    let mode = console::mode(input.as_raw_handle()).ok()?;
+    SAVED_INPUT_MODE.store(u64::from(mode), Ordering::SeqCst);
+    Some(mode)
+}
+
+#[cfg(windows)]
+fn restore_input_mode(saved: u32) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let input = console::open_input()?;
+    console::set_mode(input.as_raw_handle(), restored_input_mode(saved))
+}
+
+/// The restore `leave` does from the recorded mode; a no-op while the
+/// sentinel is in place, which is what the failed `u32` conversion means.
+#[cfg(windows)]
+fn restore_input_mode_from_static() -> io::Result<()> {
+    match u32::try_from(SAVED_INPUT_MODE.load(Ordering::SeqCst)) {
+        Ok(saved) => restore_input_mode(saved),
+        Err(_) => Ok(()),
+    }
 }
 
 /// The tty's current line-discipline settings.
@@ -206,17 +486,33 @@ fn static_tty() -> Option<std::mem::ManuallyDrop<std::fs::File>> {
     })
 }
 
+/// The console behind the handle `enter` recorded, or None before
+/// `Screen::enter` and after the `Screen` is gone.
+#[cfg(windows)]
+fn static_tty() -> Option<std::mem::ManuallyDrop<console::ConsoleWriter>> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    // Read, not taken, for the same reason as the unix fd: the handle
+    // stays armed for the next panic after a caught one.
+    let handle = CONSOLE_HANDLE.load(Ordering::SeqCst);
+    (handle != 0).then(|| {
+        // SAFETY: the handle was duplicated by `open_tty_writer`; `Screen`
+        // clears CONSOLE_HANDLE before the writer that owns it drops, so
+        // this write normally lands on an open handle. A hook racing
+        // `Screen::drop` on another thread can still find it closed and
+        // get ERROR_INVALID_HANDLE, which is ignored like every other
+        // error here. ManuallyDrop keeps this writer from closing it.
+        std::mem::ManuallyDrop::new(console::ConsoleWriter::new(unsafe {
+            OwnedHandle::from_raw_handle(handle as _)
+        }))
+    })
+}
+
 /// Writes the leave sequence through the descriptor `enter` recorded. Runs
 /// on the panic path, so every error is ignored: there is nothing left to
 /// report it to.
 fn restore_from_static() {
-    #[cfg(unix)]
     if let Some(mut writer) = static_tty() {
         let _ = leave(&mut *writer);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = leave(&mut io::stdout());
     }
 }
 
@@ -225,7 +521,6 @@ fn restore_from_static() {
 /// and its text comes back through the late-output path; the driver's own
 /// panic ends the process with the text still in the pipe, so it is
 /// written to the terminal here as well, after `leave` has cooked it.
-#[cfg(unix)]
 fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
     if super::redirect::output_captured()
         && std::thread::current().name() == Some(crate::MAIN_THREAD_NAME)
@@ -238,12 +533,11 @@ fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
     }
 }
 
-#[cfg(not(unix))]
-fn echo_panic_past_capture(_: &std::panic::PanicHookInfo<'_>) {}
-
 /// Switches the terminal into the UI's modes.
 pub(crate) fn enter(writer: &mut impl Write, enhancement: bool) -> io::Result<()> {
     install_panic_hook();
+    #[cfg(windows)]
+    ensure_vt_processing();
     enter_steps(writer, enter_sequence(enhancement))
 }
 
@@ -266,17 +560,25 @@ fn enter_steps(writer: &mut impl Write, steps: Vec<TerminalStep>) -> io::Result<
 
 /// Restores the terminal; a no-op unless `enter` ran since the last call,
 /// so the panic hook and the normal exit path can both call it. Keeps
-/// going past a failed step so the later modes still get restored.
+/// going past a failed step so the later modes still get restored. On
+/// Windows the console input mode goes back last, by hand, in case a
+/// child changed it under crossterm's snapshot.
 pub(crate) fn leave(writer: &mut impl Write) -> io::Result<()> {
     if !SCREEN_ENTERED.swap(false, Ordering::SeqCst) {
         return Ok(());
     }
+    #[cfg(windows)]
+    ensure_vt_processing();
     let enhancement = ENHANCEMENT_PUSHED.swap(false, Ordering::SeqCst);
     let mut first_error = None;
     for step in leave_sequence(enhancement) {
         if let Err(err) = step.apply(writer) {
             first_error.get_or_insert(err);
         }
+    }
+    #[cfg(windows)]
+    if let Err(err) = restore_input_mode_from_static() {
+        first_error.get_or_insert(err);
     }
     match first_error {
         Some(err) => Err(err),
@@ -497,6 +799,8 @@ fn reenter_if_left<W: Write>(
         return Ok(false);
     }
     warn!("The terminal was restored behind the UI; re-entering the screen");
+    #[cfg(windows)]
+    ensure_vt_processing();
     enter_steps(terminal.backend_mut(), steps)?;
     repaint_from_scratch(terminal)?;
     Ok(true)
@@ -508,6 +812,8 @@ pub(crate) struct Screen {
     enhancement: bool,
     #[cfg(unix)]
     fd: i32,
+    #[cfg(windows)]
+    handle: isize,
     /// The line discipline as it was before raw mode first came on. Raw
     /// mode is restored from crossterm's own snapshot, which it takes on
     /// the first `enable_raw_mode` after a `disable_raw_mode`; a child
@@ -515,6 +821,11 @@ pub(crate) struct Screen {
     /// so the re-entry puts these back first.
     #[cfg(unix)]
     cooked: libc::termios,
+    /// The console input mode before raw mode first came on, kept for the
+    /// same reason as `cooked`; None when there was no console to ask,
+    /// in which case nothing is restored.
+    #[cfg(windows)]
+    input_mode: Option<u32>,
 }
 
 impl Screen {
@@ -524,19 +835,27 @@ impl Screen {
     /// applied cannot leave them on.
     pub(crate) fn enter() -> Result<Self> {
         let enhancement = probe_keyboard_enhancement();
+        #[cfg(windows)]
+        let input_mode = snapshot_input_mode();
         let writer = open_tty_writer()?;
         #[cfg(unix)]
         let fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
+        #[cfg(windows)]
+        let handle = writer.get_ref().raw_handle() as isize;
         #[cfg(unix)]
         let cooked = tty_modes(fd)?;
         let mut terminal = Terminal::new(RowTrackingBackend::new(CrosstermBackend::new(writer)))?;
         #[cfg(unix)]
         PANIC_FD.store(fd, Ordering::SeqCst);
+        #[cfg(windows)]
+        CONSOLE_HANDLE.store(handle, Ordering::SeqCst);
         if let Err(err) = enter(terminal.backend_mut(), enhancement) {
             // Taken back before `terminal` drops the writer: the hook must
             // never write to a closed or reused descriptor.
             #[cfg(unix)]
             PANIC_FD.swap(-1, Ordering::SeqCst);
+            #[cfg(windows)]
+            CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
             return Err(err.into());
         }
         Ok(Self {
@@ -544,8 +863,12 @@ impl Screen {
             enhancement,
             #[cfg(unix)]
             fd,
+            #[cfg(windows)]
+            handle,
             #[cfg(unix)]
             cooked,
+            #[cfg(windows)]
+            input_mode,
         })
     }
 
@@ -555,6 +878,8 @@ impl Screen {
     fn arm_panic_hook(&self) {
         #[cfg(unix)]
         PANIC_FD.store(self.fd, Ordering::SeqCst);
+        #[cfg(windows)]
+        CONSOLE_HANDLE.store(self.handle, Ordering::SeqCst);
     }
 
     #[cfg(unix)]
@@ -562,12 +887,17 @@ impl Screen {
         set_tty_modes(self.fd, &self.cooked)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn restore_cooked_modes(&self) -> io::Result<()> {
-        Ok(())
+        match self.input_mode {
+            Some(mode) => restore_input_mode(mode),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
+        #[cfg(windows)]
+        ensure_vt_processing();
         if reenter_if_left(&mut self.terminal, enter_sequence(self.enhancement))? {
             self.arm_panic_hook();
         }
@@ -619,6 +949,8 @@ impl Drop for Screen {
         let _ = self.leave();
         #[cfg(unix)]
         PANIC_FD.swap(-1, Ordering::SeqCst);
+        #[cfg(windows)]
+        CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
     }
 }
 
@@ -1091,5 +1423,114 @@ mod tests {
         assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
 
         PANIC_FD.store(-1, Ordering::SeqCst);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn escape_processing_is_added_only_when_a_bit_is_missing() {
+        use windows_sys::Win32::System::Console::ENABLE_WRAP_AT_EOL_OUTPUT;
+
+        let full = ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            | ENABLE_WRAP_AT_EOL_OUTPUT;
+        assert_eq!(vt_output_mode(full), None);
+        assert_eq!(
+            vt_output_mode(ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT),
+            Some(full)
+        );
+        assert_eq!(
+            vt_output_mode(ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_WRAP_AT_EOL_OUTPUT),
+            Some(full)
+        );
+        assert_eq!(vt_output_mode(0), Some(full & !ENABLE_WRAP_AT_EOL_OUTPUT));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_restored_input_mode_carries_the_extended_flags() {
+        use windows_sys::Win32::System::Console::{ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE};
+
+        let saved = ENABLE_LINE_INPUT | ENABLE_QUICK_EDIT_MODE;
+        assert_eq!(restored_input_mode(saved), saved | ENABLE_EXTENDED_FLAGS);
+        assert_eq!(
+            restored_input_mode(saved | ENABLE_EXTENDED_FLAGS),
+            saved | ENABLE_EXTENDED_FLAGS
+        );
+    }
+
+    /// crossterm answers the kitty probe with false on Windows, so the
+    /// enter sequence there never carries the enhancement step.
+    #[cfg(windows)]
+    #[test]
+    fn windows_never_pushes_the_keyboard_enhancement() {
+        assert!(!probe_keyboard_enhancement());
+        assert!(
+            !enter_sequence(probe_keyboard_enhancement())
+                .iter()
+                .any(|step| matches!(step, TerminalStep::KeyboardEnhancement(_)))
+        );
+    }
+
+    /// The Windows twin of the unix test above: the hook's handle survives
+    /// the first restore. The pipe is read on its own thread so a hook
+    /// that writes nothing fails the test instead of blocking it.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn the_panic_hook_restores_again_after_a_reenter() {
+        use std::io::Read;
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+
+        let (mut reader, writer) = io::pipe().unwrap();
+        let (sequences, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                out.extend_from_slice(&chunk[..n]);
+                while let Some(at) = find(&out, LEAVE_ALT) {
+                    let rest = out.split_off(at + LEAVE_ALT.len());
+                    let _ = sequences.send(std::mem::replace(&mut out, rest));
+                }
+            }
+        });
+        let next_leave = || {
+            received
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the leave sequence reached the pipe")
+        };
+
+        let handle = writer.as_raw_handle() as isize;
+        CONSOLE_HANDLE.store(handle, Ordering::SeqCst);
+        SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let first = next_leave();
+        assert_eq!(count(&first, LEAVE_ALT), 1, "{first:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert_eq!(
+            CONSOLE_HANDLE.load(Ordering::SeqCst),
+            handle,
+            "the first restore disarmed the hook"
+        );
+
+        // The UI re-entering the screen, as `reenter_if_left` does.
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let second = next_leave();
+        assert_eq!(count(&second, LEAVE_ALT), 1, "{second:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+
+        CONSOLE_HANDLE.store(0, Ordering::SeqCst);
     }
 }

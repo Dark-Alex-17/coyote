@@ -31,7 +31,6 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// Whether the standard outputs point into a guard's pipe right now. The
 /// panic hook asks: a message the default hook prints there dies with the
 /// process.
-#[cfg(any(unix, test))]
 pub(crate) fn output_captured() -> bool {
     CAPTURED.load(Ordering::SeqCst)
 }
