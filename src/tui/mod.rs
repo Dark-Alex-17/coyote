@@ -2777,7 +2777,7 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
         options.mode(0o700);
         options
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     let dir_options = std::fs::DirBuilder::new();
     dir_options.create(&dir)?;
     let path = dir.join("buffer.md");

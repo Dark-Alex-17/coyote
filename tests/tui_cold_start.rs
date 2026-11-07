@@ -1,7 +1,6 @@
 //! Cold-start cases for the full-screen UI. Each case boots the real
 //! binary cold (fresh config and cache dirs, no model) and exercises a
-//! usage pattern the lifecycle suite does not pin:
-//! non-interactive modes under `COYOTE_UI=tui`, malformed input bytes,
+//! usage pattern the lifecycle suite does not pin: malformed input bytes,
 //! wide graphemes, over-width drafts, repeated commands, resize bursts and
 //! a cold start on a tiny terminal. Unix-only for the same reasons as the
 //! lifecycle suite; cases run one at a time because each takes a
@@ -11,7 +10,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
@@ -134,18 +133,6 @@ fn spawn_tui(dir: &Path) -> Pty {
     Pty::spawn(cmd).unwrap()
 }
 
-/// The binary with no terminal at all: stdin from /dev/null, stdout and
-/// stderr piped, the way a script or a pipe runs it.
-fn run_piped(dir: &Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(built_binary());
-    base_env(&mut cmd, dir);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.output().unwrap()
-}
-
 fn assert_tty_restored(transcript: &str) {
     let flags = transcript
         .lines()
@@ -253,65 +240,6 @@ fn quit_and_check(mut pty: Pty, what: &str) -> String {
         "{what}: the alternate screen was left more than once (a panic restore?):\n{transcript}"
     );
     transcript
-}
-
-// ---------------------------------------------------------------------
-// Non-interactive modes: `main` starts the full-screen UI only for an
-// interactive run, whatever `COYOTE_UI` or the `ui:` key says; a positional
-// prompt or an inspection flag is the plain command path, which has no
-// business with the alternate screen and must work without a tty.
-// ---------------------------------------------------------------------
-
-#[test]
-#[serial]
-fn a_positional_prompt_under_coyote_ui_tui_is_the_plain_command_path() {
-    let dir = fresh_config_dir("cmd-mode");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-
-    let out = run_piped(&dir, &["zebra quartz probe-marker"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    assert!(
-        find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
-        "a command-mode run entered the alternate screen:\nstdout={stdout}\nstderr={stderr}"
-    );
-    assert!(
-        out.status.success(),
-        "command mode under COYOTE_UI=tui did not exit 0 ({:?}):\nstdout={stdout}\nstderr={stderr}",
-        out.status
-    );
-    assert!(
-        stdout.contains("probe-marker"),
-        "the dry-run reply did not reach stdout:\nstdout={stdout}\nstderr={stderr}"
-    );
-}
-
-#[test]
-#[serial]
-fn the_info_flag_under_coyote_ui_tui_prints_the_table_without_a_tty() {
-    let dir = fresh_config_dir("info-flag");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-
-    let out = run_piped(&dir, &["--info"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    assert!(
-        find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
-        "--info entered the alternate screen:\nstdout={stdout}\nstderr={stderr}"
-    );
-    assert!(
-        out.status.success(),
-        "--info under COYOTE_UI=tui did not exit 0 ({:?}):\nstdout={stdout}\nstderr={stderr}",
-        out.status
-    );
-    assert!(
-        stdout.contains("dryrun:dry-model"),
-        "--info did not print the model row:\nstdout={stdout}\nstderr={stderr}"
-    );
 }
 
 // ---------------------------------------------------------------------

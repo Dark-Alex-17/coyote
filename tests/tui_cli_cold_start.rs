@@ -154,6 +154,67 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|at| from + at)
 }
 
+/// `main` starts the full-screen UI only for an interactive run, whatever
+/// `COYOTE_UI` or the `ui:` key says: a positional prompt is the plain
+/// command path, which has no business with the alternate screen and
+/// must work without a tty.
+#[test]
+#[serial]
+fn a_positional_prompt_under_coyote_ui_tui_is_the_plain_command_path() {
+    let dir = fresh_config_dir("cmd-mode");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+
+    let out = run_piped(
+        &dir,
+        &[("COYOTE_UI", "tui")],
+        &["zebra quartz probe-marker"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
+        "a command-mode run entered the alternate screen:\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "command mode under COYOTE_UI=tui did not exit 0 ({:?}):\nstdout={stdout}\nstderr={stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("probe-marker"),
+        "the dry-run reply did not reach stdout:\nstdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// An inspection flag is the plain command path too.
+#[test]
+#[serial]
+fn the_info_flag_under_coyote_ui_tui_prints_the_table_without_a_tty() {
+    let dir = fresh_config_dir("info-flag");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+
+    let out = run_piped(&dir, &[("COYOTE_UI", "tui")], &["--info"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
+        "--info entered the alternate screen:\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "--info under COYOTE_UI=tui did not exit 0 ({:?}):\nstdout={stdout}\nstderr={stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("dryrun:dry-model"),
+        "--info did not print the model row:\nstdout={stdout}\nstderr={stderr}"
+    );
+}
+
 /// A positional prompt makes the run a one-shot command, which neither
 /// shell flag can host: `--tui` and `--repl` with a prompt are refused
 /// before the config is read (a `ui: bogus` key is never seen), and

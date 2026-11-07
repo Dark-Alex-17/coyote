@@ -189,16 +189,11 @@ mod console {
     };
     use windows_sys::Win32::System::Console::{GetConsoleMode, SetConsoleMode, WriteConsoleW};
 
-    /// Most UTF-16 units handed to one `WriteConsoleW`; the console host
-    /// fails larger buffers outright on some Windows versions.
-    const MAX_UNITS_PER_WRITE: usize = 8192;
-
     /// Writes to a console through `WriteConsoleW`, so text outside the
     /// console's code page still arrives intact, and to anything else (a
-    /// pipe, a file) through `WriteFile`. A write that ends inside a UTF-8
-    /// sequence has those bytes held back and reported as written, the
-    /// same way std's stdout treats them, since the buffer above splits
-    /// at byte counts, not character boundaries.
+    /// pipe, a file) through `WriteFile`. Console writes go through
+    /// [`super::utf8_chunk`], which holds back a trailing partial UTF-8
+    /// sequence between calls and caps each call's units.
     pub(crate) struct ConsoleWriter {
         handle: OwnedHandle,
         pending: [u8; 4],
@@ -217,28 +212,6 @@ mod console {
         pub(super) fn raw_handle(&self) -> HANDLE {
             self.handle.as_raw_handle()
         }
-
-        /// Finishes the sequence held back by an earlier write. The lead
-        /// byte's run of leading one bits is the sequence length, and it
-        /// is in 2..=4 because `from_utf8` classified the held bytes as
-        /// an incomplete sequence rather than invalid ones.
-        fn complete_pending(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let width = self.pending[0].leading_ones() as usize;
-            let take = buf.len().min(width - self.pending_len);
-            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&buf[..take]);
-            self.pending_len += take;
-            if self.pending_len < width {
-                return Ok(take);
-            }
-            self.pending_len = 0;
-            match std::str::from_utf8(&self.pending[..width]) {
-                Ok(text) => {
-                    write_console(self.raw_handle(), text)?;
-                    Ok(take)
-                }
-                Err(_) => Err(invalid_utf8()),
-            }
-        }
     }
 
     impl Write for ConsoleWriter {
@@ -250,25 +223,10 @@ mod console {
             if mode(handle).is_err() {
                 return write_file(handle, buf);
             }
-            if self.pending_len > 0 {
-                return self.complete_pending(buf);
-            }
-            let len = buf.len().min(MAX_UNITS_PER_WRITE);
-            let text = match std::str::from_utf8(&buf[..len]) {
-                Ok(text) => text,
-                Err(err) if err.valid_up_to() == 0 && err.error_len().is_none() => {
-                    // An unfinished sequence is under four bytes, so this
-                    // is the whole of `buf`.
-                    self.pending[..buf.len()].copy_from_slice(buf);
-                    self.pending_len = buf.len();
-                    return Ok(buf.len());
-                }
-                Err(err) if err.valid_up_to() == 0 => return Err(invalid_utf8()),
-                Err(err) => std::str::from_utf8(&buf[..err.valid_up_to()])
-                    .expect("from_utf8 vouched for this prefix"),
-            };
-            write_console(handle, text)?;
-            Ok(text.len())
+            let (units, consumed) =
+                super::utf8_chunk(&mut self.pending, &mut self.pending_len, buf)?;
+            write_console(handle, &units)?;
+            Ok(consumed)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -276,21 +234,13 @@ mod console {
         }
     }
 
-    fn invalid_utf8() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Windows console writes must be valid UTF-8",
-        )
-    }
-
-    /// Writes every unit of `text`; `WriteConsoleW` may stop short, so
-    /// the rest goes in the next call.
-    fn write_console(handle: HANDLE, text: &str) -> io::Result<()> {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let mut rest = units.as_slice();
+    /// Writes every unit of `units`, which `utf8_chunk` capped at
+    /// `MAX_UNITS_PER_WRITE`; `WriteConsoleW` may stop short, so the rest
+    /// goes in the next call.
+    fn write_console(handle: HANDLE, mut rest: &[u16]) -> io::Result<()> {
         while !rest.is_empty() {
             let mut written = 0u32;
-            let len = rest.len().min(MAX_UNITS_PER_WRITE) as u32;
+            let len = rest.len() as u32;
             // SAFETY: `rest` is valid for `len` units; the count out pointer
             // is a valid local; the reserved pointer has to be null.
             let ok =
@@ -362,6 +312,84 @@ mod console {
     }
 }
 
+/// Most UTF-16 units handed to one `WriteConsoleW`; the console host
+/// fails larger buffers outright on some Windows versions.
+#[cfg(any(windows, test))]
+const MAX_UNITS_PER_WRITE: usize = 8192;
+
+/// Splits one write of `buf` into the UTF-16 units the console gets now
+/// and how many bytes of `buf` they account for. A write that ends inside
+/// a UTF-8 sequence has those bytes held in `pending` and reported as
+/// consumed, the same way std's stdout treats them, since the buffer in
+/// front of the writer splits at byte counts, not character boundaries.
+/// The units stop at `MAX_UNITS_PER_WRITE` on a character boundary, so
+/// a surrogate pair never straddles two console writes.
+#[cfg(any(windows, test))]
+fn utf8_chunk(
+    pending: &mut [u8; 4],
+    pending_len: &mut usize,
+    buf: &[u8],
+) -> io::Result<(Vec<u16>, usize)> {
+    if *pending_len > 0 {
+        return complete_pending(pending, pending_len, buf);
+    }
+    let text = match std::str::from_utf8(buf) {
+        Ok(text) => text,
+        Err(err) if err.valid_up_to() == 0 && err.error_len().is_none() => {
+            // An unfinished sequence is under four bytes, so this is the
+            // whole of `buf`.
+            pending[..buf.len()].copy_from_slice(buf);
+            *pending_len = buf.len();
+            return Ok((Vec::new(), buf.len()));
+        }
+        Err(err) if err.valid_up_to() == 0 => return Err(invalid_utf8()),
+        Err(err) => std::str::from_utf8(&buf[..err.valid_up_to()])
+            .expect("from_utf8 vouched for this prefix"),
+    };
+    let mut units = Vec::with_capacity(text.len().min(MAX_UNITS_PER_WRITE));
+    let mut consumed = 0;
+    for c in text.chars() {
+        if units.len() + c.len_utf16() > MAX_UNITS_PER_WRITE {
+            break;
+        }
+        units.extend_from_slice(c.encode_utf16(&mut [0u16; 2]));
+        consumed += c.len_utf8();
+    }
+    Ok((units, consumed))
+}
+
+/// Finishes the sequence held back by an earlier write. The lead byte's
+/// run of leading one bits is the sequence length, and it is in 2..=4
+/// because `from_utf8` classified the held bytes as an incomplete
+/// sequence rather than invalid ones.
+#[cfg(any(windows, test))]
+fn complete_pending(
+    pending: &mut [u8; 4],
+    pending_len: &mut usize,
+    buf: &[u8],
+) -> io::Result<(Vec<u16>, usize)> {
+    let width = pending[0].leading_ones() as usize;
+    let take = buf.len().min(width - *pending_len);
+    pending[*pending_len..*pending_len + take].copy_from_slice(&buf[..take]);
+    *pending_len += take;
+    if *pending_len < width {
+        return Ok((Vec::new(), take));
+    }
+    *pending_len = 0;
+    match std::str::from_utf8(&pending[..width]) {
+        Ok(text) => Ok((text.encode_utf16().collect(), take)),
+        Err(_) => Err(invalid_utf8()),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn invalid_utf8() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Windows console writes must be valid UTF-8",
+    )
+}
+
 /// Switches escape processing on for the recorded console if a child the
 /// UI ran left it off. A no-op before `Screen::enter`, after the `Screen`
 /// is gone, and when the handle is not a console.
@@ -415,7 +443,9 @@ fn restore_input_mode(saved: u32) -> io::Result<()> {
     console::set_mode(input.as_raw_handle(), restored_input_mode(saved))
 }
 
-/// The restore `leave` does from the recorded mode; a no-op while the
+/// The restore `leave` does from the recorded mode. crossterm restores
+/// nothing of the Windows input mode, so this is the only thing that
+/// brings quick-edit, insert mode and VT input back. A no-op while the
 /// sentinel is in place, which is what the failed `u32` conversion means.
 #[cfg(windows)]
 fn restore_input_mode_from_static() -> io::Result<()> {
@@ -560,8 +590,10 @@ fn enter_steps(writer: &mut impl Write, steps: Vec<TerminalStep>) -> io::Result<
 /// Restores the terminal; a no-op unless `enter` ran since the last call,
 /// so the panic hook and the normal exit path can both call it. Keeps
 /// going past a failed step so the later modes still get restored. On
-/// Windows the console input mode goes back last, by hand, in case a
-/// child changed it under crossterm's snapshot.
+/// Windows the console input mode goes back last, by hand: crossterm
+/// restores none of it (its `disable_raw_mode` only ORs the raw-mode bits
+/// back on and its mouse-capture disable replays its own first snapshot),
+/// so this is what brings quick-edit, insert mode and VT input back.
 pub(crate) fn leave(writer: &mut impl Write) -> io::Result<()> {
     if !SCREEN_ENTERED.swap(false, Ordering::SeqCst) {
         return Ok(());
@@ -798,8 +830,6 @@ fn reenter_if_left<W: Write>(
         return Ok(false);
     }
     warn!("The terminal was restored behind the UI; re-entering the screen");
-    #[cfg(windows)]
-    ensure_vt_processing();
     enter_steps(terminal.backend_mut(), steps)?;
     repaint_from_scratch(terminal)?;
     Ok(true)
@@ -820,9 +850,11 @@ pub(crate) struct Screen {
     /// so the re-entry puts these back first.
     #[cfg(unix)]
     cooked: libc::termios,
-    /// The console input mode before raw mode first came on, kept for the
-    /// same reason as `cooked`; None when there was no console to ask,
-    /// in which case nothing is restored.
+    /// The console input mode before raw mode first came on. crossterm
+    /// restores nothing of it, so this copy (and the static one `leave`
+    /// reads) is all that brings quick-edit, insert mode and VT input
+    /// back; None when there was no console to ask, in which case nothing
+    /// is restored.
     #[cfg(windows)]
     input_mode: Option<u32>,
 }
@@ -831,11 +863,11 @@ impl Screen {
     /// Probes the terminal, enters the alternate screen and builds the
     /// ratatui terminal over the dup'd stdout. The terminal is built
     /// first (it only asks for the size) so a failure after the modes are
-    /// applied cannot leave them on.
+    /// applied cannot leave them on, and the input mode is recorded only
+    /// once nothing but `enter` itself can still fail, so an early error
+    /// never leaves the static armed.
     pub(crate) fn enter() -> Result<Self> {
         let enhancement = probe_keyboard_enhancement();
-        #[cfg(windows)]
-        let input_mode = snapshot_input_mode();
         let writer = open_tty_writer()?;
         #[cfg(unix)]
         let fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
@@ -846,6 +878,8 @@ impl Screen {
         let mut terminal = Terminal::new(RowTrackingBackend::new(CrosstermBackend::new(writer)))?;
         #[cfg(unix)]
         PANIC_FD.store(fd, Ordering::SeqCst);
+        #[cfg(windows)]
+        let input_mode = snapshot_input_mode();
         #[cfg(windows)]
         CONSOLE_HANDLE.store(handle, Ordering::SeqCst);
         if let Err(err) = enter(terminal.backend_mut(), enhancement) {
@@ -898,6 +932,8 @@ impl Screen {
     }
 
     pub(crate) fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
+        // Ahead of the re-entry check as well as the frame: a child that
+        // reset the console mode leaves it off for both.
         #[cfg(windows)]
         ensure_vt_processing();
         if reenter_if_left(&mut self.terminal, enter_sequence(self.enhancement))? {
@@ -1419,6 +1455,109 @@ mod tests {
         assert!(!install_panic_hook());
     }
 
+    fn units_of(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    /// A multi-byte character cut at every byte boundary between two
+    /// writes: the first write holds the head back and reports it
+    /// consumed, the second completes the character, emits it whole and
+    /// consumes only the bytes that finished it.
+    #[test]
+    fn a_sequence_split_across_writes_arrives_whole() {
+        for text in ["\u{1F600}", "\u{20AC}"] {
+            let bytes = text.as_bytes();
+            for cut in 1..bytes.len() {
+                let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+                let (head, consumed) =
+                    utf8_chunk(&mut pending, &mut pending_len, &bytes[..cut]).unwrap();
+                assert!(head.is_empty(), "{text:?} cut at {cut}: {head:?}");
+                assert_eq!(consumed, cut);
+                assert_eq!(pending_len, cut);
+
+                let mut rest = bytes[cut..].to_vec();
+                rest.extend_from_slice(b"tail");
+                let (tail, consumed) = utf8_chunk(&mut pending, &mut pending_len, &rest).unwrap();
+                assert_eq!(tail, units_of(text), "{text:?} cut at {cut}");
+                assert_eq!(consumed, bytes.len() - cut, "{text:?} cut at {cut}");
+                assert_eq!(pending_len, 0);
+            }
+        }
+    }
+
+    /// A write that ends mid-sequence hands over the characters before
+    /// the cut and leaves the partial sequence for the next write.
+    #[test]
+    fn a_cut_inside_the_last_sequence_stops_before_it() {
+        let bytes = "ab\u{1F600}".as_bytes();
+        let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, &bytes[..4]).unwrap();
+        assert_eq!(units, units_of("ab"));
+        assert_eq!(consumed, 2);
+        assert_eq!(pending_len, 0);
+
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, &bytes[2..4]).unwrap();
+        assert!(units.is_empty());
+        assert_eq!(consumed, 2);
+        assert_eq!(pending_len, 2);
+
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, &bytes[4..]).unwrap();
+        assert_eq!(units, units_of("\u{1F600}"));
+        assert_eq!(consumed, 2);
+        assert_eq!(pending_len, 0);
+    }
+
+    /// Bytes that are not UTF-8 are refused as `InvalidData`, whether they
+    /// lead a write or arrive where a held-back sequence expected its
+    /// continuation; the held bytes are dropped with the error.
+    #[test]
+    fn invalid_bytes_are_refused() {
+        let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+        let err = utf8_chunk(&mut pending, &mut pending_len, b"\xffabc").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending_len, 0);
+
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, b"\xf0\x9f").unwrap();
+        assert!(units.is_empty());
+        assert_eq!(consumed, 2);
+        let err = utf8_chunk(&mut pending, &mut pending_len, b"ab").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending_len, 0);
+    }
+
+    /// A write is handed over in chunks of at most `MAX_UNITS_PER_WRITE`
+    /// units, and a chunk that would end on the high half of a surrogate
+    /// pair stops one unit short so the pair goes out together.
+    #[test]
+    fn a_chunk_never_ends_on_a_high_surrogate() {
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 1);
+        text.push('\u{1F600}');
+        text.push('b');
+        let bytes = text.as_bytes();
+        let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, bytes).unwrap();
+        assert_eq!(units.len(), MAX_UNITS_PER_WRITE - 1);
+        assert_eq!(consumed, MAX_UNITS_PER_WRITE - 1);
+        assert!(units.iter().all(|unit| *unit == u16::from(b'a')));
+        let (units, consumed) =
+            utf8_chunk(&mut pending, &mut pending_len, &bytes[consumed..]).unwrap();
+        assert_eq!(units, units_of("\u{1F600}b"));
+        assert_eq!(consumed, 5);
+
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 2);
+        text.push('\u{1F600}');
+        text.push('b');
+        let bytes = text.as_bytes();
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, bytes).unwrap();
+        assert_eq!(units.len(), MAX_UNITS_PER_WRITE);
+        assert_eq!(&units[MAX_UNITS_PER_WRITE - 2..], units_of("\u{1F600}"));
+        assert_eq!(consumed, bytes.len() - 1);
+        let (units, consumed) =
+            utf8_chunk(&mut pending, &mut pending_len, &bytes[consumed..]).unwrap();
+        assert_eq!(units, units_of("b"));
+        assert_eq!(consumed, 1);
+    }
+
     /// A panic restores the terminal, the UI re-enters it, and a second
     /// panic restores it again: the hook's descriptor survives the first
     /// restore.
@@ -1500,8 +1639,11 @@ mod tests {
         );
     }
 
-    /// crossterm answers the kitty probe with false on Windows, so the
-    /// enter sequence there never carries the enhancement step.
+    /// Pins a crossterm behaviour the enter sequence relies on: 0.29
+    /// answers `supports_keyboard_enhancement` with `Ok(false)` on
+    /// Windows, so the sequence there never carries the enhancement step.
+    /// A crossterm upgrade that changes the answer would route the push
+    /// through the console API instead of the writer, and must be noticed.
     #[cfg(windows)]
     #[test]
     fn windows_never_pushes_the_keyboard_enhancement() {
