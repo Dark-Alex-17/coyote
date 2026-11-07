@@ -29,13 +29,20 @@ NEEDS-HUMAN naming the error.
 import json
 import os
 import re
+import sys
+
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 MAX_DETAIL_CHARS = 500
 
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 

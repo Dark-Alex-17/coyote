@@ -34,6 +34,12 @@ import os
 import re
 import sys
 
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 RED = "\U0001f534"  # 🔴
 YELLOW = "\U0001f7e1"  # 🟡
 GREEN = "\U0001f7e2"  # 🟢

@@ -805,17 +805,28 @@ fn python_available() -> bool {
 }
 
 /// Runs a shipped graph script with `state` delivered via GRAPH_STATE_FILE.
+/// Python's stdio is set to Windows' cp1252 and UTF-8 mode is off, as on a
+/// windows-latest runner where the engine sets neither, so a script that
+/// leans on a platform default fails here too.
 fn run_script(rel: &str, state: &Value) -> Value {
+    run_script_env(rel, state, &[])
+}
+
+fn run_script_env(rel: &str, state: &Value, envs: &[(&str, &str)]) -> Value {
     let dir = temp_dir("state");
     let state_file = dir.0.join("state.json");
     fs::write(&state_file, state.to_string()).unwrap();
-    let out = Command::new("python3")
-        .arg(manifest().join("assets/agents").join(rel))
+    let mut cmd = Command::new("python3");
+    cmd.arg(manifest().join("assets/agents").join(rel))
         .env("GRAPH_STATE_FILE", &state_file)
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env_remove("GRAPH_STATE")
-        .output()
-        .unwrap();
+        .env("PYTHONUTF8", "0")
+        .env("PYTHONIOENCODING", "cp1252")
+        .env_remove("GRAPH_STATE");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
         "{rel}: {}",
@@ -1693,5 +1704,130 @@ fn a_generated_only_diff_is_never_a_silent_pass() {
     assert!(
         report.contains("## Generated, not reviewed") && report.contains("gen/go/v1/service.pb.go"),
         "{report}"
+    );
+}
+
+/// The scripts read their UTF-8 state and write their reports in UTF-8
+/// whatever the platform's default encoding: on Windows it is cp1252, which
+/// turned every "🔴 CRITICAL" into mojibake classed as a suggestion. A C
+/// locale with UTF-8 mode off gives the same non-UTF-8 default here.
+#[test]
+fn review_scripts_are_utf8_under_a_non_utf8_platform_encoding() {
+    if !python_available() {
+        return;
+    }
+    let hostile = [("LC_ALL", "C"), ("LANG", "C"), ("PYTHONCOERCECLOCALE", "0")];
+    let mut state = json!({
+        "changed_files": ["src/na\u{ef}ve.go"],
+        "domain_reports": ["clean report \u{201c}quoted\u{201d}. DOMAIN_REVIEW_COMPLETE"],
+        "findings": [{
+            "id": "f1", "severity": "🔴 CRITICAL", "marker": "", "file": "src/na\u{ef}ve.go",
+            "lines": "5", "title": "guard removed \u{2014} na\u{ef}ve", "block": "#### guard removed 🔴"
+        }],
+        "verifier_output": "[{\"id\":\"f1\",\"verdict\":\"VERIFIED\",\"evidence\":\"line 5 \u{201c}x\u{201d}\",\"note\":\"\"}]",
+        "walkthrough": "Removes a guard \u{2014} na\u{ef}vely."
+    });
+    let verdict =
+        run_script_env("code-reviewer/scripts/verdict.py", &state, &hostile)["verdict_out"].clone();
+    assert_eq!(verdict["counts"]["🔴"], 1, "{verdict}");
+    assert_eq!(
+        verdict["findings_final"][0]["severity"], "🔴 CRITICAL",
+        "{verdict}"
+    );
+    state["verdict_out"] = verdict;
+    let report =
+        run_script_env("code-reviewer/scripts/render.py", &state, &hostile)["final_report"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(
+        report.contains("found 1 critical") && report.contains("na\u{ef}vely"),
+        "{report}"
+    );
+    let gauntlet = run_script_env(
+        "review-gauntlet/scripts/verdict_gate.py",
+        &json!({
+            "code_review_results": [report],
+            "adversary_results": [],
+            "security_results": [],
+            "probe_results": []
+        }),
+        &hostile,
+    );
+    assert!(
+        gauntlet["gauntlet_report"]
+            .as_str()
+            .unwrap()
+            .contains("code-review: 1 🔴 CRITICAL finding(s)"),
+        "{gauntlet}"
+    );
+    let fv = run_script_env(
+        "finding-verifier/scripts/verdict_gate.py",
+        &json!({
+            "finding": {"id": "f1", "severity": "🔴 CRITICAL", "path": "src/na\u{ef}ve.go"},
+            "verdict": "{\"verdict\": \"VERIFIED\", \"evidence\": \"line 5 \u{201c}x\u{201d}\", \"note\": \"\"}"
+        }),
+        &hostile,
+    );
+    assert_eq!(fv["verdict"]["verdict"], "VERIFIED", "{fv}");
+    assert_eq!(
+        fv["verdict"]["evidence"], "line 5 \u{201c}x\u{201d}",
+        "{fv}"
+    );
+}
+
+/// A git that, like native git.exe under Git Bash, receives an absolute MSYS
+/// path argument unconverted when it holds a quote, and so cannot use it.
+/// The guard must still ground a checkout whose path holds a quote, which it
+/// does by never passing a path to git as an argument.
+#[cfg(unix)]
+#[test]
+fn the_guard_never_passes_a_checkout_path_to_git() {
+    if !tools_available() {
+        return;
+    }
+    let c = clones_in("root's quote");
+    let shim_dir = temp_dir("git-shim");
+    let real_git = which::which("git").unwrap();
+    let shim = shim_dir.0.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/usr/bin/env bash\nfor a in \"$@\"; do\n  case \"$a\" in\n    /*\\'*) echo \"fatal: cannot change to '$a': No such file or directory\" >&2; exit 128 ;;\n  esac\ndone\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut run = review_run(&c.review);
+    run.vars.push((
+        "PATH",
+        format!("{}:{}", s(&shim_dir.0), env::var("PATH").unwrap()),
+    ));
+    let cache = c.root.join("cache");
+    let out = run_tool(
+        "fs_cat.sh",
+        &c.root,
+        &[("path", "internal/plan.go")],
+        &run,
+        &cache,
+    );
+    assert!(
+        out.contains("// HEAD"),
+        "a quoted checkout path must still be grounded: {out}"
+    );
+    let stale = s(&c.shadow.join("internal/plan.go"));
+    let out = run_tool("fs_cat.sh", &c.root, &[("path", &stale)], &run, &cache);
+    assert_refused(
+        &out,
+        "review/internal/plan.go",
+        "shadow clone under a quoted root",
+    );
+    let helper =
+        fs::read_to_string(manifest().join("assets/functions/utils/review-paths.sh")).unwrap();
+    assert!(
+        !helper.contains("git -C"),
+        "every git call goes through _review_git"
     );
 }
