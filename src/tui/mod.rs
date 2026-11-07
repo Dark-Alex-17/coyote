@@ -3112,9 +3112,11 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             } else {
                                 // What the model did not get runs as turns
                                 // of its own, the rest offered to each of
-                                // them in turn.
+                                // them in turn, on the returned context's
+                                // queue: an agent switch during the turn
+                                // left the finished turn's behind.
                                 let next = app.queued.remove(0);
-                                carry_over(&queue, &app.queued);
+                                carry_over(&returned.notification_queue, &app.queued);
                                 task = Some(start_turn(app, returned, abort, tx, next.text));
                             }
                         }
@@ -4162,6 +4164,36 @@ mod tests {
         let frame = harness.draw();
         assert!(frame.contains("Dropped 2 queued line(s)"), "{frame}");
         assert!(!frame.contains("pending:"), "{frame}");
+    }
+
+    /// The lines left over at the end of a turn go on the queue of the
+    /// context that came back, the one the next turn clones. A `.agent`
+    /// turn hands back a context with a fresh queue, and what the end of
+    /// the turn put on the old one would never be taken again.
+    #[test]
+    fn leftover_lines_are_carried_on_the_returned_contexts_queue() {
+        let mut harness = Harness::standalone(80, 24);
+        let mut ctx = chat_ctx();
+        let finished = Arc::clone(&ctx.notification_queue);
+        harness.app.begin_turn(".agent helper", true);
+        harness.type_text("first q9d-a");
+        harness.press(KeyCode::Enter);
+        harness.type_text("second q9d-b");
+        harness.press(KeyCode::Enter);
+        carry_over(&finished, &harness.app.queued);
+        ctx.notification_queue = Arc::new(NotificationQueue::new());
+        harness.app.end_turn(true, &TurnOutcome::default());
+
+        reconcile_queue(&mut harness.app.queued, &take_user_messages(&finished));
+        assert_eq!(harness.app.queued.len(), 2);
+        let next = harness.app.queued.remove(0);
+        assert_eq!(next.text, "first q9d-a");
+        carry_over(&ctx.notification_queue, &harness.app.queued);
+        assert_eq!(
+            take_user_messages(&ctx.notification_queue),
+            ["second q9d-b"]
+        );
+        assert!(take_user_messages(&finished).is_empty());
     }
 
     #[test]
