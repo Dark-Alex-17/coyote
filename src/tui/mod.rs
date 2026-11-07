@@ -3828,8 +3828,9 @@ mod tests {
     /// answered exactly at the second pins the boundary itself.
     #[test]
     fn checklist_8_typeahead_and_idle_gate_guard_the_modal() {
+        type GateCase = (&'static str, fn() -> PromptRequest, KeyCode, PromptAnswer);
         let input_request = || PromptRequest::new(PromptAction::Input, "Name?", Origin::detached());
-        let cases: [(&str, fn() -> PromptRequest, KeyCode, PromptAnswer); 3] = [
+        let cases: [GateCase; 3] = [
             (
                 "confirm",
                 || confirm_request(None),
