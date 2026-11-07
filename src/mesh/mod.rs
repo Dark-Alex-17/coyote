@@ -1029,28 +1029,93 @@ pub(crate) mod test_support {
     const CLOSED_PORT_POOL: std::ops::Range<u16> = 20_000..30_000;
 
     /// A loopback port nothing listens on, never handed out twice in one process. The
-    /// pool sits below every OS ephemeral range (Linux 32768-60999, macOS 49152-65535),
-    /// so a later `bind` to port 0 anywhere in the process cannot be given a port a test
-    /// holds back to bind itself later. The walk through the pool starts at an offset
-    /// taken from the process id, so test processes running side by side on one host
-    /// draw from different stretches of it. A port something else has bound right now
-    /// is passed over.
+    /// pool sits below the default ephemeral ranges (Linux 32768-60999, macOS
+    /// 49152-65535), so a later `bind` to port 0 anywhere in the process cannot be given
+    /// a port a test holds back to bind itself later. The walk through the pool starts at
+    /// a multiplicative hash of the process id spread over the whole pool, so test
+    /// processes running side by side on one host draw from different stretches of it.
+    /// A port something else has bound right now is passed over.
     #[cfg(unix)]
     pub(crate) async fn closed_port() -> u16 {
         static DRAWN: AtomicU16 = AtomicU16::new(0);
-        let span = CLOSED_PORT_POOL.end - CLOSED_PORT_POOL.start;
-        let offset = u16::try_from(std::process::id() % 1000).unwrap() * 10;
+        let start = pool_start(std::process::id());
         loop {
-            let drawn = DRAWN.fetch_add(1, Ordering::Relaxed);
-            assert!(
-                drawn < span,
-                "every port in {CLOSED_PORT_POOL:?} was handed out"
-            );
-            let port = CLOSED_PORT_POOL.start + (offset + drawn) % span;
+            let drawn = DRAWN
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < pool_span()).then_some(n + 1)
+                })
+                .unwrap_or_else(|_| panic!("every port in {CLOSED_PORT_POOL:?} was handed out"));
+            let port = pool_port(start, drawn);
             if let Ok(probe) = TcpListener::bind(("127.0.0.1", port)).await {
                 drop(probe);
                 return port;
             }
+        }
+    }
+
+    #[cfg(unix)]
+    const fn pool_span() -> u16 {
+        CLOSED_PORT_POOL.end - CLOSED_PORT_POOL.start
+    }
+
+    /// The port `drawn` steps past `start` into the pool, wrapping at its end.
+    #[cfg(unix)]
+    fn pool_port(start: u16, drawn: u16) -> u16 {
+        let step = (u32::from(start) + u32::from(drawn)) % u32::from(pool_span());
+        CLOSED_PORT_POOL.start + u16::try_from(step).unwrap()
+    }
+
+    /// Where a process with id `pid` starts its walk through the pool: Fibonacci hashing
+    /// scatters neighbouring ids across the whole span.
+    #[cfg(unix)]
+    fn pool_start(pid: u32) -> u16 {
+        let scaled = (u64::from(pid.wrapping_mul(0x9E37_79B9)) * u64::from(pool_span())) >> 32;
+        u16::try_from(scaled).unwrap()
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+
+        /// Every start and draw a `u16` can hold lands in the pool without overflowing.
+        #[test]
+        fn pool_port_stays_in_the_pool_and_wraps_at_its_end() {
+            let span = pool_span();
+            assert_eq!(pool_port(0, 0), CLOSED_PORT_POOL.start);
+            assert_eq!(pool_port(span - 1, 0), CLOSED_PORT_POOL.end - 1);
+            assert_eq!(pool_port(span - 1, 1), CLOSED_PORT_POOL.start);
+            assert!(CLOSED_PORT_POOL.contains(&pool_port(u16::MAX, u16::MAX)));
+            for start in [0, 1, span / 2, span - 1, span, u16::MAX] {
+                for drawn in [0, 1, span - 1, span, u16::MAX] {
+                    assert!(CLOSED_PORT_POOL.contains(&pool_port(start, drawn)));
+                }
+            }
+        }
+
+        /// Neighbouring process ids start in both halves of the pool, never past its end.
+        #[test]
+        fn pool_start_spreads_process_ids_over_the_whole_pool() {
+            let span = pool_span();
+            for pid in [0, 1, u32::MAX] {
+                assert!(pool_start(pid) < span, "pid {pid}");
+            }
+            let starts: Vec<u16> = (0..1000).map(pool_start).collect();
+            assert!(starts.iter().all(|&start| start < span));
+            assert!(starts.iter().any(|&start| start < span / 2));
+            assert!(starts.iter().any(|&start| start >= span / 2));
+        }
+
+        /// Successive draws in one process are all in the pool and never repeat.
+        #[tokio::test]
+        async fn closed_port_hands_out_distinct_ports_from_the_pool() {
+            let mut ports = Vec::new();
+            for _ in 0..50 {
+                ports.push(closed_port().await);
+            }
+            assert!(ports.iter().all(|port| CLOSED_PORT_POOL.contains(port)));
+            ports.sort_unstable();
+            ports.dedup();
+            assert_eq!(ports.len(), 50);
         }
     }
 
