@@ -5,6 +5,7 @@ use super::access_token::get_access_token;
 use super::oauth::{self, OAuthConfig};
 use super::*;
 
+use crate::function::ToolResult;
 use crate::utils::strip_think_tag;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -446,7 +447,7 @@ pub fn claude_build_chat_completions_body(
                             user_parts.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_result.call.id,
-                                "content": tool_result.output.to_string(),
+                                "content": claude_tool_result_content(tool_result),
                             }));
                         }
                         // Empty tool_results (reachable via deserialized sessions) must not emit an empty pair.
@@ -531,7 +532,7 @@ pub fn claude_build_chat_completions_body(
                             user_parts.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_result.call.id,
-                                "content": tool_result.output.to_string(),
+                                "content": claude_tool_result_content(tool_result),
                             }));
                         }
                         if !assistant_parts.is_empty() {
@@ -599,6 +600,28 @@ pub fn claude_build_chat_completions_body(
         apply_prompt_cache_breakpoints(&mut body, prompt_cache_ttl.as_deref());
     }
     Ok(body)
+}
+
+/// Anthropic only accepts tool-result images inside the `tool_result` block,
+/// so attachments turn `content` into a block array. Results without
+/// attachments keep the plain string form.
+fn claude_tool_result_content(tool_result: &ToolResult) -> Value {
+    let text = tool_result.output.to_string();
+    if tool_result.attachments.is_empty() {
+        return Value::String(text);
+    }
+    let mut blocks = vec![json!({ "type": "text", "text": text })];
+    blocks.extend(tool_result.attachments.iter().map(|attachment| {
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": attachment.mime_type,
+                "data": attachment.data,
+            }
+        })
+    }));
+    Value::Array(blocks)
 }
 
 /// Anthropic allows at most 4 cache_control breakpoints; all four are spent
@@ -728,7 +751,7 @@ mod tests {
     use super::*;
     use crate::client::access_token::set_access_token;
     use crate::config::AppConfig;
-    use crate::function::{FunctionDeclaration, ToolCall, ToolResult};
+    use crate::function::{FunctionDeclaration, ImageAttachment, ToolCall, ToolResult};
     use chrono::Utc;
     use std::sync::Arc;
 
@@ -738,7 +761,41 @@ mod tests {
             output: json!("ok"),
             text: text.map(|t| t.to_string()),
             thinking: vec![],
+            attachments: vec![],
         }
+    }
+
+    fn png_attachment(data: &str) -> ImageAttachment {
+        ImageAttachment {
+            source: "/tmp/a.png".into(),
+            mime_type: "image/png".into(),
+            data: data.into(),
+        }
+    }
+
+    fn image_tool_result(id: &str, attachments: Vec<ImageAttachment>) -> ToolResult {
+        tool_result(id, None).with_attachments(attachments)
+    }
+
+    fn png_block(data: &str) -> Value {
+        json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": "image/png", "data": data }
+        })
+    }
+
+    fn expected_image_content() -> Value {
+        json!([{ "type": "text", "text": "\"ok\"" }, png_block("aGVsbG8=")])
+    }
+
+    fn tool_result_blocks(body: &Value, message: usize) -> Vec<Value> {
+        body["messages"][message]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .cloned()
+            .collect()
     }
 
     fn build_body_with(
@@ -1029,6 +1086,7 @@ mod tests {
                     encrypted_content: Some("enc123".into()),
                 },
             ],
+            attachments: vec![],
         };
 
         for sequence in [false, true] {
@@ -1182,6 +1240,126 @@ mod tests {
 
         assert!(body["system"].is_string(), "body: {body}");
         assert!(!body.to_string().contains("cache_control"), "body: {body}");
+    }
+
+    #[test]
+    fn tool_result_without_attachments_keeps_string_content() {
+        for sequence in [false, true] {
+            let body = build_body_with(vec![tool_result("toolu_A", None)], "", sequence, false);
+
+            let blocks = tool_result_blocks(&body, 2);
+            assert_eq!(
+                blocks,
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_A",
+                    "content": "\"ok\"",
+                })],
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_sequence_tool_result_carries_image_blocks() {
+        let body = build_body_with(
+            vec![image_tool_result("toolu_A", vec![png_attachment("aGVsbG8=")])],
+            "",
+            false,
+            false,
+        );
+
+        let blocks = tool_result_blocks(&body, 2);
+        assert_eq!(blocks[0]["content"], expected_image_content(), "body: {body}");
+    }
+
+    #[test]
+    fn sequence_tool_result_carries_image_blocks() {
+        let body = build_body(
+            vec![image_tool_result("toolu_A", vec![png_attachment("aGVsbG8=")])],
+            false,
+        );
+
+        let blocks = tool_result_blocks(&body, 2);
+        assert_eq!(blocks[0]["content"], expected_image_content(), "body: {body}");
+    }
+
+    #[test]
+    fn round_starts_tool_result_carries_image_blocks() {
+        let body = build_body_rounds(
+            vec![
+                tool_result("toolu_A", None),
+                image_tool_result("toolu_B", vec![png_attachment("aGVsbG8=")]),
+            ],
+            vec![0, 1],
+        );
+
+        assert_eq!(body["messages"].as_array().unwrap().len(), 5, "body: {body}");
+        assert_eq!(tool_result_blocks(&body, 2)[0]["content"], "\"ok\"", "body: {body}");
+        assert_eq!(
+            tool_result_blocks(&body, 4)[0]["content"],
+            expected_image_content(),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn only_results_with_attachments_get_array_content() {
+        for sequence in [false, true] {
+            let body = build_body_with(
+                vec![
+                    tool_result("toolu_A", None),
+                    image_tool_result("toolu_B", vec![png_attachment("aGVsbG8=")]),
+                ],
+                "",
+                sequence,
+                false,
+            );
+
+            let blocks = tool_result_blocks(&body, 2);
+            assert_eq!(blocks.len(), 2, "body: {body}");
+            assert_eq!(blocks[0]["content"], "\"ok\"", "body: {body}");
+            assert_eq!(blocks[1]["content"], expected_image_content(), "body: {body}");
+        }
+    }
+
+    #[test]
+    fn multiple_attachments_keep_their_order() {
+        let body = build_body(
+            vec![image_tool_result(
+                "toolu_A",
+                vec![png_attachment("Zmlyc3Q="), png_attachment("c2Vjb25k")],
+            )],
+            false,
+        );
+
+        let blocks = tool_result_blocks(&body, 2);
+        assert_eq!(
+            blocks[0]["content"],
+            json!([
+                { "type": "text", "text": "\"ok\"" },
+                png_block("Zmlyc3Q="),
+                png_block("c2Vjb25k"),
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_marks_tool_result_with_image_content() {
+        let body = build_body(
+            vec![image_tool_result("toolu_A", vec![png_attachment("aGVsbG8=")])],
+            true,
+        );
+
+        let last_blocks = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let last_block = last_blocks.last().unwrap();
+        assert_eq!(last_block["type"], "tool_result", "body: {body}");
+        assert_eq!(last_block["cache_control"], json!({ "type": "ephemeral" }), "body: {body}");
+        assert_eq!(last_block["content"], expected_image_content(), "body: {body}");
     }
 
     /// The serializer keys on `MessageContent::ToolCalls`, not the wrapper

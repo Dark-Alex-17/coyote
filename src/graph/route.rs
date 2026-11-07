@@ -645,7 +645,9 @@ mod tests {
             .unwrap();
 
         let image = std::env::temp_dir().join(format!("{}.png", unique("route_probe")));
-        write(&image, b"not really a png").unwrap();
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
         let with_image =
             Input::from_files(&ctx, "q2", vec![image.to_string_lossy().to_string()], None)
                 .await

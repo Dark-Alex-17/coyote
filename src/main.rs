@@ -878,6 +878,7 @@ async fn create_input(
     if input.is_empty() {
         bail!("No input");
     }
+    input.guard_images()?;
     Ok(input)
 }
 
@@ -1015,4 +1016,36 @@ fn resolve_oauth_client(
         })?;
 
     Ok((name, provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{Model, ModelData};
+
+    #[tokio::test]
+    async fn create_input_refuses_an_image_for_a_non_vision_model() {
+        let dir = env::temp_dir().join(format!("coyote-create-input-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shot = dir.join("shot.png");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(&shot, png.into_inner()).unwrap();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.model = Model::from_config("openai", &[ModelData::new("blind")]).remove(0);
+
+        let result = create_input(
+            &ctx,
+            Some("hi".into()),
+            &[shot.to_string_lossy().into_owned()],
+            create_abort_signal(),
+        )
+        .await;
+        let _ = fs::remove_dir_all(&dir);
+
+        let err = result.expect_err("the image must be refused");
+        assert!(err.to_string().contains("does not accept images"), "{err}");
+    }
 }

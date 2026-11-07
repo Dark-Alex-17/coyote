@@ -5,19 +5,16 @@ use crate::client::{
     MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
 };
 use crate::function::ToolResult;
-use crate::utils::{AbortSignal, UserInterrupt, base64_encode, is_loader_protocol, sha256};
+use crate::utils::{AbortSignal, UserInterrupt, is_loader_protocol, sha256};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    io::Read,
     sync::Arc,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 const SUMMARY_MAX_WIDTH: usize = 80;
 const EXTENDED_PROMPT_CACHE_TTL: &str = "1h";
 
@@ -299,6 +296,20 @@ impl Input {
         self.continue_output = source.continue_output.clone();
     }
 
+    /// Attaches images in the given order, keeping repeats, unlike
+    /// `from_files`, which loads each distinct path once.
+    pub fn extend_image_medias(&mut self, paths: &[String]) -> Result<()> {
+        for path in paths {
+            let contents = prepare_image_file(Path::new(path))
+                .with_context(|| format!("Unable to read media '{path}'"))?
+                .to_data_url();
+            self.data_urls.insert(sha256(&contents), path.clone());
+            self.medias.push(contents);
+            self.raw.1.push(path.clone());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn set_patched_text(&mut self, text: &str) {
         self.patched_text = Some(text.to_string());
@@ -420,7 +431,17 @@ impl Input {
         model: &Model,
         stream: bool,
     ) -> Result<ChatCompletionsData> {
+        guard_medias(&self.medias, model)?;
         let mut messages = self.build_messages()?;
+        let current_user = if self.continue_output().is_none() {
+            messages.iter().rposition(|message| {
+                message.role == MessageRole::User
+                    && !matches!(message.content, MessageContent::ToolCalls(_))
+            })
+        } else {
+            None
+        };
+        limit_outgoing_images(&mut messages, model, current_user);
         patch_messages(&mut messages, model);
         model.guard_max_input_tokens(&messages)?;
         let (temperature, top_p) = (self.role().temperature(), self.role().top_p());
@@ -481,6 +502,13 @@ impl Input {
 
     pub fn role(&self) -> &Role {
         &self.role
+    }
+
+    /// Refuses a message whose images the model cannot take or that exceed
+    /// the per-request limits. Runs before anything is sent so a refusal
+    /// never reaches the session.
+    pub fn guard_images(&self) -> Result<()> {
+        guard_medias(&self.medias, self.role().model())
     }
 
     pub fn app_config(&self) -> &AppConfig {
@@ -715,9 +743,10 @@ async fn load_documents(
 
     let local_files = expand_glob_paths(&local_paths, true).await?;
     for file_path in local_files {
-        if is_image(&file_path) {
-            let contents = read_media_to_data_url(&file_path)
-                .with_context(|| format!("Unable to read media '{file_path}'"))?;
+        if is_supported_image_path(&file_path) {
+            let contents = prepare_image_file(Path::new(&file_path))
+                .with_context(|| format!("Unable to read media '{file_path}'"))?
+                .to_data_url();
             data_urls.insert(sha256(&contents), file_path);
             medias.push(contents)
         } else {
@@ -765,29 +794,137 @@ pub fn resolve_data_url(data_urls: &HashMap<String, String>, data_url: String) -
     }
 }
 
-fn is_image(path: &str) -> bool {
-    get_patch_extension(path)
-        .map(|v| IMAGE_EXTS.contains(&v.as_str()))
-        .unwrap_or_default()
+pub fn vision_unsupported_message(model: &Model) -> String {
+    format!(
+        "The model '{}' does not accept images. Switch to a vision-capable model, or set 'supports_vision: true' on this model in your config if it does support them.",
+        model.id()
+    )
 }
 
-fn read_media_to_data_url(image_path: &str) -> Result<String> {
-    let extension = get_patch_extension(image_path).unwrap_or_default();
-    let mime_type = match extension.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        _ => bail!("Unexpected media type"),
+fn guard_medias(medias: &[String], model: &Model) -> Result<()> {
+    if medias.is_empty() {
+        return Ok(());
+    }
+    if !model.supports_vision() {
+        bail!("{}", vision_unsupported_message(model));
+    }
+    let base64_bytes: usize = medias.iter().map(|url| data_url_base64_len(url)).sum();
+    if medias.len() > MAX_REQUEST_IMAGES || base64_bytes > MAX_REQUEST_IMAGE_BASE64_BYTES {
+        const MB: f64 = 1024.0 * 1024.0;
+        bail!(
+            "This message carries {} images ({:.1} MB); the limit is {MAX_REQUEST_IMAGES} images and {} MB per request.",
+            medias.len(),
+            base64_bytes as f64 / MB,
+            MAX_REQUEST_IMAGE_BASE64_BYTES as f64 / MB
+        );
+    }
+    Ok(())
+}
+
+fn data_url_base64_len(url: &str) -> usize {
+    url.split_once(',')
+        .map_or(url.len(), |(_, data)| data.len())
+}
+
+const IMAGES_UNSUPPORTED_REASON: &str = "the current model does not accept images";
+const IMAGES_OVER_BUDGET_REASON: &str = "older image dropped to stay within the request size limit";
+
+/// Running image totals for one outgoing request. Once an image is refused
+/// every older one is refused too, so the kept images are always the newest.
+struct ImageBudget {
+    open: bool,
+    count: usize,
+    bytes: usize,
+}
+
+impl ImageBudget {
+    fn admit(&mut self, size: usize) -> bool {
+        self.open = self.open
+            && self.count < MAX_REQUEST_IMAGES
+            && self.bytes + size <= MAX_REQUEST_IMAGE_BASE64_BYTES;
+        if self.open {
+            self.count += 1;
+            self.bytes += size;
+        }
+        self.open
+    }
+}
+
+/// Keeps history images within what the model and the per-request limits
+/// accept, replacing each dropped image with a short note. It rewrites only
+/// the outgoing copy and never fails: an error here would be written into
+/// the session as a failed turn. The current user message's images are never
+/// dropped; `guard_medias` has already checked them on their own.
+fn limit_outgoing_images(messages: &mut [Message], model: &Model, current_user: Option<usize>) {
+    let vision = model.supports_vision();
+    let reason = if vision {
+        IMAGES_OVER_BUDGET_REASON
+    } else {
+        IMAGES_UNSUPPORTED_REASON
     };
-    let mut file = File::open(image_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let mut budget = ImageBudget {
+        open: vision,
+        count: 0,
+        bytes: 0,
+    };
+    if let Some(MessageContent::Array(parts)) = current_user.map(|idx| &messages[idx].content) {
+        for part in parts {
+            if let MessageContentPart::ImageUrl { image_url } = part {
+                budget.count += 1;
+                budget.bytes += data_url_base64_len(&image_url.url);
+            }
+        }
+    }
 
-    let encoded_image = base64_encode(buffer);
-    let data_url = format!("data:{mime_type};base64,{encoded_image}");
-
-    Ok(data_url)
+    for (idx, message) in messages.iter_mut().enumerate().rev() {
+        if Some(idx) == current_user {
+            continue;
+        }
+        match &mut message.content {
+            MessageContent::Array(parts) if message.role == MessageRole::User => {
+                let mut dropped = 0;
+                let mut kept = Vec::with_capacity(parts.len());
+                for part in parts.drain(..).rev() {
+                    if let MessageContentPart::ImageUrl { image_url } = &part
+                        && !budget.admit(data_url_base64_len(&image_url.url))
+                    {
+                        dropped += 1;
+                        continue;
+                    }
+                    kept.push(part);
+                }
+                kept.reverse();
+                *parts = kept;
+                if dropped > 0 {
+                    parts.push(MessageContentPart::Text {
+                        text: format!("[{dropped} image(s) omitted: {reason}]"),
+                    });
+                }
+            }
+            MessageContent::ToolCalls(tool_calls) => {
+                for result in tool_calls.tool_results.iter_mut().rev() {
+                    let total = result.attachments.len();
+                    let mut kept: Vec<_> = std::mem::take(&mut result.attachments)
+                        .into_iter()
+                        .rev()
+                        .filter(|attachment| budget.admit(attachment.data.len()))
+                        .collect();
+                    kept.reverse();
+                    let dropped = total - kept.len();
+                    result.attachments = kept;
+                    if dropped > 0 {
+                        result.output = json!({
+                            "result": result.output.take(),
+                            "images_omitted": format!(
+                                "{dropped} image(s) from this tool were omitted: {reason}"
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -797,7 +934,7 @@ mod tests {
     use crate::config::request_context::RequestContext;
     use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
-    use crate::function::ToolCall;
+    use crate::function::{ImageAttachment, ToolCall};
     use serde_json::json;
     use std::fs;
     use std::sync::Arc;
@@ -1207,19 +1344,20 @@ mod tests {
     }
 
     #[test]
-    fn is_image_recognizes_image_extensions() {
-        assert!(is_image("photo.png"));
-        assert!(is_image("photo.jpeg"));
-        assert!(is_image("photo.jpg"));
-        assert!(is_image("photo.webp"));
-        assert!(is_image("photo.gif"));
+    fn is_supported_image_path_recognizes_image_extensions() {
+        assert!(is_supported_image_path("photo.png"));
+        assert!(is_supported_image_path("photo.jpeg"));
+        assert!(is_supported_image_path("photo.jpg"));
+        assert!(is_supported_image_path("photo.webp"));
+        assert!(is_supported_image_path("photo.gif"));
+        assert!(is_supported_image_path("PHOTO.PNG"));
     }
 
     #[test]
-    fn is_image_rejects_non_image_extensions() {
-        assert!(!is_image("file.txt"));
-        assert!(!is_image("file.rs"));
-        assert!(!is_image("file.pdf"));
+    fn is_supported_image_path_rejects_non_image_extensions() {
+        assert!(!is_supported_image_path("file.txt"));
+        assert!(!is_supported_image_path("file.rs"));
+        assert!(!is_supported_image_path("file.pdf"));
     }
 
     #[test]
@@ -1309,6 +1447,32 @@ mod tests {
         let ctx = create_test_ctx();
         let input = run_async(Input::from_files(&ctx, "just text", vec![], None)).unwrap();
         assert_eq!(input.text(), "just text");
+    }
+
+    #[test]
+    fn from_files_rejects_text_file_named_as_image() {
+        let dir = env::temp_dir().join(format!(
+            "coyote-input-test-fake-image-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let file_path = dir.join("x.png");
+        fs::write(&file_path, "not an image").unwrap();
+
+        let ctx = create_test_ctx();
+        let err = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![file_path.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains(&file_path.display().to_string()));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1683,5 +1847,313 @@ mod tests {
         input.carry_patch_from(&source);
 
         assert_eq!(input.continue_output(), Some("partial"));
+    }
+
+    fn model_with_vision(supports_vision: bool) -> Model {
+        let mut data = ModelData::new("eyes");
+        data.supports_vision = supports_vision;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn input_with_images(supports_vision: bool, medias: Vec<String>) -> Input {
+        let mut input = Input::from_str(&create_test_ctx(), "look", None).unwrap();
+        input.set_role_model(model_with_vision(supports_vision));
+        input.medias = medias;
+        input
+    }
+
+    fn png_data_url(base64_len: usize) -> String {
+        format!("data:image/png;base64,{}", "A".repeat(base64_len))
+    }
+
+    #[test]
+    fn guard_images_allows_text_only_on_non_vision_model() {
+        input_with_images(false, vec![]).guard_images().unwrap();
+    }
+
+    #[test]
+    fn guard_images_refuses_images_on_non_vision_model() {
+        let err = input_with_images(false, vec![png_data_url(8)])
+            .guard_images()
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "The model 'openai:eyes' does not accept images. Switch to a vision-capable model, or set 'supports_vision: true' on this model in your config if it does support them."
+        );
+    }
+
+    #[test]
+    fn guard_images_allows_the_maximum_image_count() {
+        let medias = vec![png_data_url(8); MAX_REQUEST_IMAGES];
+        input_with_images(true, medias).guard_images().unwrap();
+    }
+
+    #[test]
+    fn guard_images_refuses_too_many_images() {
+        let medias = vec![png_data_url(8); MAX_REQUEST_IMAGES + 1];
+        let err = input_with_images(true, medias).guard_images().unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "This message carries 21 images (0.0 MB); the limit is 20 images and 20 MB per request."
+        );
+    }
+
+    #[test]
+    fn guard_images_refuses_oversized_base64_total() {
+        let half = MAX_REQUEST_IMAGE_BASE64_BYTES / 2;
+        let medias = vec![png_data_url(half), png_data_url(half + 1)];
+        let err = input_with_images(true, medias).guard_images().unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "This message carries 2 images (20.0 MB); the limit is 20 images and 20 MB per request."
+        );
+    }
+
+    #[test]
+    fn prepare_completion_data_refuses_images_for_a_non_vision_model() {
+        let input = input_with_images(true, vec![png_data_url(8)]);
+
+        let err = input
+            .prepare_completion_data(&model_with_vision(false), false)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("does not accept images"), "{err}");
+    }
+
+    const OVER_BUDGET_NOTE: &str = "older image dropped to stay within the request size limit";
+
+    fn image_part(base64_len: usize) -> MessageContentPart {
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: png_data_url(base64_len),
+            },
+        }
+    }
+
+    fn user_images(count: usize, base64_len: usize) -> Message {
+        let mut parts = vec![MessageContentPart::Text {
+            text: "see these".into(),
+        }];
+        parts.extend((0..count).map(|_| image_part(base64_len)));
+        Message::new(MessageRole::User, MessageContent::Array(parts))
+    }
+
+    fn attachment(source: &str, base64_len: usize) -> ImageAttachment {
+        ImageAttachment {
+            source: source.into(),
+            mime_type: "image/png".into(),
+            data: "A".repeat(base64_len),
+        }
+    }
+
+    /// One tool result per entry of `per_result`, each carrying that many
+    /// attachments labelled `<label>-<result>-<index>`.
+    fn tool_images(
+        label: &str,
+        per_result: &[usize],
+        base64_len: usize,
+    ) -> MessageContentToolCalls {
+        let results = per_result
+            .iter()
+            .enumerate()
+            .map(|(r, &count)| {
+                ToolResult::new(
+                    ToolCall::new("fs_read".into(), json!({}), Some(format!("{label}-{r}"))),
+                    json!("read"),
+                )
+                .with_attachments(
+                    (0..count)
+                        .map(|i| attachment(&format!("{label}-{r}-{i}"), base64_len))
+                        .collect(),
+                )
+            })
+            .collect();
+        MessageContentToolCalls::new(results, String::new())
+    }
+
+    fn tool_message(tool_calls: MessageContentToolCalls) -> Message {
+        Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(tool_calls),
+        )
+    }
+
+    fn text_message(text: &str) -> Message {
+        Message::new(MessageRole::User, MessageContent::Text(text.into()))
+    }
+
+    fn image_count(message: &Message) -> usize {
+        match &message.content {
+            MessageContent::Array(parts) => parts
+                .iter()
+                .filter(|part| matches!(part, MessageContentPart::ImageUrl { .. }))
+                .count(),
+            MessageContent::ToolCalls(tool_calls) => tool_calls
+                .tool_results
+                .iter()
+                .map(|result| result.attachments.len())
+                .sum(),
+            MessageContent::Text(_) => 0,
+        }
+    }
+
+    fn last_text_part(message: &Message) -> &str {
+        match &message.content {
+            MessageContent::Array(parts) => match parts.last() {
+                Some(MessageContentPart::Text { text }) => text,
+                other => panic!("last part is not text: {other:?}"),
+            },
+            other => panic!("not a part list: {other:?}"),
+        }
+    }
+
+    fn tool_results(message: &Message) -> &[ToolResult] {
+        match &message.content {
+            MessageContent::ToolCalls(tool_calls) => &tool_calls.tool_results,
+            other => panic!("not a tool message: {other:?}"),
+        }
+    }
+
+    fn as_json(messages: &[Message]) -> serde_json::Value {
+        serde_json::to_value(messages).unwrap()
+    }
+
+    #[test]
+    fn limit_outgoing_images_keeps_the_newest_twenty() {
+        let mut messages = vec![
+            user_images(3, 8),
+            tool_message(tool_images("b", &[4], 8)),
+            user_images(8, 8),
+            tool_message(tool_images("d", &[5, 5], 8)),
+            text_message("and now?"),
+        ];
+        let stored = messages.clone();
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(4));
+
+        assert_eq!(image_count(&messages[0]), 0);
+        assert_eq!(
+            last_text_part(&messages[0]),
+            format!("[3 image(s) omitted: {OVER_BUDGET_NOTE}]")
+        );
+        let partial = &tool_results(&messages[1])[0];
+        let kept: Vec<_> = partial
+            .attachments
+            .iter()
+            .map(|a| a.source.as_str())
+            .collect();
+        assert_eq!(kept, ["b-0-2", "b-0-3"]);
+        assert_eq!(
+            partial.output,
+            json!({
+                "result": "read",
+                "images_omitted": format!("2 image(s) from this tool were omitted: {OVER_BUDGET_NOTE}"),
+            })
+        );
+        assert_eq!(as_json(&messages[2..]), as_json(&stored[2..]));
+        assert_eq!(
+            messages.iter().map(image_count).sum::<usize>(),
+            MAX_REQUEST_IMAGES
+        );
+    }
+
+    #[test]
+    fn limit_outgoing_images_drops_the_oldest_image_over_the_byte_budget() {
+        let eight_mb = 8 * 1024 * 1024;
+        let mut messages = vec![
+            user_images(1, eight_mb),
+            tool_message(tool_images("b", &[1, 1], eight_mb)),
+            text_message("and now?"),
+        ];
+        let stored = messages.clone();
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(2));
+
+        assert_eq!(image_count(&messages[0]), 0);
+        assert_eq!(
+            last_text_part(&messages[0]),
+            format!("[1 image(s) omitted: {OVER_BUDGET_NOTE}]")
+        );
+        assert_eq!(as_json(&messages[1..]), as_json(&stored[1..]));
+    }
+
+    #[test]
+    fn limit_outgoing_images_within_budget_leaves_messages_unchanged() {
+        let mut messages = vec![
+            user_images(2, 64),
+            tool_message(tool_images("b", &[2, 1], 64)),
+            user_images(1, 64),
+        ];
+        let stored = messages.clone();
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(2));
+
+        assert_eq!(as_json(&messages), as_json(&stored));
+    }
+
+    #[test]
+    fn limit_outgoing_images_strips_every_history_image_for_a_non_vision_model() {
+        let image_only = Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![image_part(8), image_part(8)]),
+        );
+        let mut messages = vec![
+            image_only,
+            tool_message(tool_images("b", &[1], 8)),
+            text_message("and now?"),
+        ];
+
+        limit_outgoing_images(&mut messages, &model_with_vision(false), Some(2));
+
+        let MessageContent::Array(parts) = &messages[0].content else {
+            panic!("{:?}", messages[0].content);
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            last_text_part(&messages[0]),
+            "[2 image(s) omitted: the current model does not accept images]"
+        );
+        let result = &tool_results(&messages[1])[0];
+        assert!(result.attachments.is_empty());
+        assert_eq!(
+            result.output,
+            json!({
+                "result": "read",
+                "images_omitted": "1 image(s) from this tool were omitted: the current model does not accept images",
+            })
+        );
+    }
+
+    #[test]
+    fn limit_outgoing_images_never_drops_the_current_message_images() {
+        let mut messages = vec![
+            tool_message(tool_images("b", &[1], 8)),
+            user_images(MAX_REQUEST_IMAGES, 8),
+        ];
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(1));
+
+        assert_eq!(image_count(&messages[0]), 0);
+        assert_eq!(image_count(&messages[1]), MAX_REQUEST_IMAGES);
+    }
+
+    #[test]
+    fn prepare_completion_data_strips_tool_attachments_for_a_non_vision_model() {
+        let mut input = input_with_images(false, vec![]);
+        input.tool_calls = Some(tool_images("b", &[1], 8));
+        let stored = serde_json::to_value(&input.tool_calls).unwrap();
+
+        let data = input
+            .prepare_completion_data(&model_with_vision(false), false)
+            .unwrap();
+
+        let result = &tool_results(data.messages.last().unwrap())[0];
+        assert!(result.attachments.is_empty());
+        assert_eq!(result.output["result"], json!("read"));
+        assert!(result.output["images_omitted"].is_string());
+        assert_eq!(serde_json::to_value(&input.tool_calls).unwrap(), stored);
     }
 }

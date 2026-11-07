@@ -719,7 +719,9 @@ mod tests {
         let earlier = Input::from_str(&ctx, "earlier", None).unwrap();
         ctx.last_message = Some(LastMessage::new(earlier, "earlier reply".to_string()));
         let image = paths::agent_data_dir(&name).join("shot.png");
-        write(&image, b"not really a png").unwrap();
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
         let input = Input::from_files(
             &ctx,
             "typed",

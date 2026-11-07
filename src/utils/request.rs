@@ -129,10 +129,13 @@ pub async fn fetch_with_loaders(
         if !allow_media {
             bail!("Unexpected media type")
         }
-        let image_bytes = res.bytes().await?;
-        let image_base64 = base64_encode(&image_bytes);
-        let contents = format!("data:{content_type};base64,{image_base64}");
-        (contents, extension)
+        if !is_supported_image_mime(&content_type) {
+            bail!("Unsupported media type '{content_type}': {SUPPORTED_IMAGE_FORMATS_NOTE}")
+        }
+        let image_bytes = read_capped_body(res, path, MAX_IMAGE_SOURCE_BYTES).await?;
+        let prepared =
+            prepare_image_bytes(&image_bytes).with_context(|| format!("Invalid image '{path}'"))?;
+        (prepared.to_data_url(), extension)
     } else {
         match loaders.get(&extension) {
             Some(loader_command) => {
@@ -164,6 +167,26 @@ pub async fn fetch_with_loaders(
         }
     };
     Ok(result)
+}
+
+async fn read_capped_body(mut res: reqwest::Response, url: &str, cap: u64) -> Result<Vec<u8>> {
+    let too_large = || {
+        anyhow!(
+            "Remote media '{url}' exceeds the {} MiB limit",
+            cap / (1024 * 1024)
+        )
+    };
+    if res.content_length().is_some_and(|len| len > cap) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if (body.len() + chunk.len()) as u64 > cap {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 pub async fn fetch_models(api_base: &str, api_key: Option<&str>) -> Result<Vec<String>> {
@@ -461,4 +484,199 @@ fn match_link(path: &str, link: &str) -> bool {
             == link
                 .trim_end_matches("/index.html")
                 .trim_end_matches("/index.htm")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
+    use std::io::Cursor;
+    use tokio::io::AsyncReadExt;
+
+    const TEST_CAP: u64 = 1024 * 1024;
+
+    async fn serve_raw(head: String, body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            // The client may hang up once it hits the cap, so write errors are expected.
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        });
+        format!("http://{addr}/file")
+    }
+
+    async fn serve_once(content_type: &'static str, body: Vec<u8>) -> String {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        serve_raw(head, body).await
+    }
+
+    async fn get(url: &str) -> reqwest::Response {
+        reqwest::get(url).await.unwrap()
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let image = RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]));
+        let mut buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut buf, ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    fn jpeg_bytes() -> Vec<u8> {
+        let image = RgbImage::from_pixel(8, 8, image::Rgb([10, 20, 30]));
+        let mut buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut buf, ImageFormat::Jpeg)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    async fn fetch_media_err(content_type: &'static str) -> String {
+        let url = serve_once(content_type, b"payload".to_vec()).await;
+        let err = fetch_with_loaders(&HashMap::new(), &url, true)
+            .await
+            .unwrap_err();
+        format!("{err:#}")
+    }
+
+    #[tokio::test]
+    async fn audio_url_is_unsupported() {
+        assert_eq!(
+            fetch_media_err("audio/mpeg").await,
+            "Unsupported media type 'audio/mpeg': only PNG, JPEG, WebP and GIF images can be attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_url_is_unsupported() {
+        assert!(
+            fetch_media_err("video/mp4")
+                .await
+                .starts_with("Unsupported media type 'video/mp4'")
+        );
+    }
+
+    #[tokio::test]
+    async fn svg_url_is_unsupported() {
+        assert!(
+            fetch_media_err("image/svg+xml")
+                .await
+                .starts_with("Unsupported media type 'image/svg+xml'")
+        );
+    }
+
+    #[tokio::test]
+    async fn png_url_attaches_as_data_url() {
+        let bytes = png_bytes();
+        let url = serve_once("image/png", bytes.clone()).await;
+        let (contents, extension) = fetch_with_loaders(&HashMap::new(), &url, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            contents,
+            format!("data:image/png;base64,{}", base64_encode(&bytes))
+        );
+        assert_eq!(extension, MEDIA_URL_EXTENSION);
+    }
+
+    #[tokio::test]
+    async fn non_image_bytes_labelled_png_name_the_url() {
+        let url = serve_once("image/png", b"not an image".to_vec()).await;
+        let err = fetch_with_loaders(&HashMap::new(), &url, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), format!("Invalid image '{url}'"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn media_url_rejected_when_media_not_allowed() {
+        let url = serve_once("image/png", png_bytes()).await;
+        let err = fetch_with_loaders(&HashMap::new(), &url, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unexpected media type");
+    }
+
+    #[tokio::test]
+    async fn jpeg_mime_aliases_attach_as_jpeg() {
+        for content_type in ["image/jpg", "image/pjpeg"] {
+            let bytes = jpeg_bytes();
+            let url = serve_once(content_type, bytes.clone()).await;
+            let (contents, _) = fetch_with_loaders(&HashMap::new(), &url, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                contents,
+                format!("data:image/jpeg;base64,{}", base64_encode(&bytes)),
+                "{content_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_body_rejects_declared_length_over_cap() {
+        // The body is shorter than declared, so only an early header check yields this error.
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            TEST_CAP + 1
+        );
+        let url = serve_raw(head, b"short".to_vec()).await;
+        let err = read_capped_body(get(&url).await, &url, TEST_CAP)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Remote media '{url}' exceeds the 1 MiB limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_body_rejects_unsized_body_over_cap() {
+        let head =
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nConnection: close\r\n\r\n".to_string();
+        let url = serve_raw(head, vec![0u8; TEST_CAP as usize + 1]).await;
+        let err = read_capped_body(get(&url).await, &url, TEST_CAP)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Remote media '{url}' exceeds the 1 MiB limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_body_never_returns_more_than_cap_when_length_understates_body() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {TEST_CAP}\r\nConnection: close\r\n\r\n"
+        );
+        let url = serve_raw(head, vec![0u8; TEST_CAP as usize * 2]).await;
+        let body = read_capped_body(get(&url).await, &url, TEST_CAP)
+            .await
+            .unwrap();
+        assert_eq!(body.len() as u64, TEST_CAP);
+    }
+
+    #[tokio::test]
+    async fn capped_body_accepts_body_at_cap() {
+        let url = serve_once("image/png", vec![0u8; TEST_CAP as usize]).await;
+        let body = read_capped_body(get(&url).await, &url, TEST_CAP)
+            .await
+            .unwrap();
+        assert_eq!(body.len() as u64, TEST_CAP);
+    }
 }

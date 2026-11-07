@@ -203,6 +203,22 @@ impl MessageContent {
             MessageContent::ToolCalls(_) => String::new(),
         }
     }
+
+    /// `to_text` with each image part rendered as `[image]` in place, so a
+    /// text-only reader still sees that an image was there.
+    pub fn to_text_with_image_placeholders(&self) -> String {
+        match self {
+            MessageContent::Array(list) => list
+                .iter()
+                .map(|item| match item {
+                    MessageContentPart::Text { text } => text.as_str(),
+                    MessageContentPart::ImageUrl { .. } => "[image]",
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            content => content.to_text(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

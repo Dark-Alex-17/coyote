@@ -15,6 +15,7 @@ use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, Input, LastMessage, MacroState,
     RequestContext, Session, SessionScope, StateFlags, TURN_INTERRUPTED_TEXT,
     flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
+    vision_unsupported_message,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pending_tasks};
@@ -25,9 +26,10 @@ use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
 use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
-    AbortSignal, SHELL, TaskCancelGuard, UserInterrupt, abortable_run_with_spinner,
-    create_abort_signal, dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command,
-    set_text, temp_file, wait_user_interrupt,
+    AbortSignal, ClipboardContent, SHELL, TaskCancelGuard, UserInterrupt,
+    abortable_run_with_spinner, create_abort_signal, dimmed_text, drain_stale_tty_input,
+    hex_encode, is_supported_image_path, read_for_paste, resolve_home_dir, resync_cursor_queries,
+    run_command, set_text, sniff_supported_image, temp_file, wait_user_interrupt,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -47,15 +49,24 @@ use reedline::{
     default_vi_visual_keybindings,
 };
 use reedline::{MenuBuilder, Signal};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::{env, process, sync::Arc};
 use tokio::task;
 
 const MENU_NAME: &str = "completion_menu";
+
+const PASTE_IMAGE_HOST_COMMAND: &str = "coyote-paste-image";
+
+const MAX_IMAGES_PER_LINE: usize = 10;
+
+const MAX_IMAGE_RUN_TOKENS: usize = 16;
 
 /// Bounded wait applied at process-exit seams (REPL teardown, headless and
 /// shell-execute exits) so already-fired exit hooks — `session.ended`, the
@@ -144,7 +155,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 66]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 67]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -306,6 +317,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 66]> = LazyLock::new(|| {
         ReplCommand::new(
             ".clear todo",
             "Clear the todo list and stop auto-continuation",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".clear images",
+            "Clear pending image attachments",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -593,6 +609,37 @@ impl Repl {
                     self.abort_signal.set_ctrld();
                     break;
                 }
+                // reedline keeps the buffer on a host command, so the next
+                // read_line resumes with the typed text intact.
+                Ok(Signal::HostCommand(cmd)) if cmd == PASTE_IMAGE_HOST_COMMAND => {
+                    let outcome = match read_for_paste() {
+                        Ok(content) => handle_clipboard_paste(&mut self.ctx.write(), content),
+                        Err(err) => PasteOutcome::Error(format!("Clipboard unavailable: {err:#}")),
+                    };
+                    match outcome {
+                        PasteOutcome::InsertText(text) => {
+                            self.editor
+                                .run_edit_commands(&[EditCommand::InsertString(text)]);
+                        }
+                        PasteOutcome::Attached(count) => {
+                            let ctx = self.ctx.read();
+                            let queued = &ctx.pending_images;
+                            let attached = &queued[queued.len().saturating_sub(count)..];
+                            if let Some(message) =
+                                paste_feedback(ctx.app.config.left_prompt.as_deref(), attached)
+                            {
+                                println!("{message}");
+                            }
+                        }
+                        PasteOutcome::Nothing => {}
+                        // The cursor still sits on the input line, so start a
+                        // fresh one before printing.
+                        PasteOutcome::Error(message) => {
+                            print!("\r\n");
+                            render_error(Error::msg(message));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -676,6 +723,18 @@ impl Repl {
             KeyCode::Char('j'),
             ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
+        keybindings.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('v'),
+            ReedlineEvent::ExecuteHostCommand(PASTE_IMAGE_HOST_COMMAND.into()),
+        );
+        // Windows terminals usually claim Ctrl+V for their own paste.
+        #[cfg(windows)]
+        keybindings.add_binding(
+            KeyModifiers::ALT,
+            KeyCode::Char('v'),
+            ReedlineEvent::ExecuteHostCommand(PASTE_IMAGE_HOST_COMMAND.into()),
+        );
     }
 
     fn create_edit_mode(app: &AppConfig) -> Box<dyn EditMode> {
@@ -756,6 +815,17 @@ pub async fn run_repl_command_with_prefix(
         && let Some(text_match) = captures.get(1)
     {
         line = text_match.as_str();
+    }
+    // A dragged absolute path under the slash prefix, or `./shot.png` under
+    // the dot prefix, would otherwise parse as an unknown command.
+    if starts_with_image_path(line)
+        && let Some(route) = route_image_line(ctx, line)
+    {
+        handle_image_route(ctx, abort_signal, route).await?;
+        if !ctx.macro_flag {
+            println!();
+        }
+        return Ok(false);
     }
     match parse_command(line, prefix) {
         Some((cmd, args)) => match cmd.as_ref() {
@@ -1684,6 +1754,9 @@ pub async fn run_repl_command_with_prefix(
                         println!("Todo list cleared.");
                     }
                 }
+                Some("images") => {
+                    println!("{}", clear_pending_images(ctx));
+                }
                 _ => unknown_command(ctx)?,
             },
             ".vault" => match split_first_arg(args) {
@@ -1750,6 +1823,8 @@ pub async fn run_repl_command_with_prefix(
         None => {
             if let Some(cmd) = try_extract_shell_command(line) {
                 handle_shell_passthrough(cmd)?;
+            } else if let Some(route) = route_image_line(ctx, line) {
+                handle_image_route(ctx, abort_signal.clone(), route).await?;
             } else {
                 reset_continuation(ctx);
                 ctx.resume_auto_continue();
@@ -1805,8 +1880,9 @@ impl std::error::Error for PreflightError {
 /// before-hook, then the transport `select_transport` picks. The same
 /// runner serves the route classifier and the turn's own completion, so a
 /// test can drive a whole turn with a canned closure. A `create_client`
-/// failure is wrapped in `PreflightError`: nothing was sent, so neither the
-/// compress-and-retry nor the INTERRUPTED bookkeeping applies to it.
+/// or `guard_images` failure is wrapped in `PreflightError`: nothing was
+/// sent, so neither the compress-and-retry nor the INTERRUPTED bookkeeping
+/// applies to it.
 fn repl_completion_runner()
 -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 {
@@ -1814,6 +1890,9 @@ fn repl_completion_runner()
         Box::pin(async move {
             let client = input
                 .create_client()
+                .map_err(|err| anyhow::Error::new(PreflightError(err)))?;
+            input
+                .guard_images()
                 .map_err(|err| anyhow::Error::new(PreflightError(err)))?;
             ctx.before_chat_completion(input)?;
             match select_transport(input) {
@@ -1930,6 +2009,9 @@ async fn ask_loop(
     forced: Option<Branch>,
     runner: &mut CompletionRunner<'_>,
 ) -> Result<()> {
+    // The graph branch never reaches the runner's preflight, so a refused
+    // image must stop the turn here, before it is recorded or routed.
+    input.guard_images()?;
     let mut input = input;
     let mut with_embeddings = with_embeddings;
     // One compress-and-retry per fresh input; tool-loop iterations share it.
@@ -2788,9 +2870,9 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
             word.to_string()
         }
     };
-    let chars: Vec<char> = line.chars().collect();
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
 
-    for (i, char) in chars.iter().cloned().enumerate() {
+    for (i, &(offset, char)) in chars.iter().enumerate() {
         match unbalance {
             Some(ub_char) if ub_char == char => {
                 word.push(char);
@@ -2801,7 +2883,7 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
             }
             None => match char {
                 ' ' | '\t' | '\r' | '\n' => {
-                    if char == '\r' && chars.get(i + 1) == Some(&'\n') {
+                    if char == '\r' && chars.get(i + 1).map(|&(_, c)| c) == Some('\n') {
                         continue;
                     }
                     if let Some('\\') = prev_char.filter(|_| !is_win) {
@@ -2809,7 +2891,7 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
                     } else if !word.is_empty() {
                         if word == "--" {
                             word.clear();
-                            text_starts_at = Some(i + 1);
+                            text_starts_at = Some(offset + 1);
                             break;
                         }
                         words.push(unquote_word(&word));
@@ -2842,6 +2924,349 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
     };
 
     (words, text)
+}
+
+/// Terminals deliver a dragged or pasted file as its path text, so a plain
+/// line can carry images without any command.
+#[derive(Debug, PartialEq)]
+enum PlainLineRoute {
+    QueueImages {
+        paths: Vec<String>,
+        ignored: usize,
+    },
+    Send {
+        text: String,
+        images: Vec<String>,
+        notice: Option<String>,
+    },
+    Refuse(String),
+}
+
+fn route_image_line(ctx: &RequestContext, line: &str) -> Option<PlainLineRoute> {
+    let cwd = env::current_dir().unwrap_or_default();
+    let tokens = image_detection_tokens(line);
+    let mut detected = Vec::new();
+    let mut overflow = 0;
+    let mut has_text = false;
+    let mut start = 0;
+    while start < tokens.len() {
+        match longest_image_run_at(&tokens, start, &cwd) {
+            Some((len, path)) => {
+                if detected.len() < MAX_IMAGES_PER_LINE {
+                    detected.push(path);
+                } else {
+                    overflow += 1;
+                }
+                start += len;
+            }
+            None => {
+                has_text = true;
+                start += 1;
+            }
+        }
+    }
+
+    if !detected.is_empty() && !has_text {
+        return Some(PlainLineRoute::QueueImages {
+            paths: detected,
+            ignored: overflow,
+        });
+    }
+    let model = ctx.current_model();
+    if !ctx.pending_images.is_empty() && !model.supports_vision() {
+        return Some(PlainLineRoute::Refuse(vision_unsupported_message(model)));
+    }
+    if detected.is_empty() {
+        return (!ctx.pending_images.is_empty()).then(|| PlainLineRoute::Send {
+            text: line.to_string(),
+            images: ctx.pending_images.clone(),
+            notice: None,
+        });
+    }
+    if !model.supports_vision() {
+        return Some(PlainLineRoute::Send {
+            text: line.to_string(),
+            images: Vec::new(),
+            notice: Some(format!(
+                "Images not attached: the model '{}' does not accept images.",
+                model.id()
+            )),
+        });
+    }
+    let mut notice = format!(
+        "Attached {} image(s): {}",
+        detected.len(),
+        image_file_names(&detected)
+    );
+    if overflow > 0 {
+        notice.push_str(&format!(
+            "; {overflow} more image path(s) left as text (at most {MAX_IMAGES_PER_LINE} per line)"
+        ));
+    }
+    let mut images = ctx.pending_images.clone();
+    images.extend(detected);
+    Some(PlainLineRoute::Send {
+        text: line.to_string(),
+        images,
+        notice: Some(notice),
+    })
+}
+
+fn starts_with_image_path(line: &str) -> bool {
+    let cwd = env::current_dir().unwrap_or_default();
+    longest_image_run_at(&image_detection_tokens(line), 0, &cwd).is_some()
+}
+
+/// Finds the longest run of tokens from `start` that names an image, joining
+/// the tokens with single spaces, because some terminals drop a path with
+/// its spaces unescaped. Returns the run length and the resolved path. Only
+/// runs ending in an image extension touch the file system.
+fn longest_image_run_at(tokens: &[String], start: usize, cwd: &Path) -> Option<(usize, String)> {
+    let longest = (tokens.len() - start.min(tokens.len())).min(MAX_IMAGE_RUN_TOKENS);
+    (1..=longest).rev().find_map(|len| {
+        let run = tokens[start..start + len].join(" ");
+        if !is_supported_image_path(&run) {
+            return None;
+        }
+        resolve_image_token(&run, cwd).map(|path| (len, path))
+    })
+}
+
+/// Splits a pasted line the way a terminal quotes a dropped file: a quote
+/// only opens a span at the start of a token, so apostrophes inside words
+/// stay literal. Outside Windows a backslash makes the next character
+/// literal, as terminals escape spaces, parentheses and quotes in dropped
+/// paths. Only ASCII whitespace separates tokens because file names such as
+/// macOS screenshots contain U+202F, which terminals do not escape.
+fn image_detection_tokens(line: &str) -> Vec<String> {
+    let is_separator = |c: &char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars.next_if(is_separator).is_some() {}
+        let Some(first) = chars.next() else {
+            break;
+        };
+        let mut token = String::new();
+        if matches!(first, '\'' | '"' | '`') {
+            token.extend(chars.by_ref().take_while(|&c| c != first));
+        } else {
+            let mut c = first;
+            loop {
+                let escaped = if !cfg!(windows) && c == '\\' {
+                    chars.next()
+                } else {
+                    None
+                };
+                token.push(escaped.unwrap_or(c));
+                match chars.next_if(|c| !is_separator(c)) {
+                    Some(next) => c = next,
+                    None => break,
+                }
+            }
+        }
+        tokens.push(token);
+    }
+    tokens
+}
+
+/// Returns the absolute path when `token` names an existing image file,
+/// accepting the `file://` URLs some terminals paste. A file whose content
+/// is not a supported image is left as text.
+fn resolve_image_token(token: &str, cwd: &Path) -> Option<String> {
+    let path = match token.strip_prefix("file://") {
+        Some(url_path) => {
+            let decoded = urlencoding::decode(url_path).ok()?.into_owned();
+            let bytes = decoded.as_bytes();
+            let drive_path = bytes.len() >= 3
+                && bytes[0] == b'/'
+                && bytes[1].is_ascii_alphabetic()
+                && bytes[2] == b':';
+            if cfg!(windows) && drive_path {
+                decoded[1..].to_string()
+            } else {
+                decoded
+            }
+        }
+        None => token.to_string(),
+    };
+    if !is_supported_image_path(&path) {
+        return None;
+    }
+    let path = cwd.join(resolve_home_dir(&path));
+    if !sniff_supported_image(&path) {
+        return None;
+    }
+    path.to_str().map(str::to_string)
+}
+
+fn image_file_names(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            Path::new(path)
+                .file_name()
+                .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn handle_image_route(
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+    route: PlainLineRoute,
+) -> Result<()> {
+    match route {
+        PlainLineRoute::QueueImages { paths, ignored } => {
+            println!("{}", queued_images_message(ctx, &paths, ignored));
+            ctx.pending_images.extend(paths);
+        }
+        PlainLineRoute::Refuse(message) => bail!("{message}"),
+        PlainLineRoute::Send {
+            text,
+            images,
+            notice,
+        } => {
+            let loaded =
+                Input::from_files_with_spinner(ctx, &text, Vec::new(), None, abort_signal.clone())
+                    .await
+                    .and_then(|mut input| {
+                        input.extend_image_medias(&images)?;
+                        Ok(input)
+                    });
+            let input = match loaded {
+                Ok(input) => input,
+                Err(err) if !ctx.pending_images.is_empty() => {
+                    return Err(err.context(format!(
+                        "Unable to prepare the message (pending images can be discarded with {})",
+                        ctx.render_hints(".clear images")
+                    )));
+                }
+                Err(err) => return Err(err),
+            };
+            // The runner preflight repeats this check for every entry point;
+            // running it here first keeps the queue intact on a refusal.
+            if let Err(err) = input.guard_images() {
+                if ctx.pending_images.is_empty() {
+                    return Err(err);
+                }
+                bail!(
+                    "{err} Remove some with {}.",
+                    ctx.render_hints(".clear images")
+                );
+            }
+            if let Some(notice) = notice {
+                println!("{notice}");
+            }
+            ctx.pending_images.clear();
+            reset_continuation(ctx);
+            ctx.resume_auto_continue();
+            ask(ctx, abort_signal, input, true).await?;
+        }
+    }
+    Ok(())
+}
+
+fn queued_images_message(ctx: &RequestContext, paths: &[String], ignored: usize) -> String {
+    let clear_hint = ctx.render_hints(".clear images");
+    let mut message = format!(
+        "Attached {} image(s): {}",
+        paths.len(),
+        image_file_names(paths)
+    );
+    if ignored > 0 {
+        message.push_str(&format!(
+            "; {ignored} more ignored (at most {MAX_IMAGES_PER_LINE} per line)"
+        ));
+    }
+    message.push_str(&format!(". Type your message, or {clear_hint}."));
+    if !ctx.current_model().supports_vision() {
+        message.push_str(&format!(
+            " The current model does not accept images; switch models before sending, or use {clear_hint}."
+        ));
+    }
+    message
+}
+
+fn clear_pending_images(ctx: &mut RequestContext) -> String {
+    if ctx.pending_images.is_empty() {
+        return "No pending images.".to_string();
+    }
+    let cleared = ctx.pending_images.len();
+    ctx.pending_images.clear();
+    format!("Cleared {cleared} pending image(s).")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PasteOutcome {
+    Attached(usize),
+    InsertText(String),
+    Error(String),
+    Nothing,
+}
+
+fn handle_clipboard_paste(ctx: &mut RequestContext, content: ClipboardContent) -> PasteOutcome {
+    let model = ctx.current_model();
+    let paths = match content {
+        ClipboardContent::Text(text) => return PasteOutcome::InsertText(text),
+        ClipboardContent::Empty => return PasteOutcome::Nothing,
+        ClipboardContent::NonImageFiles(_) => {
+            return PasteOutcome::Error("Copied files are not images.".into());
+        }
+        _ if !model.supports_vision() => {
+            return PasteOutcome::Error(vision_unsupported_message(model));
+        }
+        ClipboardContent::ImageFiles(paths) => {
+            let cwd = env::current_dir().unwrap_or_default();
+            paths
+                .iter()
+                .filter_map(|path| cwd.join(path).to_str().map(str::to_string))
+                .collect()
+        }
+        ClipboardContent::ImagePng(bytes) => match save_pasted_png(&bytes) {
+            Ok(path) => vec![path],
+            Err(err) => {
+                return PasteOutcome::Error(format!("Failed to save pasted image: {err:#}"));
+            }
+        },
+    };
+    let attached = paths.len();
+    ctx.pending_images.extend(paths);
+    PasteOutcome::Attached(attached)
+}
+
+/// The default prompt shows the pending image count, which is feedback
+/// enough; a custom prompt without `images` would leave a paste silent.
+fn paste_feedback(left_prompt: Option<&str>, attached: &[String]) -> Option<String> {
+    let prompt = left_prompt?;
+    if prompt.contains("{images}") || prompt.contains("{?images") {
+        return None;
+    }
+    Some(format!(
+        "\r\nAttached {} image(s): {}.",
+        attached.len(),
+        image_file_names(attached)
+    ))
+}
+
+/// Names the file by its content hash so pasting the same image again reuses
+/// the file instead of writing a copy. A size mismatch means an earlier write
+/// was cut short, so the file is written again.
+fn save_pasted_png(bytes: &[u8]) -> Result<String> {
+    let dir = paths::cache_dir().join("pasted-images");
+    crate::utils::fs::create_private_dir_all(&dir)
+        .with_context(|| format!("Failed to create '{}'", dir.display()))?;
+    let hash = hex_encode(&Sha256::digest(bytes));
+    let path = dir.join(format!("{hash}.png"));
+    let reusable = fs::metadata(&path).is_ok_and(|meta| meta.len() == bytes.len() as u64);
+    if !reusable {
+        crate::utils::fs::write_private_atomic(&path, bytes)
+            .with_context(|| format!("Failed to write '{}'", path.display()))?;
+    }
+    path.to_str()
+        .map(str::to_string)
+        .with_context(|| format!("Cache path '{}' is not valid UTF-8", path.display()))
 }
 
 #[cfg(test)]
@@ -3145,11 +3570,15 @@ mod tests {
     const ADMIT_GLOBAL_HOOKS: &str = "global_hooks:\n  - \"*\"\n";
 
     fn unique(prefix: &str) -> String {
+        // The clock alone repeats across parallel tests where it only has
+        // microsecond resolution, as on macOS.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("{prefix}_{nanos}")
+        format!("{prefix}_{nanos}_{count}")
     }
 
     /// A graph agent whose end node echoes `initial_prompt`.
@@ -8431,11 +8860,22 @@ local_hello() {\n\
             split_args_text(r#".\file.txt C:\dir\file.txt"#, true),
             (vec![".\\file.txt".into(), "C:\\dir\\file.txt".into()], "")
         );
+        assert_eq!(
+            split_args_text("résumé.png -- héllo", false),
+            (vec!["résumé.png".to_string()], "héllo")
+        );
+        assert_eq!(
+            split_args_text("📷.png 'my 📷.png' -- what is 📷?", false),
+            (
+                vec!["📷.png".to_string(), "my 📷.png".to_string()],
+                "what is 📷?"
+            )
+        );
     }
 
     #[test]
-    fn repl_commands_has_66_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 66);
+    fn repl_commands_has_67_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 67);
     }
 
     #[test]
@@ -10994,5 +11434,1112 @@ local_hello() {\n\
             "if ctx.session.is_none() && ctx.child_session_root.is_some() {",
             "use_session(",
         );
+    }
+
+    struct ImageDir(std::path::PathBuf);
+
+    impl ImageDir {
+        fn new() -> Self {
+            Self::new_in(&env::temp_dir())
+        }
+
+        fn new_in(parent: &Path) -> Self {
+            let dir = parent.join(unique("coyote-repl-images"));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn png(&self, name: &str) -> String {
+            let path = self.0.join(name);
+            let mut bytes = io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(2, 2)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            std::fs::write(&path, bytes.into_inner()).unwrap();
+            path.to_str().unwrap().to_string()
+        }
+
+        fn file(&self, name: &str, contents: &str) -> String {
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).unwrap();
+            path.to_str().unwrap().to_string()
+        }
+    }
+
+    impl Drop for ImageDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn model_with_vision(supports_vision: bool) -> Model {
+        let mut data = ModelData::new(if supports_vision { "eyes" } else { "blind" });
+        data.supports_vision = supports_vision;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn image_ctx(supports_vision: bool) -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            dry_run: true,
+            clients: vec![ClientConfig::default()],
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        ctx.model = model_with_vision(supports_vision);
+        ctx
+    }
+
+    fn image_session_ctx(supports_vision: bool) -> RequestContext {
+        let mut ctx = image_ctx(supports_vision);
+        let mut session = Session::default();
+        session.set_model(model_with_vision(supports_vision));
+        ctx.session = Some(session);
+        ctx
+    }
+
+    fn session_message_count(ctx: &RequestContext) -> usize {
+        ctx.session.as_ref().unwrap().messages().len()
+    }
+
+    async fn repl_line(
+        ctx: &mut RequestContext,
+        line: &str,
+        prefix: CommandPrefix,
+    ) -> Result<bool> {
+        Box::pin(run_repl_command_with_prefix(
+            ctx,
+            create_abort_signal(),
+            line,
+            prefix,
+        ))
+        .await
+    }
+
+    fn sent_input(ctx: &RequestContext) -> &Input {
+        &ctx.last_message.as_ref().expect("a message was sent").input
+    }
+
+    #[test]
+    fn route_image_line_queues_a_line_of_only_images_on_any_model() {
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let ctx = image_ctx(false);
+
+        assert_eq!(
+            route_image_line(&ctx, &shot),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![shot],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_attaches_the_same_image_twice() {
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &format!("{shot} {shot}")),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![shot.clone(), shot],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_recognizes_quoted_paths() {
+        let dir = ImageDir::new();
+        let shot = dir.png("My Shot.png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &format!("\"{shot}\"")),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![shot],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_recognizes_percent_encoded_file_urls() {
+        let dir = ImageDir::new();
+        let shot = dir.png("My Shot.png");
+        let url_path = shot.replace('\\', "/").replace(' ', "%20");
+        let url = if url_path.starts_with('/') {
+            format!("file://{url_path}")
+        } else {
+            format!("file:///{url_path}")
+        };
+        let ctx = image_ctx(true);
+
+        let Some(PlainLineRoute::QueueImages { paths, .. }) = route_image_line(&ctx, &url) else {
+            panic!("{url} was not queued");
+        };
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("My Shot.png"), "{paths:?}");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn route_image_line_recognizes_backslash_escaped_spaces() {
+        let dir = ImageDir::new();
+        let shot = dir.png("My Shot.png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &shot.replace(' ', "\\ ")),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![shot],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_attaches_images_after_an_apostrophe() {
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let ctx = image_ctx(true);
+
+        for line in [format!("what's in {shot}"), format!("don't crop {shot}")] {
+            assert_eq!(
+                route_image_line(&ctx, &line),
+                Some(PlainLineRoute::Send {
+                    text: line.clone(),
+                    images: vec![shot.clone()],
+                    notice: Some("Attached 1 image(s): shot.png".into()),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn route_image_line_joins_a_raw_path_with_unescaped_spaces() {
+        let dir = ImageDir::new();
+        let nebula = dir.png("JWST Carina Nebula - lower res.png");
+        let ctx = image_ctx(true);
+
+        let line = format!("what is in {nebula} please");
+        assert_eq!(
+            route_image_line(&ctx, &line),
+            Some(PlainLineRoute::Send {
+                text: line.clone(),
+                images: vec![nebula.clone()],
+                notice: Some("Attached 1 image(s): JWST Carina Nebula - lower res.png".into()),
+            })
+        );
+        assert!(starts_with_image_path(&nebula));
+    }
+
+    #[test]
+    fn route_image_line_queues_two_raw_paths_with_spaces() {
+        let dir = ImageDir::new();
+        let first = dir.png("My First Shot.png");
+        let second = dir.png("My Second Shot.png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &format!("{first} {second}")),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![first, second],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_prefers_the_longest_raw_path() {
+        let dir = ImageDir::new();
+        dir.png("shot.png");
+        let longer = dir.png("shot.png 2.png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &longer),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![longer],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_leaves_prose_without_image_names_alone() {
+        let ctx = image_ctx(true);
+
+        let line = "please look at the nebula picture in my wallpapers folder";
+        assert_eq!(route_image_line(&ctx, line), None);
+        assert!(!starts_with_image_path(line));
+    }
+
+    #[test]
+    fn route_image_line_treats_a_misnamed_file_as_text() {
+        let dir = ImageDir::new();
+        let fake = dir.file("fake.png", "not really a png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(route_image_line(&ctx, &fake), None);
+        assert!(!starts_with_image_path(&fake));
+    }
+
+    #[test]
+    fn image_detection_tokens_only_quote_at_token_start() {
+        assert_eq!(
+            image_detection_tokens("what's 'a b.png' \"c d.png\" `e.png`"),
+            vec!["what's", "a b.png", "c d.png", "e.png"]
+        );
+        assert_eq!(image_detection_tokens("  "), Vec::<String>::new());
+        assert_eq!(image_detection_tokens("'unclosed x"), vec!["unclosed x"]);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn image_detection_tokens_honour_escaped_spaces() {
+        assert_eq!(
+            image_detection_tokens(r"/a/My\ Shot.png -- hi"),
+            vec!["/a/My Shot.png", "--", "hi"]
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn route_image_line_accepts_shell_escaped_punctuation() {
+        let dir = ImageDir::new();
+        let ctx = image_ctx(true);
+        for (name, escaped) in [
+            ("My Shot (2).png", r"My\ Shot\ \(2\).png"),
+            ("Bob's.png", r"Bob\'s.png"),
+        ] {
+            let shot = dir.png(name);
+            let line = shot.replace(name, escaped);
+
+            assert_eq!(
+                route_image_line(&ctx, &line),
+                Some(PlainLineRoute::QueueImages {
+                    paths: vec![shot],
+                    ignored: 0
+                }),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn queueing_on_a_non_vision_model_says_the_model_cannot_take_images() {
+        let ctx = image_ctx(false);
+        let hint = ctx.render_hints(".clear images");
+
+        assert_eq!(
+            queued_images_message(&ctx, &["/tmp/shot.png".into()], 0),
+            format!(
+                "Attached 1 image(s): shot.png. Type your message, or {hint}. The current model does not accept images; switch models before sending, or use {hint}."
+            )
+        );
+    }
+
+    #[test]
+    fn queueing_on_a_vision_model_omits_the_model_warning() {
+        let ctx = image_ctx(true);
+        let hint = ctx.render_hints(".clear images");
+
+        assert_eq!(
+            queued_images_message(&ctx, &["/tmp/shot.png".into()], 2),
+            format!(
+                "Attached 1 image(s): shot.png; 2 more ignored (at most {MAX_IMAGES_PER_LINE} per line). Type your message, or {hint}."
+            )
+        );
+    }
+
+    #[test]
+    fn route_image_line_keeps_a_narrow_no_break_space_inside_the_path() {
+        let dir = ImageDir::new();
+        let shot = dir.png("Shot\u{202F}AM.png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &shot),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![shot],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn route_image_line_accepts_escaped_spaces_beside_a_narrow_no_break_space() {
+        let dir = ImageDir::new();
+        let shot = dir.png("Screenshot 2025-01-01 at 10.00.00\u{202F}AM.png");
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &shot.replace(' ', "\\ ")),
+            Some(PlainLineRoute::QueueImages {
+                paths: vec![shot],
+                ignored: 0
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_image_token_expands_the_home_directory() {
+        let home = dirs::home_dir().expect("a home directory");
+        let dir = ImageDir::new_in(&home);
+        let shot = dir.png("shot.png");
+        let relative = Path::new(&shot).strip_prefix(&home).unwrap();
+        let token = format!("~/{}", relative.to_str().unwrap().replace('\\', "/"));
+
+        let resolved = resolve_image_token(&token, Path::new("/elsewhere")).unwrap();
+
+        assert_eq!(Path::new(&resolved), Path::new(&shot));
+    }
+
+    #[test]
+    fn route_image_line_refuses_pending_images_on_a_non_vision_model() {
+        let dir = ImageDir::new();
+        let mut ctx = image_ctx(false);
+        ctx.pending_images = vec![dir.png("queued.png")];
+
+        assert_eq!(
+            route_image_line(&ctx, "describe it"),
+            Some(PlainLineRoute::Refuse(vision_unsupported_message(
+                ctx.current_model()
+            )))
+        );
+    }
+
+    #[test]
+    fn route_image_line_refuses_a_mixed_line_with_pending_images_on_a_non_vision_model() {
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let mut ctx = image_ctx(false);
+        ctx.pending_images = vec![dir.png("queued.png")];
+        let queued = ctx.pending_images.clone();
+
+        let route = route_image_line(&ctx, &format!("what is in {shot}"));
+
+        assert!(
+            matches!(route, Some(PlainLineRoute::Refuse(_))),
+            "{route:?}"
+        );
+        assert_eq!(ctx.pending_images, queued);
+    }
+
+    #[test]
+    fn route_image_line_attaches_detected_images_after_pending_ones_on_a_vision_model() {
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let queued = dir.png("queued.png");
+        let mut ctx = image_ctx(true);
+        ctx.pending_images = vec![queued.clone()];
+        let line = format!("what is in {shot}");
+
+        assert_eq!(
+            route_image_line(&ctx, &line),
+            Some(PlainLineRoute::Send {
+                text: line.clone(),
+                images: vec![queued, shot],
+                notice: Some("Attached 1 image(s): shot.png".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_sends_text_only_for_a_mixed_line_on_a_non_vision_model() {
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let ctx = image_ctx(false);
+        let line = format!("what is in {shot}");
+
+        assert_eq!(
+            route_image_line(&ctx, &line),
+            Some(PlainLineRoute::Send {
+                text: line.clone(),
+                images: vec![],
+                notice: Some(
+                    "Images not attached: the model 'openai:blind' does not accept images.".into()
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_sends_pending_images_with_a_plain_line() {
+        let dir = ImageDir::new();
+        let queued = dir.png("queued.png");
+        let mut ctx = image_ctx(true);
+        ctx.pending_images = vec![queued.clone()];
+
+        assert_eq!(
+            route_image_line(&ctx, "describe it"),
+            Some(PlainLineRoute::Send {
+                text: "describe it".into(),
+                images: vec![queued],
+                notice: None,
+            })
+        );
+    }
+
+    #[test]
+    fn route_image_line_leaves_ordinary_text_alone() {
+        let dir = ImageDir::new();
+        let missing = dir.0.join("missing.png");
+        let notes = dir.file("notes.txt", "hello");
+        let ctx = image_ctx(true);
+
+        assert_eq!(route_image_line(&ctx, "hello there"), None);
+        assert_eq!(
+            route_image_line(&ctx, &format!("look at {}", missing.display())),
+            None
+        );
+        assert_eq!(route_image_line(&ctx, &notes), None);
+    }
+
+    #[test]
+    fn route_image_line_caps_detected_images_per_line() {
+        let dir = ImageDir::new();
+        let shots: Vec<String> = (0..=MAX_IMAGES_PER_LINE)
+            .map(|i| dir.png(&format!("shot{i}.png")))
+            .collect();
+        let ctx = image_ctx(true);
+
+        assert_eq!(
+            route_image_line(&ctx, &shots.join(" ")),
+            Some(PlainLineRoute::QueueImages {
+                paths: shots[..MAX_IMAGES_PER_LINE].to_vec(),
+                ignored: 1
+            })
+        );
+
+        let Some(PlainLineRoute::Send { images, notice, .. }) =
+            route_image_line(&ctx, &format!("compare {}", shots.join(" ")))
+        else {
+            panic!("expected a send route");
+        };
+        assert_eq!(images, shots[..MAX_IMAGES_PER_LINE].to_vec());
+        assert!(
+            notice
+                .unwrap()
+                .contains("1 more image path(s) left as text"),
+            "the extra path is announced"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_images_only_line_over_the_cap_is_queued_not_sent() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shots: Vec<String> = (0..=MAX_IMAGES_PER_LINE)
+            .map(|i| dir.png(&format!("shot{i}.png")))
+            .collect();
+        run_async(async {
+            let mut ctx = image_ctx(true);
+
+            repl_line(&mut ctx, &shots.join(" "), CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            assert_eq!(ctx.pending_images, shots[..MAX_IMAGES_PER_LINE].to_vec());
+            assert!(ctx.last_message.is_none());
+        });
+    }
+
+    #[test]
+    fn commands_and_shell_lines_are_not_image_paths() {
+        for line in [".help", "/help", "!ls", "hello"] {
+            assert!(!starts_with_image_path(line), "{line}");
+        }
+        assert!(parse_command("/help", CommandPrefix::Slash).is_some());
+        assert_eq!(try_extract_shell_command("!ls"), Some("ls"));
+    }
+
+    #[test]
+    #[serial]
+    fn pasted_image_path_is_queued_under_every_command_prefix() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        run_async(async {
+            for prefix in [
+                CommandPrefix::Dot,
+                CommandPrefix::Slash,
+                CommandPrefix::Both,
+            ] {
+                let mut ctx = image_ctx(true);
+
+                repl_line(&mut ctx, &shot, prefix).await.unwrap();
+
+                assert_eq!(ctx.pending_images, vec![shot.clone()], "{prefix:?}");
+                assert!(ctx.last_message.is_none(), "{prefix:?}");
+                let app = ctx.app.config.clone();
+                let vars = ctx.generate_prompt_context(&app);
+                assert_eq!(vars.get("images").map(String::as_str), Some("1"));
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn raw_pasted_path_with_spaces_is_queued_under_every_command_prefix() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let nebula = dir.png("JWST Carina Nebula - lower res.png");
+        run_async(async {
+            for prefix in [
+                CommandPrefix::Dot,
+                CommandPrefix::Slash,
+                CommandPrefix::Both,
+            ] {
+                let mut ctx = image_ctx(true);
+
+                repl_line(&mut ctx, &nebula, prefix).await.unwrap();
+
+                assert_eq!(ctx.pending_images, vec![nebula.clone()], "{prefix:?}");
+                assert!(ctx.last_message.is_none(), "{prefix:?}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn raw_path_with_spaces_inside_a_question_is_sent_as_an_image() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let nebula = dir.png("JWST Carina Nebula - lower res.png");
+        run_async(async {
+            let mut ctx = image_ctx(true);
+
+            repl_line(
+                &mut ctx,
+                &format!("what is in {nebula} please"),
+                CommandPrefix::Slash,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(sent_input(&ctx).medias().len(), 1);
+            assert!(ctx.pending_images.is_empty());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn relative_dot_image_path_is_queued_under_the_dot_prefix() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let cwd = env::current_dir().unwrap();
+        let dir = ImageDir::new_in(&cwd);
+        let shot = dir.png("x.png");
+        let relative = format!("./{}/x.png", dir.0.file_name().unwrap().to_str().unwrap());
+        run_async(async {
+            let mut ctx = image_ctx(true);
+
+            repl_line(&mut ctx, &relative, CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            assert_eq!(ctx.pending_images.len(), 1);
+            assert_eq!(
+                std::fs::canonicalize(&ctx.pending_images[0]).unwrap(),
+                std::fs::canonicalize(&shot).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn next_plain_line_carries_the_queued_image_and_empties_the_queue() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        run_async(async {
+            let mut ctx = image_ctx(true);
+            repl_line(&mut ctx, &shot, CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            repl_line(&mut ctx, "describe it", CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            let input = sent_input(&ctx);
+            assert_eq!(input.text(), "describe it");
+            assert_eq!(input.medias().len(), 1);
+            assert!(input.medias()[0].starts_with("data:image/png"));
+            assert!(ctx.pending_images.is_empty());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_image_queued_twice_is_sent_twice() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        run_async(async {
+            let mut ctx = image_ctx(true);
+            repl_line(&mut ctx, &format!("{shot} {shot}"), CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            repl_line(&mut ctx, "describe it", CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            assert_eq!(sent_input(&ctx).medias().len(), 2);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn mixed_line_on_a_vision_model_sends_the_text_with_the_image() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let line = format!("what is in {shot}");
+        run_async(async {
+            let mut ctx = image_ctx(true);
+
+            repl_line(&mut ctx, &line, CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            let input = sent_input(&ctx);
+            assert_eq!(input.text(), line);
+            assert_eq!(input.medias().len(), 1);
+            assert!(input.medias()[0].starts_with("data:image/png"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn mixed_line_on_a_non_vision_model_sends_text_only() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        let line = format!("what is in {shot}");
+        run_async(async {
+            let mut ctx = image_ctx(false);
+
+            repl_line(&mut ctx, &line, CommandPrefix::Dot)
+                .await
+                .unwrap();
+
+            let input = sent_input(&ctx);
+            assert_eq!(input.text(), line);
+            assert!(input.medias().is_empty());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn missing_or_non_image_paths_are_sent_as_plain_text() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let missing = dir.0.join("missing.png").to_str().unwrap().to_string();
+        let notes = dir.file("notes.txt", "hello");
+        let fake = dir.file("fake.png", "not really a png");
+        run_async(async move {
+            for line in [missing, notes, fake] {
+                let mut ctx = image_ctx(true);
+
+                repl_line(&mut ctx, &line, CommandPrefix::Dot)
+                    .await
+                    .unwrap();
+
+                let input = sent_input(&ctx);
+                assert_eq!(input.text(), line);
+                assert!(input.medias().is_empty());
+                assert!(ctx.pending_images.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn pending_images_on_a_non_vision_model_are_refused_before_sending() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        run_async(async {
+            let mut ctx = image_session_ctx(false);
+            ctx.pending_images = vec![dir.png("queued.png")];
+            let queued = ctx.pending_images.clone();
+
+            let err = repl_line(&mut ctx, "describe it", CommandPrefix::Dot)
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("does not accept images"), "{err}");
+            assert_eq!(ctx.pending_images, queued);
+            assert!(ctx.last_message.is_none());
+            assert_eq!(session_message_count(&ctx), 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn too_many_queued_images_are_refused_by_the_guard() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shots: Vec<String> = (0..21).map(|i| dir.png(&format!("shot{i}.png"))).collect();
+        run_async(async {
+            let mut ctx = image_session_ctx(true);
+            ctx.pending_images = shots.clone();
+            let queued = ctx.pending_images.clone();
+
+            let err = repl_line(&mut ctx, "describe them", CommandPrefix::Dot)
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .starts_with("This message carries 21 images"),
+                "{err}"
+            );
+            assert!(
+                err.to_string()
+                    .ends_with("per request. Remove some with .clear images."),
+                "{err}"
+            );
+            assert_eq!(ctx.pending_images, queued);
+            assert!(ctx.last_message.is_none());
+            assert_eq!(session_message_count(&ctx), 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn file_command_with_an_image_on_a_non_vision_model_fails_in_preflight() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        run_async(async {
+            let mut ctx = image_session_ctx(false);
+
+            let err = repl_line(&mut ctx, &format!(".file {shot} -- hi"), CommandPrefix::Dot)
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("does not accept images"), "{err}");
+            assert!(ctx.last_message.is_none());
+            assert_eq!(session_message_count(&ctx), 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn file_command_with_an_image_never_reaches_a_graph_run_on_a_non_vision_model() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_graph_image");
+        write_graph_agent(&name, "");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .set_model(model_with_vision(false));
+            let before = session_message_count(&ctx);
+
+            let err = repl_line(&mut ctx, &format!(".file {shot} -- hi"), CommandPrefix::Dot)
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("does not accept images"), "{err}");
+            assert!(ctx.last_message.is_none());
+            assert_eq!(session_message_count(&ctx), before);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn clear_images_empties_the_queue() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = image_ctx(true);
+            ctx.pending_images = vec!["/a.png".into(), "/b.png".into()];
+
+            repl_line(&mut ctx, ".clear images", CommandPrefix::Dot)
+                .await
+                .unwrap();
+            assert!(ctx.pending_images.is_empty());
+
+            repl_line(&mut ctx, ".clear images", CommandPrefix::Dot)
+                .await
+                .unwrap();
+            assert!(ctx.pending_images.is_empty());
+        });
+    }
+
+    #[test]
+    fn clear_pending_images_reports_what_it_cleared() {
+        let mut ctx = image_ctx(true);
+        ctx.pending_images = vec!["/a.png".into(), "/b.png".into()];
+
+        assert_eq!(
+            clear_pending_images(&mut ctx),
+            "Cleared 2 pending image(s)."
+        );
+        assert!(ctx.pending_images.is_empty());
+        assert_eq!(clear_pending_images(&mut ctx), "No pending images.");
+    }
+
+    fn pasted_images() -> Vec<std::path::PathBuf> {
+        match std::fs::read_dir(paths::cache_dir().join("pasted-images")) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    #[serial]
+    fn pasting_image_data_saves_one_content_addressed_file_and_queues_it() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let mut ctx = image_ctx(true);
+
+        assert_eq!(
+            handle_clipboard_paste(&mut ctx, ClipboardContent::ImagePng(tiny_png())),
+            PasteOutcome::Attached(1)
+        );
+        let saved = pasted_images();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(ctx.pending_images, vec![saved[0].to_str().unwrap()]);
+
+        assert_eq!(
+            handle_clipboard_paste(&mut ctx, ClipboardContent::ImagePng(tiny_png())),
+            PasteOutcome::Attached(1)
+        );
+        assert_eq!(pasted_images(), saved);
+        assert_eq!(ctx.pending_images, vec![saved[0].to_str().unwrap(); 2]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pasted_images_are_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let mut ctx = image_ctx(true);
+
+        handle_clipboard_paste(&mut ctx, ClipboardContent::ImagePng(tiny_png()));
+
+        let dir = paths::cache_dir().join("pasted-images");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&pasted_images()[0]), 0o600);
+    }
+
+    #[test]
+    #[serial]
+    fn a_truncated_pasted_image_is_rewritten() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let mut ctx = image_ctx(true);
+        let bytes = tiny_png();
+        handle_clipboard_paste(&mut ctx, ClipboardContent::ImagePng(bytes.clone()));
+        let saved = pasted_images();
+        std::fs::write(&saved[0], &bytes[..bytes.len() / 2]).unwrap();
+
+        handle_clipboard_paste(&mut ctx, ClipboardContent::ImagePng(bytes.clone()));
+
+        assert_eq!(pasted_images(), saved);
+        assert_eq!(std::fs::read(&saved[0]).unwrap(), bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn pasting_non_image_files_reports_an_error() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let mut ctx = image_ctx(true);
+
+        assert_eq!(
+            handle_clipboard_paste(&mut ctx, ClipboardContent::NonImageFiles(1)),
+            PasteOutcome::Error("Copied files are not images.".into())
+        );
+        assert!(ctx.pending_images.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn pasting_image_files_queues_them_without_copying() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let files = vec![dir.png("a.png"), dir.png("b.jpg")];
+        let mut ctx = image_ctx(true);
+
+        assert_eq!(
+            handle_clipboard_paste(
+                &mut ctx,
+                ClipboardContent::ImageFiles(files.iter().map(Into::into).collect())
+            ),
+            PasteOutcome::Attached(2)
+        );
+        assert_eq!(ctx.pending_images, files);
+        assert!(pasted_images().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn pasting_text_inserts_it_and_queues_nothing() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        for supports_vision in [true, false] {
+            let mut ctx = image_ctx(supports_vision);
+
+            assert_eq!(
+                handle_clipboard_paste(&mut ctx, ClipboardContent::Text("hello".into())),
+                PasteOutcome::InsertText("hello".into())
+            );
+            assert!(ctx.pending_images.is_empty());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn pasting_images_on_a_non_vision_model_is_refused() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let contents = [
+            ClipboardContent::ImagePng(tiny_png()),
+            ClipboardContent::ImageFiles(vec![dir.png("a.png").into()]),
+        ];
+        for content in contents {
+            let mut ctx = image_ctx(false);
+
+            let PasteOutcome::Error(message) = handle_clipboard_paste(&mut ctx, content) else {
+                panic!("expected an error");
+            };
+            assert!(message.contains("openai:blind"), "{message}");
+            assert!(message.contains("supports_vision: true"), "{message}");
+            assert!(ctx.pending_images.is_empty());
+        }
+        assert!(pasted_images().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn pasting_an_empty_clipboard_does_nothing() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let mut ctx = image_ctx(true);
+
+        assert_eq!(
+            handle_clipboard_paste(&mut ctx, ClipboardContent::Empty),
+            PasteOutcome::Nothing
+        );
+        assert!(ctx.pending_images.is_empty());
+    }
+
+    #[test]
+    fn a_paste_prints_nothing_under_the_default_prompt() {
+        assert_eq!(paste_feedback(None, &["/tmp/shot.png".into()]), None);
+    }
+
+    #[test]
+    fn a_paste_prints_nothing_when_a_custom_prompt_shows_images() {
+        assert_eq!(
+            paste_feedback(
+                Some("{model}{?images  [{images} img]}> "),
+                &["/tmp/shot.png".into()]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_paste_is_reported_when_a_custom_prompt_hides_images() {
+        assert_eq!(
+            paste_feedback(
+                Some("{model}> "),
+                &["/tmp/a.png".into(), "/tmp/b.png".into()]
+            ),
+            Some("\r\nAttached 2 image(s): a.png, b.png.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_paste_is_reported_when_the_prompt_only_mentions_images_as_text() {
+        assert_eq!(
+            paste_feedback(Some("images> "), &["/tmp/a.png".into()]),
+            Some("\r\nAttached 1 image(s): a.png.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_paste_prints_nothing_when_a_custom_prompt_shows_the_bare_count() {
+        assert_eq!(
+            paste_feedback(Some("{model} {images}> "), &["/tmp/a.png".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_v_runs_the_paste_host_command_in_emacs_and_vi_insert() {
+        for mut keybindings in [default_emacs_keybindings(), default_vi_insert_keybindings()] {
+            Repl::extra_keybindings(&mut keybindings);
+
+            assert_eq!(
+                keybindings.find_binding(KeyModifiers::CONTROL, KeyCode::Char('v')),
+                Some(ReedlineEvent::ExecuteHostCommand(
+                    "coyote-paste-image".into()
+                ))
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alt_v_runs_the_paste_host_command_on_windows() {
+        for mut keybindings in [default_emacs_keybindings(), default_vi_insert_keybindings()] {
+            Repl::extra_keybindings(&mut keybindings);
+
+            assert_eq!(
+                keybindings.find_binding(KeyModifiers::ALT, KeyCode::Char('v')),
+                Some(ReedlineEvent::ExecuteHostCommand(
+                    "coyote-paste-image".into()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn an_undecodable_queued_image_keeps_the_queue_and_hints_at_clearing() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let broken = dir.0.join("broken.png");
+        std::fs::write(&broken, b"\x89PNG\r\n\x1a\ntruncated").unwrap();
+        let broken = broken.to_str().unwrap().to_string();
+        run_async(async {
+            let mut ctx = image_session_ctx(true);
+            ctx.pending_images = vec![broken.clone()];
+
+            let err = repl_line(&mut ctx, "describe it", CommandPrefix::Dot)
+                .await
+                .unwrap_err();
+
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("(pending images can be discarded with .clear images)"),
+                "{message}"
+            );
+            assert!(message.contains("broken.png"), "{message}");
+            assert_eq!(ctx.pending_images, vec![broken]);
+            assert!(ctx.last_message.is_none());
+            assert_eq!(session_message_count(&ctx), 0);
+        });
     }
 }

@@ -3,6 +3,7 @@ use super::oauth::{self, OAuthConfig, OAuthProvider};
 use super::openai_oauth::OpenAIOAuthProvider;
 use super::*;
 
+use crate::function::ToolResult;
 use crate::utils::strip_think_tag;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -509,6 +510,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                                 assistant_message["content"] = strip_think_tag(&text).into();
                             }
                             let mut messages = vec![assistant_message];
+                            let images_message = openai_chat_tool_images_message(&tool_results);
                             for tool_result in tool_results {
                                 messages.push(json!({
                                     "role": "tool",
@@ -516,6 +518,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                                     "tool_call_id": tool_result.call.id,
                                 }));
                             }
+                            messages.extend(images_message);
                             messages
                         } else {
                             tool_results.into_iter().enumerate().flat_map(|(index, tool_result)| {
@@ -540,15 +543,18 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                             if let Some(round_text) = round_text {
                                 assistant_message["content"] = strip_think_tag(&round_text).into();
                             }
-                            vec![
+                            let images_message =
+                                openai_chat_tool_images_message(std::slice::from_ref(&tool_result));
+                            let mut messages = vec![
                                 assistant_message,
                                 json!({
                                     "role": "tool",
                                     "content": tool_result.output.to_string(),
                                     "tool_call_id": tool_result.call.id,
                                 })
-                            ]
-
+                            ];
+                            messages.extend(images_message);
+                            messages
                         }).collect()
                         }
                     }
@@ -601,6 +607,50 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
             .collect();
     }
     body
+}
+
+// Chat `role: tool` content is text-only, so a round's images travel in one
+// user message placed after its tool messages.
+fn openai_chat_tool_images_message(tool_results: &[ToolResult]) -> Option<Value> {
+    let parts: Vec<Value> = tool_results
+        .iter()
+        .flat_map(|tool_result| {
+            tool_result.attachments.iter().flat_map(move |attachment| {
+                [
+                    json!({
+                        "type": "text",
+                        "text": format!(
+                            "Image output from tool call {} ({}): {}",
+                            tool_result.call.id.as_deref().unwrap_or_default(),
+                            tool_result.call.name,
+                            attachment.source,
+                        ),
+                    }),
+                    json!({
+                        "type": "image_url",
+                        "image_url": { "url": attachment.to_data_url() },
+                    }),
+                ]
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(json!({ "role": MessageRole::User, "content": parts }))
+    }
+}
+
+fn openai_responses_tool_output(tool_result: &ToolResult) -> Value {
+    let text = tool_result.output.to_string();
+    if tool_result.attachments.is_empty() {
+        return text.into();
+    }
+    let mut parts = vec![json!({ "type": "input_text", "text": text })];
+    parts.extend(tool_result.attachments.iter().map(|attachment| {
+        json!({ "type": "input_image", "image_url": attachment.to_data_url() })
+    }));
+    Value::Array(parts)
 }
 
 pub fn openai_build_embeddings_body(data: &EmbeddingsData, model: &Model) -> Value {
@@ -734,13 +784,27 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
                         items.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_result.call.id,
-                            "output": tool_result.output.to_string(),
+                            "output": openai_responses_tool_output(&tool_result),
                         }));
                         items
                     })
                     .collect(),
                 MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
                     vec![json!({ "role": role, "content": strip_think_tag(&text) })]
+                }
+                MessageContent::Array(list) => {
+                    let content: Vec<Value> = list
+                        .into_iter()
+                        .map(|part| match part {
+                            MessageContentPart::Text { text } => {
+                                json!({ "type": "input_text", "text": text })
+                            }
+                            MessageContentPart::ImageUrl {
+                                image_url: ImageUrl { url },
+                            } => json!({ "type": "input_image", "image_url": url }),
+                        })
+                        .collect();
+                    vec![json!({ "role": role, "content": content })]
                 }
                 _ => vec![json!({ "role": role, "content": content })],
             }
@@ -989,7 +1053,7 @@ mod tests {
     use super::*;
     use crate::client::access_token::set_access_token;
     use crate::config::AppConfig;
-    use crate::function::{FunctionDeclaration, ToolResult};
+    use crate::function::{FunctionDeclaration, ImageAttachment, ToolResult};
     use chrono::Utc;
     use std::sync::Arc;
 
@@ -1035,6 +1099,205 @@ mod tests {
         assert_eq!(messages.len(), 1, "body: {body}");
     }
 
+    fn png(source: &str) -> ImageAttachment {
+        ImageAttachment {
+            source: source.into(),
+            mime_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }
+    }
+
+    fn chat_tool_result(id: &str, attachments: Vec<ImageAttachment>) -> ToolResult {
+        ToolResult::new(
+            ToolCall::new("fs_read".into(), json!({"path": "x"}), Some(id.into())),
+            json!("ok"),
+        )
+        .with_attachments(attachments)
+    }
+
+    fn build_chat_body(tool_results: Vec<ToolResult>, sequence: bool) -> Value {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        text: String::new(),
+                        sequence,
+                        round_starts: vec![],
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+            prompt_cache_ttl: None,
+        };
+        openai_build_chat_completions_body(data, &Model::new("openai", "gpt-test"))
+    }
+
+    fn tool_call_json(id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": { "name": "fs_read", "arguments": "{\"path\":\"x\"}" },
+        })
+    }
+
+    fn tool_message_json(id: &str) -> Value {
+        json!({ "role": "tool", "content": "\"ok\"", "tool_call_id": id })
+    }
+
+    fn image_message_json(parts: &[(&str, &str)]) -> Value {
+        let content: Vec<Value> = parts
+            .iter()
+            .flat_map(|(id, source)| {
+                [
+                    json!({
+                        "type": "text",
+                        "text": format!("Image output from tool call {id} (fs_read): {source}"),
+                    }),
+                    json!({
+                        "type": "image_url",
+                        "image_url": { "url": "data:image/png;base64,aGVsbG8=" },
+                    }),
+                ]
+            })
+            .collect();
+        json!({ "role": "user", "content": content })
+    }
+
+    #[test]
+    fn chat_non_sequence_without_attachments_keeps_exact_shape() {
+        let body = build_chat_body(
+            vec![chat_tool_result("call_A", vec![]), chat_tool_result("call_B", vec![])],
+            false,
+        );
+
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "user", "content": "hello" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [tool_call_json("call_A"), tool_call_json("call_B")],
+                },
+                tool_message_json("call_A"),
+                tool_message_json("call_B"),
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_sequence_without_attachments_keeps_exact_shape() {
+        let body = build_chat_body(
+            vec![chat_tool_result("call_A", vec![]), chat_tool_result("call_B", vec![])],
+            true,
+        );
+
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "tool_calls": [tool_call_json("call_A")] },
+                tool_message_json("call_A"),
+                { "role": "assistant", "tool_calls": [tool_call_json("call_B")] },
+                tool_message_json("call_B"),
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_non_sequence_puts_images_in_one_user_message_after_tool_messages() {
+        let body = build_chat_body(
+            vec![
+                chat_tool_result("call_A", vec![]),
+                chat_tool_result("call_B", vec![png("/tmp/b.png")]),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "user", "content": "hello" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [tool_call_json("call_A"), tool_call_json("call_B")],
+                },
+                tool_message_json("call_A"),
+                tool_message_json("call_B"),
+                image_message_json(&[("call_B", "/tmp/b.png")]),
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_sequence_puts_images_after_their_tool_message() {
+        let body = build_chat_body(
+            vec![
+                chat_tool_result("call_A", vec![]),
+                chat_tool_result("call_B", vec![png("/tmp/b.png")]),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "tool_calls": [tool_call_json("call_A")] },
+                tool_message_json("call_A"),
+                { "role": "assistant", "tool_calls": [tool_call_json("call_B")] },
+                tool_message_json("call_B"),
+                image_message_json(&[("call_B", "/tmp/b.png")]),
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_images_keep_result_and_attachment_order() {
+        let body = build_chat_body(
+            vec![
+                chat_tool_result("call_A", vec![png("/tmp/a1.png"), png("/tmp/a2.png")]),
+                chat_tool_result("call_B", vec![png("/tmp/b.png")]),
+            ],
+            false,
+        );
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5, "body: {body}");
+        assert_eq!(
+            messages[4],
+            image_message_json(&[
+                ("call_A", "/tmp/a1.png"),
+                ("call_A", "/tmp/a2.png"),
+                ("call_B", "/tmp/b.png"),
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_images_omitted_result_serializes_as_plain_text() {
+        let mut result = chat_tool_result("call_A", vec![]);
+        result.output = json!({ "result": "ok", "images_omitted": "model has no vision" });
+
+        let body = build_chat_body(vec![result], false);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "body: {body}");
+        assert_eq!(messages[2]["role"], "tool", "body: {body}");
+        assert!(messages[2]["content"].is_string(), "body: {body}");
+    }
+
     fn reasoning_block(id: &str) -> ThinkingBlock {
         ThinkingBlock::Reasoning {
             id: id.to_string(),
@@ -1053,6 +1316,7 @@ mod tests {
             output: json!("ok"),
             text: text.map(|t| t.to_string()),
             thinking,
+            attachments: vec![],
         }
     }
 
@@ -1150,6 +1414,86 @@ mod tests {
         assert_eq!(input[5]["id"], "rs_2", "body: {body}");
         assert_eq!(input[6]["content"], "round two", "body: {body}");
         assert_eq!(input[7]["call_id"], "call_B", "body: {body}");
+    }
+
+    #[test]
+    fn responses_tool_output_with_image_is_input_array() {
+        let result = responses_tool_result("call_A", None, vec![])
+            .with_attachments(vec![png("/tmp/a.png")]);
+
+        let body = build_responses_body(vec![result], None);
+
+        let input = body["input"].as_array().unwrap();
+        let output = &input[3]["output"];
+        assert_eq!(input[3]["type"], "function_call_output", "body: {body}");
+        assert_eq!(
+            *output,
+            json!([
+                { "type": "input_text", "text": "\"ok\"" },
+                { "type": "input_image", "image_url": "data:image/png;base64,aGVsbG8=" },
+            ]),
+            "body: {body}"
+        );
+        assert!(output[1]["image_url"].is_string(), "body: {body}");
+    }
+
+    #[test]
+    fn responses_tool_output_without_image_is_string() {
+        let body = build_responses_body(vec![responses_tool_result("call_A", None, vec![])], None);
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[3]["type"], "function_call_output", "body: {body}");
+        assert_eq!(input[3]["output"], json!("\"ok\""), "body: {body}");
+    }
+
+    #[test]
+    fn responses_images_omitted_output_is_string() {
+        let mut result = responses_tool_result("call_A", None, vec![]);
+        result.output = json!({ "result": "ok", "images_omitted": "model has no vision" });
+
+        let body = build_responses_body(vec![result], None);
+
+        let input = body["input"].as_array().unwrap();
+        assert!(input[3]["output"].is_string(), "body: {body}");
+    }
+
+    #[test]
+    fn responses_user_array_content_uses_input_parts() {
+        let data = ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Array(vec![
+                    MessageContentPart::Text {
+                        text: "hi".to_string(),
+                    },
+                    MessageContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "data:image/png;base64,aGVsbG8=".to_string(),
+                        },
+                    },
+                ]),
+            )],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+            prompt_cache_ttl: None,
+        };
+
+        let body = openai_build_responses_body(data, &Model::new("openai", "gpt-test"));
+
+        assert_eq!(
+            body["input"],
+            json!([{
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "hi" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,aGVsbG8=" },
+                ],
+            }]),
+            "body: {body}"
+        );
     }
 
     #[test]
