@@ -55,27 +55,14 @@ pub(super) fn take_user_messages(queue: &NotificationQueue) -> Vec<String> {
 }
 
 /// Takes the newest copy of `text` off `queue`; false when the driver had
-/// already handed it to the model. A driver drain landing between the
-/// count and the take leaves nothing to find, which reads as sent.
+/// already handed it to the model.
 pub(super) fn unqueue_user_message(queue: &NotificationQueue, text: &str) -> bool {
-    let is_copy = |notification: &SystemNotification| match notification {
-        SystemNotification::UserMessage { text: t } => t == text,
-        SystemNotification::Task { .. } => false,
-    };
-    let mut copies = 0usize;
-    queue.take_where(|notification| {
-        copies += usize::from(is_copy(notification));
-        true
-    });
-    let mut seen = 0usize;
-    let taken = queue.take_where(|notification| {
-        if is_copy(notification) {
-            seen += 1;
-            return seen != copies;
-        }
-        true
-    });
-    !taken.is_empty()
+    queue
+        .take_last_where(|notification| match notification {
+            SystemNotification::UserMessage { text: t } => t == text,
+            SystemNotification::Task { .. } => false,
+        })
+        .is_some()
 }
 
 /// Drops the prompts the turn's driver handed to the model. Drains are

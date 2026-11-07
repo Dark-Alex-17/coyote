@@ -131,6 +131,16 @@ impl NotificationQueue {
         }
         taken
     }
+
+    /// Removes and returns the newest entry `matches` accepts, if any.
+    pub fn take_last_where(
+        &self,
+        matches: impl FnMut(&SystemNotification) -> bool,
+    ) -> Option<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let index = pending.iter().rposition(matches)?;
+        Some(pending.remove(index))
+    }
 }
 
 impl Default for NotificationQueue {
@@ -253,5 +263,25 @@ mod tests {
         assert_eq!(left.len(), 2);
         assert_eq!(left[0].id(), Some("job_1"));
         assert_eq!(left[1].id(), Some("job_2"));
+    }
+
+    #[test]
+    fn take_last_where_removes_only_the_newest_match() {
+        let queue = NotificationQueue::new();
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+
+        let taken = queue.take_last_where(|n| matches!(n, SystemNotification::UserMessage { .. }));
+
+        assert_eq!(
+            taken.map(|n| n.to_value()["text"].clone()),
+            Some(json!("a"))
+        );
+        let left = queue.drain();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0].id(), None);
+        assert_eq!(left[1].id(), Some("job_1"));
+        assert!(queue.take_last_where(|_| true).is_none());
     }
 }
