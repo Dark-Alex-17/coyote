@@ -1735,10 +1735,11 @@ fn review_scripts_are_utf8_under_a_non_utf8_platform_encoding() {
         "{verdict}"
     );
     state["verdict_out"] = verdict;
-    let report = run_script_env("code-reviewer/scripts/render.py", &state, &hostile)["final_report"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let report =
+        run_script_env("code-reviewer/scripts/render.py", &state, &hostile)["final_report"]
+            .as_str()
+            .unwrap()
+            .to_string();
     assert!(
         report.contains("found 1 critical") && report.contains("na\u{ef}vely"),
         "{report}"
@@ -1769,7 +1770,10 @@ fn review_scripts_are_utf8_under_a_non_utf8_platform_encoding() {
         &hostile,
     );
     assert_eq!(fv["verdict"]["verdict"], "VERIFIED", "{fv}");
-    assert_eq!(fv["verdict"]["evidence"], "line 5 \u{201c}x\u{201d}", "{fv}");
+    assert_eq!(
+        fv["verdict"]["evidence"], "line 5 \u{201c}x\u{201d}",
+        "{fv}"
+    );
 }
 
 /// A git that, like native git.exe under Git Bash, receives an absolute MSYS
@@ -1802,12 +1806,28 @@ fn the_guard_never_passes_a_checkout_path_to_git() {
         format!("{}:{}", s(&shim_dir.0), env::var("PATH").unwrap()),
     ));
     let cache = c.root.join("cache");
-    let out = run_tool("fs_cat.sh", &c.root, &[("path", "internal/plan.go")], &run, &cache);
-    assert!(out.contains("// HEAD"), "a quoted checkout path must still be grounded: {out}");
+    let out = run_tool(
+        "fs_cat.sh",
+        &c.root,
+        &[("path", "internal/plan.go")],
+        &run,
+        &cache,
+    );
+    assert!(
+        out.contains("// HEAD"),
+        "a quoted checkout path must still be grounded: {out}"
+    );
     let stale = s(&c.shadow.join("internal/plan.go"));
     let out = run_tool("fs_cat.sh", &c.root, &[("path", &stale)], &run, &cache);
-    assert_refused(&out, "review/internal/plan.go", "shadow clone under a quoted root");
+    assert_refused(
+        &out,
+        "review/internal/plan.go",
+        "shadow clone under a quoted root",
+    );
     let helper =
         fs::read_to_string(manifest().join("assets/functions/utils/review-paths.sh")).unwrap();
-    assert!(!helper.contains("git -C"), "every git call goes through _review_git");
+    assert!(
+        !helper.contains("git -C"),
+        "every git call goes through _review_git"
+    );
 }
