@@ -40,7 +40,15 @@
 //! - a mouse click on a folded tool row opens it and a second click folds
 //!   it again;
 //! - a narrower terminal re-wraps the cells in place without duplicating
-//!   a row.
+//!   a row;
+//! - Shift+G with the view at the bottom is plain typing, before a scroll
+//!   and right after a jump;
+//! - a think span whose `</think>` arrives late (after a hold, or only at
+//!   the end of a reasoning-only reply) never shows;
+//! - Esc over a focused row mid-turn interrupts the turn;
+//! - F2, PgUp and End keep working under a tool's Confirm modal and the
+//!   Input modal, and leave the question up;
+//! - a folded tool header at forty columns is one row ending in `ok`.
 #![cfg(unix)]
 
 mod common;
@@ -1889,5 +1897,563 @@ fn undoing_the_only_exchange_stops_at_the_command_cell_before_it() {
 
     pty.send(CTRL_C).unwrap();
     pty.read_for(Duration::from_millis(300));
+    quit(pty);
+}
+
+// =====================================================================
+// Key gating and hidden spans: Shift+G at the bottom, a think span that
+// closes late, Esc over a focused row mid-turn, the view keys under a
+// modal, and a folded header at forty columns.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// Shift+G jumps to the bottom only while the view is scrolled AND
+// the composer is empty. With the view at the bottom the letter is
+// plain typing, before any scroll and again right after a jump.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn shift_g_types_the_letter_while_the_view_follows_the_bottom() {
+    let (_guard, mut pty) = boot("shift-g-unscrolled", &[]);
+    overflow_a_short_terminal(&mut pty);
+
+    // Unscrolled, empty composer: G is a letter.
+    pty.send(b"Gx7").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains("Gx7"),
+        "Shift+G on an unscrolled empty composer was swallowed instead of typed:\n{frame}"
+    );
+    assert!(
+        !frame.contains(CHIP),
+        "typing G raised the follow chip:\n{frame}"
+    );
+    pty.send(CTRL_C).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    // Scrolled, empty composer: G jumps back and types nothing.
+    let before = pty.raw().len();
+    pty.send(PAGE_UP).unwrap();
+    wait_for_squeezed_after(&mut pty, "End = follow", before, "the chip after PgUp");
+    pty.send(b"G").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(CHIP),
+        "Shift+G while scrolled on an empty composer did not follow the bottom:\n{frame}"
+    );
+    assert!(
+        !frame.contains(">G"),
+        "Shift+G both jumped and typed its letter:\n{frame}"
+    );
+
+    // Right after the jump the view follows again: G is a letter once more.
+    pty.send(b"Gx7").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains("Gx7"),
+        "Shift+G right after a jump was swallowed instead of typed:\n{frame}"
+    );
+
+    pty.send(CTRL_C).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// The streaming cell hides a `<think>` span whose closing tag has
+// not arrived yet. With the stream held between the reasoning and the
+// answer, the open span is off screen while held, and the late
+// `</think>` leaves neither tag nor reasoning behind.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn an_open_think_span_stays_hidden_until_its_late_close_arrives() {
+    let dir_for_release = fresh_config_dir("late-think-release");
+    let _release_guard = TempDirGuard(dir_for_release.clone());
+    let release = dir_for_release.join("release");
+    let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+        Chunk::Reasoning("weighing the options v4w".to_string()),
+        Chunk::WaitFor(release.clone()),
+        Chunk::Text("the answer n7p".to_string()),
+    ])]);
+    let (_guard, mut pty) = boot_with_fake("late-think", &fake);
+
+    let started = std::time::Instant::now();
+    pty.send(b"think then hold\r").unwrap();
+    wait_for_squeezed_after(&mut pty, "Thinking for", 0, "the live thinking row");
+    assert!(
+        started.elapsed() < HOLD_LIMIT,
+        "the Thinking row appeared only after the fake gave up holding the stream"
+    );
+    pty.read_for(Duration::from_millis(500));
+    let held = repaint(&mut pty);
+    assert!(
+        !held.contains("<think>") && !held.contains("</think>"),
+        "a think tag is on screen while the span is still open:\n{held}"
+    );
+    assert!(
+        !held.contains(&squeezed("weighing the options")),
+        "the reasoning of an open think span is on screen while held:\n{held}"
+    );
+
+    fs::write(&release, b"").unwrap();
+    let after = wait_for_squeezed_after(&mut pty, "the answer n7p", 0, "the answer after the hold");
+    assert!(
+        !after.contains("<think>") && !after.contains("</think>"),
+        "a think tag was painted when the late close arrived:\n{after}"
+    );
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains(&squeezed("the answer n7p")),
+        "the answer is not on screen:\n{frame}"
+    );
+    assert!(
+        !frame.contains("<think>") && !frame.contains("</think>"),
+        "a think tag is on screen after the late close:\n{frame}"
+    );
+    assert!(
+        !frame.contains(&squeezed("weighing the options")),
+        "the reasoning is on screen after the late close:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// The other late close: a reply that is reasoning and nothing else
+// gets its `</think>` only at `[DONE]`. Nothing of the span survives on
+// screen and the UI takes the next turn.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_reasoning_only_reply_leaves_no_think_span_behind() {
+    let fake = FakeLlm::start(vec![
+        Reply::Streamed(vec![Chunk::Reasoning(
+            "only reasoning here z3k".to_string(),
+        )]),
+        Reply::Text("second reply p4m".to_string()),
+    ]);
+    let (_guard, mut pty) = boot_with_fake("think-only", &fake);
+
+    pty.send(b"reason only\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        pty.read_for(Duration::from_millis(300));
+        if fake.served() >= 1 {
+            let frame = repaint(&mut pty);
+            if !frame.contains(&squeezed("Thinking for"))
+                && !frame.contains(&squeezed("Esc to interrupt"))
+            {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reasoning-only turn never finished"
+        );
+    }
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains("<think>") && !frame.contains("</think>"),
+        "a think tag is on screen after a reasoning-only reply:\n{frame}"
+    );
+    assert!(
+        !frame.contains(&squeezed("only reasoning here")),
+        "the reasoning is on screen after a reasoning-only reply:\n{frame}"
+    );
+
+    let before = pty.raw().len();
+    pty.send(b"and now answer\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "second reply p4m",
+        before,
+        "the next turn's reply",
+    );
+    assert_eq!(fake.served(), 2);
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// While a turn runs, Esc interrupts it even with a transcript row
+// focused: the interrupted marker lands, the stream stops painting, and
+// the focus walk is intact afterwards (Ctrl+Up, Enter opens the row).
+// Whether the focus itself survives that Esc is not pinned here: the
+// contract says the interrupt comes first, not what becomes of the focus.
+// A recording session is opened first so the interrupted marker, not an
+// "Aborted." error, closes the turn (the lifecycle suite's precedent).
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn esc_with_a_focused_row_interrupts_the_running_turn_first() {
+    let dir = fresh_config_dir("esc-focus-running");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("release");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_echo".to_string(),
+            arguments: "{\"word\": \"hi\"}".to_string(),
+        },
+        Reply::Text("echo reply m9s".to_string()),
+        Reply::Streamed(vec![
+            Chunk::Text("held head h5t".to_string()),
+            Chunk::WaitFor(release.clone()),
+            Chunk::Text("held tail never shown".to_string()),
+        ]),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_echo.sh", ECHO_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".session scratch\r").unwrap();
+    pty.read_for(Duration::from_secs(1));
+
+    pty.send(b"say hi\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "echo reply m9s",
+        0,
+        "the reply after the echo tool",
+    );
+    pty.read_for(Duration::from_millis(500));
+    let output = squeezed("clicked output c4v");
+
+    let before = pty.raw().len();
+    pty.send(b"stream and hold\r").unwrap();
+    wait_for_squeezed_after(&mut pty, "held head h5t", before, "the first delta");
+    pty.wait_for("Esc to interrupt", PTY_DEADLINE)
+        .expect("the status row never offered Esc to interrupt");
+
+    // Focus the tool row mid-turn, then Esc.
+    pty.read_for(HOTKEY_GAP);
+    pty.send(CTRL_UP).unwrap();
+    pty.read_for(HOTKEY_GAP);
+    let pressed_at = pty.raw().len();
+    pty.send(ESC).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+        if since.to_lowercase().contains("interrupted") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Esc with a row focused did not interrupt the running turn:\n{since}"
+        );
+    }
+    fs::write(&release, b"").unwrap();
+    pty.read_for(Duration::from_secs(1));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(&squeezed("Esc to interrupt")),
+        "the turn is still running after Esc:\n{frame}"
+    );
+    assert!(
+        !frame.contains(&squeezed("held tail never shown")),
+        "the stream kept painting after the interrupt:\n{frame}"
+    );
+    assert!(
+        !frame.contains(&output),
+        "the tool row opened on its own around the interrupt:\n{frame}"
+    );
+
+    // The focus walk is intact once the turn is over.
+    pty.read_for(HOTKEY_GAP);
+    pty.send(CTRL_UP).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let opened = repaint(&mut pty);
+    assert!(
+        opened.contains(&output),
+        "Ctrl+Up then Enter after the interrupt did not open the tool row:\n{opened}"
+    );
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    pty.send(ESC).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let unfocused = repaint(&mut pty);
+    assert!(
+        !unfocused.contains(&output),
+        "Esc on the idle UI did not clear the focus:\n{unfocused}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// Keys that only move the view belong to the transcript, not the modal:
+// with a tool's Confirm question up, F2 toggles the Todo panel, PgUp
+// raises the follow chip and End clears it, and the question is still
+// there to answer afterwards.
+// ---------------------------------------------------------------------
+
+const CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user before continuing and record the answer.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   v=\"$(confirm \"Really do it? q9d-q\")\"\n\
+    \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
+    \x20   echo \"fixture confirm: ${v:-cancelled} q9d-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+#[test]
+#[serial]
+fn view_keys_work_under_a_tools_confirm_modal() {
+    let dir = fresh_config_dir("confirm-view-keys");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let mut replies: Vec<Reply> = (1..=5)
+        .map(|n| Reply::Text(format!("fillerreply{n:02}")))
+        .collect();
+    replies.push(Reply::ToolCall {
+        name: "fixture_confirm_rec".to_string(),
+        arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+    });
+    replies.push(Reply::Text("fixture done z2v".to_string()));
+    let fake = FakeLlm::start(replies);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_confirm_rec.sh", CONFIRM_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.resize(14, 100).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    for n in 1..=5 {
+        let before = pty.raw().len();
+        pty.send(format!("fillerline{n:02}\r").as_bytes()).unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            &format!("fillerreply{n:02}"),
+            before,
+            "a filler reply",
+        );
+        pty.read_for(Duration::from_millis(300));
+    }
+
+    pty.send(b"call the confirm tool\r").unwrap();
+    pty.wait_for("q9d-q", PTY_DEADLINE)
+        .expect("the tool's confirm question never reached the screen");
+    pty.read_for(HOTKEY_GAP);
+
+    pty.send(F2).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains("Todo"),
+        "F2 under the Confirm modal did not open the Todo panel:\n{frame}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(F2).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains("Todo"),
+        "a second F2 under the Confirm modal did not close the Todo panel:\n{frame}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    let before = pty.raw().len();
+    pty.send(PAGE_UP).unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "End = follow",
+        before,
+        "the follow chip after PgUp under the Confirm modal",
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(END).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(CHIP),
+        "End under the Confirm modal did not clear the follow chip:\n{frame}"
+    );
+    assert!(
+        frame.contains("q9d-q"),
+        "the Confirm question is gone after the view keys:\n{frame}"
+    );
+    assert!(
+        !out.exists(),
+        "a view key answered the Confirm question: {:?}",
+        fs::read_to_string(&out)
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    wait_for_squeezed_after(&mut pty, "fixture done z2v", 0, "the reply after the tool");
+    assert_eq!(fs::read_to_string(&out).unwrap().trim(), "1");
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// The same view keys under the Input modal an agent variable raises;
+// Esc then cancels the question and the UI is still alive.
+// ---------------------------------------------------------------------
+
+fn write_agent_needing_a_variable(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!(
+            "name: {name}\n\
+             description: an agent with a variable\n\
+             version: 0.1.0\n\
+             instructions: |\n\
+             \x20 You are an assistant for {{{{username}}}}. Reply briefly.\n\
+             variables:\n\
+             \x20 - name: username\n\
+             \x20   description: Your user name\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+#[serial]
+fn view_keys_work_under_the_input_modal() {
+    let dir = fresh_config_dir("input-view-keys");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    write_agent_needing_a_variable(&dir, "vars-agent-g4r");
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    overflow_a_short_terminal(&mut pty);
+
+    pty.send(b".agent vars-agent-g4r\r").unwrap();
+    wait_for_squeezed_after(&mut pty, "Enter = answer", 0, "the Input modal");
+    pty.read_for(HOTKEY_GAP);
+
+    pty.send(F2).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains("Todo"),
+        "F2 under the Input modal did not open the Todo panel:\n{frame}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(F2).unwrap();
+    pty.read_for(Duration::from_millis(500));
+
+    pty.read_for(HOTKEY_GAP);
+    let before = pty.raw().len();
+    pty.send(PAGE_UP).unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "End = follow",
+        before,
+        "the follow chip after PgUp under the Input modal",
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(END).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(CHIP),
+        "End under the Input modal did not clear the follow chip:\n{frame}"
+    );
+    assert!(
+        frame.contains(&squeezed("Enter = answer")),
+        "the Input question is gone after the view keys:\n{frame}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(ESC).unwrap();
+    pty.read_for(Duration::from_secs(1));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(&squeezed("Enter = answer")),
+        "Esc did not close the Input modal:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// A folded tool header at forty columns is still one row that ends in
+// its status: the state token is what the narrow width keeps, the
+// arguments are what it cuts.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_folded_tool_header_keeps_its_status_at_forty_columns() {
+    let dir = fresh_config_dir("forty-cols");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_echo".to_string(),
+            arguments: "{\"word\": \"a-rather-long-argument-value-q2w\"}".to_string(),
+        },
+        Reply::Text("echo reply m9s".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_echo.sh", ECHO_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"say it\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "echo reply m9s",
+        0,
+        "the reply after the echo tool",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    pty.resize(24, 40).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let rows = repaint_rows(&mut pty);
+    let headers: Vec<&(u16, String)> = rows
+        .iter()
+        .filter(|(_, text)| text.contains("fixture_echo"))
+        .collect();
+    assert_eq!(
+        headers.len(),
+        1,
+        "the tool name should be on exactly one row at 40 columns: {rows:?}"
+    );
+    let (row, header) = headers[0];
+    assert!(
+        header.ends_with("ok"),
+        "the folded header on row {row} lost its status token at 40 columns: {header:?}; rows {rows:?}"
+    );
+    let args_and_elapsed = between(header, "fixture_echo(", "ok")
+        .unwrap_or_else(|| panic!("no `fixture_echo(...) ... ok` header on row {row}: {header:?}"));
+    assert_header_is_name_args_elapsed(args_and_elapsed, "fixture_echo");
+    let frame: String = rows.iter().map(|(_, t)| t.as_str()).collect();
+    assert!(
+        !frame.contains(&squeezed("clicked output c4v")),
+        "the row opened on its own at 40 columns:\n{frame}"
+    );
+
     quit(pty);
 }
