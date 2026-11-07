@@ -1592,7 +1592,7 @@ impl App {
             }
             Action::ViInsert { append } => {
                 if let Some(motion) = append {
-                    self.composer.move_cursor(motion);
+                    self.composer.move_cursor_to_append(motion);
                 }
                 self.vi_mode = Some(ViMode::Insert);
                 None
@@ -7390,15 +7390,15 @@ mod tests {
         harness.type_text("0x");
         assert_eq!(harness.app.composer_text(), "ne two");
         harness.type_text("$hx");
-        assert_eq!(harness.app.composer_text(), "ne tw");
+        assert_eq!(harness.app.composer_text(), "ne to");
         harness.type_text("0wx");
-        assert_eq!(harness.app.composer_text(), "ne w");
+        assert_eq!(harness.app.composer_text(), "ne o");
         harness.type_text("$bx");
-        assert_eq!(harness.app.composer_text(), "ne ");
+        assert_eq!(harness.app.composer_text(), "e o");
         harness.type_text("qz");
         assert_eq!(
             harness.app.composer_text(),
-            "ne ",
+            "e o",
             "unbound letters are swallowed"
         );
         harness.type_text("dd");

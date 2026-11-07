@@ -128,8 +128,55 @@ impl Composer {
         self.textarea.insert_newline();
     }
 
+    /// The cursor's column and the count of characters on its line.
+    fn cursor_in_line(&self) -> (usize, usize) {
+        let cursor = self.textarea.cursor();
+        (cursor.1, self.textarea.lines()[cursor.0].chars().count())
+    }
+
+    /// Normal mode's cursor sits on a character; the textarea's own end
+    /// column, one past the last, is pulled back onto it.
+    fn clamp_normal_cursor(&mut self) {
+        let (col, len) = self.cursor_in_line();
+        if len > 0 && col == len {
+            self.textarea.move_cursor(CursorMove::Back);
+        }
+    }
+
+    /// A normal-mode motion: `l` and `$` stop on the last character
+    /// instead of the column after it.
     pub(super) fn move_cursor(&mut self, motion: ViMotion) {
-        self.textarea.move_cursor(match motion {
+        match motion {
+            ViMotion::Forward => {
+                let (col, len) = self.cursor_in_line();
+                if col + 1 < len {
+                    self.textarea.move_cursor(CursorMove::Forward);
+                }
+            }
+            ViMotion::End => {
+                self.textarea.move_cursor(CursorMove::End);
+                self.clamp_normal_cursor();
+            }
+            other => self.textarea.move_cursor(Self::cursor_move(other)),
+        }
+    }
+
+    /// Where `a` and `A` start inserting: after the current character or
+    /// after the last one, never on the next line.
+    pub(super) fn move_cursor_to_append(&mut self, motion: ViMotion) {
+        match motion {
+            ViMotion::Forward => {
+                let (col, len) = self.cursor_in_line();
+                if col < len {
+                    self.textarea.move_cursor(CursorMove::Forward);
+                }
+            }
+            other => self.textarea.move_cursor(Self::cursor_move(other)),
+        }
+    }
+
+    fn cursor_move(motion: ViMotion) -> CursorMove {
+        match motion {
             ViMotion::Back => CursorMove::Back,
             ViMotion::Down => CursorMove::Down,
             ViMotion::Up => CursorMove::Up,
@@ -138,11 +185,18 @@ impl Composer {
             ViMotion::WordBack => CursorMove::WordBack,
             ViMotion::Head => CursorMove::Head,
             ViMotion::End => CursorMove::End,
-        });
+        }
     }
 
+    /// Normal mode's `x`: the character under the cursor, or the last
+    /// one when the cursor sits past it; an empty line keeps its break.
     pub(super) fn delete_next_char(&mut self) {
+        if self.cursor_in_line().1 == 0 {
+            return;
+        }
+        self.clamp_normal_cursor();
         self.textarea.delete_next_char();
+        self.clamp_normal_cursor();
     }
 
     /// Deletes the cursor's line and the line break after it, so the
@@ -390,7 +444,7 @@ mod tests {
         composer.move_cursor(ViMotion::End);
         composer.move_cursor(ViMotion::Back);
         composer.delete_next_char();
-        assert_eq!(composer.text(), "one w\nthree");
+        assert_eq!(composer.text(), "one o\nthree");
         composer.delete_line();
         assert_eq!(composer.text(), "three");
         composer.delete_line();
@@ -403,6 +457,66 @@ mod tests {
         composer.move_cursor(ViMotion::WordBack);
         composer.delete_next_char();
         assert_eq!(composer.text(), "b");
+    }
+
+    #[test]
+    fn dollar_lands_on_the_last_character_so_x_deletes_it() {
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        composer.set_text("one two");
+        composer.move_cursor(ViMotion::Head);
+        composer.move_cursor(ViMotion::End);
+        assert_eq!(composer.textarea.cursor(), (0, 6));
+        composer.delete_next_char();
+        assert_eq!(composer.text(), "one tw");
+        assert_eq!(composer.textarea.cursor(), (0, 5));
+    }
+
+    #[test]
+    fn l_stops_on_the_last_character() {
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        composer.set_text("ab\ncd");
+        composer.move_cursor(ViMotion::Up);
+        composer.move_cursor(ViMotion::Head);
+        for _ in 0..3 {
+            composer.move_cursor(ViMotion::Forward);
+        }
+        assert_eq!(composer.textarea.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn a_at_the_last_character_appends_on_the_same_line() {
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        composer.set_text("ab\ncd");
+        composer.move_cursor(ViMotion::Up);
+        composer.move_cursor(ViMotion::End);
+        composer.move_cursor_to_append(ViMotion::Forward);
+        composer.insert_str("X");
+        assert_eq!(composer.text(), "abX\ncd");
+        // Past the end already (the column insert mode left behind).
+        composer.move_cursor_to_append(ViMotion::Forward);
+        composer.insert_str("Y");
+        assert_eq!(composer.text(), "abXY\ncd");
+    }
+
+    #[test]
+    fn x_at_the_end_of_a_line_deletes_the_last_character_and_keeps_the_lines() {
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        composer.set_text("ab\ncd");
+        composer.move_cursor(ViMotion::Up);
+        assert_eq!(composer.textarea.cursor(), (0, 2));
+        composer.delete_next_char();
+        assert_eq!(composer.text(), "a\ncd");
+        assert_eq!(composer.textarea.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn x_on_an_empty_line_is_a_no_op() {
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        composer.set_text("\ncd");
+        composer.move_cursor(ViMotion::Up);
+        composer.delete_next_char();
+        assert_eq!(composer.text(), "\ncd");
+        assert_eq!(composer.textarea.cursor(), (0, 0));
     }
 
     #[test]
