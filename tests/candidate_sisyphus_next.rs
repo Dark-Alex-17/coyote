@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 547;
+const SMOKE_FLOOR: usize = 550;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
