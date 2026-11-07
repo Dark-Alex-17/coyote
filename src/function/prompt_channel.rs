@@ -969,6 +969,7 @@ mod windows_tests {
             .env_remove("COYOTE_UI")
             .env_remove(OUT_FD_ENV)
             .env(REPLY_ENV, server.env_value())
+            .env("TERM", "xterm-256color")
             .env("PROMPT_UTILS", HELPER.replace('\\', "/"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

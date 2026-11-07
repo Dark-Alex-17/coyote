@@ -403,7 +403,9 @@ fn invalid_utf8() -> io::Error {
 
 /// Switches escape processing on for the recorded console if a child the
 /// UI ran left it off. A no-op before `Screen::enter`, after the `Screen`
-/// is gone, and when the handle is not a console.
+/// is gone, and when the handle is not a console. The output mode is left
+/// on at exit on purpose: escape processing is the console default on
+/// current Windows, and crossterm leaves it on as well.
 #[cfg(windows)]
 fn ensure_vt_processing() {
     let handle = CONSOLE_HANDLE.load(Ordering::SeqCst);
@@ -437,12 +439,17 @@ fn restored_input_mode(saved: u32) -> u32 {
 }
 
 /// Reads the console input mode and records it for every later restore,
-/// or None (recording nothing) when there is no console to ask.
+/// or None (recording nothing) when there is no console to ask, in which
+/// case the mode cannot be put back on exit either.
 #[cfg(windows)]
 fn snapshot_input_mode() -> Option<u32> {
     use std::os::windows::io::AsRawHandle;
-    let input = console::open_input().ok()?;
-    let mode = console::mode(input.as_raw_handle()).ok()?;
+    let mode = console::open_input()
+        .and_then(|input| console::mode(input.as_raw_handle()))
+        .map_err(|err| {
+            warn!("Could not read the console input mode; it will not be restored on exit: {err}");
+        })
+        .ok()?;
     SAVED_INPUT_MODE.store(u64::from(mode), Ordering::SeqCst);
     Some(mode)
 }
