@@ -4158,22 +4158,18 @@ impl RequestContext {
             None => bail!("No role"),
         };
         if role_name == TEMP_ROLE_NAME {
+            let mut question = "Role name:".to_string();
             role_name = loop {
                 let input = self
-                    .prompt(self.prompt_request(
-                        PromptAction::Input,
-                        "Role name:",
-                        Vec::new(),
-                        None,
-                    ))?
+                    .prompt(self.prompt_request(PromptAction::Input, &question, Vec::new(), None))?
                     .into_text()?;
                 let input = input.trim();
                 if input.is_empty() {
-                    eprintln!("This name is required");
+                    question = "Role name (required):".to_string();
                     continue;
                 }
                 if input == TEMP_ROLE_NAME {
-                    eprintln!("This name is reserved");
+                    question = format!("Role name ('{TEMP_ROLE_NAME}' is reserved):");
                     continue;
                 }
                 break input.to_string();
@@ -12049,8 +12045,9 @@ mod tests {
     }
 
     /// `.save role` on the temp role asks for a name through the prompter
-    /// and asks again after an empty or the reserved one; the role is
-    /// saved under the first usable answer, trimmed.
+    /// and asks again after an empty or the reserved one, with the reason
+    /// in the question; the role is saved under the first usable answer,
+    /// trimmed.
     #[test]
     #[serial]
     fn save_role_re_asks_until_the_name_is_usable() {
@@ -12071,11 +12068,16 @@ mod tests {
         assert!(!paths::role_file(TEMP_ROLE_NAME).exists());
         assert_eq!(ctx.role.as_ref().unwrap().name(), "mine");
         let requests = prompter.requests();
-        assert_eq!(requests.len(), 3);
-        for req in &requests {
-            assert_eq!(req.action, PromptAction::Input);
-            assert_eq!(req.question, "Role name:");
-        }
+        assert!(requests.iter().all(|req| req.action == PromptAction::Input));
+        let questions: Vec<&str> = requests.iter().map(|req| req.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            [
+                "Role name:",
+                "Role name (required):",
+                "Role name ('temp' is reserved):",
+            ]
+        );
 
         ctx.use_temp_role(&app, "another temporary role").unwrap();
         ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
