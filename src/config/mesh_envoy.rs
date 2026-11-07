@@ -6385,6 +6385,106 @@ mod tests {
             assert_eq!(reply.content, "Thanks, docs/hello.md arrived.");
             source.remove_dir();
         }
+
+        /// A message with no words and one staged file reaches the envoy as its
+        /// `attached:` line alone inside the fence, and a plain acknowledgement from the
+        /// model goes back as an answered reply: nothing is escalated to the human.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn an_attachment_only_message_carries_its_attached_line_and_a_plain_reply_is_answered()
+         {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-attachment-only");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-attachment-only");
+            let staged = tmp
+                .path
+                .join("inbox")
+                .join(peer_dir())
+                .join("docs/hello.md");
+            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            std::fs::write(&staged, b"Hello, mesh!\n").unwrap();
+            let staged = staged.display().to_string();
+            let app = test_app();
+            let idle = RecordingIdleSink::attach(&app);
+            let acknowledgement = "Received docs/hello.md (13 B); it is in the owner's inbox.";
+            let client = ScriptedClient::new(vec![ChatCompletionsOutput::new(acknowledgement)]);
+            let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+                let client = Arc::clone(&client);
+                drive_of(move |ctx, input, abort| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut ctx = ctx;
+                        let (output, _) = call_chat_completions(
+                            &input,
+                            false,
+                            false,
+                            client.as_ref(),
+                            &mut ctx,
+                            abort,
+                        )
+                        .await?;
+                        Ok(output)
+                    }
+                })
+            });
+            runner.attach();
+            let mut message = message_carrying(vec![staged_file("docs/hello.md", 13, &staged)], 0);
+            message.kind = PeerKind::Message;
+            message.content = String::new();
+            let destination = message.source_destination.clone();
+            app.mesh.deliver_peer(message.clone());
+            wait_until("the reply to land in the inbox", || {
+                app.mesh.peer_inbox().len() >= 2
+            })
+            .await;
+            runner.stop().await;
+
+            let requests = client.requests.lock();
+            assert_eq!(requests.len(), 1);
+            let sent = &requests[0].messages;
+            let begin = sent
+                .find(&peer_fence_begin(&destination))
+                .expect("the fence opens");
+            let end = sent
+                .find(&peer_fence_end(&destination))
+                .expect("the fence closes");
+            let attached = format!(
+                "attached: docs/hello.md (13 B), staged in the inbox at {}/docs/hello.md",
+                peer_dir()
+            );
+            let line = sent
+                .find(&attached)
+                .unwrap_or_else(|| panic!("no attached line in {sent}"));
+            assert!(begin < line && line < end, "{sent}");
+            assert!(
+                sent.contains("only carries an attachment and asks nothing needs no escalation"),
+                "{sent}"
+            );
+
+            let (envelopes, _) = app.mesh.peer_inbox().drain();
+            assert_eq!(envelopes.len(), 2);
+            let reply = peer_of(&envelopes[1]);
+            assert_eq!(reply.kind, PeerKind::Reply);
+            assert_eq!(reply.content, acknowledgement);
+            assert_eq!(
+                idle.count(&format!("envoy replied: {acknowledgement}")),
+                1,
+                "{:?}",
+                idle.texts()
+            );
+            assert!(!idle.has("envoy escalated"), "{:?}", idle.texts());
+            // The inbox keeps the words only; what the peer hears on the wire is the
+            // reply built from the classified outcome.
+            let outcome = classify_answer(acknowledgement);
+            assert!(
+                matches!(&outcome, EnvoyOutcome::Answered(text) if text == acknowledgement),
+                "a plain acknowledgement is an answer"
+            );
+            let out = envoy_reply(&outcome, None, acknowledgement.into(), &message).unwrap();
+            assert_eq!(out.kind, PeerKind::Reply);
+            assert_eq!(out.disposition, Some(Disposition::Answered));
+            source.remove_dir();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9331,6 +9431,86 @@ mod tests {
         assert!(
             !seen[2][0].content.to_text().contains(RESUMED_THREAD_NOTE),
             "and gets the prompt of a fresh thread"
+        );
+        source.remove_dir();
+    }
+
+    /// What a peer told the envoy about itself earlier in the thread reaches the next
+    /// run as that peer's own fenced turn, under the prompt line that makes it a fact
+    /// to repeat back rather than something the brief has to confirm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_peer_s_statement_about_itself_rides_in_the_resumed_history_as_its_own_turn() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-peer-fact");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-peer-fact");
+        let app = test_app();
+        memory_for(&app, &tmp);
+        let idle = RecordingIdleSink::attach(&app);
+        let (drive, seen) = prompt_recording_drive();
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+        for (n, job) in [
+            root_job(&PEER_IDENTITY, "t-teal", "my favourite colour is teal"),
+            threaded_job(
+                &PEER_IDENTITY,
+                "q-teal",
+                "t-teal",
+                "what is my favourite colour?",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(runner.accept(job).is_ok());
+            wait_until("the reply to land", || {
+                idle.count("envoy replied:") == n + 1
+            })
+            .await;
+        }
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2);
+        let resumed = &seen[1];
+        assert_eq!(
+            roles_of(resumed),
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User
+            ]
+        );
+        let system = resumed[0].content.to_text();
+        assert!(
+            system.contains(
+                "What a peer says about itself in this thread (its name, preferences, what it told you) is a fact about that peer: repeat it back plainly"
+            ),
+            "{system}"
+        );
+        let destination = hex_lower(&[0xab; 16]);
+        let earlier = resumed[1].content.to_text();
+        assert_eq!(
+            earlier,
+            seen[0][1].content.to_text(),
+            "the earlier peer turn is the fenced text the first run saw"
+        );
+        let begin = earlier
+            .find(&peer_fence_begin(&destination))
+            .expect("the fence opens");
+        let fact = earlier
+            .find("my favourite colour is teal")
+            .unwrap_or_else(|| panic!("no earlier statement in {earlier}"));
+        let end = earlier
+            .find(&peer_fence_end(&destination))
+            .expect("the fence closes");
+        assert!(begin < fact && fact < end, "{earlier}");
+        assert_eq!(resumed[2].content.to_text(), "answer 0");
+        let current = resumed[3].content.to_text();
+        assert!(current.contains("Message id: q-teal"), "{current}");
+        assert!(
+            current.contains("what is my favourite colour?"),
+            "{current}"
         );
         source.remove_dir();
     }
