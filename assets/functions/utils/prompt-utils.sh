@@ -134,10 +134,11 @@ fi
 # \\.\pipe\<name>, which an msys or cygwin bash cannot open by that spelling;
 # its /proc view of the pipe namespace can.
 _COYOTE_PROMPT_REPLY_PATH="${COYOTE_PROMPT_REPLY:-}"
+_coyote_pipe_prefix='\\.\pipe\'
 case "$OSTYPE" in
   msys* | cygwin*)
-    if [[ "$_COYOTE_PROMPT_REPLY_PATH" == '\\.\pipe\'* ]]; then
-      _COYOTE_PROMPT_REPLY_PATH="/proc/sys/Device/NamedPipe/${_COYOTE_PROMPT_REPLY_PATH#'\\.\pipe\'}"
+    if [[ "$_COYOTE_PROMPT_REPLY_PATH" == "$_coyote_pipe_prefix"* ]]; then
+      _COYOTE_PROMPT_REPLY_PATH="/proc/sys/Device/NamedPipe/${_COYOTE_PROMPT_REPLY_PATH#"$_coyote_pipe_prefix"}"
     fi
     ;;
 esac

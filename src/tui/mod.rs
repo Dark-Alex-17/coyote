@@ -2584,10 +2584,10 @@ impl Termination {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 struct Termination;
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl Termination {
     fn arm() -> std::io::Result<Self> {
         Ok(Self)
