@@ -237,13 +237,19 @@ impl PaletteState {
         self.highlight.and_then(|index| self.rows.get(index))
     }
 
-    /// `line` with the highlighted row in the typed token's place.
+    /// `line` with the highlighted row in the typed token's place; None
+    /// without a highlight, or when `line` is no longer the one the
+    /// range was measured on.
     pub(super) fn accept(&self, line: &str) -> Option<String> {
         let row = self.highlighted()?;
+        let Range { start, end } = self.token_range;
+        if start > end {
+            return None;
+        }
         let mut text = String::with_capacity(line.len() + row.value.len());
-        text.push_str(&line[..self.token_range.start]);
+        text.push_str(line.get(..start)?);
         text.push_str(&row.value);
-        text.push_str(&line[self.token_range.end..]);
+        text.push_str(line.get(end..)?);
         Some(text)
     }
 
@@ -744,6 +750,18 @@ mod tests {
             description: String::new(),
         };
         assert_eq!(palette.accept(".role c").as_deref(), Some(".role coder"));
+    }
+
+    #[test]
+    fn accept_refuses_a_range_the_line_no_longer_has() {
+        let mut palette = rows(&[".info"]);
+        palette.move_highlight(1);
+        palette.token_range = 0..3;
+        assert_eq!(palette.accept(".i"), None);
+        palette.token_range = 2..3;
+        assert_eq!(palette.accept(".\u{e9}"), None, "inside a multi-byte char");
+        palette.token_range = 2..1;
+        assert_eq!(palette.accept(".info"), None);
     }
 
     fn rendered(palette: &PaletteState, height: u16) -> (Buffer, Vec<String>) {

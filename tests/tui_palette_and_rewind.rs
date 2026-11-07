@@ -897,6 +897,55 @@ fn tool_verbs_are_offered_by_the_palette_cold_and_warm() {
     );
 }
 
+/// Writes an `$EDITOR` that replaces the buffer it is handed with `text`
+/// and returns the editor's path.
+fn rewriting_editor(dir: &Path, text: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let editor = dir.join("rewriting-editor.sh");
+    fs::write(
+        &editor,
+        format!("#!/bin/sh\nprintf '%s\\n' '{text}' > \"$1\"\nexit 0\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    editor.to_str().unwrap().to_string()
+}
+
+/// The palette's token range is measured on the line the band opened
+/// over. Ctrl+O hands that line to an editor that shortens it to `.i`;
+/// Enter straight after, on the highlight, must not index the old range
+/// into the shorter line: the UI stays up and the composer takes keys.
+#[test]
+#[serial]
+fn the_editor_shrinking_the_line_under_an_open_palette_does_not_crash_enter() {
+    let dir = fresh_config_dir("palette-editor-shrink");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir, "");
+    let editor = rewriting_editor(&dir, ".i");
+    let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+
+    pty.send(b".in").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\t").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    let edit_at = pty.raw().len();
+    pty.send(b"\x0f").unwrap();
+    wait_for_lend_and_return(&mut pty, edit_at, "Ctrl+O under the palette");
+    pty.send(b"\r").unwrap();
+    let after = pty.read_for(HOTKEY_GAP);
+    assert!(
+        !after.contains("exit="),
+        "Enter on the palette after the editor shrank the line ended the session:\n{after}"
+    );
+
+    let cleared_at = pty.raw().len();
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    assert_composer_takes_keys(&mut pty, cleared_at, "Enter on the stale palette");
+    quit_and_check(&mut pty);
+}
+
 // ---------------------------------------------------------------------
 // The Esc Esc rewind picker pops N exchanges.
 // ---------------------------------------------------------------------

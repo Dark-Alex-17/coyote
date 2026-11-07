@@ -1355,16 +1355,22 @@ impl App {
                 chosen
             }
             View::Palette(palette) => {
-                let accepted = self.command_line().and_then(|line| palette.accept(line));
-                match accepted {
-                    Some(text) => {
-                        self.close_view();
-                        self.set_composer_text(&text);
-                        None
-                    }
-                    None if self.turn.is_some() || self.exiting => self.queue_composer(),
-                    None => self.submit_composer(),
+                if palette.highlighted().is_none() {
+                    return if self.turn.is_some() || self.exiting {
+                        self.queue_composer()
+                    } else {
+                        self.submit_composer()
+                    };
                 }
+                // The band may outlive the line it was built on (an
+                // editor's result, a rewind's prefill); a range the line
+                // no longer has names nothing, so the band just closes.
+                let accepted = self.command_line().and_then(|line| palette.accept(line));
+                self.close_view();
+                if let Some(text) = accepted {
+                    self.set_composer_text(&text);
+                }
+                None
             }
             View::Composer => None,
         }
@@ -2900,6 +2906,7 @@ fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
         app.transcript.truncate(row.opener);
         app.set_composer_text(&row.title);
     }
+    app.refresh_palette(Some(ctx));
     // The notice is a transcript cell, so it goes in after the cut or
     // the cut would take it with the exchanges.
     if let Some(err) = stopped {
@@ -3007,7 +3014,6 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             }
             Step::Input(Some(Ok(event))) => {
                 let command = app.handle_input(events::classify(event));
-                app.refresh_palette(ctx.as_ref());
                 match command {
                     Some(Command::Submit(line)) => {
                         if let Some(ctx) = ctx.take() {
@@ -3095,6 +3101,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     }
                     None => {}
                 }
+                // After the dispatch, not before: an editor's result or a
+                // rewind's prefill replaces the composer, and the band
+                // must not keep a token range from the line it had.
+                app.refresh_palette(ctx.as_ref());
             }
             Step::Msg(Some(msg)) => app.handle_msg(msg),
             Step::Msg(None) => {}
@@ -3128,6 +3138,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             }
                             app.end_turn(command, &outcome);
                             app.sync_from_ctx(&mut returned);
+                            app.refresh_palette(Some(&returned));
                             if outcome.exit {
                                 quit_requested = true;
                             }
@@ -7150,6 +7161,31 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         harness.app.refresh_palette(None);
         assert!(palette(&harness).is_none());
+    }
+
+    /// The composer can change under an open band without a key (an
+    /// editor's result, a rewind's prefill). Enter on the highlight then
+    /// closes the band and leaves the draft as it is: the band's token
+    /// range belongs to a line that is gone.
+    #[test]
+    fn enter_on_a_palette_left_behind_by_an_edit_closes_it_and_keeps_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        harness.press(KeyCode::Tab);
+        assert!(palette(&harness).is_some_and(|open| open.highlighted().is_some()));
+        harness.app.set_composer_text(".i");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(harness.app.handle_key(enter), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), ".i");
+
+        harness.type_text("n");
+        harness.press(KeyCode::Tab);
+        assert!(palette(&harness).is_some_and(|open| open.highlighted().is_some()));
+        harness.app.set_composer_text("x");
+        assert_eq!(harness.app.handle_key(enter), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "x");
     }
 
     #[test]
