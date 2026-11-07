@@ -123,7 +123,11 @@ impl Transcript {
     }
 
     pub(super) fn remove(&mut self, index: usize) -> Cell {
+        let unseen_from = self.cells.len().saturating_sub(self.unseen);
         let removed = self.cells.remove(index);
+        if index >= unseen_from {
+            self.unseen -= 1;
+        }
         let shift = |held: Option<usize>| match held {
             Some(held) if held == index => None,
             Some(held) if held > index => Some(held - 1),
@@ -471,6 +475,27 @@ mod tests {
         assert_eq!(transcript.focus, Some(0));
         transcript.remove(0);
         assert_eq!(transcript.focus, None);
+    }
+
+    /// Removing a cell that arrived below a scrolled view takes it out
+    /// of the chip's count; removing one above the view leaves it.
+    #[test]
+    fn removing_an_unseen_cell_drops_it_from_the_count() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-100);
+        transcript.push(Cell::user("late 1"));
+        transcript.push(Cell::user("late 2"));
+        assert_eq!(transcript.unseen, 2);
+        transcript.remove(0);
+        assert_eq!(transcript.unseen, 2);
+        transcript.remove(9);
+        assert_eq!(transcript.unseen, 1);
+        transcript.remove(9);
+        assert_eq!(transcript.unseen, 0);
     }
 
     /// The offset is clamped to the lines above the view, a push while

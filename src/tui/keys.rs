@@ -85,10 +85,18 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     // protocol Ctrl+Shift+C arrives as an uppercase `C`.
     let code = lowercase(key.code);
     // Job control and repaint are the terminal's, not the modal's: they
-    // work the same whatever is on screen.
+    // work the same whatever is on screen. So do the keys that only move
+    // the view: a question waiting below does not stop the user reading
+    // what came before it. Keys that act on a row stay with the modal.
     match code {
         KeyCode::Char('z') if ctrl => return Action::Suspend,
         KeyCode::Char('l') if ctrl => return Action::ScheduleFrame,
+        KeyCode::F(2) => return Action::ToggleTodo,
+        KeyCode::PageUp => return Action::ScrollPage(-1),
+        KeyCode::PageDown => return Action::ScrollPage(1),
+        KeyCode::Up if shift => return Action::ScrollLines(-1),
+        KeyCode::Down if shift => return Action::ScrollLines(1),
+        KeyCode::End if ctx.scrolled => return Action::ScrollToBottom,
         _ => {}
     }
     match ctx.modal {
@@ -127,14 +135,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             // Readline's split: EOF only on an empty line; with a draft the
             // chord reaches the textarea, which deletes forward.
             KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
-            KeyCode::F(2) => Action::ToggleTodo,
-            KeyCode::PageUp => Action::ScrollPage(-1),
-            KeyCode::PageDown => Action::ScrollPage(1),
-            KeyCode::Up if shift => Action::ScrollLines(-1),
-            KeyCode::Down if shift => Action::ScrollLines(1),
             KeyCode::Up if ctrl => Action::FocusPrev,
             KeyCode::Down if ctrl => Action::FocusNext,
-            KeyCode::End if ctx.scrolled => Action::ScrollToBottom,
             // A draft keeps the letter: `G` mid-sentence is typing.
             KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
                 Action::ScrollToBottom
@@ -148,7 +150,6 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
-            KeyCode::Enter if ctx.focused && ctx.composer_empty => Action::ToggleFocused,
             KeyCode::Enter
                 if key
                     .modifiers
@@ -156,6 +157,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             {
                 Action::InsertNewline
             }
+            KeyCode::Enter if ctx.focused && ctx.composer_empty => Action::ToggleFocused,
             KeyCode::Enter if ctx.turn_running => Action::Nothing,
             KeyCode::Enter => Action::Submit,
             _ => Action::ComposerInput(key),
@@ -346,6 +348,7 @@ mod tests {
                 Action::ToggleFocused,
             ),
             (plain(KeyCode::Enter), focused_typing, Action::Submit),
+            (shift(KeyCode::Enter), focused, Action::InsertNewline),
             (
                 plain(KeyCode::Up),
                 focused,
@@ -372,7 +375,8 @@ mod tests {
         }
     }
 
-    /// Suspend and repaint belong to the terminal: a modal, answerable or
+    /// Suspend and repaint belong to the terminal, and the keys that only
+    /// move the view belong to the transcript: a modal, answerable or
     /// not, does not take them.
     #[test]
     fn suspend_and_repaint_work_under_every_modal() {
@@ -389,9 +393,25 @@ mod tests {
             modal: Some(ModalKind::Input),
             ..IDLE
         };
+        let shift = |code: KeyCode| press(code, KeyModifiers::SHIFT);
         for ctx in [confirm, input] {
             assert_eq!(map_key(ctrl('z'), &ctx), Action::Suspend, "{ctx:?}");
             assert_eq!(map_key(ctrl('l'), &ctx), Action::ScheduleFrame, "{ctx:?}");
+            let scrolled = KeyContext {
+                scrolled: true,
+                ..ctx
+            };
+            let cases = [
+                (plain(KeyCode::F(2)), ctx, Action::ToggleTodo),
+                (plain(KeyCode::PageUp), ctx, Action::ScrollPage(-1)),
+                (plain(KeyCode::PageDown), ctx, Action::ScrollPage(1)),
+                (shift(KeyCode::Up), ctx, Action::ScrollLines(-1)),
+                (shift(KeyCode::Down), ctx, Action::ScrollLines(1)),
+                (plain(KeyCode::End), scrolled, Action::ScrollToBottom),
+            ];
+            for (key, ctx, expected) in cases {
+                assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+            }
         }
     }
 

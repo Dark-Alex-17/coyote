@@ -1529,5 +1529,26 @@ mod tests {
                     if thinking == "hmm" && signature == "sig"
             ));
         }
+
+        #[test]
+        #[serial_test::serial]
+        fn two_reasoning_blocks_publish_a_pair_each() {
+            let (events, _) = feed(&[
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "text": "first" } } }),
+                ),
+                ("contentBlockStop", json!({ "contentBlockIndex": 0 })),
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "text": "second" } } }),
+                ),
+                ("contentBlockStop", json!({ "contentBlockIndex": 1 })),
+            ]);
+            assert_eq!(
+                events,
+                [detached_pair(), detached_pair()].concat()
+            );
+        }
     }
 }

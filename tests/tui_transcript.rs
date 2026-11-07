@@ -11,17 +11,17 @@
 //! - the welcome block carries no colour under `NO_COLOR`;
 //! - `.undo` removes the last exchange's cells back to the previous user
 //!   cell (against a recording session: a dry-run turn is never saved);
+//! - `.undo` with nothing to undo, a terminal shrunk to a few cells, and
+//!   an emoji/VS16 prompt leave the UI alive and quitting cleanly;
+//! - undoing the only exchange stops at the command cell before it and
+//!   leaves that cell in place;
 //! - the "Thinking for Ns" status row is live while a reasoning delta is
 //!   held;
 //! - `F2` shows and hides the Todo panel;
 //! - scrolling up raises the follow chip, `End` and a submitted line
-//!   clear it.
+//!   clear it;
 //! - a tool call is one cell that finishes in place (its start and end
 //!   events pair up), never a running cell plus a finished one;
-//! - `.undo` with nothing to undo, a terminal shrunk to a few cells, and
-//!   an emoji/VS16 prompt leave the UI alive and quitting cleanly;
-//! - undoing the only exchange stops at the command cell before it and
-//!   leaves that cell in place.
 //! - a finished tool row reads `name(args)  elapsed  ok`, folds its output
 //!   away, and opens/closes on `Enter` once `Ctrl+Up` focused it; `Esc`
 //!   drops the focus and a draft makes `Enter` submit instead;
@@ -29,7 +29,7 @@
 //!   opened row carries the error;
 //! - cells that land while the view is scrolled up count on the follow
 //!   chip and `End` brings them into view;
-//! - `todo__*` calls never take a transcript row; the Todo panel shows them.
+//! - `todo__*` calls never take a transcript row; the Todo panel shows them;
 //! - Shift+Up and a mouse wheel notch detach the view like PgUp does; PgDn
 //!   walks back to the bottom, and Shift+G jumps there only while the
 //!   composer is empty;

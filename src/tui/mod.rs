@@ -24,7 +24,7 @@ use anyhow::{Result, bail};
 use cells::{
     AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
 };
-use crossterm::event::{EventStream, KeyEvent, MouseEventKind};
+use crossterm::event::{EventStream, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
 use keys::{Action, KeyContext, ModalKind};
@@ -807,7 +807,10 @@ impl App {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => self.transcript.scroll_lines(-WHEEL_LINES),
                     MouseEventKind::ScrollDown => self.transcript.scroll_lines(WHEEL_LINES),
-                    _ => self.transcript.click(mouse.column, mouse.row),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.transcript.click(mouse.column, mouse.row)
+                    }
+                    _ => return None,
                 }
                 self.schedule_frame();
                 None
@@ -823,7 +826,9 @@ impl App {
         // keystroke the user is still making when the confirm appears. So
         // does a key a modal ignores: typing that runs on under a confirm
         // is not idleness either. Hotkeys answering a modal do not count;
-        // `answer_front` re-arms for the next queued question instead.
+        // `answer_front` re-arms for the next queued question instead. Nor
+        // do the view keys a modal lets through: scrolling back to reread
+        // is not typing.
         if self.prompts.is_empty() || action == Action::Nothing {
             self.last_keystroke = Some(self.clock.now());
         }
@@ -2267,7 +2272,7 @@ mod tests {
     use crate::events::{Event, Origin};
     use crate::prompt::Prompter;
     use crate::testing::TestConfigDirGuard;
-    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
     use events::ManualClock;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

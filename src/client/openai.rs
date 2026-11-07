@@ -339,8 +339,9 @@ pub async fn openai_chat_completions_streaming(
     _model: &Model,
 ) -> Result<()> {
     let mut state = OpenAiChatStreamState::default();
-    let handle =
-        |message: SseMessage| -> Result<bool> { openai_chat_handle_chunk(&message.data, &mut state, handler) };
+    let handle = |message: SseMessage| -> Result<bool> {
+        openai_chat_handle_chunk(&message.data, &mut state, handler)
+    };
 
     sse_stream(builder, handle).await
 }
@@ -2334,6 +2335,37 @@ mod tests {
             assert_eq!(events, detached_pair());
             let (_, _, thinking, _) = handler.take();
             assert!(thinking.is_empty());
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn two_reasoning_items_publish_a_pair_each() {
+            let (events, _) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning_item()
+                }),
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": { "type": "reasoning", "id": "rs_2", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": { "type": "reasoning", "id": "rs_2", "summary": [] }
+                }),
+            ]);
+            assert_eq!(
+                events,
+                [detached_pair(), detached_pair()].concat()
+            );
         }
 
         #[test]

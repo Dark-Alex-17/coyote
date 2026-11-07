@@ -1729,6 +1729,29 @@ mod tests {
 
         #[test]
         #[serial_test::serial]
+        fn two_thinking_blocks_publish_a_pair_each() {
+            let (events, _) = feed(&[
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 1 }),
+            ]);
+            assert_eq!(
+                events,
+                [detached_pair(), detached_pair()].concat()
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
         fn a_redacted_block_publishes_one_pair_around_it() {
             let (events, handler) = feed(&[
                 json!({
