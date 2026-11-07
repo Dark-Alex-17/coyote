@@ -601,7 +601,9 @@ fn a_tools_password_request_masks_the_field_and_sends_the_text() {
 }
 
 /// The field colours the command word as it is typed: green for a
-/// command the REPL knows, red for one it does not.
+/// command the REPL knows, red for one it does not. Typing a command
+/// opens the palette, whose rows also spell the command, so the band is
+/// closed with Esc before the frame is searched for the field's copy.
 #[test]
 #[serial]
 fn a_typed_command_is_painted_green_and_an_unknown_one_red() {
@@ -613,7 +615,14 @@ fn a_typed_command_is_painted_green_and_an_unknown_one_red() {
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b".info").unwrap();
     pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(300));
     let repainted = repaint(&mut pty, 40, 101);
+    assert!(
+        !since(&pty, repainted).contains("Show system info"),
+        "the palette band is still up:\n{}",
+        since(&pty, repainted)
+    );
     let at = find(pty.raw(), b".info", repainted)
         .unwrap_or_else(|| panic!("`.info` was not repainted:\n{}", since(&pty, repainted)));
     let style = sgr_before(pty.raw(), at);
@@ -627,6 +636,8 @@ fn a_typed_command_is_painted_green_and_an_unknown_one_red() {
     pty.read_for(Duration::from_millis(300));
     pty.send(b".nosuch").unwrap();
     pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(300));
     let repainted = repaint(&mut pty, 40, 100);
     let at = find(pty.raw(), b".nosuch", repainted)
         .unwrap_or_else(|| panic!("`.nosuch` was not repainted:\n{}", since(&pty, repainted)));
@@ -635,6 +646,40 @@ fn a_typed_command_is_painted_green_and_an_unknown_one_red() {
         has_indexed_foreground(&style, RED),
         "an unknown command was not painted red: {style:?}\n{}",
         since(&pty, repainted)
+    );
+
+    pty.send(b"\x03").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
+/// Esc with the palette up closes the band and nothing else: the typed
+/// prefix stays in the field and no turn is interrupted.
+#[test]
+#[serial]
+fn esc_closes_the_palette_without_interrupting_or_clearing_focus() {
+    let dir = fresh_config_dir("palette-esc");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".in").unwrap();
+    pty.wait_for("Show system info", PTY_DEADLINE)
+        .expect("the palette band never showed the `.info` row");
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let repainted = repaint(&mut pty, 40, 101);
+    let frame = since(&pty, repainted);
+    assert!(
+        !frame.contains("Show system info") && !frame.contains(".info"),
+        "the palette band survived Esc:\n{frame}"
+    );
+    assert!(
+        frame.contains(".in"),
+        "Esc cleared the typed prefix:\n{frame}"
     );
 
     pty.send(b"\x03").unwrap();

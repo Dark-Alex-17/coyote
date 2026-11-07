@@ -813,7 +813,12 @@ mod tests {
             }
         });
 
-        let outcome = drive(&mut ctx, TurnMode::Repl, "hi", &mut runner).await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive(&mut ctx, TurnMode::Repl, "hi", &mut runner),
+        )
+        .await
+        .expect("the two-round turn did not finish within 5s");
 
         assert_eq!(outcome, TurnOutcome::Completed);
         assert_eq!(calls.load(Ordering::SeqCst), 2);

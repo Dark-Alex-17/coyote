@@ -305,6 +305,58 @@ impl Drop for CacheDirGuard {
     }
 }
 
+/// A fresh directory under the temp dir for a test's scratch files,
+/// removed on drop, including on panic, so no outcome leaves them behind.
+pub(crate) struct ScratchDirGuard {
+    pub(crate) path: PathBuf,
+}
+
+impl ScratchDirGuard {
+    pub(crate) fn new(label: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("coyote-scratch-{label}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Points the process temp dir (`TMPDIR`, and `TMP` for Windows) at a fresh
+/// scratch directory for the guard's lifetime, so whatever the code under
+/// test writes through `env::temp_dir()` lands there and goes with it; a
+/// leak check then reads that directory and not the shared one. Tests
+/// using it must serialize (`#[serial]`); the env vars are process-global.
+pub(crate) struct TempDirGuard {
+    pub(crate) scratch: ScratchDirGuard,
+    _tmpdir: EnvVarGuard,
+    _tmp: EnvVarGuard,
+}
+
+impl TempDirGuard {
+    pub(crate) fn new(label: &str) -> Self {
+        let scratch = ScratchDirGuard::new(label);
+        let tmpdir = EnvVarGuard::set("TMPDIR", &scratch.path);
+        let tmp = EnvVarGuard::set("TMP", &scratch.path);
+        Self {
+            scratch,
+            _tmpdir: tmpdir,
+            _tmp: tmp,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.scratch.path
+    }
+}
+
 /// The first bash on PATH outside System32, for tests that drive the shipped
 /// shell scripts. The one Windows puts in System32 is the WSL launcher, not
 /// a shell: it prints a banner about missing distributions and exits 1, and

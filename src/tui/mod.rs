@@ -99,14 +99,27 @@ fn lender() -> Option<UnboundedSender<UiMsg>> {
 
 #[cfg(unix)]
 fn remember_tty() {
-    use std::os::fd::AsFd;
-    TTY_OUT.get_or_init(|| match std::io::stdout().as_fd().try_clone_to_owned() {
+    TTY_OUT.get_or_init(|| match dup_tty_out() {
         Ok(fd) => Some(fd),
         Err(err) => {
             warn!("Children lent the terminal will inherit the turn's output capture: {err}");
             None
         }
     });
+}
+
+/// Duplicates fd 1 close-on-exec: the copy is for the loop to hand out
+/// through `TtyHandles::stdio`, never for a child to inherit on its own.
+#[cfg(unix)]
+fn dup_tty_out() -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC takes no pointers; the result is checked.
+    let fd = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just created by fcntl and nothing else owns it.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(not(unix))]
@@ -869,6 +882,10 @@ pub(crate) struct App {
     footer: FooterInfo,
     usage: String,
     last_keystroke: Option<Instant>,
+    /// When the front prompt became the front; what Enter on a text
+    /// field is settled against, so typing the answer does not postpone
+    /// sending it.
+    front_since: Option<Instant>,
     /// The area of the last frame drawn; what a modal's question cap and
     /// its clipped state are judged against between frames.
     frame_area: Option<Rect>,
@@ -951,6 +968,7 @@ impl App {
             footer,
             usage: String::new(),
             last_keystroke: None,
+            front_since: None,
             frame_area: None,
             question_area: None,
             frames: FrameScheduler::new(Arc::clone(&clock)),
@@ -1155,9 +1173,13 @@ impl App {
     }
 
     fn key_context(&self) -> KeyContext {
+        let now = self.clock.now();
         let idle_ok = self
             .last_keystroke
-            .is_none_or(|at| self.clock.now().duration_since(at) >= HOTKEY_IDLE);
+            .is_none_or(|at| now.duration_since(at) >= HOTKEY_IDLE);
+        let field_settled = self
+            .front_since
+            .is_some_and(|at| now.duration_since(at) >= HOTKEY_IDLE);
         // The cap says what the frame should allow; the rows the last
         // draw actually gave the question say what it got. A frame too
         // short for the layout squeezes the question below its cap.
@@ -1176,6 +1198,7 @@ impl App {
             single_line: self.composer.lines().len() <= 1,
             modal: self.prompts.front().map(PendingPrompt::kind),
             idle_ok,
+            field_settled,
             question_fully_shown,
             scrolled: self.transcript.scrolled(),
             focused: self.transcript.focused(),
@@ -1473,7 +1496,9 @@ impl App {
                         // opened it cannot also send an empty answer.
                         None => {
                             prompt.open_custom_field();
-                            self.last_keystroke = Some(self.clock.now());
+                            let now = self.clock.now();
+                            self.last_keystroke = Some(now);
+                            self.front_since = Some(now);
                         }
                     }
                 }
@@ -1632,12 +1657,19 @@ impl App {
             // The asker gave up waiting (its turn was interrupted); the
             // answer has nowhere to go.
             let _ = prompt.reply.send(answer);
-            // The next queued question gets a fresh idle gate: a held or
-            // repeated hotkey must not answer it on the first prompt's
-            // momentum.
-            self.last_keystroke = Some(self.clock.now());
-            self.question_area = None;
+            self.arm_front_gates();
         }
+    }
+
+    /// Starts the modal gates over for whatever prompt is now at the
+    /// front: a held or repeated key must not answer it on the previous
+    /// prompt's momentum, and a user idle for a second who taps a key as
+    /// the modal comes up has not seen it yet.
+    fn arm_front_gates(&mut self) {
+        let now = self.clock.now();
+        self.last_keystroke = Some(now);
+        self.front_since = (!self.prompts.is_empty()).then_some(now);
+        self.question_area = None;
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
@@ -1946,15 +1978,11 @@ impl App {
 
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
         self.close_view();
-        if self.prompts.is_empty() {
-            self.question_area = None;
-            // The idle gate counts from the moment the modal appears, not
-            // from the user's last key: a user idle for a second who taps a
-            // hotkey as the modal comes up has not seen it yet. The next
-            // queued prompt is re-armed the same way when the front answers.
-            self.last_keystroke = Some(self.clock.now());
-        }
+        let becomes_front = self.prompts.is_empty();
         self.prompts.push_back(PendingPrompt::new(req, reply));
+        if becomes_front {
+            self.arm_front_gates();
+        }
     }
 
     /// Cancels every question, queued or up, whose asker has ended: the
@@ -1971,8 +1999,7 @@ impl App {
             }
         });
         if front_dismissed {
-            self.last_keystroke = Some(self.clock.now());
-            self.question_area = None;
+            self.arm_front_gates();
         }
     }
 
@@ -3324,9 +3351,15 @@ mod tests {
         );
     }
 
+    /// How long a `run_async` body may take before the test is declared
+    /// stuck; a turn that waits on a reply that never comes would
+    /// otherwise hang the whole binary.
+    const RUN_ASYNC_WAIT: Duration = Duration::from_secs(60);
+
     /// Drives a turn on a runtime whose workers have the stack headroom
     /// `run_repl_command` needs in debug builds; a default 2 MiB worker
-    /// overflows and aborts the whole test binary.
+    /// overflows and aborts the whole test binary. The body is bounded
+    /// by `RUN_ASYNC_WAIT`.
     fn run_async<F>(f: F) -> F::Output
     where
         F: Future + Send,
@@ -3343,7 +3376,13 @@ mod tests {
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(f)
+                        .block_on(async {
+                            tokio::time::timeout(RUN_ASYNC_WAIT, f)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    panic!("the async test body did not finish within {RUN_ASYNC_WAIT:?}")
+                                })
+                        })
                 })
                 .unwrap()
                 .join()
@@ -3823,38 +3862,50 @@ mod tests {
 
     /// The gate holds for every modal kind and its answer key: the key
     /// pressed before the question arrives is typing, the key one
-    /// millisecond short of the idle second is dropped (and re-arms the
-    /// gate), and the key at the full second answers. A fresh modal
-    /// answered exactly at the second pins the boundary itself.
+    /// millisecond short of the idle second is dropped (and re-arms a
+    /// hotkey's gate), and the key at the full second answers. A fresh
+    /// modal answered exactly at the second pins the boundary itself;
+    /// for the input field, characters typed inside that second do not
+    /// move it.
     #[test]
     fn checklist_8_typeahead_and_idle_gate_guard_the_modal() {
-        type GateCase = (&'static str, fn() -> PromptRequest, KeyCode, PromptAnswer);
+        type GateCase = (
+            &'static str,
+            fn() -> PromptRequest,
+            &'static str,
+            KeyCode,
+            PromptAnswer,
+        );
         let input_request = || PromptRequest::new(PromptAction::Input, "Name?", Origin::detached());
         let cases: [GateCase; 3] = [
             (
                 "confirm",
                 || confirm_request(None),
+                "",
                 KeyCode::Char('y'),
                 PromptAnswer::Confirmed(true),
             ),
             (
                 "input",
                 input_request,
+                "ab",
                 KeyCode::Enter,
-                PromptAnswer::Text(String::new()),
+                PromptAnswer::Text("ab".to_string()),
             ),
             (
                 "select",
                 || list_request(PromptAction::Select, None),
+                "",
                 KeyCode::Char('1'),
                 PromptAnswer::Selected("alpha".to_string()),
             ),
         ];
-        for (kind, request, key, expected) in cases {
+        for (kind, request, typed, key, expected) in cases {
             let mut harness = Harness::standalone(80, 24);
             harness.clock.advance(10 * HOTKEY_IDLE);
             assert_eq!(harness.press(key), None, "{kind}");
             let asker = ask_on_a_thread(&mut harness, request());
+            harness.type_text(typed);
             assert_eq!(
                 harness.app.prompts.len(),
                 1,
@@ -3878,6 +3929,7 @@ mod tests {
             let mut harness = Harness::standalone(80, 24);
             harness.clock.advance(10 * HOTKEY_IDLE);
             let asker = ask_on_a_thread(&mut harness, request());
+            harness.type_text(typed);
             harness.clock.advance(HOTKEY_IDLE);
             assert_eq!(harness.press(key), None);
             assert_eq!(
@@ -4110,6 +4162,10 @@ mod tests {
         assert_eq!(harness.app.prompt_memory.auto_answer(&req), Some(true));
     }
 
+    /// Enter on the field settles from the modal's appearance: the
+    /// answer is typed, so typing must not push the send out. Enter a
+    /// millisecond short of the second is dropped, more typing right
+    /// after does not re-arm it, and Enter at the second sends.
     #[test]
     fn an_input_modal_types_into_its_own_field_and_sends_it() {
         let mut harness = Harness::standalone(80, 24);
@@ -4119,14 +4175,19 @@ mod tests {
         harness.type_text("notes");
         let frame = harness.draw();
         assert_welcome_snapshot("input_modal_80x24", &frame);
-        // Enter is an answer, so it waits out the typing gap.
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert!(!asker.is_finished());
-        harness.clock.advance(HOTKEY_IDLE);
+        harness
+            .clock
+            .advance(HOTKEY_IDLE - Duration::from_millis(1));
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness.type_text(" two");
+        harness.clock.advance(Duration::from_millis(1));
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
-            PromptAnswer::Text("notes".to_string())
+            PromptAnswer::Text("notes two".to_string())
         );
         assert_eq!(harness.app.composer_text(), "draft");
     }
@@ -8070,6 +8131,25 @@ mod tests {
         }
     }
 
+    /// The loop's copy of the terminal is close-on-exec: a tool child
+    /// spawned during a turn must not inherit a second handle on the tty
+    /// next to the capture pipe it was given.
+    #[cfg(unix)]
+    #[test]
+    fn the_lent_tty_fd_is_cloexec() {
+        use std::os::fd::AsRawFd;
+        let fd = match dup_tty_out() {
+            Ok(fd) => fd,
+            // fd 1 is closed in this process; there is nothing to pin.
+            Err(err) if err.raw_os_error() == Some(libc::EBADF) => return,
+            Err(err) => panic!("dup of fd 1 failed: {err}"),
+        };
+        // SAFETY: fcntl with F_GETFD takes no pointers.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1, "{}", std::io::Error::last_os_error());
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
     /// With the UI flag up but no loop lending the terminal (the flag
     /// outlives the loop during teardown), `.edit` on a file fails
     /// outright: no editor is spawned onto the capture pipe (the name
@@ -8103,6 +8183,7 @@ mod tests {
     #[test]
     #[serial]
     fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
+        let _tmp = crate::testing::TempDirGuard::new("lent-editor");
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let (_lender, lent) = test_lender();
         let code = crate::utils::run_command("sh", &["-c", "exit 7"], None).unwrap();
@@ -8112,7 +8193,6 @@ mod tests {
         let path = crate::utils::temp_file("-lent-editor-", ".txt");
         crate::utils::edit_file("touch", &path).unwrap();
         assert!(path.is_file(), "{}", path.display());
-        std::fs::remove_file(&path).unwrap();
         assert_eq!(lent.load(Ordering::SeqCst), 2);
     }
 
@@ -8123,6 +8203,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_file_writing_loader_still_runs_under_the_tui() {
+        let _tmp = crate::testing::TempDirGuard::new("loader-source");
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let source = crate::utils::temp_file("-loader-source-", ".txt");
         std::fs::write(&source, "loaded under the tui x7x\n").unwrap();
@@ -8133,7 +8214,6 @@ mod tests {
         )
         .await
         .unwrap();
-        std::fs::remove_file(&source).unwrap();
         assert_eq!(loaded, "loaded under the tui x7x\n");
     }
 

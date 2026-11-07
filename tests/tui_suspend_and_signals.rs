@@ -448,17 +448,19 @@ fn assert_repainted_after(
 
 // ---------------------------------------------------------------------
 // Enter on a draft while the context is away (a tool is running). The
-// draft is not lost and the running turn is not disturbed.
+// draft is queued and rides into the next tool round.
 // ---------------------------------------------------------------------
 
-/// Keys are handled while a work task sleeps; a submit while the context
-/// is away restores the draft rather than losing it, and never ends the
-/// turn or the process. Whichever way the UI holds the draft (back in the
-/// composer, or sent as the next prompt once the turn is over), the text
-/// reaches the model exactly once and the UI stays live throughout.
+/// Keys are handled while a work task sleeps; Enter while the context is
+/// away queues the line (the strip above the field shows `pending: 1`
+/// and the text) and never ends the turn or the process. Once the tool
+/// is released the driver hands the queued line to the model at the
+/// tool-round boundary, so the fake serves exactly two requests, the
+/// strip is gone and the composer is empty. The fake does not record
+/// request bodies, so the count plus the vanished strip is the pin.
 #[test]
 #[serial]
-fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
+fn enter_on_a_draft_while_a_tool_sleeps_queues_it_and_the_model_gets_it_next_round() {
     let dir = fresh_config_dir("enter-mid-tool");
     let _guard = TempDirGuard(dir.clone());
     let marker = dir.join("tool");
@@ -468,7 +470,6 @@ fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
             arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
         },
         Reply::Text("fixture done r12-a".to_string()),
-        Reply::Text("draft reply r12-b".to_string()),
     ]);
     write_fake_llm_config(&dir, &fake, "");
     write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
@@ -490,6 +491,11 @@ fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
         !mid.contains("exit=") && find(pty.raw(), LEAVE_ALT, typed_at).is_none(),
         "Enter on a draft while a tool ran ended the UI (a panic or a quit):\n{after_enter}"
     );
+    let queued = squeezed(&mid);
+    assert!(
+        queued.contains("pending:1") && queued.contains("draft-r12-d"),
+        "Enter on a draft while a tool ran did not queue it:\n{mid}"
+    );
     assert_eq!(
         fake.served(),
         1,
@@ -508,36 +514,25 @@ fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
         "the reply after the tool",
     );
     pty.read_for(Duration::from_millis(800));
+    assert_eq!(
+        fake.served(),
+        2,
+        "the queued line did not ride into the tool round as a notification"
+    );
 
-    // Either the draft is back in the composer (Ctrl+L repaints the whole
-    // screen, so it is visible from here on) or it already went out as
-    // the next prompt; in both cases it must not be gone.
+    // Ctrl+L repaints the whole screen, so what follows is the current
+    // frame alone: no strip, and no draft left in the field.
     let repaint_at = pty.raw().len();
     pty.send(b"\x0c").unwrap();
     pty.read_for(Duration::from_millis(600));
     let repainted = since(&pty, repaint_at);
-    let in_composer = squeezed(&repainted).contains("draft-r12-d");
-    if in_composer {
-        pty.send(b"\r").unwrap();
-    } else {
-        assert!(
-            fake.served() >= 2 && squeezed(&since(&pty, typed_at)).contains("draft-r12-d"),
-            "the draft typed while the tool ran was lost: it is neither in the composer nor \
-             in the transcript (model calls served: {}):\n{repainted}",
-            fake.served()
-        );
-    }
-    let transcript = wait_for_squeezed_after(
-        &mut pty,
-        "draft reply r12-b",
-        typed_at,
-        "the reply to the draft",
+    assert!(
+        !repainted.contains("pending:"),
+        "the queue strip outlived the turn:\n{repainted}"
     );
-    assert_eq!(
-        fake.served(),
-        3,
-        "the draft reached the model {} times instead of once:\n{transcript}",
-        fake.served().saturating_sub(2)
+    assert!(
+        !squeezed(&repainted).contains("draft-r12-d"),
+        "the queued line is still on screen after it went to the model:\n{repainted}"
     );
 
     pty.send(b"\x04").unwrap();

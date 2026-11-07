@@ -66,13 +66,19 @@ pub(crate) struct KeyContext {
     pub(crate) modal: Option<ModalKind>,
     /// Whether a second has passed since the last key pressed (accepted
     /// or ignored, outside a modal or under one) or since the previous
-    /// answer: the
-    /// condition for a bare hotkey or Enter to count as an answer to any
-    /// modal, so a modal that appears mid-sentence cannot be answered by
-    /// the keystroke already in flight. Keys that only move a list's
-    /// cursor or type into a field are not gated; the letter and digit
-    /// shortcuts of a list are, like a confirm's hotkeys.
+    /// answer: the condition for a bare hotkey, or Enter on a list or
+    /// confirm, to count as an answer, so a modal that appears
+    /// mid-sentence cannot be answered by the keystroke already in
+    /// flight. Keys that only move a list's cursor or type into a field
+    /// are not gated; the letter and digit shortcuts of a list are, like
+    /// a confirm's hotkeys.
     pub(crate) idle_ok: bool,
+    /// Whether the front modal has been up for a second, counted from
+    /// its appearance, the previous answer or its custom field opening
+    /// and not from the last key: the condition for Enter to send a text
+    /// field. Typing the answer is expected under a field, so it must
+    /// not postpone sending it the way it postpones a hotkey.
+    pub(crate) field_settled: bool,
     /// Whether the whole question is on screen. A question taller than
     /// its pane is clipped with a marker, and nothing clipped may be
     /// approved: only Esc and Ctrl+C answer until the terminal is tall
@@ -210,9 +216,9 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
             // The field is one line, so the composer's newline chords have
             // nothing to insert: Enter submits however it is held, once
-            // the typing-idle gate has passed; a gated Enter is swallowed
-            // rather than typed.
-            KeyCode::Enter if !(ctx.idle_ok && ctx.question_fully_shown) => Action::Nothing,
+            // the modal has settled; a gated Enter is swallowed rather
+            // than typed.
+            KeyCode::Enter if !(ctx.field_settled && ctx.question_fully_shown) => Action::Nothing,
             KeyCode::Enter => Action::SubmitModalInput,
             KeyCode::Char('j') if ctrl => Action::Nothing,
             _ => Action::ModalInput(key),
@@ -371,6 +377,7 @@ mod tests {
         single_line: true,
         modal: None,
         idle_ok: true,
+        field_settled: true,
         question_fully_shown: true,
         scrolled: false,
         focused: false,
@@ -1159,12 +1166,13 @@ mod tests {
         );
     }
 
-    /// Enter on a field modal is an answer, so it waits out the typing
-    /// gap the way a confirm's hotkeys do; a gated Enter is swallowed,
-    /// not typed into the field. Letters are typed whatever the gate
-    /// says, and Esc cancels through it.
+    /// Enter on a field modal is an answer, so it waits for the modal to
+    /// settle; unlike a confirm's hotkeys it does not wait out the typing
+    /// gap, since typing is how the field is answered. A gated Enter is
+    /// swallowed, not typed into the field. Letters are typed whatever
+    /// the gates say, and Esc cancels through them.
     #[test]
-    fn field_modal_enter_needs_the_typing_idle_gap() {
+    fn field_modal_enter_needs_the_modal_settled_not_the_typing_gap() {
         let typed = plain(KeyCode::Char('s'));
         for kind in [
             ModalKind::Input,
@@ -1177,6 +1185,10 @@ mod tests {
                 modal: Some(kind),
                 ..IDLE
             };
+            let unsettled = KeyContext {
+                field_settled: false,
+                ..modal
+            };
             let busy_typing = KeyContext {
                 idle_ok: false,
                 ..modal
@@ -1187,17 +1199,18 @@ mod tests {
             };
             let cases = [
                 (plain(KeyCode::Enter), modal, Action::SubmitModalInput),
-                (plain(KeyCode::Enter), busy_typing, Action::Nothing),
+                (plain(KeyCode::Enter), busy_typing, Action::SubmitModalInput),
+                (plain(KeyCode::Enter), unsettled, Action::Nothing),
                 (plain(KeyCode::Enter), clipped, Action::Nothing),
-                (typed, busy_typing, Action::ModalInput(typed)),
+                (typed, unsettled, Action::ModalInput(typed)),
                 (
                     plain(KeyCode::Esc),
-                    busy_typing,
+                    unsettled,
                     Action::Answer(PromptAnswer::Cancelled),
                 ),
                 (
                     ctrl('c'),
-                    busy_typing,
+                    unsettled,
                     Action::Answer(PromptAnswer::Cancelled),
                 ),
             ];

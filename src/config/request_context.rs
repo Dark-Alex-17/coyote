@@ -8210,7 +8210,7 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
-    use crate::testing::{AtomicFlagGuard, install_log_collector, warn_snapshot};
+    use crate::testing::{AtomicFlagGuard, TempDirGuard, install_log_collector, warn_snapshot};
     use crate::turn::SilentSink;
     use crate::utils;
     use crate::utils::get_env_name;
@@ -11954,10 +11954,12 @@ mod tests {
 
     /// `.edit rag-docs` hands the document list to the editor through a
     /// temp file; with nobody lending the terminal the failure comes
-    /// before that file is created.
+    /// before that file is created. The temp dir is the test's own, so
+    /// the leak check reads nothing another test wrote.
     #[test]
     #[serial]
     fn edit_rag_docs_under_the_tui_without_a_lender_fails_before_writing_the_temp_file() {
+        let tmp = TempDirGuard::new("rag-tui-refused");
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let name = "tui-refused-kb";
@@ -11977,7 +11979,7 @@ mod tests {
         let err = run_async(ctx.edit_rag_docs(utils::create_abort_signal())).unwrap_err();
         assert_no_lender_under_the_tui(err);
         let needle = format!("-rag-{name}");
-        let leftovers: Vec<PathBuf> = read_dir(env::temp_dir())
+        let leftovers: Vec<PathBuf> = read_dir(tmp.path())
             .unwrap()
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| path.to_string_lossy().contains(&needle))

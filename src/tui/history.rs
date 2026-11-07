@@ -143,21 +143,13 @@ impl ComposerHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn temp_path(label: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir()
-            .join(format!("coyote-history-{label}-{unique}"))
-            .join("history")
-    }
+    use crate::testing::ScratchDirGuard;
 
     #[test]
     fn entries_round_trip_through_the_file_with_newlines_escaped() {
-        let path = temp_path("round-trip");
+        let dir = ScratchDirGuard::new("history-round-trip");
+        // The parent does not exist yet: the first append creates it.
+        let path = dir.path.join("state").join("history");
         append(&path, "first").unwrap();
         append(&path, "two\nlines").unwrap();
         append(&path, "last").unwrap();
@@ -165,30 +157,29 @@ mod tests {
         assert_eq!(text, "first\ntwo<\\n>lines\nlast\n");
         let history = ComposerHistory::load(&path).unwrap();
         assert_eq!(history.entries, ["first", "two\nlines", "last"]);
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn a_missing_file_is_an_empty_history() {
-        let history = ComposerHistory::load(&temp_path("missing")).unwrap();
+        let dir = ScratchDirGuard::new("history-missing");
+        let history = ComposerHistory::load(&dir.path.join("history")).unwrap();
         assert_eq!(history, ComposerHistory::default());
     }
 
     #[test]
     fn the_file_keeps_the_newest_thousand_entries() {
-        let path = temp_path("cap");
+        let dir = ScratchDirGuard::new("history-cap");
+        let path = dir.path.join("history");
         let mut text = String::new();
         for i in 0..CAPACITY + 5 {
             text.push_str(&format!("entry {i}\n"));
         }
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, text).unwrap();
         append(&path, "newest").unwrap();
         let history = ComposerHistory::load(&path).unwrap();
         assert_eq!(history.entries.len(), CAPACITY);
         assert_eq!(history.entries[0], "entry 6");
         assert_eq!(history.entries[CAPACITY - 1], "newest");
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
