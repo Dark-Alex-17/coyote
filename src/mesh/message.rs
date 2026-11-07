@@ -27,7 +27,9 @@ use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore, same_hash,
 };
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{CappedText, canonical_hash, capped_peer_text, display_text, hex_lower};
+use crate::mesh::{
+    CappedText, age_text, canonical_hash, capped_peer_text, display_text, hex_lower,
+};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::notification::{
     MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, fold_into, mesh_events_dropped,
@@ -1625,6 +1627,71 @@ impl SendError {
 pub(crate) struct SendOutcome {
     pub id: String,
     pub via: PeerVia,
+    /// For a message a propagation node holds: how the peer had gone before the send, if
+    /// it had, which the sender is told instead of a bare `store-and-forward`.
+    pub departed: Option<Departure>,
+}
+
+/// How a peer had gone when a send to it started: it said it was leaving the mesh, or
+/// the last link to it failed. Either lasts until its next announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Departure {
+    /// Its farewell arrived at this time, by this node's clock. Nothing is tried over a
+    /// link until it announces again.
+    Left(SystemTime),
+    /// The last link attempt failed; `last_seen` is its latest announce. A link is still
+    /// tried while the transport holds a path.
+    NoRoute { last_seen: SystemTime },
+}
+
+impl Departure {
+    /// What the peer's row says about it, read at `now`: its own farewell first, then a
+    /// failed link. `None` for a peer that is neither.
+    pub(crate) fn of(peer: &PeerRecord, link_failed: bool) -> Option<Self> {
+        match peer.left_at {
+            Some(at) => Some(Self::Left(at)),
+            None if link_failed => Some(Self::NoRoute {
+                last_seen: peer.last_seen,
+            }),
+            None => None,
+        }
+    }
+
+    /// What follows the peer's name in `held_sentence`: ` left 2h ago`, or why there is
+    /// no route and when it was last heard.
+    pub(crate) fn status(self, now: SystemTime) -> String {
+        match self {
+            Self::Left(at) => format!(" left {}", age_text(now, at)),
+            Self::NoRoute { last_seen } => format!(
+                " has no route (its last link failed and it has not announced since; last heard {})",
+                age_text(now, last_seen)
+            ),
+        }
+    }
+
+    /// The wire name a tool result carries for the peer's state.
+    pub(crate) fn state(self) -> &'static str {
+        match self {
+            Self::Left(_) => "left",
+            Self::NoRoute { .. } => "no_route",
+        }
+    }
+}
+
+/// The words after the peer's status in `held_sentence`, up to the second naming.
+pub(crate) const HELD_FOR_DEPARTED: &str = "; held at the propagation node, delivered to any of ";
+/// The end of `held_sentence`, after the second naming.
+pub(crate) const HELD_FOR_DEPARTED_END: &str = "'s sessions when one syncs";
+
+/// What a sender is told when a peer that had gone gets its message held by the
+/// propagation node: `bob left 2h ago; held at the propagation node, delivered to any of
+/// bob's sessions when one syncs`. `name` is how the caller names the peer; a surface that
+/// quotes peer text builds the same words from `Departure::status` and the two constants.
+pub(crate) fn held_sentence(name: &str, departure: Departure, now: SystemTime) -> String {
+    format!(
+        "{name}{}{HELD_FOR_DEPARTED}{name}{HELD_FOR_DEPARTED_END}",
+        departure.status(now)
+    )
 }
 
 /// Timeouts for one send: the direct attempt, then the fallback post, which
@@ -1914,7 +1981,9 @@ impl MeshRuntime {
     /// not stored. A message whose upload ran out before the peer had all of it is
     /// stored: the peer never read it, so the stored copy cannot land twice. Posts to
     /// the propagation node queue behind `posting`, since `propagate` needs one caller
-    /// per node at a time.
+    /// per node at a time. A peer that said it left the mesh is not tried over a link at
+    /// all while the send may be stored: its farewell holds until its next announce. The
+    /// outcome of a stored send says how the peer had gone, if it had.
     pub(crate) async fn send_peer_with(
         &self,
         destination_hex: &str,
@@ -1981,6 +2050,7 @@ impl MeshRuntime {
         {
             return Err(not_trusted());
         }
+        let departed = Departure::of(&peer, self.link_failed(&destination));
         let route = self.resolve_route(&destination).await.ok_or_else(|| {
             SendError::UnknownDestination {
                 destination: destination.clone(),
@@ -1990,77 +2060,93 @@ impl MeshRuntime {
         let desc = route.desc;
         let dest8 = short(&destination);
         let (kind, id) = (message.kind, message.id.as_str());
-        let unreachable = match self
-            .request(
-                &desc,
-                MESSAGE_PATH,
-                to_request_body(message, unix_now()),
-                route.options(options.request),
+        // A peer that said it left is not tried over a link until it announces again; a
+        // send that may go only over a link still tries it.
+        let skips_link = options.store_and_forward && matches!(departed, Some(Departure::Left(_)));
+        let attempt = if skips_link {
+            None
+        } else {
+            Some(
+                self.request(
+                    &desc,
+                    MESSAGE_PATH,
+                    to_request_body(message, unix_now()),
+                    route.options(options.request),
+                )
+                .await,
             )
-            .await
-        {
-            Ok(reply) if is_received_reply(&reply, id) => {
-                debug!("Mesh {kind} {id} to {dest8} was delivered over a link");
-                return Ok(SendOutcome {
-                    id: message.id.clone(),
-                    via: PeerVia::Direct,
-                });
-            }
-            Ok(_) => {
-                debug!("Mesh {kind} {id} to {dest8} was answered but not acknowledged");
-                return Err(SendError::NotAcknowledged);
-            }
-            Err(
-                err @ (RequestError::Timeout { .. }
-                | RequestError::RequestIncomplete { .. }
-                | RequestError::LinkActivationTimeout { .. }
-                | RequestError::LinkFailed(_)
-                | RequestError::LinkNotOpened(_)
-                | RequestError::LinkClosed),
-            ) => err,
-            Err(RequestError::Refused(RefusalCode::NoAccess)) => {
-                debug!(
-                    "Mesh {kind} {id} to {dest8} was refused: the peer has not trusted this instance"
-                );
-                return Err(SendError::NotTrustedByPeer(
-                    self.remote_refusal(&destination),
-                ));
-            }
-            Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
-                debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
-                return Err(SendError::Throttled {
-                    destination: destination.clone(),
-                });
-            }
-            Err(RequestError::Refused(code)) => {
-                debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
-                return Err(SendError::Refused(code));
-            }
-            Err(RequestError::NotRunning | RequestError::Shutdown) => {
-                return Err(SendError::NotRunning);
-            }
-            Err(RequestError::UnsupportedVersion { found, min, max }) => {
-                return Err(SendError::IncompatibleVersion {
-                    destination: destination.clone(),
-                    found,
-                    min,
-                    max,
-                });
-            }
-            Err(err) => {
-                debug!(
-                    "Mesh {kind} {id} to {dest8} was not sent over the link: {}",
-                    redact_hashes(&err.to_string())
-                );
-                return Err(SendError::Direct(err));
-            }
+        };
+        let unreachable = match attempt {
+            None => None,
+            Some(attempt) => Some(match attempt {
+                Ok(reply) if is_received_reply(&reply, id) => {
+                    debug!("Mesh {kind} {id} to {dest8} was delivered over a link");
+                    return Ok(SendOutcome {
+                        id: message.id.clone(),
+                        via: PeerVia::Direct,
+                        departed: None,
+                    });
+                }
+                Ok(_) => {
+                    debug!("Mesh {kind} {id} to {dest8} was answered but not acknowledged");
+                    return Err(SendError::NotAcknowledged);
+                }
+                Err(
+                    err @ (RequestError::Timeout { .. }
+                    | RequestError::RequestIncomplete { .. }
+                    | RequestError::LinkActivationTimeout { .. }
+                    | RequestError::LinkFailed(_)
+                    | RequestError::LinkNotOpened(_)
+                    | RequestError::LinkClosed),
+                ) => err,
+                Err(RequestError::Refused(RefusalCode::NoAccess)) => {
+                    debug!(
+                        "Mesh {kind} {id} to {dest8} was refused: the peer has not trusted this instance"
+                    );
+                    return Err(SendError::NotTrustedByPeer(
+                        self.remote_refusal(&destination),
+                    ));
+                }
+                Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
+                    debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
+                    return Err(SendError::Throttled {
+                        destination: destination.clone(),
+                    });
+                }
+                Err(RequestError::Refused(code)) => {
+                    debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
+                    return Err(SendError::Refused(code));
+                }
+                Err(RequestError::NotRunning | RequestError::Shutdown) => {
+                    return Err(SendError::NotRunning);
+                }
+                Err(RequestError::UnsupportedVersion { found, min, max }) => {
+                    return Err(SendError::IncompatibleVersion {
+                        destination: destination.clone(),
+                        found,
+                        min,
+                        max,
+                    });
+                }
+                Err(err) => {
+                    debug!(
+                        "Mesh {kind} {id} to {dest8} was not sent over the link: {}",
+                        redact_hashes(&err.to_string())
+                    );
+                    return Err(SendError::Direct(err));
+                }
+            }),
+        };
+        let why_not_direct = match &unreachable {
+            Some(err) => redact_hashes(&err.to_string()),
+            None => "it said it left the mesh, so no link was tried".to_string(),
         };
         if !options.store_and_forward {
             debug!(
-                "Mesh {kind} {id} to {dest8} could not be delivered over a link ({}); it goes over a link or not at all, so it is not stored",
-                redact_hashes(&unreachable.to_string())
+                "Mesh {kind} {id} to {dest8} could not be delivered over a link ({why_not_direct}); it goes over a link or not at all, so it is not stored"
             );
-            return Err(SendError::Direct(unreachable));
+            // A link-only send always tried the link, so there is an error to report.
+            return Err(unreachable.map_or(SendError::NoPropagationNode, SendError::Direct));
         }
         // Selected before queueing behind another post: a sender with no node to fall
         // back on is told so at once rather than after someone else's transfer.
@@ -2068,15 +2154,14 @@ impl MeshRuntime {
             self.propagation_nodes()
                 .select_for_posting()
                 .map_err(|_| match unreachable {
-                    RequestError::Timeout { .. } => {
+                    Some(RequestError::Timeout { .. }) => {
                         SendError::NoAnswer(self.no_answer(&destination))
                     }
                     _ => SendError::NoPropagationNode,
                 })?;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
-            "Mesh {kind} {id} to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
-            redact_hashes(&unreachable.to_string()),
+            "Mesh {kind} {id} to {dest8} could not be delivered over a link ({why_not_direct}); storing it with propagation node {}",
             short(&node_hex)
         );
         self.post_to_node(
@@ -2096,6 +2181,7 @@ impl MeshRuntime {
         Ok(SendOutcome {
             id: message.id.clone(),
             via: PeerVia::StoreAndForward,
+            departed,
         })
     }
 
@@ -2277,22 +2363,24 @@ impl MeshRuntime {
     /// that answered. `None` otherwise. For a peer whose last link failed nothing is
     /// waited on while a stored key or a description is held: that is used now, and the
     /// path request the request itself sends serves the next attempt. With neither held
-    /// it is asked for and waited on as any other.
+    /// it is asked for and waited on as any other. A peer that said it left is treated the
+    /// same way: its farewell already says no answer is coming.
     pub(crate) async fn resolve_route(&self, destination_hex: &str) -> Option<Route> {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
         let transport = self.transport_handle().await?;
-        let link_failed = self.link_failed(&destination);
-        let persisted = self
-            .peers()
-            .get(&destination)
-            .and_then(|record| record.verified_destination());
+        let record = self.peers().get(&destination);
+        let skips_wait = self.link_failed(&destination)
+            || record
+                .as_ref()
+                .is_some_and(|record| record.left_at.is_some());
+        let persisted = record.and_then(|record| record.verified_destination());
         let route = match persisted {
             Some(desc) => {
                 let known = transport.destination_desc(&address_hash).await.is_some()
                     || transport.has_path(&address_hash).await;
                 if !known
-                    && !link_failed
+                    && !skips_wait
                     && !transport
                         .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
                         .await
@@ -2309,7 +2397,7 @@ impl MeshRuntime {
                 })
             }
             None => {
-                let held = if link_failed {
+                let held = if skips_wait {
                     transport.destination_desc(&address_hash).await
                 } else {
                     None
@@ -2429,6 +2517,14 @@ impl MeshRuntime {
     /// on a path request for it.
     pub(crate) fn link_failed(&self, destination_hex: &str) -> bool {
         canonical_hash(destination_hex).is_some_and(|hex| self.peers().link_failed(&hex))
+    }
+
+    /// How the peer at `destination_hex` had gone, as its row reads now: `None` for one
+    /// that has neither said it left nor failed its last link, or that has no row.
+    pub(crate) fn departure(&self, destination_hex: &str) -> Option<Departure> {
+        let hex = canonical_hash(destination_hex)?;
+        let peers = self.peers();
+        Departure::of(&peers.get(&hex)?, peers.link_failed(&hex))
     }
 }
 
@@ -2606,6 +2702,9 @@ pub(crate) trait PeerSurface: Send + Sync {
     /// A farewell: the sender is marked as having left, and nothing is filed, counted or
     /// handed to the envoy.
     fn note_farewell(&self, farewell: Farewell);
+    /// An instance marked left announced again, which lifted the mark. The owner hears of
+    /// it only when a question to it is still open.
+    fn note_return(&self, _destination: &str) {}
     /// Lower-hex of the destination this node receives on right now; `None` while off.
     fn local_destination(&self) -> Option<String>;
     fn part_limits(&self) -> PartLimits {

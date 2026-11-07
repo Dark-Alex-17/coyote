@@ -24,9 +24,10 @@ use crate::mesh::knock::{
 };
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
-    BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
-    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, Route, SendError,
-    is_wire_id, left_mesh_hint, unreachable_head,
+    BroadcastOutcome, Disposition, HELD_FOR_DEPARTED, HELD_FOR_DEPARTED_END, OutboundPeer,
+    PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part, PartLimits, PeerKind, PeerMessage, PeerVia,
+    RawPart, RecipientOutcome, Route, SendError, SendOutcome, held_sentence, is_wire_id,
+    left_mesh_hint, unreachable_head,
 };
 use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
@@ -1139,6 +1140,8 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
     let names = ctx.app.mesh.address_names();
+    let peers = runtime.peers();
+    let left_at = |destination: &str| peers.get(destination).and_then(|peer| peer.left_at);
     let mut asked: Vec<QuestionRow> = ctx
         .app
         .mesh
@@ -1155,6 +1158,10 @@ fn pending(ctx: &RequestContext) -> Result<()> {
                     &correlation.record.peer_identity,
                 ),
             )
+            .waiting_on(
+                &correlation.record,
+                left_at(&correlation.record.peer_destination),
+            )
         })
         .collect();
     asked.extend(
@@ -1168,6 +1175,7 @@ fn pending(ctx: &RequestContext) -> Result<()> {
                     name_at(ctx, &names, &record.peer_destination, &record.peer_identity),
                     asker.as_ref(),
                 )
+                .waiting_on(record, left_at(&record.peer_destination))
             }),
     );
     let inbound = match ctx.app.mesh.inbound_store() {
@@ -1781,15 +1789,24 @@ async fn message(
         .await
         .map_err(quoted_send_failure)?;
     out_path_text(
-        &NoticeText::from(format!(
-            "Sent {} to {} (via {}).",
-            short(&outcome.id),
-            short(&destination),
-            via_text(outcome.via)
-        ))
-        .render(live_prefix()),
+        &sent_line(&outcome, &destination, &name, SystemTime::now()).render(live_prefix()),
     );
     Ok(())
+}
+
+/// The line `.mesh message` ends with: where the message went, or, for a peer that had
+/// gone, that the propagation node holds it and for whom. `name` is how the peer goes by
+/// here, quoted as it stands.
+fn sent_line(outcome: &SendOutcome, destination: &str, name: &str, now: SystemTime) -> NoticeText {
+    let head = format!("Sent {} to {}", short(&outcome.id), short(destination));
+    match outcome.departed {
+        Some(departed) => NoticeText::from(format!("{head}: "))
+            .peer(name)
+            .frame(format!("{}{HELD_FOR_DEPARTED}", departed.status(now)))
+            .peer(name)
+            .frame(format!("{HELD_FOR_DEPARTED_END}.")),
+        None => NoticeText::from(format!("{head} (via {}).", via_text(outcome.via))),
+    }
 }
 
 /// The line `.mesh message` shows before it asks to send, with the name the peer goes
@@ -1999,9 +2016,9 @@ async fn route_to(
     destination: &str,
     abort_signal: &AbortSignal,
 ) -> Result<Route, Unrouted> {
-    // A peer whose last link failed is not waited on while anything to link with is held,
-    // so the route line would mislead.
-    let link_failed = runtime.link_failed(destination);
+    // A peer whose last link failed, or that said it left, is not waited on while anything
+    // to link with is held, so the route line would mislead.
+    let link_failed = runtime.departure(destination).is_some();
     if let Some(desc) = runtime.resolve_destination_cached(destination).await {
         if !link_failed && !runtime.path_known(destination).await {
             out_text(&route_request_line(destination));
@@ -2771,9 +2788,13 @@ fn request_outcome_line(
     let decision_arrives =
         prefix.render_hints("(the decision arrives as an idle line; .mesh inbox lists it)");
     match &outcome.status {
-        AccessOutcome::Pending => match outcome.via {
-            PeerVia::Direct => format!("request {id8} to {d8}: pending {decision_arrives}"),
-            PeerVia::StoreAndForward => format!(
+        AccessOutcome::Pending => match (outcome.via, outcome.departed) {
+            (PeerVia::Direct, _) => format!("request {id8} to {d8}: pending {decision_arrives}"),
+            (PeerVia::StoreAndForward, Some(departed)) => format!(
+                "request {id8} to {d8}: pending; {} {decision_arrives}",
+                held_sentence(d8, departed, SystemTime::now())
+            ),
+            (PeerVia::StoreAndForward, None) => format!(
                 "request {id8} to {d8}: pending; no answer over the link, so a propagation node holds it until {d8} fetches it {decision_arrives}"
             ),
         },
@@ -7238,6 +7259,7 @@ mod name_addressing_tests {
             envoy_question: String::new(),
             extra: Vec::new(),
             expires_in: None,
+            peer_left: None,
         };
         let now = SystemTime::now();
         let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false);
@@ -9626,7 +9648,12 @@ fn render_peer_detail(
         }
         lines.push(format!("hops: {}", peer.hops).into());
         let mut line = format!("last seen: {}", age_text(now, peer.last_seen));
-        if let Some(state) = row_state(peer, successor, now) {
+        // A farewell outranks `stale` here as in `.mesh peers`; `superseded` outranks both.
+        let state = match (successor, peer.left_at) {
+            (None, Some(left_at)) => Some(left_state(now, left_at)),
+            _ => row_state(peer, successor, now),
+        };
+        if let Some(state) = state {
             line.push(' ');
             line.push_str(&state);
         }
@@ -9877,6 +9904,9 @@ struct QuestionRow {
     /// outbound row carries none, since `Correlation` holds no expiry of its own (its
     /// `timeout_at` is the collect wait, not the question's life).
     expires_in: Option<Duration>,
+    /// When the peer of a question still waiting on it said it was leaving the mesh,
+    /// rendered as `peer left <age>` beside the state. Only an outbound row carries it.
+    peer_left: Option<SystemTime>,
 }
 
 impl QuestionRow {
@@ -9896,6 +9926,13 @@ impl QuestionRow {
         row
     }
 
+    /// The row with `peer_left` set from the peer's own row, `left_at` by this node's
+    /// clock; a question already answered gets none, since nothing waits on the peer.
+    fn waiting_on(mut self, record: &PendingRecord, left_at: Option<SystemTime>) -> Self {
+        self.peer_left = left_at.filter(|_| record.state.awaits_reply());
+        self
+    }
+
     fn outbound(record: &PendingRecord, name: String) -> Self {
         let state = match record.state {
             PendingState::Open => "open",
@@ -9913,6 +9950,7 @@ impl QuestionRow {
             envoy_question: String::new(),
             extra: Vec::new(),
             expires_in: None,
+            peer_left: None,
         }
     }
 
@@ -9928,6 +9966,7 @@ impl QuestionRow {
             envoy_question: record.envoy_question.clone(),
             extra: Vec::new(),
             expires_in: time_left(&record.received_at, now),
+            peer_left: None,
         }
     }
 
@@ -9943,6 +9982,7 @@ impl QuestionRow {
             envoy_question: String::new(),
             extra: vec![("", plural(record.paths.len(), "path", "paths"))],
             expires_in: time_left(&record.received_at, now),
+            peer_left: None,
         }
     }
 }
@@ -10152,7 +10192,8 @@ fn shown_id_len(id: &str, ids: &[String]) -> usize {
 }
 
 /// One numbered `.mesh pending` entry. The first line is
-/// `-> <name> (<dest8>) <age> . <state> . id <id>` for a question this node asked and
+/// `-> <name> (<dest8>) <age> . <state> . id <id>` for a question this node asked, with
+/// ` . peer left <age>` after the state while its peer has said it left, and
 /// `<name> (<dest8>) asked <age> . expires in <span> . id <id>` for a peer's question or
 /// access request, the id cut to `id_len` characters; the quoted question, the envoy's
 /// framing and the extra rows follow, word-wrapped at `width` and indented under the
@@ -10176,9 +10217,13 @@ fn pending_entry(
         .frame(format!(" ({})", short(&row.destination)));
     let id = row.id.get(..id_len).unwrap_or(&row.id);
     let head = if outbound {
+        let left = row
+            .peer_left
+            .map(|at| format!(" . peer left {}", age_text(now, at)))
+            .unwrap_or_default();
         NoticeText::from(format!("{marker}-> "))
             .then(peer)
-            .frame(format!(" {age} . {} . id ", row.state))
+            .frame(format!(" {age} . {}{left} . id ", row.state))
     } else {
         let expires = row
             .expires_in
@@ -10497,6 +10542,7 @@ mod tests {
 
     mod request_outcome {
         use super::*;
+        use crate::mesh::message::Departure;
 
         const ID: &str = "0123456789abcdef0123456789abcdef";
         const DEST: &str = "fedcba9876543210fedcba9876543210";
@@ -10511,6 +10557,7 @@ mod tests {
                 id: ID.to_string(),
                 status,
                 via,
+                departed: None,
             };
             let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
             request_outcome_line(&outcome, DEST, &paths, prefix)
@@ -10535,6 +10582,112 @@ mod tests {
                     CommandPrefix::Dot
                 ),
                 "request 01234567 to fedcba98: pending; no answer over the link, so a propagation node holds it until fedcba98 fetches it (the decision arrives as an idle line; .mesh inbox lists it)"
+            );
+        }
+
+        /// A request held for a peer that had gone says how it went and who gets it, in
+        /// place of the plain fallback wording.
+        #[test]
+        fn a_request_held_for_a_departed_peer_says_it_left_and_who_gets_it() {
+            let now = SystemTime::now();
+            let held = |departed| AccessRequestOutcome {
+                id: ID.to_string(),
+                status: AccessOutcome::Pending,
+                via: PeerVia::StoreAndForward,
+                departed: Some(departed),
+            };
+            assert_eq!(
+                request_outcome_line(
+                    &held(Departure::Left(now - Duration::from_secs(2 * 3600))),
+                    DEST,
+                    &["docs/a.md".to_string()],
+                    CommandPrefix::Dot
+                ),
+                "request 01234567 to fedcba98: pending; fedcba98 left 2h ago; held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; .mesh inbox lists it)"
+            );
+            assert_eq!(
+                request_outcome_line(
+                    &held(Departure::NoRoute {
+                        last_seen: now - Duration::from_secs(3 * 60)
+                    }),
+                    DEST,
+                    &["docs/a.md".to_string()],
+                    CommandPrefix::Slash
+                ),
+                "request 01234567 to fedcba98: pending; fedcba98 has no route (its last link failed and it has not announced since; last heard 3m ago); held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; /mesh inbox lists it)"
+            );
+        }
+
+        /// `.mesh message` names the peer as it goes by here, quoted, when the message is
+        /// held for a peer that had gone, and keeps the plain line otherwise.
+        #[test]
+        fn a_message_held_for_a_departed_peer_names_it_twice_quoted() {
+            let now = SystemTime::now();
+            let sent = |via, departed| SendOutcome {
+                id: ID.to_string(),
+                via,
+                departed,
+            };
+            let left = sent(
+                PeerVia::StoreAndForward,
+                Some(Departure::Left(now - Duration::from_secs(2 * 3600))),
+            );
+            let line = sent_line(&left, DEST, ".bob", now);
+            assert_eq!(
+                line.plain(),
+                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs."
+            );
+            assert_eq!(
+                line.render(CommandPrefix::Slash),
+                line.plain(),
+                "the name is quoted as it stands under any prefix"
+            );
+            assert_eq!(
+                sent_line(&sent(PeerVia::StoreAndForward, None), DEST, "bob", now).plain(),
+                "Sent 01234567 to fedcba98 (via store-and-forward)."
+            );
+            assert_eq!(
+                sent_line(&sent(PeerVia::Direct, None), DEST, "bob", now).plain(),
+                "Sent 01234567 to fedcba98 (via direct)."
+            );
+        }
+
+        /// An open question whose peer said it left reads `peer left <age>` beside its
+        /// state in `.mesh pending`; a row without the mark reads as before.
+        #[test]
+        fn an_open_question_to_a_peer_that_left_says_so_in_pending() {
+            let now = SystemTime::now();
+            let record = PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: ID.to_string(),
+                peer_destination: DEST.to_string(),
+                peer_identity: DEST.to_string(),
+                thread: ID.to_string(),
+                question: "still there?".to_string(),
+                sent_at: rfc3339_utc(now - Duration::from_secs(2 * 86_400)),
+                timeout_at: rfc3339_utc(now),
+                state: PendingState::Open,
+                reply: None,
+            };
+            let left = Some(now - Duration::from_secs(3600));
+            let row = QuestionRow::outbound(&record, "bob".to_string()).waiting_on(&record, left);
+            let pending = render_pending(std::slice::from_ref(&row), &[], &[], now, 120, false);
+            assert!(
+                pending.plain().contains(
+                    "  1. -> bob (fedcba98) 2d ago . open . peer left 1h ago . id 01234567"
+                ),
+                "{pending}"
+            );
+            let answered = PendingRecord {
+                state: PendingState::Answered,
+                ..record.clone()
+            };
+            let row =
+                QuestionRow::outbound(&answered, "bob".to_string()).waiting_on(&answered, left);
+            let pending = render_pending(std::slice::from_ref(&row), &[], &[], now, 120, false);
+            assert!(
+                !pending.plain().contains("peer left"),
+                "an answered question waits on no one: {pending}"
             );
         }
 
@@ -12416,6 +12569,43 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(
             detail.contains("\nlast seen: 40s ago\n"),
             "no successor, no marker: {detail}"
+        );
+        let left = PeerRecord {
+            left_at: Some(now - Duration::from_secs(3 * 60)),
+            ..old.clone()
+        };
+        let detail = render_peer_detail(
+            &left.destination_hash,
+            Some(&left),
+            None,
+            &KnockLookup::NotKnocked,
+            "trusted",
+            now,
+        )
+        .plain();
+        assert!(
+            detail.contains(&format!(
+                "\nlast seen: 2h ago {}\n",
+                left_state(now, now - Duration::from_secs(3 * 60))
+            )),
+            "a farewell outranks stale: {detail}"
+        );
+        assert!(
+            detail.contains("(left 3m ago: it said it was leaving the mesh)"),
+            "{detail}"
+        );
+        let detail = render_peer_detail(
+            &left.destination_hash,
+            Some(&left),
+            Some(&new),
+            &KnockLookup::NotKnocked,
+            "trusted",
+            now,
+        )
+        .plain();
+        assert!(
+            detail.contains(&format!("\nlast seen: 2h ago {superseded}\n")),
+            "superseded outranks a farewell: {detail}"
         );
     }
 
@@ -31293,6 +31483,131 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap();
                     assert_eq!(reachable(&result), true, "{result}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+
+            /// A trusted peer that said it left is tried over no link and waited on for no
+            /// path, though it would answer: with no propagation node known, `.mesh
+            /// message`, `.mesh request` and mesh__send, mesh__ask and mesh__request_access
+            /// each say at once that it is unreachable and queue nothing, and `.mesh
+            /// pending` shows the question still open to it beside `peer left`.
+            #[test]
+            #[serial]
+            fn a_peer_that_said_it_left_is_not_tried_and_pending_says_it_left() {
+                use crate::function::mesh::handle_mesh_tool;
+                use crate::mesh::pending::PENDING_RECORD_VERSION;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-left-peer");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub =
+                        PeerStub::listen("repl-mesh-left-peer-stub", TcpServer::DEFAULT_CLIENT_MTU)
+                            .await;
+                    let started = started_runtime_on("repl-mesh-left-peer", stub.port()).await;
+                    let runtime = started.runtime.clone();
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(runtime.clone()).unwrap();
+                    stub.know_identity(runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    stub.wait_to_be_filed(&runtime.peers(), &peer).await;
+                    out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                        .await
+                        .unwrap();
+                    let now = SystemTime::now();
+                    ctx.app
+                        .mesh
+                        .correlations()
+                        .open(PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: "q".repeat(32),
+                            peer_destination: peer.clone(),
+                            peer_identity: stub.identity_hex(),
+                            thread: "q".repeat(32),
+                            question: "still there?".to_string(),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                        })
+                        .unwrap();
+                    assert!(runtime.peers().mark_left(&peer, now));
+                    assert!(runtime.path_known(&peer).await);
+
+                    let pending = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                    let row = pending
+                        .lines()
+                        .find(|line| line.contains("-> ") && line.contains(short(&peer)))
+                        .unwrap_or_else(|| panic!("no row for the open question: {pending}"));
+                    assert!(row.contains(" . open . peer left "), "{row}");
+                    let listed = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
+                        .await
+                        .unwrap();
+                    let listed_row = listed["peers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["destination"] == peer.as_str())
+                        .unwrap_or_else(|| panic!("{peer} missing from {listed}"))
+                        .clone();
+                    assert_eq!(listed_row["reachable"], false, "{listed_row}");
+                    assert!(listed_row["left_secs_ago"].is_u64(), "{listed_row}");
+
+                    let asked = std::time::Instant::now();
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.starts_with(
+                            "The peer is unreachable and no propagation node is known yet to hold the message for it."
+                        ),
+                        "{err}"
+                    );
+                    let err = run(&mut ctx, &format!(".mesh request {peer} docs/a.md --yes"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(
+                            "The peer is unreachable and no propagation node is known yet to hold the access request for it."
+                        ),
+                        "{err}"
+                    );
+                    let out = stdout_lines()[before..].join("\n");
+                    assert!(!out.contains(&route_request_line(&peer)), "{out}");
+                    for (tool, args) in [
+                        (
+                            "mesh__send",
+                            serde_json::json!({ "to": peer, "message": "hello" }),
+                        ),
+                        (
+                            "mesh__ask",
+                            serde_json::json!({ "to": peer, "message": "hello?" }),
+                        ),
+                        (
+                            "mesh__request_access",
+                            serde_json::json!({ "peer": peer, "paths": ["docs/a.md"], "reason": "to read it" }),
+                        ),
+                    ] {
+                        let result = handle_mesh_tool(&mut ctx, tool, &args).await.unwrap();
+                        assert_eq!(result["kind"], "no_propagation_node", "{tool}: {result}");
+                    }
+                    assert!(
+                        asked.elapsed() < PATH_REQUEST_TIMEOUT,
+                        "nothing waited on a path or a link: {:?}",
+                        asked.elapsed()
+                    );
+                    assert!(
+                        runtime.peers().get(&peer).unwrap().left_at.is_some(),
+                        "no link came up to lift the mark"
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

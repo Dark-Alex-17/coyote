@@ -445,7 +445,7 @@ pub(crate) mod network {
     use crate::mesh::knocks::KnockCache;
     use crate::mesh::limits::{PeerRefusal, RefusalReason};
     use crate::mesh::message::{
-        Disposition, LxmfPeer, OutboundPeer, PEER_LINK_TIMEOUT, PEER_WIRE_VERSION, Part,
+        Departure, Disposition, LxmfPeer, OutboundPeer, PEER_LINK_TIMEOUT, PEER_WIRE_VERSION, Part,
         PartLimits, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RawPart, RecipientOutcome, Route,
         SendError, SendOutcome, decode_peer_lxmf, from_request_body, is_received_reply,
         received_reply, to_request_body,
@@ -8261,6 +8261,7 @@ pub(crate) mod network {
                 id: "acc-1".to_string(),
                 status: AccessOutcome::Pending,
                 via: PeerVia::StoreAndForward,
+                departed: None,
             }
         );
         let received = node.next_received().await;
@@ -9581,6 +9582,7 @@ pub(crate) mod network {
             SendOutcome {
                 id: ask.id.clone(),
                 via: PeerVia::Direct,
+                departed: None,
             }
         );
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
@@ -10506,6 +10508,7 @@ pub(crate) mod network {
             SendOutcome {
                 id: message.id.clone(),
                 via: PeerVia::StoreAndForward,
+                departed: None,
             }
         );
         let received = node.next_received().await;
@@ -10567,6 +10570,7 @@ pub(crate) mod network {
             SendOutcome {
                 id: message.id.clone(),
                 via: PeerVia::Direct,
+                departed: None,
             }
         );
         assert!(
@@ -10608,6 +10612,7 @@ pub(crate) mod network {
             SendOutcome {
                 id: message.id.clone(),
                 via: PeerVia::StoreAndForward,
+                departed: None,
             }
         );
         assert!(
@@ -10617,6 +10622,198 @@ pub(crate) mod network {
         );
         node.next_received().await;
         assert_eq!(pair.recorder_b.seen_count(), 0, "nothing reached node B");
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// Node B said it was leaving: node A tries no link to it, though B is still up and
+    /// would answer, and waits for no path, though the path to B has expired. The message
+    /// goes to the propagation node at once, and the outcome says B left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_said_it_left_is_not_tried_and_its_message_is_held_at_once() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-left-held", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_hash = pair.responder.desc.address_hash;
+        let b_instance = b_hash.to_hex_string();
+        let left_at = SystemTime::now();
+        assert!(pair.node_a.peers().mark_left(&b_instance, left_at));
+        let transport = pair.node_a.transport_handle().await.unwrap();
+        assert!(transport.expire_path(&b_hash).await, "A held a path to B");
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&message.id))));
+
+        let asked = Instant::now();
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap();
+        let waited = asked.elapsed();
+
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: message.id.clone(),
+                via: PeerVia::StoreAndForward,
+                departed: Some(Departure::Left(left_at)),
+            }
+        );
+        assert!(
+            waited < PATH_REQUEST_TIMEOUT,
+            "a peer that left is not waited on: {waited:?}"
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 0, "no link was tried to B");
+        node.next_received().await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// The same peer with no propagation node known: nothing is tried and nothing is
+    /// queued, and the sender gets the unreachable wording it gets for any peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_said_it_left_with_no_propagation_node_reads_unreachable() {
+        let pair = NodePair::start_with("request-peer-left-no-node", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        assert!(
+            pair.node_a
+                .peers()
+                .mark_left(&b_instance, SystemTime::now())
+        );
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&message.id))));
+
+        let err = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, SendError::NoPropagationNode);
+        assert!(
+            err.to_string().starts_with("The peer is unreachable"),
+            "{err}"
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 0, "no link was tried to B");
+        pair.stop_node_a().await;
+    }
+
+    /// Node B is gone and its last link failed: node A waits for no path, though the path
+    /// to B has expired, and the message goes to the propagation node at once, the outcome
+    /// saying B has no route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_last_link_failed_is_held_without_waiting_for_a_path() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-no-route-held", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_hash = pair.responder.desc.address_hash;
+        let b_instance = b_hash.to_hex_string();
+        let last_seen = pair.node_a.peers().get(&b_instance).unwrap().last_seen;
+        pair.stop_b().await;
+        pair.node_a.peers().mark_link_failed(&b_instance);
+        let transport = pair.node_a.transport_handle().await.unwrap();
+        assert!(transport.expire_path(&b_hash).await, "A held a path to B");
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+
+        let asked = Instant::now();
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap();
+        let waited = asked.elapsed();
+
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: message.id.clone(),
+                via: PeerVia::StoreAndForward,
+                departed: Some(Departure::NoRoute { last_seen }),
+            }
+        );
+        assert!(
+            waited < PATH_REQUEST_TIMEOUT,
+            "a peer whose last link failed is not waited on: {waited:?}"
+        );
+        node.next_received().await;
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// A peer whose last link failed but whose path node A still holds is tried over it:
+    /// B answers, the message goes direct and the outcome names no departure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_last_link_failed_is_still_tried_over_a_held_path() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-no-route-direct", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        pair.node_a.peers().mark_link_failed(&b_instance);
+        assert!(pair.node_a.path_known(&b_instance).await);
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&message.id))));
+
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: message.id.clone(),
+                via: PeerVia::Direct,
+                departed: None,
+            }
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 1);
+        assert!(
+            !pair.node_a.link_failed(&b_instance),
+            "the link lifts the mark"
+        );
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// An access request to a peer that said it left is not tried over a link either: it
+    /// is stored with the propagation node at once and reads pending, saying B left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_access_request_to_a_peer_that_said_it_left_is_held_without_a_link() {
+        let (pair, mut node) = pair_with_propagation_node("request-access-left-held").await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let left_at = SystemTime::now();
+        assert!(pair.node_a.peers().mark_left(&b_instance, left_at));
+        let request = access_request("acc-left", &["src/x.rs"], "need it");
+
+        let outcome = pair
+            .node_a
+            .request_access_wire(&pair.responder.desc, &request, fallback_access_options())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            AccessRequestOutcome {
+                id: "acc-left".to_string(),
+                status: AccessOutcome::Pending,
+                via: PeerVia::StoreAndForward,
+                departed: Some(Departure::Left(left_at)),
+            }
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 0, "no link was tried to B");
+        node.next_received().await;
         pair.stop_node_a().await;
         node.stop().await;
     }
@@ -10727,6 +10924,7 @@ pub(crate) mod network {
                 SendOutcome {
                     id: message.id.clone(),
                     via: PeerVia::StoreAndForward,
+                    departed: None,
                 }
             );
             let received = node.next_received().await;
@@ -10785,6 +10983,7 @@ pub(crate) mod network {
                     id: "acc-1".to_string(),
                     status: AccessOutcome::Pending,
                     via: PeerVia::StoreAndForward,
+                    departed: None,
                 }
             );
             let received = node.next_received().await;
@@ -11031,6 +11230,7 @@ pub(crate) mod network {
             SendOutcome {
                 id: expected_id.clone(),
                 via: PeerVia::StoreAndForward,
+                departed: None,
             }
         );
         assert!(

@@ -22,9 +22,9 @@ use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
-    Disposition, FirstContactMiss, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia,
-    RawPart, Route, SendError, SendOutcome, is_wire_id, left_mesh_hint_when, propagation_remedy,
-    unreachable_cause,
+    Departure, Disposition, FirstContactMiss, OutboundPeer, PEER_WIRE_VERSION, PartLimits,
+    PeerKind, PeerVia, RawPart, Route, SendError, SendOutcome, is_wire_id, left_mesh_hint_when,
+    propagation_remedy, unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::{NoticeText, Source};
@@ -322,6 +322,9 @@ pub(crate) struct AccessRequestOutcome {
     pub id: String,
     pub status: AccessOutcome,
     pub via: PeerVia,
+    /// For a request a propagation node holds: how the peer had gone before the send, if
+    /// it had, as `SendOutcome` carries it.
+    pub departed: Option<Departure>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -611,6 +614,8 @@ impl MeshRuntime {
     /// exchange reached the peer, so nothing is held for later.
     /// A request whose upload ran out before the peer had all of it falls back too: the
     /// peer never read it, so the stored copy cannot land twice.
+    /// A peer that said it left the mesh is not tried over a link: the request goes to
+    /// the propagation node at once, and the outcome says the peer left.
     pub(crate) async fn request_access_wire(
         &self,
         destination: &DestinationDesc,
@@ -620,71 +625,82 @@ impl MeshRuntime {
         let dest_hex = destination.address_hash.to_hex_string();
         let dest8 = short(&dest_hex);
         let id = request.id.as_str();
-        let unreachable = match self
-            .request(
-                destination,
-                ACCESS_PATH,
-                access_body(request),
-                options.request,
+        let departed = self.departure(&dest_hex);
+        // A peer that said it left is not tried over a link until it announces again.
+        let attempt = if matches!(departed, Some(Departure::Left(_))) {
+            None
+        } else {
+            Some(
+                self.request(
+                    destination,
+                    ACCESS_PATH,
+                    access_body(request),
+                    options.request,
+                )
+                .await,
             )
-            .await
-        {
-            Ok(reply) => {
-                let status = read_access_reply(&reply, id)?;
-                debug!(
-                    "Mesh access request {id} to {dest8} was answered {} over a link",
-                    status.status()
-                );
-                return Ok(AccessRequestOutcome {
-                    id: request.id.clone(),
-                    status,
-                    via: PeerVia::Direct,
-                });
-            }
-            Err(
-                err @ (RequestError::Timeout { .. }
-                | RequestError::RequestIncomplete { .. }
-                | RequestError::LinkActivationTimeout { .. }
-                | RequestError::LinkFailed(_)
-                | RequestError::LinkNotOpened(_)
-                | RequestError::LinkClosed),
-            ) => err,
-            Err(err) if err.is_access_refusal() => {
-                debug!(
-                    "Mesh access request {id} to {dest8} was refused: the peer has not trusted this instance"
-                );
-                return Err(AccessError::NotTrustedByPeer(
-                    self.remote_refusal(&dest_hex),
-                ));
-            }
-            Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
-                debug!("Mesh access request {id} to {dest8} was refused: {code}");
-                return Err(AccessError::Throttled {
-                    destination: dest_hex,
-                });
-            }
-            Err(RequestError::Refused(code)) => {
-                debug!("Mesh access request {id} to {dest8} was refused: {code}");
-                return Err(AccessError::Refused(code));
-            }
-            Err(RequestError::NotRunning | RequestError::Shutdown) => {
-                return Err(AccessError::NotRunning);
-            }
-            Err(RequestError::UnsupportedVersion { found, min, max }) => {
-                return Err(AccessError::IncompatibleVersion {
-                    destination: dest_hex,
-                    found,
-                    min,
-                    max,
-                });
-            }
-            Err(err) => {
-                debug!(
-                    "Mesh access request {id} to {dest8} was not sent over the link: {}",
-                    redact_hashes(&err.to_string())
-                );
-                return Err(AccessError::Direct(err));
-            }
+        };
+        let unreachable = match attempt {
+            None => None,
+            Some(attempt) => Some(match attempt {
+                Ok(reply) => {
+                    let status = read_access_reply(&reply, id)?;
+                    debug!(
+                        "Mesh access request {id} to {dest8} was answered {} over a link",
+                        status.status()
+                    );
+                    return Ok(AccessRequestOutcome {
+                        id: request.id.clone(),
+                        status,
+                        via: PeerVia::Direct,
+                        departed: None,
+                    });
+                }
+                Err(
+                    err @ (RequestError::Timeout { .. }
+                    | RequestError::RequestIncomplete { .. }
+                    | RequestError::LinkActivationTimeout { .. }
+                    | RequestError::LinkFailed(_)
+                    | RequestError::LinkNotOpened(_)
+                    | RequestError::LinkClosed),
+                ) => err,
+                Err(err) if err.is_access_refusal() => {
+                    debug!(
+                        "Mesh access request {id} to {dest8} was refused: the peer has not trusted this instance"
+                    );
+                    return Err(AccessError::NotTrustedByPeer(
+                        self.remote_refusal(&dest_hex),
+                    ));
+                }
+                Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
+                    debug!("Mesh access request {id} to {dest8} was refused: {code}");
+                    return Err(AccessError::Throttled {
+                        destination: dest_hex,
+                    });
+                }
+                Err(RequestError::Refused(code)) => {
+                    debug!("Mesh access request {id} to {dest8} was refused: {code}");
+                    return Err(AccessError::Refused(code));
+                }
+                Err(RequestError::NotRunning | RequestError::Shutdown) => {
+                    return Err(AccessError::NotRunning);
+                }
+                Err(RequestError::UnsupportedVersion { found, min, max }) => {
+                    return Err(AccessError::IncompatibleVersion {
+                        destination: dest_hex,
+                        found,
+                        min,
+                        max,
+                    });
+                }
+                Err(err) => {
+                    debug!(
+                        "Mesh access request {id} to {dest8} was not sent over the link: {}",
+                        redact_hashes(&err.to_string())
+                    );
+                    return Err(AccessError::Direct(err));
+                }
+            }),
         };
         // Selected before queueing behind another post: a requester with no node to fall
         // back on is told so at once rather than after someone else's transfer.
@@ -692,15 +708,18 @@ impl MeshRuntime {
             self.propagation_nodes()
                 .select_for_posting()
                 .map_err(|_| match unreachable {
-                    RequestError::Timeout { .. } => {
+                    Some(RequestError::Timeout { .. }) => {
                         AccessError::NoAnswer(self.no_answer(&dest_hex))
                     }
                     _ => AccessError::NoPropagationNode,
                 })?;
         let node_hex = node.destination.address_hash.to_hex_string();
+        let why_not_direct = match &unreachable {
+            Some(err) => redact_hashes(&err.to_string()),
+            None => "it said it left the mesh, so no link was tried".to_string(),
+        };
         debug!(
-            "Mesh access request {id} to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
-            redact_hashes(&unreachable.to_string()),
+            "Mesh access request {id} to {dest8} could not be delivered over a link ({why_not_direct}); storing it with propagation node {}",
             short(&node_hex)
         );
         self.post_to_node(
@@ -721,6 +740,7 @@ impl MeshRuntime {
             id: request.id.clone(),
             status: AccessOutcome::Pending,
             via: PeerVia::StoreAndForward,
+            departed,
         })
     }
 }

@@ -51,7 +51,7 @@ pub(crate) enum PendingState {
 }
 
 impl PendingState {
-    fn awaits_reply(self) -> bool {
+    pub(crate) fn awaits_reply(self) -> bool {
         matches!(self, Self::Open | Self::Escalated)
     }
 

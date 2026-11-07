@@ -71,8 +71,8 @@ use crate::mesh::trust::{
     decode_name_hash, parse_hash,
 };
 use crate::mesh::{
-    PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
-    mesh_cache_dir,
+    PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, elapsed_text, hex_lower,
+    identity, mesh_cache_dir, parse_rfc3339,
 };
 use crate::render::{QuotingError, error_notice};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
@@ -1061,6 +1061,7 @@ impl MeshRuntime {
             runtime.trust.clone(),
             runtime.propagation_nodes.clone(),
             runtime.hooks.clone(),
+            Arc::downgrade(&runtime),
             runtime.cancellation_token(),
         )));
         runtime.register_task(tokio::spawn(drain_knocks(
@@ -3113,6 +3114,7 @@ async fn receive_announces(
     trust: Arc<TrustStore>,
     propagation_nodes: Arc<PropagationNodeTable>,
     hooks: MeshHooks,
+    runtime: Weak<MeshRuntime>,
     cancel: CancellationToken,
 ) {
     let mut filer = AnnounceFiler {
@@ -3154,8 +3156,25 @@ async fn receive_announces(
         if event.is_path_response {
             filer.file_path_response(announced, app_data, event.hops, now);
         } else {
-            filer.file(announced, app_data, event.hops, now);
+            let destination = announced.destination_hash.clone();
+            let had_left = peers
+                .get(&destination)
+                .is_some_and(|row| row.left_at.is_some());
+            let filed = filer.file(announced, app_data, event.hops, now).is_some();
+            if had_left && filed {
+                note_return(&runtime, &destination);
+            }
         }
+    }
+}
+
+/// Tells the slot that `destination`, marked left, has announced again.
+fn note_return(runtime: &Weak<MeshRuntime>, destination: &str) {
+    let surface = runtime
+        .upgrade()
+        .and_then(|runtime| runtime.peer_surface.lock().as_ref().and_then(Weak::upgrade));
+    if let Some(surface) = surface {
+        surface.note_return(destination);
     }
 }
 
@@ -5893,6 +5912,27 @@ impl KnockSurface for MeshSlot {
     }
 }
 
+/// The one line the owner gets when a peer that said it left announces again while
+/// `open` questions to it still wait: `bob is back; your question from 2d ago is still
+/// open`, or, for several, how many and when the oldest was asked. `None` with nothing
+/// open. The name is quoted as it stands, since the peer chose it.
+fn return_line(name: &str, open: &[PendingRecord], now: SystemTime) -> Option<NoticeText> {
+    let oldest = open
+        .iter()
+        .filter_map(|record| parse_rfc3339(&record.sent_at))
+        .min();
+    let from = match oldest {
+        Some(sent) => format!("from {}", age_text(now, sent)),
+        None => "from an unknown time".to_string(),
+    };
+    let tail = match open.len() {
+        0 => return None,
+        1 => format!(" is back; your question {from} is still open"),
+        n => format!(" is back; your {n} questions, the oldest {from}, are still open"),
+    };
+    Some(NoticeText::default().peer(name).frame(tail))
+}
+
 impl PeerSurface for MeshSlot {
     /// A reply to a question this Coyote asked is admitted without being counted: a peer
     /// past its limit must still be able to answer a `mesh__ask`, and the correlation
@@ -5996,6 +6036,36 @@ impl PeerSurface for MeshSlot {
             title: None,
             via: PeerVia::Direct,
             presence: Some(PRESENCE_LEAVING),
+        });
+    }
+
+    fn note_return(&self, destination: &str) {
+        let Some(destination) = canonical_hash(destination) else {
+            return;
+        };
+        let now = SystemTime::now();
+        let open: Vec<PendingRecord> = self
+            .correlations()
+            .list()
+            .into_iter()
+            .map(|correlation| correlation.record)
+            .filter(|record| {
+                record.state.awaits_reply()
+                    && record.peer_destination.eq_ignore_ascii_case(&destination)
+            })
+            .collect();
+        let Some(text) = return_line(&self.peer_name_at(&destination), &open, now) else {
+            return;
+        };
+        let id8 = open
+            .first()
+            .map(|record| short(&record.peer_identity).to_string())
+            .unwrap_or_default();
+        self.push_idle(IdleNotify {
+            source: Source::Reply,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
         });
     }
 
@@ -6836,6 +6906,70 @@ mod tests {
             state: PendingState::Open,
             reply: None,
         }
+    }
+
+    /// The line names one open question by when it was asked, several by how many and
+    /// the oldest, and none at all when nothing is open.
+    #[test]
+    fn the_is_back_line_counts_the_open_questions_and_dates_the_oldest() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 86_400);
+        let asked = |id: &str, secs_ago: u64| PendingRecord {
+            sent_at: rfc3339_utc(now - Duration::from_secs(secs_ago)),
+            ..pending(id)
+        };
+        assert_eq!(return_line("bob", &[], now), None);
+        assert_eq!(
+            return_line("bob", &[asked("a", 2 * 86_400)], now)
+                .unwrap()
+                .plain(),
+            "bob is back; your question from 2d ago is still open"
+        );
+        assert_eq!(
+            return_line("bob", &[asked("a", 60), asked("b", 3 * 3600)], now)
+                .unwrap()
+                .plain(),
+            "bob is back; your 2 questions, the oldest from 3h ago, are still open"
+        );
+    }
+
+    /// Only a question still waiting on that peer counts: one already answered, or one
+    /// asked of another instance, gives no line; an open one gives exactly one.
+    #[test]
+    fn a_returning_peer_is_announced_only_for_its_own_open_questions() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let peer = hex_lower(&PEER_INSTANCE);
+        slot.correlations()
+            .open(PendingRecord {
+                state: PendingState::Answered,
+                ..pending("answered")
+            })
+            .unwrap();
+        slot.correlations()
+            .open(PendingRecord {
+                peer_destination: "ef".repeat(16),
+                ..pending("elsewhere")
+            })
+            .unwrap();
+
+        PeerSurface::note_return(&slot, &peer);
+        assert!(idle.pushed.lock().is_empty());
+
+        slot.correlations().open(pending("open")).unwrap();
+        PeerSurface::note_return(&slot, &peer.to_uppercase());
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        let text = pushed[0].text.plain();
+        assert!(
+            text.starts_with(&format!("{} is back; your question from ", short(&peer)))
+                && text.ends_with("s ago is still open"),
+            "{text}"
+        );
+        assert_eq!(
+            pushed[0].origin,
+            Origin::Peer(short(&hex_lower(&PEER_IDENTITY)).to_string())
+        );
     }
 
     fn peer_ids(envelopes: &[crate::supervisor::mailbox::Envelope]) -> Vec<&str> {
@@ -14782,6 +14916,57 @@ mod tests {
                 pair.left_at_on_a().is_none()
             })
             .await;
+
+            assert!(pair.slot_a.stop().await.unwrap());
+            assert!(pair.slot_b.stop().await.unwrap());
+            pair.relay.stop().await;
+        }
+
+        /// A has a question open with B when B leaves; B's next start announces, and A's
+        /// owner gets one idle line saying B is back and the question is still open. The
+        /// mark is gone with that announce, so the next one says nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_peer_that_left_with_a_question_open_is_back_with_one_idle_line() {
+            let mut pair = Pair::start("node-farewell-back").await;
+            let to_b = pair.to_b();
+            let idle = RecordingIdleSink::new(true);
+            pair.slot_a.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+            let mut question = pending("q-back");
+            question.peer_destination = to_b.clone();
+            question.peer_identity = pair.b.runtime.fingerprint().to_string();
+            pair.slot_a.correlations().open(question).unwrap();
+
+            assert!(pair.slot_b.stop().await.unwrap());
+            wait_until("A to mark B left", || pair.left_at_on_a().is_some()).await;
+            assert!(idle.pushed.lock().is_empty(), "leaving says nothing");
+
+            pair.b.restart_on(pair.relay.port).await;
+            pair.slot_b.install(pair.b.runtime.clone()).unwrap();
+            wait_until("A's owner to hear that B is back", || {
+                !idle.pushed.lock().is_empty()
+            })
+            .await;
+            let name = pair.slot_a.peer_name_at(&to_b);
+            {
+                let pushed = idle.pushed.lock();
+                assert_eq!(pushed.len(), 1);
+                assert_eq!(pushed[0].source, Source::Reply);
+                let text = pushed[0].text.plain();
+                assert!(
+                    text.starts_with(&format!("{name} is back; your question from "))
+                        && text.ends_with(" ago is still open"),
+                    "{text}"
+                );
+            }
+            assert_eq!(pair.left_at_on_a(), None);
+
+            pair.b
+                .runtime
+                .announce_on_connect()
+                .await
+                .expect("B announces again");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(idle.pushed.lock().len(), 1, "the line comes once");
 
             assert!(pair.slot_a.stop().await.unwrap());
             assert!(pair.slot_b.stop().await.unwrap());
