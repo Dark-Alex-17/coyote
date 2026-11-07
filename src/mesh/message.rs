@@ -1645,8 +1645,8 @@ pub(crate) enum Departure {
 }
 
 impl Departure {
-    /// What the peer's row says about it, read at `now`: its own farewell first, then a
-    /// failed link. `None` for a peer that is neither.
+    /// What the peer's row says about it: its own farewell first, then a failed link.
+    /// `None` for a peer that is neither.
     pub(crate) fn of(peer: &PeerRecord, link_failed: bool) -> Option<Self> {
         match peer.left_at {
             Some(at) => Some(Self::Left(at)),
@@ -1682,6 +1682,11 @@ impl Departure {
 pub(crate) const HELD_FOR_DEPARTED: &str = "; held at the propagation node, delivered to any of ";
 /// The end of `held_sentence`, after the second naming.
 pub(crate) const HELD_FOR_DEPARTED_END: &str = "'s sessions when one syncs";
+
+/// Why a send or access request to a peer that said it left was not tried over a link,
+/// as the debug log says it.
+pub(crate) const NO_LINK_TRIED_TO_A_LEFT_PEER: &str =
+    "it said it left the mesh, so no link was tried";
 
 /// What a sender is told when a peer that had gone gets its message held by the
 /// propagation node: `bob left 2h ago; held at the propagation node, delivered to any of
@@ -2060,9 +2065,12 @@ impl MeshRuntime {
         let desc = route.desc;
         let dest8 = short(&destination);
         let (kind, id) = (message.kind, message.id.as_str());
-        // A peer that said it left is not tried over a link until it announces again; a
-        // send that may go only over a link still tries it.
-        let skips_link = options.store_and_forward && matches!(departed, Some(Departure::Left(_)));
+        // A peer that said it left is not tried over a link until it announces again. A
+        // send that may go only over a link still tries it, and so does a bulletin, whose
+        // fan-out reports each recipient on its own row.
+        let skips_link = options.store_and_forward
+            && message.kind != PeerKind::Bulletin
+            && matches!(departed, Some(Departure::Left(_)));
         let attempt = if skips_link {
             None
         } else {
@@ -2078,76 +2086,79 @@ impl MeshRuntime {
         };
         let unreachable = match attempt {
             None => None,
-            Some(attempt) => Some(match attempt {
-                Ok(reply) if is_received_reply(&reply, id) => {
-                    debug!("Mesh {kind} {id} to {dest8} was delivered over a link");
-                    return Ok(SendOutcome {
-                        id: message.id.clone(),
-                        via: PeerVia::Direct,
-                        departed: None,
-                    });
-                }
-                Ok(_) => {
-                    debug!("Mesh {kind} {id} to {dest8} was answered but not acknowledged");
-                    return Err(SendError::NotAcknowledged);
-                }
-                Err(
-                    err @ (RequestError::Timeout { .. }
-                    | RequestError::RequestIncomplete { .. }
-                    | RequestError::LinkActivationTimeout { .. }
-                    | RequestError::LinkFailed(_)
-                    | RequestError::LinkNotOpened(_)
-                    | RequestError::LinkClosed),
-                ) => err,
-                Err(RequestError::Refused(RefusalCode::NoAccess)) => {
+            Some(attempt) => {
+                let err = match attempt {
+                    Ok(reply) if is_received_reply(&reply, id) => {
+                        debug!("Mesh {kind} {id} to {dest8} was delivered over a link");
+                        return Ok(SendOutcome {
+                            id: message.id.clone(),
+                            via: PeerVia::Direct,
+                            departed: None,
+                        });
+                    }
+                    Ok(_) => {
+                        debug!("Mesh {kind} {id} to {dest8} was answered but not acknowledged");
+                        return Err(SendError::NotAcknowledged);
+                    }
+                    Err(
+                        err @ (RequestError::Timeout { .. }
+                        | RequestError::RequestIncomplete { .. }
+                        | RequestError::LinkActivationTimeout { .. }
+                        | RequestError::LinkFailed(_)
+                        | RequestError::LinkNotOpened(_)
+                        | RequestError::LinkClosed),
+                    ) => err,
+                    Err(RequestError::Refused(RefusalCode::NoAccess)) => {
+                        debug!(
+                            "Mesh {kind} {id} to {dest8} was refused: the peer has not trusted this instance"
+                        );
+                        return Err(SendError::NotTrustedByPeer(
+                            self.remote_refusal(&destination),
+                        ));
+                    }
+                    Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
+                        debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
+                        return Err(SendError::Throttled {
+                            destination: destination.clone(),
+                        });
+                    }
+                    Err(RequestError::Refused(code)) => {
+                        debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
+                        return Err(SendError::Refused(code));
+                    }
+                    Err(RequestError::NotRunning | RequestError::Shutdown) => {
+                        return Err(SendError::NotRunning);
+                    }
+                    Err(RequestError::UnsupportedVersion { found, min, max }) => {
+                        return Err(SendError::IncompatibleVersion {
+                            destination: destination.clone(),
+                            found,
+                            min,
+                            max,
+                        });
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Mesh {kind} {id} to {dest8} was not sent over the link: {}",
+                            redact_hashes(&err.to_string())
+                        );
+                        return Err(SendError::Direct(err));
+                    }
+                };
+                if !options.store_and_forward {
                     debug!(
-                        "Mesh {kind} {id} to {dest8} was refused: the peer has not trusted this instance"
-                    );
-                    return Err(SendError::NotTrustedByPeer(
-                        self.remote_refusal(&destination),
-                    ));
-                }
-                Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
-                    debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
-                    return Err(SendError::Throttled {
-                        destination: destination.clone(),
-                    });
-                }
-                Err(RequestError::Refused(code)) => {
-                    debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
-                    return Err(SendError::Refused(code));
-                }
-                Err(RequestError::NotRunning | RequestError::Shutdown) => {
-                    return Err(SendError::NotRunning);
-                }
-                Err(RequestError::UnsupportedVersion { found, min, max }) => {
-                    return Err(SendError::IncompatibleVersion {
-                        destination: destination.clone(),
-                        found,
-                        min,
-                        max,
-                    });
-                }
-                Err(err) => {
-                    debug!(
-                        "Mesh {kind} {id} to {dest8} was not sent over the link: {}",
+                        "Mesh {kind} {id} to {dest8} could not be delivered over a link ({}); it goes over a link or not at all, so it is not stored",
                         redact_hashes(&err.to_string())
                     );
                     return Err(SendError::Direct(err));
                 }
-            }),
+                Some(err)
+            }
         };
         let why_not_direct = match &unreachable {
             Some(err) => redact_hashes(&err.to_string()),
-            None => "it said it left the mesh, so no link was tried".to_string(),
+            None => NO_LINK_TRIED_TO_A_LEFT_PEER.to_string(),
         };
-        if !options.store_and_forward {
-            debug!(
-                "Mesh {kind} {id} to {dest8} could not be delivered over a link ({why_not_direct}); it goes over a link or not at all, so it is not stored"
-            );
-            // A link-only send always tried the link, so there is an error to report.
-            return Err(unreachable.map_or(SendError::NoPropagationNode, SendError::Direct));
-        }
         // Selected before queueing behind another post: a sender with no node to fall
         // back on is told so at once rather than after someone else's transfer.
         let node =

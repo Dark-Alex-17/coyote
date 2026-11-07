@@ -10743,6 +10743,68 @@ pub(crate) mod network {
             "a peer whose last link failed is not waited on: {waited:?}"
         );
         node.next_received().await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// The same gone peer with no propagation node known: no path is waited for and
+    /// nothing is queued; the sender gets the unreachable wording.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_last_link_failed_with_no_propagation_node_reads_unreachable_at_once() {
+        let pair = NodePair::start_with("request-peer-no-route-no-node", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_hash = pair.responder.desc.address_hash;
+        let b_instance = b_hash.to_hex_string();
+        pair.stop_b().await;
+        pair.node_a.peers().mark_link_failed(&b_instance);
+        let transport = pair.node_a.transport_handle().await.unwrap();
+        assert!(transport.expire_path(&b_hash).await, "A held a path to B");
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+
+        let asked = Instant::now();
+        let err = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, SendError::NoPropagationNode);
+        assert!(
+            asked.elapsed() < PATH_REQUEST_TIMEOUT,
+            "a peer whose last link failed is not waited on: {:?}",
+            asked.elapsed()
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// A bulletin is still tried over a link to a peer that said it left: its fan-out
+    /// reports each recipient on its own row, so B, up and answering, gets it directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bulletin_is_still_tried_over_a_link_to_a_peer_that_said_it_left() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-bulletin-left-direct", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        assert!(
+            pair.node_a
+                .peers()
+                .mark_left(&b_instance, SystemTime::now())
+        );
+        let bulletin = OutboundPeer::new(PeerKind::Bulletin, "news", None, None, None).unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&bulletin.id))));
+
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &bulletin, peer_send_options())
+            .await
+            .unwrap();
+
+        assert_eq!(sent.via, PeerVia::Direct);
+        assert_eq!(pair.recorder_b.seen_count(), 1);
+        node.nothing_else_received();
         pair.stop_node_a().await;
         node.stop().await;
     }
@@ -10814,6 +10876,74 @@ pub(crate) mod network {
         );
         assert_eq!(pair.recorder_b.seen_count(), 0, "no link was tried to B");
         node.next_received().await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// The same request with no propagation node known: no link is tried and nothing is
+    /// queued; the requester gets the unreachable wording.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_access_request_to_a_peer_that_said_it_left_with_no_node_reads_unreachable() {
+        let pair = NodePair::start("request-access-left-no-node").await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        assert!(
+            pair.node_a
+                .peers()
+                .mark_left(&b_instance, SystemTime::now())
+        );
+        let request = access_request("acc-left-none", &["src/x.rs"], "need it");
+
+        let err = pair
+            .node_a
+            .request_access_wire(&pair.responder.desc, &request, fallback_access_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, AccessError::NoPropagationNode);
+        assert_eq!(pair.recorder_b.seen_count(), 0, "no link was tried to B");
+        pair.stop_node_a().await;
+    }
+
+    /// An access request to a gone peer whose last link failed and whose path expired is
+    /// stored with the propagation node without a path wait, and says B has no route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_access_request_to_a_peer_whose_last_link_failed_is_held_without_waiting() {
+        let (pair, mut node) = pair_with_propagation_node("request-access-no-route-held").await;
+        pair.introduce_b_to_a().await;
+        let b_hash = pair.responder.desc.address_hash;
+        let b_instance = b_hash.to_hex_string();
+        let last_seen = pair.node_a.peers().get(&b_instance).unwrap().last_seen;
+        pair.stop_b().await;
+        pair.node_a.peers().mark_link_failed(&b_instance);
+        let transport = pair.node_a.transport_handle().await.unwrap();
+        assert!(transport.expire_path(&b_hash).await, "A held a path to B");
+        let request = access_request("acc-no-route", &["src/x.rs"], "need it");
+
+        let asked = Instant::now();
+        let outcome = pair
+            .node_a
+            .request_access_wire(&pair.responder.desc, &request, fallback_access_options())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            AccessRequestOutcome {
+                id: "acc-no-route".to_string(),
+                status: AccessOutcome::Pending,
+                via: PeerVia::StoreAndForward,
+                departed: Some(Departure::NoRoute { last_seen }),
+            }
+        );
+        assert!(
+            asked.elapsed() < PATH_REQUEST_TIMEOUT,
+            "a peer whose last link failed is not waited on: {:?}",
+            asked.elapsed()
+        );
+        node.next_received().await;
+        node.nothing_else_received();
         pair.stop_node_a().await;
         node.stop().await;
     }

@@ -1646,10 +1646,15 @@ impl MeshRuntime {
             .clone()
             .ok_or(RequestError::NotRunning)?;
         let sent = envelope.version;
-        let link_failed = self.peers.link_failed(&dest_hex);
-        if link_failed && !transport.has_path(&destination.address_hash).await {
+        // A peer whose last link failed, or that said it left, is not waited on for a path.
+        let gone = self.peers.link_failed(&dest_hex)
+            || self
+                .peers
+                .get(&dest_hex)
+                .is_some_and(|row| row.left_at.is_some());
+        if gone && !transport.has_path(&destination.address_hash).await {
             debug!(
-                "Mesh asked the network for a path to {} without waiting: its last link failed and it has not linked or announced since",
+                "Mesh asked the network for a path to {} without waiting: its last link failed or it said it left, and it has not linked or announced since",
                 short(&dest_hex)
             );
             transport
@@ -1657,7 +1662,7 @@ impl MeshRuntime {
                 .await;
         }
         let options = RequestOptions {
-            path_requested: options.path_requested || link_failed,
+            path_requested: options.path_requested || gone,
             ..options
         };
         let request = link_request(
@@ -5914,8 +5919,8 @@ impl KnockSurface for MeshSlot {
 
 /// The one line the owner gets when a peer that said it left announces again while
 /// `open` questions to it still wait: `bob is back; your question from 2d ago is still
-/// open`, or, for several, how many and when the oldest was asked. `None` with nothing
-/// open. The name is quoted as it stands, since the peer chose it.
+/// open; .mesh pending lists it`, or, for several, how many and when the oldest was asked.
+/// `None` with nothing open. The name is quoted as it stands, since the peer chose it.
 fn return_line(name: &str, open: &[PendingRecord], now: SystemTime) -> Option<NoticeText> {
     let oldest = open
         .iter()
@@ -5927,8 +5932,10 @@ fn return_line(name: &str, open: &[PendingRecord], now: SystemTime) -> Option<No
     };
     let tail = match open.len() {
         0 => return None,
-        1 => format!(" is back; your question {from} is still open"),
-        n => format!(" is back; your {n} questions, the oldest {from}, are still open"),
+        1 => format!(" is back; your question {from} is still open; .mesh pending lists it"),
+        n => format!(
+            " is back; your {n} questions, the oldest {from}, are still open; .mesh pending lists them"
+        ),
     };
     Some(NoticeText::default().peer(name).frame(tail))
 }
@@ -6922,13 +6929,13 @@ mod tests {
             return_line("bob", &[asked("a", 2 * 86_400)], now)
                 .unwrap()
                 .plain(),
-            "bob is back; your question from 2d ago is still open"
+            "bob is back; your question from 2d ago is still open; .mesh pending lists it"
         );
         assert_eq!(
             return_line("bob", &[asked("a", 60), asked("b", 3 * 3600)], now)
                 .unwrap()
                 .plain(),
-            "bob is back; your 2 questions, the oldest from 3h ago, are still open"
+            "bob is back; your 2 questions, the oldest from 3h ago, are still open; .mesh pending lists them"
         );
     }
 
@@ -6963,7 +6970,7 @@ mod tests {
         let text = pushed[0].text.plain();
         assert!(
             text.starts_with(&format!("{} is back; your question from ", short(&peer)))
-                && text.ends_with("s ago is still open"),
+                && text.ends_with("s ago is still open; .mesh pending lists it"),
             "{text}"
         );
         assert_eq!(
@@ -14954,18 +14961,26 @@ mod tests {
                 let text = pushed[0].text.plain();
                 assert!(
                     text.starts_with(&format!("{name} is back; your question from "))
-                        && text.ends_with(" ago is still open"),
+                        && text.ends_with(" ago is still open; .mesh pending lists it"),
                     "{text}"
                 );
             }
             assert_eq!(pair.left_at_on_a(), None);
 
-            pair.b
-                .runtime
-                .announce_on_connect()
-                .await
-                .expect("B announces again");
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let seen = || pair.a.runtime.peers().get(&to_b).map(|row| row.last_seen);
+            let first = seen();
+            // A repeat within the same second can be dropped as no newer, so B announces
+            // until A has filed one.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seen() == first {
+                assert!(Instant::now() < deadline, "A never filed B's next announce");
+                pair.b
+                    .runtime
+                    .announce_on_connect()
+                    .await
+                    .expect("B announces again");
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
             assert_eq!(idle.pushed.lock().len(), 1, "the line comes once");
 
             assert!(pair.slot_a.stop().await.unwrap());

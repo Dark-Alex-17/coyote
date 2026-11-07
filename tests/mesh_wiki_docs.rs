@@ -6728,8 +6728,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let back = string_literals(&fn_body("src/mesh/node.rs", "return_line"));
     for needle in [
         "from {}",
-        " is back; your question {from} is still open",
-        " is back; your {n} questions, the oldest {from}, are still open",
+        " is back; your question {from} is still open; .mesh pending lists it",
+        " is back; your {n} questions, the oldest {from}, are still open; .mesh pending lists them",
     ] {
         assert!(
             back.iter().any(|literal| literal == needle),
@@ -7021,8 +7021,10 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "`<name> (<dest8>) asked <age> . expires in <span> . id <id8>`".to_string(),
         "`-> <name> (<dest8>) <age> . <state> . id <id8>`".to_string(),
         "`. peer left <age>`".to_string(),
-        "`[mesh:reply] <name> is back; your question from <age> is still open`".to_string(),
-        "`your <n> questions, the oldest from <age>, are still open`".to_string(),
+        "`[mesh:reply] <name> is back; your question from <age> is still open; .mesh pending lists it`"
+            .to_string(),
+        "`your <n> questions, the oldest from <age>, are still open; .mesh pending lists them`"
+            .to_string(),
         "`envoy asks: <what the envoy wanted decided>`".to_string(),
         "any 8 or more of an id's first characters".to_string(),
         "plain under `NO_COLOR`".to_string(),
@@ -7122,11 +7124,13 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
     let no_route =
         " has no route (its last link failed and it has not announced since; last heard {})";
     assert_eq!(status, [" left {}", no_route], "Departure::status moved");
+    let see_back = const_str("src/repl/mesh.rs", "SEE_WHEN_IT_IS_BACK");
+    assert_eq!(see_back, ".mesh peers shows when it announces again.");
 
     let Some(wiki) = wiki_dir() else { return };
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
     for needle in [
-        format!("`Sent <id8> to <dest8>: <name> left 2h ago{held}<name>{end}.`"),
+        format!("`Sent <id8> to <dest8>: <name> left 2h ago{held}<name>{end}. {see_back}`"),
         format!("`<name>{}`", no_route.replace("{}", "<age>")),
         format!(
             "`request <id8> to <dest8>: pending; <dest8> left 2h ago{held}<dest8>{end} (the decision arrives as an idle line; .mesh inbox lists it)`"
@@ -7141,7 +7145,9 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
     let tools = format!("`<hash> left 2h ago{held}<hash>{end}`");
     assert!(mesh.contains(&tools), "Mesh.md does not quote {tools}");
     assert!(
-        mesh.contains("`departed`: `state` (`left` or `no_route`), `left_secs_ago` for `left`"),
+        mesh.contains(
+            "`departed`: `state` (`left` or `no_route`), `left_secs_ago` for `left`, `last_seen_secs_ago` for `no_route`"
+        ),
         "Mesh.md does not describe the departed object"
     );
 }

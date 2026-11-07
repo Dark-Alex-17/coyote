@@ -1316,12 +1316,30 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 .await
                 .map_err(quoted_send_failure)?;
             out_path_text(
-                &reply_sent_line(&outcome.id, destination, id, via_text(outcome.via))
+                &own_reply_sent_line(&outcome, destination, id, SystemTime::now())
                     .render(live_prefix()),
             );
         }
     }
     Ok(())
+}
+
+/// `reply_sent_line` for a follow-up on this node's own question, saying, when the peer
+/// had gone, that the propagation node holds it and for whom.
+fn own_reply_sent_line(
+    outcome: &SendOutcome,
+    destination: &str,
+    id: &str,
+    now: SystemTime,
+) -> NoticeText {
+    let line = reply_sent_line(&outcome.id, destination, id, via_text(outcome.via));
+    match outcome.departed {
+        Some(departed) => line.frame(format!(
+            " {}. {SEE_WHEN_IT_IS_BACK}",
+            held_sentence(short(destination), departed, now)
+        )),
+        None => line,
+    }
 }
 
 /// The id a peer chose for its question is quoted as it stands.
@@ -1660,6 +1678,21 @@ mod dismiss_and_answer_line_tests {
                 "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via direct).",
                 "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via direct).",
             ),
+            {
+                let now = SystemTime::now();
+                let held = SendOutcome {
+                    id: "abcdef0123456789".to_string(),
+                    via: PeerVia::StoreAndForward,
+                    departed: Some(crate::mesh::message::Departure::Left(
+                        now - Duration::from_secs(3 * 3600),
+                    )),
+                };
+                (
+                    own_reply_sent_line(&held, DESTINATION, ".vault", now),
+                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to any of 1a2b3c4d's sessions when one syncs. .mesh peers shows when it announces again.",
+                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to any of 1a2b3c4d's sessions when one syncs. /mesh peers shows when it announces again.",
+                )
+            },
         ]
     }
 
@@ -1804,10 +1837,13 @@ fn sent_line(outcome: &SendOutcome, destination: &str, name: &str, now: SystemTi
             .peer(name)
             .frame(format!("{}{HELD_FOR_DEPARTED}", departed.status(now)))
             .peer(name)
-            .frame(format!("{HELD_FOR_DEPARTED_END}.")),
+            .frame(format!("{HELD_FOR_DEPARTED_END}. {SEE_WHEN_IT_IS_BACK}")),
         None => NoticeText::from(format!("{head} (via {}).", via_text(outcome.via))),
     }
 }
+
+/// The next step after a message held for a peer that had gone.
+const SEE_WHEN_IT_IS_BACK: &str = ".mesh peers shows when it announces again.";
 
 /// The line `.mesh message` shows before it asks to send, with the name the peer goes
 /// by here quoted as it stands.
@@ -2018,9 +2054,9 @@ async fn route_to(
 ) -> Result<Route, Unrouted> {
     // A peer whose last link failed, or that said it left, is not waited on while anything
     // to link with is held, so the route line would mislead.
-    let link_failed = runtime.departure(destination).is_some();
+    let gone = runtime.departure(destination).is_some();
     if let Some(desc) = runtime.resolve_destination_cached(destination).await {
-        if !link_failed && !runtime.path_known(destination).await {
+        if !gone && !runtime.path_known(destination).await {
             out_text(&route_request_line(destination));
             result_follows();
         }
@@ -2031,7 +2067,7 @@ async fn route_to(
         .get(destination)
         .and_then(|peer| peer.verified_destination())
         .is_some();
-    if !(link_failed && key_held) {
+    if !(gone && key_held) {
         out_text(&route_request_line(destination));
         result_follows();
     }
@@ -10635,12 +10671,12 @@ mod tests {
             let line = sent_line(&left, DEST, ".bob", now);
             assert_eq!(
                 line.plain(),
-                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs."
+                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. .mesh peers shows when it announces again."
             );
             assert_eq!(
                 line.render(CommandPrefix::Slash),
-                line.plain(),
-                "the name is quoted as it stands under any prefix"
+                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. /mesh peers shows when it announces again.",
+                "the name is quoted as it stands under any prefix; the hint follows it"
             );
             assert_eq!(
                 sent_line(&sent(PeerVia::StoreAndForward, None), DEST, "bob", now).plain(),
@@ -31607,6 +31643,362 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(
                         runtime.peers().get(&peer).unwrap().left_at.is_some(),
                         "no link came up to lift the mark"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+
+            /// Announces `stub` every 1.5 s until `done` holds, as a returning peer's next
+            /// announces would arrive; an announce repeated within the same second can be
+            /// dropped by the transport as no newer than the last.
+            async fn announce_until(stub: &PeerStub, what: &str, done: impl Fn() -> bool) {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    stub.announce(Some("Tia")).await;
+                    for _ in 0..15 {
+                        if done() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for {what}"
+                    );
+                }
+            }
+
+            /// A runtime joined to a peer stub named "Tia" and to a propagation node that
+            /// stores what it is handed, the stub trusted both ways and the node filed.
+            async fn runtime_with_peer_and_storing_node(
+                tag: &str,
+            ) -> (
+                PeerStub,
+                crate::mesh::test_support::StoringPropagationNode,
+                StartedRuntime,
+                RequestContext,
+                String,
+            ) {
+                use crate::config::mesh_config::MeshInterface;
+                use crate::mesh::test_support::{
+                    StoringPropagationNode, propagation_announce_app_data,
+                };
+
+                let pn = StoringPropagationNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+                let pn_port = pn.port;
+                let stub =
+                    PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+                let started = started_runtime_on_with(tag, stub.port(), |config| {
+                    config.interfaces.push(MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: pn_port,
+                    });
+                })
+                .await;
+                let runtime = started.runtime.clone();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                ctx.app.mesh.install(runtime.clone()).unwrap();
+                stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+                stub.announce(Some("Tia")).await;
+                let peer = stub.destination_hex();
+                stub.wait_to_be_filed(&runtime.peers(), &peer).await;
+                out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                    .await
+                    .unwrap();
+                pn.announce(&propagation_announce_app_data(true, 0, 256))
+                    .await;
+                wait_until("the runtime to file the propagation node", || {
+                    runtime.propagation_nodes().select().is_ok()
+                })
+                .await;
+                (stub, pn, started, ctx, peer)
+            }
+
+            /// A trusted peer that said it left two hours ago, with a propagation node known:
+            /// `.mesh message`, `.mesh request`, mesh__send, mesh__ask and
+            /// mesh__request_access each go to the propagation node at once, with no path
+            /// wait and no link to the peer, and each says the peer left, that the node
+            /// holds it and who gets it. The tools name the peer by its full hash, `.mesh
+            /// pending` marks the open question `peer left`, and once the peer announces
+            /// again the next send goes straight to it.
+            #[test]
+            #[serial]
+            fn a_send_to_a_peer_that_left_is_held_at_once_and_says_so_on_every_surface() {
+                use crate::function::mesh::handle_mesh_tool;
+                use crate::mesh::PATH_REQUEST_TIMEOUT;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-left-held");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let (stub, mut pn, started, mut ctx, peer) =
+                        runtime_with_peer_and_storing_node("repl-mesh-left-held").await;
+                    let runtime = started.runtime.clone();
+                    let left_at = SystemTime::now();
+                    assert!(runtime.peers().mark_left(&peer, left_at));
+                    assert!(
+                        crate::mesh::test_support::expire_path(&runtime, &peer).await,
+                        "the runtime held a path to the peer"
+                    );
+                    // The farewell cannot be dated before the peer's last announce, so the
+                    // age reads in seconds: the sentence is matched around it.
+                    let held = |text: &str, name: &str| {
+                        let head = format!("{name} left ");
+                        let tail = format!(
+                            "s ago; held at the propagation node, delivered to any of {name}'s sessions when one syncs"
+                        );
+                        let Some(start) = text.find(&head) else {
+                            return false;
+                        };
+                        let rest = &text[start + head.len()..];
+                        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                        digits > 0 && rest[digits..].starts_with(&tail)
+                    };
+                    // Each send is timed on its own: handing it to the propagation node
+                    // takes a link of its own, but none may sit out a path request.
+                    let mut timings = Vec::new();
+                    let mut started_at = std::time::Instant::now();
+
+                    let out = out_of(&mut ctx, &format!(".mesh message {peer} --yes hello"))
+                        .await
+                        .unwrap();
+                    timings.push((".mesh message", started_at.elapsed()));
+                    assert!(out.contains(&format!(" to {}: ", short(&peer))), "{out}");
+                    assert!(held(&out, "Tia"), "{out}");
+                    assert!(out.contains("'s sessions when one syncs."), "{out}");
+                    assert!(!out.contains(&route_request_line(&peer)), "{out}");
+                    pn.next_received().await;
+
+                    started_at = std::time::Instant::now();
+                    let out = out_of(&mut ctx, &format!(".mesh request {peer} docs/a.md --yes"))
+                        .await
+                        .unwrap();
+                    timings.push((".mesh request", started_at.elapsed()));
+                    assert!(
+                        out.contains(&format!(": pending; {} left ", short(&peer))),
+                        "{out}"
+                    );
+                    assert!(held(&out, short(&peer)), "{out}");
+                    assert!(!out.contains(&route_request_line(&peer)), "{out}");
+                    pn.next_received().await;
+
+                    for (tool, args) in [
+                        (
+                            "mesh__send",
+                            serde_json::json!({ "to": peer, "message": "hello" }),
+                        ),
+                        (
+                            "mesh__ask",
+                            serde_json::json!({ "to": peer, "message": "still there?" }),
+                        ),
+                        (
+                            "mesh__request_access",
+                            serde_json::json!({ "peer": peer, "paths": ["docs/b.md"], "reason": "to read it" }),
+                        ),
+                    ] {
+                        started_at = std::time::Instant::now();
+                        let result = handle_mesh_tool(&mut ctx, tool, &args).await.unwrap();
+                        timings.push((tool, started_at.elapsed()));
+                        let departed = &result["departed"];
+                        assert_eq!(departed["state"], "left", "{tool}: {result}");
+                        let secs = departed["left_secs_ago"]
+                            .as_u64()
+                            .unwrap_or_else(|| panic!("{tool}: no left_secs_ago in {result}"));
+                        assert!(secs < 120, "{tool}: {result}");
+                        assert!(
+                            held(departed["message"].as_str().unwrap_or_default(), &peer),
+                            "{tool}: {result}"
+                        );
+                        assert_eq!(result["via"], "store_and_forward", "{tool}: {result}");
+                        pn.next_received().await;
+                    }
+                    for (what, took) in &timings {
+                        assert!(
+                            *took < PATH_REQUEST_TIMEOUT,
+                            "{what} waited on a path: {timings:?}"
+                        );
+                    }
+                    assert!(
+                        stub.seen().is_empty(),
+                        "no link was tried: {:?}",
+                        stub.seen()
+                    );
+                    pn.nothing_else_received();
+
+                    let pending = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                    let row = pending
+                        .lines()
+                        .find(|line| line.contains("-> ") && line.contains(short(&peer)))
+                        .unwrap_or_else(|| panic!("no row for the open question: {pending}"));
+                    assert!(row.contains(" . peer left "), "{row}");
+
+                    announce_until(&stub, "the announce to lift the left mark", || {
+                        runtime.peers().get(&peer).unwrap().left_at.is_none()
+                    })
+                    .await;
+                    let pending = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                    assert!(!pending.contains("peer left"), "{pending}");
+                    let result = handle_mesh_tool(
+                        &mut ctx,
+                        "mesh__send",
+                        &serde_json::json!({ "to": peer, "message": "welcome back" }),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(result["via"], "direct", "{result}");
+                    assert!(result.get("departed").is_none(), "{result}");
+                    assert_eq!(stub.seen().len(), 1);
+                    pn.nothing_else_received();
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                    pn.stop().await;
+                });
+            }
+
+            /// A trusted peer whose last link failed and whose path expired, with a
+            /// propagation node known: `.mesh message` and mesh__send go to the node with
+            /// no path wait, and say the peer has no route and that the node holds it.
+            #[test]
+            #[serial]
+            fn a_send_to_a_peer_with_no_route_and_no_path_is_held_without_a_wait() {
+                use crate::function::mesh::handle_mesh_tool;
+                use crate::mesh::PATH_REQUEST_TIMEOUT;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-no-route-held");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let (stub, mut pn, started, mut ctx, peer) =
+                        runtime_with_peer_and_storing_node("repl-mesh-no-route-held").await;
+                    let runtime = started.runtime.clone();
+                    // The peer is gone: nothing can answer a path request for it, so a
+                    // send that waited on one would show in the elapsed time below.
+                    stub.stop().await;
+                    runtime.peers().mark_link_failed(&peer);
+                    assert!(crate::mesh::test_support::expire_path(&runtime, &peer).await);
+                    let started_at = std::time::Instant::now();
+
+                    let out = out_of(&mut ctx, &format!(".mesh message {peer} --yes hello"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.contains("Tia has no route (its last link failed and it has not announced since; last heard "),
+                        "{out}"
+                    );
+                    assert!(
+                        out.contains("; held at the propagation node, delivered to any of Tia's sessions when one syncs."),
+                        "{out}"
+                    );
+                    assert!(!out.contains(&route_request_line(&peer)), "{out}");
+                    pn.next_received().await;
+
+                    let result = handle_mesh_tool(
+                        &mut ctx,
+                        "mesh__send",
+                        &serde_json::json!({ "to": peer, "message": "hello" }),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(result["departed"]["state"], "no_route", "{result}");
+                    assert!(
+                        result["departed"].get("left_secs_ago").is_none(),
+                        "{result}"
+                    );
+                    let message = result["departed"]["message"].as_str().unwrap();
+                    assert!(
+                        message.starts_with(&format!("{peer} has no route")),
+                        "{message}"
+                    );
+                    assert!(
+                        message.ends_with(&format!(
+                            "delivered to any of {peer}'s sessions when one syncs"
+                        )),
+                        "{message}"
+                    );
+                    pn.next_received().await;
+                    assert!(
+                        started_at.elapsed() < PATH_REQUEST_TIMEOUT,
+                        "nothing waited on a path: {:?}",
+                        started_at.elapsed()
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    pn.stop().await;
+                });
+            }
+
+            /// A peer that said it left with no open question of this node's announces
+            /// again: the mark lifts and no idle line is pushed. With a question open to it,
+            /// its next return after another farewell pushes exactly one is-back line.
+            #[test]
+            #[serial]
+            fn a_returning_peer_gets_an_is_back_line_only_with_a_question_open() {
+                use crate::mesh::pending::PENDING_RECORD_VERSION;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-left-back-silent");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-left-back-silent-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started =
+                        started_runtime_on("repl-mesh-left-back-silent", stub.port()).await;
+                    let runtime = started.runtime.clone();
+                    let ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(runtime.clone()).unwrap();
+                    let idle = Arc::new(Recording::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    stub.know_identity(runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    stub.wait_to_be_filed(&runtime.peers(), &peer).await;
+                    assert!(runtime.peers().mark_left(&peer, SystemTime::now()));
+
+                    announce_until(&stub, "the announce to lift the left mark", || {
+                        runtime.peers().get(&peer).unwrap().left_at.is_none()
+                    })
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    assert!(idle.0.lock().is_empty(), "{:?}", idle.0.lock());
+
+                    let now = SystemTime::now();
+                    let asked = now - Duration::from_secs(2 * 86400);
+                    ctx.app
+                        .mesh
+                        .correlations()
+                        .open(PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: "q".repeat(32),
+                            peer_destination: peer.clone(),
+                            peer_identity: stub.identity_hex(),
+                            thread: "q".repeat(32),
+                            question: "still there?".to_string(),
+                            sent_at: rfc3339_utc(asked),
+                            timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                        })
+                        .unwrap();
+                    assert!(runtime.peers().mark_left(&peer, now));
+                    announce_until(&stub, "the is-back line", || !idle.0.lock().is_empty()).await;
+                    assert!(runtime.peers().get(&peer).unwrap().left_at.is_none());
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    stub.announce(Some("Tia")).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let lines = idle.0.lock().clone();
+                    assert_eq!(
+                        lines,
+                        ["Tia is back; your question from 2d ago is still open; .mesh pending lists it".to_string()],
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());

@@ -22,9 +22,9 @@ use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
-    Departure, Disposition, FirstContactMiss, OutboundPeer, PEER_WIRE_VERSION, PartLimits,
-    PeerKind, PeerVia, RawPart, Route, SendError, SendOutcome, is_wire_id, left_mesh_hint_when,
-    propagation_remedy, unreachable_cause,
+    Departure, Disposition, FirstContactMiss, NO_LINK_TRIED_TO_A_LEFT_PEER, OutboundPeer,
+    PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart, Route, SendError, SendOutcome,
+    is_wire_id, left_mesh_hint_when, propagation_remedy, unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::{NoticeText, Source};
@@ -716,7 +716,7 @@ impl MeshRuntime {
         let node_hex = node.destination.address_hash.to_hex_string();
         let why_not_direct = match &unreachable {
             Some(err) => redact_hashes(&err.to_string()),
-            None => "it said it left the mesh, so no link was tried".to_string(),
+            None => NO_LINK_TRIED_TO_A_LEFT_PEER.to_string(),
         };
         debug!(
             "Mesh access request {id} to {dest8} could not be delivered over a link ({why_not_direct}); storing it with propagation node {}",

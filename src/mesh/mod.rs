@@ -399,6 +399,10 @@ pub(crate) mod test_support {
     pub(crate) use super::propagation::PropagationNode;
     #[cfg(unix)]
     use super::propagation::pn_announce_app_data;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::propagation::pn_announce_app_data as propagation_announce_app_data;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::propagation::test_support::FakeNode as StoringPropagationNode;
     #[cfg(unix)]
     use super::propagation_fetch::{FETCH_TRANSFER_LIMIT_KB, GET_PATH};
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
