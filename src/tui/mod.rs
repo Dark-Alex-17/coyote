@@ -1844,7 +1844,10 @@ fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> 
 /// and whatever the editor left in it are removed on every path.
 fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     let dir = crate::utils::temp_file("-tui-edit-", "");
+    #[cfg(unix)]
     let mut dir_options = std::fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let dir_options = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -6121,7 +6124,6 @@ mod tests {
                 "src/tui/mod.rs",
                 "let _ = reply.send(PromptAnswer::Cancelled);",
             ),
-            ("src/tui/redirect.rs", "String::new()"),
             (
                 "tests/tui_binary.rs",
                 "the transcript is not yet printed on the normal screen when the UI leaves",

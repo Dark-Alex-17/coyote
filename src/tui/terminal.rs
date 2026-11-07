@@ -227,7 +227,7 @@ fn restore_from_static() {
 /// written to the terminal here as well, after `leave` has cooked it.
 #[cfg(unix)]
 fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
-    if super::redirect::fds_captured()
+    if super::redirect::output_captured()
         && std::thread::current().name() == Some(crate::MAIN_THREAD_NAME)
         && let Some(mut tty) = static_tty()
     {
