@@ -2723,6 +2723,10 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         Arc::clone(&ctx.prompt_memory),
         FooterInfo::from_ctx(&ctx),
     )?;
+    // The first frame reads the context the way every later idle return
+    // does: the palette's command set in particular, which is otherwise
+    // the bare one until the first command hands the context back.
+    app.sync_from_ctx(&mut ctx);
 
     // Fd 1 is still the terminal here; a turn's capture takes it over.
     remember_tty();
@@ -6934,6 +6938,30 @@ mod tests {
         assert_welcome_snapshot("palette_open_80x24", &frame);
         assert!(frame.contains(".info"), "{frame}");
         assert!(frame.contains("Show system info"), "{frame}");
+    }
+
+    /// Seeded from the context, the first `.` lists what the context
+    /// allows, the rows the REPL completer gives: the tool and skill
+    /// commands a bare state hides, and not the `.agent` a bare state
+    /// alone offers.
+    #[test]
+    fn the_palette_seeded_from_the_context_lists_what_the_context_allows() {
+        let mut ctx = chat_ctx();
+        assert!(ctx.app.config.function_calling_support);
+        assert!(ctx.resolved_skills_enabled());
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.press_with_ctx(KeyCode::Char('.'), Some(&ctx));
+        let rows: Vec<&str> = palette(&harness)
+            .expect("the palette opens on a sigil")
+            .rows
+            .iter()
+            .map(|row| row.value.trim_end())
+            .collect();
+        for present in [".info tools", ".skill load", ".tool enable"] {
+            assert!(rows.contains(&present), "{present} missing from {rows:?}");
+        }
+        assert!(!rows.contains(&".agent"), "{rows:?}");
     }
 
     #[test]

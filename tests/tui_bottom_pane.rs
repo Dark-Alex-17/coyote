@@ -411,6 +411,52 @@ fn finish_after_tool(pty: &mut Pty) {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
 }
 
+/// The palette lists what the context allows from the first key, the
+/// rows the REPL completer gives: with function calling on, the `.tool`
+/// verbs are in the band before any command has run, under either
+/// prefix.
+#[test]
+#[serial]
+fn the_cold_start_palette_matches_the_repl_completer() {
+    for (prefix, typed, rows) in [
+        ("slash", "/tool", ["/tool enable", "/tool disable"]),
+        ("dot", ".tool", [".tool enable", ".tool disable"]),
+    ] {
+        let dir = fresh_config_dir(&format!("cold-palette-{prefix}"));
+        let _guard = TempDirGuard(dir.clone());
+        write_config(
+            &dir,
+            &format!(
+                "save_session: false\n\
+                 function_calling_support: true\n\
+                 command_prefix: {prefix}\n"
+            ),
+        );
+        let mut pty = spawn_tui(&dir, &[]);
+
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.send(typed.as_bytes()).unwrap();
+        pty.wait_for("Enable a single tool", PTY_DEADLINE)
+            .unwrap_or_else(|err| {
+                panic!("the band never listed the tool commands under {prefix}: {err}")
+            });
+        let repainted = repaint(&mut pty, 40, 101);
+        let frame = since(&pty, repainted);
+        for row in rows {
+            assert!(
+                frame.contains(row),
+                "`{row}` is not in the band under {prefix}:\n{frame}"
+            );
+        }
+
+        pty.send(b"\x03").unwrap();
+        pty.read_for(HOTKEY_GAP);
+        pty.send(b"\x04").unwrap();
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+}
+
 /// The field is its own surface: the cells of its text rows are painted
 /// on a background the transcript rows above the rule are not. The screen
 /// is made tall enough for the `.info` table so the `> .info` header is
