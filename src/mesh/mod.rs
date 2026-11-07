@@ -1040,11 +1040,7 @@ pub(crate) mod test_support {
         static DRAWN: AtomicU16 = AtomicU16::new(0);
         let start = pool_start(std::process::id());
         loop {
-            let drawn = DRAWN
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    (n < pool_span()).then_some(n + 1)
-                })
-                .unwrap_or_else(|_| panic!("every port in {CLOSED_PORT_POOL:?} was handed out"));
+            let drawn = draw(&DRAWN);
             let port = pool_port(start, drawn);
             if let Ok(probe) = TcpListener::bind(("127.0.0.1", port)).await {
                 drop(probe);
@@ -1056,6 +1052,28 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     const fn pool_span() -> u16 {
         CLOSED_PORT_POOL.end - CLOSED_PORT_POOL.start
+    }
+
+    /// Takes the next draw from `drawn` and returns the value before it; the counter
+    /// stops at the pool's span instead of wrapping, and a draw past it panics.
+    #[cfg(unix)]
+    fn draw(drawn: &AtomicU16) -> u16 {
+        let mut current = drawn.load(Ordering::Relaxed);
+        loop {
+            assert!(
+                current < pool_span(),
+                "every port in {CLOSED_PORT_POOL:?} was handed out"
+            );
+            match drawn.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(previous) => return previous,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// The port `drawn` steps past `start` into the pool, wrapping at its end.
@@ -1090,6 +1108,17 @@ pub(crate) mod test_support {
                     assert!(CLOSED_PORT_POOL.contains(&pool_port(start, drawn)));
                 }
             }
+        }
+
+        /// The counter hands out each draw below the span once and stops at the span.
+        #[test]
+        fn draw_counts_up_to_the_span_and_stops_there() {
+            let drawn = AtomicU16::new(pool_span() - 1);
+            assert_eq!(draw(&drawn), pool_span() - 1);
+            assert_eq!(drawn.load(Ordering::Relaxed), pool_span());
+            let past = std::panic::catch_unwind(|| draw(&drawn));
+            assert!(past.is_err(), "a draw past the span panics");
+            assert_eq!(drawn.load(Ordering::Relaxed), pool_span());
         }
 
         /// Neighbouring process ids start in both halves of the pool, never past its end.
