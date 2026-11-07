@@ -2537,7 +2537,9 @@ impl Unfinished {
 struct Shell<'a> {
     app: &'a mut App,
     screen: &'a mut Screen,
-    stream: EventStream,
+    /// Always `Some` outside `renew_stream`; the option exists so the old
+    /// stream can be dropped before its replacement is built.
+    stream: Option<EventStream>,
     termination: Termination,
     rx: UnboundedReceiver<UiMsg>,
     tx: UnboundedSender<UiMsg>,
@@ -2741,7 +2743,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     let mut shell = Shell {
         app: &mut app,
         screen: &mut screen,
-        stream: EventStream::new(),
+        stream: Some(EventStream::new()),
         termination,
         rx,
         tx,
@@ -2876,6 +2878,19 @@ fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> Result<()> {
     Ok(())
 }
 
+/// Replaces the event stream, dropping the old one first. Constructing a
+/// crossterm stream takes the shared reader lock, and the old stream's
+/// pending poll holds that lock until the stream is dropped (dropping it
+/// sets its shutdown flag and wakes the poll). During a turn the run loop
+/// always has a poll in flight, so building the new stream before
+/// dropping the old one would wait on the lock until the next keystroke.
+fn renew_stream(stream: &mut Option<EventStream>) {
+    drop(stream.take());
+    *stream = Some(EventStream::new());
+}
+
+const STREAM_RENEWED_IN_PLACE: &str = "the event stream is renewed in place";
+
 /// Hands the terminal to `f` in its normal modes and takes it back: the
 /// event stream is restarted around the release so nothing it had in
 /// flight lands on the child or comes back as a keystroke, a Ctrl+C
@@ -2883,14 +2898,14 @@ fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> Result<()> {
 /// meanwhile is dropped.
 async fn with_terminal_released<T>(
     screen: &mut Screen,
-    stream: &mut EventStream,
+    stream: &mut Option<EventStream>,
     termination: &mut Termination,
     f: impl FnOnce() -> T,
 ) -> std::io::Result<T> {
-    *stream = EventStream::new();
+    renew_stream(stream);
     let released = screen.with_terminal_released(f);
     termination.discard_pending();
-    flush_typeahead(stream).await;
+    flush_typeahead(stream.as_mut().expect(STREAM_RENEWED_IN_PLACE)).await;
     released
 }
 
@@ -2911,7 +2926,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let mut frame_failing = false;
     loop {
         let step = tokio::select! {
-            event = stream.next() => Step::Input(event),
+            event = stream.as_mut().expect(STREAM_RENEWED_IN_PLACE).next() => Step::Input(event),
             msg = rx.recv() => Step::Msg(msg),
             _ = app.frames.next_frame() => Step::Frame,
             done = join(&mut task), if task.is_some() => Step::Work(Box::new(done)),
