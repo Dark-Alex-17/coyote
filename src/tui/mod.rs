@@ -1317,7 +1317,8 @@ impl App {
 
     /// Takes the band's highlighted row: the palette's into the typed
     /// token, the search's into the composer, the rewind picker's to
-    /// the loop. The palette with no highlight lets the Enter submit.
+    /// the loop. The palette with no highlight lets the Enter do what
+    /// it does without a band: submit when idle, queue during a turn.
     fn accept_popup(&mut self) -> Option<Command> {
         match &self.view {
             View::HistorySearch(search) => {
@@ -1344,7 +1345,7 @@ impl App {
                         self.set_composer_text(&text);
                         None
                     }
-                    None if self.turn.is_some() || self.exiting => None,
+                    None if self.turn.is_some() || self.exiting => self.queue_composer(),
                     None => self.submit_composer(),
                 }
             }
@@ -4070,6 +4071,8 @@ mod tests {
     }
 
     /// Esc during a turn drops what was lined up behind it and says so.
+    /// The second held line went in through the palette, which the queue
+    /// closes: the Esc that follows reaches the turn, not a band.
     #[test]
     fn an_interrupt_drops_the_queued_lines_with_a_notice() {
         let mut harness = Harness::standalone(80, 24);
@@ -4077,7 +4080,12 @@ mod tests {
         harness.type_text("later");
         harness.press(KeyCode::Enter);
         harness.type_text(".info");
-        harness.press(KeyCode::Enter);
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(harness.app.queued.len(), 2);
+        assert!(harness.app.composer.is_empty());
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.vi_mode, None);
         assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
         assert!(harness.app.queued.is_empty());
         let frame = harness.draw();
@@ -6824,6 +6832,29 @@ mod tests {
         assert_eq!(
             harness.press(KeyCode::Enter),
             Some(Command::Submit(".in".to_string()))
+        );
+        assert!(palette(&harness).is_none());
+        assert!(harness.app.composer.is_empty());
+    }
+
+    /// Mid-turn the same Enter holds the line instead; a command waits
+    /// without reaching the loop.
+    #[test]
+    fn enter_with_the_palette_open_and_no_highlight_queues_the_command_mid_turn() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text(".info");
+        assert_eq!(
+            palette(&harness).map(|palette| palette.highlight),
+            Some(None)
+        );
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: ".info".to_string(),
+                command: true
+            }]
         );
         assert!(palette(&harness).is_none());
         assert!(harness.app.composer.is_empty());

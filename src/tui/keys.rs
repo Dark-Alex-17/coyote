@@ -628,7 +628,7 @@ mod tests {
 
     /// The plain arrows walk the history only on a one-line composer;
     /// a multi-line draft keeps them for its own cursor, and a modifier
-    /// (Alt+Up is a textarea motion) keeps them too.
+    /// (Alt+Up edits the queue) keeps them too.
     #[test]
     fn single_line_arrows_walk_the_history() {
         let multi_line = KeyContext {
@@ -662,7 +662,7 @@ mod tests {
             (
                 press(KeyCode::Up, KeyModifiers::ALT),
                 IDLE,
-                Action::ComposerInput(press(KeyCode::Up, KeyModifiers::ALT)),
+                Action::EditQueued,
             ),
             (ctrl('r'), IDLE, Action::OpenHistorySearch),
             (ctrl('r'), running, Action::OpenHistorySearch),
@@ -819,7 +819,7 @@ mod tests {
             (letter('q'), normal, Action::Nothing),
             (letter('H'), normal, Action::Nothing),
             (plain(KeyCode::Enter), normal, Action::Submit),
-            (plain(KeyCode::Enter), running, Action::Nothing),
+            (plain(KeyCode::Enter), running, Action::QueueInput),
             (plain(KeyCode::Esc), normal, Action::Nothing),
             (plain(KeyCode::Esc), empty, Action::IdleEsc),
             (plain(KeyCode::Esc), running, Action::Interrupt),
@@ -936,7 +936,7 @@ mod tests {
             (
                 press(KeyCode::Up, KeyModifiers::ALT),
                 focused,
-                Action::ComposerInput(press(KeyCode::Up, KeyModifiers::ALT)),
+                Action::EditQueued,
             ),
         ];
         for (key, ctx, expected) in cases {
