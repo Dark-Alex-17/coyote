@@ -5441,10 +5441,7 @@ fn graph_exposes_the_discussion_carries_its_run_id_and_declares_the_confirmation
             "confirm_draft",
             &["Use this draft", "Edit the draft", "Abort the run"][..],
         ),
-        (
-            "ask_choice_2",
-            &["Option 1 (recommended)", "Option 2"][..],
-        ),
+        ("ask_choice_2", &["Option 1 (recommended)", "Option 2"][..]),
         (
             "ask_choice_3",
             &["Option 1 (recommended)", "Option 2", "Option 3"][..],
@@ -5496,7 +5493,12 @@ fn assess_states_a_sizing_verdict_and_no_longer_defaults_unsure_sizing_up() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    for gone in ["Unsure defaults UP", "plan_shaped over compound", "at most 3", "more than 3"] {
+    for gone in [
+        "Unsure defaults UP",
+        "plan_shaped over compound",
+        "at most 3",
+        "more than 3",
+    ] {
         assert!(!flat.contains(gone), "assess still says {gone:?}:\n{flat}");
     }
     for needle in [
@@ -5509,12 +5511,18 @@ fn assess_states_a_sizing_verdict_and_no_longer_defaults_unsure_sizing_up() {
         "subtask_estimate the estimated number of subtasks",
         "proposed_breakdown one short line per estimated subtask",
     ] {
-        assert!(flat.contains(needle), "assess does not state {needle:?}:\n{flat}");
+        assert!(
+            flat.contains(needle),
+            "assess does not state {needle:?}:\n{flat}"
+        );
     }
     let props = &assess["output_schema"]["properties"];
     assert_eq!(props["sizing_reason"]["type"].as_str(), Some("string"));
     assert_eq!(props["subtask_estimate"]["type"].as_str(), Some("integer"));
     assert_eq!(props["proposed_breakdown"]["type"].as_str(), Some("array"));
     let plan = doc["nodes"]["plan_subtasks"]["prompt"].as_str().unwrap();
-    assert!(plan.contains("{{sizing_note}}"), "plan_subtasks must read the sizing note");
+    assert!(
+        plan.contains("{{sizing_note}}"),
+        "plan_subtasks must read the sizing note"
+    );
 }
