@@ -5,7 +5,7 @@ use crate::utils::fs::EXCLUSIVE_LOCK_WAIT;
 use crate::utils::process::ProcessStamp;
 
 use anyhow::{Context, Result, anyhow};
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -104,16 +104,32 @@ pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {
 pub(crate) enum InstanceSession {
     /// Its process is still running, under this session name.
     Running(String),
-    /// Its row is still filed but its process has gone.
+    /// Its row is still filed but its process has gone. A session that stopped in
+    /// order took its row with it, so this is a session that ended without saying so
+    /// and whose row no write has pruned yet.
     Gone(String),
 }
 
 /// Every row the registry holds, live or not yet dropped, by instance id, each with
-/// whether its process still runs. A registry that cannot be read names none; `live`
-/// warns about it.
+/// whether its process still runs. A registry that cannot be read names none, logged at
+/// debug level; `live` warns about it where the sessions are listed.
 pub(crate) fn sessions_by_instance(cache_dir: &Path) -> HashMap<String, InstanceSession> {
-    let Ok(rows) = read_rows(&registry_path(cache_dir)) else {
-        return HashMap::new();
+    let path = registry_path(cache_dir);
+    let rows = match read_rows(&path) {
+        Ok(rows) => rows,
+        Err(RegistryRead::Version(found)) => {
+            debug!("{}", refusal(&path, found));
+            return HashMap::new();
+        }
+        Err(RegistryRead::Corrupt { cause, error }) => {
+            debug!(
+                "Mesh instance registry '{}' {} ({}), so no session is named",
+                path.display(),
+                redact_hashes(&cause),
+                redact_hashes(&error)
+            );
+            return HashMap::new();
+        }
     };
     let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
     let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);

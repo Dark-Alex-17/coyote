@@ -17,14 +17,14 @@ use crate::mesh::message::{
     collect_next_action, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::pending::{
-    DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord,
-    PendingState, WaitOutcome,
+    DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PENDING_TTL,
+    PendingRecord, PendingState, WaitOutcome,
 };
 use crate::mesh::request::short;
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, Verdict, same_hash};
 use crate::mesh::{
-    MeshRuntime, MeshSlot, PeerRecord, RequestOptions, canonical_hash, decode_hex, display_text,
-    hex_lower, redact_hashes, rfc3339_utc,
+    InstanceSession, MeshRuntime, MeshSlot, PeerRecord, RequestOptions, canonical_hash, decode_hex,
+    display_text, hex_lower, redact_hashes, rfc3339_utc,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::untrusted_content::{wrap, wrap_own, wrap_short};
@@ -759,10 +759,11 @@ pub(crate) fn inherit_reply_thread(
     }
 }
 
-/// A thread the caller names is continued, never authored: it must be one this node
-/// has sent or received, as one of its own sends, a question in flight or a filed
-/// inbound. A thread `inherit_reply_thread` fills in comes from those same records and
-/// is not checked. Runs before anything reaches the wire, so a refusal sends nothing.
+/// A thread the caller names is continued, never authored: it must be one a session on
+/// this config dir has sent or received (the shared sent-threads list), or one this
+/// node has a question in flight or a filed inbound in. A thread `inherit_reply_thread`
+/// fills in comes from those same records and is not checked. Runs before anything
+/// reaches the wire, so a refusal sends nothing.
 fn refuse_unseen_thread(slot: &MeshSlot, out: &OutboundPeer) -> Result<(), SendError> {
     let Some(thread) = out.thread.as_deref() else {
         return Ok(());
@@ -1186,13 +1187,44 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
             "next_action": collect_next_action(id),
             "message": "The peer's human has been asked; the question stays open. Collect again later.",
         }),
-        WaitOutcome::Unknown => json!({
-            "status": "error",
-            "message": format!(
-                "No open or answered question with id '{id}'. It may have been collected already, or abandoned; mesh__check_inbox lists answered questions awaiting collection and mesh__ask opens a new one."
-            ),
+        WaitOutcome::Unknown => asked_by_another_session(ctx, id).unwrap_or_else(|| {
+            json!({
+                "status": "error",
+                "message": format!(
+                    "No open or answered question with id '{id}'. It may have been collected already, or abandoned; mesh__check_inbox lists answered questions awaiting collection and mesh__ask opens a new one."
+                ),
+            })
         }),
     }
+}
+
+/// The refusal for collecting `id` when another session on this config dir asked it:
+/// only the asking session holds the question, so only it can collect the reply. `None`
+/// when no other session asked it.
+fn asked_by_another_session(ctx: &RequestContext, id: &str) -> Option<Value> {
+    let runtime = ctx.app.mesh.get()?;
+    let (_, asker) = runtime
+        .other_sessions_asked(SystemTime::now())
+        .into_iter()
+        .find(|(ask, _)| ask.record.id == id)?;
+    let message = match asker {
+        Some(InstanceSession::Running(session)) => format!(
+            "Question '{id}' was asked by your session '{session}', not this one, and only the session that asked a question can collect its reply. Leave it to that session's mesh__collect --id {id}; nothing needs to be done here."
+        ),
+        Some(InstanceSession::Gone(session)) => format!(
+            "Question '{id}' was asked by your session '{session}', which is no longer running, and only the session that asked a question can collect its reply. The person at the keyboard can resume that session and turn the mesh on there to collect it; nothing needs to be done here."
+        ),
+        None => format!(
+            "Question '{id}' was asked by another of your sessions that is no longer running here, and only the session that asked a question can collect its reply. Nothing in this session can collect it; it expires {} days after it was sent.",
+            PENDING_TTL.as_secs() / 86_400
+        ),
+    };
+    Some(json!({
+        "status": "error",
+        "kind": "asked_by_another_session",
+        "id": id,
+        "message": message,
+    }))
 }
 
 /// The answer was there when the wait ended and gone by the time this call reached for
@@ -8065,6 +8097,28 @@ mod tests {
                 assert!(
                     history.turns.iter().any(|turn| turn.text.contains("teal")),
                     "{history:?}"
+                );
+
+                let follow_up_id = follow_up["id"].as_str().unwrap().to_string();
+                let collected = handle_mesh_tool(
+                    &mut live.ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}collect"),
+                    &json!({"id": follow_up_id, "timeout_secs": 1}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(collected["status"], "error", "{collected}");
+                assert_eq!(collected["kind"], "asked_by_another_session", "{collected}");
+                assert_eq!(
+                    collected["message"],
+                    format!(
+                        "Question '{follow_up_id}' was asked by your session 'c', not this one, and only the session that asked a question can collect its reply. Leave it to that session's mesh__collect --id {follow_up_id}; nothing needs to be done here."
+                    ),
+                    "{collected}"
+                );
+                assert!(
+                    c_ctx.app.mesh.correlations().is_open(&follow_up_id),
+                    "the asking session's question stays open"
                 );
 
                 let refused = handle_mesh_tool(

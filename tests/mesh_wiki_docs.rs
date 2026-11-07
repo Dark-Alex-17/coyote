@@ -7566,9 +7566,10 @@ fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() 
     );
 }
 
-/// `.mesh pending` lists the questions the other sessions on the cache dir asked, each
+/// `.mesh pending` lists the questions the other sessions on the config dir asked, each
 /// with a line naming the session that asked it and saying to collect it there. The
-/// renderer's words for the three cases and the Commands page's must agree.
+/// renderer's words for the three cases and the Commands page's must agree; the
+/// composed lines are pinned by the REPL test of the same rows.
 #[test]
 fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     let asked_by = string_literals(&fn_body("src/repl/mesh.rs", "asked_by"));
@@ -7582,6 +7583,10 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
             "asked_by no longer prints {needle:?}: {asked_by:?}"
         );
     }
+    assert!(
+        fn_body("src/repl/mesh.rs", "asked_by").contains("own_session_name(session)"),
+        "asked_by no longer names a running session as `.mesh peers` does"
+    );
     let other = string_literals(&method_body("src/repl/mesh.rs", "other_session"));
     assert!(
         other
@@ -7600,11 +7605,57 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
         "`asked by (you, gone: <session>)`",
         "`asked by another session`",
         "`collect it from that session`",
+        "`.session <session>` and `.mesh on`",
     ] {
         assert!(
             prose.contains(needle),
             "the `.mesh pending` section does not show {needle:?}:\n{prose}"
         );
+    }
+}
+
+/// The sent-threads list is one per config dir: the Mesh page's cache table names the
+/// file the code opens, with its cap, and says an earlier per-instance list is deleted;
+/// the `thread` paragraph says any of your sessions may continue a thread another one
+/// opened; and the `mesh__collect` row names the refusal for another session's question.
+#[test]
+fn the_mesh_page_describes_the_shared_sent_threads_list() {
+    let file = const_str("src/mesh/sent_threads.rs", "SENT_THREADS_FILE");
+    let cap = const_u64("src/mesh/sent_threads.rs", "SENT_THREADS_MAX_ENTRIES");
+    let open = method_body("src/mesh/sent_threads.rs", "open");
+    assert!(
+        open.contains("remove_per_instance_lists(&dir)"),
+        "SentThreads::open no longer deletes the per-instance lists:\n{open}"
+    );
+    let collect = fn_body("src/function/mesh.rs", "asked_by_another_session");
+    assert!(
+        collect.contains("\"asked_by_another_session\""),
+        "mesh__collect's refusal kind moved:\n{collect}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let row = page
+        .lines()
+        .find(|line| line.starts_with(&format!("| `{file}`")))
+        .unwrap_or_else(|| panic!("Mesh.md's cache table has no `{file}` row"));
+    for needle in [
+        "any of your sessions on this config dir".to_string(),
+        format!("At most {cap} in all"),
+        "`sent-threads-<instance_id>.json` left by an earlier Coyote is deleted unread".to_string(),
+    ] {
+        assert!(
+            row.contains(&needle),
+            "the `{file}` row does not say {needle:?}: {row}"
+        );
+    }
+    let prose = flat(&page);
+    for needle in [
+        "in any of your sessions on this config dir",
+        "A thread one session opened can be continued from another",
+        "`kind: asked_by_another_session`",
+    ] {
+        assert!(prose.contains(needle), "Mesh.md does not say {needle:?}");
     }
 }
 

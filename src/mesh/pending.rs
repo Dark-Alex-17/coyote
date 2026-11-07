@@ -1239,6 +1239,84 @@ mod tests {
         records.iter().map(|record| record.id.as_str()).collect()
     }
 
+    /// The other sessions' questions come from every other `pending-<id>.jsonl`, newest
+    /// first across the files: this session's own file, expired questions and answered
+    /// ones whose reply is gone are left out, an answered one still holding its reply is
+    /// kept, a store that cannot be read is skipped without hiding the rest, and nothing
+    /// is written.
+    #[test]
+    fn other_sessions_asked_lists_every_other_store_newest_first() {
+        let tmp = TempDir::new("pending-other-sessions");
+        let base = 2_000_000;
+        let now = t(base);
+        PendingStore::new(&tmp.path, "own")
+            .upsert(record("own-q", t(base - 5), PendingState::Open), now)
+            .unwrap();
+        let temp = PendingStore::new(&tmp.path, "temp");
+        temp.upsert(record("temp-old", t(base - 30), PendingState::Open), now)
+            .unwrap();
+        temp.upsert(
+            record("temp-new", t(base - 1), PendingState::Escalated),
+            now,
+        )
+        .unwrap();
+        temp.upsert(
+            record("temp-spent", t(base - 2), PendingState::Answered),
+            now,
+        )
+        .unwrap();
+        let old = PendingStore::new(&tmp.path, "old");
+        old.upsert(
+            PendingRecord {
+                reply: Some(reply_to("old-answered")),
+                ..record("old-answered", t(base - 10), PendingState::Answered)
+            },
+            now,
+        )
+        .unwrap();
+        let expired_at = t(base - PENDING_TTL.as_secs() - 60);
+        old.upsert(
+            record("old-expired", expired_at, PendingState::Open),
+            expired_at,
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&old.read_all().unwrap()),
+            ["old-expired", "old-answered"]
+        );
+        let broken = mesh_cache_dir(&tmp.path).join("pending-broken.jsonl");
+        fs::write(&broken, b"{not json\n").unwrap();
+        let before: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(mesh_cache_dir(&tmp.path))
+            .unwrap()
+            .flatten()
+            .map(|entry| (entry.path(), fs::read(entry.path()).unwrap_or_default()))
+            .collect();
+
+        let asks = other_sessions_asked(&tmp.path, "own", now);
+
+        let listed: Vec<(&str, &str)> = asks
+            .iter()
+            .map(|ask| (ask.instance_id.as_str(), ask.record.id.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("temp", "temp-new"),
+                ("old", "old-answered"),
+                ("temp", "temp-old"),
+            ]
+        );
+        for (path, bytes) in before {
+            assert_eq!(
+                fs::read(&path).unwrap_or_default(),
+                bytes,
+                "{} changed",
+                path.display()
+            );
+        }
+        assert!(other_sessions_asked(&tmp.path.join("nowhere"), "own", now).is_empty());
+    }
+
     #[test]
     fn pending_store_survives_reopen_and_prunes_by_ttl_and_cap() {
         let tmp = TempDir::new("pending-reopen");

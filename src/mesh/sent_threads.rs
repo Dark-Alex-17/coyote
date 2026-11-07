@@ -24,10 +24,11 @@ const SENT_THREADS_FILE: &str = "sent-threads.json";
 /// What the lock on the list is called in a refusal.
 const SENT_THREADS_LOCK_WHAT: &str = "mesh sent-threads list";
 
-/// How long recording a received thread waits for the lock. A delivery can run on the
-/// propagation fetch task, so the wait is kept short there; the holder keeps the lock
-/// for one read-modify-write of a small file.
-const RECEIVED_LOCK_WAIT: Duration = Duration::from_millis(250);
+/// How long `record_received` waits for the lock. A delivery can run on the propagation
+/// fetch task, an async worker, so the wait there is kept short; the holder keeps the
+/// lock for one read-modify-write of a small file, and a caller that runs out of it
+/// retries off the worker with `record_received_waiting`.
+pub(crate) const RECEIVED_LOCK_WAIT: Duration = Duration::from_millis(250);
 
 /// The whole file: the version first, then each list oldest to newest. Rejects unknown
 /// fields, so any change to the layout bumps `SENT_THREADS_VERSION`.
@@ -117,14 +118,17 @@ impl SentThreads {
     /// first thread is recorded. A file that cannot be read or parsed, or whose version
     /// cannot be read, is moved aside to `<path>.corrupt` with a warning and the lists
     /// start empty, as the peer table does. A readable version other than
-    /// `SENT_THREADS_VERSION` is refused and the file left in place.
+    /// `SENT_THREADS_VERSION` is refused and the file left in place. Past the open, only
+    /// a file that does not parse is moved aside: one that cannot be read is an error
+    /// for that lookup or record alone, so a passing fault never empties the list every
+    /// session shares.
     pub(crate) fn load(path: PathBuf) -> Result<Self> {
         let store = Self {
             lock_path: path.with_added_extension("lock"),
             path,
         };
         if store.path.exists() {
-            store.locked(EXCLUSIVE_LOCK_WAIT, || store.read())?;
+            store.locked(EXCLUSIVE_LOCK_WAIT, || store.read(Unreadable::SetAside))?;
         }
         Ok(store)
     }
@@ -138,14 +142,13 @@ impl SentThreads {
     /// file under its lock. A list that cannot be read answers no, with a warning, so
     /// the tools refuse the thread rather than continue one nobody can vouch for.
     pub(crate) fn contains(&self, thread: &str) -> bool {
-        match self.locked(EXCLUSIVE_LOCK_WAIT, || self.read()) {
+        match self.locked(EXCLUSIVE_LOCK_WAIT, || self.read(Unreadable::Refuse)) {
             Ok(held) => held.contains(thread),
             Err(err) => {
                 warn!(
-                    "Mesh sent-threads list '{}' could not be read, so mesh__send and mesh__ask treat thread {thread} as one this identity has not seen: {}. Try the call again; if this repeats, move '{}' aside and the list starts empty.",
+                    "Mesh sent-threads list '{}' could not be read, so mesh__send and mesh__ask treat thread {thread} as one this identity has not seen: {}. Try the call again in a moment; the error says what to do if it repeats.",
                     self.path.display(),
-                    redact_hashes(&format!("{err:#}")),
-                    self.path.display()
+                    redact_hashes(&format!("{err:#}"))
                 );
                 false
             }
@@ -167,9 +170,19 @@ impl SentThreads {
     /// Records `thread` as one a peer sent. A thread this identity sent stays in the sent
     /// list, only moved to its newest end, so a peer cannot make it the first evicted.
     /// The lock is waited for only `RECEIVED_LOCK_WAIT`, since a delivery may run on an
-    /// async worker.
+    /// async worker; on an error the caller retries with `record_received_waiting` off
+    /// that worker.
     pub(crate) fn record_received(&self, thread: &str) -> Result<()> {
-        self.record(thread, RECEIVED_LOCK_WAIT, |held| {
+        self.record_received_within(thread, RECEIVED_LOCK_WAIT)
+    }
+
+    /// `record_received` with the full lock wait, for a thread that may block.
+    pub(crate) fn record_received_waiting(&self, thread: &str) -> Result<()> {
+        self.record_received_within(thread, EXCLUSIVE_LOCK_WAIT)
+    }
+
+    fn record_received_within(&self, thread: &str, wait: Duration) -> Result<()> {
+        self.record(thread, wait, |held| {
             if held.sent.iter().any(|other| other == thread) {
                 Held::bump(&mut held.sent, thread)
             } else {
@@ -190,7 +203,7 @@ impl SentThreads {
             return Ok(());
         }
         self.locked(wait, || {
-            let mut held = self.read()?;
+            let mut held = self.read(Unreadable::Refuse)?;
             if !change(&mut held) {
                 return Ok(());
             }
@@ -212,7 +225,9 @@ impl SentThreads {
     }
 
     /// The lists on disk, normalized as `Held::normalized` says; called under the lock.
-    fn read(&self) -> Result<Held> {
+    /// A file that does not parse is set aside; one that cannot be read is handled as
+    /// `unreadable` says.
+    fn read(&self, unreadable: Unreadable) -> Result<Held> {
         match fs::read(&self.path) {
             Ok(bytes) => match parse_sent_threads(&bytes) {
                 Ok(file) => Ok(Held::normalized(file)),
@@ -229,18 +244,36 @@ impl SentThreads {
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Held::default()),
-            Err(err) => Ok(set_aside_corrupt(
-                &self.path,
-                "could not be read",
-                &err.to_string(),
-            )),
+            Err(err) => match unreadable {
+                Unreadable::SetAside => Ok(set_aside_corrupt(
+                    &self.path,
+                    "could not be read",
+                    &err.to_string(),
+                )),
+                Unreadable::Refuse => Err(err).with_context(|| {
+                    format!(
+                        "Failed to read the mesh sent-threads list '{}'; check that it is readable",
+                        self.path.display()
+                    )
+                }),
+            },
         }
     }
 
     #[cfg(test)]
     fn snapshot(&self) -> Held {
-        self.locked(EXCLUSIVE_LOCK_WAIT, || self.read()).unwrap()
+        self.locked(EXCLUSIVE_LOCK_WAIT, || self.read(Unreadable::Refuse))
+            .unwrap()
     }
+}
+
+/// What `SentThreads::read` does with a file that exists but cannot be read.
+#[derive(Clone, Copy)]
+enum Unreadable {
+    /// Moves it aside and starts empty, as the open does.
+    SetAside,
+    /// Fails the one lookup or record and leaves the file for the next.
+    Refuse,
 }
 
 /// Deletes the `sent-threads-<instance_id>.json` lists earlier builds kept per instance
@@ -681,6 +714,64 @@ mod tests {
         assert!(store.path().with_extension("json.corrupt").exists());
         store.record_sent("m-2").unwrap();
         assert_eq!(written(store.path()).sent, vec!["m-2"]);
+    }
+
+    /// A list that exists but cannot be read fails the one lookup or record and is left
+    /// in place, so a passing fault never empties the list every session shares.
+    #[test]
+    fn a_list_that_cannot_be_read_after_open_is_left_in_place() {
+        install_log_collector();
+        let tmp = TempDir::new("sent-threads-unreadable-later");
+        let store = store(&tmp);
+        fs::create_dir_all(store.path()).unwrap();
+
+        assert!(!store.contains("m-1"));
+        let err = format!("{:#}", store.record_sent("m-1").unwrap_err());
+
+        assert!(
+            err.contains("Failed to read the mesh sent-threads list"),
+            "{err}"
+        );
+        assert!(
+            store.path().is_dir(),
+            "the unreadable list is left where it is"
+        );
+        assert!(!store.path().with_extension("json.corrupt").exists());
+        let path_text = store.path().display().to_string();
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| message.contains(&path_text)
+                && message.contains("treat thread m-1 as one this identity has not seen")
+                && message.contains("Try the call again in a moment")),
+            "no lookup warning names {path_text}; captured: {warns:#?}"
+        );
+    }
+
+    /// `record_received` gives up after `RECEIVED_LOCK_WAIT` while another holder keeps
+    /// the lock, well inside the full wait; `record_received_waiting` waits the holder
+    /// out and records the thread.
+    #[test]
+    fn record_received_waits_only_briefly_for_a_held_lock() {
+        let tmp = TempDir::new("sent-threads-received-wait");
+        let store = store(&tmp);
+        let held = acquire_mesh_lock(&store.lock_path, "test holder", Duration::ZERO).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = store.record_received("t-1").unwrap_err();
+        let waited = started.elapsed();
+
+        assert!(waited >= RECEIVED_LOCK_WAIT, "{waited:?}");
+        assert!(waited < EXCLUSIVE_LOCK_WAIT, "{waited:?}");
+        assert!(err.to_string().contains("is held"), "{err}");
+        assert!(!store.path().exists(), "nothing was written");
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(RECEIVED_LOCK_WAIT * 2);
+                drop(held);
+            });
+            store.record_received_waiting("t-1").unwrap();
+        });
+        assert!(store.contains("t-1"));
     }
 
     /// A file with a readable version 1 but another shape is not a list this build can

@@ -7274,20 +7274,44 @@ fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<Stri
     )
 }
 
-/// The refusal for `id` when another session on this cache dir asked it, naming that
-/// session and the command to run there; `None` when none did.
+/// The refusal for `id` when another session on this config dir asked it, naming that
+/// session and what to run to reach it; `None` when none did. The id and the session
+/// name are quoted as they stand.
 fn asked_elsewhere(ctx: &RequestContext, id: &str, now: SystemTime) -> Option<anyhow::Error> {
     let runtime = ctx.app.mesh.get()?;
-    runtime
+    let (_, asker) = runtime
         .other_sessions_asked(now)
         .into_iter()
-        .find(|(ask, _)| ask.record.id == id)
-        .map(|(_, asker)| {
-            anyhow!(
-                "Question {id} was {}, not this session, and only the session that asked it can collect the reply or follow up: run `.mesh answer {id} \"<text>\"` in that session.",
-                asked_by(asker.as_ref())
-            )
-        })
+        .find(|(ask, _)| ask.record.id == id)?;
+    let head = NoticeText::default().frame("Question ").peer(id);
+    let answer_there = |session: &str| {
+        NoticeText::default()
+            .frame("run `.mesh answer ")
+            .peer(id)
+            .frame(" \"<text>\"` in session ")
+            .peer(session)
+    };
+    let text = match &asker {
+        Some(InstanceSession::Running(session)) => head
+            .frame(" was asked by ")
+            .peer(own_session_name(session))
+            .frame(", not this session, and only the session that asked it can collect the reply or follow up: ")
+            .then(answer_there(session))
+            .frame("."),
+        Some(InstanceSession::Gone(session)) => head
+            .frame(" was asked by ")
+            .peer(format!("(you, gone: {session})"))
+            .frame(", which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session ")
+            .peer(session.as_str())
+            .frame("` and `.mesh on`, then ")
+            .then(answer_there(session))
+            .frame("."),
+        None => head.frame(format!(
+            " was asked by another session this computer no longer lists, and only the session that asked it can collect the reply or follow up, so none here can; it expires {} days after it was sent.",
+            PENDING_TTL.as_secs() / 86_400
+        )),
+    };
+    Some(QuotingError::wrap(text))
 }
 
 fn change_text(change: TrustChange) -> &'static str {
@@ -18626,21 +18650,29 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert!(out.contains(&format!(". id {id}")), "no {id} in {out}");
                         }
 
-                        let refused = out_of(&mut ctx, ".mesh answer q-temp-0001 \"main\"")
+                        let running = "Question q-temp-0001 was asked by (you: temp), not this session, and only the session that asked it can collect the reply or follow up: run `.mesh answer q-temp-0001 \"<text>\"` in session temp.";
+                        for verb in [
+                            ".mesh answer q-temp-0001 \"main\"",
+                            ".mesh dismiss q-temp-0001",
+                        ] {
+                            let refused = out_of(&mut ctx, verb).await.unwrap_err().to_string();
+                            assert_eq!(refused, running, "{verb}");
+                        }
+                        let gone = out_of(&mut ctx, ".mesh answer q-gone-0001 \"main\"")
                             .await
                             .unwrap_err()
                             .to_string();
                         assert_eq!(
-                            refused,
-                            "Question q-temp-0001 was asked by (you: temp), not this session, and only the session that asked it can collect the reply or follow up: run `.mesh answer q-temp-0001 \"<text>\"` in that session."
+                            gone,
+                            "Question q-gone-0001 was asked by (you, gone: old), which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session old` and `.mesh on`, then run `.mesh answer q-gone-0001 \"<text>\"` in session old."
                         );
                         let by_prefix = out_of(&mut ctx, ".mesh answer q-lost-0 \"main\"")
                             .await
                             .unwrap_err()
                             .to_string();
-                        assert!(
-                            by_prefix.starts_with("Question q-lost-0001 was asked by another session, not this session"),
-                            "{by_prefix}"
+                        assert_eq!(
+                            by_prefix,
+                            "Question q-lost-0001 was asked by another session this computer no longer lists, and only the session that asked it can collect the reply or follow up, so none here can; it expires 7 days after it was sent."
                         );
                         assert!(ctx.app.mesh.correlations().list().is_empty());
                         assert!(temp_slot.correlations().is_open("q-temp-0001"));

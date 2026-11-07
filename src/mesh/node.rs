@@ -4532,9 +4532,27 @@ impl MeshSlot {
     }
 
     /// Records `thread` as one a peer sent, so the tools of every session on this cache
-    /// dir accept it as a thread to continue.
+    /// dir accept it as a thread to continue. A delivery may run on an async worker, so
+    /// the lock is waited for only briefly here; when that wait or the write fails, the
+    /// record is tried once more with the full wait on a thread of its own.
     pub(crate) fn remember_received_thread(&self, thread: &str) {
-        self.remember_thread(|store| store.record_received(thread));
+        let Some(store) = self.sent_threads() else {
+            return;
+        };
+        if store.record_received(thread).is_ok() {
+            return;
+        }
+        let thread = thread.to_string();
+        let retry = std::thread::Builder::new()
+            .name("mesh-sent-threads".to_string())
+            .spawn(move || {
+                if let Err(err) = store.record_received_waiting(&thread) {
+                    warn_thread_not_remembered(&err);
+                }
+            });
+        if let Err(err) = retry {
+            warn_thread_not_remembered(&anyhow::Error::from(err));
+        }
     }
 
     /// A failed write is only logged: the send or delivery it follows has already
@@ -4544,10 +4562,7 @@ impl MeshSlot {
             return;
         };
         if let Err(err) = record(&store) {
-            warn!(
-                "Mesh sent-threads list could not be written, so mesh__send and mesh__ask will refuse the thread just sent or received as one to continue; omit thread to start a new conversation instead. Check the permissions and free space of the mesh cache directory; the error says which file: {}",
-                redact_hashes(&format!("{err:#}"))
-            );
+            warn_thread_not_remembered(&err);
         }
     }
 
@@ -5763,6 +5778,15 @@ fn refusal_phrase(reason: RefusalReason, path: RefusalPath) -> &'static str {
             "sent a reply the envoy will not answer, filed in the inbox"
         }
     }
+}
+
+/// The warning for a thread sent or received that the sent-threads list could not take:
+/// the send or delivery has already happened, so only the follow-up is lost.
+fn warn_thread_not_remembered(err: &anyhow::Error) {
+    warn!(
+        "Mesh sent-threads list could not be written, so mesh__send and mesh__ask will refuse the thread just sent or received as one to continue; omit thread to start a new conversation instead. Check the permissions and free space of the mesh cache directory; the error says which file: {}",
+        redact_hashes(&format!("{err:#}"))
+    );
 }
 
 /// The questions `store` holds open or answered and uncollected. A file this Coyote
@@ -19901,6 +19925,44 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["sent"], serde_json::json!(["m-original", "m-fork"]));
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A received thread whose short lock wait runs out, because another session holds
+    /// the list's lock, is still recorded: the retry waits the holder out.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_received_thread_is_recorded_once_a_lock_held_past_the_short_wait_is_let_go() {
+        use crate::mesh::lock::acquire_mesh_lock;
+        use crate::mesh::sent_threads::RECEIVED_LOCK_WAIT;
+
+        let started = started_runtime("node-sent-threads-retry").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let lock_path = started
+            .runtime
+            .cache_dir()
+            .join("mesh")
+            .join("sent-threads.json.lock");
+        let held = acquire_mesh_lock(&lock_path, "test holder", Duration::ZERO).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(RECEIVED_LOCK_WAIT * 3);
+            drop(held);
+        });
+
+        slot.remember_received_thread("t-held");
+
+        releaser.join().unwrap();
+        let threads = slot.sent_threads().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !threads.contains("t-held") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the received thread was never recorded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }
