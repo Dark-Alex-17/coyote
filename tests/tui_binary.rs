@@ -1237,6 +1237,9 @@ fn exit_session_shows_the_save_modal_and_saves_on_y() {
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
+    // Enter on a field modal only counts once the modal has been up for
+    // a second; the gate runs from its appearance, not from typing.
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"probe-saved\r").unwrap();
     // The footer said "no session" at startup too; only a fresh one means
     // the session was written and closed.
@@ -1598,6 +1601,9 @@ fn ctrl_d_on_a_dirty_session_asks_to_save_and_y_writes_it_before_leaving() {
     pty.read_for(HOTKEY_GAP);
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
+    // Enter on a field modal only counts once the modal has been up for
+    // a second; the gate runs from its appearance, not from typing.
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"probe-ctrl-d\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
@@ -3477,64 +3483,50 @@ fn a_fenced_dot_command_runs_as_a_command_and_not_as_a_prompt() {
     assert_tty_restored(&transcript);
 }
 
-/// `.skill <name>` opens `$EDITOR` in the REPL; the UI refuses it instead
-/// and must do so before anything is written: no skill file appears
-/// under the config dir, the editor is never launched, and the UI keeps
-/// taking keys.
+/// `.skill <name>` scaffolds the skill file and opens it in `$EDITOR` on
+/// the lent terminal: the alternate screen is left for the editor, the
+/// editor is handed the skill file's path, the file exists afterwards,
+/// and the UI comes back repainted and taking keys.
 #[test]
 #[serial]
-fn dot_skill_under_the_tui_is_refused_before_it_writes_anything() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = fresh_config_dir("skill-refused");
+fn dot_skill_scaffolds_the_file_and_opens_it_on_the_lent_terminal() {
+    let dir = fresh_config_dir("skill-editor");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let launched = dir.join("editor-launched");
-    let editor = dir.join("recording-editor.sh");
-    fs::write(
-        &editor,
-        format!("#!/bin/sh\n: > '{}'\nexit 0\n", launched.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
-    let editor = editor.to_str().unwrap();
-    let mut pty = spawn_tui(&dir, &[("EDITOR", editor), ("VISUAL", editor)]);
+    let editor = recording_editor(&dir, &launched);
+    let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let files_before = walk(&dir);
     let before = pty.raw().len();
     pty.send(b".skill probe-skill-zq7\r").unwrap();
-    let since = pty
-        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
-        .expect("`.skill` was not refused with the TUI notice");
-    pty.read_for(Duration::from_millis(500));
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, before, PTY_DEADLINE)
+        .expect("`.skill` did not release the terminal for the editor");
+    let re_entered = wait_for_re_entry(&mut pty, left);
+    assert_repainted_after(&mut pty, re_entered, "the `.skill` editor");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
 
-    let new_files: Vec<PathBuf> = walk(&dir)
-        .into_iter()
-        .filter(|path| !files_before.contains(path))
-        .filter(|path| !path.to_string_lossy().contains("/cache/"))
-        .collect();
-    let skill_files: Vec<&PathBuf> = new_files
-        .iter()
-        .filter(|path| path.to_string_lossy().contains("probe-skill-zq7"))
-        .collect();
+    let edited = fs::read_to_string(&launched)
+        .unwrap_or_else(|e| panic!("`.skill` never launched the editor ({e}):\n{since}"));
     assert!(
-        skill_files.is_empty(),
-        "the refused `.skill` still wrote {skill_files:?}:\n{since}"
+        edited.contains("probe-skill-zq7") && edited.contains("SKILL.md"),
+        "the editor was not handed the skill file: {edited:?}\n{since}"
     );
     assert!(
-        !launched.exists(),
-        "the refused `.skill` still launched the editor:\n{since}"
+        Path::new(edited.trim()).exists(),
+        "the skill file {edited:?} was not scaffolded:\n{since}"
     );
-    assert_eq!(
-        count(pty.raw(), LEAVE_ALT),
-        0,
-        "the refused `.skill` released the terminal:\n{since}"
+    let skill_files = new_files_named(&dir, &files_before, "probe-skill-zq7");
+    assert!(
+        !skill_files.is_empty(),
+        "no probe-skill-zq7 file appeared under {dir:?}:\n{since}"
     );
 
     pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", before, PTY_DEADLINE)
-        .expect("keys were not handled after the refused `.skill`");
+    pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
+        .expect("keys were not handled after the `.skill` editor returned");
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -3823,14 +3815,17 @@ fn esc_still_cancels_a_clipped_confirm_question() {
     assert_tty_restored(&transcript);
 }
 
-/// Writes an `$EDITOR` that only records that it was launched and returns
-/// its path.
+/// Writes an `$EDITOR` that only records the path it was asked to open
+/// into `launched` and returns the editor's path.
 fn recording_editor(dir: &Path, launched: &Path) -> String {
     use std::os::unix::fs::PermissionsExt;
     let editor = dir.join("recording-editor.sh");
     fs::write(
         &editor,
-        format!("#!/bin/sh\n: > '{}'\nexit 0\n", launched.display()),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{}'\nexit 0\n",
+            launched.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3848,14 +3843,13 @@ fn new_files_named(dir: &Path, before: &[PathBuf], name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `.role <new-name>` first asks `Create a new role?` and then scaffolds
-/// the role in `$EDITOR` in the REPL; the UI refuses it through the prompt
-/// gate before the question is built: no role file, no editor, the
-/// terminal never released, and the UI keeps taking keys.
+/// `.role <new-name>` asks `Create a new role?` in a modal; `y` opens the
+/// new role's file in `$EDITOR` on the lent terminal, and the UI comes
+/// back taking keys.
 #[test]
 #[serial]
-fn dot_role_for_a_new_role_is_refused_before_it_writes_anything() {
-    let dir = fresh_config_dir("role-refused");
+fn dot_role_for_a_new_role_asks_in_the_modal_and_opens_the_editor_on_y() {
+    let dir = fresh_config_dir("role-modal");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let launched = dir.join("editor-launched");
@@ -3863,54 +3857,46 @@ fn dot_role_for_a_new_role_is_refused_before_it_writes_anything() {
     let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    let files_before = walk(&dir);
     let before = pty.raw().len();
     pty.send(b".role new-role-xk3\r").unwrap();
-    let since = pty
-        .wait_for_after(PROMPT_REFUSAL, before, PTY_DEADLINE)
-        .unwrap_or_else(|e| {
-            panic!(
-                "`.role <new>` was not refused with {PROMPT_REFUSAL:?}; the turn sat on \
-                 `Working` with the REPL's `Create a new role?` prompt hidden: {e:?}\n{}",
-                strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
-            )
-        });
-    pty.read_for(Duration::from_millis(500));
-
-    let role_files = new_files_named(&dir, &files_before, "new-role-xk3");
-    assert!(
-        role_files.is_empty(),
-        "the refused `.role` still wrote {role_files:?}:\n{since}"
-    );
+    pty.wait_for_after("Create a new role?", before, PTY_DEADLINE)
+        .expect("`.role <new>` did not ask `Create a new role?` in a modal");
     assert!(
         !launched.exists(),
-        "the refused `.role` still launched the editor:\n{since}"
+        "the editor opened before the question was answered"
     );
-    assert_eq!(
-        count(pty.raw(), LEAVE_ALT),
-        0,
-        "the refused `.role` released the terminal:\n{since}"
+    pty.read_for(HOTKEY_GAP);
+    let answered = pty.raw().len();
+    pty.send(b"y").unwrap();
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, answered, PTY_DEADLINE)
+        .expect("`y` did not release the terminal for the role editor");
+    let re_entered = wait_for_re_entry(&mut pty, left);
+    assert_repainted_after(&mut pty, re_entered, "the `.role` editor");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    let edited = fs::read_to_string(&launched)
+        .unwrap_or_else(|e| panic!("`y` never launched the editor ({e}):\n{since}"));
+    assert!(
+        edited.contains("new-role-xk3"),
+        "the editor was not handed the new role's file: {edited:?}\n{since}"
     );
 
     pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", before, PTY_DEADLINE)
-        .expect("keys were not handled after the refused `.role`");
+    pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
+        .expect("keys were not handled after the role editor returned");
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
-    assert!(
-        new_files_named(&dir, &files_before, "new-role-xk3").is_empty(),
-        "a role file appeared by the time the UI left:\n{transcript}"
-    );
 }
 
-/// `.edit session` on a live named session opens its yaml in `$EDITOR`
-/// in the REPL; the UI refuses it before the session is written to disk.
+/// `.edit session` on a live named session writes it to disk and opens
+/// its yaml in `$EDITOR` on the lent terminal; the UI comes back taking
+/// keys.
 #[test]
 #[serial]
-fn dot_edit_session_is_refused_before_the_session_is_written() {
-    let dir = fresh_config_dir("edit-session-refused");
+fn dot_edit_session_opens_the_editor_on_the_lent_terminal() {
+    let dir = fresh_config_dir("edit-session-editor");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let launched = dir.join("editor-launched");
@@ -3925,41 +3911,44 @@ fn dot_edit_session_is_refused_before_the_session_is_written() {
     let files_before = walk(&dir);
     let before = pty.raw().len();
     pty.send(b".edit session\r").unwrap();
-    let since = pty
-        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
-        .expect("`.edit session` was not refused with the TUI notice");
-    pty.read_for(Duration::from_millis(500));
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, before, PTY_DEADLINE)
+        .expect("`.edit session` did not release the terminal for the editor");
+    let re_entered = wait_for_re_entry(&mut pty, left);
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
 
+    let edited = fs::read_to_string(&launched)
+        .unwrap_or_else(|e| panic!("`.edit session` never launched the editor ({e}):\n{since}"));
+    assert!(
+        edited.contains("named-sess-xk3"),
+        "the editor was not handed the session file: {edited:?}\n{since}"
+    );
+    assert!(
+        Path::new(edited.trim()).exists(),
+        "the session file {edited:?} was not written before the editor opened:\n{since}"
+    );
     let session_files = new_files_named(&dir, &files_before, "named-sess-xk3");
     assert!(
-        session_files.is_empty(),
-        "the refused `.edit session` still wrote {session_files:?}:\n{since}"
-    );
-    assert!(
-        !launched.exists(),
-        "the refused `.edit session` still launched the editor:\n{since}"
-    );
-    assert_eq!(
-        count(pty.raw(), LEAVE_ALT),
-        0,
-        "the refused `.edit session` released the terminal:\n{since}"
+        !session_files.is_empty(),
+        "no named-sess-xk3 session file appeared under {dir:?}:\n{since}"
     );
 
     pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", before, PTY_DEADLINE)
-        .expect("keys were not handled after the refused `.edit session`");
+    pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
+        .expect("keys were not handled after the session editor returned");
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
 
-/// A `!shell` line is a command, not a message for the model: the fake
-/// model is never asked, and the line lands as the UI's refusal of the
-/// shell passthrough instead of a reply.
+/// A `!shell` line is a command, not a message for the model: it runs on
+/// the lent terminal (alternate screen left, the child's output on the
+/// normal screen, alternate screen re-entered) and the fake model is
+/// never asked.
 #[test]
 #[serial]
-fn a_bang_shell_line_is_a_command_and_never_reaches_the_model() {
+fn a_bang_shell_line_runs_on_the_lent_terminal_and_never_reaches_the_model() {
     let dir = fresh_config_dir("bang-shell");
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![Reply::Text(
@@ -3971,19 +3960,25 @@ fn a_bang_shell_line_is_a_command_and_never_reaches_the_model() {
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
     let before = pty.raw().len();
-    pty.send(b"!ls\r").unwrap();
-    let since = pty
-        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
-        .expect("`!ls` was neither run nor refused as a command");
-    pty.read_for(Duration::from_millis(800));
-    let since = format!(
-        "{since}{}",
-        strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+    pty.send(b"!echo bang-probe-q9d\r").unwrap();
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, before, PTY_DEADLINE)
+        .expect("`!echo` did not release the terminal for the shell");
+    let re_entered = wait_for_re_entry(&mut pty, left);
+    // The typed line echoes in the composer before the send, so only the
+    // window between the leave and the re-entry can hold the child's own
+    // output.
+    let on_the_normal_screen = strip_ansi(&String::from_utf8_lossy(&pty.raw()[left..re_entered]));
+    assert!(
+        on_the_normal_screen.contains("bang-probe-q9d"),
+        "the shell's output did not land on the normal screen:\n{on_the_normal_screen}"
     );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
     assert_eq!(
         fake.served(),
         0,
-        "`!ls` was sent to the model as a prompt:\n{since}"
+        "`!echo` was sent to the model as a prompt:\n{since}"
     );
     assert!(
         !since.contains("b4s"),
@@ -3991,8 +3986,8 @@ fn a_bang_shell_line_is_a_command_and_never_reaches_the_model() {
     );
 
     pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", before, PTY_DEADLINE)
-        .expect("keys were not handled after the refused `!ls`");
+    pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
+        .expect("keys were not handled after the shell returned");
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -4281,18 +4276,55 @@ fn assert_refused_through_the_prompt_gate(flow: &GatedFlow) {
     }
 }
 
-/// `.save role` on a temp role asks for a name in the REPL.
+/// `.save role` on a temp role asks `Role name:` in a modal and writes the
+/// role file under that name.
 #[test]
 #[serial]
-fn dot_save_role_on_a_temp_role_is_refused_through_the_prompt_gate() {
-    assert_refused_through_the_prompt_gate(&GatedFlow {
-        scenario: "gate-save-role",
-        prelude: &[".temp-role you are the temp role g4r"],
-        command: ".save role",
-        footprints: &["g4r", "/roles/"],
-        setup: None,
-        binary: None,
-    });
+fn dot_save_role_on_a_temp_role_asks_for_the_name_in_the_modal() {
+    let dir = fresh_config_dir("save-role-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".temp-role you are the temp role g4r\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".save role\r").unwrap();
+    pty.wait_for_after("Role name:", before, PTY_DEADLINE)
+        .expect("`.save role` on a temp role did not ask `Role name:` in a modal");
+    // Enter on a field modal only counts once the modal has been up for
+    // a second; the gate runs from its appearance, not from typing.
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"saved-role-xk3\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let saved = loop {
+        let saved = new_files_named(&dir, &files_before, "saved-role-xk3");
+        if !saved.is_empty() {
+            break saved;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no saved-role-xk3 role file was written under {dir:?}:\n{}",
+            strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+        );
+        pty.read_for(Duration::from_millis(200));
+    };
+    assert!(
+        saved
+            .iter()
+            .any(|path| path.to_string_lossy().contains("/roles/")),
+        "the role was written outside the roles dir: {saved:?}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", before, PTY_DEADLINE)
+        .expect("keys were not handled after the role was saved");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
 }
 
 /// `.vault add <name>` asks for the secret's value in the REPL.
@@ -6581,6 +6613,9 @@ fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
+    // Enter on a field modal only counts once the modal has been up for
+    // a second; the gate runs from its appearance, not from typing.
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"probe-r9-session\r").unwrap();
     // The painter skips cells that were already blank, so the words of a
     // line can reach the stream without the spaces between them.
@@ -6658,6 +6693,9 @@ fn dot_exit_saving_the_session_on_y_carries_the_saved_line_to_the_normal_screen(
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
+    // Enter on a field modal only counts once the modal has been up for
+    // a second; the gate runs from its appearance, not from typing.
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"probe-r9-exit\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
