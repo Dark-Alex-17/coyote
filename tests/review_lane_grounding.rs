@@ -19,7 +19,7 @@
 //! stale clone of the same repository in the working directory under the
 //! repository's name, and an unrelated shared library.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -122,16 +122,31 @@ fn clones() -> Clones {
     for clone in [&review, &shadow] {
         git(
             &root,
-            &["clone", "-q", seed.to_str().unwrap(), clone.to_str().unwrap()],
+            &[
+                "clone",
+                "-q",
+                seed.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
         );
     }
     git(
         &review,
-        &["remote", "set-url", "origin", "git@github.com:Org/Billing.git"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Org/Billing.git",
+        ],
     );
     git(
         &shadow,
-        &["remote", "set-url", "origin", "https://github.com/org/billing/"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/org/billing/",
+        ],
     );
     write(&shadow.join("internal/plan.go"), "package plan // STALE\n");
     let other = root.join("shared-lib");
@@ -139,7 +154,12 @@ fn clones() -> Clones {
     git(&other, &["init", "-q"]);
     git(
         &other,
-        &["remote", "add", "origin", "git@github.com:org/shared-lib.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:org/shared-lib.git",
+        ],
     );
     write(&other.join("caller.go"), "package lib // CALLER\n");
     Clones {
@@ -197,7 +217,7 @@ fn review_vars(review: &Path) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn as_refs(vars: &[(&'static str, String)]) -> Vec<(&'static str, &str)> {
+fn as_refs<'a>(vars: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
     vars.iter().map(|(k, v)| (*k, v.as_str())).collect()
 }
 
@@ -214,8 +234,17 @@ fn relative_paths_resolve_against_the_review_checkout() {
     let vars = review_vars(&c.review);
     let vars = as_refs(&vars);
     for tool in ["fs_cat.sh", "fs_read.sh"] {
-        let out = run_tool(tool, &c.root, &[("path", "internal/plan.go")], &vars, &cache);
-        assert!(out.contains("// HEAD"), "{tool} must read the checkout: {out}");
+        let out = run_tool(
+            tool,
+            &c.root,
+            &[("path", "internal/plan.go")],
+            &vars,
+            &cache,
+        );
+        assert!(
+            out.contains("// HEAD"),
+            "{tool} must read the checkout: {out}"
+        );
         assert!(!out.contains("STALE"), "{tool} read the stale clone: {out}");
     }
     let out = run_tool(
@@ -235,7 +264,10 @@ fn relative_paths_resolve_against_the_review_checkout() {
         "fs_glob with no path must search the checkout: {out}"
     );
     let out = run_tool("fs_ls.sh", &c.root, &[("path", "internal")], &vars, &cache);
-    assert!(out.contains("plan.go"), "fs_ls must list the checkout: {out}");
+    assert!(
+        out.contains("plan.go"),
+        "fs_ls must list the checkout: {out}"
+    );
 
     let out = run_tool(
         "fs_read.sh",
@@ -297,12 +329,19 @@ fn reads_in_a_same_origin_clone_are_redirected_to_the_checkout() {
         ("fs_read.sh", vec![("path", "../billing/internal/plan.go")]),
         ("fs_cat.sh", vec![("path", &*missing)]),
         ("fs_ls.sh", vec![("path", &*shadow_dir)]),
-        ("fs_grep.sh", vec![("pattern", "STALE"), ("path", &*shadow_dir)]),
-        ("fs_glob.sh", vec![("pattern", "*.go"), ("path", &*shadow_dir)]),
+        (
+            "fs_grep.sh",
+            vec![("pattern", "STALE"), ("path", &*shadow_dir)],
+        ),
+        (
+            "fs_glob.sh",
+            vec![("pattern", "*.go"), ("path", &*shadow_dir)],
+        ),
     ] {
         let out = run_tool(tool, &c.root, &args, &vars, &cache);
         assert!(
-            out.contains("Refused:") && out.contains("another clone of the repository under review"),
+            out.contains("Refused:")
+                && out.contains("another clone of the repository under review"),
             "{tool} {args:?} must refuse the shadow clone: {out}"
         );
         assert!(
@@ -426,7 +465,13 @@ fn review_agents_declare_review_grounding_on_by_default() {
             .unwrap_or_else(|| panic!("{rel}: no review_grounding variable"));
         assert_eq!(var["default"].as_str(), Some("1"), "{rel}");
     }
-    for tool in ["fs_read.sh", "fs_cat.sh", "fs_grep.sh", "fs_glob.sh", "fs_ls.sh"] {
+    for tool in [
+        "fs_read.sh",
+        "fs_cat.sh",
+        "fs_grep.sh",
+        "fs_glob.sh",
+        "fs_ls.sh",
+    ] {
         let text =
             fs::read_to_string(manifest().join("assets/functions/tools").join(tool)).unwrap();
         assert!(
@@ -462,7 +507,10 @@ fn run_script(rel: &str, state: &Value) -> Value {
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!("{rel} emitted invalid JSON ({e}): {}", String::from_utf8_lossy(&out.stdout))
+        panic!(
+            "{rel} emitted invalid JSON ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
     })
 }
 
@@ -531,7 +579,10 @@ fn no_blocking_criticals(label: &str, verdict: &Value, report: &str, gauntlet: &
         !text.contains("🔴 CRITICAL finding(s)"),
         "{label}: the gauntlet must not route unverified criticals as findings to fix: {text}"
     );
-    assert_eq!(gauntlet["gauntlet_verdict"], "BLOCKED", "{label}: {gauntlet}");
+    assert_eq!(
+        gauntlet["gauntlet_verdict"], "BLOCKED",
+        "{label}: {gauntlet}"
+    );
 }
 
 /// The #1001 failure: the verifier faulted and the unverified criticals were
@@ -574,13 +625,17 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
     for (label, verifier_output) in [
         (
             "per-finding faults",
-            json!(r#"[{"id":"f1","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"},{"id":"f2","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"}]"#),
+            json!(
+                r#"[{"id":"f1","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"},{"id":"f2","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"}]"#
+            ),
         ),
         ("dead verifier", json!("Agent node failed: timed out")),
         (
             "verified nothing",
-            json!(r#"FINDING_VERIFIER_RESULTS
-[{"id":"pipeline-fault","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: parse failed"}]"#),
+            json!(
+                r#"FINDING_VERIFIER_RESULTS
+[{"id":"pipeline-fault","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: parse failed"}]"#
+            ),
         ),
         ("no verdicts returned", json!("[]")),
     ] {
@@ -661,7 +716,10 @@ fn pr_repo() -> PrRepo {
     git(&repo, &["init", "-q"]);
     write(&repo.join("internal/plan.go"), &numbered(30, None));
     write(&repo.join("internal/other.go"), "package other\n");
-    write(&repo.join(".gitattributes"), "api/*.ts linguist-generated\n");
+    write(
+        &repo.join(".gitattributes"),
+        "api/*.ts linguist-generated\n",
+    );
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "base"]);
     let out = Command::new("git")
@@ -754,7 +812,10 @@ fn generated_files_are_excluded_from_review_and_listed() {
         .split("## Generated, not reviewed")
         .nth(1)
         .unwrap_or_else(|| panic!("the report must list generated files: {report}"));
-    assert!(section.contains("`gen/go/admin/v1/service.pb.go`"), "{report}");
+    assert!(
+        section.contains("`gen/go/admin/v1/service.pb.go`"),
+        "{report}"
+    );
 }
 
 /// The anchor gate keeps findings inside or next to a changed hunk and drops
@@ -773,10 +834,25 @@ fn anchor_gate_drops_unanchored_findings_and_keeps_valid_ones() {
         finding("on-change", "🔴 CRITICAL", "internal/plan.go", "5"),
         finding("adjacent", "🟡 WARNING", "internal/plan.go", "L7-L8"),
         finding("appended", "🟡 WARNING", "internal/plan.go", "33-35"),
-        finding("repo-prefixed", "🟡 WARNING", "billing/internal/plan.go", "4-6"),
-        finding("absolute", "🟢 SUGGESTION", &absolute.to_string_lossy(), "5"),
+        finding(
+            "repo-prefixed",
+            "🟡 WARNING",
+            "billing/internal/plan.go",
+            "4-6"
+        ),
+        finding(
+            "absolute",
+            "🟢 SUGGESTION",
+            &absolute.to_string_lossy(),
+            "5"
+        ),
         finding("not-in-diff", "🔴 CRITICAL", "internal/other.go", "1"),
-        finding("generated", "🔴 CRITICAL", "gen/go/admin/v1/service.pb.go", "1"),
+        finding(
+            "generated",
+            "🔴 CRITICAL",
+            "gen/go/admin/v1/service.pb.go",
+            "1"
+        ),
         finding("far", "🟡 WARNING", "internal/plan.go", "15-17"),
         finding("no-lines", "🟢 SUGGESTION", "internal/plan.go", "")
     ]);
@@ -878,7 +954,10 @@ fn anchor_gate_faults_and_drops_reach_the_verdict() {
             .contains("1 🔴 finding(s) could not be anchored in the diff"),
         "{verdict}"
     );
-    let section = report.split("## Could not anchor").nth(1).unwrap_or_else(|| panic!("{report}"));
+    let section = report
+        .split("## Could not anchor")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{report}"));
     assert!(
         section.contains("store.SetEndDate is unsafe") && section.contains("38 lines"),
         "{report}"
@@ -900,16 +979,31 @@ fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
     let shadow = pr.root.join("billing");
     git(
         &pr.root,
-        &["clone", "-q", pr.repo.to_str().unwrap(), shadow.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            pr.repo.to_str().unwrap(),
+            shadow.to_str().unwrap(),
+        ],
     );
     git(&shadow, &["checkout", "-q", &pr.base]);
     git(
         &pr.repo,
-        &["remote", "add", "origin", "git@github.com:docker/billing.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:docker/billing.git",
+        ],
     );
     git(
         &shadow,
-        &["remote", "set-url", "origin", "https://github.com/docker/billing"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/docker/billing",
+        ],
     );
     let vars = review_vars(&pr.repo);
     let vars = as_refs(&vars);
@@ -922,8 +1016,20 @@ fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
         &cache,
     );
     assert!(
-        out.contains("Refused:") && out.contains("pr-review-billing-1001"),
-        "the stale clone read must be redirected to the review checkout: {out}"
+        !out.contains("1: line 1") && out.contains("did you mean"),
+        "the relative path #1001 used must resolve in the checkout, never the stale clone: {out}"
+    );
+    let stale = shadow.join("internal/plan.go");
+    let out = run_tool(
+        "fs_read.sh",
+        &pr.root,
+        &[("path", &stale.to_string_lossy())],
+        &vars,
+        &cache,
+    );
+    assert!(
+        out.contains("Refused:") && out.contains("pr-review-billing-1001/internal/plan.go"),
+        "a read in the stale clone must be redirected to the review checkout: {out}"
     );
     let out = run_tool(
         "fs_read.sh",
@@ -940,7 +1046,12 @@ fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
     let mut state = facts(&pr);
     state["findings"] = json!([
         finding("fabricated", "🔴 CRITICAL", "internal/plan.go", "45-50"),
-        finding("generated", "🔴 CRITICAL", "gen/go/admin/v1/service.pb.go", "1"),
+        finding(
+            "generated",
+            "🔴 CRITICAL",
+            "gen/go/admin/v1/service.pb.go",
+            "1"
+        ),
         finding("real", "🔴 CRITICAL", "internal/plan.go", "5")
     ]);
     let anchored = run_script("code-reviewer/scripts/anchor_gate.py", &state);
@@ -971,7 +1082,10 @@ fn synthesis_and_reviewer_wording_is_in_place() {
         "next: anchor_gate",
         "script: scripts/anchor_gate.py",
     ] {
-        assert!(graph.contains(needle), "code-reviewer graph.yaml lacks {needle:?}");
+        assert!(
+            graph.contains(needle),
+            "code-reviewer graph.yaml lacks {needle:?}"
+        );
     }
     for rel in ["domain-reviewer/config.yaml", "file-reviewer/config.yaml"] {
         let text = read(rel);
