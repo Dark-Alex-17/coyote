@@ -25,5 +25,5 @@ expression: frame
 "> beta                                                                          "
 "  gamma                                                                         "
 "  Other (custom)                                                                "
-"Up/Down = move  Enter = choose  1-9 = choose by number  Esc = cancel            "
+"Up/Down = move  Enter = choose  Esc = cancel                                    "
 "openai:test-model . no session . agents 0 . jobs 0                              "

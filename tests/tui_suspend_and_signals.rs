@@ -519,6 +519,12 @@ fn enter_on_a_draft_while_a_tool_sleeps_queues_it_and_the_model_gets_it_next_rou
         2,
         "the queued line did not ride into the tool round as a notification"
     );
+    let bodies = fake.bodies();
+    assert!(
+        bodies[1].contains("draft-r12-d"),
+        "the queued line is missing from the model's second request:\n{}",
+        bodies[1]
+    );
 
     // Ctrl+L repaints the whole screen, so what follows is the current
     // frame alone: no strip, and no draft left in the field.

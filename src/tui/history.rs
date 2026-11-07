@@ -8,6 +8,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::utils::fs::write_private_atomic;
+
 const CAPACITY: usize = 1000;
 const NEWLINE_ESCAPE: &str = "<\\n>";
 
@@ -50,8 +52,9 @@ fn push_entry(entries: &mut Vec<String>, line: &str) {
     cap(entries);
 }
 
-/// Records `line` in the file at `path`, creating it and its directory
-/// as needed and dropping the oldest entries past the capacity.
+/// Records `line` in the file at `path`, creating it (owner-only) and
+/// its directory as needed and dropping the oldest entries past the
+/// capacity. Prompts can carry secrets, so the file is never world-readable.
 pub(crate) fn append(path: &Path, line: &str) -> io::Result<()> {
     let mut entries = read_entries(path)?;
     push_entry(&mut entries, line);
@@ -63,7 +66,7 @@ pub(crate) fn append(path: &Path, line: &str) -> io::Result<()> {
         text.push_str(&encode_entry(entry));
         text.push('\n');
     }
-    fs::write(path, text)
+    write_private_atomic(path, &text)
 }
 
 /// The entries in memory and the walk through them: `cursor` is the
@@ -157,6 +160,18 @@ mod tests {
         assert_eq!(text, "first\ntwo<\\n>lines\nlast\n");
         let history = ComposerHistory::load(&path).unwrap();
         assert_eq!(history.entries, ["first", "two\nlines", "last"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDirGuard::new("history-mode");
+        let path = dir.path.join("history");
+        append(&path, "secret prompt").unwrap();
+        append(&path, "another").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
     }
 
     #[test]

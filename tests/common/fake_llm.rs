@@ -1,8 +1,8 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -41,6 +41,7 @@ pub enum Chunk {
 pub struct FakeLlm {
     port: u16,
     served: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -50,15 +51,18 @@ impl FakeLlm {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
         let port = listener.local_addr().unwrap().port();
         let served = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = thread::spawn({
             let served = Arc::clone(&served);
+            let bodies = Arc::clone(&bodies);
             let stop = Arc::clone(&stop);
-            move || serve(listener, &replies, &served, &stop)
+            move || serve(listener, &replies, &served, &bodies, &stop)
         });
         FakeLlm {
             port,
             served,
+            bodies,
             stop,
             thread: Some(thread),
         }
@@ -70,6 +74,11 @@ impl FakeLlm {
 
     pub fn served(&self) -> usize {
         self.served.load(Ordering::SeqCst)
+    }
+
+    /// The JSON body of every request answered so far, in arrival order.
+    pub fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().unwrap().clone()
     }
 }
 
@@ -84,7 +93,13 @@ impl Drop for FakeLlm {
     }
 }
 
-fn serve(listener: TcpListener, replies: &[Reply], served: &AtomicUsize, stop: &AtomicBool) {
+fn serve(
+    listener: TcpListener,
+    replies: &[Reply],
+    served: &AtomicUsize,
+    bodies: &Mutex<Vec<String>>,
+    stop: &AtomicBool,
+) {
     let fallback = Reply::Text("fake llm: no reply scripted".to_string());
     for conn in listener.incoming() {
         if stop.load(Ordering::SeqCst) {
@@ -100,6 +115,7 @@ fn serve(listener: TcpListener, replies: &[Reply], served: &AtomicUsize, stop: &
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let response = match read_chat_request(&mut stream) {
             Ok(body) => {
+                bodies.lock().unwrap().push(body.to_string());
                 let n = served.fetch_add(1, Ordering::SeqCst);
                 let reply = replies.get(n).unwrap_or(&fallback);
                 match (reply, body["stream"] == Value::Bool(true)) {

@@ -220,7 +220,7 @@ const LATE_OUTPUT_LIMIT: usize = 64 * 1024;
 /// terminal is tall enough.
 const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
-const SELECT_HINT: &str = "Up/Down = move  Enter = choose  1-9 = choose by number  Esc = cancel";
+const SELECT_HINT: &str = "Up/Down = move  Enter = choose  Esc = cancel";
 const CHECKBOX_HINT: &str = "Space = tick  Up/Down = move  Enter = answer  Esc = cancel";
 /// The last row of a select: the REPL's prompter appends the same entry,
 /// and choosing it opens a free-text field in the list's place.
@@ -954,7 +954,7 @@ impl App {
         Ok(Self {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
-            composer: Composer::new(background),
+            composer: Composer::new(background, config.command_prefix),
             queued: Vec::new(),
             prompts: VecDeque::new(),
             lend_requests: Vec::new(),
@@ -1026,6 +1026,7 @@ impl App {
                 }
                 Err(err) => warn!("Keeping the previous render options: {err}"),
             }
+            self.composer.set_command_prefix(config.command_prefix);
             self.config = Arc::clone(&ctx.app.config);
             self.vi_mode = match (vi_mode(&self.config), self.vi_mode) {
                 (Some(_), Some(current)) => Some(current),
@@ -8599,6 +8600,19 @@ mod tests {
         assert!(
             enter < stream,
             "the event stream took stdin before the probe"
+        );
+    }
+
+    /// Two event streams alive at once both read stdin, so the one being
+    /// replaced must be dropped before its successor is created.
+    #[test]
+    fn renew_stream_drops_the_old_stream_before_opening_the_new_one() {
+        let renew = fn_body(include_str!("mod.rs"), "fn renew_stream(");
+        let dropped = renew.find("drop(stream.take())").unwrap();
+        let opened = renew.find("EventStream::new()").unwrap();
+        assert!(
+            dropped < opened,
+            "the new event stream was opened while the old one still held stdin"
         );
     }
 }

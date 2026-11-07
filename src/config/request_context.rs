@@ -4249,6 +4249,7 @@ impl RequestContext {
         if self.macro_flag {
             bail!("No macro");
         }
+        crate::tui::ensure_terminal_lendable()?;
         let ans = self
             .prompt(self.prompt_request(
                 PromptAction::Confirm,
@@ -6893,6 +6894,7 @@ impl RequestContext {
     }
 
     fn upsert_role(&self, app: &AppConfig, name: &str) -> Result<()> {
+        crate::tui::ensure_terminal_lendable()?;
         let role_path = paths::role_file(name);
         ensure_parent_exists(&role_path)?;
         let editor = app.editor()?;
@@ -11984,6 +11986,34 @@ mod tests {
             leftovers.is_empty(),
             "the failed lend left the editor's temp file behind: {leftovers:?}"
         );
+    }
+
+    /// `.role <new>` and `.macro new` open the editor on a file under the
+    /// roles or macros dir; with nobody lending the terminal the failure
+    /// comes before anything is written, so a failed lend leaves no
+    /// half-made role or macro behind.
+    #[test]
+    #[serial]
+    fn upsert_role_and_new_macro_without_a_lender_fails_before_creating_anything() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]));
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        assert_no_lender_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
+        assert_no_lender_under_the_tui(ctx.new_macro(&app, "tui-refused-macro").unwrap_err());
+
+        for dir in [paths::roles_dir(), paths::macros_dir()] {
+            let written: Vec<PathBuf> = read_dir(&dir)
+                .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+                .unwrap_or_default();
+            assert!(
+                written.is_empty(),
+                "the failed lend wrote under {}: {written:?}",
+                dir.display()
+            );
+        }
     }
 
     /// `.macro new` asks `Create a new macro?` through the prompter; a

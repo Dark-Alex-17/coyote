@@ -16,7 +16,6 @@ use ratatui::widgets::{Block, Borders, Widget};
 use ratatui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
-const PLACEHOLDER: &str = "Type a prompt or a .command; Enter sends";
 /// The rule's title while the vi layer is in normal mode.
 pub(super) const NORMAL_TAG: &str = " NORMAL ";
 /// Text rows the field shows, before the rule above them.
@@ -29,6 +28,13 @@ const UNKNOWN_COLOR: Color = Color::Red;
 const SURFACE_NUDGE: u8 = 12;
 const DARK_FALLBACK: Color = Color::Indexed(236);
 const LIGHT_FALLBACK: Color = Color::Indexed(254);
+
+fn placeholder(prefix: CommandPrefix) -> String {
+    format!(
+        "Type a prompt or a {}command; Enter sends",
+        prefix.display()
+    )
+}
 
 /// The field's fill: the transcript theme's background nudged a step
 /// towards the text, which only an RGB-capable terminal can show; every
@@ -58,20 +64,22 @@ pub(super) fn field_background(config: &AppConfig, options: &RenderOptions) -> C
 pub(super) struct Composer {
     textarea: TextArea<'static>,
     background: Color,
+    prefix: CommandPrefix,
 }
 
 impl Composer {
-    pub(super) fn new(background: Color) -> Self {
+    pub(super) fn new(background: Color, prefix: CommandPrefix) -> Self {
         Self {
-            textarea: Self::textarea(Vec::new()),
+            textarea: Self::textarea(Vec::new(), prefix),
             background,
+            prefix,
         }
     }
 
-    fn textarea(lines: Vec<String>) -> TextArea<'static> {
+    fn textarea(lines: Vec<String>, prefix: CommandPrefix) -> TextArea<'static> {
         let mut textarea = TextArea::new(lines);
         textarea.set_cursor_line_style(Style::new());
-        textarea.set_placeholder_text(PLACEHOLDER);
+        textarea.set_placeholder_text(placeholder(prefix));
         textarea.set_placeholder_style(DIM);
         textarea
     }
@@ -80,19 +88,24 @@ impl Composer {
         self.background = background;
     }
 
+    pub(super) fn set_command_prefix(&mut self, prefix: CommandPrefix) {
+        self.prefix = prefix;
+        self.textarea.set_placeholder_text(placeholder(prefix));
+    }
+
     pub(super) fn text(&self) -> String {
         self.textarea.lines().join("\n")
     }
 
     /// Replaces the draft and puts the cursor after its last character.
     pub(super) fn set_text(&mut self, text: &str) {
-        self.textarea = Self::textarea(text.split('\n').map(str::to_string).collect());
+        self.textarea = Self::textarea(text.split('\n').map(str::to_string).collect(), self.prefix);
         self.textarea.move_cursor(CursorMove::Bottom);
         self.textarea.move_cursor(CursorMove::End);
     }
 
     pub(super) fn clear(&mut self) {
-        self.textarea = Self::textarea(Vec::new());
+        self.textarea = Self::textarea(Vec::new(), self.prefix);
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -256,7 +269,7 @@ mod tests {
     const BACKGROUND: Color = Color::Indexed(236);
 
     fn render(text: &str, prefix: CommandPrefix, extra_known: &[&str], no_color: bool) -> Buffer {
-        let mut composer = Composer::new(BACKGROUND);
+        let mut composer = Composer::new(BACKGROUND, prefix);
         composer.set_text(text);
         let mut buf = Buffer::empty(AREA);
         composer
@@ -304,6 +317,25 @@ mod tests {
     }
 
     #[test]
+    fn the_placeholder_names_the_configured_sigil() {
+        let composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        assert_eq!(
+            composer.textarea.placeholder_text(),
+            "Type a prompt or a .command; Enter sends"
+        );
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Slash);
+        assert_eq!(
+            composer.textarea.placeholder_text(),
+            "Type a prompt or a /command; Enter sends"
+        );
+        composer.set_text("draft");
+        composer.clear();
+        assert!(composer.textarea.placeholder_text().contains("/command"));
+        composer.set_command_prefix(CommandPrefix::Both);
+        assert!(composer.textarea.placeholder_text().contains(".command"));
+    }
+
+    #[test]
     fn the_rule_and_the_surface_frame_the_field() {
         let buf = render("hi", CommandPrefix::Dot, &[], false);
         assert_eq!(buf[(0, 0)].symbol(), HORIZONTAL);
@@ -324,7 +356,7 @@ mod tests {
 
     #[test]
     fn a_draft_scrolled_past_its_first_line_shows_no_command() {
-        let mut composer = Composer::new(BACKGROUND);
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         composer.set_text(&[".info x", "a", "b", "c", "d", "e"].join("\n"));
         let mut buf = Buffer::empty(AREA);
         composer
@@ -336,7 +368,7 @@ mod tests {
 
     #[test]
     fn normal_mode_titles_the_rule() {
-        let composer = Composer::new(BACKGROUND);
+        let composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         let mut buf = Buffer::empty(AREA);
         composer
             .view(CommandPrefix::Dot, &[], false, true)
@@ -348,7 +380,7 @@ mod tests {
 
     #[test]
     fn the_vi_edits_move_and_delete_in_the_draft() {
-        let mut composer = Composer::new(BACKGROUND);
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         composer.set_text("one two\nthree");
         composer.move_cursor(ViMotion::Up);
         composer.move_cursor(ViMotion::Head);
@@ -375,7 +407,7 @@ mod tests {
 
     #[test]
     fn deleting_a_line_takes_only_that_line() {
-        let mut composer = Composer::new(BACKGROUND);
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         composer.set_text("one\n\nthree");
         composer.move_cursor(ViMotion::Up);
         composer.delete_line();
@@ -398,7 +430,7 @@ mod tests {
 
     #[test]
     fn the_rows_follow_the_draft_between_the_bounds_plus_the_rule() {
-        let mut composer = Composer::new(BACKGROUND);
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         assert_eq!(composer.rows(), MIN_ROWS + 1);
         composer.set_text(&["x"; 5].join("\n"));
         assert_eq!(composer.rows(), 6);
