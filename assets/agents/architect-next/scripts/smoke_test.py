@@ -1504,6 +1504,12 @@ check("wave retry: compose_delegation delegates into the task's worktree - deleg
       and f"ALL code you WRITE goes in {WAVE[0]['worktree']}" in U_RETRY["delegation_prompt"], U_RETRY.get("delegate_project_dir"))
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=0))
 check("wave_route: findings -> one in-branch fix round (B13 side 1) with the prior report", u["_next"] == "wave_delegate" and "## FIX ROUND 1" in u["wtask"]["prompt"] and u["wave_fix_rounds"] == 1)
+OLD_ITEM = {k: v for k, v in WAVE[0].items() if k != "review_cadence"}
+u_std = gates.wave_route(base_state(wtask=OLD_ITEM, wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=0))
+u_mic = gates.wave_route(base_state(wtask=OLD_ITEM, wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=0, task_granularity="micro"))
+check("wave_route: a fix-round item from an older snapshot (no review_cadence) -> defaulted, task when standard, batch when micro",
+      "review_cadence" not in OLD_ITEM and u_std["wtask"].get("review_cadence") == "task" and u_mic["wtask"].get("review_cadence") == "batch",
+      (u_std.get("wtask", {}).get("review_cadence"), u_mic.get("wtask", {}).get("review_cadence")))
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=1))
 check("wave_route: B13 used -> needs_escalation (deferred to the wave boundary, E7/V7)", u["wave_result"]["status"] == "needs_escalation" and u["wave_result"]["escalation"]["kind"] == "conformance_stuck")
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report="SISYPHUS_FAILED", wave_gauntlet_result=""))

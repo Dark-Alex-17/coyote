@@ -1035,10 +1035,11 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
 /// relayed to the owner instead of the oracle, the relay parked at once
 /// whatever the policy, the child's exact parent-resume form, the delegation
 /// kind restored after the resumed child returns, the sentinel read only at the
-/// start of a line, the opening-lines heuristic anchored the same way, and a
-/// retried wave member delegated into its own worktree.
+/// start of a line, the opening-lines heuristic anchored the same way, a
+/// retried wave member delegated into its own worktree, and the review cadence
+/// defaulted on a wave fix-round item from an older snapshot.
 #[test]
-#[ignore = "seven smoke battery runs take about a minute; run with -- --ignored"]
+#[ignore = "eight smoke battery runs take about a minute; run with -- --ignored"]
 fn relay_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
@@ -1100,6 +1101,14 @@ fn relay_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "    pd = state.get(\"code_repo_path\", \"\")\n",
                 "wave retry: compose_delegation delegates into the task's worktree - \
                  delegate_project_dir and the prompt's code dir agree",
+            ),
+            (
+                "snapshot-cadence",
+                "        fixed.setdefault(\"review_cadence\", \"batch\" if is_micro(state) else \
+                 \"task\")  # a wave item from an older snapshot\n",
+                "        pass\n",
+                "wave_route: a fix-round item from an older snapshot (no review_cadence) -> \
+                 defaulted, task when standard, batch when micro",
             ),
         ],
     );
