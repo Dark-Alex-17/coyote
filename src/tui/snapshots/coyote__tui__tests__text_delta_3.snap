@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 3426
 expression: rendered
 ---
 "> tell me a story                                                               "
@@ -20,8 +21,8 @@ expression: rendered
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
 "Working . 0s  Esc to interrupt                                                  "
+"────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                       "
 "                                                                                "
 "                                                                                "
