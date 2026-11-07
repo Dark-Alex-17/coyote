@@ -14,7 +14,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
-use common::fake_llm::{FakeLlm, Reply};
+use common::fake_llm::{Chunk, FakeLlm, Reply};
 use common::pty::{Pty, strip_ansi};
 use serial_test::serial;
 
@@ -793,6 +793,124 @@ fn esc_closes_the_palette_without_interrupting_or_clearing_focus() {
 
     pty.send(b"\x03").unwrap();
     pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
+/// A streamed reply held open at `release` with no tool call in it, so
+/// the driver has no round at which to hand a queued line to the model.
+fn held_stream(release: &Path) -> Reply {
+    Reply::Streamed(vec![
+        Chunk::Text("first half q9d-m".to_string()),
+        Chunk::WaitFor(release.to_path_buf()),
+        Chunk::Text(" tail q9d-t".to_string()),
+    ])
+}
+
+/// Starts a turn on the held stream and queues `line` behind it; the
+/// preview shows the line held and the model has had its one request.
+fn queue_behind_held_stream(pty: &mut Pty, fake: &FakeLlm, line: &[u8]) {
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"stream and hold\r").unwrap();
+    wait_for_squeezed(pty, "first half q9d-m", "the first delta");
+    pty.send(line).unwrap();
+    pty.wait_for("pending: 1", PTY_DEADLINE)
+        .expect("the preview never showed the queued line");
+    assert_eq!(fake.served(), 1, "the queued line went out mid-stream");
+}
+
+/// Where each marker first appears in `frame` with whitespace squeezed
+/// out, so the order of transcript cells can be compared no matter how
+/// the rows wrapped.
+fn squeezed_positions<const N: usize>(frame: &str, markers: [&str; N]) -> [usize; N] {
+    let squeezed: String = frame.chars().filter(|c| !c.is_whitespace()).collect();
+    markers.map(|marker| {
+        squeezed
+            .find(marker)
+            .unwrap_or_else(|| panic!("`{marker}` is not on the screen:\n{frame}"))
+    })
+}
+
+/// A prompt queued while the model streams, with no tool round for the
+/// driver to hand it over at, becomes the next turn's prompt once the
+/// reply ends: the second request goes out only after the first reply,
+/// the line sits as a user cell between the two replies, and the
+/// preview is gone.
+#[test]
+#[serial]
+fn a_queued_prompt_the_model_never_got_becomes_the_next_prompt() {
+    let dir = fresh_config_dir("queued-next-prompt");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("release");
+    let fake = FakeLlm::start(vec![
+        held_stream(&release),
+        Reply::Text("second reply q9d-s".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+    queue_behind_held_stream(&mut pty, &fake, b"follow-up q9d-n\r");
+
+    fs::write(&release, "").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "second reply q9d-s",
+        "the reply to the queued prompt",
+    );
+    assert_eq!(fake.served(), 2);
+    pty.read_for(Duration::from_millis(500));
+    let repainted = repaint(&mut pty, 40, 101);
+    let frame = since(&pty, repainted);
+    let [tail, header, second] =
+        squeezed_positions(&frame, ["tailq9d-t", ">follow-upq9d-n", "secondreplyq9d-s"]);
+    assert!(
+        tail < header && header < second,
+        "the queued line is not a prompt between the two replies:\n{frame}"
+    );
+    assert!(
+        !frame.contains("pending:"),
+        "the preview outlived the queued line:\n{frame}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
+/// A command queued while the model streams never goes to the model: it
+/// runs as a turn of its own once the reply ends, its header and output
+/// after the reply, with no second request.
+#[test]
+#[serial]
+fn a_queued_command_runs_as_its_own_turn_after_the_reply() {
+    let dir = fresh_config_dir("queued-command");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("release");
+    let fake = FakeLlm::start(vec![held_stream(&release)]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+    queue_behind_held_stream(&mut pty, &fake, b".info\r");
+
+    let released_at = pty.raw().len();
+    fs::write(&release, "").unwrap();
+    pty.wait_for_after("log_path", released_at, PTY_DEADLINE)
+        .expect("the queued `.info` never ran");
+    pty.read_for(Duration::from_millis(500));
+    // Tall enough for the `.info` table to leave the reply above it on
+    // screen.
+    let repainted = repaint(&mut pty, 80, 101);
+    let frame = since(&pty, repainted);
+    let [tail, header, output] = squeezed_positions(&frame, ["tailq9d-t", ">.info", "log_path"]);
+    assert!(
+        tail < header && header < output,
+        "the queued command did not run as its own turn after the reply:\n{frame}"
+    );
+    assert_eq!(fake.served(), 1, "a command reached the model");
+    assert!(
+        !frame.contains("pending:"),
+        "the preview outlived the queued command:\n{frame}"
+    );
+
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
