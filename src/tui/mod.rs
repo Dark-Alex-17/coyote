@@ -2886,17 +2886,10 @@ fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> (usize, Option<any
 /// command row holds the command, which the session never did.
 fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
     let chosen = target.rows.len();
-    let cut = if ctx.session.is_some() {
-        let (popped, stopped) = rewind_exchanges(ctx, chosen);
-        if let Some(err) = stopped {
-            app.handle_msg(UiMsg::Notice {
-                kind: NoticeKind::ToolWarning,
-                text: format!("Rewind stopped: {err}"),
-            });
-        }
-        popped
+    let (cut, stopped) = if ctx.session.is_some() {
+        rewind_exchanges(ctx, chosen)
     } else {
-        chosen
+        (chosen, None)
     };
     app.sync_from_ctx(ctx);
     if let Some(row) = cut
@@ -2905,6 +2898,14 @@ fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
     {
         app.transcript.truncate(row.opener);
         app.set_composer_text(&row.title);
+    }
+    // The notice is a transcript cell, so it goes in after the cut or
+    // the cut would take it with the exchanges.
+    if let Some(err) = stopped {
+        app.handle_msg(UiMsg::Notice {
+            kind: NoticeKind::ToolWarning,
+            text: format!("Rewind stopped: {err}"),
+        });
     }
 }
 
@@ -8344,7 +8345,6 @@ mod tests {
     #[test]
     #[serial]
     fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
-        let _tmp = crate::testing::TempDirGuard::new("lent-editor");
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let (_lender, lent) = test_lender();
         let code = crate::utils::run_command("sh", &["-c", "exit 7"], None).unwrap();
@@ -8353,7 +8353,9 @@ mod tests {
 
         let path = crate::utils::temp_file("-lent-editor-", ".txt");
         crate::utils::edit_file("touch", &path).unwrap();
-        assert!(path.is_file(), "{}", path.display());
+        let touched = path.is_file();
+        let _ = std::fs::remove_file(&path);
+        assert!(touched, "{}", path.display());
         assert_eq!(lent.load(Ordering::SeqCst), 2);
     }
 
@@ -8364,7 +8366,6 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_file_writing_loader_still_runs_under_the_tui() {
-        let _tmp = crate::testing::TempDirGuard::new("loader-source");
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let source = crate::utils::temp_file("-loader-source-", ".txt");
         std::fs::write(&source, "loaded under the tui x7x\n").unwrap();
@@ -8373,9 +8374,9 @@ mod tests {
             "txt",
             "sh -c \"cat $1 - > $2\"",
         )
-        .await
-        .unwrap();
-        assert_eq!(loaded, "loaded under the tui x7x\n");
+        .await;
+        let _ = std::fs::remove_file(&source);
+        assert_eq!(loaded.unwrap(), "loaded under the tui x7x\n");
     }
 
     /// A task id in the source names the owner of a debt marker and
