@@ -183,7 +183,13 @@ impl Server {
     pub(crate) fn reply(&self, id: &str, answer: &Value) {
         let mut line = json!({"id": id, "answer": answer}).to_string();
         line.push('\n');
-        self.shared.delivery.lock().unwrap().lines.push_back(line);
+        let mut delivery = self.shared.delivery.lock().unwrap();
+        if delivery.closed {
+            warn!("Unable to write the prompt reply for '{id}': the reply pipe is gone");
+            return;
+        }
+        delivery.lines.push_back(line);
+        drop(delivery);
         self.shared.wake.notify_all();
     }
 }
@@ -215,12 +221,16 @@ fn deliver_lines(
 ) {
     let mut listener = Some(first);
     loop {
+        // With no listener ahead, no instance of the name is alive, so the
+        // replacement claims the name again rather than joining a pipe
+        // somebody else created under it meanwhile.
         let pipe = match listener.take() {
             Some(pipe) => pipe,
-            None => match win::create_instance(name, false, descriptor) {
+            None => match win::create_instance(name, true, descriptor) {
                 Ok(pipe) => pipe,
                 Err(err) => {
                     warn!("Unable to create a prompt reply pipe instance: {err}");
+                    shared.delivery.lock().unwrap().closed = true;
                     return;
                 }
             },
@@ -489,7 +499,10 @@ mod win {
     /// Writes `line` and returns once the client has read every byte of
     /// it, so the line is known to have arrived before it leaves the
     /// queue. The helpers read a byte at a time up to the newline, so the
-    /// flush does not wait on bytes the client will never ask for.
+    /// flush does not wait on bytes the client will never ask for. A client
+    /// that closes before reading makes the write or the flush fail, which
+    /// is what keeps the line at the front of the queue for the next one;
+    /// `each_reopen_of_the_pipe_receives_the_next_queued_line` pins it.
     pub(super) fn deliver(pipe: &OwnedHandle, line: &[u8]) -> io::Result<()> {
         let mut rest = line;
         while !rest.is_empty() {

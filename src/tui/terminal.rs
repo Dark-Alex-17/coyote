@@ -362,10 +362,9 @@ mod console {
     }
 }
 
-/// Switches escape processing on for the recorded console if something
-/// (a child, a `SetStdHandle` swap that made crossterm's own attempt land
-/// on a pipe) left it off. A no-op before `Screen::enter`, after the
-/// `Screen` is gone, and when the handle is not a console.
+/// Switches escape processing on for the recorded console if a child the
+/// UI ran left it off. A no-op before `Screen::enter`, after the `Screen`
+/// is gone, and when the handle is not a console.
 #[cfg(windows)]
 fn ensure_vt_processing() {
     let handle = CONSOLE_HANDLE.load(Ordering::SeqCst);
@@ -908,6 +907,8 @@ impl Screen {
     }
 
     pub(crate) fn clear(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        ensure_vt_processing();
         repaint_from_scratch(&mut self.terminal)
     }
 
