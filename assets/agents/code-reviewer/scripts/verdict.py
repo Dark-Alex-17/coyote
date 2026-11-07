@@ -11,7 +11,11 @@ The model that wrote the findings never grades its own homework:
 Fail-closed: any PIPELINE-FAULT recorded upstream (dead domain lane, dead
 verifier, verifier verdicts carrying a PIPELINE-FAULT note or the
 `pipeline-fault` sentinel id, dead synthesis, missing domain reports)
-forces NEEDS-HUMAN — a degraded run can never read MERGE-READY. Faults
+forces NEEDS-HUMAN. A 🔴/🟡 finding whose verification did not complete (a
+dead or degraded verifier, a faulted verdict, no verdict at all) is never
+blocking: it moves to the `unverified` section and the reason opens with
+`review incomplete:`, so a degraded round cannot read as a list of defects
+to fix — a degraded run can never read MERGE-READY. Faults
 always lead the attention list; the display cap applies only to the
 non-fault entries so a degraded run can never hide a fault.
 The gate never crashes into a silent verdict: any internal error emits
@@ -77,28 +81,45 @@ def main():
     verifier_entries = parse_verifier_entries(state.get("verifier_output"))
     verdicts = parse_verifier(verifier_entries)
 
+    verifier_raw = state.get("verifier_output")
+    verifier_dead = isinstance(verifier_raw, str) and verifier_raw.lstrip().startswith(
+        "Agent node failed:"
+    )
+    verified_nothing = any(v.get("id") == "pipeline-fault" for v in verifier_entries)
+
+    def is_fault_note(v):
+        return isinstance(v.get("note"), str) and v["note"].lstrip().startswith("PIPELINE-FAULT:")
+
     kept, dropped_titles = [], []
     for f in findings:
         icon = sev_icon(f.get("severity"))
         v = verdicts.get(str(f.get("id")))
         block = f.get("block") or f"#### {f.get('title', '(untitled)')}"
+        incomplete = False
+        if icon in ("🔴", "🟡"):
+            # Verification that did not complete leaves the finding unverified,
+            # and an unverified finding is never reported as blocking.
+            incomplete = verifier_dead or verified_nothing or not v or is_fault_note(v)
         if v and icon in ("🔴", "🟡"):
-            if v.get("verdict") == "FALSE":
+            if v.get("verdict") == "FALSE" and not incomplete:
                 dropped_titles.append(f.get("title", f.get("id", "?")))
                 continue
-            if v.get("verdict") == "VERIFIED" and v.get("evidence"):
+            if v.get("verdict") == "VERIFIED" and v.get("evidence") and not incomplete:
                 block += f"\n- **Evidence** (verifier): {v['evidence']}"
-            elif v.get("verdict") == "UNVERIFIABLE":
+            elif v.get("verdict") == "UNVERIFIABLE" or incomplete:
                 block += "\n- *(unverified: " + (v.get("note") or "could not be established") + ")*"
         elif icon in ("🔴", "🟡") and not v:
             block += "\n- *(unverified: no verifier verdict returned for this finding)*"
-        kept.append({**f, "icon": icon, "block": block})
+        kept.append({**f, "icon": icon, "block": block, "verification_incomplete": incomplete})
 
     # --- rigor folding (arithmetic, never rewrites severities) --------------
     for f in kept:
         marker = (f.get("marker") or "").lower()
         icon = f["icon"]
         section = "blocking"
+        if f["verification_incomplete"]:
+            f["section"] = "unverified"
+            continue
         if icon == "🔴":
             section = "blocking"
         elif rigor == "prototype" and ((icon == "🟡" and marker == "convention") or icon == "🟢"):
@@ -112,6 +133,7 @@ def main():
     final = [f for f in kept if f["section"] != "dropped-by-poc"]
     blocking = [f for f in final if f["section"] == "blocking"]
     deferred = [f for f in final if f["section"] == "deferred"]
+    unverified = [f for f in final if f["section"] == "unverified"]
 
     counts = {i: sum(1 for f in blocking if f["icon"] == i) for i in ("🔴", "🟡", "🟢", "💡")}
     yellow_correctness = sum(
@@ -148,8 +170,7 @@ def main():
             f"PIPELINE-FAULT: {faulted} of {len(reports)} domain review lane(s) "
             "failed after retries — their slices were not reviewed"
         )
-    verifier_raw = state.get("verifier_output")
-    if isinstance(verifier_raw, str) and verifier_raw.lstrip().startswith("Agent node failed:"):
+    if verifier_dead:
         faults.append(
             "PIPELINE-FAULT: finding verification failed — findings render as unverified"
         )
@@ -189,8 +210,8 @@ def main():
     if soft_fv:
         soft_notes.append(
             f"Verifier: {len(soft_fv)} finding(s) could not be verified (verifier "
-            f"branch fault: {_fv_detail(soft_fv)}) — they stand above UNVERIFIED; "
-            "verify them manually"
+            f"branch fault: {_fv_detail(soft_fv)}); they are listed under the "
+            "unverified findings, not as blocking; verify them manually"
         )
     # Files beyond facts.py's 300-file cap were never grouped or reviewed —
     # disclose the gap and force NEEDS-HUMAN with wording that does NOT match
@@ -221,9 +242,22 @@ def main():
     # faults go FIRST and uncapped so the display cap can never hide one;
     # the trigger reason keys off the human-facing triggers alone
     has_triggers = bool(attention)
-    attention = faults + soft_notes + coverage_notes + attention[:5]
+    incomplete_notes = []
+    if unverified:
+        incomplete_notes.append(
+            f"Review incomplete: finding verification did not complete, so {len(unverified)} "
+            "finding(s) are listed under 'Unverified findings (verification incomplete)' and "
+            "are NOT blocking defects; re-run the review or check each one by hand"
+        )
+    attention = faults + incomplete_notes + soft_notes + coverage_notes + attention[:5]
 
     reasons = []
+    if unverified:
+        # CONTRACT: review-gauntlet/verdict_gate.py anchors on "review incomplete:"
+        reasons.append(
+            f"review incomplete: {len(unverified)} finding(s) unverified, listed "
+            "separately and not blocking"
+        )
     if counts["🔴"]:
         reasons.append(f"{counts['🔴']} 🔴 CRITICAL finding(s)")
     if yellow_correctness:
@@ -251,6 +285,7 @@ def main():
                     "reason": reason_line,
                     "counts": counts,
                     "deferred_count": len(deferred),
+                    "unverified_count": len(unverified),
                     "dropped_count": len(dropped_titles),
                     "dropped_titles": dropped_titles,
                     "attention": attention,

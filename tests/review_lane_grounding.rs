@@ -6,12 +6,16 @@
 //!   the review checkout and refuse a read inside another clone of the same
 //!   origin repository, while other repositories stay readable;
 //! - the review agents declare the `review_grounding` variable that turns the
-//!   guard on.
+//!   guard on;
+//! - code-reviewer fails closed when finding verification does not complete:
+//!   unverified findings are listed separately, never as blocking, and the
+//!   review gauntlet reads the lane as an incomplete review.
 //!
 //! The fixture mirrors the failure it guards against: a review checkout, a
 //! stale clone of the same repository in the working directory under the
 //! repository's name, and an unrelated shared library.
 
+use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -426,4 +430,199 @@ fn review_agents_declare_review_grounding_on_by_default() {
             "{tool} must ground its path argument"
         );
     }
+}
+
+fn python_available() -> bool {
+    let ok = which::which("python3").is_ok();
+    if !ok {
+        eprintln!("skipping: python3 not available");
+    }
+    ok
+}
+
+/// Runs a shipped graph script with `state` delivered via GRAPH_STATE_FILE.
+fn run_script(rel: &str, state: &Value) -> Value {
+    let dir = temp_dir("state");
+    let state_file = dir.0.join("state.json");
+    fs::write(&state_file, state.to_string()).unwrap();
+    let out = Command::new("python3")
+        .arg(manifest().join("assets/agents").join(rel))
+        .env("GRAPH_STATE_FILE", &state_file)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("GRAPH_STATE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{rel}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!("{rel} emitted invalid JSON ({e}): {}", String::from_utf8_lossy(&out.stdout))
+    })
+}
+
+fn critical(id: &str, file: &str, lines: &str) -> Value {
+    json!({
+        "id": id, "severity": "🔴 CRITICAL", "marker": "", "file": file, "lines": lines,
+        "title": format!("critical {id}"), "block": format!("#### critical {id}")
+    })
+}
+
+/// verdict.py, render.py and the gauntlet's verdict_gate.py over one state.
+fn review_round(mut state: Value) -> (Value, String, Value) {
+    let verdict = run_script("code-reviewer/scripts/verdict.py", &state)["verdict_out"].clone();
+    state["verdict_out"] = verdict.clone();
+    let report = run_script("code-reviewer/scripts/render.py", &state)["final_report"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let gauntlet = run_script(
+        "review-gauntlet/scripts/verdict_gate.py",
+        &json!({
+            "code_review_results": [report],
+            "adversary_results": [],
+            "security_results": [],
+            "probe_results": []
+        }),
+    );
+    (verdict, report, gauntlet)
+}
+
+fn no_blocking_criticals(label: &str, verdict: &Value, report: &str, gauntlet: &Value) {
+    assert_eq!(verdict["counts"]["🔴"], 0, "{label}: {verdict}");
+    assert!(
+        verdict["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("review incomplete:"),
+        "{label}: the reason must open with review incomplete: {verdict}"
+    );
+    assert!(
+        verdict["findings_final"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["section"] != "blocking"),
+        "{label}: no unverified finding may be blocking: {verdict}"
+    );
+    assert!(
+        report.contains("## Unverified findings (verification incomplete)"),
+        "{label}: {report}"
+    );
+    assert!(report.contains("found 0 critical"), "{label}: {report}");
+    let detailed = report
+        .split("## Detailed Findings")
+        .nth(1)
+        .unwrap()
+        .split("## Unverified findings")
+        .next()
+        .unwrap();
+    assert!(
+        detailed.contains("No blocking findings."),
+        "{label}: unverified findings must not render as detailed findings: {report}"
+    );
+    let text = gauntlet["gauntlet_report"].as_str().unwrap();
+    assert!(
+        !text.contains("🔴 CRITICAL finding(s)"),
+        "{label}: the gauntlet must not route unverified criticals as findings to fix: {text}"
+    );
+    assert_eq!(gauntlet["gauntlet_verdict"], "BLOCKED", "{label}: {gauntlet}");
+}
+
+/// The #1001 failure: the verifier faulted and the unverified criticals were
+/// posted as blockers. Every way verification can fail to complete yields no
+/// blocking finding and an explicit review incomplete.
+#[test]
+fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
+    if !python_available() {
+        return;
+    }
+    let base = json!({
+        "changed_files": ["internal/plan.go"],
+        "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+        "findings": [critical("f1", "internal/plan.go", "10-12"), critical("f2", "internal/plan.go", "20")]
+    });
+    let soft = r#"[{"id":"f1","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: verifier lane failed after retries"},{"id":"f2","verdict":"VERIFIED","evidence":"line 20","note":""}]"#;
+    let mut state = base.clone();
+    state["verifier_output"] = json!(soft);
+    let (verdict, report, gauntlet) = review_round(state);
+    assert_eq!(
+        verdict["counts"]["🔴"], 1,
+        "a verified critical still blocks beside an unverified one: {verdict}"
+    );
+    assert!(
+        verdict["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("review incomplete: 1 finding(s) unverified"),
+        "{verdict}"
+    );
+    assert!(report.contains("## Unverified findings (verification incomplete)"));
+    assert!(
+        gauntlet["gauntlet_incomplete_line"]
+            .as_str()
+            .unwrap()
+            .contains("GAUNTLET_REVIEW_INCOMPLETE: code-review"),
+        "an incomplete code review is named on the machine line: {gauntlet}"
+    );
+
+    for (label, verifier_output) in [
+        (
+            "per-finding faults",
+            json!(r#"[{"id":"f1","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"},{"id":"f2","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"}]"#),
+        ),
+        ("dead verifier", json!("Agent node failed: timed out")),
+        (
+            "verified nothing",
+            json!(r#"FINDING_VERIFIER_RESULTS
+[{"id":"pipeline-fault","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: parse failed"}]"#),
+        ),
+        ("no verdicts returned", json!("[]")),
+    ] {
+        let mut state = base.clone();
+        state["verifier_output"] = verifier_output;
+        let (verdict, report, gauntlet) = review_round(state);
+        no_blocking_criticals(label, &verdict, &report, &gauntlet);
+        let machine = gauntlet["gauntlet_incomplete_line"].as_str().unwrap();
+        let text = gauntlet["gauntlet_report"].as_str().unwrap();
+        assert!(
+            machine.contains("code-review") || text.contains("internal PIPELINE-FAULT"),
+            "{label}: the lane must read as incomplete or degraded, never as findings: {gauntlet}"
+        );
+    }
+}
+
+/// Control: a completed verification keeps its verified criticals blocking and
+/// drops the provably false ones, with no review-incomplete wording.
+#[test]
+fn completed_verification_keeps_verified_criticals_blocking() {
+    if !python_available() {
+        return;
+    }
+    let state = json!({
+        "changed_files": ["internal/plan.go"],
+        "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+        "findings": [critical("f1", "internal/plan.go", "10"), critical("f2", "internal/plan.go", "20")],
+        "verifier_output": r#"[{"id":"f1","verdict":"VERIFIED","evidence":"line 10","note":""},{"id":"f2","verdict":"FALSE","evidence":"","note":"no such call"}]"#
+    });
+    let (verdict, report, gauntlet) = review_round(state);
+    assert_eq!(verdict["counts"]["🔴"], 1, "{verdict}");
+    assert_eq!(verdict["dropped_count"], 1, "{verdict}");
+    assert!(
+        !verdict["reason"]
+            .as_str()
+            .unwrap()
+            .contains("review incomplete"),
+        "{verdict}"
+    );
+    assert!(!report.contains("## Unverified findings"), "{report}");
+    assert!(
+        gauntlet["gauntlet_report"]
+            .as_str()
+            .unwrap()
+            .contains("1 🔴 CRITICAL finding(s)"),
+        "{gauntlet}"
+    );
+    assert_eq!(gauntlet["gauntlet_incomplete_line"], "", "{gauntlet}");
 }

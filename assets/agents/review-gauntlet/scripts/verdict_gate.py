@@ -26,6 +26,11 @@ re-reads, no judgment. The gate's hard rules:
     of the lane's own verdict line — derived from render.py's deterministic
     summary line (`*Reviewed N files, found X critical, …*`); the raw 🔴
     count is used only when that summary line is missing;
+  - a code-review lane whose OWN verdict line opens a `review incomplete:`
+    reason (finding verification did not complete, so its unverified
+    findings sit in a separate section and count as no 🔴) is an incomplete
+    review: the row blocks and the lane is named on the
+    GAUNTLET_REVIEW_INCOMPLETE: machine line, never routed as findings to fix;
   - NEEDS-HUMAN without 🔴 passes but is surfaced as attention required;
   - probe INCONCLUSIVE blocks with an ENVIRONMENT note — it is never
     treated as PASS or FAIL (fix the environment per the plan's local-run
@@ -129,6 +134,9 @@ def main():
     state = load_state()
     blockers, attention, reports = [], [], []
     rows = {}
+    # lane -> the "Review incomplete" line for a lane that completed with a
+    # verdict but reported its own review as incomplete.
+    incomplete_detail = {}
     malformed = set()
     lane_attempts = state.get("lane_attempts")
     if not isinstance(lane_attempts, dict):
@@ -221,6 +229,23 @@ def main():
             re.MULTILINE,
         )
         reds = int(sums[-1]) if sums else cr.count("🔴")
+        # CONTRACT: code-reviewer/verdict.py emits this reason when finding
+        # verification did not complete; same first-verdict-line scoping.
+        m_incomplete = verdict_line and re.search(
+            r"^\*\*Verdict: NEEDS-HUMAN\*\* .*review incomplete: (\d+) finding",
+            verdict_line.group(0),
+        )
+        if m_incomplete and not m_fault:
+            n_unverified = m_incomplete.group(1)
+            incomplete_detail["code-review"] = (
+                f"code-review: finding verification did not complete; {n_unverified} "
+                "unverified finding(s) are listed separately in the lane report"
+            )
+            blockers.append(
+                f"code-review: review incomplete - finding verification did not complete; "
+                f"{n_unverified} unverified finding(s) are listed separately in the lane report "
+                "and are not blocking defects"
+            )
         if m_fault:
             blockers.append(
                 "code-review: the lane reported an internal PIPELINE-FAULT "
@@ -235,6 +260,10 @@ def main():
             record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane{suffix}); {reds} 🔴")
         elif m_fault:
             record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane{suffix})")
+        elif m_incomplete and reds:
+            record("code-review", "BLOCKED", f"review incomplete (verification); {reds} 🔴")
+        elif m_incomplete:
+            record("code-review", "BLOCKED", "review incomplete (verification)")
         elif reds:
             record("code-review", "BLOCKED", f"{reds} 🔴 finding(s)")
         elif m and m.group(1) == "MERGE-READY":
@@ -400,6 +429,7 @@ def main():
         malformed_bookkeeping = repr(declared)[:80]
     if debris_incomplete is not None:
         incomplete.add("debris")
+    incomplete.update(incomplete_detail)
     for lane in sorted(incomplete - {"pipeline"}):
         if rows.get(lane, ("", ""))[0] == "BLOCKED":
             continue
@@ -440,6 +470,8 @@ def main():
             )
         elif name == "debris" and debris_incomplete is not None:
             incomplete_lines.append(f"debris: {debris_incomplete}")
+        elif name in incomplete_detail:
+            incomplete_lines.append(incomplete_detail[name])
         elif n := attempt_count(name):
             incomplete_lines.append(f"{name}: no completed review after {n} attempt(s)")
         else:

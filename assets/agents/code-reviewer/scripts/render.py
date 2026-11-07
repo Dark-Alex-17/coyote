@@ -63,6 +63,7 @@ def main():
             desc_by_file[row["file"]] = row.get("desc", "")
     blocking = [f for f in findings if f.get("section") == "blocking"]
     deferred = [f for f in findings if f.get("section") == "deferred"]
+    unverified = [f for f in findings if f.get("section") == "unverified"]
     for f in changed:
         per = [x for x in blocking if x.get("file") == f]
         tally = " ".join(
@@ -83,6 +84,17 @@ def main():
                 lines += [x.get("block", ""), ""]
     else:
         lines += ["No blocking findings.", ""]
+    if unverified:
+        lines += [
+            "## Unverified findings (verification incomplete)",
+            "",
+            "Finding verification did not complete, so these findings were NOT verified and are "
+            "NOT blocking. Re-run the review or check each one against the code before acting "
+            "on it.",
+            "",
+        ]
+        for x in unverified:
+            lines += [x.get("block", ""), ""]
 
     lines += ["## Cross-File Concerns", state.get("cross_file") or "None", ""]
     if (state.get("operational_history") or "").strip():
