@@ -1141,14 +1141,22 @@ fn failure_sentinel_names_every_sisyphus_next_no_work_end() {
         if node["type"].as_str() != Some("end") {
             continue;
         }
-        let first = node["output"].as_str().unwrap_or("").lines().next().unwrap_or("");
+        let first = node["output"]
+            .as_str()
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("");
         if let Some(word) = first.trim().strip_prefix("SISYPHUS_")
             && word != "AWAITING_DISCUSSION"
         {
             named.insert(word.to_string());
         }
     }
-    assert!(named.contains("HANDOFF"), "sisyphus-next has no SISYPHUS_HANDOFF end: {named:?}");
+    assert!(
+        named.contains("HANDOFF"),
+        "sisyphus-next has no SISYPHUS_HANDOFF end: {named:?}"
+    );
     for word in &named {
         assert!(
             line.contains(&format!("|{word}")) || line.contains(&format!("({word}|")),

@@ -63,14 +63,14 @@ executes it. You two share artifacts, never transcripts.
 - When the conversation concludes that work should be DONE, produce a
   HANDOFF: write it to `plans/engineer-handoffs/<slug>.md` (create the
   directory; or the path the user names; never `plans/handoffs/`, which holds
-  a phased plan's numbered step handoffs), summarize it inline, and recommend the vehicle
-  with a stated sizing verdict: sisyphus for work that fits one run of up to
-  about 6 in-run subtasks, otherwise the architect (more subtasks, several PRs,
-  or batch/protected work). State the verdict as one line with the estimate and
-  its reason (for example "about 9 subtasks across 3 modules, needs a sealed
-  plan"); unsure: say why and let the user pick. The handoff is written to the
-  SEALED-CONTAINER standard: a fresh agent with ZERO access to this
-  conversation must be able to act on it alone.
+  a phased plan's numbered step handoffs), summarize it inline, and recommend
+  the vehicle with a stated sizing verdict: sisyphus for work that fits one run
+  of up to about 6 in-run subtasks, otherwise the architect (more subtasks,
+  several PRs, or batch/protected work). State the verdict as one line with the
+  estimate and its reason (for example "about 9 subtasks across 3 modules,
+  needs a sealed plan"); unsure: say why and let the user pick. The handoff is
+  written to the SEALED-CONTAINER standard: a fresh agent with ZERO access to
+  this conversation must be able to act on it alone.
   - Begin every handoff with this frontmatter, so an architect run started
     without a design doc can find it:
     ```
@@ -193,8 +193,9 @@ executes it. You two share artifacts, never transcripts.
   larger, say so with the estimate and its reason in one line (for example
   "about 9 subtasks across 3 modules, needs a sealed plan"). A top-level run
   that sizes it plan-shaped asks the user instead of refusing: hand it to the
-  architect (it writes a ready `vehicle: architect` handoff), do it here in up
-  to 6 subtasks, or narrow the scope.
+  architect (the run writes a ready `vehicle: architect` handoff), do it here in
+  up to 6 subtasks, or narrow the scope. Do-it-here is not offered again once
+  the in-run planner could not fit the work in 6.
 - When the last run's exposed `discussion` is non-empty, the run is parked on
   that question (`discussion.kind` names the escalation kind, any of them).
   Discuss it with the user using its question, its options (the recommended

@@ -1788,9 +1788,12 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
 /// option; only a top-level run asks the verdict, the verdict is a hard
 /// trigger, the handoff is a `vehicle: architect` seed architect-next's own
 /// `_find_seed` picks up, a planner overflow is asked about rather than
-/// redirected, and doing it here is not offered again after the overflow.
+/// redirected, and doing it here is not offered again after the overflow;
+/// then the fix-round guards: an empty reply never picks a hard trigger's
+/// recommendation, only an exact option picks a sizing answer, a delegated run
+/// writes no handoff, and a taken handoff name is never overwritten.
 #[test]
-#[ignore = "ten smoke battery runs take about two minutes; run with -- --ignored"]
+#[ignore = "fourteen smoke battery runs take about three minutes; run with -- --ignored"]
 fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     run_smoke_sabotages(
@@ -1826,9 +1829,38 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "choice-empty-recommended",
-                "        if not text and options and picker:\n",
+                "        if not text and options and picker and not esc.get(\"hard_trigger\"):\n",
                 "        if False:\n",
                 "choice: an empty picker reply after the re-asks takes the recommended option, ledgered",
+            ),
+            (
+                "hard-trigger-no-auto-pick",
+                "        if not text and options and picker and not esc.get(\"hard_trigger\"):\n",
+                "        if not text and options and picker:\n",
+                "sizing: an empty reply after the re-asks never picks the hard-trigger recommendation -> \
+                 end_redirect, no file",
+            ),
+            (
+                "sizing-exact-only",
+                "    return _exact_option(m.group(1) if m else reply, options)\n",
+                "    return next((o.get(\"text\") for o in options if o.get(\"text\", \"\").lower() in \
+                 reply.lower()), None) or _exact_option(m.group(1) if m else reply, options)\n",
+                "sizing: only an exact option counts - a negated reply naming the architect picks none \
+                 -> end_redirect, nothing written",
+            ),
+            (
+                "architect-top-level",
+                "        if picked == SIZING_ARCHITECT and not truthy(state.get(\"top_level\")):\n",
+                "        if False:\n",
+                "sizing: the architect option in a delegated run writes no handoff -> end_redirect, \
+                 ledgered",
+            ),
+            (
+                "handoff-no-overwrite",
+                "with open(path, \"x\", encoding=\"utf-8\", newline=\"\\n\") as f:",
+                "with open(path, \"w\", encoding=\"utf-8\", newline=\"\\n\") as f:",
+                "sizing: a second handoff with the same title gets the run id in its name, the first \
+                 left alone",
             ),
             (
                 "sizing-top-level",
@@ -3133,6 +3165,16 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("SUBTASK_MAX", "6"),
     ("TAIL_CHARS", "6000"),
 ];
+
+/// The pinned `SUBTASK_MAX`, so the prompt and engineer wording pins move with
+/// the bound instead of repeating its value.
+fn subtask_max_pin() -> &'static str {
+    FROZEN_SCRIPT_BOUNDS
+        .iter()
+        .find(|(name, _)| *name == "SUBTASK_MAX")
+        .map(|(_, value)| *value)
+        .expect("SUBTASK_MAX is pinned")
+}
 
 fn is_constant_name(s: &str) -> bool {
     let mut chars = s.trim_start_matches('_').chars();
@@ -5304,6 +5346,16 @@ fn engineer_block(open: &str) -> String {
 #[test]
 fn engineer_sisyphus_block_states_the_handoff_contract() {
     let flat = engineer_block("<!-- when:chat_agent_for=sisyphus -->");
+    let max = subtask_max_pin();
+    let sized = [
+        format!(
+            "the run does up to about {max} in-run subtasks; beyond that the architect is the vehicle"
+        ),
+        format!("do it here in up to {max} subtasks, or narrow the scope"),
+        format!(
+            "Do-it-here is not offered again once the in-run planner could not fit the work in {max}"
+        ),
+    ];
     for needle in [
         "When the user describes task-sized work the run should execute",
         "plans/engineer-handoffs/",
@@ -5316,11 +5368,14 @@ fn engineer_sisyphus_block_states_the_handoff_contract() {
         "the run drafts a brief from this conversation and confirms that instead",
         "`status: consumed` once it has started work on it",
         "never edit a handoff whose status is `consumed`",
-        "the run does up to about 6 in-run subtasks; beyond that the architect is the vehicle",
         "\"about 9 subtasks across 3 modules, needs a sealed plan\"",
-        "asks the user instead of refusing: hand it to the architect",
-        "do it here in up to 6 subtasks, or narrow the scope",
-    ] {
+        "asks the user instead of refusing: hand it to the architect (the run writes a ready \
+         `vehicle: architect` handoff)",
+    ]
+    .map(String::from)
+    .iter()
+    .chain(&sized)
+    {
         assert!(
             flat.contains(needle),
             "the sisyphus-attachment block does not state {needle:?}:\n{flat}"
@@ -5366,10 +5421,16 @@ fn engineer_standalone_block_states_the_sisyphus_go_ahead() {
          `vehicle: sisyphus` handoff can also be started with a bare \"go ahead\"",
         "(an explicit path still works)",
         "\"execute the handoff at <path>\"",
-        "recommend the vehicle with a stated sizing verdict: sisyphus for work that fits one run of \
-         up to about 6 in-run subtasks, otherwise the architect",
         "State the verdict as one line with the estimate and its reason",
-    ] {
+    ]
+    .map(String::from)
+    .iter()
+    .chain(&[format!(
+        "recommend the vehicle with a stated sizing verdict: sisyphus for work that fits one run of \
+         up to about {} in-run subtasks, otherwise the architect",
+        subtask_max_pin()
+    )])
+    {
         assert!(
             flat.contains(needle),
             "the standalone block does not state {needle:?}:\n{flat}"
@@ -5501,16 +5562,25 @@ fn assess_states_a_sizing_verdict_and_no_longer_defaults_unsure_sizing_up() {
     ] {
         assert!(!flat.contains(gone), "assess still says {gone:?}:\n{flat}");
     }
+    let max = subtask_max_pin();
+    let bounded = [
+        format!("compound = an ordered breakdown of at most {max} subtasks in one PR"),
+        format!(
+            "plan_shaped = more than {max} subtasks, cross-PR sequencing, or batch/protected semantics"
+        ),
+    ];
     for needle in [
-        "compound = an ordered breakdown of at most 6 subtasks in one PR",
-        "plan_shaped = more than 6 subtasks, cross-PR sequencing, or batch/protected semantics",
         "a top-level run asks the user with your verdict",
         "Unsure between simple and compound: compound.",
         "Unsure between compound and plan_shaped: compound; plan_shaped only when the evidence shows it.",
         "sizing_reason is ONE line naming the evidence",
         "subtask_estimate the estimated number of subtasks",
         "proposed_breakdown one short line per estimated subtask",
-    ] {
+    ]
+    .map(String::from)
+    .iter()
+    .chain(&bounded)
+    {
         assert!(
             flat.contains(needle),
             "assess does not state {needle:?}:\n{flat}"
