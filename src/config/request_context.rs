@@ -30585,7 +30585,13 @@ print(json.dumps({
                 .is_some_and(|u| u.contains_key("synth_failure")),
             "synthesize must capture its failure text for the verdict"
         );
-        assert_eq!(synthesize.next_target(), Some("verify"));
+        // The anchor gate sits between synthesis and verification, so no
+        // finding reaches the verifier or the report without being anchored.
+        assert_eq!(synthesize.next_target(), Some("anchor_gate"));
+        assert_eq!(
+            graph.get_node("anchor_gate").unwrap().next_target(),
+            Some("verify")
+        );
 
         // verify: same retry-then-fail-closed shape.
         let NodeType::Agent(verify) = &graph.get_node("verify").unwrap().node_type else {
