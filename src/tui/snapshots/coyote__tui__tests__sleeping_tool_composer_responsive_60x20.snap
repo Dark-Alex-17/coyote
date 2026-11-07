@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 3379
 expression: rendered
 ---
 "> run the tool                                              "

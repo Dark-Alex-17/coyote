@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 3312
 expression: rendered
 ---
 "> tell me a story                                                               "

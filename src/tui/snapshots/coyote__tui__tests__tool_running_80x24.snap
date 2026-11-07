@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 5044
 expression: "&frame"
 ---
 "> read it                                                                       "
