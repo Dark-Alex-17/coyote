@@ -359,6 +359,108 @@ def assess_fault(state):
 # route_intent targets that start work; only these spend a picked-up handoff
 WORK_STARTS = ("next_subtask", "plan_subtasks", "architecture_review", "run_step")
 
+# The sizing verdict's options: plan-shaped work at the top level is asked about, never refused.
+SIZING_ARCHITECT = "Hand it to the architect"
+SIZING_HERE = f"Do it here anyway (up to {SUBTASK_MAX} subtasks)"
+SIZING_NARROW = "Narrow the scope"
+SIZING_NARROW_PREFIX = "Narrow the scope to: "
+
+
+def _one_line(text, n=200):
+    return tail(" ".join(str(text or "").split()), n)
+
+
+def _sizing_verdict(state, u, reason, planned=None):
+    """Ask a top-level run's user what to do with plan-shaped work, the verdict and its reason stated.
+
+    `planned` is the in-run planner's breakdown when it could not fit the work into SUBTASK_MAX subtasks; doing it
+    here is then not offered again. Past CLARIFY_MAX verdicts in one run the work is redirected as before.
+    """
+    rounds = as_int(state.get("sizing_rounds"))
+    reason = _one_line(reason) or f"more than {SUBTASK_MAX} subtasks, cross-PR sequencing, or batch/protected semantics"
+    if rounds >= CLARIFY_MAX:
+        u["redirect_reason"] = (f"Still plan-shaped after {rounds} sizing verdicts ({reason}): this wants an "
+                                "architect run.")
+        ledger(state, u, f"sizing: {u['redirect_reason']}")
+        u["_next"] = "end_redirect"
+        return u
+    estimate = as_int(state.get("subtask_estimate"))
+    breakdown = [_one_line(b) for b in (planned or as_list(state.get("proposed_breakdown"))) if _one_line(b)]
+    u.update({"sizing_rounds": rounds + 1, "sizing_reason": reason, "proposed_breakdown": breakdown})
+    if planned is not None:
+        question = (f"Sizing verdict: the in-run planner could not fit this work into {SUBTASK_MAX} subtasks "
+                    f"({reason}). It wants a sealed plan. How should it go ahead?")
+    else:
+        question = (f"Sizing verdict: plan-shaped ({reason}). One run takes at most {SUBTASK_MAX} in-run subtasks "
+                    "in one PR; larger work wants a sealed plan. How should it go ahead?")
+    evidence = [f"Intent: {_one_line(state.get('intent_statement'), 400) or '(none stated)'}",
+                f"Estimated subtasks: {estimate or len(breakdown) or 'not estimated'}"]
+    if breakdown:
+        evidence += ["Proposed breakdown:"] + [f"- {b}" for b in breakdown]
+    opts = [option(SIZING_ARCHITECT, True, "writes a ready architect handoff that a bare go-ahead in architect-next "
+                                           "picks up")]
+    if planned is None:
+        opts.append(option(SIZING_HERE, evidence=f"plans at most {SUBTASK_MAX} sealed subtasks in this run"))
+    opts.append(option(SIZING_NARROW, evidence="asks for the narrower scope, then sizes it again"))
+    ledger(state, u, f"sizing: verdict {rounds + 1}/{CLARIFY_MAX}: plan-shaped ({reason}); asking")
+    return raise_escalation(state, u, escalation(
+        "sizing_verdict", question, opts, evidence="\n".join(evidence), hard_trigger=True, tier3_ok=False,
+        data={"planned": planned is not None}))
+
+
+def _handoff_title(state):
+    brief = str(state.get("brief") or "")
+    m = re.search(r"(?m)^#+\s+(.+)$", brief)
+    first = m.group(1) if m else next((l for l in brief.splitlines() if l.strip()), "")
+    return _one_line(first, 100).strip("\"' ") or "Plan-shaped work handed over by sisyphus-next"
+
+
+def _write_architect_handoff(state, u):
+    """Write the brief and the assess findings as a ready `vehicle: architect` engineer handoff; its path, or ""."""
+    project = os.path.realpath(state.get("git_root") or state.get("project_dir") or ".")
+    title = _handoff_title(state)
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60].strip("-") or "handoff"
+    folder = os.path.join(project, "plans", "engineer-handoffs")
+    breakdown = [b for b in as_list(u.get("proposed_breakdown", state.get("proposed_breakdown"))) if str(b).strip()]
+    estimate = as_int(state.get("subtask_estimate"))
+    reason = u.get("sizing_reason") or state.get("sizing_reason") or ""
+    lines = ["---", "status: ready", "vehicle: architect", f"project: {project}", f"created: {now_iso()}",
+             f"title: {title}", "---", "", f"# {title}", "",
+             f"Handed over by sisyphus-next run {state.get('run_id') or '(unknown)'}: its sizing verdict was "
+             f"plan-shaped ({reason}). This is a design-doc seed; the architect owns the decomposition.", "",
+             "## Brief (verbatim)", "", str(state.get("brief") or "").strip() or "(empty)", ""]
+    if str(state.get("clarifications") or "").strip():
+        lines += ["## Clarifications (verbatim)", "", str(state["clarifications"]).strip(), ""]
+    lines += ["## Intent", "", _one_line(state.get("intent_statement"), 1000) or "(none stated)", "",
+              "## Sizing verdict", "", "- Verdict: plan-shaped", f"- Reason: {reason or '(none stated)'}",
+              f"- Estimated subtasks: {estimate or len(breakdown) or 'not estimated'}", "",
+              "## Proposed breakdown", ""]
+    lines += [f"- {b}" for b in breakdown] or ["(none proposed)"]
+    lines += ["", "## Acceptance criteria (verbatim)", "", str(state.get("spec_text") or "").strip() or "(none stated)"]
+    text = "\n".join(lines) + "\n"
+    try:
+        os.makedirs(folder, exist_ok=True)
+        for name in (f"{slug}.md", f"{slug}-{state.get('run_id') or 'run'}.md"):
+            path = os.path.join(folder, name)
+            try:
+                with open(path, "x", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                return path
+            except FileExistsError:
+                continue
+    except OSError as e:
+        ledger(state, u, f"sizing: the architect handoff could not be written under {folder}: {e}")
+    write_artifact(state.get("run_dir") or "", "architect-handoff.md", text)
+    return ""
+
+
+def _narrow_scope(state, u, scope):
+    """Size the narrowed scope again: it becomes the brief, the original request kept below it as context."""
+    u.update({"sizing_reason": "", "subtask_estimate": 0, "proposed_breakdown": [], "sizing_note": ""})
+    text = (f"{scope.strip()}\n\nThe user narrowed a plan-shaped request to the scope above; size and do only that. "
+            f"The original request, as context only:\n\n{str(state.get('brief') or '').strip()}\n")
+    _adopt_brief(state, u, text, "the narrowed scope after a plan-shaped sizing verdict")
+
 
 def route_intent(state):
     u = {}
@@ -423,9 +525,13 @@ def _route_intent(state, u):
         u["_next"] = "end_redirect"
     elif intent == "plan_execution":
         u["_next"] = "run_step"
+    elif sizing == "plan_shaped" and truthy(state.get("top_level")):
+        return _sizing_verdict(state, u, state.get("sizing_reason"))
     elif sizing == "plan_shaped":
-        u["redirect_reason"] = ("Plan-shaped work (more than 3 subtasks, cross-PR sequencing, or batch/protected "
-                                "semantics): this wants an architect run. The chat lane can draft the design-doc skeleton.")
+        why = _one_line(state.get("sizing_reason"))
+        u["redirect_reason"] = (f"Plan-shaped work (more than {SUBTASK_MAX} subtasks, cross-PR sequencing, or "
+                                f"batch/protected semantics{': ' + why if why else ''}): this wants an architect run. "
+                                "The chat lane can draft the design-doc skeleton.")
         u["_next"] = "end_redirect"
     elif sizing == "compound":
         u["_next"] = "plan_subtasks"
@@ -484,6 +590,10 @@ def record_subtasks(state):
     subtasks = [s for s in as_list(state.get("subtasks")) if isinstance(s, dict)]
     if not subtasks or len(subtasks) > SUBTASK_MAX:
         why = state.get("plan_shaped_reason") or f"{len(subtasks)} subtasks (bound: {SUBTASK_MAX})"
+        if truthy(state.get("top_level")):
+            # never silently dropped or trimmed: the user picks the architect or a narrower scope
+            ledger(state, u, f"subtasks: {len(subtasks)} planned, bound {SUBTASK_MAX}: {_one_line(why)}; asking")
+            return _sizing_verdict(state, u, why, planned=[s.get("title") or s.get("outcome") or "" for s in subtasks])
         u["redirect_reason"] = f"Plan-shaped by A11: {why}. This wants an architect run."
         u["_next"] = "end_redirect"
         return u
@@ -884,6 +994,7 @@ ACCEPTED_INSTRUCTIONS = {
     "scope_breach": ("rescope",),
     "handoff_confirm": ("path",),
     "handoff_path": ("path",),
+    "sizing_verdict": ("narrow",),
 }
 INSTRUCTION_HELP = {
     "answer": "answer the question in the user's own words; value: the answer",
@@ -892,13 +1003,14 @@ INSTRUCTION_HELP = {
     "recipe": "supply what the probe needs to run (recipe, fixture, mock); value: what to provide",
     "rescope": "proceed with the task's scope re-declared as described; value: the new scope",
     "path": "use the handoff file at a path; value: the path",
+    "narrow": "do a narrower part of the work in this run, sized again first; value: the narrower scope",
 }
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
 # the owner's own words verbatim.
 INSTRUCTION_ANSWERS = {"answer": "{}", "design": "Use this approach instead: {}",
                        "amendment": "Continue; treat the criterion as amended: {}", "recipe": "Supply it: {}",
-                       "rescope": "Proceed: scope re-declared to include: {}"}
-FREE_FORM_SHAPES = ("answer", "design", "amendment", "recipe", "rescope")
+                       "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}"}
+FREE_FORM_SHAPES = ("answer", "design", "amendment", "recipe", "rescope", "narrow")
 
 
 def _accepts_text(kind):
@@ -1178,6 +1290,54 @@ def apply_answer(state):
         u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {answer}\n"
         u["assess_faulted"] = False
         u["_next"] = "assess"
+    elif kind in ("sizing_verdict", "sizing_narrow") and stop:
+        u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
+        u["_next"] = "end_aborted"
+    elif kind == "sizing_verdict":
+        planned = truthy(as_dict(esc.get("data")).get("planned"))
+        a = _answered(state, {"architect": [SIZING_ARCHITECT.lower()], "here": ["do it here"],
+                              "narrow": [SIZING_NARROW.lower()]})
+        if a == "architect":
+            path = _write_architect_handoff(state, u)
+            _consume_handoff(state, u)
+            if path:
+                u["architect_handoff"] = path
+                u["handoff_report"] = (
+                    f"Wrote the architect handoff {path} (status: ready, vehicle: architect). Start an architect-next "
+                    "run in this project: a bare \"go ahead\" picks the handoff up and asks you to confirm it as the "
+                    "design doc; naming the path works too.")
+                ledger(state, u, f"sizing: handed to the architect: {path}")
+                u["_next"] = "end_handoff"
+            else:
+                kept = os.path.join(state.get("run_dir") or "", "architect-handoff.md")
+                u["redirect_reason"] = (f"Plan-shaped work for the architect; the handoff could not be written under "
+                                        f"plans/engineer-handoffs/, so its text is at {kept}.")
+                u["_next"] = "end_redirect"
+        elif a == "here" and not planned:
+            u["sizing_note"] = (f"The user chose to do this work here despite a plan-shaped sizing verdict "
+                                f"({state.get('sizing_reason') or 'no reason recorded'}). Fit it into at most "
+                                f"{SUBTASK_MAX} sealed subtasks; return an empty list with plan_shaped_reason only "
+                                "when it cannot fit at all.")
+            _consume_handoff(state, u)
+            ledger(state, u, f"sizing: doing plan-shaped work here in at most {SUBTASK_MAX} subtasks (user's choice)")
+            u["_next"] = "plan_subtasks"
+        elif a == "narrow" and answer.strip().startswith(SIZING_NARROW_PREFIX) and \
+                answer.strip()[len(SIZING_NARROW_PREFIX):].strip():
+            _narrow_scope(state, u, answer.strip()[len(SIZING_NARROW_PREFIX):])
+        elif a == "narrow":
+            raise_escalation(state, u, escalation(
+                "sizing_narrow", "Which narrower part of the work should this run do? Describe the scope; it is sized "
+                                 "again before any work starts.", [], hard_trigger=True, tier3_ok=False))
+        else:
+            u["redirect_reason"] = (f"Plan-shaped work ({state.get('sizing_reason') or 'no reason recorded'}); the "
+                                    f"reply {tail(answer, 120)!r} picked none of the sizing options, so nothing was "
+                                    "started: this wants an architect run.")
+            u["_next"] = "end_redirect"
+    elif kind == "sizing_narrow" and answer.strip():
+        _narrow_scope(state, u, answer)
+    elif kind == "sizing_narrow":
+        u["redirect_reason"] = "Plan-shaped work and no narrower scope was given: this wants an architect run."
+        u["_next"] = "end_redirect"
     elif kind == "design_choice":
         u["_next"] = "compose_brief"
     elif kind == "oracle_fault":

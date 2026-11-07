@@ -28,8 +28,8 @@ AGENT_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(o
 # Node -> bound id(s) (the named loop bounds). A cycle is legal
 # only if it passes through at least one of these nodes.
 BOUNDED = {
-    "route_intent": "B1 clarify_rounds<=3",
-    "record_subtasks": "B2 subtasks<=3",
+    "route_intent": "B1 clarify_rounds<=3 / sizing_rounds<=3 sizing verdicts",
+    "record_subtasks": "B2 subtasks<=6 / sizing_rounds<=3 sizing verdicts",
     "next_subtask": "B3 list-bounded subtask index",
     "oracle_gate": "B4 once per task",
     "route_coder_result": "B5 fix_strikes<=3 / B7 rejected_rounds<=3",

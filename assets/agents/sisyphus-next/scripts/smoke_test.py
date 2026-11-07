@@ -436,7 +436,7 @@ check("handoff pickup: a typed path to a vehicle-architect handoff is the brief 
       u["_next"] == "next_subtask" and "Add a /health route." in s2["brief"] and fm(arch)["status"] == "ready"
       and any("not a vehicle: sisyphus handoff" in d for d in s3["decisions"]))
 for intent, sizing, nxt in (("plan_authoring", "n/a", "end_redirect"), ("ambiguous", "n/a", "escalate_gate"),
-                            ("exploration", "n/a", "research_answer"), ("implementation", "plan_shaped", "end_redirect")):
+                            ("exploration", "n/a", "research_answer"), ("implementation", "plan_shaped", "escalate_gate")):
     s3, u = chain({**hs, "handoff_path": new, "intent": intent, "sizing": sizing}, "route_intent")
     check(f"handoff pickup: route_intent -> {nxt} ({intent}/{sizing}) starts no work -> handoff left ready, ledgered",
           u["_next"] == nxt and fm(new)["status"] == "ready" and any("left ready" in d for d in s3["decisions"]))
@@ -640,6 +640,94 @@ u = gates.scope_check(base_state(roster_scope={"TASK-001": ["src/a/"], "TASK-002
 check("choice: the scope_breach escalation set outside raise_escalation is a multiple choice too",
       u.get("_next") == "send_breach_notice" and u["escalation"]["data"].get("multiple_choice") is True
       and u["escalation"]["options"][0]["text"].startswith("Serialize") and "Option 1 (recommended)" in u["ask_question"])
+
+# ---------------------------------------------------------------- sizing verdict: plan-shaped work is asked, not refused
+check("sizing: SUBTASK_MAX is 6 and the do-it-here option names it",
+      SUBTASK_MAX == 6 and gates.SIZING_HERE == "Do it here anyway (up to 6 subtasks)")
+SREPO = os.path.join(TMP, "srepo")
+os.makedirs(SREPO)
+subprocess.run(["git", "-C", SREPO, "init", "-q"], check=True, capture_output=True)
+sz = dict(project_dir=SREPO, git_root=SREPO, top_level=True, delegated=False, intent="implementation", sizing="plan_shaped",
+          sizing_reason="about 9 subtasks across 3 modules, needs a sealed plan", subtask_estimate=9,
+          proposed_breakdown=["parser", "planner", "executor"], intent_statement="Add a query engine",
+          brief="# Query engine\n\nBuild a query engine.", spec_text="- `qe run` returns rows", run_id="sz1")
+ss, u = chain(base_state(**sz), "route_intent")
+e = ss["escalation"]
+check("sizing: a top-level plan_shaped run raises a hard-trigger sizing_verdict stating the reason, with three options",
+      u["_next"] == "escalate_gate" and e["kind"] == "sizing_verdict" and e["hard_trigger"] and not e["tier3_ok"]
+      and "about 9 subtasks across 3 modules" in e["question"]
+      and [o["text"] for o in e["options"]] == [gates.SIZING_ARCHITECT, gates.SIZING_HERE, gates.SIZING_NARROW]
+      and e["options"][0]["recommended"] and "Estimated subtasks: 9" in e["evidence"] and "- parser" in e["evidence"])
+check("sizing: the verdict escalates even under escalation_policy=autonomous, asked at ask_choice_3",
+      gates.escalate_gate({**ss, "escalation_policy": "autonomous"})["_next"] == "ask_dispatch"
+      and gates.ask_dispatch(ss)["_next"] == "ask_choice_3"
+      and "Option 1 (recommended): Hand it to the architect" in ss["ask_question"])
+u = gates.route_intent(base_state(**{**sz, "top_level": False, "delegated": True}))
+check("sizing: a delegated plan_shaped run keeps SISYPHUS_REDIRECT (end_redirect), never asks",
+      u["_next"] == "end_redirect" and "escalation" not in u and "more than 6 subtasks" in u["redirect_reason"]
+      and "about 9 subtasks" in u["redirect_reason"])
+s2, u = chain({**ss, "last_answer": "Option 1 (recommended)", "last_answer_text": "Option 1 (recommended)"},
+              "parse_answer", "apply_answer")
+hp = s2.get("architect_handoff", "")
+check("sizing: 'Hand it to the architect' writes a ready handoff and ends at end_handoff naming it and the go-ahead",
+      u["_next"] == "end_handoff"
+      and hp == os.path.join(os.path.realpath(SREPO), "plans", "engineer-handoffs", "query-engine.md")
+      and hp in s2["handoff_report"] and 'a bare "go ahead" picks the handoff up' in s2["handoff_report"])
+hfm, hbody = _lib.frontmatter(open(hp).read()) if hp else ({}, "")
+check("sizing: the handoff frontmatter and body carry the brief and the assess findings",
+      hfm.get("status") == "ready" and hfm.get("vehicle") == "architect" and hfm.get("project") == os.path.realpath(SREPO)
+      and hfm.get("title") == "Query engine" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", hfm.get("created", ""))
+      and all(t in hbody for t in ("Build a query engine.", "Add a query engine",
+                                    "- Reason: about 9 subtasks across 3 modules", "- Estimated subtasks: 9",
+                                    "- parser\n- planner\n- executor", "- `qe run` returns rows")))
+ARCH_SCRIPTS = os.path.join(HERE, "..", "..", "architect-next", "scripts")
+_seed_probe = ("import json, os, sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]); import gates; "
+               "u = {'code_repo_path': sys.argv[2], 'plans_root': os.path.join(sys.argv[2], 'plans'), "
+               "'git_root': sys.argv[2]}; p = gates._find_seed(u); "
+               "print(json.dumps([p, gates._seed_question(p) if p else '']))")
+_r = subprocess.run([sys.executable, "-c", _seed_probe, ARCH_SCRIPTS, SREPO], capture_output=True, text=True, timeout=120,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+_seed = json.loads(_r.stdout.strip().splitlines()[-1]) if _r.returncode == 0 and _r.stdout.strip() else ["", _r.stderr[-300:]]
+check("sizing: architect-next's own _find_seed picks the written handoff up as its ready seed",
+      os.path.realpath(_seed[0] or "/nonexistent") == os.path.realpath(hp or "/x") and "'Query engine'" in _seed[1], _seed[1])
+s3, u = chain({**ss, "last_answer": gates.SIZING_ARCHITECT, "run_id": "sz2"}, "apply_answer")
+check("sizing: a second handoff with the same title gets the run id in its name, the first left alone",
+      s3["architect_handoff"].endswith("query-engine-sz2.md") and _lib.frontmatter(open(hp).read())[0].get("status") == "ready")
+BADREPO = os.path.join(TMP, "badrepo")
+os.makedirs(BADREPO)
+open(os.path.join(BADREPO, "plans"), "w").write("not a dir\n")
+s3, u = chain({**ss, "project_dir": BADREPO, "git_root": BADREPO, "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: an unwritable handoff dir -> end_redirect naming the copy in the run dir, ledgered",
+      u["_next"] == "end_redirect" and "architect-handoff.md" in s3["redirect_reason"]
+      and os.path.isfile(os.path.join(ss["run_dir"], "architect-handoff.md"))
+      and any("could not be written" in d for d in s3["decisions"]))
+s2, u = chain({**ss, "last_answer": "Option 2", "last_answer_text": "Option 2"}, "parse_answer", "apply_answer")
+check("sizing: 'Do it here anyway' -> plan_subtasks, told to fit at most 6 subtasks",
+      u["_next"] == "plan_subtasks" and "at most 6" in s2["sizing_note"] and s2["last_answer"] == gates.SIZING_HERE)
+seven = [{"title": f"t{i}", "outcome": "o", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX + 1)]
+s3, u = chain({**s2, "subtasks": seven}, "record_subtasks")
+e3 = s3["escalation"]
+check("record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, never trimmed",
+      e3["kind"] == "sizing_verdict" and [o["text"] for o in e3["options"]] == [gates.SIZING_ARCHITECT, gates.SIZING_NARROW]
+      and e3["data"]["planned"] is True and "- t6" in e3["evidence"] and "subtask_index" not in u
+      and gates.ask_dispatch(s3)["_next"] == "ask_choice_2")
+u = gates.apply_answer({**s3, "last_answer": gates.SIZING_HERE})
+check("record_subtasks: a typed do-it-here after the planner overflowed is no pick -> end_redirect, nothing started",
+      u["_next"] == "end_redirect")
+s2, u = chain({**ss, "last_answer": "Option 3", "last_answer_text": "Option 3"}, "parse_answer", "apply_answer")
+check("sizing: 'Narrow the scope' asks for the narrower scope as free text (ask_user)",
+      s2["escalation"]["kind"] == "sizing_narrow" and gates.ask_dispatch(s2)["_next"] == "ask_user")
+s3, u = chain({**s2, "last_answer_text": "only the parser"}, "parse_answer", "apply_answer")
+check("sizing: the narrowed scope becomes the brief and assess runs again, the old verdict cleared",
+      u["_next"] == "assess" and s3["brief"].startswith("only the parser") and "Build a query engine." in s3["brief"]
+      and s3["sizing_reason"] == "" and s3["proposed_breakdown"] == [])
+s2, u = chain({**ss, "last_answer_text": "just do the parser for now", "reply_verdict": "instruction",
+               "reply_instruction": "narrow", "reply_value": "the parser"}, "interpret_route", "apply_answer")
+check("sizing: an Other reply that narrows the scope -> interpret_reply's narrow instruction, assess on the owner's words",
+      u["_next"] == "assess" and s2["brief"].startswith("just do the parser for now"))
+check("sizing: a whole-reply abort ends the run; the verdict re-asks at most CLARIFY_MAX times, then redirects",
+      gates.apply_answer({**ss, "last_answer": "abort"})["_next"] == "end_aborted"
+      and gates.route_intent(base_state(**sz, sizing_rounds=CLARIFY_MAX))["_next"] == "end_redirect")
 oj = escalation("pr_review_owner_judgment", "q", [option("Fix them as the reviewer asks"), option("Skip them and keep watching"),
                                                   option("Stop watching and report")],
                 data={"judgment": [{"id": "c1", "kind": "comment", "url": "u", "body": "b", "question": "q"}], "noaction": []})
