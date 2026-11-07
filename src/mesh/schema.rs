@@ -431,7 +431,7 @@ mod tests {
             (
                 "INSTANCES_VERSION",
                 crate::mesh::instances::INSTANCES_VERSION,
-                1,
+                2,
             ),
             (
                 "PROPAGATION_STORE_VERSION",

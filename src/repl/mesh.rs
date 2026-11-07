@@ -526,17 +526,24 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
     let now = SystemTime::now();
     let mut records = runtime.peers().snapshot();
     records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
-    let own_sessions = runtime.own_sessions();
+    let sessions = runtime.registered_sessions();
     let names = runtime.address_names();
     let mut facts = Vec::with_capacity(records.len());
     for peer in &records {
         let is_you = same_hash(&peer.identity_hash, runtime.fingerprint());
+        let own_session = is_you
+            .then(|| sessions.running.get(&peer.destination_hash))
+            .flatten()
+            .map(|row| row.session.clone());
+        let own_gone =
+            is_you && own_session.is_none() && sessions.gone.contains_key(&peer.destination_hash);
         facts.push(HeardFacts {
-            no_route: !runtime.path_known(&peer.destination_hash).await,
+            no_route: own_gone
+                || runtime.link_failed(&peer.destination_hash)
+                || !runtime.path_known(&peer.destination_hash).await,
             is_you,
-            own_session: is_you
-                .then(|| own_sessions.get(&peer.destination_hash).cloned())
-                .flatten(),
+            own_session,
+            own_gone,
             label: owner_label(&names, &peer.destination_hash).map(|label| label.name.clone()),
         });
     }
@@ -1992,12 +1999,20 @@ async fn route_to(
     destination: &str,
     abort_signal: &AbortSignal,
 ) -> Result<Route, Unrouted> {
+    // A peer whose last link failed is never asked for, so the route line would mislead.
+    let link_failed = runtime.link_failed(destination);
     if let Some(desc) = runtime.resolve_destination_cached(destination).await {
-        if !runtime.path_known(destination).await {
+        if !link_failed && !runtime.path_known(destination).await {
             out_text(&route_request_line(destination));
             result_follows();
         }
         return Ok(Route::unasked(desc));
+    }
+    if link_failed {
+        return runtime
+            .resolve_route(destination)
+            .await
+            .ok_or(Unrouted::NoAnswer);
     }
     out_text(&route_request_line(destination));
     result_follows();
@@ -8634,16 +8649,18 @@ enum PeerRow {
     MarkedOnly(TrustRecord, &'static str, KeyChangeMark),
 }
 
-/// What this node knows about a heard row beyond its record: whether the transport holds
-/// no path to it, from the cached path table alone, and whether it announces this node's
-/// own identity, as another session on the same config dir does, with the session's name
-/// when the instance registry lists the row's destination as running here, and the trust
-/// label you gave it.
+/// What this node knows about a heard row beyond its record: whether it has no route, as
+/// a row the transport holds no path to (from the cached path table alone), one whose
+/// last link failed or one of your sessions that has gone reads; whether it announces
+/// this node's own identity, as another session on the same config dir does, with the
+/// session's name when the instance registry lists the row's destination as running here
+/// or whether the registry keeps it as gone; and the trust label you gave it.
 #[derive(Debug, Default, Clone)]
 struct HeardFacts {
     no_route: bool,
     is_you: bool,
     own_session: Option<String>,
+    own_gone: bool,
     label: Option<String>,
 }
 
@@ -8820,6 +8837,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
                 };
                 let name = match &facts.own_session {
                     Some(session) => own_session_name(session),
+                    None if facts.own_gone => GONE_SESSION_NAME.to_string(),
                     None if facts.is_you => "(you)".to_string(),
                     None => match &facts.label {
                         Some(label) => labelled_name(label, peer.display_name.as_deref()),
@@ -8898,6 +8916,7 @@ mod peers_route_tests {
         no_route: true,
         is_you: false,
         own_session: None,
+        own_gone: false,
         label: None,
     };
 
@@ -8928,7 +8947,9 @@ mod peers_route_tests {
         assert_eq!(cells[0][6], NO_ROUTE_STATE, "{text}");
         assert_eq!(cells[1][6], "", "{text}");
         assert!(
-            peers_legend().contains("no route = this node has no path to it right now"),
+            peers_legend().contains(
+                "no route = this node has no path to it, its last link failed or the session has ended"
+            ),
             "{text}"
         );
         assert!(text.ends_with(&peers_legend()), "{text}");
@@ -8978,6 +8999,7 @@ mod peers_you_tests {
             no_route: false,
             is_you: true,
             own_session: None,
+            own_gone: false,
             label: None,
         };
         let rows = vec![
@@ -9014,6 +9036,56 @@ mod peers_you_tests {
             "{text}"
         );
     }
+
+    /// A session of yours the registry keeps as gone is named `(you, gone)` and reads
+    /// `no route`; a running one keeps its name, and the legend says what both mean.
+    #[test]
+    fn a_gone_session_of_yours_is_named_you_gone_with_no_route() {
+        let now = SystemTime::now();
+        let rows = vec![
+            PeerRow::Heard(
+                peer(Some("Laptop"), 5, now),
+                "trusted",
+                None,
+                HeardFacts {
+                    no_route: true,
+                    is_you: true,
+                    own_gone: true,
+                    ..HeardFacts::default()
+                },
+            ),
+            PeerRow::Heard(
+                PeerRecord {
+                    destination_hash: "12".repeat(16),
+                    ..peer(None, 5, now)
+                },
+                "trusted",
+                None,
+                HeardFacts {
+                    is_you: true,
+                    own_session: Some("temp".to_string()),
+                    ..HeardFacts::default()
+                },
+            ),
+        ];
+
+        let text = render_peers(&rows, now).plain();
+
+        let cells = table_rows(&text);
+        assert_eq!(cells[0][0], "(you, gone)", "{text}");
+        assert_eq!(cells[0][6], NO_ROUTE_STATE, "{text}");
+        assert_eq!(cells[1][0], "(you: temp)", "{text}");
+        assert_eq!(cells[1][6], "", "{text}");
+        let legend = peers_legend();
+        assert!(
+            legend.contains("(you, gone) = your session on this computer that has ended"),
+            "{legend}"
+        );
+        assert!(
+            legend.contains("no route = this node has no path to it, its last link failed or the session has ended"),
+            "{legend}"
+        );
+    }
 }
 
 /// Why a heard row is not current, if it is not. A successor is only ever found for a
@@ -9038,11 +9110,15 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
     })
 }
 
-/// The `state` of a heard row the transport holds no path to. It outranks `stale`, which
-/// only says how long the row has been silent, and yields to `superseded`, which says
-/// where the identity went.
-const NO_ROUTE_STATE: &str =
-    "(no route: this node has no path to it right now, so it has probably left the mesh)";
+/// The `state` of a heard row with no route: the transport holds no path to it, the last
+/// link to it failed, or it is a session of yours that has gone. It outranks `stale`,
+/// which only says how long the row has been silent, and yields to `superseded`, which
+/// says where the identity went.
+const NO_ROUTE_STATE: &str = "(no route: this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh)";
+
+/// How `.mesh peers` names a session of yours on this computer that has stopped or whose
+/// process has gone, while the instance registry still keeps its tombstone.
+const GONE_SESSION_NAME: &str = "(you, gone)";
 
 /// The standing of a deny-only record: a block with no heard peer to judge is the
 /// `DestinationDenied` verdict whatever the identity's standing.
@@ -9064,7 +9140,7 @@ fn trust_legend() -> &'static str {
 /// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -11642,7 +11718,7 @@ mod tests {
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                 NAME_ADDRESSING_LINE,
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
             ],
             "{text}"
         );
@@ -11678,9 +11754,10 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120)
     }
 
-    /// The whole `.mesh peers` text for another session of the owner's, a current trusted
-    /// row whose key changed, a row with no route, a current successor, the stale row it
-    /// supersedes and a stale row of its own: the sample the Commands page carries. The test
+    /// The whole `.mesh peers` text for another session of the owner's, one of the owner's
+    /// sessions that has ended, a current trusted row whose key changed, a row with no
+    /// route, a current successor, the stale row it supersedes and a stale row of its own:
+    /// the sample the Commands page carries. The test
     /// harness renders without a terminal, so the table takes its content width.
     #[test]
     fn peers_table_snapshot() {
@@ -11702,6 +11779,19 @@ mod tests {
                     no_route: false,
                     is_you: true,
                     own_session: None,
+                    own_gone: false,
+                    label: None,
+                },
+            ),
+            PeerRow::Heard(
+                row(Some("laptop"), "6a7b8c9d", "8b9c0d1e", 1, 300),
+                "trusted",
+                None,
+                HeardFacts {
+                    no_route: true,
+                    is_you: true,
+                    own_session: None,
+                    own_gone: true,
                     label: None,
                 },
             ),
@@ -11727,6 +11817,7 @@ mod tests {
                     no_route: true,
                     is_you: false,
                     own_session: None,
+                    own_gone: false,
                     label: None,
                 },
             ),
@@ -11752,24 +11843,26 @@ mod tests {
         assert_eq!(render_peers(&rows, now).plain(), PEERS_SNAPSHOT);
     }
 
-    const PEERS_SNAPSHOT: &str = r#"┌───────────┬──────────┬──────────┬───────────┬──────┬───────────┬─────────────────────────────────────────────────────────────────────────────────────┐
-│ name      ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                               │
-╞═══════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪═════════════════════════════════════════════════════════════════════════════════════╡
-│ (you)     ┆ 2c3d4e5f ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                     │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ alice     ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                     │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob       ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: this node has no path to it right now, so it has probably left the mesh) │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob       ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                    │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (no name) ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                    │
-└───────────┴──────────┴──────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────┘
+    const PEERS_SNAPSHOT: &str = r#"┌─────────────┬──────────┬──────────┬───────────┬──────┬───────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ name        ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                    │
+╞═════════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
+│ (you)       ┆ 2c3d4e5f ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                          │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ (you, gone) ┆ 6a7b8c9d ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh) │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ alice       ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                          │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob         ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh) │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob         ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                                                         │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ (no name)   ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                         │
+└─────────────┴──────────┴──────────┴───────────┴──────┴───────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
-5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
+6 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it right now, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
 
     /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
     #[test]
@@ -18575,6 +18668,96 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
+                /// Once `temp` stops in order its registry row stays as a tombstone: `a`
+                /// names temp's row `(you, gone)` with `no route` in `.mesh peers`,
+                /// `mesh__peers` marks it `session_gone` and unreachable, the question it
+                /// left open reads `asked by (you, gone: temp)` in `.mesh pending`, and
+                /// the name `temp` no longer resolves.
+                #[test]
+                #[serial]
+                fn a_cleanly_stopped_own_session_reads_gone_with_no_route() {
+                    use crate::function::mesh::handle_mesh_tool;
+                    use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord};
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-own-session-gone");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let tmp = TempDir::new("repl-mesh-own-session-gone");
+                        let a = start_as("a", &tmp, addr.port()).await;
+                        let temp = start_as("temp", &tmp, addr.port()).await;
+                        let temp_slot = Arc::new(MeshSlot::default());
+                        temp_slot.install(temp.clone()).unwrap();
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(a.clone()).unwrap();
+                        let temp_dest = temp.current_destination_hash();
+                        heard_as_you(&a, &temp_dest);
+                        let now = SystemTime::now();
+                        temp_slot
+                            .correlations()
+                            .open(PendingRecord {
+                                version: PENDING_RECORD_VERSION,
+                                id: "q-temp-0001".to_string(),
+                                peer_destination: hex_lower(&[0x5e; 16]),
+                                peer_identity: hex_lower(&[0x6f; 16]),
+                                thread: "q-temp-0001".to_string(),
+                                question: "Which branch?".to_string(),
+                                sent_at: rfc3339_utc(now),
+                                timeout_at: rfc3339_utc(now + Duration::from_secs(30)),
+                                state: PendingState::Open,
+                                reply: None,
+                            })
+                            .unwrap();
+                        let named_temp = |ctx: &RequestContext| {
+                            ctx.app
+                                .mesh
+                                .address_names()
+                                .iter()
+                                .any(|name| name.name == "temp")
+                        };
+                        assert!(named_temp(&ctx));
+
+                        assert!(temp_slot.stop().await.unwrap());
+
+                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let rows = table_rows(&out);
+                        let row = rows
+                            .iter()
+                            .find(|row| row[1] == short(&temp_dest))
+                            .unwrap_or_else(|| panic!("no row for {temp_dest} in {out}"));
+                        assert_eq!(row[0], "(you, gone)", "{out}");
+                        assert_eq!(row[6], NO_ROUTE_STATE, "{out}");
+                        assert!(out.contains("(you, gone) = "), "{out}");
+
+                        let result =
+                            handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
+                                .await
+                                .unwrap();
+                        let tool_row = result["peers"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|row| row["destination"] == temp_dest.as_str())
+                            .unwrap_or_else(|| panic!("{temp_dest} missing from {result}"))
+                            .clone();
+                        assert_eq!(tool_row["session"], "temp", "{result}");
+                        assert_eq!(tool_row["session_gone"], true, "{result}");
+                        assert_eq!(tool_row["reachable"], false, "{result}");
+
+                        let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                        assert!(
+                            out.contains(
+                                "asked by (you, gone: temp) . collect it from that session"
+                            ),
+                            "{out}"
+                        );
+                        assert!(!named_temp(&ctx), "a gone session is never a name");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        relay_handle.abort();
+                    });
+                }
+
                 /// `a`'s `.mesh pending` lists the questions every other session on the
                 /// cache dir asked under `Asked by this node`, each naming the session
                 /// that asked it (running, ended, or no longer in the registry) and
@@ -23538,7 +23721,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ctx.app.mesh.install(started.runtime.clone()).unwrap();
                         let runtime = started.runtime.clone();
                         let now = SystemTime::now();
-                        let hint = "It may have left the mesh; a session that exits says nothing.";
+                        let hint = "It may have left the mesh; a session that crashes or loses its network says nothing.";
 
                         for (seen, says_left) in [(now, true), (now - PEER_STALE_AFTER, false)] {
                             let (destination, _) = heard_peer(&runtime, "Tia", seen);

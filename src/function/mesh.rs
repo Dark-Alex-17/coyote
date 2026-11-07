@@ -121,9 +121,11 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                  display name, trust standing (`trusted`, `known`, `untrusted`, `blocked (instance)`, \
                  `blocked (identity)`), protocol compatibility \
                  (`compatible`, or `incompatible` with a `compatibility_note`), when each was last seen and \
-                 whether a path to it is known right now. A row with a `session` field is one of your \
-                 own sessions running on this computer, named so you can tell them apart; the other \
-                 tools still take its destination hash. The table itself is NOT a status: it says \
+                 whether it is `reachable` right now (`false` when no path to it is known, its last link \
+                 failed, or it is a session of yours that has ended). A row with a `session` field is one \
+                 of your own sessions on this computer, named so you can tell them apart; with \
+                 `session_gone: true` that session has ended. The other tools still take its destination \
+                 hash. The table itself is NOT a status: it says \
                  who is out there, not what they are doing. Their /status cards are fetched only with \
                  `with_status: true`, and only for trusted peers with a known path. A card's free text \
                  (`objective`, `about`, `repo` and `todo goal`) arrives in one fenced `text` block as \
@@ -915,11 +917,22 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     let mut peers = Vec::with_capacity(records.len());
     let mut status_lookups = Vec::new();
     let trust = runtime.trust();
-    let own_sessions = runtime.own_sessions();
+    let sessions = runtime.registered_sessions();
     for (index, peer) in records.iter().enumerate() {
         let grant = trust.authorize(&peer.identity_hash, &peer.destination_hash);
         let standing = trust.identity_standing(&peer.identity_hash);
-        let reachable = runtime.path_known(&peer.destination_hash).await;
+        let is_you = same_hash(&peer.identity_hash, runtime.fingerprint());
+        let running = sessions
+            .running
+            .get(&peer.destination_hash)
+            .filter(|_| is_you);
+        let gone = sessions
+            .gone
+            .get(&peer.destination_hash)
+            .filter(|_| is_you && running.is_none());
+        let path_known = runtime.path_known(&peer.destination_hash).await;
+        let reachable =
+            path_known && gone.is_none() && !runtime.link_failed(&peer.destination_hash);
         let mut row = json!({
             "destination": peer.destination_hash,
             "identity": peer.identity_hash,
@@ -938,14 +951,18 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         if let Some(note) = peer.compatibility_line() {
             row["compatibility_note"] = json!(note);
         }
-        if let Some(session) = own_sessions.get(&peer.destination_hash)
-            && same_hash(&peer.identity_hash, runtime.fingerprint())
-        {
-            row["session"] = json!(session);
+        if let Some(row_of) = running {
+            row["session"] = json!(row_of.session);
+        } else if let Some(row_of) = gone {
+            row["session"] = json!(row_of.session);
+            row["session_gone"] = json!(true);
         }
         peers.push(row);
+        // A peer whose last link failed is still asked while a path is held; a session of
+        // yours that has gone is not.
         if with_status
-            && reachable
+            && path_known
+            && gone.is_none()
             && grant.decision == Decision::Allow
             && let Some(desc) = runtime
                 .resolve_destination_cached(&peer.destination_hash)
@@ -7343,7 +7360,7 @@ mod tests {
             assert_eq!(
                 result["message"],
                 format!(
-                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard."
+                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard."
                 ),
                 "{result}"
             );

@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rns_transport::destination::{DestinationDesc, DestinationName};
 use rns_transport::identity::Identity;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -202,6 +202,9 @@ pub(crate) struct PeerTable {
     inner: Mutex<BTreeMap<String, PeerRecord>>,
     /// Set by every change since the last write, so a burst of announces costs one write.
     dirty: AtomicBool,
+    /// The rows whose last link attempt failed, until a link to them comes up or they
+    /// announce again. Held in memory only: a restart starts with none marked.
+    link_failed: Mutex<BTreeSet<String>>,
 }
 
 impl PeerTable {
@@ -249,10 +252,13 @@ impl PeerTable {
             path,
             inner: Mutex::new(inner),
             dirty: AtomicBool::new(false),
+            link_failed: Mutex::new(BTreeSet::new()),
         })
     }
 
+    /// The announce clears any failed-link mark the row had.
     pub(crate) fn observe(&self, sighting: PeerSighting, now: SystemTime) -> PeerChange {
+        self.link_failed.lock().remove(&sighting.destination_hash);
         let mut peers = self.inner.lock();
         let change = match peers.get_mut(&sighting.destination_hash) {
             Some(record) => {
@@ -315,6 +321,26 @@ impl PeerTable {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Marks the row of `destination_hash` as one no link could be opened to, so listings
+    /// read it `no route` and a request to it waits on no path request; a destination the
+    /// table does not know is left unmarked.
+    pub(crate) fn mark_link_failed(&self, destination_hash: &str) {
+        if self.inner.lock().contains_key(destination_hash) {
+            self.link_failed.lock().insert(destination_hash.to_string());
+        }
+    }
+
+    /// Lifts the mark `mark_link_failed` set, once a link to the peer came up.
+    pub(crate) fn clear_link_failed(&self, destination_hash: &str) {
+        self.link_failed.lock().remove(destination_hash);
+    }
+
+    /// Whether the last link attempt to `destination_hash` failed and the peer has
+    /// neither linked nor announced since.
+    pub(crate) fn link_failed(&self, destination_hash: &str) -> bool {
+        self.link_failed.lock().contains(destination_hash)
+    }
+
     pub(crate) fn sweep(&self, now: SystemTime) -> Vec<String> {
         let mut peers = self.inner.lock();
         let expired: Vec<String> = peers
@@ -322,8 +348,10 @@ impl PeerTable {
             .filter(|record| is_expired(record, now))
             .map(|record| record.destination_hash.clone())
             .collect();
+        let mut link_failed = self.link_failed.lock();
         for hash in &expired {
             peers.remove(hash);
+            link_failed.remove(hash);
         }
         if !expired.is_empty() {
             self.dirty.store(true, Ordering::Release);
@@ -707,6 +735,46 @@ mod tests {
     fn ttl_is_three_heartbeats() {
         assert_eq!(PEER_TTL, Duration::from_secs(10980));
         assert_eq!(PEER_TABLE_MAX_ENTRIES, 1024);
+    }
+
+    /// A failed link marks a known row until a link comes up, its next announce or its
+    /// age-out; a destination the table does not know is never marked, and nothing of the
+    /// mark reaches the file.
+    #[test]
+    fn a_failed_link_marks_the_row_until_a_link_or_an_announce() {
+        let (table, tmp) = table("peers-link-failed");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        table.observe(sighting("aa", None), t0);
+
+        table.mark_link_failed("unknown");
+        assert!(!table.link_failed("unknown"));
+
+        table.mark_link_failed("aa");
+        assert!(table.link_failed("aa"));
+        table.persist_if_dirty().unwrap();
+        let reloaded = PeerTable::load(tmp.path.join("mesh").join("peers.json"), t0).unwrap();
+        assert!(reloaded.get("aa").is_some());
+        assert!(
+            !reloaded.link_failed("aa"),
+            "the mark is held in memory only"
+        );
+        table.clear_link_failed("aa");
+        assert!(!table.link_failed("aa"));
+
+        table.mark_link_failed("aa");
+        table.observe(sighting("aa", None), t0 + Duration::from_secs(60));
+        assert!(
+            !table.link_failed("aa"),
+            "the next announce clears the mark"
+        );
+
+        table.mark_link_failed("aa");
+        assert_eq!(table.sweep(t0 + Duration::from_secs(60) + PEER_TTL), ["aa"]);
+        table.observe(sighting("aa", None), t0 + PEER_TTL * 2);
+        assert!(
+            !table.link_failed("aa"),
+            "an aged-out row takes its mark with it"
+        );
     }
 
     #[test]

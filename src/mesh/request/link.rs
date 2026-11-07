@@ -132,6 +132,7 @@ impl Deadline {
         RequestError::LinkActivationTimeout {
             path: path.to_string(),
             after: self.after,
+            recently_seen: false,
         }
     }
 }

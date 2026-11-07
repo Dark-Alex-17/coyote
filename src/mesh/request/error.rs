@@ -1,5 +1,6 @@
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::display_text;
+use crate::mesh::message::left_mesh_hint_when;
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::short;
 
@@ -16,7 +17,13 @@ pub(crate) enum RequestError {
     /// `after`; the link may still be up.
     Timeout { path: String, after: Duration },
     /// The link to the peer did not come up within `after`, so nothing was asked.
-    LinkActivationTimeout { path: String, after: Duration },
+    /// `recently_seen` is set by the caller that knows the peer table, when the peer had
+    /// announced within `PEER_STALE_AFTER`: the message then says it may have left.
+    LinkActivationTimeout {
+        path: String,
+        after: Duration,
+        recently_seen: bool,
+    },
     /// This node's own wait ran out before the request left it: the link lock stayed
     /// held, or the transport did not take the request, within `after`.
     LocalTimeout { path: String, after: Duration },
@@ -96,11 +103,23 @@ impl fmt::Display for RequestError {
                 "No response to the mesh request {path} within {:.1}s",
                 after.as_secs_f64()
             ),
-            Self::LinkActivationTimeout { after, .. } => write!(
-                f,
-                "No mesh link to the peer came up within {:.1}s",
-                after.as_secs_f64()
-            ),
+            Self::LinkActivationTimeout {
+                after,
+                recently_seen,
+                ..
+            } => {
+                write!(
+                    f,
+                    "No mesh link to the peer came up within {:.1}s",
+                    after.as_secs_f64()
+                )?;
+                // Every caller ends this message with its own full stop.
+                let hint = left_mesh_hint_when(*recently_seen).trim_end_matches('.');
+                if !hint.is_empty() {
+                    write!(f, ".{hint}")?;
+                }
+                Ok(())
+            }
             Self::LocalTimeout { after, .. } => write!(
                 f,
                 "This node could not hand the request to its own mesh link within {:.1}s",
@@ -422,6 +441,7 @@ mod no_answer_tests {
         let err = RequestError::LinkActivationTimeout {
             path: "/message".to_string(),
             after: Duration::from_secs(10),
+            recently_seen: false,
         };
 
         assert_eq!(
@@ -431,6 +451,22 @@ mod no_answer_tests {
         assert_eq!(
             request_remedy(&err),
             request_remedy(&RequestError::LinkClosed)
+        );
+    }
+
+    /// A peer heard within the stale window that no link reaches has likely left: the
+    /// message says so between the timeout and the caller's remedy.
+    #[test]
+    fn a_link_that_never_came_up_to_a_recent_peer_says_it_may_have_left() {
+        let err = RequestError::LinkActivationTimeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(10),
+            recently_seen: true,
+        };
+
+        assert_eq!(
+            format!("{err}. {}.", request_remedy(&err)),
+            "No mesh link to the peer came up within 10.0s. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; `.mesh peers` shows when the peer was last heard."
         );
     }
 
@@ -444,6 +480,7 @@ mod no_answer_tests {
             RequestError::LinkActivationTimeout {
                 path: path.clone(),
                 after,
+                recently_seen: false,
             },
             RequestError::LocalTimeout {
                 path: path.clone(),

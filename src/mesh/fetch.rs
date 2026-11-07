@@ -1813,6 +1813,7 @@ mod no_answer_tests {
             RequestError::LinkActivationTimeout {
                 path: LIST_PATH.to_string(),
                 after,
+                recently_seen: false,
             },
         );
         assert!(

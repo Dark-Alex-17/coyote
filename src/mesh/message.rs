@@ -2145,11 +2145,13 @@ impl MeshRuntime {
     /// answered at once with no request, even when its path has expired (the link then
     /// asks for the path itself), and one it does not hold is asked for once over the
     /// network and waited for up to `PATH_REQUEST_TIMEOUT`, coming back only with the path
-    /// that answered. `None` otherwise.
+    /// that answered. `None` otherwise. A peer whose last link failed is never asked for:
+    /// only what the transport already holds is used until a link comes up or it announces.
     pub(crate) async fn resolve_route(&self, destination_hex: &str) -> Option<Route> {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
         let transport = self.transport_handle().await?;
+        let link_failed = self.link_failed(&destination);
         let persisted = self
             .peers()
             .get(&destination)
@@ -2159,6 +2161,7 @@ impl MeshRuntime {
                 let known = transport.destination_desc(&address_hash).await.is_some()
                     || transport.has_path(&address_hash).await;
                 if !known
+                    && !link_failed
                     && !transport
                         .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
                         .await
@@ -2174,6 +2177,10 @@ impl MeshRuntime {
                     path_requested: !known,
                 })
             }
+            None if link_failed => transport
+                .destination_desc(&address_hash)
+                .await
+                .map(Route::unasked),
             None => transport
                 .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
                 .await
@@ -2279,6 +2286,13 @@ impl MeshRuntime {
             None => false,
         }
     }
+
+    /// Whether the last link attempt to `destination_hex` failed and the peer has neither
+    /// linked nor announced since: `.mesh peers` reads it `no route`, and no request waits
+    /// on a path request for it.
+    pub(crate) fn link_failed(&self, destination_hex: &str) -> bool {
+        canonical_hash(destination_hex).is_some_and(|hex| self.peers().link_failed(&hex))
+    }
 }
 
 /// The first sentences of every refusal for a destination the table knows but the network
@@ -2288,17 +2302,18 @@ pub(crate) fn unreachable_head(destination: &str) -> String {
 }
 
 /// The sentence a "no answer" refusal adds after `unreachable_head` or `unreachable_cause`
-/// when the peer announced recently: a session that exits sends no goodbye, so a peer heard
-/// within `PEER_STALE_AFTER` that no longer answers has most likely gone. Empty for a stale
-/// row or none, where the silence says nothing new.
+/// when the peer announced recently: a session that crashes or loses its network sends no
+/// goodbye, so a peer heard within `PEER_STALE_AFTER` that no longer answers has most
+/// likely gone. Empty for a stale row or none, where the silence says nothing new.
 pub(crate) fn left_mesh_hint(peer: Option<&PeerRecord>, now: SystemTime) -> &'static str {
     left_mesh_hint_when(peer.is_some_and(|peer| !peer.is_stale(now)))
 }
 
-/// `left_mesh_hint` for an error that kept only whether the peer was recently seen.
+/// `left_mesh_hint` for an error that kept only whether the peer was recently seen; a
+/// link that never came up (`RequestError::LinkActivationTimeout`) carries it too.
 pub(crate) fn left_mesh_hint_when(recently_seen: bool) -> &'static str {
     if recently_seen {
-        " It may have left the mesh; a session that exits says nothing."
+        " It may have left the mesh; a session that crashes or loses its network says nothing."
     } else {
         ""
     }
@@ -2331,7 +2346,7 @@ mod left_mesh_hint_tests {
         let recent = seen(PEER_STALE_AFTER - Duration::from_secs(1), now);
         assert_eq!(
             left_mesh_hint(Some(&recent), now),
-            " It may have left the mesh; a session that exits says nothing."
+            " It may have left the mesh; a session that crashes or loses its network says nothing."
         );
     }
 
@@ -2356,7 +2371,7 @@ mod left_mesh_hint_tests {
         };
         let recent = refusal(true);
         assert!(
-            recent.contains("cannot reach. It may have left the mesh; a session that exits says nothing. Nothing was queued"),
+            recent.contains("cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued"),
             "{recent}"
         );
         let stale = refusal(false);

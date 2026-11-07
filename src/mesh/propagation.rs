@@ -1255,6 +1255,7 @@ mod tests {
             RequestError::LinkActivationTimeout {
                 path: path.clone(),
                 after,
+                recently_seen: false,
             },
             RequestError::LocalTimeout {
                 path: path.clone(),

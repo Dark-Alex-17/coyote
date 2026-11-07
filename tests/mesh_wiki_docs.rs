@@ -5582,6 +5582,11 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         .find(|literal| !literal.is_empty())
         .expect("left_mesh_hint_when returns one non-empty hint");
     let hint = hint.trim().to_string();
+    let link_timeout_display = fn_body("src/mesh/request/error.rs", "fmt");
+    assert!(
+        link_timeout_display.contains("left_mesh_hint_when(*recently_seen)"),
+        "src/mesh/request/error.rs no longer adds the left-the-mesh hint to a link that never came up"
+    );
 
     let commands = read(wiki.join("Mesh-Commands.md"));
     let status = flat(&section(
@@ -5597,6 +5602,14 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         status.contains(&format!("`{hint}` after `cannot reach.`"))
             && status.contains("`.mesh message`"),
         "Mesh-Commands.md's `.mesh status` entry does not say the refusals add {hint:?} after `cannot reach.`"
+    );
+    let link_timeout_line = format!(
+        "No mesh link to the peer came up within 10.0s. {hint} {}.",
+        "Try again in a minute; `.mesh peers` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later"
+    );
+    assert!(
+        status.contains(&link_timeout_line),
+        "Mesh-Commands.md's `.mesh status` entry does not quote the link-timeout refusal with the hint: {link_timeout_line:?}"
     );
     assert!(
         status.contains(&format!("waits up to {timeout} s for the answer")),

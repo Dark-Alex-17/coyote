@@ -1,4 +1,5 @@
 use crate::mesh::lock::acquire_mesh_lock;
+use crate::mesh::peers::PEER_TTL;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::{mesh_cache_dir, redact_hashes, write_atomically_owner_only};
 use crate::utils::fs::EXCLUSIVE_LOCK_WAIT;
@@ -12,9 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub(crate) const INSTANCES_VERSION: u64 = 1;
+pub(crate) const INSTANCES_VERSION: u64 = 2;
 
-/// The whole registry: the version first, then each running node by its instance id.
+/// The whole registry: the version first, then each node by its instance id.
 /// Rejects unknown fields, so any change to the layout bumps `INSTANCES_VERSION`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,9 +24,11 @@ pub(crate) struct InstancesFile {
     pub instances: BTreeMap<String, InstanceRow>,
 }
 
-/// One node running on this cache dir: the destination it serves, the session and agent
-/// it serves them for, and the process that started it, by pid and start time so a pid
-/// the kernel handed to another process does not keep the row alive.
+/// One node on this cache dir: the destination it serves, the session and agent it
+/// serves them for, and the process that started it, by pid and start time so a pid the
+/// kernel handed to another process does not keep the row alive. `gone_at` is set when
+/// the node stops, or when a write first finds its process gone: the row then stays as a
+/// tombstone, so the session can still be named as gone, until it is `PEER_TTL` old.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InstanceRow {
@@ -34,6 +37,8 @@ pub(crate) struct InstanceRow {
     pub agent: Option<String>,
     pub process: ProcessStamp,
     pub started: SystemTime,
+    #[serde(default)]
+    pub gone_at: Option<SystemTime>,
 }
 
 impl InstanceRow {
@@ -45,47 +50,74 @@ impl InstanceRow {
             agent,
             process: ProcessStamp::current(),
             started: SystemTime::now(),
+            gone_at: None,
         }
     }
 }
 
-/// `<cache_dir>/mesh/instances.json`: the nodes running on this cache dir, so a session
-/// can tell its own other sessions apart from foreign peers. It is local only and a
-/// convenience: nothing in it reaches the mesh, and no read or write failure stops a node
-/// from starting or stopping.
+/// `<cache_dir>/mesh/instances.json`: the nodes on this cache dir, running or recently
+/// gone, so a session can tell its own other sessions apart from foreign peers. It is
+/// local only and a convenience: nothing in it reaches the mesh, and no read or write
+/// failure stops a node from starting or stopping.
 fn registry_path(cache_dir: &Path) -> PathBuf {
     mesh_cache_dir(cache_dir).join("instances.json")
 }
 
-/// Files `row` under `instance_id`, replacing any row the id had.
+/// Files `row` under `instance_id`, replacing any row the id had, a tombstone included.
 pub(crate) fn register(cache_dir: &Path, instance_id: &str, row: InstanceRow) {
     update(cache_dir, |rows| {
         rows.insert(instance_id.to_string(), row);
     });
 }
 
+/// Marks the row of `instance_id` gone, keeping it as a tombstone; a row already gone
+/// keeps the time it went.
 pub(crate) fn unregister(cache_dir: &Path, instance_id: &str) {
+    let now = SystemTime::now();
     update(cache_dir, |rows| {
-        rows.remove(instance_id);
+        if let Some(row) = rows.get_mut(instance_id) {
+            row.gone_at.get_or_insert(now);
+        }
     });
 }
 
-/// The rows whose process is still running, by the destination each serves. A registry
-/// that cannot be used reads as empty, with a warning, and is left for the next write to
-/// deal with.
+/// The registry's rows by the destination each serves, split into the sessions still
+/// running and the tombstones of those that have gone.
+#[derive(Debug, Default)]
+pub(crate) struct Sessions {
+    pub running: HashMap<String, InstanceRow>,
+    pub gone: HashMap<String, InstanceRow>,
+}
+
+/// The rows whose node still runs, by the destination each serves. A tombstone is never
+/// among them, so no name resolves to a session that has gone.
 pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {
+    by_destination(cache_dir).running
+}
+
+/// Every row by the destination it serves, running or gone. A registry that cannot be
+/// used reads as empty, with a warning, and is left for the next write to deal with.
+pub(crate) fn by_destination(cache_dir: &Path) -> Sessions {
     let path = registry_path(cache_dir);
-    match read_live_rows(&path) {
-        Ok(rows) => rows
-            .into_values()
-            .map(|row| (row.destination.clone(), row))
-            .collect(),
+    match read_judged_rows(&path, SystemTime::now()) {
+        Ok(rows) => {
+            let mut sessions = Sessions::default();
+            for row in rows.into_values() {
+                let side = if row.gone_at.is_some() {
+                    &mut sessions.gone
+                } else {
+                    &mut sessions.running
+                };
+                side.insert(row.destination.clone(), row);
+            }
+            sessions
+        }
         Err(RegistryRead::Version(found)) => {
             warn!(
                 "{} Until then `.mesh peers` and `mesh__peers` name none of your sessions.",
                 refusal(&path, found)
             );
-            HashMap::new()
+            Sessions::default()
         }
         Err(RegistryRead::Corrupt { cause, error }) => {
             warn!(
@@ -94,7 +126,7 @@ pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {
                 redact_hashes(&cause),
                 redact_hashes(&error)
             );
-            HashMap::new()
+            Sessions::default()
         }
     }
 }
@@ -102,20 +134,19 @@ pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {
 /// What the registry says of the session that runs, or ran, an instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InstanceSession {
-    /// Its process is still running, under this session name.
+    /// Its node is still running, under this session name.
     Running(String),
-    /// Its row is still filed but its process has gone. A session that stopped in
-    /// order took its row with it, so this is a session that ended without saying so
-    /// and whose row no write has pruned yet.
+    /// Its node stopped, or its process has gone, and its tombstone is not yet
+    /// `PEER_TTL` old.
     Gone(String),
 }
 
-/// Every row the registry holds, live or not yet dropped, by instance id, each with
-/// whether its process still runs. A registry that cannot be read names none, logged at
-/// debug level; `live` warns about it where the sessions are listed.
+/// Every row the registry holds, running or a tombstone, by instance id. A registry that
+/// cannot be read names none, logged at debug level; `by_destination` warns about it
+/// where the sessions are listed.
 pub(crate) fn sessions_by_instance(cache_dir: &Path) -> HashMap<String, InstanceSession> {
     let path = registry_path(cache_dir);
-    let rows = match read_rows(&path) {
+    let rows = match read_judged_rows(&path, SystemTime::now()) {
         Ok(rows) => rows,
         Err(RegistryRead::Version(found)) => {
             debug!("{}", refusal(&path, found));
@@ -131,22 +162,21 @@ pub(crate) fn sessions_by_instance(cache_dir: &Path) -> HashMap<String, Instance
             return HashMap::new();
         }
     };
-    let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
-    let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);
     rows.into_iter()
         .map(|(instance_id, row)| {
-            let session = if alive.contains(&row.process) {
-                InstanceSession::Running(row.session)
-            } else {
+            let session = if row.gone_at.is_some() {
                 InstanceSession::Gone(row.session)
+            } else {
+                InstanceSession::Running(row.session)
             };
             (instance_id, session)
         })
         .collect()
 }
 
-/// Applies `change` to the live rows under the registry's lock and writes the result,
-/// which drops every row whose process has gone. A failure is only warned about.
+/// Applies `change` to the judged rows under the registry's lock and writes the result,
+/// which files a tombstone for every row whose process has gone and drops every
+/// tombstone `PEER_TTL` old. A failure is only warned about.
 fn update(cache_dir: &Path, change: impl FnOnce(&mut BTreeMap<String, InstanceRow>)) {
     let path = registry_path(cache_dir);
     if let Err(err) = rewrite(&path, change) {
@@ -164,7 +194,7 @@ fn rewrite(path: &Path, change: impl FnOnce(&mut BTreeMap<String, InstanceRow>))
         "mesh instance registry",
         EXCLUSIVE_LOCK_WAIT,
     )?;
-    let mut rows = match read_live_rows(path) {
+    let mut rows = match read_judged_rows(path, SystemTime::now()) {
         Ok(rows) => rows,
         Err(RegistryRead::Version(found)) => return Err(anyhow!(refusal(path, found))),
         Err(RegistryRead::Corrupt { cause, error }) => {
@@ -203,18 +233,42 @@ enum RegistryRead {
     },
 }
 
-/// The rows at `path` whose process is still running, judged on one process-table
-/// refresh; a missing file has none. A row stamped without a start time stays while its
-/// pid is in use, since it cannot be told from the process that filed it.
-fn read_live_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, RegistryRead> {
+/// The rows at `path` as of `now`: a row whose process is gone reads as a tombstone gone
+/// at `now`, judged on one process-table refresh over the rows not already gone, and a
+/// tombstone `PEER_TTL` old is dropped; a missing file has none. A row stamped without a
+/// start time stays running while its pid is in use, since it cannot be told from the
+/// process that filed it.
+fn read_judged_rows(
+    path: &Path,
+    now: SystemTime,
+) -> Result<BTreeMap<String, InstanceRow>, RegistryRead> {
     let mut rows = read_rows(path)?;
-    let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
-    let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);
-    rows.retain(|_, row| alive.contains(&row.process));
+    let stamps: Vec<ProcessStamp> = rows
+        .values()
+        .filter(|row| row.gone_at.is_none())
+        .map(|row| row.process)
+        .collect();
+    if !stamps.is_empty() {
+        let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);
+        for row in rows.values_mut() {
+            if row.gone_at.is_none() && !alive.contains(&row.process) {
+                row.gone_at = Some(now);
+            }
+        }
+    }
+    rows.retain(|_, row| {
+        !row.gone_at
+            .is_some_and(|gone_at| tombstone_expired(gone_at, now))
+    });
     Ok(rows)
 }
 
-/// Every row at `path`, whether its process runs or not; a missing file has none.
+/// A `gone_at` in the future (the clock stepped back) reads as just gone, not as expired.
+fn tombstone_expired(gone_at: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(gone_at).unwrap_or_default() >= PEER_TTL
+}
+
+/// Every row at `path` as filed; a missing file has none.
 fn read_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, RegistryRead> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -322,14 +376,144 @@ mod tests {
     }
 
     #[test]
-    fn unregister_removes_the_row() {
+    fn unregister_keeps_the_row_as_a_tombstone_that_is_never_live() {
         let tmp = TempDir::new("instances-unregister");
-        register(&tmp.path, ID_A, row(&"aa".repeat(16), "temp"));
+        let filed = row(&"aa".repeat(16), "temp");
+        register(&tmp.path, ID_A, filed.clone());
+        let before = SystemTime::now();
 
         unregister(&tmp.path, ID_A);
 
         assert!(live(&tmp.path).is_empty());
-        assert!(written(&tmp).instances.is_empty());
+        let tombstone = written(&tmp).instances[ID_A].clone();
+        let gone_at = tombstone
+            .gone_at
+            .expect("the row is kept with its gone time");
+        assert!(gone_at >= before, "{gone_at:?} before {before:?}");
+        assert_eq!(
+            InstanceRow {
+                gone_at: None,
+                ..tombstone
+            },
+            filed
+        );
+        let sessions = by_destination(&tmp.path);
+        assert!(sessions.running.is_empty());
+        assert_eq!(sessions.gone[&"aa".repeat(16)].session, "temp");
+        assert_eq!(
+            sessions_by_instance(&tmp.path).get(ID_A),
+            Some(&InstanceSession::Gone("temp".to_string()))
+        );
+
+        unregister(&tmp.path, ID_A);
+        assert_eq!(
+            written(&tmp).instances[ID_A].gone_at,
+            Some(gone_at),
+            "a second stop keeps the time the row went"
+        );
+    }
+
+    /// A node that joins again under the same instance id replaces its tombstone.
+    #[test]
+    fn registering_over_a_tombstone_makes_the_row_live_again() {
+        let tmp = TempDir::new("instances-revive");
+        register(&tmp.path, ID_A, row(&"aa".repeat(16), "temp"));
+        unregister(&tmp.path, ID_A);
+
+        register(&tmp.path, ID_A, row(&"aa".repeat(16), "temp"));
+
+        assert_eq!(live(&tmp.path)[&"aa".repeat(16)].session, "temp");
+        assert!(by_destination(&tmp.path).gone.is_empty());
+        assert_eq!(written(&tmp).instances[ID_A].gone_at, None);
+    }
+
+    /// A tombstone is pruned once it is `PEER_TTL` old: a read no longer names it, and the
+    /// next write drops it. One just under the age, or stamped in the future, stays.
+    #[test]
+    fn a_tombstone_peer_ttl_old_is_pruned_on_read_and_dropped_by_the_next_write() {
+        let tmp = TempDir::new("instances-tombstone-ttl");
+        let now = SystemTime::now();
+        let gone = |destination: &str, session: &str, gone_at| InstanceRow {
+            gone_at: Some(gone_at),
+            ..row(destination, session)
+        };
+        let expired_id = "11".repeat(16);
+        let fresh_id = "22".repeat(16);
+        let future_id = "33".repeat(16);
+        let file = InstancesFile {
+            version: INSTANCES_VERSION,
+            instances: BTreeMap::from([
+                (
+                    expired_id.clone(),
+                    gone(&"e1".repeat(16), "expired", now - PEER_TTL),
+                ),
+                (
+                    fresh_id.clone(),
+                    gone(
+                        &"f1".repeat(16),
+                        "fresh",
+                        now - PEER_TTL + std::time::Duration::from_secs(60),
+                    ),
+                ),
+                (
+                    future_id.clone(),
+                    gone(
+                        &"f2".repeat(16),
+                        "future",
+                        now + std::time::Duration::from_secs(60),
+                    ),
+                ),
+            ]),
+        };
+        write_raw(&tmp, &serde_json::to_vec(&file).unwrap());
+
+        let sessions = sessions_by_instance(&tmp.path);
+        assert_eq!(sessions.get(&expired_id), None, "{sessions:?}");
+        assert_eq!(
+            sessions.get(&fresh_id),
+            Some(&InstanceSession::Gone("fresh".to_string()))
+        );
+        assert_eq!(
+            sessions.get(&future_id),
+            Some(&InstanceSession::Gone("future".to_string()))
+        );
+        assert!(
+            !by_destination(&tmp.path)
+                .gone
+                .contains_key(&"e1".repeat(16))
+        );
+
+        register(&tmp.path, ID_A, row(&"aa".repeat(16), "temp"));
+
+        let instances = written(&tmp).instances;
+        assert!(
+            !instances.contains_key(&expired_id),
+            "{:?}",
+            instances.keys()
+        );
+        assert!(instances.contains_key(&fresh_id));
+        assert!(instances.contains_key(&future_id));
+    }
+
+    /// `.mesh off` in a session that keeps running: the process is alive, the row is not.
+    #[test]
+    fn a_tombstone_whose_process_still_runs_reads_gone() {
+        let tmp = TempDir::new("instances-off-but-running");
+        register(&tmp.path, ID_A, row(&"aa".repeat(16), "a"));
+        register(&tmp.path, ID_B, row(&"bb".repeat(16), "b"));
+
+        unregister(&tmp.path, ID_A);
+
+        let sessions = by_destination(&tmp.path);
+        assert_eq!(
+            sessions.running.keys().collect::<Vec<_>>(),
+            [&"bb".repeat(16)]
+        );
+        assert_eq!(sessions.gone.keys().collect::<Vec<_>>(), [&"aa".repeat(16)]);
+        assert_eq!(
+            sessions_by_instance(&tmp.path).get(ID_A),
+            Some(&InstanceSession::Gone("a".to_string()))
+        );
     }
 
     #[test]
@@ -347,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_whose_process_is_gone_is_pruned_on_read_and_dropped_by_the_next_write() {
+    fn a_row_whose_process_is_gone_reads_gone_and_the_next_write_files_its_tombstone() {
         assert!(
             !ProcessStamp::pid_exists(DEAD_PID),
             "pid {DEAD_PID} is in use"
@@ -367,15 +551,23 @@ mod tests {
         write_raw(&tmp, &serde_json::to_vec(&file).unwrap());
 
         assert!(live(&tmp.path).is_empty(), "a dead row is not live");
+        assert_eq!(
+            by_destination(&tmp.path).gone[&"dd".repeat(16)].session,
+            "gone"
+        );
         assert!(
-            written(&tmp).instances.contains_key(ID_B),
+            written(&tmp).instances[ID_B].gone_at.is_none(),
             "a read leaves the file alone"
         );
 
+        let before = SystemTime::now();
         register(&tmp.path, ID_A, row(&"aa".repeat(16), "temp"));
 
         let instances = written(&tmp).instances;
-        assert!(!instances.contains_key(ID_B), "{:?}", instances.keys());
+        let gone_at = instances[ID_B]
+            .gone_at
+            .expect("the write files the dead row as a tombstone");
+        assert!(gone_at >= before, "{gone_at:?} before {before:?}");
         assert!(instances.contains_key(ID_A));
     }
 
@@ -487,7 +679,7 @@ mod tests {
     fn another_version_is_refused_and_left_as_it_was() {
         install_log_collector();
         let tmp = TempDir::new("instances-version");
-        let bytes = br#"{"version":2,"instances":{}}"#;
+        let bytes = br#"{"version":1,"instances":{}}"#;
         let path = write_raw(&tmp, bytes);
 
         register(&tmp.path, ID_A, row(&"aa".repeat(16), "temp"));
@@ -503,7 +695,7 @@ mod tests {
         let warns = warn_snapshot();
         assert!(
             warns.iter().any(|message| message.contains(&path_text)
-                && message.contains("is version 2 but this Coyote writes version 1")
+                && message.contains("is version 1 but this Coyote writes version 2")
                 && message.contains("was not updated")),
             "no refusal names {path_text}; captured: {warns:#?}"
         );

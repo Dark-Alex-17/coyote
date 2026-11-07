@@ -1112,12 +1112,20 @@ impl MeshRuntime {
     }
 
     /// The sessions of yours running on this cache dir, this one included, by the
-    /// destination each serves, as the instance registry lists them.
+    /// destination each serves, as the instance registry lists them. A session that has
+    /// gone is never among them, so no session name resolves to it.
     pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
         instances::live(&self.cache_dir)
             .into_iter()
             .map(|(destination, row)| (destination, row.session))
             .collect()
+    }
+
+    /// The registry's sessions of yours on this cache dir by the destination each
+    /// serves, the running ones and the gone ones whose tombstones it still keeps, from
+    /// one read.
+    pub(crate) fn registered_sessions(&self) -> instances::Sessions {
+        instances::by_destination(&self.cache_dir)
     }
 
     /// The questions the other sessions on this cache dir asked and still wait on or
@@ -1609,7 +1617,9 @@ impl MeshRuntime {
     /// `request` with the envelope already built. Every request to a peer passes here: a peer
     /// the table knows speaks another protocol is refused before any link is opened, and a
     /// peer that refuses this node's version over the wire is marked so the next request is
-    /// refused here.
+    /// refused here. A link that could not be opened marks the peer's row `no route` until
+    /// a link comes up or it announces again; while marked, the request still runs when the
+    /// transport holds a path but never waits on a path request for it.
     async fn request_envelope(
         &self,
         destination: &DestinationDesc,
@@ -1632,6 +1642,10 @@ impl MeshRuntime {
             .clone()
             .ok_or(RequestError::NotRunning)?;
         let sent = envelope.version;
+        let options = RequestOptions {
+            path_requested: options.path_requested || self.peers.link_failed(&dest_hex),
+            ..options
+        };
         let request = link_request(
             &transport,
             &self.transport_identity,
@@ -1647,7 +1661,7 @@ impl MeshRuntime {
             outcome = request => outcome,
         };
         note_version_refusal(&self.peers, &dest_hex, path, sent, &outcome);
-        outcome
+        note_link_outcome(&self.peers, &dest_hex, outcome, SystemTime::now())
     }
 
     /// `body` in the envelope naming the instance this node speaks for right now, read per
@@ -3037,6 +3051,45 @@ fn note_version_refusal(
         "Mesh request for {path} to {} was refused for its protocol version; the peer speaks protocol {max} and is marked incompatible",
         short(dest_hex)
     );
+}
+
+/// Files what one request learned about the link to `dest_hex`: a link that never came up
+/// marks the row `no route`, and one that came up, whatever the request's own fate, lifts
+/// the mark. A link that did not come up says the peer may have left the mesh when its
+/// row was heard within `PEER_STALE_AFTER` of `now`.
+fn note_link_outcome(
+    peers: &PeerTable,
+    dest_hex: &str,
+    mut outcome: Result<rmpv::Value, RequestError>,
+    now: SystemTime,
+) -> Result<rmpv::Value, RequestError> {
+    match &mut outcome {
+        Err(RequestError::LinkActivationTimeout { recently_seen, .. }) => {
+            *recently_seen = peers.get(dest_hex).is_some_and(|peer| !peer.is_stale(now));
+            peers.mark_link_failed(dest_hex);
+        }
+        Err(RequestError::LinkFailed(_)) => peers.mark_link_failed(dest_hex),
+        Ok(_)
+        | Err(
+            RequestError::Timeout { .. }
+            | RequestError::IdentifyTimeout { .. }
+            | RequestError::ResponseIncomplete { .. }
+            | RequestError::RequestIncomplete { .. }
+            | RequestError::LinkClosed
+            | RequestError::ResponseOversize { .. }
+            | RequestError::Decode(_)
+            | RequestError::Refused(_)
+            | RequestError::UnsupportedVersion { .. },
+        ) => peers.clear_link_failed(dest_hex),
+        Err(
+            RequestError::LocalTimeout { .. }
+            | RequestError::Oversize { .. }
+            | RequestError::Send(_)
+            | RequestError::NotRunning
+            | RequestError::Shutdown,
+        ) => {}
+    }
+    outcome
 }
 
 async fn receive_announces(
@@ -12042,7 +12095,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
             )
         );
 
@@ -16077,6 +16130,7 @@ mod tests {
             let never_linked = RequestError::LinkActivationTimeout {
                 path: STATUS_PATH.to_string(),
                 after: Duration::from_secs(10),
+                recently_seen: false,
             };
             let sentences = reconnect_lines.into_iter().chain([
                 no_answer.to_string(),
@@ -16846,7 +16900,8 @@ mod tests {
         /// stored key is still enough to hold the message on the persisted propagation node,
         /// and the send pays the resolve's one path-request wait: the link that follows
         /// fails without asking again, so the fallback comes after one
-        /// `PATH_REQUEST_TIMEOUT` plus the post, not two.
+        /// `PATH_REQUEST_TIMEOUT` plus the post, not two. That failed link marks the peer
+        /// `no route`, so the next send waits on no path request at all.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_message_to_an_offline_peer_known_by_its_stored_key_is_held_on_a_propagation_node()
          {
@@ -16921,6 +16976,19 @@ mod tests {
                 waited >= PATH_REQUEST_TIMEOUT
                     && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
                 "the send waited {waited:?} before falling back"
+            );
+            node.next_received().await;
+            assert!(runtime.link_failed(&destination));
+
+            let message =
+                OutboundPeer::new(PeerKind::Message, "held again", None, None, None).unwrap();
+            let asked = Instant::now();
+            let outcome = runtime.send_peer(&destination, &message).await.unwrap();
+            let waited = asked.elapsed();
+            assert_eq!(outcome.via, PeerVia::StoreAndForward);
+            assert!(
+                waited < PATH_REQUEST_TIMEOUT,
+                "a peer whose last link failed is not asked for again: waited {waited:?}"
             );
             node.next_received().await;
 
@@ -17275,9 +17343,11 @@ mod tests {
 
         /// Two sessions on one cache dir each file their row at start, each sees the
         /// other's session by its destination, a re-key moves the row to the fork's id
-        /// and destination, and a stop removes only the stopped node's row.
+        /// and destination and keeps the original's as a tombstone, and a stop turns only
+        /// the stopped node's row into one. A tombstone is never a running session, so
+        /// no name resolves to it.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn start_files_the_row_rekey_moves_it_and_stop_removes_it() {
+        async fn start_files_the_row_rekey_moves_it_and_stop_keeps_it_as_gone() {
             let (addr, relay_handle, _) = loopback_relay().await;
             let tmp = TempDir::new("node-own-session-rows");
             let a = start_as("a", &tmp, addr.port()).await;
@@ -17288,6 +17358,7 @@ mod tests {
                 a.current_destination_hash(),
                 temp.current_destination_hash(),
             );
+            let original_id = temp.current_instance_id();
 
             let rows = instances::live(&a.cache_dir);
             assert_eq!(rows.len(), 2, "{rows:?}");
@@ -17308,7 +17379,7 @@ mod tests {
 
             temp_slot
                 .rekey(ForkRekey {
-                    original_instance_id: Some(temp.current_instance_id()),
+                    original_instance_id: Some(original_id.clone()),
                     fork_instance_id: fresh_instance_id(),
                 })
                 .await
@@ -17318,16 +17389,40 @@ mod tests {
             let rows = a.own_sessions();
             assert!(!rows.contains_key(&temp_dest), "{rows:?}");
             assert_eq!(rows.get(&fork_dest).map(String::as_str), Some("temp"));
+            assert_eq!(
+                a.registered_sessions().gone[&temp_dest].session,
+                "temp",
+                "the original instance is kept as gone"
+            );
+            assert_eq!(
+                instances::sessions_by_instance(&a.cache_dir).get(&original_id),
+                Some(&InstanceSession::Gone("temp".to_string()))
+            );
             temp_slot.rename_session("temp-fork");
             assert_eq!(
                 a.own_sessions().get(&fork_dest).map(String::as_str),
                 Some("temp-fork")
             );
+            let session_names = |runtime: &MeshRuntime| -> Vec<String> {
+                let mut names: Vec<String> = runtime
+                    .address_names()
+                    .into_iter()
+                    .filter(|name| matches!(name.target, NameTarget::Session { .. }))
+                    .map(|name| name.name)
+                    .collect();
+                names.sort_unstable();
+                names
+            };
+            assert_eq!(session_names(&a), ["a", "temp-fork"]);
 
             assert!(temp_slot.stop().await.unwrap());
             let rows = a.own_sessions();
             assert_eq!(rows.len(), 1, "{rows:?}");
             assert_eq!(rows.get(&a_dest).map(String::as_str), Some("a"));
+            let gone = a.registered_sessions().gone;
+            assert_eq!(gone[&fork_dest].session, "temp-fork", "{gone:?}");
+            assert_eq!(gone[&temp_dest].session, "temp", "{gone:?}");
+            assert_eq!(session_names(&a), ["a"], "a gone session is never a name");
 
             a.shutdown().await.unwrap();
             assert!(instances::live(&tmp.path.join("cache")).is_empty());
@@ -20396,6 +20491,76 @@ mod tests {
             peers.get(&hash).unwrap().compatibility,
             Compatibility::Compatible
         );
+    }
+
+    /// A link that never came up marks the row `no route`, and says the peer may have left
+    /// when it was heard within the stale window; a request whose link came up lifts the
+    /// mark whatever its own fate, and a failure on this node's side leaves it as it was.
+    #[test]
+    fn a_failed_link_marks_the_peer_and_a_link_that_came_up_clears_it() {
+        let (_tmp, peers, hash) = compatible_peer_table("node-link-outcome");
+        let now = SystemTime::now();
+        let never_linked = || {
+            Err(RequestError::LinkActivationTimeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(10),
+                recently_seen: false,
+            })
+        };
+
+        let outcome = note_link_outcome(&peers, &hash, never_linked(), now);
+        assert!(peers.link_failed(&hash));
+        assert!(
+            matches!(
+                outcome,
+                Err(RequestError::LinkActivationTimeout {
+                    recently_seen: true,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        let later = now + PEER_STALE_AFTER;
+        let outcome = note_link_outcome(&peers, &hash, never_linked(), later);
+        assert!(
+            matches!(
+                outcome,
+                Err(RequestError::LinkActivationTimeout {
+                    recently_seen: false,
+                    ..
+                })
+            ),
+            "a stale row says nothing more: {outcome:?}"
+        );
+
+        let _ = note_link_outcome(&peers, &hash, Err(RequestError::NotRunning), now);
+        assert!(
+            peers.link_failed(&hash),
+            "this node's own failure keeps the mark"
+        );
+        let _ = note_link_outcome(
+            &peers,
+            &hash,
+            Err(RequestError::Timeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(1),
+            }),
+            now,
+        );
+        assert!(
+            !peers.link_failed(&hash),
+            "a link that came up clears the mark"
+        );
+
+        let _ = note_link_outcome(
+            &peers,
+            &hash,
+            Err(RequestError::LinkFailed("no known path".to_string())),
+            now,
+        );
+        assert!(peers.link_failed(&hash));
+        let _ = note_link_outcome(&peers, &hash, Ok(rmpv::Value::Nil), now);
+        assert!(!peers.link_failed(&hash));
     }
 
     /// A stub filed as compatible, then marked incompatible in the table as a wire refusal
