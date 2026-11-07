@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 5156
 expression: "&frame"
 ---
 "> read it                               "
@@ -17,7 +18,7 @@ expression: "&frame"
 "                                        "
 "                                        "
 "                                        "
-"                                        "
+"────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"
 "                                        "
 "                                        "

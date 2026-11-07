@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 6462
 expression: "&frame"
 ---
 "> plan it                                             ┌Todo────────────────────┐"
@@ -19,9 +20,9 @@ expression: "&frame"
 "                                                      │                        │"
 "                                                      │                        │"
 "                                                      │                        │"
-"                                                      │                        │"
 "                                                      └────────────────────────┘"
 "                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                       "
 "                                                                                "
 "                                                                                "

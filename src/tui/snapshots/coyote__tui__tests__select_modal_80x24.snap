@@ -1,0 +1,29 @@
+---
+source: src/tui/mod.rs
+assertion_line: 2956
+expression: frame
+---
+"                                                                                "
+"                                                                                "
+"┌──────────────────────────────────────────────────────────────────────────────┐"
+"│ coyote X.Y.Z │"
+"│ model: openai:test-model                                                     │"
+"│                                                                              │"
+"│ Tip: Press Ctrl-C as the model works to interrupt the turn and send another  │"
+"│ prompt.                                                                      │"
+"│ Press it again at the idle prompt to cancel background work it left running. │"
+"│                                                                              │"
+"│ Type ".help" for additional help.                                            │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"Pick one q9d-s                                                                  "
+"tool: ask                                                                       "
+"  alpha                                                                         "
+"> beta                                                                          "
+"  gamma                                                                         "
+"  Other (custom)                                                                "
+"Up/Down = move  Enter = choose  1-9 = choose by number  Esc = cancel            "
+"openai:test-model . no session . agents 0 . jobs 0                              "

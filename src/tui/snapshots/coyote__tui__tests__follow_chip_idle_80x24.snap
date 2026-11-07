@@ -1,9 +1,8 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 5983
 expression: "&frame"
 ---
-"                                                                                "
-"> filler line 1                                                                 "
 "                                                                                "
 "> filler line 2                                                                 "
 "                                                                                "
@@ -20,8 +19,10 @@ expression: "&frame"
 "> filler line 8                                                                 "
 "                                                                                "
 "> filler line 9                                                                 "
-"                                                                    End = follow"
 "                                                                                "
+"> filler line 10                                                    End = follow"
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                       "
 "                                                                                "
 "                                                                                "

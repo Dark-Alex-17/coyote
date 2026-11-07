@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 3379
 expression: rendered
 ---
 "> run the tool                                              "
@@ -16,8 +17,8 @@ expression: rendered
 "                                                            "
 "                                                            "
 "                                                            "
-"                                                            "
 "Working . Ns  Esc to interrupt                              "
+"────────────────────────────────────────────────────────────"
 "hello                                                       "
 "                                                            "
 "                                                            "
