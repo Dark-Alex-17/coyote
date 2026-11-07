@@ -310,12 +310,14 @@ struct Delivery {
 
 #[cfg(windows)]
 impl Server {
+    /// The name carries a random suffix: the pipe namespace is shared by
+    /// every process on the machine, and the first instance claims the
+    /// name, so a guessable one could be taken before the server gets to it.
     pub(crate) fn open() -> Result<Self> {
-        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = format!(
             r"\\.\pipe\coyote-prompt-{}-{}",
             std::process::id(),
-            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            uuid::Uuid::new_v4().simple()
         );
         let name = win::wide(&path);
         let descriptor = win::OwnerOnlyDescriptor::new()?;
@@ -485,8 +487,8 @@ mod win {
     }
 
     /// A security descriptor granting the current user full access and
-    /// nobody else anything; the pipe name is guessable, the replies are
-    /// not for other accounts on the machine.
+    /// nobody else anything: the pipe namespace is visible to every account
+    /// on the machine, and the replies are not for the other ones.
     pub(super) struct OwnerOnlyDescriptor(*mut c_void);
 
     // SAFETY: the descriptor is an opaque heap buffer that is only read
