@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 4520
 expression: "&narrow"
 ---
 "> explain                               "
@@ -21,7 +22,7 @@ expression: "&narrow"
 "                                        "
 "                                        "
 "                                        "
-"                                        "
+"────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"
 "                                        "
 "                                        "
