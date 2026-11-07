@@ -139,9 +139,9 @@ fn built_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_coyote"))
 }
 
-/// The one place the binary is launched: `wrapper` is one of the bash
-/// scripts above and `stdin` the path the binary's stdin is redirected
-/// from.
+/// [`spawn_binary_under`] for the build's own binary: `wrapper` is one of
+/// the bash scripts above and `stdin` the path the binary's stdin is
+/// redirected from.
 fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin: &str) -> Pty {
     spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin, "")
 }
@@ -1727,7 +1727,8 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
 /// the pty nor an ordinary file opened without close-on-exec: it sees
 /// only its three standard streams and, on the lowest free number, `ls`'s
 /// own handle on the directory it lists. On a tty `ls` prints its entries
-/// in columns, so the list is read word by word.
+/// in columns, so the list is read word by word. A placeholder keeps the
+/// scratch file off fd 3, where `ls`'s own handle would be mistaken for it.
 #[test]
 #[serial]
 fn the_child_inherits_no_pty_descriptor() {
@@ -1741,6 +1742,7 @@ fn the_child_inherits_no_pty_descriptor() {
     }
     let dir = fresh_config_dir("fd-leak");
     let _guard = TempDirGuard(dir.clone());
+    let _placeholder = fs::File::open(&dir).unwrap();
     let scratch = fs::File::create(dir.join("scratch")).unwrap();
     // SAFETY: fcntl with F_SETFD takes no pointers; the result is checked.
     assert_ne!(
