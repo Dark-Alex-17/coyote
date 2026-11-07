@@ -683,6 +683,47 @@ fn resolve_paths(
     ))
 }
 
+/// Runs a backtick document command and returns what it wrote, stderr
+/// folded in and an error message standing in for output it could not
+/// produce. Under the full-screen UI the only stdin is the raw tty the
+/// event stream owns, so the command gets none, and the wait is a poll
+/// the turn's abort can interrupt: dropping the future kills the child.
+async fn run_document_command(cmd: &str) -> String {
+    let expr = duct::cmd(&SHELL.cmd, [SHELL.arg.as_str(), cmd])
+        .stderr_to_stdout()
+        .unchecked();
+    if !crate::tui::active() {
+        return expr.read().unwrap_or_else(|err| err.to_string());
+    }
+    let child = match expr.stdin_null().stdout_capture().start() {
+        Ok(handle) => KillOnDrop(handle),
+        Err(err) => return err.to_string(),
+    };
+    loop {
+        match child.0.try_wait() {
+            Ok(Some(output)) => {
+                return match String::from_utf8(output.stdout.clone()) {
+                    Ok(text) => text.trim_end_matches(['\n', '\r']).to_string(),
+                    Err(err) => err.to_string(),
+                };
+            }
+            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            Err(err) => return err.to_string(),
+        }
+    }
+}
+
+/// A document command that does not outlive the future waiting on it.
+struct KillOnDrop(duct::Handle);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // Both fail only when the child is already reaped.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 async fn load_documents(
     loaders: &HashMap<String, String>,
     local_paths: Vec<String>,
@@ -699,11 +740,7 @@ async fn load_documents(
     let mut data_urls = HashMap::new();
 
     for cmd in external_cmds {
-        let output = duct::cmd(&SHELL.cmd, &[&SHELL.arg, &cmd])
-            .stderr_to_stdout()
-            .unchecked()
-            .read()
-            .unwrap_or_else(|err| err.to_string());
+        let output = run_document_command(&cmd).await;
         files.push(("CMD", cmd, output));
     }
 
@@ -793,7 +830,9 @@ mod tests {
     use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
     use crate::function::ToolCall;
+    use crate::testing::AtomicFlagGuard;
     use serde_json::json;
+    use serial_test::serial;
     use std::fs;
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -1317,6 +1356,25 @@ mod tests {
         ))
         .unwrap();
         assert!(input.text().contains("hello from cmd"));
+    }
+
+    /// Under the full-screen UI a document command that reads stdin gets
+    /// none, so `cat -` returns at once with nothing instead of waiting on
+    /// a tty the event stream owns.
+    #[test]
+    #[serial]
+    fn a_document_command_under_the_tui_reads_no_stdin() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let started = std::time::Instant::now();
+
+        let output = run_async(run_document_command("cat -; echo done-k2m"));
+
+        assert_eq!(output, "done-k2m");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
