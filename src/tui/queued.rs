@@ -44,49 +44,60 @@ pub(super) fn carry_over(queue: &NotificationQueue, queued: &[QueuedLine]) {
 /// Takes the user messages off `queue` and leaves the task notifications
 /// on it for the next turn.
 pub(super) fn take_user_messages(queue: &NotificationQueue) -> Vec<String> {
-    let mut texts = Vec::new();
-    for notification in queue.drain() {
-        match notification {
-            SystemNotification::UserMessage { text } => texts.push(text),
-            other => queue.push(other),
-        }
-    }
-    texts
+    queue
+        .take_where(|notification| !matches!(notification, SystemNotification::UserMessage { .. }))
+        .into_iter()
+        .filter_map(|notification| match notification {
+            SystemNotification::UserMessage { text } => Some(text),
+            SystemNotification::Task { .. } => None,
+        })
+        .collect()
 }
 
 /// Takes the newest copy of `text` off `queue`; false when the driver had
 /// already handed it to the model. A driver drain landing between the
-/// take and the push-back finds nothing and gets the rest at the boundary
-/// after, which is where they were headed anyway.
+/// count and the take leaves nothing to find, which reads as sent.
 pub(super) fn unqueue_user_message(queue: &NotificationQueue, text: &str) -> bool {
-    let mut unsent = take_user_messages(queue);
-    let found = unsent
-        .iter()
-        .rposition(|t| t == text)
-        .map(|pos| unsent.remove(pos));
-    for text in unsent {
-        queue.push(SystemNotification::UserMessage { text });
-    }
-    found.is_some()
+    let is_copy = |notification: &SystemNotification| match notification {
+        SystemNotification::UserMessage { text: t } => t == text,
+        SystemNotification::Task { .. } => false,
+    };
+    let mut copies = 0usize;
+    queue.take_where(|notification| {
+        copies += usize::from(is_copy(notification));
+        true
+    });
+    let mut seen = 0usize;
+    let taken = queue.take_where(|notification| {
+        if is_copy(notification) {
+            seen += 1;
+            return seen != copies;
+        }
+        true
+    });
+    !taken.is_empty()
 }
 
 /// Drops the prompts the turn's driver handed to the model. Drains are
-/// whole and in order, so `unsent` is a suffix of the prompts pushed; the
-/// commands, never pushed, all stay.
+/// whole and in order, so the prompts still held appear in `unsent` in
+/// order, after anything an interrupt dropped from the strip but not yet
+/// from the queue; the match walks both from the newest end and skips
+/// those stale leading entries. The commands, never pushed, all stay.
 pub(super) fn reconcile_queue(queued: &mut Vec<QueuedLine>, unsent: &[String]) {
-    let mut unsent = unsent.iter().peekable();
-    queued.retain(|line| {
+    let mut unsent = unsent.iter().rev().peekable();
+    let mut kept: Vec<QueuedLine> = Vec::with_capacity(queued.len());
+    for line in queued.drain(..).rev() {
         if line.command {
-            return true;
+            kept.push(line);
+            continue;
         }
-        match unsent.peek() {
-            Some(text) if **text == line.text => {
-                unsent.next();
-                true
-            }
-            _ => false,
+        if unsent.peek().is_some_and(|text| **text == line.text) {
+            unsent.next();
+            kept.push(line);
         }
-    });
+    }
+    kept.reverse();
+    *queued = kept;
 }
 
 /// The header plus the newest entries, up to the cap.
@@ -154,6 +165,16 @@ mod tests {
         let mut queued = vec![prompt("a"), prompt("b"), prompt("c")];
         reconcile_queue(&mut queued, &[]);
         assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn stale_leading_entries_on_the_queue_do_not_hide_the_held_prompt() {
+        let mut queued = vec![prompt("c")];
+        reconcile_queue(
+            &mut queued,
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+        assert_eq!(texts(&queued), ["c"]);
     }
 
     #[test]

@@ -3041,7 +3041,15 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             });
                         }
                     }
-                    Some(Command::Interrupt) => abort.set_ctrlc(),
+                    Some(Command::Interrupt) => {
+                        abort.set_ctrlc();
+                        // The strip was cleared with the interrupt; the
+                        // copies on the queue must go too, or the next
+                        // tool round would still hand them to the model.
+                        if let Some(Task::Turn { queue, .. }) = &task {
+                            take_user_messages(queue);
+                        }
+                    }
                     Some(Command::Quit) => {
                         quit_requested = true;
                         quit_abort(abort, task.is_some());
@@ -4200,6 +4208,34 @@ mod tests {
         let frame = harness.draw();
         assert!(frame.contains("Dropped 2 queued line(s)"), "{frame}");
         assert!(!frame.contains("pending:"), "{frame}");
+    }
+
+    /// A line queued after the interrupt, before the turn actually ends,
+    /// survives the reconcile even when the dropped one is still on the
+    /// queue the turn hands back.
+    #[test]
+    fn a_line_queued_after_an_interrupt_survives_the_reconcile() {
+        let mut harness = Harness::standalone(80, 24);
+        let queue = NotificationQueue::new();
+        harness.app.begin_turn("explain", false);
+        harness.type_text("a");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("a".to_string()))
+        );
+        queued::queue_user_message(&queue, "a");
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(harness.app.queued.is_empty());
+        harness.type_text("b");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("b".to_string()))
+        );
+        queued::queue_user_message(&queue, "b");
+
+        reconcile_queue(&mut harness.app.queued, &take_user_messages(&queue));
+        let texts: Vec<&str> = harness.app.queued.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["b"]);
     }
 
     /// The lines left over at the end of a turn go on the queue of the

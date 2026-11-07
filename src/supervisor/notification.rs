@@ -111,6 +111,26 @@ impl NotificationQueue {
     pub fn drain(&self) -> Vec<SystemNotification> {
         std::mem::take(&mut *self.pending.lock())
     }
+
+    /// Removes and returns, in order, the entries `keep` rejects; the rest
+    /// stay in place. One lock, so a concurrent drain sees either the whole
+    /// queue or the kept remainder, never a half-moved one.
+    pub fn take_where(
+        &self,
+        mut keep: impl FnMut(&SystemNotification) -> bool,
+    ) -> Vec<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let mut taken = Vec::new();
+        let mut index = 0;
+        while index < pending.len() {
+            if keep(&pending[index]) {
+                index += 1;
+            } else {
+                taken.push(pending.remove(index));
+            }
+        }
+        taken
+    }
 }
 
 impl Default for NotificationQueue {
@@ -215,5 +235,23 @@ mod tests {
     fn drain_on_empty_queue_is_a_noop() {
         let queue = NotificationQueue::default();
         assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn take_where_removes_the_rejected_entries_and_keeps_the_rest_in_order() {
+        let queue = NotificationQueue::new();
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(SystemNotification::UserMessage { text: "b".into() });
+        queue.push(job_notification("job_2", "execute_command", false));
+
+        let taken = queue.take_where(|n| matches!(n, SystemNotification::Task { .. }));
+
+        let texts: Vec<Value> = taken.iter().map(|n| n.to_value()["text"].clone()).collect();
+        assert_eq!(texts, [json!("a"), json!("b")]);
+        let left = queue.drain();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0].id(), Some("job_1"));
+        assert_eq!(left[1].id(), Some("job_2"));
     }
 }
