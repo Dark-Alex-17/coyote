@@ -7658,7 +7658,11 @@ mod tests {
         three_exchanges(&mut harness);
         let target = choose_rewind(&mut harness, 1);
         apply_rewind(&mut harness.app, &mut ctx, target);
-        assert_eq!(harness.app.transcript.len(), 4);
+        assert_eq!(
+            harness.app.transcript.len(),
+            5,
+            "two exchanges stay and the notice follows them"
+        );
         assert_eq!(harness.app.composer_text(), "third question");
         assert!(!ctx.session.as_ref().unwrap().has_user_messages());
         let frame = harness.draw();
