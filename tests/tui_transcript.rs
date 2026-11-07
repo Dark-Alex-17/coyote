@@ -25,8 +25,8 @@
 //! - a finished tool row reads `name(args)  elapsed  ok`, folds its output
 //!   away, and opens/closes on `Enter` once `Ctrl+Up` focused it; `Esc`
 //!   drops the focus and a draft makes `Enter` submit instead;
-//! - a failed tool row says `failed` without the error in its header; the
-//!   opened row carries the error;
+//! - a failed tool row's header ends in `failed: <first line>` of the
+//!   error; the opened row carries the rest;
 //! - cells that land while the view is scrolled up count on the follow
 //!   chip and `End` brings them into view;
 //! - `todo__*` calls never take a transcript row; the Todo panel shows them;
@@ -831,23 +831,19 @@ fn long_tool_args_are_cut_short_in_the_folded_header() {
     );
     pty.read_for(Duration::from_millis(500));
 
-    let folded = repaint(&mut pty);
+    let rows = repaint_rows(&mut pty);
+    let header = folded_header_row(&rows, "fixture_note");
     assert!(
-        folded.contains("fixture_note("),
-        "no folded header names the note tool:\n{folded}"
+        header.contains("seg00xx"),
+        "the folded header shows none of the arguments: {header:?}"
     );
     assert!(
-        folded.contains("seg00xx"),
-        "the folded header shows none of the arguments:\n{folded}"
+        !header.contains("seg39xx"),
+        "the folded header spilled the whole 320-character argument: {header:?}"
     );
-    assert!(
-        !folded.contains("seg39xx"),
-        "the folded header spilled the whole 320-character argument:\n{folded}"
-    );
-    let header_end = folded.find("ok").unwrap_or(folded.len());
-    assert!(
-        folded[..header_end].contains("fixture_note("),
-        "the folded header does not end in its status:\n{folded}"
+    assert_header_is_name_args_elapsed(
+        header_before_status(header, "fixture_note", "ok"),
+        "fixture_note",
     );
 
     quit(pty);
@@ -1078,6 +1074,36 @@ fn between<'a>(frame: &'a str, start: &str, end: &str) -> Option<&'a str> {
     Some(&frame[from..to])
 }
 
+/// The one squeezed screen row carrying `name(`: the tool's folded
+/// header.
+fn folded_header_row<'a>(rows: &'a [(u16, String)], name: &str) -> &'a str {
+    let needle = format!("{name}(");
+    let mut headers = rows.iter().filter(|(_, text)| text.contains(&needle));
+    let (_, header) = headers
+        .next()
+        .unwrap_or_else(|| panic!("no screen row carries the {name} header: {rows:?}"));
+    assert!(
+        headers.next().is_none(),
+        "the {name} header is on more than one row: {rows:?}"
+    );
+    header
+}
+
+/// The `args)<elapsed>` part of a folded header, read from its right
+/// end: the row has to end in `status`, so the text in between can be
+/// checked without a search for the status word landing inside a path.
+fn header_before_status<'a>(header: &'a str, name: &str, status: &str) -> &'a str {
+    let body = header
+        .strip_suffix(status)
+        .unwrap_or_else(|| panic!("the {name} header does not end in {status:?}: {header:?}"));
+    let needle = format!("{name}(");
+    let from = body
+        .find(&needle)
+        .unwrap_or_else(|| panic!("the {name} header lost its name: {header:?}"))
+        + needle.len();
+    &body[from..]
+}
+
 /// Checks a folded tool header squeezed to `name(args)<elapsed><status>`:
 /// the piece after the closing paren must be a duration (`0.4s`, `12s`,
 /// `350ms`) and nothing else, which is also what keeps an error message
@@ -1157,10 +1183,13 @@ fn a_finished_tool_row_is_one_folded_line_that_opens_on_enter_when_focused() {
     );
     pty.read_for(Duration::from_millis(500));
 
-    let folded = repaint(&mut pty);
-    let header = between(&folded, "fixture_sleep(", "ok")
-        .unwrap_or_else(|| panic!("no `fixture_sleep(...) ... ok` header on screen:\n{folded}"));
-    assert_header_is_name_args_elapsed(header, "fixture_sleep");
+    let rows = repaint_rows(&mut pty);
+    let header = folded_header_row(&rows, "fixture_sleep");
+    assert_header_is_name_args_elapsed(
+        header_before_status(header, "fixture_sleep", "ok"),
+        "fixture_sleep",
+    );
+    let folded: String = rows.iter().map(|(_, text)| text.as_str()).collect();
     let output = squeezed("fixture slept p3t");
     assert!(
         !folded.contains(&output),
@@ -1234,14 +1263,15 @@ fn a_finished_tool_row_is_one_folded_line_that_opens_on_enter_when_focused() {
 }
 
 // ---------------------------------------------------------------------
-// A tool that exits non-zero folds to `name(args)  elapsed  failed`; the
-// error text is not in that header but is there once the row is opened.
+// A tool that exits non-zero folds to `name(args)  elapsed  failed: <first
+// line of the error>`; what the tool wrote to stderr is there once the
+// row is opened.
 // ---------------------------------------------------------------------
 
 #[test]
 #[serial]
 fn a_failed_tool_row_says_failed_and_keeps_the_error_for_the_opened_row() {
-    let dir = fresh_config_dir("tool-failed");
+    let dir = fresh_config_dir("erroring");
     let _guard = TempDirGuard(dir.clone());
     let marker = dir.join("tool");
     let fake = FakeLlm::start(vec![
@@ -1266,14 +1296,18 @@ fn a_failed_tool_row_says_failed_and_keeps_the_error_for_the_opened_row() {
     );
     pty.read_for(Duration::from_millis(500));
 
-    let folded = repaint(&mut pty);
-    let header = between(&folded, "fixture_fail(", "failed")
-        .unwrap_or_else(|| panic!("no `fixture_fail(...) ... failed` header on screen:\n{folded}"));
+    let rows = repaint_rows(&mut pty);
+    let header = folded_header_row(&rows, "fixture_fail");
+    let status = squeezed("failed: Tool call 'fixture_fail' exited with code 1");
+    assert_header_is_name_args_elapsed(
+        header_before_status(header, "fixture_fail", &status),
+        "fixture_fail",
+    );
     assert!(
         !header.contains("boom"),
-        "the folded header carries the error text:\n{folded}"
+        "the folded header carries the tool's stderr: {header:?}"
     );
-    assert_header_is_name_args_elapsed(header, "fixture_fail");
+    let folded: String = rows.iter().map(|(_, text)| text.as_str()).collect();
     let errors_folded = folded.matches("boom-error-q8x").count();
 
     pty.read_for(HOTKEY_GAP);
@@ -1298,10 +1332,21 @@ fn a_failed_tool_row_says_failed_and_keeps_the_error_for_the_opened_row() {
 // counts them as new, and End brings them into view and clears the chip.
 // ---------------------------------------------------------------------
 
+/// The count a follow chip `N new below  End = follow` carries at the
+/// right end of a squeezed screen row, if the row ends in one.
+fn follow_chip_count(row: &str) -> Option<usize> {
+    let before = row.strip_suffix("End=follow")?.strip_suffix("newbelow")?;
+    before
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
 #[test]
 #[serial]
 fn cells_landing_while_scrolled_up_count_on_the_follow_chip_until_end() {
-    let dir = fresh_config_dir("new-chip");
+    let dir = fresh_config_dir("scrolled-landing");
     let _guard = TempDirGuard(dir.clone());
     let marker = dir.join("tool");
     let mut replies: Vec<Reply> = (1..=5)
@@ -1354,8 +1399,10 @@ fn cells_landing_while_scrolled_up_count_on_the_follow_chip_until_end() {
     let late = squeezed("late reply tail-v6c");
     let scrolled = loop {
         pty.read_for(Duration::from_millis(300));
-        let frame = repaint(&mut pty);
-        if frame.contains("new") {
+        let rows = repaint_rows(&mut pty);
+        let frame: String = rows.iter().map(|(_, text)| text.as_str()).collect();
+        if let Some(count) = rows.iter().find_map(|(_, text)| follow_chip_count(text)) {
+            assert!(count > 0, "the follow chip counts nothing new:\n{frame}");
             break frame;
         }
         assert!(
@@ -1363,10 +1410,6 @@ fn cells_landing_while_scrolled_up_count_on_the_follow_chip_until_end() {
             "the follow chip never counted the cells that landed while scrolled up:\n{frame}"
         );
     };
-    assert!(
-        scrolled.contains("End=follow"),
-        "the view stopped following the scroll position when new cells landed:\n{scrolled}"
-    );
     assert!(
         !scrolled.contains(&late),
         "the reply pulled the scrolled view down to the bottom:\n{scrolled}"
