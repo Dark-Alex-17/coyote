@@ -1758,6 +1758,10 @@ fn the_child_inherits_no_pty_descriptor() {
         -1
     );
     let scratch_fd = u32::try_from(scratch.as_raw_fd()).unwrap();
+    assert_ne!(
+        scratch_fd, 3,
+        "the placeholder did not keep the scratch file off fd 3"
+    );
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg("ls /dev/fd; echo fd-list-done");
