@@ -9,6 +9,7 @@ mod bottom_pane;
 mod cells;
 mod composer;
 mod events;
+mod history;
 mod keys;
 mod redirect;
 mod render;
@@ -23,7 +24,10 @@ use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, anyhow, bail};
-use bottom_pane::{PaletteSnapshot, PaletteState, PaletteView, View};
+use bottom_pane::{
+    PaletteSnapshot, PaletteState, PaletteView, RewindState, RewindView, SearchState, SearchView,
+    View,
+};
 use cells::{
     AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
 };
@@ -31,7 +35,8 @@ use composer::{Composer, field_background};
 use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
-use keys::{Action, KeyContext, ModalKind};
+use history::ComposerHistory;
+use keys::{Action, KeyContext, ModalKind, PopupKind, ViMode};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -46,6 +51,7 @@ use serde_json::Value;
 use sink::{AgentOutcome, LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -171,6 +177,8 @@ const PANIC_AT_EXIT_ENV: &str = "COYOTE_TUI_PANIC_AT_EXIT";
 /// counts as a modal answer, so a keystroke meant for the composer never
 /// confirms a prompt that appeared under it.
 const HOTKEY_IDLE: Duration = Duration::from_secs(1);
+/// How close two idle Escs must come to open the rewind picker.
+const REWIND_ESC_GAP: Duration = Duration::from_secs(1);
 /// How long the UI waits on the exit work. The work itself waits
 /// `EXIT_CANCEL_WAIT` on background tasks before it saves the session and
 /// runs the finished hook, so the wait on it has to outlast that or a
@@ -796,6 +804,13 @@ pub(crate) enum Command {
     Suspend,
     OpenEditor,
     Redraw,
+    /// Take the `pops` newest exchanges out of the session and the
+    /// transcript back to the cell at `opener`, which opened the oldest
+    /// of them.
+    Rewind {
+        pops: usize,
+        opener: usize,
+    },
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -855,8 +870,39 @@ pub(crate) struct App {
     /// rebuilds the palette's rows and clears it. A palette closed by
     /// Esc stays closed until the draft changes again.
     palette_dirty: bool,
+    history: ComposerHistory,
+    /// Where submitted lines are recorded, None when the config keeps
+    /// no shell history; the history then lasts the run.
+    history_file: Option<PathBuf>,
+    /// None under emacs bindings.
+    vi_mode: Option<ViMode>,
+    /// A `d` pressed in normal mode, waiting for the second.
+    vi_pending_d: bool,
+    /// When the last idle Esc was pressed; a second one within
+    /// `REWIND_ESC_GAP` opens the rewind picker.
+    last_esc: Option<Instant>,
     config: Arc<AppConfig>,
     prompt_memory: Arc<PromptMemory>,
+}
+
+fn history_file(config: &AppConfig, session: Option<&str>) -> Option<PathBuf> {
+    config
+        .save_shell_history
+        .then(|| crate::config::paths::repl_history_file_for(session))
+}
+
+fn load_history(path: Option<&Path>) -> ComposerHistory {
+    let Some(path) = path else {
+        return ComposerHistory::default();
+    };
+    ComposerHistory::load(path).unwrap_or_else(|err| {
+        warn!("Failed to read the history at {}: {err}", path.display());
+        ComposerHistory::default()
+    })
+}
+
+fn vi_mode(config: &AppConfig) -> Option<ViMode> {
+    (config.keybindings == "vi").then_some(ViMode::Insert)
 }
 
 impl App {
@@ -869,6 +915,7 @@ impl App {
         let options = config.render_options()?;
         let background = field_background(&config, &options);
         let renderer = Renderer::new(options)?;
+        let history_file = history_file(&config, footer.session.as_deref());
         Ok(Self {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
@@ -891,6 +938,11 @@ impl App {
             view: View::Composer,
             palette_snapshot: PaletteSnapshot::EMPTY,
             palette_dirty: false,
+            history: load_history(history_file.as_deref()),
+            history_file,
+            vi_mode: vi_mode(&config),
+            vi_pending_d: false,
+            last_esc: None,
             config,
             prompt_memory,
         })
@@ -938,6 +990,17 @@ impl App {
                 Err(err) => warn!("Keeping the previous render options: {err}"),
             }
             self.config = Arc::clone(&ctx.app.config);
+            self.vi_mode = match (vi_mode(&self.config), self.vi_mode) {
+                (Some(_), Some(current)) => Some(current),
+                (wanted, _) => wanted,
+            };
+        }
+        // A new session, or history switched on or off, means another
+        // file; the entries of the run so far go with the old one.
+        let file = history_file(&self.config, self.footer.session.as_deref());
+        if file != self.history_file {
+            self.history_file = file;
+            self.history = load_history(self.history_file.as_deref());
         }
         if let Some(text) = ctx.pending_prefill.take() {
             self.set_composer_text(&text);
@@ -1087,12 +1150,19 @@ impl App {
         KeyContext {
             turn_running: self.turn.is_some() || self.exiting,
             composer_empty: self.composer.is_empty(),
+            single_line: self.composer.lines().len() <= 1,
             modal: self.prompts.front().map(PendingPrompt::kind),
             idle_ok,
             question_fully_shown,
             scrolled: self.transcript.scrolled(),
             focused: self.transcript.focused(),
-            popup: matches!(self.view, View::Palette(_)),
+            popup: match self.view {
+                View::Composer => None,
+                View::Palette(_) => Some(PopupKind::Palette),
+                View::HistorySearch(_) => Some(PopupKind::HistorySearch),
+                View::Rewind(_) => Some(PopupKind::Rewind),
+            },
+            vi: self.vi_mode,
         }
     }
 
@@ -1110,8 +1180,9 @@ impl App {
     }
 
     /// Opens, refreshes or closes the palette after an edit of the
-    /// composer. With the context in hand the rows include arguments and
-    /// macros; mid-turn they are the commands the snapshot allows.
+    /// composer; an edit under another band closes that band. With the
+    /// context in hand the rows include arguments and macros; mid-turn
+    /// they are the commands the snapshot allows.
     pub(crate) fn refresh_palette(&mut self, ctx: Option<&RequestContext>) {
         if !self.palette_dirty {
             return;
@@ -1134,9 +1205,18 @@ impl App {
         self.schedule_frame();
     }
 
-    fn close_palette(&mut self) {
+    fn close_view(&mut self) {
         self.view = View::Composer;
         self.palette_dirty = false;
+    }
+
+    fn record_history(&mut self, line: &str) {
+        self.history.push(line);
+        if let Some(path) = &self.history_file
+            && let Err(err) = history::append(path, line)
+        {
+            warn!("Failed to write the history at {}: {err}", path.display());
+        }
     }
 
     fn submit_composer(&mut self) -> Option<Command> {
@@ -1147,7 +1227,64 @@ impl App {
         self.composer.clear();
         self.palette_dirty = true;
         self.transcript.clear_focus();
-        Some(Command::Submit(text.trim().to_string()))
+        // The next line is typed, so the vi layer starts it in insert.
+        self.vi_mode = self.vi_mode.map(|_| ViMode::Insert);
+        let line = text.trim().to_string();
+        self.record_history(&line);
+        Some(Command::Submit(line))
+    }
+
+    /// A second idle Esc within the gap opens the rewind picker, when
+    /// the transcript holds an exchange to go back to.
+    fn idle_esc(&mut self) {
+        let now = self.clock.now();
+        let second = self
+            .last_esc
+            .is_some_and(|at| now.duration_since(at) <= REWIND_ESC_GAP);
+        self.last_esc = (!second).then_some(now);
+        if second
+            && let Some(rewind) =
+                RewindState::from_cells(self.transcript.cells(), self.config.command_prefix)
+        {
+            self.view = View::Rewind(rewind);
+        }
+    }
+
+    /// Takes the band's highlighted row: the palette's into the typed
+    /// token, the search's into the composer, the rewind picker's to
+    /// the loop. The palette with no highlight lets the Enter submit.
+    fn accept_popup(&mut self) -> Option<Command> {
+        match &self.view {
+            View::HistorySearch(search) => {
+                let chosen = search.highlighted().map(str::to_string);
+                self.close_view();
+                if let Some(text) = chosen {
+                    self.set_composer_text(&text);
+                }
+                None
+            }
+            View::Rewind(rewind) => {
+                let chosen = rewind.highlighted().map(|row| Command::Rewind {
+                    pops: rewind.pops(),
+                    opener: row.opener,
+                });
+                self.close_view();
+                chosen
+            }
+            View::Palette(palette) => {
+                let accepted = self.command_line().and_then(|line| palette.accept(line));
+                match accepted {
+                    Some(text) => {
+                        self.close_view();
+                        self.set_composer_text(&text);
+                        None
+                    }
+                    None if self.turn.is_some() || self.exiting => None,
+                    None => self.submit_composer(),
+                }
+            }
+            View::Composer => None,
+        }
     }
 
     pub(crate) fn handle_input(&mut self, input: TermInput) -> Option<Command> {
@@ -1209,6 +1346,13 @@ impl App {
         if self.prompts.is_empty() || action == Action::Nothing {
             self.last_keystroke = Some(self.clock.now());
         }
+        // The two-key sequences only count consecutive presses.
+        if action != Action::IdleEsc {
+            self.last_esc = None;
+        }
+        if action != Action::ViDeleteLine {
+            self.vi_pending_d = false;
+        }
         let command = match action {
             Action::Submit => self.submit_composer(),
             Action::InsertNewline => {
@@ -1223,6 +1367,10 @@ impl App {
             Action::Interrupt => {
                 self.transcript.clear_focus();
                 (!self.exiting).then_some(Command::Interrupt)
+            }
+            Action::IdleEsc => {
+                self.idle_esc();
+                None
             }
             Action::Quit => (!self.exiting).then_some(Command::Quit),
             Action::Suspend => Some(Command::Suspend),
@@ -1301,29 +1449,75 @@ impl App {
                 self.palette_dirty = true;
                 None
             }
-            Action::PaletteMove(delta) => {
-                if let View::Palette(palette) = &mut self.view {
-                    palette.move_highlight(delta);
+            Action::HistoryPrev => {
+                let draft = self.composer_text();
+                if let Some(entry) = self.history.prev(&draft).map(str::to_string) {
+                    self.set_composer_text(&entry);
                 }
                 None
             }
-            Action::PaletteAccept => {
-                let accepted = match (&self.view, self.command_line()) {
-                    (View::Palette(palette), Some(line)) => palette.accept(line),
-                    _ => None,
-                };
-                match accepted {
-                    Some(text) => {
-                        self.close_palette();
-                        self.set_composer_text(&text);
-                        None
-                    }
-                    None if self.turn.is_some() || self.exiting => None,
-                    None => self.submit_composer(),
+            Action::HistoryNext => {
+                if let Some(text) = self.history.next() {
+                    self.set_composer_text(&text);
                 }
+                None
             }
+            Action::OpenHistorySearch => {
+                self.view = View::HistorySearch(SearchState::new(&self.history));
+                None
+            }
+            Action::PaletteMove(delta) => {
+                match &mut self.view {
+                    View::Composer => {}
+                    View::Palette(palette) => palette.move_highlight(delta),
+                    View::HistorySearch(search) => search.move_highlight(delta),
+                    View::Rewind(rewind) => rewind.move_highlight(delta),
+                }
+                None
+            }
+            Action::PaletteAccept => self.accept_popup(),
             Action::ClosePopup => {
-                self.close_palette();
+                self.close_view();
+                None
+            }
+            Action::PopupChar(c) => {
+                if let View::HistorySearch(search) = &mut self.view {
+                    search.push_char(c, &self.history);
+                }
+                None
+            }
+            Action::PopupBackspace => {
+                if let View::HistorySearch(search) = &mut self.view {
+                    search.pop_char(&self.history);
+                }
+                None
+            }
+            Action::ViNormal => {
+                self.vi_mode = Some(ViMode::Normal);
+                None
+            }
+            Action::ViInsert { append } => {
+                if let Some(motion) = append {
+                    self.composer.move_cursor(motion);
+                }
+                self.vi_mode = Some(ViMode::Insert);
+                None
+            }
+            Action::ViMotion(motion) => {
+                self.composer.move_cursor(motion);
+                None
+            }
+            Action::ViDeleteChar => {
+                self.composer.delete_next_char();
+                self.palette_dirty = true;
+                None
+            }
+            Action::ViDeleteLine => {
+                if self.vi_pending_d {
+                    self.composer.delete_line();
+                    self.palette_dirty = true;
+                }
+                self.vi_pending_d = !self.vi_pending_d;
                 None
             }
             Action::ToggleTodo => {
@@ -1682,7 +1876,7 @@ impl App {
     }
 
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
-        self.close_palette();
+        self.close_view();
         if self.prompts.is_empty() {
             self.question_area = None;
             // The idle gate counts from the moment the modal appears, not
@@ -1908,21 +2102,18 @@ impl App {
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
         match self.prompts.front() {
             Some(prompt) => prompt.rows(area.width, area.height),
-            None => self.composer.rows() + self.palette_band_rows(area),
+            None => self.composer.rows() + self.band_rows(area),
         }
     }
 
-    /// The rows the palette's band takes from the transcript: what it
-    /// asks for, within what the frame can give once the composer, the
-    /// status and footer rows and the transcript's minimum have theirs.
-    fn palette_band_rows(&self, area: Rect) -> u16 {
-        let View::Palette(palette) = &self.view else {
-            return 0;
-        };
+    /// The rows the view's band takes from the transcript: what it asks
+    /// for, within what the frame can give once the composer, the status
+    /// and footer rows and the transcript's minimum have theirs.
+    fn band_rows(&self, area: Rect) -> u16 {
         let room = area
             .height
             .saturating_sub(self.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
-        palette.band_rows().min(room)
+        self.view.band_rows().min(room)
     }
 
     /// One frame from state; `frame.area()` is the only size consulted.
@@ -1965,18 +2156,25 @@ impl App {
             }
             None => {
                 let [band, field] = Layout::vertical([
-                    Constraint::Length(self.palette_band_rows(area)),
+                    Constraint::Length(self.band_rows(area)),
                     Constraint::Min(0),
                 ])
                 .areas(bottom);
-                if let View::Palette(palette) = &self.view {
-                    frame.render_widget(PaletteView(palette), band);
+                match &self.view {
+                    View::Composer => {}
+                    View::Palette(palette) => frame.render_widget(PaletteView(palette), band),
+                    View::HistorySearch(search) => frame.render_widget(SearchView(search), band),
+                    View::Rewind(rewind) => frame.render_widget(RewindView(rewind), band),
                 }
                 let macro_names: Vec<&str> =
                     self.macros.iter().map(|(name, _)| name.as_str()).collect();
                 frame.render_widget(
-                    self.composer
-                        .view(self.config.command_prefix, &macro_names, self.no_color),
+                    self.composer.view(
+                        self.config.command_prefix,
+                        &macro_names,
+                        self.no_color,
+                        self.vi_mode == Some(ViMode::Normal),
+                    ),
                     field,
                 );
                 None
@@ -2545,6 +2743,16 @@ fn quit_abort(abort: &AbortSignal, turn_running: bool) {
     }
 }
 
+/// Takes the `pops` newest exchanges out of the session, stopping at
+/// the first that cannot be undone. Each pop leaves its prompt as the
+/// pending prefill, so the last one's is what the composer gets back.
+fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> Result<()> {
+    for _ in 0..pops {
+        ctx.undo_last_exchange()?;
+    }
+    Ok(())
+}
+
 /// Hands the terminal to `f` in its normal modes and takes it back: the
 /// event stream is restarted around the release so nothing it had in
 /// flight lands on the child or comes back as a keystroke, a Ctrl+C
@@ -2698,6 +2906,18 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         }
                         app.schedule_frame();
                     }
+                    Some(Command::Rewind { pops, opener }) => {
+                        if let Some(ctx) = ctx.as_mut() {
+                            if let Err(err) = rewind_exchanges(ctx, pops) {
+                                app.handle_msg(UiMsg::Notice {
+                                    kind: NoticeKind::ToolWarning,
+                                    text: format!("Rewind stopped: {err}"),
+                                });
+                            }
+                            app.transcript.truncate(opener);
+                            app.sync_from_ctx(ctx);
+                        }
+                    }
                     None => {}
                 }
             }
@@ -2786,7 +3006,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
 mod tests {
     use super::*;
     use crate::client::{ClientConfig, Model};
-    use crate::config::{AppState, Session, SessionScope, WorkingMode};
+    use crate::config::{AppState, Input, Session, SessionScope, WorkingMode};
     use crate::events::{Event, Origin};
     use crate::prompt::Prompter;
     use crate::testing::TestConfigDirGuard;
@@ -2800,6 +3020,7 @@ mod tests {
     fn plain_config() -> Arc<AppConfig> {
         Arc::new(AppConfig {
             highlight: false,
+            save_shell_history: false,
             ..Default::default()
         })
     }
@@ -2809,6 +3030,7 @@ mod tests {
         app.config = Arc::new(AppConfig {
             dry_run: true,
             highlight: false,
+            save_shell_history: false,
             clients: vec![ClientConfig::default()],
             memory: Some(false),
             workspace_instructions: Some(false),
@@ -2923,18 +3145,48 @@ mod tests {
         }
     }
 
+    /// How long a test waits for an asker's answer before it is declared
+    /// stuck; the alternative is a test that never ends.
+    const ASKER_WAIT: Duration = Duration::from_secs(5);
+
+    /// A prompt asked on its own thread; `join` is bounded by
+    /// `ASKER_WAIT`.
+    struct Asker {
+        answer: mpsc::Receiver<Result<PromptAnswer>>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Asker {
+        fn is_finished(&self) -> bool {
+            self.thread.is_finished()
+        }
+
+        fn join(self) -> std::thread::Result<Result<PromptAnswer>> {
+            match self.answer.recv_timeout(ASKER_WAIT) {
+                Ok(answer) => self.thread.join().map(|()| answer),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the asker got no answer within {ASKER_WAIT:?}")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(self
+                    .thread
+                    .join()
+                    .expect_err("a thread that sent no answer panicked")),
+            }
+        }
+    }
+
     /// Asks through the prompter on its own thread, the way a tool would,
     /// and delivers the request to the app.
-    fn ask_on_a_thread(
-        harness: &mut Harness,
-        req: PromptRequest,
-    ) -> std::thread::JoinHandle<Result<PromptAnswer>> {
+    fn ask_on_a_thread(harness: &mut Harness, req: PromptRequest) -> Asker {
         let (tx, mut rx) = unbounded_channel();
         let prompter = TuiPrompter::new(tx, Arc::new(AtomicBool::new(false)));
-        let asker = std::thread::spawn(move || prompter.prompt(req));
+        let (answer_tx, answer) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = answer_tx.send(prompter.prompt(req));
+        });
         let msg = rx.blocking_recv().expect("the prompter sends the request");
         harness.app.handle_msg(msg);
-        asker
+        Asker { answer, thread }
     }
 
     fn duplicated_adjacent_rows(rendered: &str) -> usize {
@@ -3595,6 +3847,10 @@ mod tests {
         harness.type_text("notes");
         let frame = harness.draw();
         assert_welcome_snapshot("input_modal_80x24", &frame);
+        // Enter is an answer, so it waits out the typing gap.
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
@@ -6264,7 +6520,7 @@ mod tests {
     fn palette(harness: &Harness) -> Option<&PaletteState> {
         match &harness.app.view {
             View::Palette(palette) => Some(palette),
-            View::Composer => None,
+            _ => None,
         }
     }
 
@@ -6426,8 +6682,8 @@ mod tests {
         let mut harness = Harness::standalone(80, 24);
         harness.type_text(".");
         harness.render();
-        let rows = usize::from(harness.app.palette_band_rows(Rect::new(0, 0, 80, 24)));
-        assert_eq!(rows, usize::from(bottom_pane::PALETTE_MAX_ROWS));
+        let rows = usize::from(harness.app.band_rows(Rect::new(0, 0, 80, 24)));
+        assert_eq!(rows, usize::from(bottom_pane::BAND_MAX_ROWS));
         let frame = harness.terminal.backend().to_string();
         let lines: Vec<&str> = frame.lines().collect();
         let rule_row = usize::from(COMPOSER_RULE_ROW);
@@ -6441,7 +6697,417 @@ mod tests {
         harness.resize(80, 12);
         harness.render();
         let room = 12 - (harness.app.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
-        assert_eq!(harness.app.palette_band_rows(Rect::new(0, 0, 80, 12)), room);
+        assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 12)), room);
+    }
+
+    fn submit(harness: &mut Harness, line: &str) {
+        harness.type_text(line);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit(line.to_string()))
+        );
+    }
+
+    #[test]
+    fn up_and_down_on_a_single_line_walk_the_history_around_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        assert!(harness.app.history_file.is_none(), "tests keep no file");
+        submit(&mut harness, "first");
+        submit(&mut harness, "second");
+        harness.type_text("draft");
+        assert!(harness.press(KeyCode::Up).is_none());
+        assert_eq!(harness.app.composer_text(), "second");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "first");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "first", "the oldest holds");
+        harness.press(KeyCode::Down);
+        assert_eq!(harness.app.composer_text(), "second");
+        harness.press(KeyCode::Down);
+        assert_eq!(harness.app.composer_text(), "draft");
+        harness.press(KeyCode::Down);
+        assert_eq!(harness.app.composer_text(), "draft");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("draft".to_string()))
+        );
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "draft");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "second");
+    }
+
+    #[test]
+    fn the_arrows_of_a_multi_line_draft_stay_with_the_cursor() {
+        let mut harness = Harness::standalone(80, 24);
+        submit(&mut harness, "old line");
+        harness.type_text("one");
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        harness.type_text("two");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "one\ntwo");
+        harness.type_text("!");
+        assert_eq!(harness.app.composer_text(), "one!\ntwo");
+    }
+
+    #[test]
+    fn a_submitted_line_is_recorded_in_the_history_file_when_one_is_kept() {
+        let dir = std::env::temp_dir().join(format!(
+            "coyote-tui-history-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("history");
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.history_file = Some(path.clone());
+        submit(&mut harness, "hello");
+        submit(&mut harness, ".info");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n.info\n");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let saving = AppConfig {
+            save_shell_history: true,
+            ..Default::default()
+        };
+        assert!(history_file(&saving, None).is_some_and(|p| p.ends_with("default")));
+        assert!(history_file(&saving, Some("a/b")).is_some_and(|p| p.ends_with("session_a_b")));
+        assert_eq!(history_file(&plain_config(), Some("a")), None);
+    }
+
+    fn search(harness: &Harness) -> Option<&SearchState> {
+        match &harness.app.view {
+            View::HistorySearch(search) => Some(search),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn ctrl_r_opens_the_search_band_whose_filter_narrows_and_enter_recalls() {
+        let mut harness = Harness::standalone(80, 24);
+        submit(&mut harness, "git status");
+        submit(&mut harness, "cargo test");
+        submit(&mut harness, "git log");
+        assert!(harness.app.handle_key(ctrl(KeyCode::Char('r'))).is_none());
+        let open = search(&harness).expect("the band opens");
+        assert_eq!(open.matches, ["git log", "cargo test", "git status"]);
+        harness.type_text("git");
+        let open = search(&harness).unwrap();
+        assert_eq!(open.filter, "git");
+        assert_eq!(open.matches, ["git log", "git status"]);
+        assert_eq!(harness.app.composer_text(), "", "typing goes to the filter");
+        let frame = harness.draw();
+        assert!(frame.contains("history: git"), "{frame}");
+        assert!(!frame.contains("cargo test"), "{frame}");
+        harness.press(KeyCode::Down);
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert!(search(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "git status");
+
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        harness.type_text("x");
+        harness.press(KeyCode::Backspace);
+        assert_eq!(search(&harness).unwrap().filter, "");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(search(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "git status");
+    }
+
+    #[test]
+    fn the_search_band_with_no_matches_closes_on_enter_leaving_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        assert!(search(&harness).unwrap().matches.is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("(no matches)"), "{frame}");
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert!(search(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "draft");
+    }
+
+    fn vi_harness() -> Harness {
+        let footer = FooterInfo {
+            model: "openai:test-model".to_string(),
+            ..FooterInfo::default()
+        };
+        let config = Arc::new(AppConfig {
+            keybindings: "vi".to_string(),
+            ..(*plain_config()).clone()
+        });
+        Harness::new(80, 24, config, footer)
+    }
+
+    #[test]
+    fn emacs_bindings_have_no_vi_mode() {
+        let mut harness = Harness::standalone(80, 24);
+        assert_eq!(harness.app.vi_mode, None);
+        harness.type_text("text");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(harness.app.vi_mode, None);
+        assert!(!harness.draw().contains(composer::NORMAL_TAG));
+    }
+
+    #[test]
+    fn vi_esc_enters_normal_mode_where_the_letters_move_delete_and_return_to_insert() {
+        let mut harness = vi_harness();
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        harness.type_text("one two");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Normal));
+        assert!(harness.draw().contains(composer::NORMAL_TAG));
+        harness.type_text("0x");
+        assert_eq!(harness.app.composer_text(), "ne two");
+        harness.type_text("$hx");
+        assert_eq!(harness.app.composer_text(), "ne tw");
+        harness.type_text("0wx");
+        assert_eq!(harness.app.composer_text(), "ne w");
+        harness.type_text("$bx");
+        assert_eq!(harness.app.composer_text(), "ne ");
+        harness.type_text("qz");
+        assert_eq!(
+            harness.app.composer_text(),
+            "ne ",
+            "unbound letters are swallowed"
+        );
+        harness.type_text("dd");
+        assert_eq!(harness.app.composer_text(), "");
+        harness.type_text("i");
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        harness.type_text("abc");
+        assert_eq!(harness.app.composer_text(), "abc");
+        assert!(!harness.draw().contains(composer::NORMAL_TAG));
+        harness.press(KeyCode::Esc);
+        harness.type_text("Ad");
+        assert_eq!(harness.app.composer_text(), "abcd");
+        harness.press(KeyCode::Esc);
+        harness.type_text("0aX");
+        assert_eq!(harness.app.composer_text(), "aXbcd");
+        harness.press(KeyCode::Esc);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("aXbcd".to_string()))
+        );
+        assert_eq!(
+            harness.app.vi_mode,
+            Some(ViMode::Insert),
+            "a sent line starts the next in insert"
+        );
+    }
+
+    #[test]
+    fn a_lone_d_is_forgotten_by_the_next_key_and_j_k_move_between_lines() {
+        let mut harness = vi_harness();
+        harness.type_text("top");
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        harness.type_text("bottom");
+        harness.press(KeyCode::Esc);
+        harness.type_text("hdxd");
+        assert_eq!(harness.app.composer_text(), "top\nbotto");
+        harness.type_text("k0dd");
+        assert_eq!(harness.app.composer_text(), "botto");
+        harness.type_text("jdd");
+        assert_eq!(harness.app.composer_text(), "");
+    }
+
+    #[test]
+    fn vi_esc_still_interrupts_a_turn_and_closes_a_popup_first() {
+        let mut harness = vi_harness();
+        harness.app.begin_turn("hello", false);
+        harness.type_text("draft");
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.app.set_composer_text(".in");
+        harness.app.refresh_palette(None);
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Normal));
+    }
+
+    #[test]
+    fn rewind_exchanges_pops_the_newest_exchanges_and_prefills_the_last_popped() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        for prompt in ["first", "second", "third"] {
+            let input = Input::from_str(&ctx, prompt, None).unwrap();
+            session.add_message(&input, "reply").unwrap();
+        }
+        ctx.session = Some(session);
+        rewind_exchanges(&mut ctx, 2).unwrap();
+        let session = ctx.session.as_ref().unwrap();
+        let prompts: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role.is_user())
+            .filter_map(|m| m.content.as_text())
+            .collect();
+        assert_eq!(prompts, ["first"]);
+        assert_eq!(ctx.pending_prefill.as_deref(), Some("second"));
+
+        let err = rewind_exchanges(&mut ctx, 3).unwrap_err();
+        assert!(err.to_string().contains("Nothing to undo"), "{err}");
+        assert!(!ctx.session.as_ref().unwrap().has_user_messages());
+        assert_eq!(ctx.pending_prefill.as_deref(), Some("first"));
+
+        ctx.session = None;
+        let err = rewind_exchanges(&mut ctx, 1).unwrap_err();
+        assert!(err.to_string().contains("No session"), "{err}");
+    }
+
+    fn rewind(harness: &Harness) -> Option<&RewindState> {
+        match &harness.app.view {
+            View::Rewind(rewind) => Some(rewind),
+            _ => None,
+        }
+    }
+
+    fn three_exchanges(harness: &mut Harness) {
+        for question in ["first question", "second\nwith detail", "third question"] {
+            harness.app.begin_turn(question, false);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+            harness.app.end_turn(false, &TurnOutcome::default());
+        }
+    }
+
+    #[test]
+    fn esc_esc_on_an_empty_idle_composer_opens_the_rewind_picker_newest_first() {
+        let mut harness = Harness::standalone(80, 24);
+        three_exchanges(&mut harness);
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(rewind(&harness).is_none(), "one Esc is not enough");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        let picker = rewind(&harness).expect("the second Esc opens it");
+        let titles: Vec<(usize, &str)> = picker
+            .rows
+            .iter()
+            .map(|row| (row.opener, row.title.as_str()))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                (4, "third question"),
+                (2, "second\nwith detail"),
+                (0, "first question"),
+            ]
+        );
+        assert_eq!(picker.highlight, 0);
+        let frame = harness.draw();
+        insta::assert_snapshot!("rewind_picker_80x24", &frame);
+        assert!(frame.contains("third question"), "{frame}");
+        assert!(frame.contains("+1 line"), "{frame}");
+        harness.press(KeyCode::Down);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Rewind { pops: 2, opener: 2 })
+        );
+        assert!(rewind(&harness).is_none());
+    }
+
+    #[test]
+    fn esc_esc_does_not_open_the_picker_when_anything_outranks_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "nothing to rewind to");
+
+        three_exchanges(&mut harness);
+        harness.type_text("typed");
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "a draft");
+        harness.app.set_composer_text("");
+
+        harness.press(KeyCode::Esc);
+        harness
+            .clock
+            .advance(REWIND_ESC_GAP + Duration::from_millis(1));
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "too far apart");
+        harness
+            .clock
+            .advance(REWIND_ESC_GAP + Duration::from_millis(1));
+
+        harness.app.begin_turn("running", false);
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(rewind(&harness).is_none(), "a turn");
+        harness.app.end_turn(false, &TurnOutcome::default());
+
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        harness.press(KeyCode::Esc);
+        harness.app.set_composer_text("");
+        harness.press(KeyCode::Esc);
+        assert!(
+            rewind(&harness).is_none(),
+            "closing the palette is not an idle Esc"
+        );
+
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        harness.press(KeyCode::Esc);
+        assert!(matches!(asker.join().unwrap(), Ok(PromptAnswer::Cancelled)));
+        harness.press(KeyCode::Esc);
+        assert!(
+            rewind(&harness).is_none(),
+            "cancelling a modal is not an idle Esc"
+        );
+
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_some(), "two idle Escs in a row open it");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(rewind(&harness).is_none(), "Esc closes it");
+        assert_eq!(harness.app.composer_text(), "");
+    }
+
+    #[test]
+    fn under_vi_the_picker_opens_from_normal_mode() {
+        let mut harness = vi_harness();
+        three_exchanges(&mut harness);
+        harness.press(KeyCode::Esc);
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Normal));
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "the first Esc only left insert");
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_some());
+        harness.press(KeyCode::Enter);
+        assert!(rewind(&harness).is_none());
+    }
+
+    #[test]
+    fn a_rewind_command_pops_the_session_and_truncates_the_transcript() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        for prompt in ["first question", "second\nwith detail", "third question"] {
+            let input = Input::from_str(&ctx, prompt, None).unwrap();
+            session.add_message(&input, "an answer").unwrap();
+        }
+        ctx.session = Some(session);
+        let mut harness = Harness::for_ctx(&ctx);
+        three_exchanges(&mut harness);
+        assert_eq!(harness.app.transcript.len(), 6);
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Down);
+        let Some(Command::Rewind { pops, opener }) = harness.press(KeyCode::Enter) else {
+            panic!("the second row rewinds two exchanges");
+        };
+        rewind_exchanges(&mut ctx, pops).unwrap();
+        harness.app.transcript.truncate(opener);
+        harness.app.sync_from_ctx(&mut ctx);
+        assert_eq!(harness.app.transcript.len(), 2);
+        assert_eq!(harness.app.composer_text(), "second\nwith detail");
+        assert_eq!(ctx.pending_prefill, None);
     }
 
     #[test]

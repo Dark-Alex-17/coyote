@@ -24,11 +24,45 @@ pub(crate) enum ModalKind {
     Password,
 }
 
+/// What is open over the composer, if anything; the list keys and Esc
+/// go to it before anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PopupKind {
+    /// Typing goes on into the composer under it.
+    Palette,
+    /// Typing goes into the band's filter line.
+    HistorySearch,
+    Rewind,
+}
+
+/// The vi layer's mode; the composer under emacs bindings has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViMode {
+    Insert,
+    Normal,
+}
+
+/// A normal-mode cursor motion, named after the key that asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViMotion {
+    Back,
+    Down,
+    Up,
+    Forward,
+    WordForward,
+    WordBack,
+    Head,
+    End,
+}
+
 /// What the key table needs to know about the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyContext {
     pub(crate) turn_running: bool,
     pub(crate) composer_empty: bool,
+    /// Whether the composer holds one line (an empty one counts): only
+    /// then do the plain arrows walk the history instead of the draft.
+    pub(crate) single_line: bool,
     pub(crate) modal: Option<ModalKind>,
     /// Whether a second has passed since the last key pressed (accepted
     /// or ignored, outside a modal or under one) or since the previous
@@ -51,9 +85,8 @@ pub(crate) struct KeyContext {
     /// Whether a transcript row holds the focus; an Enter on an empty
     /// composer goes to it, and so does Esc while no turn is running.
     pub(crate) focused: bool,
-    /// Whether a popup (the command palette) is open over the composer;
-    /// the list keys and Esc go to it before anything else.
-    pub(crate) popup: bool,
+    pub(crate) popup: Option<PopupKind>,
+    pub(crate) vi: Option<ViMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +97,9 @@ pub(crate) enum Action {
     ClearComposer,
     /// Soft-interrupt the running turn.
     Interrupt,
+    /// An Esc with nothing to cancel on an empty composer; two of them
+    /// close together open the rewind picker.
+    IdleEsc,
     Quit,
     Suspend,
     OpenEditor,
@@ -84,12 +120,30 @@ pub(crate) enum Action {
     ModalJump(usize),
     ModalInput(KeyEvent),
     ComposerInput(KeyEvent),
+    /// Show the next older history entry in the composer.
+    HistoryPrev,
+    /// Show the next newer history entry, or the draft past the newest.
+    HistoryNext,
+    OpenHistorySearch,
     /// Move the popup's highlight by this many rows, down when positive.
     PaletteMove(i32),
     /// Take the popup's highlighted row into the composer; with no row
     /// highlighted the Enter goes on to submit.
     PaletteAccept,
     ClosePopup,
+    /// Type into the popup's filter line.
+    PopupChar(char),
+    PopupBackspace,
+    ViNormal,
+    /// Enter insert mode, after the motion if one is given.
+    ViInsert {
+        append: Option<ViMotion>,
+    },
+    ViMotion(ViMotion),
+    /// Delete the character under the cursor.
+    ViDeleteChar,
+    /// The `d` of `dd`: the second press deletes the cursor's line.
+    ViDeleteLine,
     ToggleTodo,
     /// Move the transcript view by this many lines, down when positive.
     ScrollLines(i32),
@@ -200,19 +254,41 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
                 Action::ScrollToBottom
             }
-            KeyCode::Esc if ctx.popup => Action::ClosePopup,
-            KeyCode::Up if ctx.popup => Action::PaletteMove(-1),
-            KeyCode::Down if ctx.popup => Action::PaletteMove(1),
-            KeyCode::Tab if ctx.popup => Action::PaletteMove(1),
-            KeyCode::BackTab if ctx.popup => Action::PaletteMove(-1),
+            KeyCode::Esc if ctx.popup.is_some() => Action::ClosePopup,
+            KeyCode::Up if ctx.popup.is_some() => Action::PaletteMove(-1),
+            KeyCode::Down if ctx.popup.is_some() => Action::PaletteMove(1),
+            KeyCode::Tab if ctx.popup.is_some() => Action::PaletteMove(1),
+            KeyCode::BackTab if ctx.popup.is_some() => Action::PaletteMove(-1),
+            // The bands that are not the palette have no draft under
+            // them to take a newline: Enter accepts however it is held.
+            KeyCode::Enter
+                if matches!(
+                    ctx.popup,
+                    Some(PopupKind::HistorySearch | PopupKind::Rewind)
+                ) =>
+            {
+                Action::PaletteAccept
+            }
+            KeyCode::Char(_) if !ctrl && ctx.popup == Some(PopupKind::HistorySearch) => {
+                match key.code {
+                    KeyCode::Char(typed) => Action::PopupChar(typed),
+                    _ => Action::Nothing,
+                }
+            }
+            KeyCode::Backspace if ctx.popup == Some(PopupKind::HistorySearch) => {
+                Action::PopupBackspace
+            }
             // Interrupting the turn outranks a focused row; the focus
             // goes with it.
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
             KeyCode::Esc if ctx.focused => Action::ClearFocus,
+            KeyCode::Esc if ctx.vi == Some(ViMode::Insert) => Action::ViNormal,
+            KeyCode::Esc if ctx.composer_empty => Action::IdleEsc,
             KeyCode::Esc => Action::Nothing,
             // The editor would inherit fds 1 and 2 on the turn's capture pipe.
             KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
+            KeyCode::Char('r') if ctrl => Action::OpenHistorySearch,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
             KeyCode::Enter
                 if key
@@ -221,12 +297,40 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             {
                 Action::InsertNewline
             }
-            KeyCode::Enter if ctx.popup => Action::PaletteAccept,
+            KeyCode::Enter if ctx.popup.is_some() => Action::PaletteAccept,
             KeyCode::Enter if ctx.focused && ctx.composer_empty => Action::ToggleFocused,
             KeyCode::Enter if ctx.turn_running => Action::Nothing,
             KeyCode::Enter => Action::Submit,
+            KeyCode::Up if ctx.single_line && key.modifiers.is_empty() => Action::HistoryPrev,
+            KeyCode::Down if ctx.single_line && key.modifiers.is_empty() => Action::HistoryNext,
+            KeyCode::Char(_) if !ctrl && ctx.vi == Some(ViMode::Normal) => vi_normal(key.code),
             _ => Action::ComposerInput(key),
         },
+    }
+}
+
+/// Normal mode's letters, matched with their case: `a` and `A` differ.
+/// A letter with no binding is swallowed, not typed.
+fn vi_normal(code: KeyCode) -> Action {
+    match code {
+        KeyCode::Char('h') => Action::ViMotion(ViMotion::Back),
+        KeyCode::Char('j') => Action::ViMotion(ViMotion::Down),
+        KeyCode::Char('k') => Action::ViMotion(ViMotion::Up),
+        KeyCode::Char('l') => Action::ViMotion(ViMotion::Forward),
+        KeyCode::Char('w') => Action::ViMotion(ViMotion::WordForward),
+        KeyCode::Char('b') => Action::ViMotion(ViMotion::WordBack),
+        KeyCode::Char('0') => Action::ViMotion(ViMotion::Head),
+        KeyCode::Char('$') => Action::ViMotion(ViMotion::End),
+        KeyCode::Char('x') => Action::ViDeleteChar,
+        KeyCode::Char('d') => Action::ViDeleteLine,
+        KeyCode::Char('i') => Action::ViInsert { append: None },
+        KeyCode::Char('a') => Action::ViInsert {
+            append: Some(ViMotion::Forward),
+        },
+        KeyCode::Char('A') => Action::ViInsert {
+            append: Some(ViMotion::End),
+        },
+        _ => Action::Nothing,
     }
 }
 
@@ -257,12 +361,14 @@ mod tests {
     const IDLE: KeyContext = KeyContext {
         turn_running: false,
         composer_empty: true,
+        single_line: true,
         modal: None,
         idle_ok: true,
         question_fully_shown: true,
         scrolled: false,
         focused: false,
-        popup: false,
+        popup: None,
+        vi: None,
     };
 
     #[test]
@@ -282,7 +388,8 @@ mod tests {
             (ctrl('d'), IDLE, Action::Quit),
             (ctrl('d'), typing, Action::ComposerInput(ctrl('d'))),
             (ctrl('d'), running, Action::Quit),
-            (plain(KeyCode::Esc), IDLE, Action::Nothing),
+            (plain(KeyCode::Esc), IDLE, Action::IdleEsc),
+            (plain(KeyCode::Esc), typing, Action::Nothing),
             (plain(KeyCode::Esc), running, Action::Interrupt),
         ];
         for (key, ctx, expected) in cases {
@@ -351,7 +458,7 @@ mod tests {
     #[test]
     fn popup_keys() {
         let popup = KeyContext {
-            popup: true,
+            popup: Some(PopupKind::Palette),
             composer_empty: false,
             ..IDLE
         };
@@ -393,11 +500,6 @@ mod tests {
                 IDLE,
                 Action::ComposerInput(plain(KeyCode::Tab)),
             ),
-            (
-                plain(KeyCode::Up),
-                IDLE,
-                Action::ComposerInput(plain(KeyCode::Up)),
-            ),
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
@@ -406,12 +508,225 @@ mod tests {
         assert_eq!(map_key(typed, &popup), Action::ComposerInput(typed));
     }
 
+    /// The plain arrows walk the history only on a one-line composer;
+    /// a multi-line draft keeps them for its own cursor, and a modifier
+    /// (Alt+Up is a textarea motion) keeps them too.
+    #[test]
+    fn single_line_arrows_walk_the_history() {
+        let multi_line = KeyContext {
+            single_line: false,
+            composer_empty: false,
+            ..IDLE
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..IDLE
+        };
+        let typing = KeyContext {
+            composer_empty: false,
+            ..IDLE
+        };
+        let cases = [
+            (plain(KeyCode::Up), IDLE, Action::HistoryPrev),
+            (plain(KeyCode::Down), IDLE, Action::HistoryNext),
+            (plain(KeyCode::Up), typing, Action::HistoryPrev),
+            (plain(KeyCode::Up), running, Action::HistoryPrev),
+            (
+                plain(KeyCode::Up),
+                multi_line,
+                Action::ComposerInput(plain(KeyCode::Up)),
+            ),
+            (
+                plain(KeyCode::Down),
+                multi_line,
+                Action::ComposerInput(plain(KeyCode::Down)),
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::ALT),
+                IDLE,
+                Action::ComposerInput(press(KeyCode::Up, KeyModifiers::ALT)),
+            ),
+            (ctrl('r'), IDLE, Action::OpenHistorySearch),
+            (ctrl('r'), running, Action::OpenHistorySearch),
+            (ctrl('r'), multi_line, Action::OpenHistorySearch),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// With the search band open the letters and Backspace edit its
+    /// filter and Enter takes the highlighted entry however it is held;
+    /// the rewind picker types into the composer instead.
+    #[test]
+    fn history_search_and_rewind_popup_keys() {
+        let search = KeyContext {
+            popup: Some(PopupKind::HistorySearch),
+            ..IDLE
+        };
+        let rewind = KeyContext {
+            popup: Some(PopupKind::Rewind),
+            ..IDLE
+        };
+        let shifted_g = press(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        let cases = [
+            (plain(KeyCode::Char('g')), search, Action::PopupChar('g')),
+            (shifted_g, search, Action::PopupChar('G')),
+            (plain(KeyCode::Char(' ')), search, Action::PopupChar(' ')),
+            (plain(KeyCode::Backspace), search, Action::PopupBackspace),
+            (plain(KeyCode::Enter), search, Action::PaletteAccept),
+            (
+                press(KeyCode::Enter, KeyModifiers::SHIFT),
+                search,
+                Action::PaletteAccept,
+            ),
+            (plain(KeyCode::Up), search, Action::PaletteMove(-1)),
+            (plain(KeyCode::Down), search, Action::PaletteMove(1)),
+            (plain(KeyCode::Esc), search, Action::ClosePopup),
+            (ctrl('r'), search, Action::OpenHistorySearch),
+            (ctrl('c'), search, Action::Quit),
+            (plain(KeyCode::Enter), rewind, Action::PaletteAccept),
+            (plain(KeyCode::Up), rewind, Action::PaletteMove(-1)),
+            (plain(KeyCode::Down), rewind, Action::PaletteMove(1)),
+            (plain(KeyCode::Esc), rewind, Action::ClosePopup),
+            (
+                plain(KeyCode::Char('g')),
+                rewind,
+                Action::ComposerInput(plain(KeyCode::Char('g'))),
+            ),
+            (
+                plain(KeyCode::Backspace),
+                rewind,
+                Action::ComposerInput(plain(KeyCode::Backspace)),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// Insert mode is the emacs table but for Esc, which enters normal
+    /// mode when nothing outranks it: a popup, a focused row and a
+    /// running turn each still take the Esc first.
+    #[test]
+    fn vi_insert_keys() {
+        let insert = KeyContext {
+            vi: Some(ViMode::Insert),
+            composer_empty: false,
+            ..IDLE
+        };
+        let empty = KeyContext {
+            composer_empty: true,
+            ..insert
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..insert
+        };
+        let focused = KeyContext {
+            focused: true,
+            ..insert
+        };
+        let popup = KeyContext {
+            popup: Some(PopupKind::Palette),
+            ..insert
+        };
+        let typed = plain(KeyCode::Char('x'));
+        let cases = [
+            (plain(KeyCode::Esc), insert, Action::ViNormal),
+            (plain(KeyCode::Esc), empty, Action::ViNormal),
+            (plain(KeyCode::Esc), running, Action::Interrupt),
+            (plain(KeyCode::Esc), focused, Action::ClearFocus),
+            (plain(KeyCode::Esc), popup, Action::ClosePopup),
+            (typed, insert, Action::ComposerInput(typed)),
+            (
+                plain(KeyCode::Char('j')),
+                insert,
+                Action::ComposerInput(plain(KeyCode::Char('j'))),
+            ),
+            (plain(KeyCode::Enter), insert, Action::Submit),
+            (plain(KeyCode::Up), insert, Action::HistoryPrev),
+            (ctrl('c'), insert, Action::ClearComposer),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// Normal mode's letters move, delete and re-enter insert; the rest
+    /// are swallowed. Enter submits as in insert, Esc keeps the usual
+    /// meanings, and the chords stay the chords.
+    #[test]
+    fn vi_normal_keys() {
+        let normal = KeyContext {
+            vi: Some(ViMode::Normal),
+            composer_empty: false,
+            ..IDLE
+        };
+        let empty = KeyContext {
+            composer_empty: true,
+            ..normal
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..normal
+        };
+        let letter = |c: char| plain(KeyCode::Char(c));
+        let cases = [
+            (letter('h'), normal, Action::ViMotion(ViMotion::Back)),
+            (letter('j'), normal, Action::ViMotion(ViMotion::Down)),
+            (letter('k'), normal, Action::ViMotion(ViMotion::Up)),
+            (letter('l'), normal, Action::ViMotion(ViMotion::Forward)),
+            (letter('w'), normal, Action::ViMotion(ViMotion::WordForward)),
+            (letter('b'), normal, Action::ViMotion(ViMotion::WordBack)),
+            (letter('0'), normal, Action::ViMotion(ViMotion::Head)),
+            (letter('$'), normal, Action::ViMotion(ViMotion::End)),
+            (letter('x'), normal, Action::ViDeleteChar),
+            (letter('d'), normal, Action::ViDeleteLine),
+            (letter('i'), normal, Action::ViInsert { append: None }),
+            (
+                letter('a'),
+                normal,
+                Action::ViInsert {
+                    append: Some(ViMotion::Forward),
+                },
+            ),
+            (
+                press(KeyCode::Char('A'), KeyModifiers::SHIFT),
+                normal,
+                Action::ViInsert {
+                    append: Some(ViMotion::End),
+                },
+            ),
+            (letter('q'), normal, Action::Nothing),
+            (letter('H'), normal, Action::Nothing),
+            (plain(KeyCode::Enter), normal, Action::Submit),
+            (plain(KeyCode::Enter), running, Action::Nothing),
+            (plain(KeyCode::Esc), normal, Action::Nothing),
+            (plain(KeyCode::Esc), empty, Action::IdleEsc),
+            (plain(KeyCode::Esc), running, Action::Interrupt),
+            (ctrl('c'), normal, Action::ClearComposer),
+            (ctrl('j'), normal, Action::InsertNewline),
+            (ctrl('r'), normal, Action::OpenHistorySearch),
+            (plain(KeyCode::Up), normal, Action::HistoryPrev),
+            (
+                plain(KeyCode::Backspace),
+                normal,
+                Action::ComposerInput(plain(KeyCode::Backspace)),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
     /// The transcript's keys: F2, the page and Shift+arrow scrolls and
     /// the Ctrl+arrow focus walk work whatever the turn is doing; End
     /// goes to the view only while it is scrolled, Shift+G only while
     /// it is scrolled and the composer is empty; Enter goes to a
     /// focused row while the composer is empty, Esc while no turn runs.
-    /// The plain arrows and Tab stay the composer's.
+    /// The plain arrows of a multi-line draft and Tab stay the
+    /// composer's.
     #[test]
     fn transcript_keys() {
         let running = KeyContext {
@@ -437,6 +752,15 @@ mod tests {
         let focused_typing = KeyContext {
             composer_empty: false,
             ..focused
+        };
+        let focused_multi_line = KeyContext {
+            single_line: false,
+            ..focused_typing
+        };
+        let scrolled_multi_line = KeyContext {
+            single_line: false,
+            composer_empty: false,
+            ..scrolled
         };
         let shift = |code: KeyCode| press(code, KeyModifiers::SHIFT);
         let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
@@ -478,12 +802,12 @@ mod tests {
             (shift(KeyCode::Enter), focused, Action::InsertNewline),
             (
                 plain(KeyCode::Up),
-                focused,
+                focused_multi_line,
                 Action::ComposerInput(plain(KeyCode::Up)),
             ),
             (
                 plain(KeyCode::Down),
-                scrolled,
+                scrolled_multi_line,
                 Action::ComposerInput(plain(KeyCode::Down)),
             ),
             (

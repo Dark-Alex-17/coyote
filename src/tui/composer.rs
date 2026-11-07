@@ -4,6 +4,7 @@
 //! something that would run and red when it does not.
 
 use super::DIM;
+use super::keys::ViMotion;
 use crate::config::{AppConfig, CommandPrefix};
 use crate::render::RenderOptions;
 use crate::repl::{CommandSpan, classify_command};
@@ -16,6 +17,8 @@ use ratatui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
 const PLACEHOLDER: &str = "Type a prompt or a .command; Enter sends";
+/// The rule's title while the vi layer is in normal mode.
+pub(super) const NORMAL_TAG: &str = " NORMAL ";
 /// Text rows the field shows, before the rule above them.
 const MIN_ROWS: u16 = 3;
 const MAX_ROWS: u16 = 8;
@@ -112,6 +115,31 @@ impl Composer {
         self.textarea.insert_newline();
     }
 
+    pub(super) fn move_cursor(&mut self, motion: ViMotion) {
+        self.textarea.move_cursor(match motion {
+            ViMotion::Back => CursorMove::Back,
+            ViMotion::Down => CursorMove::Down,
+            ViMotion::Up => CursorMove::Up,
+            ViMotion::Forward => CursorMove::Forward,
+            ViMotion::WordForward => CursorMove::WordForward,
+            ViMotion::WordBack => CursorMove::WordBack,
+            ViMotion::Head => CursorMove::Head,
+            ViMotion::End => CursorMove::End,
+        });
+    }
+
+    pub(super) fn delete_next_char(&mut self) {
+        self.textarea.delete_next_char();
+    }
+
+    /// Deletes the cursor's line, and the line break after it when
+    /// there is one, so the lines below move up.
+    pub(super) fn delete_line(&mut self) {
+        self.textarea.move_cursor(CursorMove::Head);
+        self.textarea.delete_line_by_end();
+        self.textarea.delete_next_char();
+    }
+
     /// Rows the field takes in a frame: its text rows, following the
     /// draft between the bounds, plus the rule above them.
     pub(super) fn rows(&self) -> u16 {
@@ -126,12 +154,14 @@ impl Composer {
         prefix: CommandPrefix,
         extra_known: &[&str],
         no_color: bool,
+        vi_normal: bool,
     ) -> ComposerView<'a> {
         let first_line = self.textarea.lines().first().map(String::as_str);
         ComposerView {
             composer: self,
             command: first_line.and_then(|line| classify_command(line, prefix, extra_known)),
             no_color,
+            vi_normal,
         }
     }
 }
@@ -140,6 +170,7 @@ pub(super) struct ComposerView<'a> {
     composer: &'a Composer,
     command: Option<CommandSpan>,
     no_color: bool,
+    vi_normal: bool,
 }
 
 impl ComposerView<'_> {
@@ -184,7 +215,10 @@ impl Widget for ComposerView<'_> {
         if area.is_empty() {
             return;
         }
-        let rule = Block::new().borders(Borders::TOP).border_style(DIM);
+        let mut rule = Block::new().borders(Borders::TOP).border_style(DIM);
+        if self.vi_normal {
+            rule = rule.title(NORMAL_TAG);
+        }
         let inner = rule.inner(area);
         rule.render(area, buf);
         if inner.is_empty() {
@@ -214,7 +248,7 @@ mod tests {
         composer.set_text(text);
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(prefix, extra_known, no_color)
+            .view(prefix, extra_known, no_color, false)
             .render(AREA, &mut buf);
         buf
     }
@@ -280,10 +314,49 @@ mod tests {
         composer.set_text(&[".info x", "a", "b", "c", "d", "e"].join("\n"));
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(CommandPrefix::Dot, &[], false)
+            .view(CommandPrefix::Dot, &[], false, false)
             .render(AREA, &mut buf);
         assert!(composer.textarea.scroll_offset().0 > 0);
         assert!(first_row(&buf).iter().all(|cell| !cell.1));
+    }
+
+    #[test]
+    fn normal_mode_titles_the_rule() {
+        let composer = Composer::new(BACKGROUND);
+        let mut buf = Buffer::empty(AREA);
+        composer
+            .view(CommandPrefix::Dot, &[], false, true)
+            .render(AREA, &mut buf);
+        let top: String = (0..AREA.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(top.contains(NORMAL_TAG), "{top:?}");
+        assert_eq!(buf[(AREA.width - 1, 0)].symbol(), HORIZONTAL);
+    }
+
+    #[test]
+    fn the_vi_edits_move_and_delete_in_the_draft() {
+        let mut composer = Composer::new(BACKGROUND);
+        composer.set_text("one two\nthree");
+        composer.move_cursor(ViMotion::Up);
+        composer.move_cursor(ViMotion::Head);
+        composer.move_cursor(ViMotion::WordForward);
+        composer.delete_next_char();
+        assert_eq!(composer.text(), "one wo\nthree");
+        composer.move_cursor(ViMotion::End);
+        composer.move_cursor(ViMotion::Back);
+        composer.delete_next_char();
+        assert_eq!(composer.text(), "one w\nthree");
+        composer.delete_line();
+        assert_eq!(composer.text(), "three");
+        composer.delete_line();
+        assert_eq!(composer.text(), "");
+        composer.set_text("a b");
+        composer.move_cursor(ViMotion::Head);
+        composer.move_cursor(ViMotion::Forward);
+        composer.delete_next_char();
+        assert_eq!(composer.text(), "ab");
+        composer.move_cursor(ViMotion::WordBack);
+        composer.delete_next_char();
+        assert_eq!(composer.text(), "b");
     }
 
     #[test]
