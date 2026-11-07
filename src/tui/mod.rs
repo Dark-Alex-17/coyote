@@ -5,6 +5,7 @@
 //! transcript is redrawn from its sources on every frame, so a resize is
 //! just another frame.
 
+mod bottom_pane;
 mod cells;
 mod composer;
 mod events;
@@ -22,11 +23,12 @@ use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, anyhow, bail};
+use bottom_pane::{PaletteSnapshot, PaletteState, PaletteView, View};
 use cells::{
     AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
 };
 use composer::{Composer, field_background};
-use crossterm::event::{EventStream, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
 use keys::{Action, KeyContext, ModalKind};
@@ -842,9 +844,17 @@ pub(crate) struct App {
     /// Read once at start: `NO_COLOR` drops the UI's own colours while the
     /// attributes stay.
     no_color: bool,
-    /// The macros the typed-command highlight accepts as known, refreshed
-    /// with the context since a turn can enable or shadow one.
-    macro_names: Vec<String>,
+    /// The enabled macros as (name, description), refreshed with the
+    /// context since a turn can enable or shadow one: the typed-command
+    /// highlight accepts them as known and the palette lists them.
+    macros: Vec<(String, String)>,
+    view: View,
+    /// What the palette lists while the context is away on a turn.
+    palette_snapshot: PaletteSnapshot,
+    /// Set by every edit of the composer; the next `refresh_palette`
+    /// rebuilds the palette's rows and clears it. A palette closed by
+    /// Esc stays closed until the draft changes again.
+    palette_dirty: bool,
     config: Arc<AppConfig>,
     prompt_memory: Arc<PromptMemory>,
 }
@@ -877,7 +887,10 @@ impl App {
             clock,
             renderer,
             no_color: *crate::utils::NO_COLOR,
-            macro_names: Vec::new(),
+            macros: Vec::new(),
+            view: View::Composer,
+            palette_snapshot: PaletteSnapshot::EMPTY,
+            palette_dirty: false,
             config,
             prompt_memory,
         })
@@ -898,6 +911,7 @@ impl App {
 
     pub(crate) fn set_composer_text(&mut self, text: &str) {
         self.composer.set_text(text);
+        self.palette_dirty = true;
         self.schedule_frame();
     }
 
@@ -905,11 +919,12 @@ impl App {
     /// called whenever the context is back in the UI's hands.
     pub(crate) fn sync_from_ctx(&mut self, ctx: &mut RequestContext) {
         self.footer = FooterInfo::from_ctx(ctx);
-        self.macro_names = ctx
+        self.macros = ctx
             .visible_macro_completions()
             .into_iter()
-            .map(|(name, _)| name)
+            .map(|(name, description)| (name, description.unwrap_or_default()))
             .collect();
+        self.palette_snapshot = PaletteSnapshot::from_ctx(ctx);
         if !Arc::ptr_eq(&self.config, &ctx.app.config) {
             let config = &ctx.app.config;
             match config.render_options().and_then(|options| {
@@ -1077,7 +1092,62 @@ impl App {
             question_fully_shown,
             scrolled: self.transcript.scrolled(),
             focused: self.transcript.focused(),
+            popup: matches!(self.view, View::Palette(_)),
         }
+    }
+
+    /// The composer's line when it is a single line opening with a
+    /// sigil the configured prefix accepts: the line the palette is for.
+    fn command_line(&self) -> Option<&str> {
+        let [line] = self.composer.lines() else {
+            return None;
+        };
+        let first = line.trim_start().chars().next()?;
+        self.config
+            .command_prefix
+            .accepts(first)
+            .then_some(line.as_str())
+    }
+
+    /// Opens, refreshes or closes the palette after an edit of the
+    /// composer. With the context in hand the rows include arguments and
+    /// macros; mid-turn they are the commands the snapshot allows.
+    pub(crate) fn refresh_palette(&mut self, ctx: Option<&RequestContext>) {
+        if !self.palette_dirty {
+            return;
+        }
+        self.palette_dirty = false;
+        let palette = match self.command_line() {
+            Some(line) if self.prompts.is_empty() => PaletteState::build(
+                line,
+                self.config.command_prefix,
+                self.palette_snapshot,
+                &self.macros,
+                ctx,
+            ),
+            _ => None,
+        };
+        self.view = match palette {
+            Some(palette) => View::Palette(palette),
+            None => View::Composer,
+        };
+        self.schedule_frame();
+    }
+
+    fn close_palette(&mut self) {
+        self.view = View::Composer;
+        self.palette_dirty = false;
+    }
+
+    fn submit_composer(&mut self) -> Option<Command> {
+        let text = self.composer_text();
+        if text.trim().is_empty() {
+            return None;
+        }
+        self.composer.clear();
+        self.palette_dirty = true;
+        self.transcript.clear_focus();
+        Some(Command::Submit(text.trim().to_string()))
     }
 
     pub(crate) fn handle_input(&mut self, input: TermInput) -> Option<Command> {
@@ -1100,6 +1170,7 @@ impl App {
                     }
                     None => {
                         self.composer.insert_str(&text);
+                        self.palette_dirty = true;
                     }
                 }
                 self.schedule_frame();
@@ -1139,18 +1210,10 @@ impl App {
             self.last_keystroke = Some(self.clock.now());
         }
         let command = match action {
-            Action::Submit => {
-                let text = self.composer_text();
-                if text.trim().is_empty() {
-                    None
-                } else {
-                    self.composer.clear();
-                    self.transcript.clear_focus();
-                    Some(Command::Submit(text.trim().to_string()))
-                }
-            }
+            Action::Submit => self.submit_composer(),
             Action::InsertNewline => {
                 self.composer.insert_newline();
+                self.palette_dirty = true;
                 None
             }
             Action::ClearComposer => {
@@ -1230,7 +1293,37 @@ impl App {
                 None
             }
             Action::ComposerInput(key) => {
-                self.composer.input(key);
+                // Tab on a command line asks for the palette rather than
+                // indenting the command.
+                if key.code != KeyCode::Tab || self.command_line().is_none() {
+                    self.composer.input(key);
+                }
+                self.palette_dirty = true;
+                None
+            }
+            Action::PaletteMove(delta) => {
+                if let View::Palette(palette) = &mut self.view {
+                    palette.move_highlight(delta);
+                }
+                None
+            }
+            Action::PaletteAccept => {
+                let accepted = match (&self.view, self.command_line()) {
+                    (View::Palette(palette), Some(line)) => palette.accept(line),
+                    _ => None,
+                };
+                match accepted {
+                    Some(text) => {
+                        self.close_palette();
+                        self.set_composer_text(&text);
+                        None
+                    }
+                    None if self.turn.is_some() || self.exiting => None,
+                    None => self.submit_composer(),
+                }
+            }
+            Action::ClosePopup => {
+                self.close_palette();
                 None
             }
             Action::ToggleTodo => {
@@ -1589,6 +1682,7 @@ impl App {
     }
 
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
+        self.close_palette();
         if self.prompts.is_empty() {
             self.question_area = None;
             // The idle gate counts from the moment the modal appears, not
@@ -1814,8 +1908,21 @@ impl App {
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
         match self.prompts.front() {
             Some(prompt) => prompt.rows(area.width, area.height),
-            None => self.composer.rows(),
+            None => self.composer.rows() + self.palette_band_rows(area),
         }
+    }
+
+    /// The rows the palette's band takes from the transcript: what it
+    /// asks for, within what the frame can give once the composer, the
+    /// status and footer rows and the transcript's minimum have theirs.
+    fn palette_band_rows(&self, area: Rect) -> u16 {
+        let View::Palette(palette) = &self.view else {
+            return 0;
+        };
+        let room = area
+            .height
+            .saturating_sub(self.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
+        palette.band_rows().min(room)
     }
 
     /// One frame from state; `frame.area()` is the only size consulted.
@@ -1857,11 +1964,20 @@ impl App {
                 Some(question)
             }
             None => {
-                let macro_names: Vec<&str> = self.macro_names.iter().map(String::as_str).collect();
+                let [band, field] = Layout::vertical([
+                    Constraint::Length(self.palette_band_rows(area)),
+                    Constraint::Min(0),
+                ])
+                .areas(bottom);
+                if let View::Palette(palette) = &self.view {
+                    frame.render_widget(PaletteView(palette), band);
+                }
+                let macro_names: Vec<&str> =
+                    self.macros.iter().map(|(name, _)| name.as_str()).collect();
                 frame.render_widget(
                     self.composer
                         .view(self.config.command_prefix, &macro_names, self.no_color),
-                    bottom,
+                    field,
                 );
                 None
             }
@@ -2510,6 +2626,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             }
             Step::Input(Some(Ok(event))) => {
                 let command = app.handle_input(events::classify(event));
+                app.refresh_palette(ctx.as_ref());
                 match command {
                     Some(Command::Submit(line)) => {
                         if let Some(ctx) = ctx.take() {
@@ -2761,7 +2878,19 @@ mod tests {
         }
 
         fn press(&mut self, code: KeyCode) -> Option<Command> {
-            self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            self.press_with_ctx(code, None)
+        }
+
+        /// A key followed by the palette refresh the loop runs after
+        /// every input, with the context in hand when `ctx` is given.
+        fn press_with_ctx(
+            &mut self,
+            code: KeyCode,
+            ctx: Option<&RequestContext>,
+        ) -> Option<Command> {
+            let command = self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            self.app.refresh_palette(ctx);
+            command
         }
 
         fn type_text(&mut self, text: &str) {
@@ -6130,6 +6259,189 @@ mod tests {
             .find(|position| buffer[*position].modifier.contains(Modifier::REVERSED))
             .expect("the composer draws its cursor");
         assert_eq!((cursor.x, cursor.y), (5, COMPOSER_TEXT_ROW));
+    }
+
+    fn palette(harness: &Harness) -> Option<&PaletteState> {
+        match &harness.app.view {
+            View::Palette(palette) => Some(palette),
+            View::Composer => None,
+        }
+    }
+
+    #[test]
+    fn a_typed_sigil_opens_the_palette_with_no_highlight() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".");
+        let palette = palette(&harness).expect("the palette opens on a sigil");
+        assert_eq!(palette.highlight, None);
+        assert!(palette.rows.iter().any(|row| row.value == ".help "));
+        assert_eq!(palette.token_range, 0..1);
+        harness.type_text("in");
+        let frame = harness.draw();
+        assert_welcome_snapshot("palette_open_80x24", &frame);
+        assert!(frame.contains(".info"), "{frame}");
+        assert!(frame.contains("Show system info"), "{frame}");
+    }
+
+    #[test]
+    fn enter_with_no_highlight_submits_the_line() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit(".in".to_string()))
+        );
+        assert!(palette(&harness).is_none());
+        assert!(harness.app.composer.is_empty());
+    }
+
+    #[test]
+    fn tab_highlights_the_first_row_and_enter_takes_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".inf");
+        assert!(harness.press(KeyCode::Tab).is_none());
+        let open = palette(&harness).expect("still open");
+        assert_eq!(open.highlight, Some(0));
+        let first = open.rows[0].value.clone();
+        assert!(
+            first.starts_with(".in") && first.ends_with(' '),
+            "{first:?}"
+        );
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert_eq!(harness.app.composer_text(), first);
+        assert!(palette(&harness).is_none_or(|open| open.token_range.start > 0));
+        harness.type_text("x");
+        assert_eq!(harness.app.composer_text(), format!("{first}x"));
+    }
+
+    #[test]
+    fn up_from_the_first_row_clears_the_highlight() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".");
+        harness.press(KeyCode::Down);
+        harness.press(KeyCode::Down);
+        assert_eq!(palette(&harness).unwrap().highlight, Some(1));
+        harness.press(KeyCode::BackTab);
+        assert_eq!(palette(&harness).unwrap().highlight, Some(0));
+        harness.press(KeyCode::Up);
+        assert_eq!(palette(&harness).unwrap().highlight, None);
+    }
+
+    #[test]
+    fn esc_closes_the_palette_without_interrupting_or_losing_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hello", false);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), ".in");
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        harness.type_text("f");
+        assert!(palette(&harness).is_some(), "an edit reopens it");
+    }
+
+    #[test]
+    fn tab_reopens_a_closed_palette_on_a_command_line() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        harness.press(KeyCode::Esc);
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Tab);
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.app.composer_text(), ".in");
+    }
+
+    #[test]
+    fn a_space_after_a_full_command_keeps_the_palette_only_for_arguments() {
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        for c in ".help".chars() {
+            harness.press_with_ctx(KeyCode::Char(c), Some(&ctx));
+        }
+        assert!(palette(&harness).is_some());
+        harness.press_with_ctx(KeyCode::Char(' '), Some(&ctx));
+        assert!(palette(&harness).is_none());
+
+        harness.app.set_composer_text(".set");
+        harness.app.refresh_palette(Some(&ctx));
+        harness.press_with_ctx(KeyCode::Char(' '), Some(&ctx));
+        let palette = palette(&harness).expect("the settable keys are rows");
+        assert!(palette.rows.iter().all(|row| !row.value.starts_with('.')));
+        assert!(palette.rows.iter().any(|row| row.value == "highlight"));
+        assert_eq!(palette.token_range, 5..5);
+        harness.press_with_ctx(KeyCode::Tab, Some(&ctx));
+        let first = palette_first_value(&harness);
+        harness.press_with_ctx(KeyCode::Enter, Some(&ctx));
+        assert_eq!(harness.app.composer_text(), format!(".set {first}"));
+    }
+
+    fn palette_first_value(harness: &Harness) -> String {
+        palette(harness).unwrap().rows[0].value.clone()
+    }
+
+    #[test]
+    fn mid_turn_the_palette_lists_commands_from_the_snapshot_only() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hello", false);
+        harness.type_text(".set ");
+        assert!(palette(&harness).is_none());
+        harness.app.set_composer_text(".h");
+        harness.app.refresh_palette(None);
+        let palette = palette(&harness).expect("commands need no context");
+        assert!(palette.rows.iter().any(|row| row.value == ".help "));
+    }
+
+    #[test]
+    fn a_prompt_arriving_closes_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hello", false);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        assert!(palette(&harness).is_none());
+        assert!(matches!(
+            harness.app.key_context().modal,
+            Some(ModalKind::Confirm { .. })
+        ));
+        harness.press(KeyCode::Esc);
+        assert!(matches!(asker.join().unwrap(), Ok(PromptAnswer::Cancelled)));
+    }
+
+    #[test]
+    fn a_second_line_closes_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        harness.app.refresh_palette(None);
+        assert!(palette(&harness).is_none());
+    }
+
+    #[test]
+    fn the_palette_band_sits_above_the_rule_and_keeps_the_transcript_minimum() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".");
+        harness.render();
+        let rows = usize::from(harness.app.palette_band_rows(Rect::new(0, 0, 80, 24)));
+        assert_eq!(rows, usize::from(bottom_pane::PALETTE_MAX_ROWS));
+        let frame = harness.terminal.backend().to_string();
+        let lines: Vec<&str> = frame.lines().collect();
+        let rule_row = usize::from(COMPOSER_RULE_ROW);
+        assert!(lines[rule_row].contains(ratatui::symbols::line::HORIZONTAL));
+        assert!(lines[rule_row - 1].contains("(+"), "{frame}");
+        assert!(
+            lines[rule_row - rows].trim_start().starts_with('.'),
+            "{frame}"
+        );
+
+        harness.resize(80, 12);
+        harness.render();
+        let room = 12 - (harness.app.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
+        assert_eq!(harness.app.palette_band_rows(Rect::new(0, 0, 80, 12)), room);
     }
 
     #[test]

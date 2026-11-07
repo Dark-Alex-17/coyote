@@ -3,7 +3,7 @@ mod highlighter;
 mod prompt;
 mod replay;
 
-use self::completer::ReplCompleter;
+pub(crate) use self::completer::{ReplCompleter, command_candidates, split_line};
 use self::highlighter::ReplHighlighter;
 pub(crate) use self::highlighter::{CommandSpan, classify_command};
 use self::prompt::ReplPrompt;
@@ -723,6 +723,14 @@ impl ReplCommand {
 
     fn is_valid(&self, flags: StateFlags) -> bool {
         self.state.assert(flags)
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) fn description(&self) -> &'static str {
+        self.description
     }
 }
 

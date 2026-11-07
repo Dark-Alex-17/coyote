@@ -51,6 +51,9 @@ pub(crate) struct KeyContext {
     /// Whether a transcript row holds the focus; an Enter on an empty
     /// composer goes to it, and so does Esc while no turn is running.
     pub(crate) focused: bool,
+    /// Whether a popup (the command palette) is open over the composer;
+    /// the list keys and Esc go to it before anything else.
+    pub(crate) popup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +84,12 @@ pub(crate) enum Action {
     ModalJump(usize),
     ModalInput(KeyEvent),
     ComposerInput(KeyEvent),
+    /// Move the popup's highlight by this many rows, down when positive.
+    PaletteMove(i32),
+    /// Take the popup's highlighted row into the composer; with no row
+    /// highlighted the Enter goes on to submit.
+    PaletteAccept,
+    ClosePopup,
     ToggleTodo,
     /// Move the transcript view by this many lines, down when positive.
     ScrollLines(i32),
@@ -191,6 +200,11 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
                 Action::ScrollToBottom
             }
+            KeyCode::Esc if ctx.popup => Action::ClosePopup,
+            KeyCode::Up if ctx.popup => Action::PaletteMove(-1),
+            KeyCode::Down if ctx.popup => Action::PaletteMove(1),
+            KeyCode::Tab if ctx.popup => Action::PaletteMove(1),
+            KeyCode::BackTab if ctx.popup => Action::PaletteMove(-1),
             // Interrupting the turn outranks a focused row; the focus
             // goes with it.
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
@@ -207,6 +221,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             {
                 Action::InsertNewline
             }
+            KeyCode::Enter if ctx.popup => Action::PaletteAccept,
             KeyCode::Enter if ctx.focused && ctx.composer_empty => Action::ToggleFocused,
             KeyCode::Enter if ctx.turn_running => Action::Nothing,
             KeyCode::Enter => Action::Submit,
@@ -247,6 +262,7 @@ mod tests {
         question_fully_shown: true,
         scrolled: false,
         focused: false,
+        popup: false,
     };
 
     #[test]
@@ -327,6 +343,67 @@ mod tests {
         let typed = plain(KeyCode::Char('x'));
         assert_eq!(map_key(typed, &IDLE), Action::ComposerInput(typed));
         assert_eq!(map_key(typed, &running), Action::ComposerInput(typed));
+    }
+
+    /// With the palette open the list keys and Esc go to it, whatever
+    /// the turn or the focus is doing; typing still reaches the composer
+    /// and the view keys still move the transcript.
+    #[test]
+    fn popup_keys() {
+        let popup = KeyContext {
+            popup: true,
+            composer_empty: false,
+            ..IDLE
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..popup
+        };
+        let focused = KeyContext {
+            focused: true,
+            ..popup
+        };
+        let cases = [
+            (plain(KeyCode::Esc), popup, Action::ClosePopup),
+            (plain(KeyCode::Esc), running, Action::ClosePopup),
+            (plain(KeyCode::Esc), focused, Action::ClosePopup),
+            (plain(KeyCode::Up), popup, Action::PaletteMove(-1)),
+            (plain(KeyCode::Down), popup, Action::PaletteMove(1)),
+            (plain(KeyCode::Tab), popup, Action::PaletteMove(1)),
+            (plain(KeyCode::BackTab), popup, Action::PaletteMove(-1)),
+            (plain(KeyCode::Enter), popup, Action::PaletteAccept),
+            (plain(KeyCode::Enter), running, Action::PaletteAccept),
+            (
+                press(KeyCode::Enter, KeyModifiers::SHIFT),
+                popup,
+                Action::InsertNewline,
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::SHIFT),
+                popup,
+                Action::ScrollLines(-1),
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::CONTROL),
+                popup,
+                Action::FocusPrev,
+            ),
+            (
+                plain(KeyCode::Tab),
+                IDLE,
+                Action::ComposerInput(plain(KeyCode::Tab)),
+            ),
+            (
+                plain(KeyCode::Up),
+                IDLE,
+                Action::ComposerInput(plain(KeyCode::Up)),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+        let typed = plain(KeyCode::Char('x'));
+        assert_eq!(map_key(typed, &popup), Action::ComposerInput(typed));
     }
 
     /// The transcript's keys: F2, the page and Shift+arrow scrolls and

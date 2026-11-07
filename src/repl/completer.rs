@@ -1,6 +1,6 @@
 use super::{REPL_COMMANDS, ReplCommand};
 
-use crate::config::{McpPromptCompletion, RequestContext, sanitize_display_text};
+use crate::config::{McpPromptCompletion, RequestContext, StateFlags, sanitize_display_text};
 use crate::mcp::ConnectedServer;
 use crate::utils::fuzzy_filter;
 
@@ -20,7 +20,7 @@ impl Completer for ReplCompleter {
 }
 
 impl ReplCompleter {
-    fn suggestions_for(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    pub(crate) fn suggestions_for(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let mut suggestions = vec![];
         let line = &line[0..pos];
         let mut parts = split_line(line);
@@ -68,19 +68,7 @@ impl ReplCompleter {
             .chain(parts.iter().skip(1).take(1).map(|(v, _)| *v))
             .collect::<Vec<&str>>()
             .join(" ");
-        let commands: Vec<_> = self
-            .commands
-            .iter()
-            .filter(|cmd| {
-                cmd.is_valid(state)
-                    && (command_filter.len() == 1
-                        || command_filter
-                            .get(..2)
-                            .is_none_or(|head| cmd.name.starts_with(head)))
-                    && (cmd.name != ".reasoning" || model_has_reasoning)
-            })
-            .collect();
-        let commands = fuzzy_filter(commands, |v| v.name, &command_filter);
+        let commands = command_candidates(state, model_has_reasoning, &command_filter);
 
         if parts_len > 1 {
             let span = Span::new(parts[parts_len - 1].1, pos);
@@ -132,7 +120,6 @@ impl ReplCompleter {
 
 pub struct ReplCompleter {
     ctx: Arc<RwLock<RequestContext>>,
-    commands: Vec<ReplCommand>,
     groups: HashMap<&'static str, usize>,
 }
 
@@ -140,19 +127,37 @@ impl ReplCompleter {
     pub fn new(ctx: Arc<RwLock<RequestContext>>) -> Self {
         let mut groups = HashMap::new();
 
-        let commands: Vec<ReplCommand> = REPL_COMMANDS.to_vec();
-
         for cmd in REPL_COMMANDS.iter() {
             let name = cmd.name;
             *groups.entry(name).or_insert(0) += 1;
         }
 
-        Self {
-            ctx,
-            commands,
-            groups,
-        }
+        Self { ctx, groups }
     }
+}
+
+/// The commands offered for a typed command token, in the completer's
+/// order. The command palette draws from the same table, so what one
+/// offers the other offers too. A one-character filter (the bare sigil)
+/// admits everything; a longer one is narrowed to the names sharing its
+/// first two characters before the fuzzy match.
+pub(crate) fn command_candidates(
+    state: StateFlags,
+    model_has_reasoning: bool,
+    command_filter: &str,
+) -> Vec<&'static ReplCommand> {
+    let commands: Vec<&'static ReplCommand> = REPL_COMMANDS
+        .iter()
+        .filter(|cmd| {
+            cmd.is_valid(state)
+                && (command_filter.len() == 1
+                    || command_filter
+                        .get(..2)
+                        .is_none_or(|head| cmd.name.starts_with(head)))
+                && (cmd.name != ".reasoning" || model_has_reasoning)
+        })
+        .collect();
+    fuzzy_filter(commands, |v| v.name, command_filter)
 }
 
 fn with_sigil(name: &str, sigil: char) -> String {
@@ -242,7 +247,7 @@ fn list_prompts_blocking(
     result.ok()?.ok()
 }
 
-fn split_line(line: &str) -> Vec<(&str, usize)> {
+pub(crate) fn split_line(line: &str) -> Vec<(&str, usize)> {
     let mut parts = vec![];
     let mut part_start = None;
     for (i, ch) in line.char_indices() {

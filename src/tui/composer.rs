@@ -96,7 +96,6 @@ impl Composer {
         self.textarea.is_empty()
     }
 
-    #[cfg(test)]
     pub(super) fn lines(&self) -> &[String] {
         self.textarea.lines()
     }
