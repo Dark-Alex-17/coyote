@@ -1,6 +1,6 @@
 ---
 source: src/tui/mod.rs
-expression: narrow.clone()
+expression: "&narrow"
 ---
 "> explain                               "
 "                                        "

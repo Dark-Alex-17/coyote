@@ -3,7 +3,7 @@
 //! terminal events are reduced to the few inputs the app reacts to before
 //! they reach it. The clock is injected so tests can move time by hand.
 
-use crossterm::event::{Event, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -82,6 +82,9 @@ pub(crate) enum TermInput {
     /// Only schedules a frame: the next draw reads the new size from
     /// `Frame::area()`.
     Resize,
+    /// A wheel notch or a left button press; moves, releases and the
+    /// other buttons are dropped.
+    Mouse(MouseEvent),
     Ignored,
 }
 
@@ -91,6 +94,16 @@ pub(crate) fn classify(event: Event) -> TermInput {
         Event::Key(_) => TermInput::Ignored,
         Event::Paste(text) => TermInput::Paste(text),
         Event::Resize(_, _) => TermInput::Resize,
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::Down(MouseButton::Left)
+            ) =>
+        {
+            TermInput::Mouse(mouse)
+        }
         Event::Mouse(_) | Event::FocusGained | Event::FocusLost => TermInput::Ignored,
     }
 }
@@ -191,5 +204,36 @@ mod tests {
     fn resize_only_asks_for_a_frame() {
         assert_eq!(classify(Event::Resize(40, 24)), TermInput::Resize);
         assert_eq!(classify(Event::FocusGained), TermInput::Ignored);
+    }
+
+    #[test]
+    fn only_wheel_notches_and_left_presses_reach_the_app() {
+        let mouse = |kind: MouseEventKind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for kind in [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            assert!(
+                matches!(classify(mouse(kind)), TermInput::Mouse(m) if m.kind == kind),
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::ScrollLeft,
+        ] {
+            assert_eq!(classify(mouse(kind)), TermInput::Ignored, "{kind:?}");
+        }
     }
 }

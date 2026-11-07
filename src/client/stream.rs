@@ -1,5 +1,5 @@
 use super::{ApiStatusError, ThinkingBlock, TokenUsage, ToolCall, catch_error};
-use crate::events::{Event, bus};
+use crate::events::{Event, Origin, bus};
 use crate::utils::AbortSignal;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +21,8 @@ pub struct SseHandler {
     call_repeat_chain_len: usize,
     silent: bool,
     call_loop_detection: bool,
+    origin: Origin,
+    thinking_open: bool,
 }
 
 impl SseHandler {
@@ -37,11 +39,19 @@ impl SseHandler {
             call_repeat_chain_len: 3,
             silent: false,
             call_loop_detection: true,
+            origin: Origin::detached(),
+            thinking_open: false,
         }
     }
 
     pub fn set_silent(&mut self, silent: bool) {
         self.silent = silent;
+    }
+
+    /// Stamped on the thinking events so the UI can tell the root's
+    /// reasoning from a child agent's.
+    pub fn set_origin(&mut self, origin: Origin) {
+        self.origin = origin;
     }
 
     /// Loop detection guards an interactive stream; the non-streaming
@@ -75,6 +85,7 @@ impl SseHandler {
     }
 
     pub fn done(&mut self) {
+        self.thinking_stopped();
         let ret = self.sender.send(SseEvent::Done);
         if ret.is_err() {
             if self.abort_signal.aborted() {
@@ -184,18 +195,40 @@ impl SseHandler {
         message
     }
 
-    /// The adapters deliver a thinking block only once it is complete, so
-    /// the started/stopped pair brackets its arrival rather than the
-    /// model's actual thinking time. A silent handler keeps the block and
-    /// publishes nothing, like it does for text.
-    pub fn thinking_block(&mut self, block: ThinkingBlock) {
-        if self.silent {
-            self.thinking.push(block);
+    /// Opens the thinking phase on the bus. Idempotent: an adapter calls it
+    /// from both a block-start frame and the first reasoning delta, since
+    /// some providers skip the start frame. A silent handler publishes
+    /// nothing, like it does for text.
+    pub fn thinking_started(&mut self) {
+        if self.silent || self.thinking_open {
             return;
         }
-        bus().publish(Event::ThinkingStarted);
+        bus().publish(Event::ThinkingStarted {
+            origin: self.origin.clone(),
+        });
+        self.thinking_open = true;
+    }
+
+    /// Closes a thinking phase opened by `thinking_started`; a no-op when
+    /// none is open, so adapters can call it on every transition out of
+    /// reasoning and `done` can call it unconditionally.
+    pub fn thinking_stopped(&mut self) {
+        if !self.thinking_open {
+            return;
+        }
+        bus().publish(Event::ThinkingStopped {
+            origin: self.origin.clone(),
+        });
+        self.thinking_open = false;
+    }
+
+    /// Keeps a completed thinking block. An adapter that could not announce
+    /// the block's start earlier still gets a started/stopped pair around
+    /// its arrival.
+    pub fn thinking_block(&mut self, block: ThinkingBlock) {
+        self.thinking_started();
         self.thinking.push(block);
-        bus().publish(Event::ThinkingStopped);
+        self.thinking_stopped();
     }
 
     /// Merges a usage update into the accumulator; later non-None fields win.
@@ -438,7 +471,80 @@ impl JsonStreamParser {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::{SseEvent, SseHandler};
+    use crate::events::{Event, EventSink, Origin, SubscriptionId, bus};
+
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, ThreadId};
+
+    pub(crate) fn new_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        (SseHandler::new(sender, abort_signal), receiver)
+    }
+
+    /// Records only what this thread publishes: the bus is shared with
+    /// every other test handing over thinking blocks at the same time, and
+    /// `publish` runs each sink on the publishing thread. Unsubscribes on
+    /// drop so a failed assertion leaves no sink behind on the bus.
+    struct ThisThreadSink {
+        thread: ThreadId,
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl EventSink for ThisThreadSink {
+        fn on_event(&self, event: &Event) {
+            if thread::current().id() == self.thread {
+                self.events.lock().unwrap().push(event.clone());
+            }
+        }
+    }
+
+    pub(crate) struct ThisThreadRecording {
+        sink: Arc<ThisThreadSink>,
+        subscription: SubscriptionId,
+    }
+
+    impl ThisThreadRecording {
+        /// Subscribes to the process-wide bus, so it runs under
+        /// `#[serial]`: the bus's own `sink_count` pins in `events::tests`
+        /// must not see a second subscriber.
+        pub(crate) fn install() -> Self {
+            let sink = Arc::new(ThisThreadSink {
+                thread: thread::current().id(),
+                events: Mutex::new(Vec::new()),
+            });
+            let subscription = bus().subscribe(Arc::clone(&sink) as Arc<dyn EventSink>);
+            Self { sink, subscription }
+        }
+
+        pub(crate) fn events(&self) -> Vec<Event> {
+            self.sink.events.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for ThisThreadRecording {
+        fn drop(&mut self) {
+            bus().unsubscribe(self.subscription);
+        }
+    }
+
+    pub(crate) fn detached_pair() -> Vec<Event> {
+        vec![
+            Event::ThinkingStarted {
+                origin: Origin::detached(),
+            },
+            Event::ThinkingStopped {
+                origin: Origin::detached(),
+            },
+        ]
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{ThisThreadRecording, detached_pair, new_handler};
     use super::*;
 
     use bytes::Bytes;
@@ -526,12 +632,6 @@ mod tests {
         assert!(format!("{err:#}").starts_with("Failed to read json stream"));
     }
 
-    fn new_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let abort_signal = crate::utils::create_abort_signal();
-        (SseHandler::new(sender, abort_signal), receiver)
-    }
-
     #[test]
     fn test_has_received_content_text() {
         let (mut handler, _rx) = new_handler();
@@ -580,51 +680,6 @@ mod tests {
         assert!(handler.has_received_visible_output());
     }
 
-    /// Records only what this thread publishes: the bus is shared with
-    /// every other test handing over thinking blocks at the same time, and
-    /// `publish` runs each sink on the publishing thread. Unsubscribes on
-    /// drop so a failed assertion leaves no sink behind on the bus.
-    struct ThisThreadSink {
-        thread: std::thread::ThreadId,
-        events: std::sync::Mutex<Vec<Event>>,
-    }
-
-    impl crate::events::EventSink for ThisThreadSink {
-        fn on_event(&self, event: &Event) {
-            if std::thread::current().id() == self.thread {
-                self.events.lock().unwrap().push(event.clone());
-            }
-        }
-    }
-
-    struct ThisThreadRecording {
-        sink: std::sync::Arc<ThisThreadSink>,
-        subscription: crate::events::SubscriptionId,
-    }
-
-    impl ThisThreadRecording {
-        /// Subscribes to the process-wide bus, so it runs under
-        /// `#[serial]`: the bus's own `sink_count` pins in `events::tests`
-        /// must not see a second subscriber.
-        fn install() -> Self {
-            let sink = std::sync::Arc::new(ThisThreadSink {
-                thread: std::thread::current().id(),
-                events: std::sync::Mutex::new(Vec::new()),
-            });
-            let subscription =
-                bus()
-                    .subscribe(std::sync::Arc::clone(&sink)
-                        as std::sync::Arc<dyn crate::events::EventSink>);
-            Self { sink, subscription }
-        }
-    }
-
-    impl Drop for ThisThreadRecording {
-        fn drop(&mut self) {
-            bus().unsubscribe(self.subscription);
-        }
-    }
-
     #[test]
     #[serial_test::serial]
     fn a_thinking_block_publishes_started_then_stopped() {
@@ -634,10 +689,65 @@ mod tests {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         });
+        assert_eq!(recording.events(), detached_pair());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn thinking_started_then_a_block_publishes_one_pair() {
+        let recording = ThisThreadRecording::install();
+        let (mut handler, _rx) = new_handler();
+        handler.thinking_started();
+        handler.thinking_block(ThinkingBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        });
+        assert_eq!(recording.events(), detached_pair());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_stream_ending_inside_reasoning_publishes_stopped() {
+        let recording = ThisThreadRecording::install();
+        let (mut handler, _rx) = new_handler();
+        handler.thinking_started();
+        handler.done();
+        assert_eq!(recording.events(), detached_pair());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_handler_with_an_origin_stamps_it_on_the_pair() {
+        let recording = ThisThreadRecording::install();
+        let (mut handler, _rx) = new_handler();
+        let origin = Origin {
+            agent_id: Some("agent_x".into()),
+            depth: 1,
+        };
+        handler.set_origin(origin.clone());
+        handler.thinking_started();
+        handler.thinking_stopped();
         assert_eq!(
-            *recording.sink.events.lock().unwrap(),
-            vec![Event::ThinkingStarted, Event::ThinkingStopped]
+            recording.events(),
+            vec![
+                Event::ThinkingStarted {
+                    origin: origin.clone()
+                },
+                Event::ThinkingStopped { origin },
+            ]
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn thinking_started_twice_publishes_once() {
+        let recording = ThisThreadRecording::install();
+        let (mut handler, _rx) = new_handler();
+        handler.thinking_started();
+        handler.thinking_started();
+        handler.thinking_stopped();
+        handler.thinking_stopped();
+        assert_eq!(recording.events(), detached_pair());
     }
 
     #[test]
@@ -650,7 +760,7 @@ mod tests {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         });
-        assert!(recording.sink.events.lock().unwrap().is_empty());
+        assert!(recording.events().is_empty());
         let (_, _, thinking, _) = handler.take();
         assert_eq!(thinking.len(), 1);
     }

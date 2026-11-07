@@ -213,12 +213,7 @@ async fn chat_completions_streaming(
         bail!("Invalid response data: {data}");
     }
 
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
-    let mut thinking_text = String::new();
-    let mut thinking_signature = String::new();
+    let mut state = BedrockStreamState::default();
 
     let mut stream = res.bytes_stream();
     let mut buffer = BytesMut::new();
@@ -234,86 +229,7 @@ async fn chat_completions_streaming(
                 ("event", _) => {
                     let data: Value = serde_json::from_slice(message.payload())?;
                     debug!("stream-data: {smithy_type} {data}");
-                    match smithy_type {
-                        "contentBlockStart" => {
-                            if let Some(tool_use) = data["start"]["toolUse"].as_object()
-                                && let (Some(id), Some(name)) = (
-                                    json_str_from_map(tool_use, "toolUseId"),
-                                    json_str_from_map(tool_use, "name"),
-                                )
-                            {
-                                if !function_name.is_empty() {
-                                    if function_arguments.is_empty() {
-                                        function_arguments = String::from("{}");
-                                    }
-                                    let arguments: Value =
-                                        function_arguments.parse().with_context(|| {
-                                            format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
-                                        })?;
-                                    handler.tool_call(ToolCall::new(
-                                        function_name.clone(),
-                                        arguments,
-                                        Some(function_id.clone()),
-                                    ))?;
-                                }
-                                function_arguments.clear();
-                                function_name = name.into();
-                                function_id = id.into();
-                            }
-                        }
-                        "contentBlockDelta" => {
-                            if let Some(text) = data["delta"]["text"].as_str() {
-                                handler.text(text)?;
-                            } else if let Some(text) =
-                                data["delta"]["reasoningContent"]["text"].as_str()
-                            {
-                                reasoning_state = 1;
-                                thinking_text.push_str(text);
-                            } else if let Some(signature) =
-                                data["delta"]["reasoningContent"]["signature"].as_str()
-                            {
-                                thinking_signature.push_str(signature);
-                            } else if let Some(redacted_data) =
-                                data["delta"]["reasoningContent"]["redactedContent"].as_str()
-                            {
-                                handler.thinking_block(ThinkingBlock::RedactedThinking {
-                                    data: redacted_data.to_string(),
-                                });
-                            } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
-                                function_arguments.push_str(input);
-                            }
-                        }
-                        "contentBlockStop" => {
-                            if reasoning_state == 1 {
-                                reasoning_state = 0;
-                                handler.thinking_block(ThinkingBlock::Thinking {
-                                    thinking: mem::take(&mut thinking_text),
-                                    signature: mem::take(&mut thinking_signature),
-                                });
-                            }
-                            if !function_name.is_empty() {
-                                if function_arguments.is_empty() {
-                                    function_arguments = String::from("{}");
-                                }
-                                let arguments: Value = function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
-                                })?;
-                                handler.tool_call(ToolCall::new(
-                                    mem::take(&mut function_name),
-                                    arguments,
-                                    Some(mem::take(&mut function_id)),
-                                ))?;
-                                function_arguments.clear();
-                            }
-                        }
-                        "metadata" => {
-                            if let Some(usage) = bedrock_parse_usage(&data["usage"]) {
-                                debug!("token-usage: {usage:?}");
-                                handler.usage(usage);
-                            }
-                        }
-                        _ => {}
-                    }
+                    bedrock_handle_stream_event(smithy_type, &data, &mut state, handler)?;
                 }
                 ("exception", _) => {
                     let payload = base64_decode(message.payload())?;
@@ -328,6 +244,114 @@ async fn chat_completions_streaming(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// What a Converse stream carries between events: the tool call and the
+/// thinking block being assembled from their deltas.
+#[derive(Default)]
+struct BedrockStreamState {
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_open: bool,
+    thinking_text: String,
+    thinking_signature: String,
+}
+
+impl BedrockStreamState {
+    fn parse_arguments(&mut self) -> Result<Value> {
+        if self.function_arguments.is_empty() {
+            self.function_arguments = String::from("{}");
+        }
+        self.function_arguments.parse().with_context(|| {
+            format!(
+                "Tool call '{}' has non-JSON arguments '{}'",
+                self.function_name, self.function_arguments
+            )
+        })
+    }
+}
+
+/// Reasoning only ever arrives through `contentBlockDelta`: a Converse
+/// `contentBlockStart` carries nothing but `toolUse`, so the thinking phase
+/// opens at the first reasoning delta.
+fn bedrock_handle_stream_event(
+    smithy_type: &str,
+    data: &Value,
+    state: &mut BedrockStreamState,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    match smithy_type {
+        "contentBlockStart" => {
+            if let Some(tool_use) = data["start"]["toolUse"].as_object()
+                && let (Some(id), Some(name)) = (
+                    json_str_from_map(tool_use, "toolUseId"),
+                    json_str_from_map(tool_use, "name"),
+                )
+            {
+                if !state.function_name.is_empty() {
+                    let arguments = state.parse_arguments()?;
+                    handler.tool_call(ToolCall::new(
+                        state.function_name.clone(),
+                        arguments,
+                        Some(state.function_id.clone()),
+                    ))?;
+                }
+                state.function_arguments.clear();
+                state.function_name = name.into();
+                state.function_id = id.into();
+            }
+        }
+        "contentBlockDelta" => {
+            if let Some(text) = data["delta"]["text"].as_str() {
+                handler.text(text)?;
+            } else if let Some(text) = data["delta"]["reasoningContent"]["text"].as_str() {
+                if !state.reasoning_open {
+                    handler.thinking_started();
+                }
+                state.reasoning_open = true;
+                state.thinking_text.push_str(text);
+            } else if let Some(signature) = data["delta"]["reasoningContent"]["signature"].as_str()
+            {
+                state.thinking_signature.push_str(signature);
+            } else if let Some(redacted_data) =
+                data["delta"]["reasoningContent"]["redactedContent"].as_str()
+            {
+                handler.thinking_block(ThinkingBlock::RedactedThinking {
+                    data: redacted_data.to_string(),
+                });
+            } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
+                state.function_arguments.push_str(input);
+            }
+        }
+        "contentBlockStop" => {
+            if state.reasoning_open {
+                state.reasoning_open = false;
+                handler.thinking_block(ThinkingBlock::Thinking {
+                    thinking: mem::take(&mut state.thinking_text),
+                    signature: mem::take(&mut state.thinking_signature),
+                });
+            }
+            handler.thinking_stopped();
+            if !state.function_name.is_empty() {
+                let arguments = state.parse_arguments()?;
+                handler.tool_call(ToolCall::new(
+                    mem::take(&mut state.function_name),
+                    arguments,
+                    Some(mem::take(&mut state.function_id)),
+                ))?;
+                state.function_arguments.clear();
+            }
+        }
+        "metadata" => {
+            if let Some(usage) = bedrock_parse_usage(&data["usage"]) {
+                debug!("token-usage: {usage:?}");
+                handler.usage(usage);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1439,5 +1463,92 @@ mod tests {
             &output.thinking[1],
             ThinkingBlock::RedactedThinking { data } if data == "b64data"
         ));
+    }
+
+    mod thinking_events {
+        use super::*;
+        use crate::client::stream::test_support::{
+            ThisThreadRecording, detached_pair, new_handler,
+        };
+        use crate::events::{Event, Origin};
+
+        fn feed(events: &[(&str, Value)]) -> (Vec<Event>, SseHandler) {
+            let recording = ThisThreadRecording::install();
+            let (mut handler, _rx) = new_handler();
+            let mut state = BedrockStreamState::default();
+            for (smithy_type, data) in events {
+                bedrock_handle_stream_event(smithy_type, data, &mut state, &mut handler).unwrap();
+            }
+            (recording.events(), handler)
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_first_reasoning_delta_opens_the_phase_once() {
+            let (events, _) = feed(&[
+                ("contentBlockStart", json!({ "contentBlockIndex": 0 })),
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "text": "let me" } } }),
+                ),
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "text": " think" } } }),
+                ),
+            ]);
+            assert_eq!(
+                events,
+                vec![Event::ThinkingStarted {
+                    origin: Origin::detached()
+                }]
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_block_stop_closes_the_phase_once() {
+            let (events, handler) = feed(&[
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "text": "hmm" } } }),
+                ),
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "signature": "sig" } } }),
+                ),
+                ("contentBlockStop", json!({ "contentBlockIndex": 0 })),
+                ("contentBlockDelta", json!({ "delta": { "text": "answer" } })),
+                ("contentBlockStop", json!({ "contentBlockIndex": 1 })),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, thinking, _) = handler.take();
+            assert_eq!(text, "answer");
+            assert!(matches!(
+                &thinking[0],
+                ThinkingBlock::Thinking { thinking, signature }
+                    if thinking == "hmm" && signature == "sig"
+            ));
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn two_reasoning_blocks_publish_a_pair_each() {
+            let (events, _) = feed(&[
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "text": "first" } } }),
+                ),
+                ("contentBlockStop", json!({ "contentBlockIndex": 0 })),
+                (
+                    "contentBlockDelta",
+                    json!({ "delta": { "reasoningContent": { "text": "second" } } }),
+                ),
+                ("contentBlockStop", json!({ "contentBlockIndex": 1 })),
+            ]);
+            assert_eq!(
+                events,
+                [detached_pair(), detached_pair()].concat()
+            );
+        }
     }
 }

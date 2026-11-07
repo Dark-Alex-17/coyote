@@ -1,6 +1,6 @@
 ---
 source: src/tui/mod.rs
-expression: rendered.clone()
+expression: "&rendered"
 ---
 "> clean up                              "
 "                                        "

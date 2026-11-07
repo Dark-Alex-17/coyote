@@ -1,6 +1,6 @@
 ---
 source: src/tui/mod.rs
-expression: final_frame.clone()
+expression: "&final_frame"
 ---
 "> hello                                                                         "
 "                                                                                "

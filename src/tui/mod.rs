@@ -5,12 +5,15 @@
 //! transcript is redrawn from its sources on every frame, so a resize is
 //! just another frame.
 
+mod cells;
 mod events;
 mod keys;
 mod redirect;
 mod render;
 mod sink;
 mod terminal;
+mod todo;
+mod transcript;
 
 use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
@@ -18,7 +21,10 @@ use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, bail};
-use crossterm::event::{EventStream, KeyEvent};
+use cells::{
+    AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
+};
+use crossterm::event::{EventStream, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
 use keys::{Action, KeyContext, ModalKind};
@@ -32,7 +38,8 @@ use ratatui_textarea::TextArea;
 use redirect::FdRedirect;
 pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
-use sink::{TuiPrompter, TuiSink, UiMsg, unattended_answer};
+use serde_json::Value;
+use sink::{AgentOutcome, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -40,8 +47,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use terminal::Screen;
+use todo::TodoPanel;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
+use transcript::{Transcript, WHEEL_LINES};
 
 /// Set while `run` owns the terminal; `RequestContext::ui_kind` reads it.
 pub(crate) static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -327,139 +336,6 @@ impl FooterInfo {
     }
 }
 
-/// Plain lines cached per width; the two most recently used widths are kept.
-#[derive(Default)]
-struct LineCache {
-    entries: Vec<(u16, Vec<Line<'static>>)>,
-}
-
-impl LineCache {
-    fn get(
-        &mut self,
-        width: u16,
-        render: impl FnOnce() -> Vec<Line<'static>>,
-    ) -> Vec<Line<'static>> {
-        let entry = match self.entries.iter().position(|(w, _)| *w == width) {
-            Some(index) => self.entries.remove(index),
-            None => {
-                if self.entries.len() >= 2 {
-                    self.entries.remove(0);
-                }
-                (width, render())
-            }
-        };
-        let lines = entry.1.clone();
-        self.entries.push(entry);
-        lines
-    }
-}
-
-/// One entry of the transcript, kept as source so any width can render it.
-enum Cell {
-    User {
-        text: String,
-        cache: LineCache,
-    },
-    Assistant {
-        source: String,
-        done: bool,
-        cache: RenderCache,
-    },
-    Notice {
-        kind: NoticeKind,
-        text: String,
-        cache: LineCache,
-    },
-    Error {
-        text: String,
-        cache: LineCache,
-    },
-    /// A REPL command and everything it printed, already painted.
-    Command {
-        name: String,
-        output: String,
-        lines: Option<Vec<Line<'static>>>,
-    },
-    /// Dim lines: a tool's narration and the tail of its output.
-    Text {
-        call_id: Option<String>,
-        lines: Vec<String>,
-        open_line: bool,
-    },
-}
-
-impl Cell {
-    fn user(text: &str) -> Self {
-        Self::User {
-            text: text.to_string(),
-            cache: LineCache::default(),
-        }
-    }
-
-    fn assistant(source: String, done: bool) -> Self {
-        Self::Assistant {
-            source,
-            done,
-            cache: RenderCache::default(),
-        }
-    }
-
-    fn notice(kind: NoticeKind, text: String) -> Self {
-        Self::Notice {
-            kind,
-            text,
-            cache: LineCache::default(),
-        }
-    }
-
-    fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
-        let no_color = *crate::utils::NO_COLOR;
-        match self {
-            Cell::User { text, cache } => cache.get(width, || {
-                render::plain_lines(
-                    &format!("> {text}"),
-                    width,
-                    Style::new().add_modifier(Modifier::BOLD),
-                )
-            }),
-            Cell::Assistant {
-                source,
-                done,
-                cache,
-            } => cache.lines(source, *done, width, renderer),
-            Cell::Notice { kind, text, cache } => {
-                let style = chrome_style(ChromeKind::Notice(*kind), no_color);
-                cache.get(width, || render::plain_lines(text, width, style))
-            }
-            Cell::Error { text, cache } => cache.get(width, || {
-                render::plain_lines(text, width, chrome_style(ChromeKind::Error, no_color))
-            }),
-            Cell::Command {
-                name,
-                output,
-                lines,
-            } => lines
-                .get_or_insert_with(|| {
-                    // The header is the typed line; scrubbed like a User
-                    // cell's, so a pasted escape cannot paint through it.
-                    let header = render::plain_text(&format!("> {name}"));
-                    let mut lines = vec![Line::from(Span::styled(header, DIM))];
-                    if !output.is_empty() {
-                        lines.extend(render::preformatted_lines(output));
-                    }
-                    lines
-                })
-                .clone(),
-            Cell::Text { lines, .. } => {
-                render::hard_wrap(render::preformatted_lines(&lines.join("\n")), width)
-                    .into_iter()
-                    .map(|line| line.patch_style(DIM))
-                    .collect()
-            }
-        }
-    }
-}
-
 struct TurnStatus {
     started: Instant,
     busy: Option<String>,
@@ -468,6 +344,11 @@ struct TurnStatus {
     /// Index of the turn's first cell; tool output never merges into a
     /// cell before it.
     first_cell: usize,
+    /// Whether a request reached the model: the first sign of a reply, or
+    /// the busy indicator and stream end that the transports raise only
+    /// once the request is on the wire. The session records an exchange
+    /// for every such request, reply or not.
+    requested: bool,
 }
 
 struct PendingPrompt {
@@ -574,6 +455,55 @@ fn row_count(lines: usize) -> u16 {
     u16::try_from(lines).unwrap_or(u16::MAX)
 }
 
+/// The command word of a submitted line under the active prefix, in its
+/// dot form.
+fn command_word(line: &str, prefix: crate::config::CommandPrefix) -> Option<String> {
+    prefix
+        .normalize(line.trim())
+        .and_then(|command| command.split_whitespace().next().map(str::to_string))
+}
+
+/// Whether a submitted command line is `.undo` under the active prefix.
+fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
+    command_word(line, prefix).as_deref() == Some(".undo")
+}
+
+/// Commands whose reply rewrites the exchange they follow instead of
+/// opening one: `Session::add_message` appends to the last assistant
+/// message for `.continue` and replaces it for `.regenerate`, so the
+/// exchange `.undo` removes after either is the one before the command.
+/// Every other command whose request reached the model (`.file`, `.run`,
+/// `.starter`, `.prompt`, a macro, ...) recorded a fresh exchange the
+/// way a prompt does.
+const EXCHANGE_MODIFYING_COMMANDS: [&str; 2] = [".continue", ".regenerate"];
+
+/// Whether the cell opened an exchange `.undo` would take back: a user
+/// line or a command turn whose request reached the model, the command
+/// not in `EXCHANGE_MODIFYING_COMMANDS`. A request that failed or was
+/// interrupted before any reply still counts: the session keeps the user
+/// message with an interrupted-response marker. A turn that failed
+/// before the request (no API key, a usage bail on bare `.file`) or
+/// never asks the model (`.info`) recorded nothing, so it is looked past.
+fn opens_exchange(cell: &Cell, prefix: crate::config::CommandPrefix) -> bool {
+    match cell {
+        Cell::User { opened, .. } => *opened,
+        Cell::Command { name, opened, .. } => {
+            *opened
+                && command_word(name, prefix)
+                    .is_some_and(|word| !EXCHANGE_MODIFYING_COMMANDS.contains(&word.as_str()))
+        }
+        _ => false,
+    }
+}
+
+/// Index of the cell that opened the exchange a `.undo` at `undo` takes
+/// back: the latest opener before it, scanning back past any reply.
+fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix) -> Option<usize> {
+    cells[..undo]
+        .iter()
+        .rposition(|cell| opens_exchange(cell, prefix))
+}
+
 /// Something the loop, not the app, has to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -602,7 +532,8 @@ fn new_composer() -> TextArea<'static> {
 
 /// Everything drawn, and the rules for changing it.
 pub(crate) struct App {
-    cells: Vec<Cell>,
+    transcript: Transcript,
+    todo: TodoPanel,
     composer: TextArea<'static>,
     prompts: VecDeque<PendingPrompt>,
     turn: Option<TurnStatus>,
@@ -637,7 +568,8 @@ impl App {
     ) -> Result<Self> {
         let renderer = Renderer::new(config.render_options()?)?;
         Ok(Self {
-            cells: Vec::new(),
+            transcript: Transcript::new(footer.model.clone(), config.command_prefix),
+            todo: TodoPanel::default(),
             composer: new_composer(),
             prompts: VecDeque::new(),
             turn: None,
@@ -689,53 +621,85 @@ impl App {
         if let Some(text) = ctx.pending_prefill.take() {
             self.set_composer_text(&text);
         }
+        self.todo
+            .set(ctx.todo_list.goal.clone(), ctx.todo_list.todos.clone());
         self.schedule_frame();
     }
 
     /// Records that a line left for the work task. A command gets its cell
     /// now, so the transcript shows what is running under a modal the
-    /// command raises; the output fills in when the turn ends.
+    /// command raises; the output fills in when the turn ends. The view
+    /// follows again so the line just sent is not out of sight, and a
+    /// focused row lets go: the line opens a new context.
     pub(crate) fn begin_turn(&mut self, line: &str, command: bool) {
-        let first_cell = self.cells.len();
-        if command {
-            self.cells.push(Cell::Command {
-                name: line.to_string(),
-                output: String::new(),
-                lines: None,
-            });
+        self.transcript.clear_welcome();
+        self.transcript.scroll_to_bottom();
+        self.transcript.clear_focus();
+        let first_cell = self.transcript.len();
+        self.transcript.push(if command {
+            Cell::command(line)
         } else {
-            self.cells.push(Cell::user(line));
-        }
+            Cell::user(line)
+        });
         self.turn = Some(TurnStatus {
             started: self.clock.now(),
             busy: None,
             thinking_since: None,
             tool: None,
             first_cell,
+            requested: false,
         });
         self.schedule_frame();
     }
 
     /// Commits what the work task brought back.
     pub(crate) fn end_turn(&mut self, command: bool, outcome: &TurnOutcome) {
-        let first_cell = self.turn.take().map(|turn| turn.first_cell);
+        let turn = self.turn.take();
         self.close_stream();
+        if let Some(turn) = &turn {
+            self.fail_unreported_tools(turn.first_cell);
+        }
         if command {
-            let index = first_cell.expect("end_turn follows begin_turn");
-            let Cell::Command { output, lines, .. } = &mut self.cells[index] else {
+            let turn = turn.expect("end_turn follows begin_turn");
+            let index = turn.first_cell;
+            let prefix = self.config.command_prefix;
+            let Some(Cell::Command {
+                name,
+                output,
+                opened,
+                cache,
+            }) = self.transcript.cell_mut(index)
+            else {
                 panic!("begin_turn pushed a Command cell for a command turn");
             };
             *output = outcome.captured.clone();
-            *lines = None;
-        } else if !outcome.captured.trim().is_empty() {
-            self.cells.push(Cell::notice(
-                NoticeKind::Routing,
-                render::plain_text(&outcome.captured).trim_end().to_string(),
-            ));
+            *opened = turn.requested;
+            *cache = LineCache::default();
+            // `.undo` took the last exchange out of the context; the
+            // transcript drops it too, back to the cell that opened it,
+            // and the command cell with it.
+            if outcome.error.is_none()
+                && is_undo(name, prefix)
+                && let Some(opener) = undo_opener(self.transcript.cells(), index, prefix)
+            {
+                self.transcript.truncate(opener);
+            }
+        } else {
+            if let Some(turn) = &turn
+                && let Some(Cell::User { opened, .. }) = self.transcript.cell_mut(turn.first_cell)
+            {
+                *opened = turn.requested;
+            }
+            if !outcome.captured.trim().is_empty() {
+                self.transcript.push(Cell::notice(
+                    NoticeKind::Routing,
+                    render::plain_text(&outcome.captured).trim_end().to_string(),
+                ));
+            }
         }
         if let Some(error) = &outcome.error {
             // Errors arrive painted for the REPL like notices do.
-            self.cells.push(Cell::Error {
+            self.transcript.push(Cell::Error {
                 text: render::plain_text(error),
                 cache: LineCache::default(),
             });
@@ -749,15 +713,38 @@ impl App {
         // would fall before it.
         if !self.exiting {
             self.exiting = true;
-            self.exit_first_cell = self.cells.len();
+            self.transcript.clear_welcome();
+            self.exit_first_cell = self.transcript.len();
         }
         self.schedule_frame();
     }
 
     fn close_stream(&mut self) {
-        if let Some(Cell::Assistant { done, .. }) = self.cells.last_mut() {
+        if let Some(Cell::Assistant { done, .. }) = self.transcript.close_stream() {
             *done = true;
         }
+    }
+
+    /// A tool row still running when its turn ends never got its
+    /// finish hook: the turn was interrupted or the task died under it.
+    /// Job and agent rows are left alone; their work goes on in the
+    /// background.
+    fn fail_unreported_tools(&mut self, first_cell: usize) {
+        let now = self.clock.now();
+        for cell in self.transcript.cells_mut().iter_mut().skip(first_cell) {
+            if let Cell::Tool { status, .. } = cell
+                && let ToolStatus::Running { since } = *status
+            {
+                *status = ToolStatus::Failed {
+                    elapsed: now.duration_since(since),
+                    error: "interrupted".to_string(),
+                };
+            }
+        }
+    }
+
+    fn turn_first_cell(&self) -> usize {
+        self.turn.as_ref().map_or(0, |turn| turn.first_cell)
     }
 
     fn key_context(&self) -> KeyContext {
@@ -782,6 +769,8 @@ impl App {
             modal: self.prompts.front().map(PendingPrompt::kind),
             idle_ok,
             question_fully_shown,
+            scrolled: self.transcript.scrolled(),
+            focused: self.transcript.focused(),
         }
     }
 
@@ -814,6 +803,18 @@ impl App {
                 self.schedule_frame();
                 None
             }
+            TermInput::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => self.transcript.scroll_lines(-WHEEL_LINES),
+                    MouseEventKind::ScrollDown => self.transcript.scroll_lines(WHEEL_LINES),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.transcript.click(mouse.column, mouse.row)
+                    }
+                    _ => return None,
+                }
+                self.schedule_frame();
+                None
+            }
             TermInput::Ignored => None,
         }
     }
@@ -825,7 +826,9 @@ impl App {
         // keystroke the user is still making when the confirm appears. So
         // does a key a modal ignores: typing that runs on under a confirm
         // is not idleness either. Hotkeys answering a modal do not count;
-        // `answer_front` re-arms for the next queued question instead.
+        // `answer_front` re-arms for the next queued question instead. Nor
+        // do the view keys a modal lets through: scrolling back to reread
+        // is not typing.
         if self.prompts.is_empty() || action == Action::Nothing {
             self.last_keystroke = Some(self.clock.now());
         }
@@ -836,6 +839,7 @@ impl App {
                     None
                 } else {
                     self.composer = new_composer();
+                    self.transcript.clear_focus();
                     Some(Command::Submit(text.trim().to_string()))
                 }
             }
@@ -847,7 +851,10 @@ impl App {
                 self.set_composer_text("");
                 None
             }
-            Action::Interrupt => (!self.exiting).then_some(Command::Interrupt),
+            Action::Interrupt => {
+                self.transcript.clear_focus();
+                (!self.exiting).then_some(Command::Interrupt)
+            }
             Action::Quit => (!self.exiting).then_some(Command::Quit),
             Action::Suspend => Some(Command::Suspend),
             Action::OpenEditor => Some(Command::OpenEditor),
@@ -886,6 +893,38 @@ impl App {
                 self.composer.input(key);
                 None
             }
+            Action::ToggleTodo => {
+                self.todo.toggle();
+                None
+            }
+            Action::ScrollLines(delta) => {
+                self.transcript.scroll_lines(delta);
+                None
+            }
+            Action::ScrollPage(direction) => {
+                self.transcript.scroll_page(direction);
+                None
+            }
+            Action::ScrollToBottom => {
+                self.transcript.scroll_to_bottom();
+                None
+            }
+            Action::FocusPrev => {
+                self.transcript.focus_prev();
+                None
+            }
+            Action::FocusNext => {
+                self.transcript.focus_next();
+                None
+            }
+            Action::ToggleFocused => {
+                self.transcript.toggle_focused();
+                None
+            }
+            Action::ClearFocus => {
+                self.transcript.clear_focus();
+                None
+            }
             Action::Nothing => None,
         };
         self.schedule_frame();
@@ -906,35 +945,96 @@ impl App {
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
+        if let Some(turn) = self.turn.as_mut()
+            && matches!(
+                msg,
+                UiMsg::TextDelta(_)
+                    | UiMsg::StreamDone
+                    | UiMsg::AssistantText(_)
+                    | UiMsg::ThinkingStarted
+                    | UiMsg::ToolNarration { .. }
+                    | UiMsg::Busy(Some(_))
+            )
+        {
+            turn.requested = true;
+        }
         match msg {
-            UiMsg::TextDelta(delta) => match self.cells.last_mut() {
-                Some(Cell::Assistant {
-                    source,
-                    done: false,
-                    ..
-                }) => source.push_str(&delta),
-                _ => self.cells.push(Cell::assistant(delta, false)),
+            UiMsg::TextDelta(delta) => match self.transcript.stream_cell_mut() {
+                Some(Cell::Assistant { source, .. }) => source.push_str(&delta),
+                _ => self.transcript.open_stream(Cell::assistant(delta, false)),
             },
             UiMsg::StreamDone => self.close_stream(),
-            UiMsg::AssistantText(text) => match self.cells.last_mut() {
+            UiMsg::AssistantText(text) => match self.transcript.close_stream() {
                 Some(Cell::Assistant {
                     source,
                     done,
                     cache,
-                }) if !*done => {
+                }) => {
                     *source = text;
                     *done = true;
                     *cache = RenderCache::default();
                 }
-                _ => self.cells.push(Cell::assistant(text, true)),
+                _ => self.transcript.push(Cell::assistant(text, true)),
             },
             UiMsg::Notice { kind, text } => self.push_notice(kind, text),
-            UiMsg::ToolNarration { call_id, line } => self.cells.push(Cell::Text {
-                call_id: Some(call_id),
-                lines: vec![line],
-                open_line: false,
-            }),
+            UiMsg::ToolNarration { call_id, line } => {
+                // The todo panel shows what a todo call did; its row
+                // would only repeat it.
+                if !cells::narrated_tool_name(&line).starts_with("todo__") {
+                    self.transcript
+                        .push(Cell::tool(call_id, line, self.clock.now()));
+                }
+            }
             UiMsg::ToolOutput { call_id, bytes } => self.append_tool_output(call_id, &bytes),
+            UiMsg::ToolStarted {
+                call_id,
+                name,
+                args,
+            } => self.tool_started(call_id, name, args),
+            UiMsg::ToolFinished {
+                call_id,
+                ok,
+                error,
+                duration_ms,
+            } => self.tool_finished(&call_id, ok, error, duration_ms),
+            UiMsg::JobStarted { job_id, tool } => self.start_row(
+                Cell::Job {
+                    job_id,
+                    tool,
+                    status: JobStatus::Running,
+                    calls: Vec::new(),
+                    expanded: false,
+                },
+                "job__start",
+            ),
+            UiMsg::JobFinished { job_id, ok, error } => self.set_job_status(
+                &job_id,
+                if ok {
+                    JobStatus::Done
+                } else {
+                    JobStatus::Failed(error.unwrap_or_default())
+                },
+            ),
+            UiMsg::JobCancelled { job_id } => self.set_job_status(&job_id, JobStatus::Cancelled),
+            UiMsg::AgentStarted { agent_id, name } => self.start_row(
+                Cell::Agent {
+                    agent_id,
+                    name,
+                    status: AgentStatus::Running,
+                    calls: Vec::new(),
+                    expanded: false,
+                },
+                "agent__spawn",
+            ),
+            UiMsg::AgentFinished { agent_id, outcome } => {
+                let status = match outcome {
+                    AgentOutcome::Completed => AgentStatus::Completed,
+                    AgentOutcome::Failed(error) => AgentStatus::Failed(error),
+                    AgentOutcome::Interrupted => AgentStatus::Interrupted,
+                };
+                self.set_agent_status(&agent_id, status);
+            }
+            UiMsg::TodoUpdated(items) => self.todo.set_items(items),
             UiMsg::Busy(message) => {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.busy = message;
@@ -962,12 +1062,184 @@ impl App {
         self.schedule_frame();
     }
 
+    /// The tool row a hook's call id names: the row with that id, or,
+    /// for a model that gave no id, the newest running row without one.
+    fn tool_row(&self, call_id: &str) -> Option<usize> {
+        let cells = self.transcript.cells();
+        (self.turn_first_cell()..cells.len())
+            .rev()
+            .find(|&index| match &cells[index] {
+                Cell::Tool {
+                    call_id: id,
+                    status,
+                    ..
+                } if call_id.is_empty() => {
+                    id.is_empty() && matches!(status, ToolStatus::Running { .. })
+                }
+                Cell::Tool { call_id: id, .. } => id == call_id,
+                _ => false,
+            })
+    }
+
+    /// The job or agent row a `job__*` or `agent__*` call addresses by
+    /// the id in its arguments.
+    fn addressed_row(&self, name: &str, args: Option<&Value>) -> Option<usize> {
+        let id = args?.get("id")?.as_str()?;
+        let job = matches!(name, "job__check" | "job__collect" | "job__cancel");
+        let agent = matches!(
+            name,
+            "agent__check" | "agent__collect" | "agent__send_message" | "agent__cancel"
+        );
+        self.transcript.cells().iter().rposition(|cell| match cell {
+            Cell::Job { job_id, .. } => job && job_id == id,
+            Cell::Agent { agent_id, .. } => agent && agent_id == id,
+            _ => false,
+        })
+    }
+
+    /// Names the row the narration opened. A call that checks on a job
+    /// or agent folds into that job's or agent's row instead, so the
+    /// transcript shows one row per background task rather than one per
+    /// look at it.
+    fn tool_started(&mut self, call_id: String, name: String, args: Option<Value>) {
+        let Some(mut row) = self.addressed_row(&name, args.as_ref()) else {
+            if let Some(index) = self.tool_row(&call_id)
+                && let Some(Cell::Tool {
+                    name: current,
+                    args: short,
+                    bookkeeping,
+                    ..
+                }) = self.transcript.cell_mut(index)
+            {
+                *bookkeeping = cells::is_bookkeeping(&name);
+                *current = name;
+                if let Some(args) = &args {
+                    *short = cells::short_args(&args.to_string());
+                }
+            }
+            return;
+        };
+        if let Some(index) = self.tool_row(&call_id) {
+            self.transcript.remove(index);
+            if index < row {
+                row -= 1;
+            }
+        }
+        if let Some(Cell::Job { calls, .. } | Cell::Agent { calls, .. }) =
+            self.transcript.cell_mut(row)
+        {
+            calls.push(FoldedCall::new(call_id, name));
+        }
+    }
+
+    fn tool_finished(
+        &mut self,
+        call_id: &str,
+        ok: bool,
+        error: Option<String>,
+        duration_ms: Option<u64>,
+    ) {
+        let now = self.clock.now();
+        let Some(index) = self.tool_row(call_id) else {
+            return;
+        };
+        if let Some(Cell::Tool { status, .. }) = self.transcript.cell_mut(index)
+            && let ToolStatus::Running { since } = *status
+        {
+            // The hook's own measurement when it has one; the UI's clock
+            // otherwise, so a failed call still shows how long it took.
+            let elapsed =
+                duration_ms.map_or_else(|| now.duration_since(since), Duration::from_millis);
+            *status = if ok {
+                ToolStatus::Ok { elapsed }
+            } else {
+                ToolStatus::Failed {
+                    elapsed,
+                    error: error.unwrap_or_default(),
+                }
+            };
+        }
+    }
+
+    /// A job or agent row takes the place of the running `starter` call
+    /// that made it, keeping that call folded so its output still routes
+    /// to the row; without one the row is appended.
+    fn start_row(&mut self, row: Cell, starter: &str) {
+        let cells = self.transcript.cells();
+        let running = (self.turn_first_cell()..cells.len()).rev().find(|&index| {
+            matches!(
+                &cells[index],
+                Cell::Tool {
+                    status: ToolStatus::Running { .. },
+                    ..
+                }
+            )
+        });
+        match running {
+            Some(index) if matches!(&cells[index], Cell::Tool { name, .. } if name == starter) => {
+                let Cell::Tool {
+                    call_id,
+                    name,
+                    output,
+                    open_line,
+                    pending,
+                    ..
+                } = self.transcript.replace(index, row)
+                else {
+                    unreachable!("the index was found holding a tool row");
+                };
+                if let Some(Cell::Job { calls, .. } | Cell::Agent { calls, .. }) =
+                    self.transcript.cell_mut(index)
+                {
+                    calls.push(FoldedCall {
+                        call_id,
+                        name,
+                        output,
+                        open_line,
+                        pending,
+                    });
+                }
+            }
+            _ => self.transcript.push(row),
+        }
+    }
+
+    fn set_job_status(&mut self, job_id: &str, status: JobStatus) {
+        for cell in self.transcript.cells_mut().iter_mut().rev() {
+            if let Cell::Job {
+                job_id: id,
+                status: current,
+                ..
+            } = cell
+                && id == job_id
+            {
+                *current = status;
+                return;
+            }
+        }
+    }
+
+    fn set_agent_status(&mut self, agent_id: &str, status: AgentStatus) {
+        for cell in self.transcript.cells_mut().iter_mut().rev() {
+            if let Cell::Agent {
+                agent_id: id,
+                status: current,
+                ..
+            } = cell
+                && id == agent_id
+            {
+                *current = status;
+                return;
+            }
+        }
+    }
+
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
         let field = match req.action {
             PromptAction::Confirm => None,
             PromptAction::Input => Some(new_textarea()),
             PromptAction::Select | PromptAction::Checkbox | PromptAction::Password => {
-                self.cells.push(Cell::notice(
+                self.transcript.push(Cell::notice(
                     NoticeKind::ToolWarning,
                     format!(
                         "Prompt kind {} is not available in the TUI yet",
@@ -994,7 +1266,7 @@ impl App {
     /// cell of their own, and the cell keeps only its newest text.
     fn push_notice(&mut self, kind: NoticeKind, mut text: String) {
         if kind != NoticeKind::Routing {
-            self.cells.push(Cell::notice(kind, text));
+            self.transcript.push(Cell::notice(kind, text));
             return;
         }
         text.truncate(text.trim_end_matches('\n').len());
@@ -1005,12 +1277,12 @@ impl App {
         } else {
             0
         };
-        if self.cells.len() > merge_from
+        if self.transcript.len() > merge_from
             && let Some(Cell::Notice {
                 kind: NoticeKind::Routing,
                 text: tail,
                 cache,
-            }) = self.cells.last_mut()
+            }) = self.transcript.last_mut()
         {
             if !tail.is_empty() && !text.is_empty() {
                 tail.push('\n');
@@ -1026,69 +1298,95 @@ impl App {
             *cache = LineCache::default();
             return;
         }
-        self.cells.push(Cell::notice(kind, text));
+        self.transcript.push(Cell::notice(kind, text));
     }
 
     fn append_tool_output(&mut self, call_id: Option<String>, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let text = String::from_utf8_lossy(bytes);
+        let first_cell = self.turn_first_cell();
+        // Output of a call the transcript has a row for (or has folded
+        // into a job's or agent's row) belongs to that row. The pump of a
+        // call the model gave no id reports `None`; its row is the one
+        // the narration opened with an empty id.
+        let target = match call_id.as_deref() {
+            Some(id) => self.tool_output_target(first_cell, id),
+            None if self.turn.is_some() => self.anonymous_tool_output_target(first_cell),
+            None => None,
+        };
+        if let Some(target) = target {
+            append_output(target, bytes);
+            return;
+        }
         // Inside a turn the output never merges into a cell from before
         // the turn; outside one (a background job still writing) every
         // chunk of the same call shares the trailing cell, so a chatty
         // job cannot grow the transcript by a cell per read.
-        let first_cell = self.turn.as_ref().map_or(0, |turn| turn.first_cell);
-        let last = self.cells.len().checked_sub(1);
+        let cells = self.transcript.cells();
+        let last = cells.len().checked_sub(1);
         let continues_last = last.is_some_and(|index| {
             index >= first_cell
-                && matches!(&self.cells[index], Cell::Text { call_id: id, .. } if *id == call_id)
+                && matches!(&cells[index], Cell::Text { call_id: id, .. } if *id == call_id)
         });
         if !continues_last {
-            self.cells.push(Cell::Text {
+            self.transcript.push(Cell::Text {
                 call_id,
                 lines: Vec::new(),
                 open_line: false,
+                pending: Vec::new(),
             });
         }
-        let index = self.cells.len() - 1;
-        let Cell::Text {
-            lines, open_line, ..
-        } = &mut self.cells[index]
+        let Some(Cell::Text {
+            lines,
+            open_line,
+            pending,
+            ..
+        }) = self.transcript.last_mut()
         else {
             return;
         };
-        let pieces: Vec<&str> = text.split('\n').collect();
-        for (i, piece) in pieces.iter().enumerate() {
-            let last_is_open = i == pieces.len() - 1;
-            if i == 0 && *open_line {
-                if let Some(last) = lines.last_mut() {
-                    last.push_str(piece);
-                    // A stream that never breaks its line would grow one
-                    // line without bound; it keeps its newest text, like
-                    // late output does.
-                    if last.len() > LATE_OUTPUT_LIMIT {
-                        let cut = last.len() - LATE_OUTPUT_LIMIT;
-                        let cut = (cut..=last.len())
-                            .find(|at| last.is_char_boundary(*at))
-                            .unwrap_or(last.len());
-                        last.drain(..cut);
-                    }
+        append_output((lines, open_line, pending), bytes);
+    }
+
+    /// The output lines of the call `call_id`: a tool row's own, within
+    /// this turn, or those of a call folded into a job's or agent's row,
+    /// which a later turn's check reaches back to.
+    fn tool_output_target(&mut self, first_cell: usize, call_id: &str) -> Option<OutputTarget<'_>> {
+        self.transcript
+            .cells_mut()
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .filter(|(index, cell)| {
+                *index >= first_cell || matches!(cell, Cell::Job { .. } | Cell::Agent { .. })
+            })
+            .find_map(|(_, cell)| cell.output_for(call_id))
+    }
+
+    /// The output lines of a call without an id, within this turn: the
+    /// newest running tool row without one (a finished one has had all
+    /// its output), or the newest such call folded into a running job's
+    /// or agent's row; a finished job or agent takes nothing more.
+    fn anonymous_tool_output_target(&mut self, first_cell: usize) -> Option<OutputTarget<'_>> {
+        let cells = self.transcript.cells();
+        let index = (first_cell..cells.len())
+            .rev()
+            .find(|&index| match &cells[index] {
+                Cell::Tool {
+                    call_id, status, ..
+                } => call_id.is_empty() && matches!(status, ToolStatus::Running { .. }),
+                Cell::Job { calls, status, .. } => {
+                    matches!(status, JobStatus::Running)
+                        && calls.iter().any(|call| call.call_id.is_empty())
                 }
-            } else if !(last_is_open && piece.is_empty()) {
-                lines.push(piece.to_string());
-            }
-            *open_line = last_is_open && !piece.is_empty();
-        }
-        if lines.len() > TOOL_OUTPUT_TAIL {
-            lines.drain(..lines.len() - TOOL_OUTPUT_TAIL);
-        }
-        // The lines that stay are bounded in bytes too, oldest first.
-        let mut total: usize = lines.iter().map(|line| line.len() + 1).sum();
-        while total > LATE_OUTPUT_LIMIT && lines.len() > 1 {
-            total -= lines[0].len() + 1;
-            lines.remove(0);
-        }
+                Cell::Agent { calls, status, .. } => {
+                    matches!(status, AgentStatus::Running)
+                        && calls.iter().any(|call| call.call_id.is_empty())
+                }
+                _ => false,
+            })?;
+        self.transcript.cell_mut(index)?.output_for("")
     }
 
     /// Gives every queued prompt its unattended answer; used when the UI
@@ -1116,7 +1414,8 @@ impl App {
     }
 
     fn late_output_since(&self, first_cell: usize) -> Vec<String> {
-        self.cells[first_cell.min(self.cells.len())..]
+        let cells = self.transcript.cells();
+        cells[first_cell.min(cells.len())..]
             .iter()
             .filter_map(|cell| match cell {
                 Cell::Notice {
@@ -1175,14 +1474,23 @@ impl App {
         ])
         .areas(area);
 
-        let mut lines = Vec::new();
-        for (i, cell) in self.cells.iter_mut().enumerate() {
-            if i > 0 {
-                lines.push(Line::default());
+        // The todo panel shares the transcript's rows: beside it on a
+        // wide frame, in its place on a narrow one.
+        let (transcript, todo) = match (self.todo.visible(), TodoPanel::width_beside(area.width)) {
+            (false, _) => (transcript, None),
+            (true, Some(width)) => {
+                let [transcript, todo] =
+                    Layout::horizontal([Constraint::Min(0), Constraint::Length(width)])
+                        .areas(transcript);
+                (transcript, Some(todo))
             }
-            lines.extend(cell.lines(transcript.width, &mut self.renderer));
+            (true, None) => (Rect::ZERO, Some(transcript)),
+        };
+        let view = self.transcript.view(transcript, &mut self.renderer);
+        frame.render_widget(view, transcript);
+        if let Some(todo) = todo {
+            frame.render_widget(&self.todo, todo);
         }
-        frame.render_widget(TranscriptView { lines }, transcript);
 
         frame.render_widget(StatusStrip(self.status_text()), status);
 
@@ -1215,23 +1523,6 @@ impl App {
         if self.turn.is_some() {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
-    }
-}
-
-/// The transcript's bottom-most lines, auto-following new output.
-struct TranscriptView {
-    lines: Vec<Line<'static>>,
-}
-
-impl Widget for TranscriptView {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let area = area.intersection(*buf.area());
-        if area.is_empty() {
-            return;
-        }
-        let skip = self.lines.len().saturating_sub(usize::from(area.height));
-        let visible: Vec<Line<'static>> = self.lines.into_iter().skip(skip).collect();
-        Paragraph::new(visible).render(area, buf);
     }
 }
 
@@ -1930,6 +2221,13 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     };
                     match joined {
                         Ok((mut returned, outcome)) => {
+                            // The select is unbiased: a tool's last report
+                            // may still sit in the channel next to the join
+                            // that won, and the end-of-turn sweep would
+                            // otherwise fail its row as unreported.
+                            while let Ok(msg) = rx.try_recv() {
+                                app.handle_msg(msg);
+                            }
                             app.end_turn(command, &outcome);
                             app.sync_from_ctx(&mut returned);
                             if outcome.exit {
@@ -1979,7 +2277,7 @@ mod tests {
     use crate::events::{Event, Origin};
     use crate::prompt::Prompter;
     use crate::testing::TestConfigDirGuard;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
     use events::ManualClock;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2123,6 +2421,17 @@ mod tests {
         rows.windows(2).filter(|pair| pair[0] == pair[1]).count()
     }
 
+    /// Snapshots a frame that shows the welcome block. The version in
+    /// its wordmark changes with every release, so the row is folded to
+    /// a fixed text together with the padding that follows it, which
+    /// would otherwise shift with the version's length.
+    fn assert_welcome_snapshot(name: &str, frame: &str) {
+        insta::with_settings!(
+            { filters => vec![(r"coyote \S+ +", "coyote X.Y.Z ")] },
+            { insta::assert_snapshot!(name, frame) }
+        );
+    }
+
     /// Drives a turn on a runtime whose workers have the stack headroom
     /// `run_repl_command` needs in debug builds; a default 2 MiB worker
     /// overflows and aborts the whole test binary.
@@ -2166,7 +2475,7 @@ mod tests {
         harness
             .app
             .append_tool_output(Some("c1".to_string()), "tail-m3z".as_bytes());
-        let Some(Cell::Text { lines, .. }) = harness.app.cells.last() else {
+        let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
             panic!("the tool output did not land in a text cell");
         };
         assert_eq!(lines.len(), 1);
@@ -2225,15 +2534,15 @@ mod tests {
             let rendered = harness.draw();
             insta::assert_snapshot!(format!("text_delta_{}", i + 1), rendered);
         }
-        assert_eq!(harness.app.cells.len(), 2);
+        assert_eq!(harness.app.transcript.len(), 2);
         assert!(matches!(
-            &harness.app.cells[1],
+            &harness.app.transcript.cells()[1],
             Cell::Assistant { source, done: false, .. }
                 if source.ends_with("second one, still arriving.")
         ));
         harness.app.handle_msg(UiMsg::StreamDone);
         assert!(matches!(
-            &harness.app.cells[1],
+            &harness.app.transcript.cells()[1],
             Cell::Assistant { done: true, .. }
         ));
     }
@@ -2294,7 +2603,7 @@ mod tests {
             assert!(!final_frame.contains("Working"), "{final_frame}");
             assert!(!final_frame.contains("Esc to interrupt"), "{final_frame}");
             assert!(matches!(
-                harness.app.cells.last(),
+                harness.app.transcript.cells().last(),
                 Some(Cell::Assistant { source, done: true, .. }) if source.contains("hello")
             ));
         });
@@ -2326,7 +2635,8 @@ mod tests {
 
             let commands: Vec<&Cell> = harness
                 .app
-                .cells
+                .transcript
+                .cells()
                 .iter()
                 .filter(|cell| matches!(cell, Cell::Command { .. }))
                 .collect();
@@ -2372,7 +2682,7 @@ mod tests {
                 ..TurnOutcome::default()
             },
         );
-        let Some(Cell::Command { output, .. }) = harness.app.cells.last() else {
+        let Some(Cell::Command { output, .. }) = harness.app.transcript.cells().last() else {
             panic!("the command turn left no Command cell");
         };
         assert_eq!(output, &info);
@@ -2759,7 +3069,7 @@ mod tests {
         let asker = ask_on_a_thread(&mut harness, req);
         harness.type_text("notes");
         let frame = harness.draw();
-        insta::assert_snapshot!("input_modal_80x24", frame);
+        assert_welcome_snapshot("input_modal_80x24", &frame);
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
@@ -2776,7 +3086,7 @@ mod tests {
         assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
         assert!(harness.app.prompts.is_empty());
         assert!(matches!(
-            harness.app.cells.last(),
+            harness.app.transcript.cells().last(),
             Some(Cell::Notice {
                 kind: NoticeKind::ToolWarning,
                 ..
@@ -3097,15 +3407,15 @@ mod tests {
         let mut harness = Harness::standalone(80, 24);
         harness.app.begin_turn("explain", false);
         harness.app.end_turn(false, &TurnOutcome::default());
-        let cells_before = harness.app.cells.len();
+        let cells_before = harness.app.transcript.len();
         harness
             .app
             .append_tool_output(Some("bg".to_string()), b"first-q7k\n");
         harness
             .app
             .append_tool_output(Some("bg".to_string()), b"second-q7k\n");
-        assert_eq!(harness.app.cells.len(), cells_before + 1);
-        let Some(Cell::Text { lines, .. }) = harness.app.cells.last() else {
+        assert_eq!(harness.app.transcript.len(), cells_before + 1);
+        let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
             panic!("the output did not land in a text cell");
         };
         assert_eq!(lines, &["first-q7k", "second-q7k"]);
@@ -3116,8 +3426,8 @@ mod tests {
                 .app
                 .append_tool_output(Some("bg".to_string()), line.as_bytes());
         }
-        assert_eq!(harness.app.cells.len(), cells_before + 1);
-        let Some(Cell::Text { lines, .. }) = harness.app.cells.last() else {
+        assert_eq!(harness.app.transcript.len(), cells_before + 1);
+        let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
             panic!("the output did not stay in its text cell");
         };
         let total: usize = lines.iter().map(|line| line.len() + 1).sum();
@@ -3164,13 +3474,13 @@ mod tests {
         while let Ok(msg) = rx.try_recv() {
             harness.app.handle_msg(msg);
         }
-        assert_eq!(harness.app.cells.len(), 2);
+        assert_eq!(harness.app.transcript.len(), 2);
         assert_eq!(harness.app.turn_late_output(), ["first-k1q\nsecond-k1q"]);
 
         late("x".repeat(LATE_OUTPUT_LIMIT));
         harness.app.handle_msg(rx.try_recv().unwrap());
         let kept = harness.app.turn_late_output();
-        assert_eq!(harness.app.cells.len(), 2);
+        assert_eq!(harness.app.transcript.len(), 2);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].len(), LATE_OUTPUT_LIMIT);
         assert!(!kept[0].contains("k1q"));
@@ -3406,15 +3716,33 @@ mod tests {
 
     #[test]
     fn every_widget_survives_a_tiny_screen() {
-        for (width, height) in [(1, 1), (0, 0), (3, 2)] {
+        for (width, height) in [(1, 1), (0, 0), (3, 2), (10, 3)] {
             let mut harness = Harness::standalone(width, height);
+            harness.render();
             harness.app.begin_turn("hi", false);
+            narrate(
+                &mut harness,
+                "call-1",
+                "Call fs_read \u{2714}\u{fe0f} {\"path\":\"x\"}",
+            );
+            start_tool(&mut harness, "call-1", "fs_read", None);
+            tool_output(&mut harness, "call-1", "\u{2714}\u{fe0f} done\n");
+            harness.render();
+            finish_tool(&mut harness, "call-1", true, None);
+            harness.app.handle_key(ctrl(KeyCode::Up));
+            harness.render();
             harness
                 .app
                 .handle_msg(UiMsg::TextDelta("reply".to_string()));
             harness
                 .app
                 .handle_msg(UiMsg::UsageUpdated("12 tokens".to_string()));
+            harness.app.handle_msg(UiMsg::TodoUpdated(todo_items()));
+            harness.press(KeyCode::F(2));
+            harness.render();
+            harness.press(KeyCode::F(2));
+            harness.press(KeyCode::PageUp);
+            harness.app.transcript.push(Cell::user("late"));
             harness.render();
             let _asker = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
             harness.render();
@@ -3570,11 +3898,36 @@ mod tests {
     fn thinking_events_pass_through_the_sink() {
         let (tx, mut rx) = unbounded_channel();
         let sink = TuiSink::new(tx);
-        sink.on_event(&Event::ThinkingStarted);
+        sink.on_event(&Event::ThinkingStarted {
+            origin: Origin::detached(),
+        });
         assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStarted)));
-        sink.on_event(&Event::ThinkingStopped);
+        sink.on_event(&Event::ThinkingStopped {
+            origin: Origin::detached(),
+        });
         assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStopped)));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A child agent's reasoning says nothing about what the root is
+    /// doing, so only root-origin thinking events reach the status row.
+    #[test]
+    fn a_child_agents_thinking_never_drives_the_status_row() {
+        let (tx, mut rx) = unbounded_channel();
+        let sink = TuiSink::new(tx);
+        let child = Origin {
+            agent_id: Some("agent_c".into()),
+            depth: 1,
+        };
+        sink.on_event(&Event::ThinkingStarted {
+            origin: child.clone(),
+        });
+        sink.on_event(&Event::ThinkingStopped { origin: child });
+        assert!(rx.try_recv().is_err(), "a child's thinking reached the UI");
+        sink.on_event(&Event::ThinkingStarted {
+            origin: Origin::detached(),
+        });
+        assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStarted)));
     }
 
     /// An editor that exits non-zero has not finished the edit: the text
@@ -3668,11 +4021,11 @@ mod tests {
     fn plain_cells_are_scrubbed_when_drawn() {
         let mut harness = Harness::standalone(60, 12);
         harness.app.begin_turn("hi\x1b[2Jthere\u{200b}u7p", false);
-        harness.app.cells.push(Cell::Error {
+        harness.app.transcript.push(Cell::Error {
             text: "\x1b[31mbroken\x1b[0m e7p".to_string(),
             cache: LineCache::default(),
         });
-        harness.app.cells.push(Cell::notice(
+        harness.app.transcript.push(Cell::notice(
             NoticeKind::Routing,
             "\x1b]8;;x\x07note\x1b]8;;\x07 n7p".to_string(),
         ));
@@ -3698,15 +4051,76 @@ mod tests {
         harness
             .app
             .handle_msg(UiMsg::AssistantText("the whole reply".to_string()));
-        assert_eq!(harness.app.cells.len(), 2);
+        assert_eq!(harness.app.transcript.len(), 2);
         assert!(matches!(
-            &harness.app.cells[1],
+            &harness.app.transcript.cells()[1],
             Cell::Assistant { source, done: true, .. } if source == "the whole reply"
         ));
         harness
             .app
             .handle_msg(UiMsg::AssistantText("a second reply".to_string()));
-        assert_eq!(harness.app.cells.len(), 3);
+        assert_eq!(harness.app.transcript.len(), 3);
+    }
+
+    /// A cell pushed while the reply streams (a background job's output
+    /// here) lands after the reply, and the next delta still extends the
+    /// reply rather than opening a second one.
+    #[test]
+    fn a_stream_survives_a_cell_pushed_between_deltas() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hi", false);
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("Hello".to_string()));
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"job noise\n".to_vec(),
+        });
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta(" world".to_string()));
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 3);
+        assert!(matches!(
+            &cells[1],
+            Cell::Assistant { source, done: false, .. } if source == "Hello world"
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Text { call_id: None, lines, .. } if lines == &["job noise"]
+        ));
+        harness.app.handle_msg(UiMsg::StreamDone);
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Assistant { done: true, .. }
+        ));
+        harness.app.handle_msg(UiMsg::TextDelta("next".to_string()));
+        assert_eq!(harness.app.transcript.len(), 4);
+    }
+
+    /// Undoing past the streaming cell forgets it; a later delta opens a
+    /// fresh cell instead of writing into whatever took its index.
+    #[test]
+    fn truncating_past_the_stream_cell_forgets_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hi", false);
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("partial".to_string()));
+        harness.app.transcript.truncate(1);
+        harness.app.transcript.push(Cell::notice(
+            NoticeKind::ToolWarning,
+            "took the slot".to_string(),
+        ));
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("fresh".to_string()));
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(&cells[1], Cell::Notice { .. }));
+        assert!(matches!(
+            &cells[2],
+            Cell::Assistant { source, done: false, .. } if source == "fresh"
+        ));
     }
 
     #[test]
@@ -3740,7 +4154,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            harness.app.cells.last(),
+            harness.app.transcript.cells().last(),
             Some(Cell::Notice { text, .. }) if text == "\u{280b} Thinking!"
         ));
     }
@@ -3759,23 +4173,1402 @@ mod tests {
             call_id: None,
             bytes: b" turn\n".to_vec(),
         });
-        assert_eq!(harness.app.cells.len(), 2);
+        assert_eq!(harness.app.transcript.len(), 2);
         harness.app.end_turn(true, &TurnOutcome::default());
-        let cells_after_first = harness.app.cells.len();
+        let cells_after_first = harness.app.transcript.len();
 
         harness.app.begin_turn(".run", true);
         harness.app.handle_msg(UiMsg::ToolOutput {
             call_id: None,
             bytes: b"second turn\n".to_vec(),
         });
-        assert_eq!(harness.app.cells.len(), cells_after_first + 2);
+        assert_eq!(harness.app.transcript.len(), cells_after_first + 2);
         assert!(matches!(
-            harness.app.cells.last(),
+            harness.app.transcript.cells().last(),
             Some(Cell::Text { call_id: None, lines, .. }) if lines == &["second turn"]
         ));
         assert!(matches!(
-            &harness.app.cells[1],
+            &harness.app.transcript.cells()[1],
             Cell::Text { lines, .. } if lines == &["first turn"]
+        ));
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn narrate(harness: &mut Harness, call_id: &str, line: &str) {
+        harness.app.handle_msg(UiMsg::ToolNarration {
+            call_id: call_id.to_string(),
+            line: line.to_string(),
+        });
+    }
+
+    /// Sends what the sink sends for a tool's start hook: the status
+    /// row's name first, then the row's own message.
+    fn start_tool(harness: &mut Harness, call_id: &str, name: &str, args: Option<Value>) {
+        harness
+            .app
+            .handle_msg(UiMsg::ToolRunning(Some(name.to_string())));
+        harness.app.handle_msg(UiMsg::ToolStarted {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            args,
+        });
+    }
+
+    fn tool_output(harness: &mut Harness, call_id: &str, bytes: &str) {
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: Some(call_id.to_string()),
+            bytes: bytes.as_bytes().to_vec(),
+        });
+    }
+
+    fn finish_tool(harness: &mut Harness, call_id: &str, ok: bool, error: Option<&str>) {
+        harness.app.handle_msg(UiMsg::ToolRunning(None));
+        harness.app.handle_msg(UiMsg::ToolFinished {
+            call_id: call_id.to_string(),
+            ok,
+            error: error.map(str::to_string),
+            duration_ms: Some(1200),
+        });
+    }
+
+    /// A turn with one `fs_read` call under way: narrated, started and
+    /// two chunks of output in.
+    fn running_fs_read(harness: &mut Harness) {
+        harness.app.begin_turn("read it", false);
+        narrate(harness, "call-1", "Call fs_read {\"path\":\"src/main.rs\"}");
+        start_tool(harness, "call-1", "fs_read", None);
+        tool_output(harness, "call-1", "fn main() {\n");
+        tool_output(harness, "call-1", "    println!(\"hi\");\n}\n");
+    }
+
+    fn todo_items() -> Vec<crate::config::todo::TodoItem> {
+        use crate::config::todo::TodoItem;
+        vec![
+            TodoItem {
+                id: 1,
+                desc: "wire the panel".to_string(),
+                done: true,
+            },
+            TodoItem {
+                id: 2,
+                desc: "snapshot it narrow".to_string(),
+                done: false,
+            },
+        ]
+    }
+
+    /// The first screen row of the last frame that starts with `prefix`.
+    fn screen_row(harness: &Harness, prefix: &str) -> u16 {
+        let buffer = harness.terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let text: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if text.starts_with(prefix) {
+                return y;
+            }
+        }
+        panic!("no row starts with {prefix:?}:\n{buffer:?}");
+    }
+
+    /// The modifiers on the first cell of the first screen row that
+    /// starts with `prefix`.
+    fn row_modifier(harness: &Harness, prefix: &str) -> Modifier {
+        let row = screen_row(harness, prefix);
+        harness.terminal.backend().buffer()[(0, row)].modifier
+    }
+
+    #[test]
+    fn a_running_tool_row_shows_its_output_tail() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        let frame = harness.draw();
+        insta::assert_snapshot!("tool_running_80x24", &frame);
+        assert!(frame.contains("fs_read({\"path\":\"src/main.rs\"})  running"));
+        assert!(
+            frame.contains("Call fs_read {\"path\":\"src/main.rs\"}"),
+            "{frame}"
+        );
+        assert!(frame.contains("println!(\"hi\");"));
+    }
+
+    /// The start hook's compact JSON and the narration's text after the
+    /// name are the same arguments, so the header reads the same from
+    /// either.
+    #[test]
+    fn the_hooks_arguments_render_the_same_header_as_the_narration() {
+        let mut from_narration = Harness::standalone(80, 24);
+        running_fs_read(&mut from_narration);
+        let mut from_hook = Harness::standalone(80, 24);
+        from_hook.app.begin_turn("read it", false);
+        narrate(
+            &mut from_hook,
+            "call-1",
+            "Call fs_read {\"path\":\"src/main.rs\"}",
+        );
+        start_tool(
+            &mut from_hook,
+            "call-1",
+            "fs_read",
+            Some(serde_json::json!({"path": "src/main.rs"})),
+        );
+        tool_output(&mut from_hook, "call-1", "fn main() {\n");
+        tool_output(&mut from_hook, "call-1", "    println!(\"hi\");\n}\n");
+        let header = |harness: &mut Harness| {
+            let frame = harness.draw();
+            let row = screen_row(harness, "fs_read(");
+            frame.lines().nth(usize::from(row)).unwrap().to_string()
+        };
+        let expected = header(&mut from_narration);
+        assert!(expected.contains("fs_read({\"path\":\"src/main.rs\"})  running"));
+        assert_eq!(header(&mut from_hook), expected);
+    }
+
+    #[test]
+    fn a_finished_tool_row_collapses_and_opens_from_the_keyboard() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let frame = harness.draw();
+        insta::assert_snapshot!("tool_collapsed_ok_80x24", &frame);
+        assert!(frame.contains("1.2s  ok"), "{frame}");
+        assert!(!frame.contains("fn main()"), "{frame}");
+        assert!(!frame.contains("Call fs_read"), "{frame}");
+
+        assert!(harness.app.handle_key(ctrl(KeyCode::Up)).is_none());
+        assert!(harness.app.transcript.focused());
+        assert!(harness.press(KeyCode::Enter).is_none());
+        let frame = harness.draw();
+        insta::assert_snapshot!("tool_expanded_80x24", &frame);
+        assert!(frame.contains("fn main()"), "{frame}");
+        assert!(
+            frame.contains("Call fs_read {\"path\":\"src/main.rs\"}"),
+            "{frame}"
+        );
+        assert!(
+            row_modifier(&harness, "fs_read(").contains(Modifier::REVERSED),
+            "the focused header is not reversed"
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_row_shows_the_first_error_line_until_opened() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(
+            &mut harness,
+            "call-1",
+            false,
+            Some("exit 2\nno such file: src/main.rs"),
+        );
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let frame = harness.draw();
+        insta::assert_snapshot!("tool_failed_80x24", &frame);
+        assert!(frame.contains("1.2s  failed: exit 2"), "{frame}");
+        assert!(!frame.contains("no such file"), "{frame}");
+
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        harness.press(KeyCode::Enter);
+        let frame = harness.draw();
+        assert!(frame.contains("no such file: src/main.rs"), "{frame}");
+        assert!(frame.contains("fn main()"), "{frame}");
+    }
+
+    /// A folded header wider than the row gives up arguments, not its
+    /// state: at 40 columns a 48-character argument string is cut to
+    /// what leaves `failed: exit 2` on screen.
+    #[test]
+    fn a_narrow_folded_header_keeps_its_state_and_cuts_the_arguments() {
+        let mut harness = Harness::standalone(40, 20);
+        harness.app.begin_turn("read it", false);
+        let path = format!("src/{}.rs", "x".repeat(30));
+        let args = serde_json::json!({ "path": path }).to_string();
+        assert_eq!(args.chars().count(), 48);
+        narrate(&mut harness, "call-1", &format!("Call fs_read {args}"));
+        start_tool(&mut harness, "call-1", "fs_read", None);
+        finish_tool(
+            &mut harness,
+            "call-1",
+            false,
+            Some("exit 2\nno such file: src/main.rs"),
+        );
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let frame = harness.draw();
+        insta::assert_snapshot!("tool_failed_40x20", &frame);
+        assert!(frame.contains("1.2s  failed: exit 2"), "{frame}");
+        assert!(frame.contains("fs_read({\"path...)  1.2s"), "{frame}");
+    }
+
+    #[test]
+    fn a_job_takes_its_start_calls_row_and_folds_the_checks_in() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("build it", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call job__start {\"tool\":\"execute_command\"}",
+        );
+        start_tool(&mut harness, "call-1", "job__start", None);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        tool_output(&mut harness, "call-1", "started\n");
+        finish_tool(&mut harness, "call-1", true, None);
+        narrate(
+            &mut harness,
+            "call-2",
+            "Call job__check {\"id\":\"job_1a2b3c4d\"}",
+        );
+        start_tool(
+            &mut harness,
+            "call-2",
+            "job__check",
+            Some(serde_json::json!({"id": "job_1a2b3c4d"})),
+        );
+        tool_output(&mut harness, "call-2", "still running\n");
+        finish_tool(&mut harness, "call-2", true, None);
+        harness.app.handle_msg(UiMsg::JobFinished {
+            job_id: "job_1a2b3c4d".to_string(),
+            ok: true,
+            error: None,
+        });
+        harness.app.end_turn(false, &TurnOutcome::default());
+
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 2, "one user cell and one job row");
+        let Cell::Job { status, calls, .. } = &cells[1] else {
+            panic!("the job did not take the start call's row");
+        };
+        assert_eq!(*status, JobStatus::Done);
+        let names: Vec<&str> = calls.iter().map(|call| call.name.as_str()).collect();
+        assert_eq!(names, ["job__start", "job__check"]);
+        assert_eq!(calls[0].output, ["started"]);
+        assert_eq!(calls[1].output, ["still running"]);
+
+        let frame = harness.draw();
+        insta::assert_snapshot!("job_row_80x24", &frame);
+        assert!(
+            frame.contains("job execute_command job_1a2b3c4d  done  started, checked"),
+            "{frame}"
+        );
+        assert!(!frame.contains("still running"), "{frame}");
+        harness.app.handle_key(ctrl(KeyCode::Down));
+        harness.press(KeyCode::Enter);
+        let frame = harness.draw();
+        assert!(frame.contains("still running"), "{frame}");
+    }
+
+    /// A check on a job from a later turn folds into the job's row, and
+    /// its output goes with it rather than into a loose text cell.
+    #[test]
+    fn a_later_turns_check_on_a_job_lands_on_the_jobs_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("build it", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call job__start {\"tool\":\"execute_command\"}",
+        );
+        start_tool(&mut harness, "call-1", "job__start", None);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        finish_tool(&mut harness, "call-1", true, None);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("Started it.".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        assert_eq!(harness.app.transcript.len(), 3);
+
+        harness.app.begin_turn("how is it going", false);
+        narrate(
+            &mut harness,
+            "call-2",
+            "Call job__check {\"id\":\"job_1a2b3c4d\"}",
+        );
+        start_tool(
+            &mut harness,
+            "call-2",
+            "job__check",
+            Some(serde_json::json!({"id": "job_1a2b3c4d"})),
+        );
+        tool_output(&mut harness, "call-2", "still running\n");
+        finish_tool(&mut harness, "call-2", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 4, "the check added only its user line");
+        let Cell::Job { calls, .. } = &cells[1] else {
+            panic!("the job row moved");
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].name, "job__check");
+        assert_eq!(calls[1].output, ["still running"]);
+        assert!(matches!(&cells[3], Cell::User { .. }));
+    }
+
+    /// A tool row still running when its turn ends (interrupted, or the
+    /// task died under it) is marked failed rather than left spinning;
+    /// a job row, whose work goes on, is not.
+    #[test]
+    fn a_turn_ending_fails_its_unreported_tool_rows_and_spares_jobs() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.clock.advance(Duration::from_secs(3));
+        harness.app.end_turn(
+            false,
+            &TurnOutcome {
+                error: Some("interrupted".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(
+            &cells[1],
+            Cell::Tool {
+                status: ToolStatus::Failed { elapsed, error },
+                ..
+            } if error == "interrupted" && *elapsed == Duration::from_secs(3)
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Job {
+                status: JobStatus::Running,
+                ..
+            }
+        ));
+        let frame = harness.draw();
+        assert!(frame.contains("3.0s  failed: interrupted"), "{frame}");
+    }
+
+    /// The loop drains the channel before `end_turn`, the way the Work arm
+    /// does, so a report that lost the select to the join still lands
+    /// ahead of the sweep.
+    #[test]
+    fn a_tool_report_queued_before_the_turn_ends_beats_the_sweep() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(UiMsg::ToolFinished {
+            call_id: "call-1".to_string(),
+            ok: true,
+            error: None,
+            duration_ms: Some(1200),
+        })
+        .unwrap();
+        while let Ok(msg) = rx.try_recv() {
+            harness.app.handle_msg(msg);
+        }
+        harness.app.end_turn(false, &TurnOutcome::default());
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Tool {
+                status: ToolStatus::Ok { elapsed },
+                ..
+            } if *elapsed == Duration::from_millis(1200)
+        ));
+    }
+
+    #[test]
+    fn an_agent_takes_its_spawn_calls_row_and_folds_the_collect_in() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("delegate it", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call agent__spawn {\"agent\":\"coder\"}",
+        );
+        start_tool(&mut harness, "call-1", "agent__spawn", None);
+        harness.app.handle_msg(UiMsg::AgentStarted {
+            agent_id: "agent_coder_1a2b3c4d".to_string(),
+            name: "coder".to_string(),
+        });
+        finish_tool(&mut harness, "call-1", true, None);
+        narrate(
+            &mut harness,
+            "call-2",
+            "Call agent__collect {\"id\":\"agent_coder_1a2b3c4d\"}",
+        );
+        start_tool(
+            &mut harness,
+            "call-2",
+            "agent__collect",
+            Some(serde_json::json!({"id": "agent_coder_1a2b3c4d"})),
+        );
+        finish_tool(&mut harness, "call-2", true, None);
+        harness.app.handle_msg(UiMsg::AgentFinished {
+            agent_id: "agent_coder_1a2b3c4d".to_string(),
+            outcome: AgentOutcome::Completed,
+        });
+        harness.app.end_turn(false, &TurnOutcome::default());
+
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 2, "one user cell and one agent row");
+        let Cell::Agent { status, calls, .. } = &cells[1] else {
+            panic!("the agent did not take the spawn call's row");
+        };
+        assert_eq!(*status, AgentStatus::Completed);
+        let names: Vec<&str> = calls.iter().map(|call| call.name.as_str()).collect();
+        assert_eq!(names, ["agent__spawn", "agent__collect"]);
+
+        let frame = harness.draw();
+        insta::assert_snapshot!("agent_row_80x24", &frame);
+        assert!(
+            frame.contains("agent coder agent_coder_1a2b3c4d  completed  spawned, collected"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn a_bookkeeping_call_is_one_dim_line_that_never_takes_the_focus() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("remember", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call memory__search {\"query\":\"tui\"}",
+        );
+        start_tool(&mut harness, "call-1", "memory__search", None);
+        tool_output(&mut harness, "call-1", "3 hits\n");
+        let frame = harness.draw();
+        assert!(
+            !frame.contains("3 hits"),
+            "a running bookkeeping call showed output:\n{frame}"
+        );
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let frame = harness.draw();
+        insta::assert_snapshot!("bookkeeping_line_80x24", &frame);
+        assert!(
+            frame.contains("memory__search({\"query\":\"tui\"})  1.2s  ok"),
+            "{frame}"
+        );
+        assert!(!frame.contains("3 hits"), "{frame}");
+
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        assert!(!harness.app.transcript.focused());
+        harness.press(KeyCode::Enter);
+        let frame = harness.draw();
+        assert!(!frame.contains("3 hits"), "{frame}");
+    }
+
+    #[test]
+    fn a_todo_call_leaves_no_row_in_the_transcript() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("plan it", false);
+        let before = harness.app.transcript.len();
+        narrate(&mut harness, "call-1", "Call todo__list {}");
+        start_tool(&mut harness, "call-1", "todo__list", None);
+        finish_tool(&mut harness, "call-1", true, None);
+        assert_eq!(harness.app.transcript.len(), before);
+        assert!(!harness.draw().contains("todo__list"));
+    }
+
+    #[test]
+    fn tool_output_routes_by_call_id_past_newer_rows() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("two reads", false);
+        narrate(&mut harness, "call-1", "Call fs_read {\"path\":\"a\"}");
+        start_tool(&mut harness, "call-1", "fs_read", None);
+        narrate(&mut harness, "call-2", "Call fs_read {\"path\":\"b\"}");
+        start_tool(&mut harness, "call-2", "fs_read", None);
+        tool_output(&mut harness, "call-1", "from a\n");
+        tool_output(&mut harness, "call-2", "from b\n");
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(
+            &cells[1],
+            Cell::Tool { call_id, output, .. } if call_id == "call-1" && output == &["from a"]
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Tool { call_id, output, .. } if call_id == "call-2" && output == &["from b"]
+        ));
+    }
+
+    /// A multi-byte character the pipe split across two reads renders
+    /// whole; a lone byte no sequence can hold still shows as U+FFFD.
+    #[test]
+    fn tool_output_split_mid_character_decodes_whole() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("accents", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call execute_command {\"command\":\"menu\"}",
+        );
+        start_tool(&mut harness, "call-1", "execute_command", None);
+        for chunk in [
+            &b"caf"[..],
+            &[0xC3][..],
+            &[0xA9, b'\n'][..],
+            &[0xFF, b'\n'][..],
+        ] {
+            harness.app.handle_msg(UiMsg::ToolOutput {
+                call_id: Some("call-1".to_string()),
+                bytes: chunk.to_vec(),
+            });
+        }
+        let Some(Cell::Tool {
+            output, pending, ..
+        }) = harness.app.transcript.cells().get(1)
+        else {
+            panic!("the tool row is gone");
+        };
+        assert_eq!(output, &["caf\u{e9}", "\u{FFFD}"]);
+        assert!(pending.is_empty());
+    }
+
+    /// A model that names no call id leaves the hooks with an empty one;
+    /// it pairs with the newest running row that has none, and once that
+    /// row finishes the next empty id finds the next row.
+    #[test]
+    fn an_empty_call_id_pairs_with_the_newest_running_anonymous_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("anonymous", false);
+        narrate(&mut harness, "", "Call fs_read {\"path\":\"a\"}");
+        start_tool(&mut harness, "", "fs_read", None);
+        narrate(&mut harness, "", "Call fs_write {\"path\":\"b\"}");
+        start_tool(&mut harness, "", "fs_write", None);
+        finish_tool(&mut harness, "", false, Some("denied"));
+        finish_tool(&mut harness, "", true, None);
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(
+            &cells[1],
+            Cell::Tool { name, status: ToolStatus::Ok { .. }, .. } if name == "fs_read"
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Tool { name, status: ToolStatus::Failed { error, .. }, .. }
+                if name == "fs_write" && error == "denied"
+        ));
+    }
+
+    /// The output pump of a call without an id reports `None` rather
+    /// than an empty id; the bytes still reach the newest running row
+    /// without one, and a row that has finished takes no more of them.
+    #[test]
+    fn anonymous_tool_output_lands_in_the_newest_running_anonymous_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("anonymous", false);
+        narrate(&mut harness, "", "Call fs_read {\"path\":\"a\"}");
+        start_tool(&mut harness, "", "fs_read", None);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"from read\n".to_vec(),
+        });
+        narrate(&mut harness, "", "Call fs_write {\"path\":\"b\"}");
+        start_tool(&mut harness, "", "fs_write", None);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"from write\n".to_vec(),
+        });
+        finish_tool(&mut harness, "", true, None);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"late read\n".to_vec(),
+        });
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 3, "the output took no cell of its own");
+        assert!(matches!(
+            &cells[1],
+            Cell::Tool { name, output, status: ToolStatus::Running { .. }, .. }
+                if name == "fs_read" && output == &["from read", "late read"]
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Tool { name, output, status: ToolStatus::Ok { .. }, .. }
+                if name == "fs_write" && output == &["from write"]
+        ));
+    }
+
+    /// Once a call without an id has folded into the job row it started,
+    /// its output follows it there.
+    #[test]
+    fn anonymous_tool_output_follows_its_call_into_a_job_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("background", false);
+        narrate(
+            &mut harness,
+            "",
+            "Call job__start {\"tool\":\"execute_command\"}",
+        );
+        start_tool(&mut harness, "", "job__start", None);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"started\n".to_vec(),
+        });
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 2, "the output took no cell of its own");
+        let Cell::Job { calls, .. } = &cells[1] else {
+            panic!("the job did not take the start call's row");
+        };
+        assert_eq!(calls[0].output, ["started"]);
+    }
+
+    /// Output without an id that arrives after the job has finished is
+    /// not the job's: it takes a cell of its own rather than reopening
+    /// the finished row.
+    #[test]
+    fn anonymous_tool_output_never_joins_a_finished_job_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("background", false);
+        narrate(
+            &mut harness,
+            "",
+            "Call job__start {\"tool\":\"execute_command\"}",
+        );
+        start_tool(&mut harness, "", "job__start", None);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.app.handle_msg(UiMsg::JobFinished {
+            job_id: "job_1a2b3c4d".to_string(),
+            ok: true,
+            error: None,
+        });
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"late\n".to_vec(),
+        });
+        let cells = harness.app.transcript.cells();
+        let Cell::Job { calls, .. } = &cells[1] else {
+            panic!("the job did not take the start call's row");
+        };
+        assert!(calls[0].output.is_empty(), "{:?}", calls[0].output);
+        let Some(Cell::Text {
+            call_id: None,
+            lines,
+            ..
+        }) = cells.last()
+        else {
+            panic!("the late output took no cell of its own");
+        };
+        assert_eq!(lines, &["late"]);
+    }
+
+    #[test]
+    fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("background", false);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.app.handle_msg(UiMsg::AgentStarted {
+            agent_id: "agent_coder_1a2b3c4d".to_string(),
+            name: "coder".to_string(),
+        });
+        harness.app.handle_msg(UiMsg::JobFinished {
+            job_id: "job_other".to_string(),
+            ok: false,
+            error: Some("boom".to_string()),
+        });
+        harness.app.handle_msg(UiMsg::AgentFinished {
+            agent_id: "agent_other".to_string(),
+            outcome: AgentOutcome::Failed("boom".to_string()),
+        });
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 3);
+        assert!(matches!(
+            &cells[1],
+            Cell::Job {
+                status: JobStatus::Running,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &cells[2],
+            Cell::Agent {
+                status: AgentStatus::Running,
+                ..
+            }
+        ));
+
+        harness.app.handle_msg(UiMsg::JobCancelled {
+            job_id: "job_1a2b3c4d".to_string(),
+        });
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Job {
+                status: JobStatus::Cancelled,
+                ..
+            }
+        ));
+    }
+
+    /// One exchange plus a tool call, for the undo cases.
+    fn exchange(harness: &mut Harness) {
+        harness.app.begin_turn("first question", false);
+        narrate(harness, "call-1", "Call fs_read {\"path\":\"a\"}");
+        finish_tool(harness, "call-1", true, None);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("first answer".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+    }
+
+    #[test]
+    fn a_successful_undo_takes_the_last_exchange_out_of_the_transcript() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        exchange(&mut harness);
+        assert_eq!(harness.app.transcript.len(), 6);
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let cells = harness.app.transcript.cells();
+        assert_eq!(
+            cells.len(),
+            3,
+            "the second exchange and the command cell are gone"
+        );
+        assert!(matches!(&cells[0], Cell::User { text, .. } if text == "first question"));
+        assert!(matches!(&cells[2], Cell::Assistant { .. }));
+        assert!(!harness.app.transcript.focused());
+        let frame = harness.draw();
+        assert!(!frame.contains(".undo"), "{frame}");
+    }
+
+    #[test]
+    fn a_failed_undo_keeps_the_transcript_and_its_command_cell() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(
+            true,
+            &TurnOutcome {
+                error: Some("nothing to undo".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 5);
+        assert!(matches!(&cells[3], Cell::Command { name, .. } if name == ".undo"));
+        assert!(matches!(&cells[4], Cell::Error { .. }));
+    }
+
+    #[test]
+    fn an_undo_with_no_user_line_before_it_keeps_its_command_cell() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn(".info", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 2);
+        assert!(matches!(&cells[1], Cell::Command { name, .. } if name == ".undo"));
+    }
+
+    #[test]
+    fn an_undo_after_a_file_command_stops_at_the_command_cell_that_opened_the_exchange() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".file notes.md -- summarize", true);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("a summary".to_string()));
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert_eq!(harness.app.transcript.len(), 5);
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let cells = harness.app.transcript.cells();
+        assert_eq!(
+            cells.len(),
+            3,
+            "the file exchange and the command cell are gone"
+        );
+        assert!(matches!(&cells[0], Cell::User { text, .. } if text == "first question"));
+        assert!(matches!(&cells[2], Cell::Assistant { .. }));
+    }
+
+    /// Any answered command outside the modifying pair opened an
+    /// exchange, whichever REPL arm handled it.
+    #[test]
+    fn an_undo_after_an_answered_starter_or_prompt_command_stops_at_that_command_cell() {
+        for command in [".starter 1", ".prompt x y"] {
+            let mut harness = Harness::standalone(80, 24);
+            exchange(&mut harness);
+            harness.app.begin_turn(command, true);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("a reply".to_string()));
+            harness.app.end_turn(true, &TurnOutcome::default());
+            assert_eq!(harness.app.transcript.len(), 5);
+            harness.app.begin_turn(".undo", true);
+            harness.app.end_turn(true, &TurnOutcome::default());
+            let cells = harness.app.transcript.cells();
+            assert_eq!(cells.len(), 3, "{command}: the command's exchange is gone");
+            assert!(matches!(&cells[0], Cell::User { text, .. } if text == "first question"));
+            assert!(matches!(&cells[2], Cell::Assistant { .. }));
+        }
+    }
+
+    #[test]
+    fn an_undo_looks_past_a_command_that_opened_no_exchange() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".info", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert!(harness.draw().contains("Tip: Press"));
+    }
+
+    /// A `.file` whose request reached the model and failed before any
+    /// reply (the connection dropped, Esc before the first delta) left
+    /// the session holding an exchange with an interrupted reply, so the
+    /// `.undo` after it takes that exchange and not the one before.
+    #[test]
+    fn an_undo_after_a_file_command_whose_request_got_no_reply_stops_at_that_command_cell() {
+        for began in [UiMsg::ThinkingStarted, UiMsg::StreamDone] {
+            let mut harness = Harness::standalone(80, 24);
+            exchange(&mut harness);
+            harness.app.begin_turn(".file notes.md -- summarize", true);
+            harness.app.handle_msg(began);
+            harness.app.end_turn(
+                true,
+                &TurnOutcome {
+                    error: Some("connection reset".to_string()),
+                    ..TurnOutcome::default()
+                },
+            );
+            assert_eq!(harness.app.transcript.len(), 5);
+            assert!(matches!(
+                &harness.app.transcript.cells()[3],
+                Cell::Command { opened: true, .. }
+            ));
+            harness.app.begin_turn(".undo", true);
+            harness.app.end_turn(true, &TurnOutcome::default());
+            let cells = harness.app.transcript.cells();
+            assert_eq!(cells.len(), 3, "the file command and its error are gone");
+            assert!(matches!(&cells[0], Cell::User { text, .. } if text == "first question"));
+            assert!(matches!(&cells[2], Cell::Assistant { .. }));
+        }
+    }
+
+    /// A `.file` that bailed on usage opened nothing in the session, so
+    /// the `.undo` after it takes back the exchange before it.
+    #[test]
+    fn an_undo_looks_past_a_file_command_that_bailed_before_a_reply() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".file", true);
+        harness.app.end_turn(
+            true,
+            &TurnOutcome {
+                error: Some("usage: .file <path>".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        assert!(matches!(
+            harness.app.transcript.cells().last(),
+            Some(Cell::Error { .. })
+        ));
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert!(harness.draw().contains("Tip: Press"));
+    }
+
+    /// A prompt whose turn failed before any request (no API key)
+    /// recorded nothing in the session, so the `.undo` after it takes
+    /// the exchange before it, and the transcript drops the failed line
+    /// along with that exchange.
+    #[test]
+    fn an_undo_after_a_prompt_that_never_reached_the_model_takes_the_exchange_before_it() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn("second", false);
+        harness.app.end_turn(
+            false,
+            &TurnOutcome {
+                error: Some("no api key".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 5);
+        assert!(matches!(&cells[0], Cell::User { opened: true, .. }));
+        assert!(matches!(&cells[3], Cell::User { opened: false, .. }));
+        assert!(matches!(&cells[4], Cell::Error { .. }));
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let frame = harness.draw();
+        assert!(matches!(
+            harness.app.transcript.cells(),
+            [Cell::Welcome { .. }]
+        ));
+        assert!(frame.contains("Tip: Press"), "{frame}");
+        assert!(!frame.contains("first question"), "{frame}");
+    }
+
+    /// `.regenerate` replaces the last reply inside the exchange it
+    /// follows, so the `.undo` after it takes that whole exchange, user
+    /// line included, as the session does.
+    #[test]
+    fn an_undo_after_a_regenerate_takes_the_original_exchange_too() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".regenerate", true);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("second answer".to_string()));
+        harness.app.end_turn(true, &TurnOutcome::default());
+        assert_eq!(harness.app.transcript.len(), 5);
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let frame = harness.draw();
+        assert!(frame.contains("Tip: Press"), "{frame}");
+        assert!(!frame.contains("first question"), "{frame}");
+    }
+
+    /// Undoing the only exchange empties the transcript; the greeting
+    /// comes back and the next turn clears it as on boot.
+    #[test]
+    fn undoing_the_only_exchange_brings_the_greeting_back() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        assert!(!harness.draw().contains("Tip: Press"));
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let frame = harness.draw();
+        assert!(frame.contains("Tip: Press"), "{frame}");
+        assert!(!frame.contains(".undo"), "{frame}");
+        harness.app.begin_turn("second question", false);
+        let frame = harness.draw();
+        assert!(!frame.contains("Tip: Press"), "{frame}");
+        assert!(matches!(
+            harness.app.transcript.cells(),
+            [Cell::User { text, .. }] if text == "second question"
+        ));
+    }
+
+    /// A turn's worth of filler, enough to overflow the 80x24 view.
+    fn fill_the_view(harness: &mut Harness) {
+        harness.app.begin_turn("fill", false);
+        for i in 0..20 {
+            harness
+                .app
+                .transcript
+                .push(Cell::user(&format!("filler line {i}")));
+        }
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.draw();
+    }
+
+    #[test]
+    fn cells_arriving_below_a_scrolled_view_are_counted_on_a_chip() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
+        assert!(harness.press(KeyCode::PageUp).is_none());
+        assert!(harness.app.transcript.scrolled());
+        let held = harness.draw();
+        for i in 0..3 {
+            harness
+                .app
+                .transcript
+                .push(Cell::user(&format!("late line {i}")));
+        }
+        let frame = harness.draw();
+        insta::assert_snapshot!("follow_chip_80x24", &frame);
+        let chip = "3 new below  End = follow";
+        let buffer = harness.terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let row = (0..buffer.area.height)
+            .find(|y| row_text(*y).ends_with(chip))
+            .unwrap_or_else(|| panic!("no right-aligned chip:\n{frame}"));
+        let column = buffer.area.width - u16::try_from(chip.len()).unwrap();
+        let modifier = |x: u16| buffer[(x, row)].modifier;
+        assert!(modifier(column).contains(Modifier::REVERSED), "{frame}");
+        assert!(
+            !modifier(column - 1).contains(Modifier::REVERSED),
+            "{frame}"
+        );
+        assert!(!frame.contains("late line 2"), "the view moved:\n{frame}");
+        assert_eq!(
+            frame.lines().take(18).collect::<Vec<_>>(),
+            held.lines().take(18).collect::<Vec<_>>(),
+            "the view slid under the new cells:\n{frame}"
+        );
+
+        assert!(harness.press(KeyCode::End).is_none());
+        assert!(!harness.app.transcript.scrolled());
+        let frame = harness.draw();
+        assert!(!frame.contains("new below"), "{frame}");
+        assert!(!frame.contains("End = follow"), "{frame}");
+        assert!(frame.contains("late line 2"), "{frame}");
+    }
+
+    /// Scrolled up with nothing new yet, the chip already offers the way
+    /// back, so a held view is never mistaken for a following one.
+    #[test]
+    fn a_scrolled_view_offers_the_way_back_before_anything_new_arrives() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
+        harness.press(KeyCode::PageUp);
+        let frame = harness.draw();
+        insta::assert_snapshot!("follow_chip_idle_80x24", &frame);
+        assert!(frame.contains("End = follow"), "{frame}");
+        assert!(!frame.contains("new below"), "{frame}");
+        harness.press(KeyCode::End);
+        assert!(!harness.draw().contains("End = follow"));
+    }
+
+    /// Shift+G is the keyboard's other way back to the bottom, but only
+    /// while the composer is empty: with a draft the letter is typing,
+    /// and the view stays where it is.
+    #[test]
+    fn shift_g_follows_the_bottom_only_from_an_empty_composer() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
+        let shift_g = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+
+        harness.press(KeyCode::PageUp);
+        harness.type_text("draft");
+        assert!(harness.app.handle_key(shift_g).is_none());
+        assert!(harness.app.transcript.scrolled());
+        assert_eq!(harness.app.composer.lines(), ["draftG"]);
+        assert!(harness.draw().contains("End = follow"));
+
+        harness.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert!(harness.app.composer.is_empty());
+        assert!(harness.app.handle_key(shift_g).is_none());
+        assert!(!harness.app.transcript.scrolled());
+        assert!(harness.app.composer.is_empty());
+        assert!(!harness.draw().contains("End = follow"));
+    }
+
+    /// Every custom widget draws only inside the buffer it is given, so
+    /// a layout handing one an area the frame does not cover (a resize
+    /// mid-draw, a zero-height pane) cannot panic or write out of range.
+    #[test]
+    fn every_custom_widget_clamps_its_area_to_the_buffer() {
+        type Draw<'a> = Box<dyn FnMut(Rect, &mut Buffer) + 'a>;
+        let mut welcome = Harness::standalone(80, 24);
+        let mut plain = Harness::standalone(80, 24);
+        exchange(&mut plain);
+        let mut chip = Harness::standalone(80, 24);
+        fill_the_view(&mut chip);
+        chip.app.transcript.scroll_lines(-5);
+        let mut todo = TodoPanel::default();
+        todo.set("ship it".to_string(), todo_items());
+        let (reply, _answers) = mpsc::channel();
+        let confirm = PendingPrompt {
+            req: confirm_request(Some("fs_write")),
+            reply: reply.clone(),
+            field: None,
+        };
+        let input = PendingPrompt {
+            req: PromptRequest::new(PromptAction::Input, "Name?", Origin::detached()),
+            reply,
+            field: Some(new_textarea()),
+        };
+        let mut widgets: Vec<(&str, Draw<'_>)> = vec![
+            (
+                "transcript (welcome)",
+                Box::new(|area, buf| {
+                    welcome
+                        .app
+                        .transcript
+                        .view(area, &mut welcome.app.renderer)
+                        .render(area, buf);
+                }),
+            ),
+            (
+                "transcript",
+                Box::new(|area, buf| {
+                    plain
+                        .app
+                        .transcript
+                        .view(area, &mut plain.app.renderer)
+                        .render(area, buf);
+                }),
+            ),
+            (
+                "transcript (follow chip)",
+                Box::new(|area, buf| {
+                    let view = chip.app.transcript.view(area, &mut chip.app.renderer);
+                    assert!(chip.app.transcript.scrolled());
+                    view.render(area, buf);
+                }),
+            ),
+            (
+                "status strip",
+                Box::new(|area, buf| {
+                    StatusStrip(Some("thinking for 3s".to_string())).render(area, buf);
+                }),
+            ),
+            (
+                "footer bar",
+                Box::new(|area, buf| {
+                    FooterBar {
+                        left: "openai:test-model . no session".to_string(),
+                        right: Line::from("in 10 out 20"),
+                    }
+                    .render(area, buf);
+                }),
+            ),
+            (
+                "confirm modal",
+                Box::new(|area, buf| PromptModal(&confirm).render(area, buf)),
+            ),
+            (
+                "input modal",
+                Box::new(|area, buf| PromptModal(&input).render(area, buf)),
+            ),
+            (
+                "todo panel",
+                Box::new(|area, buf| (&todo).render(area, buf)),
+            ),
+        ];
+        let screen = Rect::new(0, 0, 10, 3);
+        for (name, render) in &mut widgets {
+            let mut buf = Buffer::empty(screen);
+            render(Rect::new(0, 0, 40, 10), &mut buf);
+            assert_ne!(buf, Buffer::empty(screen), "{name}: nothing drawn");
+
+            let mut buf = Buffer::empty(screen);
+            render(Rect::new(20, 20, 5, 5), &mut buf);
+            assert_eq!(
+                buf,
+                Buffer::empty(screen),
+                "{name}: drew outside the buffer"
+            );
+        }
+    }
+
+    /// A line sent while scrolled up would otherwise land out of sight.
+    #[test]
+    fn a_submitted_line_brings_the_view_back_to_the_bottom() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
+        harness.press(KeyCode::PageUp);
+        assert!(harness.app.transcript.scrolled());
+        harness.app.begin_turn("late question", false);
+        assert!(!harness.app.transcript.scrolled());
+        let frame = harness.draw();
+        assert!(frame.contains("> late question"), "{frame}");
+        assert!(!frame.contains("End = follow"), "{frame}");
+    }
+
+    /// The wheel moves the view; a left click on a row that opens
+    /// focuses and opens it, mapped through the rows of the last frame.
+    #[test]
+    fn the_mouse_scrolls_the_view_and_opens_the_row_it_clicks() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.draw();
+        let mouse = |kind: MouseEventKind, column: u16, row: u16| {
+            TermInput::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let row = screen_row(&harness, "fs_read(");
+        assert!(
+            harness
+                .app
+                .handle_input(mouse(MouseEventKind::Down(MouseButton::Left), 4, row))
+                .is_none()
+        );
+        assert!(harness.app.transcript.focused());
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Tool { expanded: true, .. }
+        ));
+        let frame = harness.draw();
+        assert!(frame.contains("fn main()"), "{frame}");
+        assert!(
+            row_modifier(&harness, "fs_read(").contains(Modifier::REVERSED),
+            "the clicked header is not reversed"
+        );
+
+        fill_the_view(&mut harness);
+        assert!(
+            harness
+                .app
+                .handle_input(mouse(MouseEventKind::ScrollUp, 0, 0))
+                .is_none()
+        );
+        assert!(harness.app.transcript.scrolled());
+        assert!(harness.draw().contains("End = follow"));
+        harness
+            .app
+            .handle_input(mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert!(!harness.app.transcript.scrolled());
+    }
+
+    #[test]
+    fn end_on_an_unscrolled_view_moves_the_composer_cursor() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("ac");
+        harness.press(KeyCode::Left);
+        harness.type_text("b");
+        assert!(harness.press(KeyCode::End).is_none());
+        assert!(!harness.app.transcript.scrolled());
+        harness.type_text("d");
+        assert_eq!(harness.app.composer_text(), "abcd");
+    }
+
+    #[test]
+    fn f2_shows_the_todo_panel_beside_the_transcript_and_hides_it_again() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("plan it", false);
+        harness
+            .app
+            .todo
+            .set("ship the panel".to_string(), Vec::new());
+        harness.app.handle_msg(UiMsg::TodoUpdated(todo_items()));
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("Working through it.".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        assert!(harness.press(KeyCode::F(2)).is_none());
+        let frame = harness.draw();
+        insta::assert_snapshot!("todo_panel_80x24", &frame);
+        for text in [
+            "Todo",
+            "ship the panel",
+            "[x] wire the panel",
+            "[ ] snapshot it narrow",
+            "Working through it.",
+        ] {
+            assert!(frame.contains(text), "{text:?} missing:\n{frame}");
+        }
+        harness.press(KeyCode::F(2));
+        let frame = harness.draw();
+        assert!(!frame.contains("Todo"), "{frame}");
+        assert!(frame.contains("Working through it."), "{frame}");
+    }
+
+    #[test]
+    fn on_a_narrow_frame_the_todo_panel_takes_the_transcripts_place() {
+        let mut harness = Harness::standalone(40, 20);
+        harness.app.begin_turn("plan it", false);
+        harness.app.handle_msg(UiMsg::TodoUpdated(todo_items()));
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("Working through it.".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.press(KeyCode::F(2));
+        let frame = harness.draw();
+        insta::assert_snapshot!("todo_panel_40x20", &frame);
+        assert!(frame.contains("[ ] snapshot it narrow"), "{frame}");
+        assert!(!frame.contains("Working through it."), "{frame}");
+    }
+
+    #[test]
+    fn the_welcome_block_greets_an_empty_transcript_until_the_first_turn() {
+        let mut harness = Harness::standalone(80, 24);
+        let frame = harness.draw();
+        assert_welcome_snapshot("welcome_80x24", &frame);
+        assert!(frame.contains(concat!("coyote ", env!("CARGO_PKG_VERSION"))));
+        assert!(frame.contains("model: openai:test-model"));
+        harness.type_text("hello there");
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Tip: Press"),
+            "typing removed the welcome:\n{frame}"
+        );
+        harness.app.begin_turn("hi", false);
+        let frame = harness.draw();
+        assert!(!frame.contains("Tip: Press"), "{frame}");
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("hello".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let frame = harness.draw();
+        assert!(!frame.contains("Tip: Press"), "{frame}");
+        assert!(
+            !harness
+                .app
+                .transcript
+                .cells()
+                .iter()
+                .any(|cell| matches!(cell, Cell::Welcome { .. }))
+        );
+
+        let mut narrow = Harness::standalone(40, 20);
+        assert_welcome_snapshot("welcome_40x20", &narrow.draw());
+    }
+
+    #[test]
+    fn esc_on_a_focused_row_interrupts_the_running_turn_and_drops_the_focus() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        assert!(harness.app.transcript.focused());
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(!harness.app.transcript.focused());
+    }
+
+    /// A submitted line is a new context: the focus goes when the line
+    /// leaves the composer and again when its turn begins, so the Esc
+    /// that follows reaches the turn.
+    #[test]
+    fn a_submitted_line_drops_the_focus_so_esc_interrupts_its_turn() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        assert!(harness.app.transcript.focused());
+        harness.type_text("next question");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("next question".to_string()))
+        );
+        assert!(!harness.app.transcript.focused());
+
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        assert!(harness.app.transcript.focused());
+        harness.app.begin_turn("next question", false);
+        assert!(!harness.app.transcript.focused());
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(!harness.app.transcript.focused());
+    }
+
+    #[test]
+    fn enter_with_a_focused_row_and_a_draft_still_submits() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        harness.type_text("next question");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("next question".to_string()))
+        );
+        assert!(matches!(
+            &harness.app.transcript.cells()[1],
+            Cell::Tool {
+                expanded: false,
+                ..
+            }
         ));
     }
 
