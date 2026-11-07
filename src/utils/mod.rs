@@ -15,7 +15,10 @@ mod render_prompt;
 mod request;
 mod spinner;
 mod task_cancel_guard;
+pub(crate) mod untrusted_content;
 mod variables;
+#[cfg(windows)]
+pub(crate) mod windows_acl;
 
 pub use self::abort_signal::*;
 pub use self::clipboard::set_text;
@@ -53,6 +56,7 @@ pub static CODE_BLOCK_RE: LazyLock<Regex> =
 pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| io::stdout().is_terminal());
+pub static IS_STDERR_TERMINAL: LazyLock<bool> = LazyLock::new(|| io::stderr().is_terminal());
 pub static SHOW_TOOL_CALLS: LazyLock<bool> = LazyLock::new(|| {
     env::var(get_env_name("show_tool_calls"))
         .ok()
@@ -76,13 +80,14 @@ pub fn drain_acp_permissions() -> Vec<Value> {
         .map(|mut q| q.drain(..).collect())
         .unwrap_or_default()
 }
-pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
+pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| no_color_env_set() || !*IS_STDOUT_TERMINAL);
+
+pub fn no_color_env_set() -> bool {
     env::var("NO_COLOR")
         .ok()
         .and_then(|v| parse_bool(&v))
         .unwrap_or_default()
-        || !*IS_STDOUT_TERMINAL
-});
+}
 
 static TOOL_DIM_COLOR: OnceLock<Color> = OnceLock::new();
 static TOOL_FN_COLOR: OnceLock<Color> = OnceLock::new();
@@ -215,14 +220,23 @@ where
 }
 
 pub fn pretty_error(err: &anyhow::Error) -> String {
+    pretty_error_with(err, |link| link.to_string())
+}
+
+/// `pretty_error` with each link of the chain spelled by `show`.
+pub fn pretty_error_with(
+    err: &anyhow::Error,
+    show: impl Fn(&(dyn std::error::Error + 'static)) -> String,
+) -> String {
     let mut output = vec![];
-    output.push(format!("Error: {err}"));
-    let causes: Vec<_> = err.chain().skip(1).collect();
+    let mut links = err.chain().map(show);
+    output.push(format!("Error: {}", links.next().unwrap_or_default()));
+    let causes: Vec<_> = links.collect();
     let causes_len = causes.len();
     if causes_len > 0 {
         output.push("\nCaused by:".to_string());
         if causes_len == 1 {
-            output.push(format!("    {}", indent_text(causes[0], 4).trim()));
+            output.push(format!("    {}", indent_text(&causes[0], 4).trim()));
         } else {
             for (i, cause) in causes.into_iter().enumerate() {
                 output.push(format!("{i:5}: {}", indent_text(cause, 7).trim()));
@@ -243,6 +257,23 @@ pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
 
 pub fn error_text(input: &str) -> String {
     color_text(input, Color::Red)
+}
+
+/// `error_text` for text going to stderr, keyed on stderr being a terminal rather than
+/// stdout, so a redirected stdout does not strip the colour and a redirected stderr
+/// does not get escape codes.
+pub fn stderr_error_text(input: &str) -> String {
+    if !colour_for_stderr(*IS_STDERR_TERMINAL, no_color_env_set()) {
+        return input.to_string();
+    }
+    nu_ansi_term::Style::new()
+        .fg(Color::Red)
+        .paint(input)
+        .to_string()
+}
+
+fn colour_for_stderr(is_tty: bool, no_color: bool) -> bool {
+    is_tty && !no_color
 }
 
 pub fn warning_text(input: &str) -> String {
@@ -279,12 +310,18 @@ pub fn cyan_bold_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
+    tool_name_text_forced(input)
+}
+
+/// `cyan_bold_text` without the `NO_COLOR` gate, for a caller that settled colour itself.
+pub(crate) fn tool_name_text_forced(input: &str) -> String {
+    tool_name_style().paint(input).to_string()
+}
+
+/// The style `tool_name_text_forced` paints with.
+pub(crate) fn tool_name_style() -> nu_ansi_term::Style {
     let color = TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73));
-    nu_ansi_term::Style::new()
-        .fg(color)
-        .bold()
-        .paint(input)
-        .to_string()
+    nu_ansi_term::Style::new().fg(color).bold()
 }
 
 pub fn replay_label_text(input: &str) -> String {
@@ -355,6 +392,14 @@ pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_colour_needs_a_terminal_and_no_opt_out() {
+        assert!(colour_for_stderr(true, false));
+        assert!(!colour_for_stderr(true, true));
+        assert!(!colour_for_stderr(false, false));
+        assert!(!colour_for_stderr(false, true));
+    }
 
     #[test]
     #[cfg(not(target_os = "windows"))]

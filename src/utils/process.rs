@@ -61,22 +61,7 @@ impl ProcessStamp {
     /// rule, decided with one process-table refresh instead of one per
     /// stamp. An empty slice asks sysinfo nothing.
     pub(crate) fn alive_set(stamps: &[ProcessStamp]) -> HashSet<ProcessStamp> {
-        if stamps.is_empty() {
-            return HashSet::new();
-        }
-        #[cfg(test)]
-        ALIVE_SET_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let pids: HashSet<Pid> = stamps
-            .iter()
-            .map(|stamp| Pid::from_u32(stamp.pid))
-            .collect();
-        let pids: Vec<Pid> = pids.into_iter().collect();
-        let mut sys = System::new();
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&pids),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
+        let sys = Self::refreshed(stamps);
         stamps
             .iter()
             .copied()
@@ -87,13 +72,61 @@ impl ProcessStamp {
             })
             .collect()
     }
+
+    /// The subset of `stamps` that hold by the `is_alive_or_start_unknown`
+    /// rule, decided on the same single refresh as [`Self::alive_set`].
+    pub(crate) fn alive_or_start_unknown_set(stamps: &[ProcessStamp]) -> HashSet<ProcessStamp> {
+        let sys = Self::refreshed(stamps);
+        stamps
+            .iter()
+            .copied()
+            .filter(|stamp| {
+                let start = sys
+                    .process(Pid::from_u32(stamp.pid))
+                    .map(|p| p.start_time());
+                stamp.pid != 0
+                    && (start == Some(stamp.start) || (stamp.start == 0 && start.is_some()))
+            })
+            .collect()
+    }
+
+    /// One process-table refresh covering the pids in `stamps`; an empty
+    /// slice asks sysinfo nothing.
+    fn refreshed(stamps: &[ProcessStamp]) -> System {
+        let mut sys = System::new();
+        if stamps.is_empty() {
+            return sys;
+        }
+        #[cfg(test)]
+        ALIVE_SET_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let pids: HashSet<Pid> = stamps
+            .iter()
+            .map(|stamp| Pid::from_u32(stamp.pid))
+            .collect();
+        let pids: Vec<Pid> = pids.into_iter().collect();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys
+    }
 }
 
-/// How many process-table refreshes `alive_set` has spent in this process,
-/// so a test can pin how many one caller costs.
 #[cfg(test)]
-pub(crate) static ALIVE_SET_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// How many process-table refreshes `alive_set` has spent on this thread,
+    /// so a test can pin how many one caller costs. Counted per thread because
+    /// the mesh instance registry refreshes on every read, and tests running
+    /// beside the one counting read it. The code being counted must therefore run
+    /// on the calling thread, not on a spawned one.
+    static ALIVE_SET_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn alive_set_calls() -> usize {
+    ALIVE_SET_CALLS.with(std::cell::Cell::get)
+}
 
 fn lookup_start_time(pid: u32) -> Option<u64> {
     let pid = Pid::from_u32(pid);
@@ -109,7 +142,6 @@ fn lookup_start_time(pid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
     fn current_process_is_alive() {
@@ -135,9 +167,7 @@ mod tests {
         assert!(!stale.is_alive());
     }
 
-    /// Serial with the sweep tests that count `alive_set` calls.
     #[test]
-    #[serial]
     fn alive_set_keeps_only_the_live_self() {
         let current = ProcessStamp::current();
         let dead = ProcessStamp {
@@ -167,7 +197,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn alive_set_of_nothing_is_empty() {
         assert!(ProcessStamp::alive_set(&[]).is_empty());
     }

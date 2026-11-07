@@ -1,5 +1,6 @@
 use super::agent::Agent;
 use super::app_config::AppConfig;
+use super::command_prefix::CommandPrefix;
 use super::macros::Macro;
 use super::paths;
 use super::role::Role;
@@ -104,6 +105,7 @@ impl MacroPolicy {
             role.and_then(|r| r.enabled_macros()),
             global.enabled_macros.as_deref(),
             builtin_commands,
+            global.command_prefix,
         )
     }
 
@@ -114,6 +116,7 @@ impl MacroPolicy {
         role_list: Option<&[String]>,
         global_list: Option<&[String]>,
         builtin_commands: &[&str],
+        prefix: CommandPrefix,
     ) -> Self {
         let allowlist = session_list
             .map(|list| (MacroAllowlistLevel::Session, list))
@@ -124,7 +127,7 @@ impl MacroPolicy {
         let mut macros: Vec<ResolvedMacro> = discovered
             .into_iter()
             .map(|discovered_macro| {
-                let state = resolve_state(&discovered_macro, allowlist, builtin_commands);
+                let state = resolve_state(&discovered_macro, allowlist, builtin_commands, prefix);
                 let (description, isolated) = match &discovered_macro.definition {
                     Ok(value) => (value.description.clone(), Some(value.isolated)),
                     Err(_) => (None, None),
@@ -188,6 +191,7 @@ fn resolve_state(
     discovered: &DiscoveredMacro,
     allowlist: Option<(MacroAllowlistLevel, &[String])>,
     builtin_commands: &[&str],
+    prefix: CommandPrefix,
 ) -> MacroState {
     if RESERVED_MACRO_NAMES.contains(&discovered.name.as_str()) {
         warn!(
@@ -200,10 +204,12 @@ fn resolve_state(
         };
     }
 
-    if let Err(reason) = &discovered.definition {
-        return MacroState::Invalid {
-            reason: reason.clone(),
-        };
+    let invalid_reason = match &discovered.definition {
+        Err(reason) => Some(reason.clone()),
+        Ok(definition) => definition.forbidden_mesh_step(prefix),
+    };
+    if let Some(reason) = invalid_reason {
+        return MacroState::Invalid { reason };
     }
 
     if let Some((level, list)) = allowlist
@@ -336,7 +342,15 @@ mod tests {
         role: Option<&[String]>,
         global: Option<&[String]>,
     ) -> MacroPolicy {
-        MacroPolicy::effective_with(discovered, session, agent, role, global, &[])
+        MacroPolicy::effective_with(
+            discovered,
+            session,
+            agent,
+            role,
+            global,
+            &[],
+            CommandPrefix::Dot,
+        )
     }
 
     fn state_of<'a>(policy: &'a MacroPolicy, name: &str) -> &'a MacroState {
@@ -559,8 +573,15 @@ mod tests {
 
     #[test]
     fn builtin_name_collision_is_shadowed() {
-        let policy =
-            MacroPolicy::effective_with(globals(&["help", "a"]), None, None, None, None, &["help"]);
+        let policy = MacroPolicy::effective_with(
+            globals(&["help", "a"]),
+            None,
+            None,
+            None,
+            None,
+            &["help"],
+            CommandPrefix::Dot,
+        );
 
         assert_eq!(state_of(&policy, "help"), &MacroState::ShadowedBuiltin);
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
@@ -575,6 +596,7 @@ mod tests {
             None,
             None,
             &repl::builtin_command_names(),
+            CommandPrefix::Dot,
         );
 
         assert_eq!(state_of(&policy, "prompt"), &MacroState::ShadowedBuiltin);
@@ -589,6 +611,7 @@ mod tests {
             None,
             None,
             &repl::builtin_command_names(),
+            CommandPrefix::Dot,
         );
 
         assert_eq!(state_of(&policy, "temp-role"), &MacroState::ShadowedBuiltin);
@@ -605,6 +628,7 @@ mod tests {
             None,
             None,
             &["help"],
+            CommandPrefix::Dot,
         );
 
         assert_eq!(
@@ -619,8 +643,15 @@ mod tests {
     fn allowlisted_builtin_collision_stays_shadowed() {
         let l = list(&["help"]);
 
-        let policy =
-            MacroPolicy::effective_with(globals(&["help"]), None, None, None, Some(&l), &["help"]);
+        let policy = MacroPolicy::effective_with(
+            globals(&["help"]),
+            None,
+            None,
+            None,
+            Some(&l),
+            &["help"],
+            CommandPrefix::Dot,
+        );
 
         assert_eq!(state_of(&policy, "help"), &MacroState::ShadowedBuiltin);
     }
@@ -654,8 +685,15 @@ mod tests {
 
     #[test]
     fn reserved_name_invalid_wins_over_builtin_collision() {
-        let policy =
-            MacroPolicy::effective_with(globals(&["enable"]), None, None, None, None, &["enable"]);
+        let policy = MacroPolicy::effective_with(
+            globals(&["enable"]),
+            None,
+            None,
+            None,
+            None,
+            &["enable"],
+            CommandPrefix::Dot,
+        );
 
         assert_eq!(
             state_of(&policy, "enable"),
@@ -698,6 +736,49 @@ mod tests {
                 reason: "boom".to_string()
             }
         );
+    }
+
+    fn disc_with_mesh_step(name: &str) -> DiscoveredMacro {
+        DiscoveredMacro {
+            definition: Ok(Macro {
+                steps: vec![".model x".to_string(), "  .mesh trust {{peer}}".to_string()],
+                ..valid_macro()
+            }),
+            ..disc(name, MacroSource::Global)
+        }
+    }
+
+    fn assert_mesh_invalid(state: &MacroState) {
+        let MacroState::Invalid { reason } = state else {
+            panic!("expected Invalid, got {state:?}");
+        };
+        assert!(reason.contains("step 2"), "{reason}");
+        assert!(reason.contains(".mesh trust {{peer}}"), "{reason}");
+    }
+
+    #[test]
+    fn mesh_step_is_invalid_and_keeps_description_and_isolated() {
+        let policy = resolve(vec![disc_with_mesh_step("meshy")], None, None, None, None);
+
+        assert_mesh_invalid(state_of(&policy, "meshy"));
+        let row = policy.macros.iter().find(|m| m.name == "meshy").unwrap();
+        assert_eq!(row.description.as_deref(), Some("a test macro"));
+        assert_eq!(row.isolated, Some(true));
+    }
+
+    #[test]
+    fn mesh_step_invalid_wins_over_allowlist_exclusion() {
+        let l = list(&["other"]);
+
+        let policy = resolve(
+            vec![disc_with_mesh_step("meshy")],
+            Some(&l),
+            None,
+            None,
+            None,
+        );
+
+        assert_mesh_invalid(state_of(&policy, "meshy"));
     }
 
     #[test]
@@ -852,6 +933,105 @@ mod tests {
 
             assert_eq!(discovered.len(), 1);
             assert!(discovered[0].definition.is_err());
+        });
+    }
+
+    #[test]
+    fn discovered_mesh_step_macro_resolves_invalid() {
+        with_macro_dirs(|_, global| {
+            write_macro(
+                global,
+                "meshy",
+                "steps:\n  - \".model x\"\n  - \"  .mesh trust {{peer}}\"\n",
+            );
+
+            let discovered = discover_macros_in(&[(MacroSource::Global, global.to_path_buf())]);
+            assert_eq!(discovered.len(), 1);
+            assert!(discovered[0].definition.is_ok());
+
+            let policy = MacroPolicy::effective_with(
+                discovered,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                CommandPrefix::Dot,
+            );
+
+            assert_mesh_invalid(state_of(&policy, "meshy"));
+        });
+    }
+
+    /// A `/mesh` step is only a mesh command when the runner would dispatch
+    /// it: the policy marks such a macro invalid under slash and both with
+    /// the dot form's reason, and leaves it enabled under dot where the step
+    /// is prose. The global config's prefix is what `effective` threads in.
+    #[test]
+    #[serial]
+    fn discovered_slash_mesh_macro_is_invalid_only_where_the_runner_dispatches_it() {
+        with_macro_dirs(|_, global| {
+            write_macro(
+                global,
+                "slashy",
+                "steps:\n  - \".model x\"\n  - \"/mesh trust {{peer}}\"\n",
+            );
+            let discovered = || discover_macros_in(&[(MacroSource::Global, global.to_path_buf())]);
+
+            for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+                let policy =
+                    MacroPolicy::effective_with(discovered(), None, None, None, None, &[], prefix);
+                let MacroState::Invalid { reason } = state_of(&policy, "slashy") else {
+                    panic!(
+                        "{prefix}: expected Invalid, got {:?}",
+                        state_of(&policy, "slashy")
+                    );
+                };
+                assert!(
+                    reason.contains("step 2 '/mesh trust {{peer}}'"),
+                    "{prefix}: {reason}"
+                );
+                assert!(
+                    reason.contains("literal `.mesh` steps are refused at load"),
+                    "{prefix}: {reason}"
+                );
+            }
+
+            let policy = MacroPolicy::effective_with(
+                discovered(),
+                None,
+                None,
+                None,
+                None,
+                &[],
+                CommandPrefix::Dot,
+            );
+            assert_eq!(state_of(&policy, "slashy"), &MacroState::Enabled);
+
+            // The config-driven entry point reads `command_prefix` from the
+            // global config rather than assuming the dot form.
+            let guard = crate::testing::TestConfigDirGuard::new("macro-policy-tests");
+            let macros_dir = paths::macros_dir();
+            fs::create_dir_all(&macros_dir).unwrap();
+            write_macro(&macros_dir, "slashy", "steps:\n  - \"/mesh status\"\n");
+            for (prefix, expect_invalid) in [
+                (CommandPrefix::Dot, false),
+                (CommandPrefix::Slash, true),
+                (CommandPrefix::Both, true),
+            ] {
+                let config = AppConfig {
+                    command_prefix: prefix,
+                    ..AppConfig::default()
+                };
+                let policy = MacroPolicy::effective(&config, None, None, None, &[], true);
+                let state = state_of(&policy, "slashy");
+                assert_eq!(
+                    matches!(state, MacroState::Invalid { .. }),
+                    expect_invalid,
+                    "{prefix}: {state:?}"
+                );
+            }
+            drop(guard);
         });
     }
 

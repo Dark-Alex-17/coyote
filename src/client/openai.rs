@@ -858,6 +858,7 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
         tool_calls,
         thinking,
         usage: openai_parse_responses_usage(&data["usage"]),
+        refusal: None,
     })
 }
 

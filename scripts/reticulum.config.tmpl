@@ -1,0 +1,64 @@
+# Reticulum configuration rendered by /usr/local/bin/coyote-entrypoint on first start
+# (into $HOME/.reticulum/config; never overwritten: edit it there, or mount your own).
+# Interface options: https://markqvist.github.io/Reticulum/manual/interfaces.html
+
+[reticulum]
+
+# Relay announces and paths between the Coyote sessions attached to it. A transport
+# node also forwards traffic for any other Reticulum peer it hears on its interfaces.
+enable_transport = True
+
+# Coyote sessions announce hourly (3600 s plus a minute of slack, so the relay never counts
+# a heartbeat as early): a transport node rate-limits announces per destination, Reticulum's
+# defaults being announce_rate_target = 3600 s with an announce_rate_grace of 5 (RNS
+# Interfaces/Interface.py, DEFAULT_AR_TARGET and DEFAULT_AR_GRACE), and past that grace it
+# blocks a destination's rebroadcasts until an hour after its last accepted announce. Do not
+# lower announce_rate_target here, nor default_ar_target in the [reticulum] section: team
+# relays and community nodes keep the default.
+
+# Every Coyote session in this container attaches to this daemon as a shared-instance
+# client (the shipped mesh.interfaces default, type: local), as do rnstatus and rnpath.
+# The three keys below are Reticulum's own defaults, written out so the contract is
+# visible: on Linux the shared instance is the abstract AF_UNIX socket rns/<instance_name>,
+# so instance_name is the key that matters and shared_instance_port is inert unless
+# shared_instance_type = tcp.
+share_instance = Yes
+shared_instance_port = 37428
+instance_name = default
+
+[logging]
+
+# rnsd applies its -v flags only when this section exists (Reticulum.py:459-467).
+# 4 = LOG_INFO, the value RNS's own default config ships; -vv on top reaches LOG_DEBUG.
+loglevel = 4
+
+[interfaces]
+
+#@if lan
+  # Link-local discovery of other hosts on the same LAN; needs --network host.
+  [[Coyote Local]]
+    type = AutoInterface
+    enabled = Yes
+
+#@end
+  # The TCP hop for a session configured with type: private at 127.0.0.1:4242. It listens on
+  # loopback only, inside this container; sessions in this container attach over the shared
+  # instance instead.
+  [[Coyote Sessions]]
+    type = TCPServerInterface
+    enabled = Yes
+    listen_ip = 127.0.0.1
+    listen_port = 4242
+
+    # Reticulum holds announces from unknown peers by default, which would delay a
+    # brand-new Coyote identity's first announce. Off here, as on the repo's test relay.
+    ingress_control = No
+#@if relay
+
+  # Your team's relay (a propagation node or another rnsd reachable over the network).
+  [[Team Relay]]
+    type = TCPClientInterface
+    enabled = Yes
+    target_host = @RELAY_HOST@
+    target_port = @RELAY_PORT@
+#@end

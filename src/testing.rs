@@ -4,6 +4,7 @@ use crate::config::{WORKSPACE_COYOTE_DIR_NAME, memory};
 use crate::utils;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
 
@@ -15,18 +16,26 @@ static INFO_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Debug and info capture are restricted to the modules whose tests assert
 /// on that output so the buffers are not flooded by the rest of the crate.
+/// `config::request_context` is in for the completer's knock-cache read pin.
 /// Matching is module-boundary-aware: only these exact modules or their `::`
 /// submodules qualify, so a sibling like `hooks_registry` would not.
-const DEBUG_TARGET_PREFIXES: [&str; 4] = [
+const DEBUG_TARGET_PREFIXES: [&str; 6] = [
     concat!(env!("CARGO_CRATE_NAME"), "::hooks"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::agent"),
+    concat!(env!("CARGO_CRATE_NAME"), "::config::request_context"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::child_sessions"),
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
+    concat!(env!("CARGO_CRATE_NAME"), "::mesh"),
 ];
 
-const INFO_TARGET_PREFIXES: [&str; 3] = [
+/// Info capture also covers the mesh node start and the `inbox_dir` resolver,
+/// whose tests assert that a translation is announced at info level exactly
+/// once and never by the resolver itself.
+const INFO_TARGET_PREFIXES: [&str; 5] = [
     concat!(env!("CARGO_CRATE_NAME"), "::graph::script"),
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
+    concat!(env!("CARGO_CRATE_NAME"), "::mesh::node"),
+    concat!(env!("CARGO_CRATE_NAME"), "::config::mesh_config"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::child_sessions"),
 ];
 
@@ -185,6 +194,28 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Clears the process umask so the modes a test reads back are the ones the code
+/// asked for, and restores the previous umask on drop, including on panic. The umask
+/// is process-global, so tests using it must serialize (`#[serial]`).
+#[cfg(unix)]
+pub(crate) struct UmaskGuard(libc::mode_t);
+
+#[cfg(unix)]
+impl UmaskGuard {
+    pub(crate) fn zero() -> Self {
+        Self(unsafe { libc::umask(0) })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+
 /// Points the config dir and the workspace config dir at fresh temp
 /// directories for the guard's lifetime and removes them on drop, including
 /// on panic, so the developer's real `./.coyote/` never leaks into a test.
@@ -261,6 +292,23 @@ impl TestConfigDirGuard {
     pub(crate) fn cache_root(&self) -> &Path {
         &self.cache_root
     }
+
+    /// Whether `text` names the config dir env var this guard pins, for
+    /// tests that check a rendered script never mentions it. The name stays
+    /// in this file so no test elsewhere can pin the var with it.
+    pub(crate) fn mentions_config_dir_env(text: &str) -> bool {
+        text.contains(&utils::get_env_name("config_dir"))
+    }
+
+    /// Unsets the config dir env var until the returned guard drops, which
+    /// puts the pinned dir back, so a test can exercise the fallback for an
+    /// unset config dir while every other dir stays pinned.
+    pub(crate) fn unset_config_dir_env(&self) -> ConfigDirUnset<'_> {
+        ConfigDirUnset {
+            _env: EnvVarGuard::unset(utils::get_env_name("config_dir")),
+            _guard: PhantomData,
+        }
+    }
 }
 
 impl Drop for TestConfigDirGuard {
@@ -268,6 +316,50 @@ impl Drop for TestConfigDirGuard {
         let _ = std::fs::remove_dir_all(&self.path);
         let _ = std::fs::remove_dir_all(&self.workspace_root);
         let _ = std::fs::remove_dir_all(&self.cache_root);
+    }
+}
+
+/// Keeps the config dir env var unset; borrows the [`TestConfigDirGuard`]
+/// so it cannot outlive the pin it restores.
+pub(crate) struct ConfigDirUnset<'a> {
+    _env: EnvVarGuard,
+    _guard: PhantomData<&'a TestConfigDirGuard>,
+}
+
+/// Whether a process with `pid` still exists. A pid that exists but cannot
+/// be signalled or queried counts as alive.
+///
+/// The unix arm asks the kernel directly through `libc::kill(pid, 0)` rather than
+/// reusing `config::envoy::pid_alive`: that one shells out to `ps` where `/proc` is
+/// absent, and a test asserting that a timeout kill reached its interpreter must not
+/// depend on an external tool being installed.
+#[cfg(unix)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows arm of [`pid_alive`]: `OpenProcess` + `GetExitCodeProcess`.
+#[cfg(windows)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        queried && code == STILL_ACTIVE as u32
     }
 }
 

@@ -1,4 +1,4 @@
-Set-PSReadLineKeyHandler -Chord "alt+e" -ScriptBlock {
+﻿Set-PSReadLineKeyHandler -Chord "alt+e" -ScriptBlock {
     $_old = $null
     [Microsoft.PowerShell.PSConsoleReadline]::GetBufferState([ref]$_old, [ref]$null)
     if ($_old) {

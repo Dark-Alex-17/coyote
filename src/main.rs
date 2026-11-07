@@ -5,12 +5,15 @@ mod config;
 mod function;
 mod graph;
 mod hooks;
+#[cfg(test)]
+mod hygiene_pins;
 mod rag;
 mod render;
 mod repl;
 #[macro_use]
 mod utils;
 mod mcp;
+mod mesh;
 mod parsers;
 mod sandbox;
 mod supervisor;
@@ -28,14 +31,16 @@ use crate::client::{
 };
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
-    Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
-    RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
-    install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
-    sync_models,
+    Agent, AgentListing, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input,
+    MemoryScope, RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode,
+    cleanup_envoy_dir, ensure_parent_exists, install_builtins, list_agents_for_humans,
+    load_env_file, macro_execute, maybe_spawn_models_refresh, publish_mesh_snapshot,
+    register_envoy_source, sync_models,
 };
 use crate::config::{memory, memory_migrate, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
+use crate::mesh::snapshot::TurnState;
 use crate::render::{prompt_theme, render_error};
 use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket};
 use crate::utils::*;
@@ -91,6 +96,7 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     load_env_file()?;
     CompleteEnv::with_factory(Cli::command).complete();
+    register_envoy_source();
     let cli = Cli::parse();
 
     if cli.dangerously_skip_permissions {
@@ -362,18 +368,11 @@ async fn async_main() -> Result<()> {
 
     if let Err(err) = run(ctx, cli, text, abort_signal).await {
         render_error(err);
+        cleanup_envoy_dir();
         process::exit(1);
     }
+    cleanup_envoy_dir();
     Ok(())
-}
-
-fn update_app_config(ctx: &mut RequestContext, update: impl FnOnce(&mut AppConfig)) {
-    let mut app_config = (*ctx.app.config).clone();
-    update(&mut app_config);
-
-    let mut app_state = (*ctx.app).clone();
-    app_state.config = Arc::new(app_config);
-    ctx.app = Arc::new(app_state);
 }
 
 async fn run(
@@ -402,7 +401,11 @@ async fn run(
         return Ok(());
     }
     if cli.list_agents {
-        let agents = list_agents().join("\n");
+        let agents = list_agents_for_humans()
+            .iter()
+            .map(AgentListing::list_line)
+            .collect::<Vec<_>>()
+            .join("\n");
         println!("{agents}");
         return Ok(());
     }
@@ -440,7 +443,7 @@ async fn run(
     }
 
     if cli.dry_run {
-        update_app_config(&mut ctx, |app| app.dry_run = true);
+        ctx.update_app_config(|app| app.dry_run = true);
     }
 
     if let Some(agent) = &cli.agent {
@@ -521,20 +524,20 @@ async fn run(
         ctx.set_model_on_role_like(app.as_ref(), model_id)?;
     }
     if cli.no_stream {
-        update_app_config(&mut ctx, |app| app.stream = false);
+        ctx.update_app_config(|app| app.stream = false);
     }
     if cli.raw_markdown {
-        update_app_config(&mut ctx, |app| app.raw_markdown = true);
+        ctx.update_app_config(|app| app.raw_markdown = true);
     }
     if cli.no_memory {
-        update_app_config(&mut ctx, |app| app.memory = Some(false));
+        ctx.update_app_config(|app| app.memory = Some(false));
     }
     if cli.no_workspace_instructions {
-        update_app_config(&mut ctx, |app| app.workspace_instructions = Some(false));
+        ctx.update_app_config(|app| app.workspace_instructions = Some(false));
     }
     if !cli.workspace_instructions_file.is_empty() {
         let files = cli.workspace_instructions_file.clone();
-        update_app_config(&mut ctx, |app| {
+        ctx.update_app_config(|app| {
             app.workspace_instructions_files = Some(files);
         });
     }
@@ -611,8 +614,10 @@ async fn run(
     }
     if let Some(name) = &cli.macro_name {
         ctx.top_level_agent_started();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
         let result = macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await;
         ctx.cancel_background_tasks();
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         return result;
@@ -621,11 +626,13 @@ async fn run(
         // Dispatch committed: open the top-level agent bracket only now,
         // past every inspection-flag early return above.
         ctx.top_level_agent_started();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
         let result = async {
             let input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
             shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await
         }
         .await;
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         return result;
@@ -654,12 +661,14 @@ async fn run(
     ctx.top_level_agent_started();
     match is_repl {
         false => {
+            publish_mesh_snapshot(&ctx, TurnState::working_now());
             let result = async {
                 let mut input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
                 input.use_embeddings(abort_signal.clone()).await?;
                 start_directive(&mut ctx, input, cli.code, abort_signal.clone()).await
             }
             .await;
+            publish_mesh_snapshot(&ctx, TurnState::idle_now());
             ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
             hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
             result
@@ -798,6 +807,9 @@ async fn shell_execute(
                     }
                     ctx.top_level_agent_finished(None, None);
                     hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+                    // The only process::exit reachable after bootstrap; kept
+                    // here so a reorder of run() cannot leak the dir.
+                    cleanup_envoy_dir();
                     process::exit(code);
                 }
                 'r' => {
@@ -908,7 +920,7 @@ fn setup_logger(acp_mode: bool) -> Result<Option<PathBuf>> {
                 .into_owned();
             let trigger = SizeTrigger::new(10 * 1024 * 1024);
             let roller = FixedWindowRoller::builder()
-                .build(&archive_pattern, 5)
+                .build(&archive_pattern, paths::LOG_ARCHIVE_COUNT)
                 .unwrap();
             let policy = CompoundPolicy::new(Box::new(trigger), Box::new(roller));
 

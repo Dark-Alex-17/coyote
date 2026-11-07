@@ -1,0 +1,20966 @@
+use crate::config::mesh_config::{
+    DEFAULT_LOCAL_RNSD_INSTANCE, DEFAULT_LOCAL_RNSD_PORT, EnvoyMemoryConfig, MeshConfig,
+    MeshInterface,
+};
+use crate::config::mesh_digest::MeshDigestHook;
+use crate::config::{ForkRekey, LivePrefix, Session, paths};
+use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
+use crate::mesh::announce::{
+    AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
+    announce_app_data,
+};
+use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
+use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
+use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+use crate::mesh::envoy_sessions::{
+    EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn, Forgotten, RememberedOf,
+};
+use crate::mesh::events::{
+    BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
+};
+use crate::mesh::fetch::{FetchHandler, FetchServing, ListHandler, PeerMemory, ShareSource};
+use crate::mesh::grants::GrantStore;
+use crate::mesh::identity::IdentityLock;
+use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
+use crate::mesh::inbox::InboxStaging;
+use crate::mesh::instances::{self, InstanceRow, InstanceSession};
+use crate::mesh::knock::{
+    ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
+    KnockFallback, KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia,
+    drain_knocks, knock_message,
+};
+use crate::mesh::knocks::KnockCache;
+use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
+use crate::mesh::lock::InstanceLock;
+use crate::mesh::message::{
+    CHECK_INBOX_NEXT_ACTION, Disposition, INBOX_FULL_TEXT_POINTER, ModelNotes, OutboundPeer,
+    PEER_INBOX_CAPACITY, PEER_LINE_MAX_CHARS, Part, PartLimits, PeerAdmission, PeerInbox, PeerKind,
+    PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPart, RawPeerMessage,
+    Route, SendError, SendOutcome, collect_next_action, is_wire_id, unix_now,
+};
+use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
+use crate::mesh::peers::{
+    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
+};
+use crate::mesh::pending::{
+    Correlations, InboundKind, InboundRecord, InboundStore, OtherSessionAsk, PendingRecord,
+    PendingStore, access_not_a_question, other_sessions_asked,
+};
+use crate::mesh::propagation::{
+    self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
+};
+use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
+use crate::mesh::propagation_nodes::{
+    PROPAGATION_NODE_TABLE_FILE, PersistTrigger, PropagationNodeTable,
+};
+use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
+#[cfg(all(test, unix))]
+use crate::mesh::request::RequestHandler;
+use crate::mesh::request::{
+    ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS, LIST_PATH,
+    LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NoAnswer,
+    OriginName, RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH,
+    redact_hashes, request as link_request, short,
+};
+use crate::mesh::sent_threads::SentThreads;
+use crate::mesh::shares::ShareLocations;
+use crate::mesh::snapshot::MeshSnapshot;
+use crate::mesh::trust::{
+    Decision, InstancePresence, KeyChangeOutcome, SELF_TRUST_LABEL, Tier, TrustStore,
+    decode_name_hash, parse_hash,
+};
+use crate::mesh::{
+    PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
+    mesh_cache_dir,
+};
+use crate::render::{QuotingError, error_notice};
+use crate::supervisor::notification::{SystemNotification, mesh_notification};
+
+use anyhow::{Context, Result, anyhow, bail};
+use arc_swap::ArcSwapOption;
+use parking_lot::RwLock;
+use rns_transport::destination::DestinationDesc;
+use rns_transport::destination::request::RequestAllow;
+use rns_transport::destination::{DestinationName, SingleInputDestination};
+use rns_transport::hash::AddressHash;
+use rns_transport::identity::Identity;
+use rns_transport::identity::PrivateIdentity as TransportIdentity;
+use rns_transport::identity_bridge::{to_core_private_identity, to_transport_private_identity};
+use rns_transport::iface::auto::{AutoInterfaceConfig, AutoInterfaceDeviceFilter};
+use rns_transport::iface::auto_runtime::{
+    AutoDiscoveryRuntime, AutoInterfaceTransportRuntime, AutoRuntimePlan,
+};
+#[cfg(unix)]
+use rns_transport::iface::local::LocalUnixEndpoint;
+use rns_transport::iface::tcp_client::{TcpClient, TcpRuntimeStatusHandle};
+use rns_transport::iface::{IfaceRole, InterfaceMode};
+use rns_transport::transport::{
+    AnnounceEvent, DialFailureKind, DisconnectReason, InterfaceEvent, InterfaceEventKind,
+    SharedInstanceEndpoint, SharedInstanceEvent, SharedInstanceOptions, Transport, TransportConfig,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, sleep, timeout, timeout_at};
+use tokio_util::sync::CancellationToken;
+
+/// Budget for each join and lock wait around the node's lifecycle: `stop` gives the node's
+/// tasks one window, and a second window, opened before the transport stops, bounds the
+/// transport's own stop, the TCP client joins and the request handler drain together,
+/// except that the joins and the drain always keep `POST_STOP_GRACE` after the stop
+/// returns (the library's stop has its own budget of the same length, so it can use the
+/// whole window); `start` gives registering and first announcing the destination one, and
+/// `abandon_start` and the `join_lan` failure cleanup bound their unwinding with it. The
+/// request-layer tests bound their own teardown with it too.
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// What the TCP client joins and the request handler drain keep after the transport's stop
+/// returns, however much of `SHUTDOWN_GRACE` the stop used.
+const POST_STOP_GRACE: Duration = Duration::from_secs(2);
+/// Budget for each step `rekey` and `announce_now` take under the `destination` lock:
+/// registering and releasing a destination, attaching announce data, announcing.
+pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for a TCP relay to report itself connected.
+const CONNECT_POLL: Duration = Duration::from_millis(50);
+/// Depth of the channel a `local` rnsd's shared-instance client reports its connection
+/// state on; the client drops an event when it is full. A client failing its dial sends
+/// one event every `LOCAL_RECONNECT_WAIT`, so 64 slots outlast the start's later joins and
+/// the watcher's announce waits by minutes before a `Connected` could be dropped.
+const LOCAL_EVENT_CAPACITY: usize = 64;
+/// How long the shared-instance client waits before redialing rnsd after a drop; the row
+/// reads `lost, retrying` until a redial lands.
+const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
+/// Depth of the host channel a LAN interface feeds the transport through.
+const LAN_CHANNEL_CAPACITY: usize = 128;
+/// How often the peer table is written back if it changed; `stop` writes it regardless.
+const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
+/// Refusal shared by `MeshSlot::install` and the `.mesh on` pre-check.
+pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
+/// Floor between two snapshot captures made at progress points inside a turn. Turn
+/// boundaries publish regardless of it.
+pub(crate) const MESH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many (sending identity, message id) pairs the slot remembers as handed to the
+/// envoy. A body reaches a receiver twice when a link delivery's acknowledgement is lost
+/// and the sender falls back to store-and-forward. 4096 matches the fetch path's
+/// `DEDUP_CAPACITY`; past it the oldest pair is forgotten first and its repeat is filed
+/// twice, which the inbox tolerates. The window lives in memory alone: a restart forgets it.
+pub(crate) const BODY_DEDUP_CAPACITY: usize = 4096;
+/// How long a pair stays remembered. A day covers the default sync interval and the
+/// default request timeout with a wide margin; a receiver syncing less often than daily,
+/// or a sender whose request timeout exceeds a day, may see the envoy run a late repeat
+/// again, bounded by the sender's budgets.
+pub(crate) const BODY_DEDUP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
+/// How many of its own inbox entries the slot remembers filing. Twice the peer inbox's
+/// cap, so every own entry still in the inbox is marked with room to spare; past it the
+/// oldest mark is forgotten first, and by then the entry it marked has been pushed out
+/// of the inbox, since each later mark is a later delivery.
+pub(crate) const OWN_ENTRY_MARKS: usize = 2 * PEER_INBOX_CAPACITY;
+
+/// What the asker reads in the `refused` reply `.mesh dismiss` sends.
+pub(crate) const HUMAN_DECLINED: &str = "the human declined to answer";
+
+/// Where a node keeps its identity, the user's trust list and its disposable state.
+pub(crate) struct MeshPaths {
+    pub identity_path: PathBuf,
+    pub cache_dir: PathBuf,
+    pub config_dir: PathBuf,
+}
+
+impl MeshPaths {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            identity_path: identity::identity_path(),
+            cache_dir: paths::cache_dir(),
+            config_dir: paths::config_dir(),
+        }
+    }
+}
+
+/// The translation `MeshRuntime::start` applies to a `mesh.fetch.inbox_dir` that does
+/// not exist; `paths::translate_sandboxed_home_dir` by default, a stand-in in tests.
+pub(crate) type InboxDirTranslation = Arc<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
+
+pub(crate) struct NodeOptions {
+    pub connect_timeout: Duration,
+    /// The handle the node fires its `mesh.*` events through; the slot that installs
+    /// the node shares it, so pass `MeshSlot::hooks`.
+    pub hooks: MeshHooks,
+    pub translate_inbox_dir: InboxDirTranslation,
+    /// The agent the session is running, announced after the display name. It is read
+    /// once at start and fixed for the node's life: the agent cannot change under a
+    /// running node, since every agent switch leaves the mesh and joins afresh.
+    pub agent: Option<String>,
+}
+
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: TcpClient::DEFAULT_CONNECT_TIMEOUT,
+            hooks: MeshHooks::default(),
+            translate_inbox_dir: Arc::new(paths::translate_sandboxed_home_dir),
+            agent: None,
+        }
+    }
+}
+
+/// Timeouts for one knock: the direct attempt, then the fallback post.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KnockOptions {
+    pub request: RequestOptions,
+    pub propagation: PropagationOptions,
+}
+
+impl Default for KnockOptions {
+    fn default() -> Self {
+        Self {
+            request: RequestOptions {
+                request_timeout: KNOCK_REQUEST_TIMEOUT,
+                link_timeout: KNOCK_LINK_TIMEOUT,
+                path_requested: false,
+            },
+            propagation: PropagationOptions::default(),
+        }
+    }
+}
+
+/// `mesh.request_timeout_secs` and `mesh.link_timeout_secs` as deadlines; `None` leaves a
+/// path's own. Applied to `/message`, `/knock`, `/list`, `/access` and `/status`; `/fetch`
+/// and the `mesh__peers` status sweep keep their constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestTimeouts {
+    request: Option<Duration>,
+    link: Option<Duration>,
+}
+
+impl From<&MeshConfig> for RequestTimeouts {
+    fn from(mesh: &MeshConfig) -> Self {
+        Self {
+            request: mesh.request_timeout_secs.map(Duration::from_secs),
+            link: mesh.link_timeout_secs.map(Duration::from_secs),
+        }
+    }
+}
+
+impl RequestTimeouts {
+    /// `defaults` with each configured deadline applied where it is the longer; a
+    /// configured value never shortens a path's own.
+    pub(crate) fn raise(&self, defaults: RequestOptions) -> RequestOptions {
+        RequestOptions {
+            request_timeout: self.request.map_or(defaults.request_timeout, |configured| {
+                configured.max(defaults.request_timeout)
+            }),
+            link_timeout: self.link.map_or(defaults.link_timeout, |configured| {
+                configured.max(defaults.link_timeout)
+            }),
+            path_requested: defaults.path_requested,
+        }
+    }
+}
+
+/// One configured interface, resolved to what the transport will be asked to join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InterfacePlan {
+    Lan,
+    Local {
+        endpoint: LocalEndpoint,
+    },
+    Tcp {
+        kind: &'static str,
+        endpoint: String,
+    },
+}
+
+impl InterfacePlan {
+    fn label(&self) -> String {
+        match self {
+            Self::Lan => "lan".to_string(),
+            Self::Local { endpoint } => local_label(endpoint),
+            Self::Tcp { kind, endpoint } => format!("{kind} {endpoint}"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Local { .. } => "local",
+            Self::Tcp { kind, .. } => kind,
+        }
+    }
+
+    fn status(&self, state: InterfaceState) -> InterfaceStatus {
+        InterfaceStatus {
+            label: self.label(),
+            kind: self.kind(),
+            endpoint: match self {
+                Self::Lan => None,
+                Self::Local { endpoint } => Some(endpoint.to_string()),
+                Self::Tcp { endpoint, .. } => Some(endpoint.clone()),
+            },
+            state,
+        }
+    }
+}
+
+fn local_label(endpoint: &LocalEndpoint) -> String {
+    format!("local rnsd at {endpoint}")
+}
+
+/// Where a `local` entry dials rnsd's shared instance. rnsd binds it to an abstract socket
+/// on Linux and Android, which no other OS has, and to loopback TCP everywhere else. The
+/// config row and the node label both print it through `Display`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalEndpoint {
+    Tcp(SocketAddr),
+    /// The socket's config spelling, `@rns/<instance>`.
+    Abstract(String),
+}
+
+impl LocalEndpoint {
+    pub(crate) fn of(port: Option<u16>, instance: Option<&str>) -> Self {
+        Self::on_platform(
+            cfg!(any(target_os = "linux", target_os = "android")),
+            port,
+            instance,
+        )
+    }
+
+    fn on_platform(abstract_sockets: bool, port: Option<u16>, instance: Option<&str>) -> Self {
+        if abstract_sockets {
+            Self::Abstract(format!(
+                "@rns/{}",
+                instance.unwrap_or(DEFAULT_LOCAL_RNSD_INSTANCE)
+            ))
+        } else {
+            Self::Tcp(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                port.unwrap_or(DEFAULT_LOCAL_RNSD_PORT),
+            )))
+        }
+    }
+}
+
+impl fmt::Display for LocalEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(addr) => write!(f, "{addr}"),
+            Self::Abstract(name) => f.write_str(name),
+        }
+    }
+}
+
+/// What one configured interface is doing. `retrying` means it is tried again without
+/// the user: a TCP client the transport keeps reconnecting.
+/// `Unreachable` without it is a `lan` bind that failed, or a `local` rnsd the node could
+/// not attach to; neither is tried again.
+/// `Connecting` is a `local` rnsd not connected yet: with the client's last dial failure,
+/// without one while no dial has failed;
+/// `Disconnected` one that dropped the socket after the node attached, which the
+/// transport is redialing. An attached rnsd's row follows the shared-instance client's
+/// state events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterfaceState {
+    Connected,
+    Unreachable { reason: String, retrying: bool },
+    Connecting { dial_failure: Option<DialFailure> },
+    Disconnected { reason: String },
+}
+
+/// What a `local` rnsd's failed dial leaves to the user. `StartRnsd`: nothing answered
+/// at the endpoint, so no rnsd runs there. `Redialing`: the dial failed another way
+/// (no answer in time, an I/O error) and the client's next redial may get past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialAdvice {
+    StartRnsd,
+    Redialing,
+}
+
+/// A `local` rnsd client's last failed dial: the row's sentence for it and the advice
+/// its kind carries, both read off the transport's typed `DialFailureKind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DialFailure {
+    pub reason: String,
+    pub advice: DialAdvice,
+}
+
+impl DialFailure {
+    fn of(kind: DialFailureKind, endpoint: &LocalEndpoint) -> Self {
+        let advice = match kind {
+            DialFailureKind::Refused | DialFailureKind::NotFound => DialAdvice::StartRnsd,
+            _ => DialAdvice::Redialing,
+        };
+        Self {
+            reason: dial_failure_sentence(kind, endpoint),
+            advice,
+        }
+    }
+}
+
+impl fmt::Display for InterfaceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connected => f.write_str("connected"),
+            Self::Unreachable {
+                reason,
+                retrying: true,
+            } => write!(f, "unreachable, retrying: {reason}"),
+            Self::Unreachable {
+                reason,
+                retrying: false,
+            } => write!(f, "unreachable: {reason}"),
+            Self::Connecting { dial_failure: None } => f.write_str("connecting"),
+            Self::Connecting {
+                dial_failure: Some(DialFailure { reason, .. }),
+            } => write!(f, "connecting, retrying: {reason}"),
+            Self::Disconnected { reason } => write!(f, "lost, retrying: {reason}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterfaceStatus {
+    pub label: String,
+    pub kind: &'static str,
+    /// `host:port` for a relay, the rnsd endpoint for `local`; `None` for `lan`.
+    pub endpoint: Option<String>,
+    pub state: InterfaceState,
+}
+
+impl InterfaceStatus {
+    /// An endpoint on this host, a loopback relay or rnsd's abstract socket, where nothing
+    /// listening means no local daemon.
+    pub(crate) fn is_loopback(&self) -> bool {
+        self.endpoint.as_deref().is_some_and(loopback_endpoint)
+    }
+}
+
+/// Whether `host`, an address (IPv6 bracketed or not) or a name, is this machine's
+/// loopback.
+pub(crate) fn loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.parse::<std::net::IpAddr>().map_or_else(
+        |_| host.eq_ignore_ascii_case("localhost"),
+        |ip| ip.is_loopback(),
+    )
+}
+
+/// `loopback_host` for a `host:port` endpoint; an abstract socket (`@...`) never leaves
+/// the host either.
+pub(crate) fn loopback_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with('@')
+        || endpoint
+            .rsplit_once(':')
+            .is_some_and(|(host, _)| loopback_host(host))
+}
+
+/// Maps the configured list 1:1; nothing is detected, defaulted, or substituted.
+fn plan_interfaces(interfaces: &[MeshInterface]) -> Vec<InterfacePlan> {
+    interfaces
+        .iter()
+        .map(|interface| match interface {
+            MeshInterface::Lan => InterfacePlan::Lan,
+            MeshInterface::Local { port, instance } => InterfacePlan::Local {
+                endpoint: LocalEndpoint::of(*port, instance.as_deref()),
+            },
+            MeshInterface::Private { host, port } => InterfacePlan::Tcp {
+                kind: "private",
+                endpoint: format!("{host}:{port}"),
+            },
+            MeshInterface::Public { host, port } => InterfacePlan::Tcp {
+                kind: "public",
+                endpoint: format!("{host}:{port}"),
+            },
+        })
+        .collect()
+}
+
+enum JoinedInterface {
+    Lan {
+        runtime: AutoDiscoveryRuntime,
+    },
+    /// The shared-instance client; the transport holds it and stops it with the rest.
+    Local {
+        label: String,
+    },
+    Tcp {
+        hash: AddressHash,
+        handle: JoinHandle<()>,
+        label: String,
+        status: TcpRuntimeStatusHandle,
+    },
+}
+
+enum Joined {
+    Connected(JoinedInterface),
+    /// A `local` rnsd the transport attached to and whose client reported its first
+    /// `Connected` within the start wait; `events` is where that client reports its
+    /// connection state from here on.
+    Attached {
+        label: String,
+        endpoint: LocalEndpoint,
+        events: mpsc::Receiver<SharedInstanceEvent>,
+    },
+    /// `Attached`, but the client had not connected when the start wait ran out: it
+    /// keeps dialing, the row starts at `connecting` with `dial_failure`, the last dial
+    /// that failed (`None` when none had), and the watcher moves it on the client's first
+    /// `Connected`.
+    Dialing {
+        label: String,
+        endpoint: LocalEndpoint,
+        events: mpsc::Receiver<SharedInstanceEvent>,
+        dial_failure: Option<DialFailure>,
+        reason: String,
+        message: String,
+    },
+    /// A TCP client whose first connect failed; it stays attached and keeps reconnecting.
+    Pending {
+        iface: JoinedInterface,
+        reason: String,
+        message: String,
+    },
+    /// A `local` rnsd the transport could not attach to, or whose client stopped
+    /// reporting during the start wait; nothing retries it, so the row is `unreachable`
+    /// with that reason for the node's lifetime.
+    NotReached {
+        reason: String,
+        message: String,
+    },
+    /// Nothing was attached; `lan` only.
+    Failed {
+        reason: String,
+        message: String,
+    },
+}
+
+impl Joined {
+    /// The row an interface starts on: only what something keeps retrying reads as
+    /// retrying.
+    fn start_state(&self) -> InterfaceState {
+        match self {
+            Self::Connected(_) | Self::Attached { .. } => InterfaceState::Connected,
+            Self::Dialing { dial_failure, .. } => InterfaceState::Connecting {
+                dial_failure: dial_failure.clone(),
+            },
+            Self::Pending { reason, .. } => InterfaceState::Unreachable {
+                reason: reason.clone(),
+                retrying: true,
+            },
+            Self::NotReached { reason, .. } | Self::Failed { reason, .. } => {
+                InterfaceState::Unreachable {
+                    reason: reason.clone(),
+                    retrying: false,
+                }
+            }
+        }
+    }
+}
+
+/// An interface the watcher follows for the node's lifetime: a TCP client whose events it
+/// reads off the transport's interface events, or the local rnsd whose shared-instance
+/// client reports its connection state.
+pub(crate) enum WatchedInterface {
+    Tcp {
+        /// Position in `interface_states`.
+        index: usize,
+        label: String,
+        /// The interface address the client's events carry.
+        hash: AddressHash,
+        status: TcpRuntimeStatusHandle,
+        /// Whether the client was connected when `start` returned; one that was not
+        /// announces without the floor on its first `connected`.
+        connected_at_start: bool,
+    },
+    Local {
+        /// Position in `interface_states`.
+        index: usize,
+        label: String,
+        endpoint: LocalEndpoint,
+        /// The state events of a shared-instance client attached when `start` returned;
+        /// `None` once the watcher has taken them.
+        events: parking_lot::Mutex<Option<mpsc::Receiver<SharedInstanceEvent>>>,
+    },
+}
+
+impl WatchedInterface {
+    /// `None` for a LAN interface, which has no client to follow; a `local` rnsd is
+    /// watched from `Joined::Attached` or `Joined::Dialing`, never from here.
+    fn of(index: usize, iface: &JoinedInterface, connected_at_start: bool) -> Option<Self> {
+        match iface {
+            JoinedInterface::Lan { .. } | JoinedInterface::Local { .. } => None,
+            JoinedInterface::Tcp {
+                hash,
+                label,
+                status,
+                ..
+            } => Some(Self::Tcp {
+                index,
+                label: label.clone(),
+                hash: *hash,
+                status: status.clone(),
+                connected_at_start,
+            }),
+        }
+    }
+}
+
+struct DestinationState {
+    dest: Arc<Mutex<SingleInputDestination>>,
+    hash: AddressHash,
+    /// The name hash requests claim as their origin; moves with `dest` on a rekey.
+    origin: OriginName,
+    instance_id: String,
+    /// `None` only once the runtime has stopped and released it.
+    lock: Option<InstanceLock>,
+    last_announce: Option<Instant>,
+}
+
+/// The instance and destination the node speaks for, readable without waiting on the
+/// `destination` mutex: the peer surface and the pending store are asked for them on
+/// paths that cannot `.await`.
+struct CurrentIds {
+    instance_id: String,
+    destination_hash: String,
+}
+
+/// A name the human `.mesh` verbs take in place of a hash: one of your running sessions,
+/// or a label you gave a grant in the trust list. Peers never supply these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddressName {
+    pub name: String,
+    pub target: NameTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameTarget {
+    /// A session the instance registry lists as running here, by the destination it serves.
+    Session {
+        destination: String,
+        identity: String,
+    },
+    /// The label of a destination grant.
+    DestinationLabel {
+        destination: String,
+        identity: Option<String>,
+    },
+    /// The label of an identity grant, with every instance of that identity the peer
+    /// table holds, in hash order.
+    IdentityLabel {
+        identity: String,
+        instances: Vec<String>,
+    },
+}
+
+impl NameTarget {
+    /// The one destination the name stands for: an identity label only stands for one
+    /// when the peer table holds exactly one instance of the identity.
+    pub(crate) fn destination(&self) -> Option<&str> {
+        match self {
+            Self::Session { destination, .. } | Self::DestinationLabel { destination, .. } => {
+                Some(destination)
+            }
+            Self::IdentityLabel { instances, .. } => match instances.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The label you gave `destination` in the trust list: the one on its own grant, else
+/// the one on the grant of the identity the peer table hears it under. The grant this
+/// node gives its own identity carries a label you did not give, so it names nothing.
+pub(crate) fn owner_label<'a>(
+    names: &'a [AddressName],
+    destination: &str,
+) -> Option<&'a AddressName> {
+    let find = |own_grant: bool| {
+        names.iter().find(|name| match &name.target {
+            NameTarget::DestinationLabel {
+                destination: at, ..
+            } => own_grant && at == destination,
+            NameTarget::IdentityLabel { instances, .. } => {
+                !own_grant
+                    && name.name != SELF_TRUST_LABEL
+                    && instances.iter().any(|at| at == destination)
+            }
+            NameTarget::Session { .. } => false,
+        })
+    };
+    find(true).or_else(|| find(false))
+}
+
+/// One in-process Reticulum node: a transport over the configured interfaces, one destination
+/// derived from the session's mesh instance id, and the tasks that announce it and track peers.
+pub(crate) struct MeshRuntime {
+    fingerprint: String,
+    /// The start gave this node's existing identity its `this node` grant, which the
+    /// caller tells the user about once; a key minted by the start is granted silently.
+    self_trust_seeded_on_upgrade: bool,
+    transport_identity: TransportIdentity,
+    app_data: Vec<u8>,
+    announce: bool,
+    display_name: Option<String>,
+    about: Option<String>,
+    peer_limits: PeerLimitConfig,
+    request_timeouts: RequestTimeouts,
+    inline_max_bytes: u64,
+    /// The directory `mesh.fetch.inbox_dir` resolved to at node start; `None` stages
+    /// under the cache dir.
+    inbox_dir: Option<PathBuf>,
+    cache_dir: PathBuf,
+    serving: Arc<FetchServing>,
+    /// What the envoy remembers of each peer thread; `None` while `mesh.envoy_memory`
+    /// is off. Bound to the instance the node currently serves: `rebind_envoy_memory`
+    /// re-points it at the fork's store on a re-key.
+    envoy_memory: ArcSwapOption<EnvoySessions>,
+    envoy_memory_config: EnvoyMemoryConfig,
+    /// The threads any session on this cache dir has sent or received, which the tools
+    /// accept as a thread to continue. One list per config dir, so a fork keeps it
+    /// across a re-key.
+    sent_threads: Arc<SentThreads>,
+    memory: PeerMemory,
+    /// Every configured interface with what it is doing, in config order.
+    interface_states: RwLock<Vec<InterfaceStatus>>,
+    /// Every TCP client and `local` rnsd from the config, connected or not, in config
+    /// order.
+    watched_interfaces: Vec<WatchedInterface>,
+    /// The transport's interface events, subscribed before any interface joined; `None`
+    /// once the interface watcher has taken them.
+    interface_events: parking_lot::Mutex<Option<broadcast::Receiver<InterfaceEvent>>>,
+    hooks: MeshHooks,
+    /// `None` once `shutdown` has released this owner. `shutdown` stops the transport
+    /// explicitly, which cancels its tasks; the clones requests hold only keep the memory
+    /// alive until the last of them finishes. The request handler holds only a `Weak`
+    /// reference: an inbound request still being handled ends with the transport.
+    transport: Mutex<Option<Arc<Transport>>>,
+    interfaces: Mutex<Vec<JoinedInterface>>,
+    destination: Mutex<DestinationState>,
+    /// Held shared for the node's lifetime so no process rotates the key it announces
+    /// under; `None` once `shutdown` has released it. Outside `DestinationState` because a
+    /// rekey replaces that whole value and the identity does not change with it.
+    identity_lock: parking_lot::Mutex<Option<IdentityLock>>,
+    ids: RwLock<CurrentIds>,
+    /// This node's row in the instance registry, as filed under the current instance id:
+    /// `rekey` moves it to the fork's id and destination and `shutdown` removes it.
+    instance_row: parking_lot::Mutex<InstanceRow>,
+    peers: Arc<PeerTable>,
+    propagation_nodes: Arc<PropagationNodeTable>,
+    trust: Arc<TrustStore>,
+    request_handler: Arc<LibraryHandler>,
+    dispatcher: Arc<Dispatcher>,
+    knock_gate: Arc<KnockGate>,
+    /// Where fetched peer messages go; attached by the slot the node is installed into.
+    peer_surface: parking_lot::Mutex<Option<Weak<dyn PeerSurface>>>,
+    /// Where access requests are admitted; attached by the same slot.
+    access_surface: parking_lot::Mutex<Option<Weak<dyn AccessSurface>>>,
+    /// When `start` finished joining; the heartbeat's ticks are counted from here.
+    joined_at: SystemTime,
+    /// When this node last sent an announce, whichever destination and whatever the
+    /// cause: the start announce, a connect or reconnect, the heartbeat or a re-key.
+    /// Readable without the `destination` lock, unlike the floor `DestinationState` keeps.
+    last_announce_at: ArcSwapOption<SystemTime>,
+    /// Held for the length of one propagation fetch; a second caller is refused, never
+    /// queued behind the first.
+    fetching: Mutex<()>,
+    /// Held across one knock's or message's propagation-node post. `propagate` needs calls
+    /// for the same node serialised, so a second poster waits here rather than sharing
+    /// the out-link.
+    posting: Mutex<()>,
+    cancel: CancellationToken,
+    tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    /// Every request's path and deadlines in the order they were made, for the tests
+    /// that pin which deadline a path hands the client; those tests drive a live node,
+    /// which the loopback fixtures only do on unix.
+    #[cfg(all(test, unix))]
+    requests_made: parking_lot::Mutex<Vec<(String, RequestOptions)>>,
+    /// An error the next request ends with before it touches the wire, for the tests that
+    /// pin how a caller routes a failure loopback cannot stage.
+    #[cfg(all(test, unix))]
+    next_request_error: parking_lot::Mutex<Option<RequestError>>,
+}
+
+impl MeshRuntime {
+    /// Brings a node up for `session` and returns it running. Validation comes first so a bad
+    /// config touches nothing on disk; the instance lock is taken before the identity is minted
+    /// so a refused start never creates a key. A trust list that does not load refuses the
+    /// start outright: the node never serves against a partial list.
+    pub(crate) async fn start(
+        config: &MeshConfig,
+        function_calling_support: bool,
+        session: &mut Session,
+        paths: MeshPaths,
+        options: NodeOptions,
+    ) -> Result<Arc<Self>> {
+        // `validate` is a no-op while `enabled` is false, and the caller is about to turn the
+        // mesh on, so the checks have to run against the enabled view of the config.
+        let mut enabled_view = config.clone();
+        enabled_view.enabled = true;
+        enabled_view.validate(function_calling_support)?;
+        let plans = plan_interfaces(config.interfaces());
+        let app_data = announce_app_data(config, options.agent.as_deref())?;
+        let trust = Arc::new(TrustStore::open(&paths.config_dir)?);
+        trust.set_observer(Arc::new(TrustHookObserver(options.hooks.clone())));
+        trust.set_collision_protection(config.collision_protection);
+
+        let instance_id = session.ensure_mesh_instance_id().to_string();
+        let lock = InstanceLock::acquire(&paths.cache_dir, &instance_id)?;
+        let identity_lock = IdentityLock::share(&paths.identity_path)?;
+        let minted = !paths.identity_path.exists();
+        let core_identity = identity::load_or_mint_identity(&paths.identity_path)?;
+        let fingerprint = identity::fingerprint(&core_identity);
+        trust.set_own_identity(&fingerprint)?;
+        let transport_identity = to_transport_private_identity(&core_identity);
+        let peers = Arc::new(PeerTable::load(
+            mesh_cache_dir(&paths.cache_dir).join("peers.json"),
+            SystemTime::now(),
+        )?);
+        let propagation_nodes = Arc::new(PropagationNodeTable::load(
+            mesh_cache_dir(&paths.cache_dir).join(PROPAGATION_NODE_TABLE_FILE),
+            SystemTime::now(),
+        )?);
+        let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
+        let sent_threads = SentThreads::open(&paths.cache_dir)?;
+        let envoy_memory =
+            EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
+        if let Some(store) = &envoy_memory {
+            prune_envoy_memory(store);
+        }
+        let inbox_dir = config
+            .fetch
+            .inbox_dir_with(|configured| (options.translate_inbox_dir)(configured));
+        if let (Some(configured), Some(resolved)) =
+            (config.fetch.inbox_dir.as_deref(), inbox_dir.as_deref())
+            && resolved != configured
+        {
+            info!(
+                "mesh.fetch.inbox_dir '{}' not found; resolved to sandboxed path '{}'",
+                configured.display(),
+                resolved.display()
+            );
+        }
+        let serving = Arc::new(FetchServing::new(
+            paths.config_dir,
+            paths.cache_dir.clone(),
+            inbox_dir.clone(),
+            config.fetch.max_bytes,
+            grants,
+            options.hooks.clone(),
+        ));
+
+        let transport = Transport::new(TransportConfig::new(
+            SCOPE_APP_NAME,
+            &transport_identity,
+            false,
+        ));
+        // Every stream is subscribed before an interface is joined so nothing is missed.
+        let announces = transport.recv_announces().await;
+        let interface_events = transport.interface_events();
+        let mut joined = Vec::with_capacity(plans.len());
+        let mut states = Vec::with_capacity(plans.len());
+        let mut watched = Vec::new();
+        let mut failures = Vec::new();
+        for (index, plan) in plans.iter().enumerate() {
+            let outcome = join_interface(&transport, plan, &options, plans.len() == 1).await;
+            states.push(plan.status(outcome.start_state()));
+            match outcome {
+                Joined::Connected(iface) => {
+                    watched.extend(WatchedInterface::of(index, &iface, true));
+                    joined.push(iface);
+                }
+                Joined::Attached {
+                    label,
+                    endpoint,
+                    events,
+                } => {
+                    info!("Mesh interface {label} connected");
+                    watched.push(WatchedInterface::Local {
+                        index,
+                        label: label.clone(),
+                        endpoint,
+                        events: parking_lot::Mutex::new(Some(events)),
+                    });
+                    joined.push(JoinedInterface::Local { label });
+                }
+                Joined::Dialing {
+                    label,
+                    endpoint,
+                    events,
+                    message,
+                    ..
+                } => {
+                    watched.push(WatchedInterface::Local {
+                        index,
+                        label: label.clone(),
+                        endpoint,
+                        events: parking_lot::Mutex::new(Some(events)),
+                    });
+                    joined.push(JoinedInterface::Local { label });
+                    failures.push(message);
+                }
+                Joined::Pending { iface, message, .. } => {
+                    watched.extend(WatchedInterface::of(index, &iface, false));
+                    joined.push(iface);
+                    failures.push(message);
+                }
+                Joined::NotReached { message, .. } | Joined::Failed { message, .. } => {
+                    failures.push(message);
+                }
+            }
+        }
+        let transport = Arc::new(transport);
+        if !states
+            .iter()
+            .any(|status| status.state == InterfaceState::Connected)
+        {
+            abandon_start(transport, joined, None).await;
+            // `validate` refused an empty list above, so every plan failed and the first
+            // failure is the first plan.
+            let mut text = failures[0].clone();
+            // A `local` refusal already names its one fix (start rnsd or fix
+            // mesh.interfaces); the relay hint would stack a second next step on it.
+            if states[0].kind != "local" && states.iter().all(InterfaceStatus::is_loopback) {
+                text.push_str(&loopback_hint(
+                    states[0].endpoint.as_deref().unwrap_or_default(),
+                ));
+            }
+            bail!(text);
+        }
+        let (knock_sink, knock_rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
+        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink));
+        let request_handler = Arc::new(LibraryHandler::new(dispatcher.clone()));
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let (dest, hash, origin) = match register_destination(
+            &transport,
+            &transport_identity,
+            &instance_id,
+            &app_data,
+            &request_handler,
+            deadline,
+        )
+        .await
+        {
+            Ok(registered) => registered,
+            Err(err) => {
+                abandon_start(transport, joined, Some(&request_handler)).await;
+                return Err(err.context(format!(
+                    "The mesh node's destination could not be registered within {}s",
+                    SHUTDOWN_GRACE.as_secs()
+                )));
+            }
+        };
+        let mut last_announce = None;
+        let last_announce_at = ArcSwapOption::empty();
+        if config.announce {
+            match timeout_at(
+                deadline,
+                announce_destination(&transport, &dest, &hash, &app_data, &last_announce_at),
+            )
+            .await
+            {
+                Ok(Ok(sent_at)) => last_announce = Some(sent_at),
+                Ok(Err(err)) => {
+                    abandon_start(transport, joined, Some(&request_handler)).await;
+                    return Err(err);
+                }
+                Err(_) => {
+                    abandon_start(transport, joined, Some(&request_handler)).await;
+                    bail!(
+                        "The mesh node's first announce for destination {} was not sent within {}s",
+                        hash.to_hex_string(),
+                        SHUTDOWN_GRACE.as_secs()
+                    );
+                }
+            }
+        }
+        let self_trust_granted = seed_own_grant(&trust, &fingerprint, minted);
+        debug!(
+            "Started mesh node {} (instance {instance_id}) as destination {}",
+            short(&fingerprint),
+            short(&hash.to_hex_string())
+        );
+        let instance_row = InstanceRow::started_now(
+            hash.to_hex_string(),
+            session.name().to_string(),
+            options.agent.clone(),
+        );
+        instances::register(&paths.cache_dir, &instance_id, instance_row.clone());
+
+        // Nothing fallible may follow: a failure once the tasks exist would leak them.
+        let knock_gate = Arc::new(KnockGate::new(
+            trust.clone(),
+            peers.clone(),
+            KnockCache::new(&paths.cache_dir, config.knock_retention_hours),
+            options.hooks.clone(),
+        ));
+        let runtime = Arc::new(Self {
+            fingerprint,
+            self_trust_seeded_on_upgrade: self_trust_granted && !minted,
+            transport_identity,
+            app_data,
+            announce: config.announce,
+            display_name: config.display_name.clone(),
+            about: config.about.clone(),
+            peer_limits: PeerLimitConfig::from(config),
+            request_timeouts: RequestTimeouts::from(config),
+            inline_max_bytes: config.fetch.inline_max_bytes,
+            inbox_dir,
+            cache_dir: paths.cache_dir,
+            serving,
+            envoy_memory: ArcSwapOption::new(envoy_memory),
+            envoy_memory_config: config.envoy_memory.clone(),
+            sent_threads: Arc::new(sent_threads),
+            memory: PeerMemory::default(),
+            interface_states: RwLock::new(states),
+            watched_interfaces: watched,
+            interface_events: parking_lot::Mutex::new(Some(interface_events)),
+            hooks: options.hooks,
+            transport: Mutex::new(Some(transport.clone())),
+            interfaces: Mutex::new(joined),
+            destination: Mutex::new(DestinationState {
+                dest,
+                hash,
+                origin,
+                instance_id: instance_id.clone(),
+                lock: Some(lock),
+                last_announce,
+            }),
+            identity_lock: parking_lot::Mutex::new(Some(identity_lock)),
+            ids: RwLock::new(CurrentIds {
+                instance_id,
+                destination_hash: hash.to_hex_string(),
+            }),
+            instance_row: parking_lot::Mutex::new(instance_row),
+            peers,
+            propagation_nodes,
+            trust,
+            request_handler,
+            dispatcher,
+            knock_gate,
+            peer_surface: parking_lot::Mutex::new(None),
+            access_surface: parking_lot::Mutex::new(None),
+            joined_at: SystemTime::now(),
+            last_announce_at,
+            fetching: Mutex::new(()),
+            posting: Mutex::new(()),
+            cancel: CancellationToken::new(),
+            tasks: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(all(test, unix))]
+            requests_made: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(all(test, unix))]
+            next_request_error: parking_lot::Mutex::new(None),
+        });
+        runtime.register_task(tokio::spawn(receive_announces(
+            announces,
+            runtime.peers.clone(),
+            runtime.trust.clone(),
+            runtime.propagation_nodes.clone(),
+            runtime.hooks.clone(),
+            runtime.cancellation_token(),
+        )));
+        runtime.register_task(tokio::spawn(drain_knocks(
+            knock_rx,
+            runtime.knock_gate.clone(),
+            runtime.cancellation_token(),
+        )));
+        runtime.register_task(tokio::spawn(sweep_peers(
+            runtime.peers.clone(),
+            runtime.cancellation_token(),
+        )));
+        runtime.register_task(tokio::spawn(persist_tables_periodically(
+            runtime.peers.clone(),
+            runtime.propagation_nodes.clone(),
+            runtime.cancellation_token(),
+        )));
+        runtime
+            .trust()
+            .attach_envoy_memory(Arc::downgrade(&runtime) as Weak<dyn EnvoyMemorySink>);
+        if config.envoy_memory.enabled {
+            let swept = Arc::downgrade(&runtime);
+            runtime.register_task(tokio::spawn(sweep_envoy_memory(
+                move || swept.upgrade().and_then(|runtime| runtime.envoy_memory()),
+                runtime.cancellation_token(),
+            )));
+        }
+        if config.announce {
+            runtime.register_task(tokio::spawn(announce_periodically(
+                runtime.clone(),
+                runtime.cancellation_token(),
+            )));
+        }
+        Ok(runtime)
+    }
+
+    /// Test oracle: `instance_id` read under the destination lock, checked against the cache.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn instance_id(&self) -> String {
+        self.destination.lock().await.instance_id.clone()
+    }
+
+    /// `instance_id` without the wait, from the cache `start` fills and `rekey` moves.
+    pub(crate) fn current_instance_id(&self) -> String {
+        self.ids.read().instance_id.clone()
+    }
+
+    /// `destination_hash` without the wait, from the cache `start` fills and `rekey` moves.
+    pub(crate) fn current_destination_hash(&self) -> String {
+        self.ids.read().destination_hash.clone()
+    }
+
+    /// The sessions of yours running on this cache dir, this one included, by the
+    /// destination each serves, as the instance registry lists them.
+    pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
+        instances::live(&self.cache_dir)
+            .into_iter()
+            .map(|(destination, row)| (destination, row.session))
+            .collect()
+    }
+
+    /// The questions the other sessions on this cache dir asked and still wait on or
+    /// have yet to collect, newest first, each with what the instance registry says of
+    /// the session that asked it (`None` once its row is gone).
+    pub(crate) fn other_sessions_asked(
+        &self,
+        now: SystemTime,
+    ) -> Vec<(OtherSessionAsk, Option<InstanceSession>)> {
+        let sessions = instances::sessions_by_instance(&self.cache_dir);
+        other_sessions_asked(&self.cache_dir, &self.current_instance_id(), now)
+            .into_iter()
+            .map(|ask| {
+                let session = sessions.get(&ask.instance_id).cloned();
+                (ask, session)
+            })
+            .collect()
+    }
+
+    /// Files this node's registry row under `session`, the name the context now serves
+    /// it for: a fork's name differs from the session the node started for.
+    pub(crate) fn rename_session(&self, session: &str) {
+        let mut row = self.instance_row.lock();
+        row.session = session.to_string();
+        instances::register(&self.cache_dir, &self.current_instance_id(), row.clone());
+    }
+
+    /// Every name the human verbs resolve: your running sessions in destination order,
+    /// then the labelled grants in the trust list's order. An unnamed session and a blank
+    /// label name nothing.
+    pub(crate) fn address_names(&self) -> Vec<AddressName> {
+        let mut sessions: Vec<(String, String)> = self
+            .own_sessions()
+            .into_iter()
+            .filter(|(_, session)| !session.trim().is_empty())
+            .collect();
+        sessions.sort_unstable();
+        let peers = self.peers().snapshot();
+        let mut names: Vec<AddressName> = sessions
+            .into_iter()
+            .map(|(destination, session)| AddressName {
+                name: session,
+                target: NameTarget::Session {
+                    destination,
+                    identity: self.fingerprint.clone(),
+                },
+            })
+            .collect();
+        for record in self.trust().records() {
+            let Some(label) = record.label.filter(|label| !label.trim().is_empty()) else {
+                continue;
+            };
+            let target = match record.tier {
+                Tier::Destination => NameTarget::DestinationLabel {
+                    destination: record.hash,
+                    identity: record.identity,
+                },
+                Tier::Identity => {
+                    let mut instances: Vec<String> = peers
+                        .iter()
+                        .filter(|peer| peer.identity_hash == record.hash)
+                        .map(|peer| peer.destination_hash.clone())
+                        .collect();
+                    instances.sort_unstable();
+                    instances.dedup();
+                    NameTarget::IdentityLabel {
+                        identity: record.hash,
+                        instances,
+                    }
+                }
+            };
+            names.push(AddressName {
+                name: label,
+                target,
+            });
+        }
+        names
+    }
+
+    /// A peer's `NoAccess` as every request path reports it: the peer by the name the
+    /// table filed for `destination`, this node by its current destination.
+    pub(crate) fn remote_refusal(&self, destination: &str) -> RemoteRefusal {
+        let display_name = self
+            .peers()
+            .get(destination)
+            .and_then(|peer| peer.display_name);
+        RemoteRefusal::new(
+            destination,
+            display_name.as_deref(),
+            self.current_destination_hash(),
+        )
+    }
+
+    /// A peer's silence after the link came up, with this node by the same current
+    /// destination `remote_refusal` names.
+    pub(crate) fn no_answer(&self, destination: &str) -> NoAnswer {
+        NoAnswer::new(destination, self.current_destination_hash())
+    }
+
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// The envoy's conversation memory for the instance the node currently serves; a
+    /// re-key re-points it to the fork's store, so a fork never reads the original's
+    /// conversations. `None` while `mesh.envoy_memory` is off.
+    pub(crate) fn envoy_memory(&self) -> Option<Arc<EnvoySessions>> {
+        self.envoy_memory.load_full()
+    }
+
+    /// Opens the envoy memory of `instance_id`, prunes it as `start` would, and remembers
+    /// into it, handing back the store it displaces so a caller that has to undo the
+    /// switch can put it back without touching the disk. The displaced store's directory
+    /// is left as it is: the fork never reads it. A no-op while `mesh.envoy_memory` is off.
+    pub(crate) fn rebind_envoy_memory(&self, instance_id: &str) -> Option<Arc<EnvoySessions>> {
+        let store = EnvoySessions::open(&self.cache_dir, instance_id, &self.envoy_memory_config)
+            .map(Arc::new);
+        if let Some(store) = &store {
+            prune_envoy_memory(store);
+        }
+        self.envoy_memory.swap(store)
+    }
+
+    /// Remembers into `store` again: the infallible half of `rebind_envoy_memory`.
+    pub(crate) fn restore_envoy_memory(&self, store: Option<Arc<EnvoySessions>>) {
+        self.envoy_memory.store(store);
+    }
+
+    pub(crate) fn sent_threads(&self) -> Arc<SentThreads> {
+        Arc::clone(&self.sent_threads)
+    }
+
+    /// The share root's serving state: the local size limit, the grant store and the
+    /// case probe the `/list` and `/fetch` providers read.
+    pub(crate) fn serving(&self) -> &Arc<FetchServing> {
+        &self.serving
+    }
+
+    /// What this node last heard from each peer: status cards and listing pages.
+    pub(crate) fn memory(&self) -> &PeerMemory {
+        &self.memory
+    }
+
+    /// Where a file fetched from a peer is staged: under the directory
+    /// `mesh.fetch.inbox_dir` resolved to at node start when set, else under the cache
+    /// dir, keyed by the instance this node speaks for right now.
+    pub(crate) fn inbox_staging(&self) -> InboxStaging {
+        InboxStaging::for_instance_under(
+            self.inbox_dir.as_deref(),
+            &self.cache_dir,
+            &self.current_instance_id(),
+        )
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn self_trust_seeded_on_upgrade(&self) -> bool {
+        self.self_trust_seeded_on_upgrade
+    }
+
+    /// The configured display name, as the status card carries it to trusted peers.
+    /// `display_name_on_public` gates announces only; the card is exempt because it
+    /// reaches trusted destinations and nobody else.
+    pub(crate) fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    /// The name this node's announces carry, label included, as a peer decodes it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn announced_name(&self) -> Option<String> {
+        AnnounceAppData::decode(&self.app_data)?.display_name
+    }
+
+    /// The configured `mesh.about` line, carried on the status card and nowhere else.
+    pub(crate) fn about(&self) -> Option<&str> {
+        self.about.as_deref()
+    }
+
+    /// The per-peer ceilings the node was started with, for the slot that installs it.
+    pub(crate) fn peer_limits(&self) -> PeerLimitConfig {
+        self.peer_limits
+    }
+
+    /// The configured deadlines, for the paths that raise their own by them.
+    pub(crate) fn request_timeouts(&self) -> RequestTimeouts {
+        self.request_timeouts
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn requests_made(&self) -> Vec<(String, RequestOptions)> {
+        self.requests_made.lock().clone()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_next_request(&self, err: RequestError) {
+        *self.next_request_error.lock() = Some(err);
+    }
+
+    /// The ceilings an inbound message's parts are admitted under.
+    pub(crate) fn part_limits(&self) -> PartLimits {
+        PartLimits {
+            inline_max_bytes: self.inline_max_bytes,
+        }
+    }
+
+    /// `send_peer` for a message the human attached a file to: a file carried by
+    /// reference is first lent to the peer as a one-off grant under the message's id, so
+    /// the peer may fetch it once within the default TTL. A send that then fails takes
+    /// the grant back: the peer never heard of the file. A message with no reference
+    /// part is sent as it is.
+    pub(crate) async fn send_peer_lending_reference(
+        &self,
+        destination_hex: &str,
+        message: &OutboundPeer,
+    ) -> Result<SendOutcome> {
+        let references: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                RawPart::File {
+                    reference: Some(reference),
+                    ..
+                } => Some(reference.clone()),
+                _ => None,
+            })
+            .collect();
+        let grants = self.serving().grants();
+        if !references.is_empty() {
+            grants.grant(
+                &message.id,
+                destination_hex,
+                &references,
+                None,
+                SystemTime::now(),
+            )?;
+        }
+        match self.send_peer(destination_hex, message).await {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                if !references.is_empty()
+                    && let Err(revoke) = grants.revoke(&message.id, destination_hex)
+                {
+                    bail!(
+                        "{err}; and the one-off grant lent to {} for it could not be taken back: {revoke:#}",
+                        short(destination_hex)
+                    );
+                }
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Test oracle: `destination_hash` read under the destination lock, checked against the cache.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn destination_hash(&self) -> String {
+        self.destination.lock().await.hash.to_hex_string()
+    }
+
+    /// Human labels of the connected interfaces, in config order. A pending interface
+    /// joins the list when the interface watcher sees it come up; `mesh.started` fired once
+    /// at install with the kinds connected then and nothing refires on a later connect,
+    /// so a hook consumer learns of it only through `.mesh info`.
+    pub(crate) fn interfaces(&self) -> Vec<String> {
+        self.connected_interfaces()
+            .map(|status| status.label)
+            .collect()
+    }
+
+    /// The connected interfaces by kind only (`lan`, `local`, `private`, `public`), in
+    /// config order; a later connect updates it the same way as `interfaces`.
+    pub(crate) fn interface_kinds(&self) -> Vec<&'static str> {
+        self.connected_interfaces()
+            .map(|status| status.kind)
+            .collect()
+    }
+
+    fn connected_interfaces(&self) -> impl Iterator<Item = InterfaceStatus> {
+        self.interface_states()
+            .into_iter()
+            .filter(|status| status.state == InterfaceState::Connected)
+    }
+
+    /// Every configured interface with its current state, in config order.
+    pub(crate) fn interface_states(&self) -> Vec<InterfaceStatus> {
+        self.interface_states.read().clone()
+    }
+
+    /// Every interface the interface watcher follows: each TCP client with its status
+    /// handle, each `local` rnsd with its endpoint.
+    pub(crate) fn watched_interfaces(&self) -> &[WatchedInterface] {
+        &self.watched_interfaces
+    }
+
+    pub(crate) fn joined_at(&self) -> SystemTime {
+        self.joined_at
+    }
+
+    /// When this node last sent an announce of any kind; `None` until it has sent one.
+    pub(crate) fn last_announce_at(&self) -> Option<SystemTime> {
+        self.last_announce_at.load().as_deref().copied()
+    }
+
+    /// Whether the node announces at all (`mesh.announce`).
+    pub(crate) fn announces(&self) -> bool {
+        self.announce
+    }
+
+    /// Records that the interface at `index` came up and returns its label; `None` when
+    /// it was already connected or there is no such interface.
+    pub(crate) fn mark_interface_connected(&self, index: usize) -> Option<String> {
+        let mut states = self.interface_states.write();
+        let status = states.get_mut(index)?;
+        if status.state == InterfaceState::Connected {
+            return None;
+        }
+        status.state = InterfaceState::Connected;
+        Some(status.label.clone())
+    }
+
+    /// Records `state` for the interface at `index` and returns its label; `None` when it
+    /// was already in that state or there is no such interface.
+    pub(crate) fn mark_interface_state(
+        &self,
+        index: usize,
+        state: InterfaceState,
+    ) -> Option<String> {
+        let mut states = self.interface_states.write();
+        let status = states.get_mut(index)?;
+        if status.state == state {
+            return None;
+        }
+        status.state = state;
+        Some(status.label.clone())
+    }
+
+    pub(crate) fn hooks(&self) -> &MeshHooks {
+        &self.hooks
+    }
+
+    pub(crate) fn peers(&self) -> Arc<PeerTable> {
+        self.peers.clone()
+    }
+
+    /// The LXMF propagation nodes heard so far, as `fetch_propagated` chooses among them.
+    pub(crate) fn propagation_nodes(&self) -> Arc<PropagationNodeTable> {
+        self.propagation_nodes.clone()
+    }
+
+    pub(crate) fn trust(&self) -> Arc<TrustStore> {
+        self.trust.clone()
+    }
+
+    /// The gate every inbound request passes; providers register their paths on it.
+    /// `register` returns the provider it displaced, a placeholder counting as nothing
+    /// displaced; `/knock` is owned by the dispatcher itself and registering it is refused.
+    pub(crate) fn dispatcher(&self) -> Arc<Dispatcher> {
+        self.dispatcher.clone()
+    }
+
+    /// Where every knock lands, from a link or from a propagation node.
+    pub(crate) fn knock_gate(&self) -> Arc<KnockGate> {
+        self.knock_gate.clone()
+    }
+
+    /// Where peer messages fetched from a propagation node land. Held weakly: the slot
+    /// owns the runtime.
+    pub(crate) fn attach_peer_surface(&self, surface: Weak<dyn PeerSurface>) {
+        *self.peer_surface.lock() = Some(surface);
+    }
+
+    /// Where access requests are admitted, from a link or a propagation node. Held
+    /// weakly for the same reason as the peer surface.
+    pub(crate) fn attach_access_surface(&self, surface: Weak<dyn AccessSurface>) {
+        *self.access_surface.lock() = Some(surface);
+    }
+
+    pub(crate) fn access_surface(&self) -> Option<Arc<dyn AccessSurface>> {
+        self.access_surface.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn has_destination(&self, hex: &str) -> bool {
+        let hash = AddressHash::new_from_hex_string(hex).unwrap();
+        match self.transport.lock().await.as_ref() {
+            Some(transport) => transport.has_destination(&hash).await,
+            None => false,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn transport(&self) -> Option<Arc<Transport>> {
+        self.transport.lock().await.clone()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn max_request_size(&self) -> Option<usize> {
+        let state = self.destination.lock().await;
+        state.dest.lock().await.max_request_size()
+    }
+
+    /// The paths the node's current destination was given a request handler for, in
+    /// registration order.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn registered_request_paths(&self) -> Vec<&'static str> {
+        let hash = self.destination.lock().await.hash;
+        REGISTERED_REQUEST_PATHS
+            .lock()
+            .iter()
+            .filter(|(destination, _)| *destination == hash)
+            .map(|(_, path)| *path)
+            .collect()
+    }
+
+    /// The node's private key as hex, for tests that prove no hook env carries it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn private_key_hex(&self) -> String {
+        to_core_private_identity(&self.transport_identity).to_hex_string()
+    }
+
+    /// A token cancelled when the node stops; every task the node owns should watch it.
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.child_token()
+    }
+
+    /// Adopts a task so `stop` waits for it to finish.
+    pub(crate) fn register_task(&self, handle: JoinHandle<()>) {
+        self.tasks.lock().push(handle);
+    }
+
+    /// A handle on the running transport, `None` once the node has stopped. Taken so the
+    /// `transport` guard is not held across the caller's waits.
+    pub(super) async fn transport_handle(&self) -> Option<Arc<Transport>> {
+        self.transport.lock().await.clone()
+    }
+
+    /// Hands `build(origin)` to `node` for `recipient`, queued behind `posting` since
+    /// `propagate` needs one caller per node at a time. `build` gets this node's current
+    /// origin so the stored message names the instance sending it.
+    pub(super) async fn post_to_node(
+        &self,
+        recipient: &Identity,
+        node: &PropagationNode,
+        build: impl FnOnce(&OriginName) -> OutboundMessage,
+        options: &PropagationOptions,
+    ) -> Result<(), PropagationError> {
+        let _posting = self.posting.lock().await;
+        let transport = self
+            .transport_handle()
+            .await
+            .ok_or(PropagationError::Link(RequestError::NotRunning))?;
+        let sender = to_core_private_identity(&self.transport_identity);
+        let origin = self.destination.lock().await.origin;
+        let cancel = self.cancellation_token();
+        let asked =
+            request_path_to_node(&transport, node, &cancel, PropagationError::Cancelled).await?;
+        let options = PropagationOptions {
+            path_requested: options.path_requested || asked,
+            ..*options
+        };
+        propagation::propagate(
+            &transport,
+            &sender,
+            recipient,
+            node,
+            &build(&origin),
+            cancel,
+            &options,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Sends one request to `destination` over a link, proving this node's identity first
+    /// and naming its current instance as the origin.
+    pub(crate) async fn request(
+        &self,
+        destination: &DestinationDesc,
+        path: &str,
+        data: rmpv::Value,
+        options: RequestOptions,
+    ) -> Result<rmpv::Value, RequestError> {
+        let envelope = self.envelope(data).await;
+        self.request_envelope(destination, path, envelope, options)
+            .await
+    }
+
+    /// `request` with the envelope already built. Every request to a peer passes here: a peer
+    /// the table knows speaks another protocol is refused before any link is opened, and a
+    /// peer that refuses this node's version over the wire is marked so the next request is
+    /// refused here.
+    async fn request_envelope(
+        &self,
+        destination: &DestinationDesc,
+        path: &str,
+        envelope: Envelope,
+        options: RequestOptions,
+    ) -> Result<rmpv::Value, RequestError> {
+        #[cfg(all(test, unix))]
+        self.requests_made.lock().push((path.to_string(), options));
+        #[cfg(all(test, unix))]
+        if let Some(err) = self.next_request_error.lock().take() {
+            return Err(err);
+        }
+        let dest_hex = destination.address_hash.to_hex_string();
+        refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
+        let transport = self
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or(RequestError::NotRunning)?;
+        let sent = envelope.version;
+        let request = link_request(
+            &transport,
+            &self.transport_identity,
+            destination,
+            path,
+            envelope,
+            options,
+        );
+        // Dropping the request future does not cancel it in the library: the responder
+        // still serves it and the library's own timer retires the entry.
+        let outcome = tokio::select! {
+            () = self.cancel.cancelled() => Err(RequestError::Shutdown),
+            outcome = request => outcome,
+        };
+        note_version_refusal(&self.peers, &dest_hex, path, sent, &outcome);
+        outcome
+    }
+
+    /// `body` in the envelope naming the instance this node speaks for right now, read per
+    /// request so a rekeyed node claims its new instance and never a cached one.
+    async fn envelope(&self, body: rmpv::Value) -> Envelope {
+        Envelope::new(self.destination.lock().await.origin, body)
+    }
+
+    /// Asks the peer `route` leads to to trust this node's current instance, with `intro`
+    /// as the words. The link is tried first; a peer that cannot be reached gets the knock
+    /// held by a propagation node until it next fetches.
+    pub(crate) async fn knock(
+        &self,
+        route: Route,
+        intro: &KnockIntro,
+    ) -> Result<KnockOutcome, KnockError> {
+        let mut options = KnockOptions::default();
+        options.request = route.options(self.request_timeouts.raise(options.request));
+        self.knock_with(&route.desc, intro, options).await
+    }
+
+    /// `knock` with its timeouts chosen. The dispatcher answers a knock with `NoAccess` by
+    /// design, so that refusal (or an answer) means the knock landed. Only the
+    /// peer-unreachable errors fall back to store-and-forward: any other refusal code did
+    /// not file the knock and is not unreachability; a peer that refuses this node's
+    /// protocol version heard the knock and a stored one would meet the same peer; an
+    /// oversize or undecodable frame is this node's fault and storing it would not help.
+    /// A link that came up and drew no reply is kept apart from one that never came up:
+    /// a peer that does not trust this identity answers a knock with silence, so that
+    /// outcome is reported as unanswered, never as the peer being unreachable.
+    /// A knock whose upload ran out before the peer had all of it is unanswered too: the
+    /// peer never filed it, so the stored copy cannot land twice.
+    /// A wait that ran out on this node's side, or with the peer's answer still
+    /// arriving, is neither: it is reported with the retry and not stored.
+    /// Posts to the propagation node queue behind `posting`, since `propagate` needs one
+    /// caller per node at a time.
+    pub(crate) async fn knock_with(
+        &self,
+        destination: &DestinationDesc,
+        intro: &KnockIntro,
+        options: KnockOptions,
+    ) -> Result<KnockOutcome, KnockError> {
+        let dest_hex = destination.address_hash.to_hex_string();
+        let dest8 = short(&dest_hex);
+        let (fallback, failure) = match self
+            .request(
+                destination,
+                KNOCK_PATH,
+                intro.to_request_body(),
+                options.request,
+            )
+            .await
+        {
+            Ok(_) | Err(RequestError::Refused(RefusalCode::NoAccess)) => {
+                return Ok(KnockOutcome {
+                    via: KnockVia::Direct,
+                    fallback: None,
+                });
+            }
+            Err(err @ (RequestError::Timeout { .. } | RequestError::RequestIncomplete { .. })) => {
+                (KnockFallback::Unanswered, err)
+            }
+            Err(
+                err @ (RequestError::LinkActivationTimeout { .. }
+                | RequestError::LinkFailed(_)
+                | RequestError::LinkClosed),
+            ) => (KnockFallback::Unreachable, err),
+            Err(RequestError::NotRunning | RequestError::Shutdown) => {
+                return Err(KnockError::NotRunning);
+            }
+            Err(err @ RequestError::UnsupportedVersion { .. }) => {
+                return Err(KnockError::Direct(err));
+            }
+            Err(err) => {
+                debug!(
+                    "Mesh knock to {dest8} was not filed over the link: {}",
+                    redact_hashes(&err.to_string())
+                );
+                return Err(KnockError::Direct(err));
+            }
+        };
+        // Selected before queueing behind another post: a knocker with no node to fall
+        // back on is told so at once rather than after someone else's transfer.
+        let node = self
+            .propagation_nodes
+            .select_for_posting()
+            .map_err(|_| match fallback {
+                KnockFallback::Unanswered => KnockError::Unanswered {
+                    dest8: dest8.to_string(),
+                },
+                KnockFallback::Unreachable => KnockError::NoPropagationNode,
+            })?;
+        let node_hex = node.destination.address_hash.to_hex_string();
+        match fallback {
+            KnockFallback::Unanswered => debug!(
+                "Mesh knock to {dest8} drew no answer over the link ({}); storing it with propagation node {}",
+                redact_hashes(&failure.to_string()),
+                short(&node_hex)
+            ),
+            KnockFallback::Unreachable => debug!(
+                "Mesh knock to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
+                redact_hashes(&failure.to_string()),
+                short(&node_hex)
+            ),
+        }
+        self.post_to_node(
+            &destination.identity,
+            &node,
+            |origin| knock_message(intro, origin),
+            &options.propagation,
+        )
+        .await
+        .map_err(|err| match err {
+            PropagationError::Cancelled
+            | PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
+                KnockError::NotRunning
+            }
+            other => KnockError::Propagation {
+                fallback,
+                err: other,
+            },
+        })?;
+        Ok(KnockOutcome {
+            via: KnockVia::StoreAndForward,
+            fallback: Some(fallback),
+        })
+    }
+
+    /// Fetches the messages the nearest announced propagation node holds for this node,
+    /// handing the ones that pass every check to `sink`; knocks, access requests and peer
+    /// messages go to the knock gate and the access and peer surfaces instead. The dedup
+    /// store is read from disk for each fetch and written back before the node is told to
+    /// delete anything, so a message survives a restart between the two as a remembered id
+    /// rather than a second delivery. One fetch runs at a time across every Coyote process
+    /// of this identity; stopping the node cancels it.
+    pub(crate) async fn fetch_propagated(
+        &self,
+        sink: &dyn InboundSink,
+    ) -> Result<FetchReport, FetchError> {
+        let Ok(_fetching) = self.fetching.try_lock() else {
+            return Err(FetchError::AlreadyRunning);
+        };
+        let store_path = mesh_cache_dir(&self.cache_dir).join("propagation.json");
+        let _lock = propagation_fetch::FetchLock::acquire(&store_path)?;
+        let transport = self
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or(FetchError::Link(RequestError::NotRunning))?;
+        let node = self.propagation_nodes.select()?;
+        let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
+        let cancel = self.cancellation_token();
+        let asked = request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
+        let peers = PeerRouting {
+            trust: &self.trust,
+            surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
+            inner: sink,
+        };
+        let access = AccessRouting {
+            trust: &self.trust,
+            surface: self.access_surface(),
+            inner: &peers,
+        };
+        let routing = KnockRouting {
+            gate: &self.knock_gate,
+            inner: &access,
+        };
+        propagation_fetch::fetch(
+            &transport,
+            &self.transport_identity,
+            &node,
+            &self.peers,
+            &self.trust,
+            &mut store,
+            &routing,
+            &FetchOptions {
+                path_requested: asked,
+                ..FetchOptions::default()
+            },
+            cancel,
+        )
+        .await
+    }
+
+    /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_request_handler(&self, handler: Arc<dyn RequestHandler>) {
+        self.request_handler.set_handler(handler);
+    }
+
+    /// Handler slots not in use; every one of them once `shutdown` has returned.
+    #[cfg(all(test, unix))]
+    pub(crate) fn free_request_handler_slots(&self) -> usize {
+        self.request_handler.available_permits()
+    }
+
+    /// Announces the current destination unless it was announced within
+    /// `REANNOUNCE_FLOOR_SECS`, in which case nothing is sent and `Ok(false)` is returned.
+    pub(crate) async fn announce_now(&self) -> Result<bool> {
+        let mut state = self.destination.lock().await;
+        if state
+            .last_announce
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS))
+        {
+            return Ok(false);
+        }
+        let transport = self.running_transport().await?;
+        timeout(REKEY_GRACE, self.send_announce(&mut state, &transport))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "The mesh transport did not send the announce for destination {} within {}s; run `.mesh off` and then `.mesh on` to restart the node",
+                    state.hash.to_hex_string(),
+                    REKEY_GRACE.as_secs()
+                )
+            })??;
+        Ok(true)
+    }
+
+    /// `announce_now` for a TCP client that reconnected: `Ok(None)` when the announce went
+    /// out, otherwise how long ago the announce the floor still holds for was sent.
+    async fn announce_after_reconnect(&self) -> Result<Option<Duration>> {
+        if self.announce_now().await? {
+            return Ok(None);
+        }
+        let last_announce = self.destination.lock().await.last_announce;
+        let age = last_announce.map(|at| at.elapsed()).unwrap_or_default();
+        Ok(Some(age))
+    }
+
+    /// Announces the current destination over a pending interface that has just connected,
+    /// once per interface, skipping the floor on `REANNOUNCE_FLOOR_SECS`: the peers behind
+    /// that relay have never heard this destination, and the next heartbeat is up to
+    /// `HEARTBEAT_PERIOD_SECS` away. Sends nothing when the node is configured not to
+    /// announce. Leaves `last_announce` untouched, so a connect neither delays the
+    /// heartbeat nor shortens the floor the heartbeat and the reconnect announce honour.
+    pub(crate) async fn announce_on_connect(&self) -> Result<()> {
+        if !self.announce {
+            return Ok(());
+        }
+        let state = self.destination.lock().await;
+        let transport = self.running_transport().await?;
+        timeout(
+            REKEY_GRACE,
+            announce_destination(
+                &transport,
+                &state.dest,
+                &state.hash,
+                &self.app_data,
+                &self.last_announce_at,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "The mesh transport did not send the announce for destination {} within {}s",
+                state.hash.to_hex_string(),
+                REKEY_GRACE.as_secs()
+            )
+        })??;
+        Ok(())
+    }
+
+    /// A handle on the transport, taken so the `transport` guard is not held across the
+    /// caller's waits and a concurrent `request` or `shutdown` does not queue behind them.
+    async fn running_transport(&self) -> Result<Arc<Transport>> {
+        self.transport
+            .lock()
+            .await
+            .clone()
+            .context("The mesh node has been stopped; run `.mesh on` to start it again")
+    }
+
+    async fn send_announce(
+        &self,
+        state: &mut DestinationState,
+        transport: &Transport,
+    ) -> Result<()> {
+        state.last_announce = Some(
+            announce_destination(
+                transport,
+                &state.dest,
+                &state.hash,
+                &self.app_data,
+                &self.last_announce_at,
+            )
+            .await?,
+        );
+        Ok(())
+    }
+
+    /// Moves the live destination from the original session to its fork. An `Err` always
+    /// leaves the original destination, instance id and lock in place and served: every
+    /// fallible step (instance-id check, stopped-transport check, fork lock acquisition,
+    /// registering the fork's destination) happens before the swap, and the fork's
+    /// destination is registered before the original is released so a transport that stalls
+    /// on the registration leaves the node serving exactly what it served before. The two
+    /// hashes differ (`session.{instance_id}`), so both may be registered at once; a release of
+    /// the original that does not finish within `REKEY_GRACE` is logged and the swap goes
+    /// ahead, leaving the original registered until the node stops. Each transport wait is
+    /// bounded because a stalled one would otherwise hold `destination` for good.
+    pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
+        let mut state = self.destination.lock().await;
+        if rekey.original_instance_id.as_deref() != Some(state.instance_id.as_str()) {
+            bail!(
+                "The mesh node is serving instance {} rather than the forked session's instance {}, so the fork cannot take over its destination. Run `.mesh off` and then `.mesh on` in the fork to join the mesh with the fork's own destination.",
+                state.instance_id,
+                rekey.original_instance_id.as_deref().unwrap_or("(none)")
+            );
+        }
+        let transport = self.running_transport().await?;
+        let lock = InstanceLock::acquire(&self.cache_dir, &rekey.fork_instance_id)?;
+
+        let deadline = tokio::time::Instant::now() + REKEY_GRACE;
+        let (dest, hash, origin) = register_destination(
+            &transport,
+            &self.transport_identity,
+            &rekey.fork_instance_id,
+            &self.app_data,
+            &self.request_handler,
+            deadline,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "The fork's destination could not be registered within {}s, so the node still serves destination {}. Run `.mesh off` and then `.mesh on` in the fork to join the mesh with the fork's own destination.",
+                REKEY_GRACE.as_secs(),
+                state.hash.to_hex_string(),
+            )
+        })?;
+        if timeout_at(deadline, transport.deregister_destination(&state.hash))
+            .await
+            .is_err()
+        {
+            warn!(
+                "The mesh transport did not release destination {} within {}s; it stays registered until the node stops",
+                short(&state.hash.to_hex_string()),
+                REKEY_GRACE.as_secs()
+            );
+        }
+        debug!(
+            "Re-keyed mesh node {} from instance {} to fork instance {} (destination {})",
+            short(&self.fingerprint),
+            state.instance_id,
+            rekey.fork_instance_id,
+            short(&hash.to_hex_string())
+        );
+        let original_instance_id = std::mem::take(&mut state.instance_id);
+        *state = DestinationState {
+            dest,
+            hash,
+            origin,
+            instance_id: rekey.fork_instance_id,
+            lock: Some(lock),
+            last_announce: None,
+        };
+        *self.ids.write() = CurrentIds {
+            instance_id: state.instance_id.clone(),
+            destination_hash: hash.to_hex_string(),
+        };
+        {
+            let mut row = self.instance_row.lock();
+            row.destination = hash.to_hex_string();
+            instances::unregister(&self.cache_dir, &original_instance_id);
+            instances::register(&self.cache_dir, &state.instance_id, row.clone());
+        }
+        if self.announce {
+            // With `last_announce` still `None`, the next heartbeat tick announces the fork.
+            match timeout_at(deadline, self.send_announce(&mut state, &transport)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!(
+                    "Failed to announce mesh node {} for fork instance {} after re-keying; the heartbeat will announce it: {}",
+                    short(&self.fingerprint),
+                    state.instance_id,
+                    redact_hashes(&format!("{err:#}"))
+                ),
+                Err(_) => warn!(
+                    "Mesh node {} did not announce fork instance {} within {}s of re-keying; the heartbeat will announce it",
+                    short(&self.fingerprint),
+                    state.instance_id,
+                    REKEY_GRACE.as_secs()
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Cancels and joins the node's tasks, stops the transport with its interfaces, waits
+    /// for the request handlers it aborted to be gone and releases the instance and
+    /// identity locks, in that order so nothing outlives what it depends on: a handler
+    /// still winding down may settle a reply against files the locks guard. A settled
+    /// resource reply's transfer confirmation runs on a detached task outside the handler
+    /// slot, so the drain does not cover it; it only touches the settlement, whose store
+    /// has its own lock, and the same holds for the blocking drop of an unsent settlement,
+    /// which the slot leaves behind the same way. The task joins share one grace window;
+    /// a second one, opened before the transport stops, bounds the transport's own stop,
+    /// the client joins and the handler drain, which keep at least `POST_STOP_GRACE` after
+    /// the stop returns; past that the clients are aborted and the drain gives up, each
+    /// with its warning.
+    async fn shutdown(&self) -> Result<()> {
+        self.cancel.cancel();
+        let tasks = std::mem::take(&mut *self.tasks.lock());
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        for mut handle in tasks {
+            if timeout_at(deadline, &mut handle).await.is_err() {
+                handle.abort();
+                warn!(
+                    "Mesh task did not stop within {}s; aborted it",
+                    SHUTDOWN_GRACE.as_secs()
+                );
+            }
+        }
+
+        let interfaces = std::mem::take(&mut *self.interfaces.lock().await);
+        let mut state = self.destination.lock().await;
+        let Some(transport) = self.transport.lock().await.take() else {
+            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let deadline = stop_transport(transport, interfaces, deadline).await;
+        drain_request_handlers(&self.request_handler, deadline).await;
+        instances::unregister(&self.cache_dir, &state.instance_id);
+        state.lock = None;
+        *self.identity_lock.lock() = None;
+        if let Err(err) = self.peers.persist_if_dirty() {
+            warn!(
+                "Failed to persist the mesh peer table on stop: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+        }
+        self.propagation_nodes
+            .persist_if_dirty_or_warn(PersistTrigger::Stop);
+        debug!(
+            "Stopped mesh node {} (instance {}, destination {})",
+            short(&self.fingerprint),
+            state.instance_id,
+            short(&state.hash.to_hex_string())
+        );
+        Ok(())
+    }
+}
+
+const SCOPE_APP_NAME: &str = "scope";
+
+/// The Reticulum destination name `scope.session.<instance_id>` a node with
+/// `instance_id` registers, announces and is reached at. `SCOPE_APP_NAME` also labels the
+/// transport's logs (`TransportConfig::new`), which puts nothing on the wire.
+pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
+    DestinationName::new(SCOPE_APP_NAME, &format!("session.{instance_id}"))
+}
+
+/// Arms a session destination with the responder's caps on what it accepts and what it
+/// sends. With `MAX_REQUEST_PAYLOAD_BYTES`, coyote-rns-transport 0.18.1 refuses an oversize
+/// request at the advertisement, before it reaches a handler (a request that travels as a
+/// resource; a packet-form one over the cap is dropped). With `MAX_FETCH_RESPONSE_BYTES`,
+/// the widest bound any requester accepts, a reply no peer could take is refused before it
+/// costs a transfer.
+pub(crate) fn arm_destination_caps(destination: &mut SingleInputDestination) {
+    destination
+        .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
+        .expect("the cap setter is infallible");
+    destination
+        .set_max_response_size(MAX_FETCH_RESPONSE_BYTES)
+        .expect("the cap setter is infallible");
+}
+
+/// Registers the destination for `instance_id`, with `request_handler` serving every known
+/// path on it, and attaches `app_data` to its announces; each transport wait gives up at
+/// `deadline`. A destination registered but left without its announce data is
+/// deregistered again, best effort, and the error says whether that worked. The
+/// destination's caps come from `arm_destination_caps`.
+async fn register_destination(
+    transport: &Transport,
+    identity: &TransportIdentity,
+    instance_id: &str,
+    app_data: &[u8],
+    request_handler: &Arc<LibraryHandler>,
+    deadline: tokio::time::Instant,
+) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash, OriginName)> {
+    let name = session_destination_name(instance_id);
+    let mut destination = SingleInputDestination::new(identity.clone(), name);
+    arm_destination_caps(&mut destination);
+    let registered = register_request_paths(&mut destination, request_handler)?;
+    let hash = destination.desc.address_hash;
+    let origin = OriginName::of(&destination.desc.name);
+    let dest = timeout_at(deadline, transport.register_destination(destination))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "The mesh transport did not register destination {} in time",
+                hash.to_hex_string()
+            )
+        })?;
+    registered.record();
+    let app_data = transport.set_destination_announce_app_data(&dest, Some(app_data.to_vec()));
+    if timeout_at(deadline, app_data).await.is_err() {
+        let released = timeout_at(deadline, transport.deregister_destination(&hash))
+            .await
+            .is_ok();
+        bail!(
+            "The mesh transport registered destination {} but did not attach its announce data in time; {}",
+            hash.to_hex_string(),
+            if released {
+                "it was deregistered again"
+            } else {
+                "it could not be deregistered either, so the node serves it without announce data"
+            }
+        );
+    }
+    Ok((dest, hash, origin))
+}
+
+/// Puts `request_handler` behind every path in `KNOWN_PATHS` before the destination is
+/// registered, so no request can arrive at a destination without its handlers. Every path
+/// is open to any peer at this layer (`RequestAllow::All`); who is served is the
+/// dispatcher's verdict, taken on the proven identity. The handlers live on the destination
+/// and go with it when it is deregistered, so nothing deregisters them separately. The
+/// paths it registered come back for the caller to record once the transport holds the
+/// destination.
+fn register_request_paths(
+    destination: &mut SingleInputDestination,
+    request_handler: &Arc<LibraryHandler>,
+) -> Result<RegisteredRequestPaths> {
+    #[cfg(all(test, unix))]
+    let mut paths = Vec::new();
+    for path in KNOWN_PATHS {
+        destination
+            .register_request_handler(path, request_handler.clone(), RequestAllow::All, true)
+            .map_err(|err| anyhow!("Failed to register the mesh request path {path}: {err}"))?;
+        #[cfg(all(test, unix))]
+        paths.push((destination.desc.address_hash, path));
+    }
+    Ok(RegisteredRequestPaths {
+        #[cfg(all(test, unix))]
+        paths,
+    })
+}
+
+/// The paths `register_request_paths` put a handler behind, with the destination that
+/// carries them, held until that destination is the transport's.
+struct RegisteredRequestPaths {
+    #[cfg(all(test, unix))]
+    paths: Vec<(AddressHash, &'static str)>,
+}
+
+impl RegisteredRequestPaths {
+    /// Files the paths where a test reads them; nothing is kept outside tests.
+    fn record(self) {
+        #[cfg(all(test, unix))]
+        REGISTERED_REQUEST_PATHS.lock().extend(self.paths);
+    }
+}
+
+/// Every path a request handler was registered behind, with the destination it was
+/// registered on, filed once the transport holds that destination. The library keeps its
+/// handler table private, so this is what a test reads to pin them.
+#[cfg(all(test, unix))]
+static REGISTERED_REQUEST_PATHS: parking_lot::Mutex<Vec<(AddressHash, &'static str)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Sends one announce and records the moment in `last_announce_at`, so every path that
+/// announces (start, connect, reconnect, heartbeat, re-key) is counted there.
+async fn announce_destination(
+    transport: &Transport,
+    dest: &Arc<Mutex<SingleInputDestination>>,
+    hash: &AddressHash,
+    app_data: &[u8],
+    last_announce_at: &ArcSwapOption<SystemTime>,
+) -> Result<Instant> {
+    #[cfg(all(test, unix))]
+    if FAIL_NEXT_ANNOUNCE_OF.lock().remove(hash) {
+        bail!(
+            "The mesh announce for destination {} failed for the test",
+            hash.to_hex_string()
+        );
+    }
+    transport
+        .try_send_announce(dest, Some(app_data))
+        .await
+        .map_err(|err| {
+            anyhow!(
+                "Failed to build the mesh announce for destination {}: {err}",
+                hash.to_hex_string()
+            )
+        })?;
+    last_announce_at.store(Some(Arc::new(SystemTime::now())));
+    debug!(
+        "Sent mesh announce for destination {}",
+        short(&hash.to_hex_string())
+    );
+    Ok(Instant::now())
+}
+
+/// The destinations whose next announce, whichever path sends it, fails instead of being
+/// built; that announce consumes its own entry. Keyed by destination so tests arming it
+/// at once in the same process neither fail nor disarm each other's announce.
+#[cfg(all(test, unix))]
+static FAIL_NEXT_ANNOUNCE_OF: std::sync::LazyLock<parking_lot::Mutex<HashSet<AddressHash>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Makes the next announce of destination `hash` fail; the one after it is sent as usual.
+/// Armed before a start, that is the start's first announce.
+#[cfg(all(test, unix))]
+pub(crate) fn fail_next_announce_of(hash: AddressHash) {
+    FAIL_NEXT_ANNOUNCE_OF.lock().insert(hash);
+}
+
+/// How many abandoned starts saw their request handlers drained before the grace window
+/// ran out, summed over the process. A start's handler is fresh, so its own drain count
+/// is 0 or 1 when the start is abandoned.
+#[cfg(all(test, unix))]
+pub(crate) static DRAINED_ON_ABANDON: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Unwinds a start that failed once the transport existed: the transport is stopped with
+/// the joined interfaces, which cancels its own tasks and aborts the request handlers of
+/// any destination it came to hold, and those handlers are waited for before the caller
+/// releases the locks they may still touch. The transport's own stop, the client joins
+/// and the handler drain share one window opened before the transport stops, so a stop
+/// that uses it up leaves the joins and the drain only their warnings. A handler nothing
+/// ran on drains at once, so every arm with a handler in hand passes it;
+/// `request_handler` is `None` only before one exists.
+async fn abandon_start(
+    transport: Arc<Transport>,
+    joined: Vec<JoinedInterface>,
+    request_handler: Option<&Arc<LibraryHandler>>,
+) {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    let deadline = stop_transport(transport, joined, deadline).await;
+    if let Some(handler) = request_handler {
+        drain_request_handlers(handler, deadline).await;
+        #[cfg(all(test, unix))]
+        DRAINED_ON_ABANDON.fetch_add(handler.drained_count(), Ordering::SeqCst);
+    }
+}
+
+/// Waits until no request handler the transport aborted is still running, giving up at
+/// `deadline` with a warning: past it the caller releases what a handler's drop may still
+/// touch.
+async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time::Instant) {
+    if timeout_at(deadline, handler.drained()).await.is_err() {
+        warn!(
+            "Mesh request handlers did not stop within the shutdown window; the node releases its locks with them still running"
+        );
+    }
+}
+
+/// Seeds this node's own grant once the start can no longer fail, so a refused start
+/// writes none. A seed that fails leaves the node running without the grant, warned
+/// about with the trust file to fix and the command that gives it, and reads as not
+/// granted. The own hash is logged short, as every hash in a log line is; the remedy
+/// names where the whole one is shown.
+fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
+    match trust.seed_self_trust(fingerprint, minted, SystemTime::now()) {
+        Ok(granted) => granted,
+        Err(err) => {
+            warn!(
+                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity <hash>` with the identity hash `.mesh info` shows.",
+                short(fingerprint),
+                redact_hashes(&format!("{err:#}")),
+                trust.path().display()
+            );
+            false
+        }
+    }
+}
+
+/// `alone` is set when `plan` is the only configured interface, so a failure to join it
+/// refuses the start.
+async fn join_interface(
+    transport: &Transport,
+    plan: &InterfacePlan,
+    options: &NodeOptions,
+    alone: bool,
+) -> Joined {
+    let joined = match plan {
+        InterfacePlan::Lan => join_lan(transport).await,
+        InterfacePlan::Local { endpoint } => {
+            join_local(transport, endpoint, options.connect_timeout, alone).await
+        }
+        InterfacePlan::Tcp { kind, endpoint } => {
+            join_tcp(transport, kind, endpoint, options.connect_timeout).await
+        }
+    };
+    match &joined {
+        Joined::Connected(_) | Joined::Attached { .. } => {
+            debug!("Joined mesh interface {}", plan.label());
+        }
+        Joined::Dialing { reason, .. } => warn!(
+            "Mesh interface {} is attached but not connected yet; its client keeps dialing: {reason}",
+            plan.label()
+        ),
+        Joined::Pending { reason, .. } => warn!(
+            "Mesh interface {} is unreachable and keeps reconnecting: {reason}",
+            plan.label()
+        ),
+        Joined::NotReached { reason, .. } => warn!(
+            "Mesh interface {} could not be attached and is not retried: {reason}",
+            plan.label()
+        ),
+        Joined::Failed { reason, .. } => {
+            warn!("Mesh interface {} was not attached: {reason}", plan.label());
+        }
+    }
+    joined
+}
+
+/// Appended to the refusal when every configured relay is on loopback and none answered.
+fn loopback_hint(endpoint: &str) -> String {
+    format!(
+        " Nothing is listening on {endpoint}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+    )
+}
+
+async fn join_lan(transport: &Transport) -> Joined {
+    let plan = match AutoRuntimePlan::from_system(
+        AutoInterfaceConfig::default(),
+        AutoInterfaceDeviceFilter::default(),
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Joined::Failed {
+                reason: err.to_string(),
+                message: format!(
+                    "Failed to enumerate network interfaces for the mesh lan interface: {err}. Remove the lan entry from mesh.interfaces or fix the host's networking."
+                ),
+            };
+        }
+    };
+    let manager = transport.iface_manager();
+    let channel = manager.lock().await.new_channel_with_role_and_mode(
+        LAN_CHANNEL_CAPACITY,
+        IfaceRole::Multicast,
+        InterfaceMode::default(),
+    );
+    let host_iface = channel.address;
+    let bridge = AutoInterfaceTransportRuntime::from_channel(channel, manager);
+    match plan
+        .spawn_discovery_runtime_with_native_scope_ids_and_transport(Some(bridge), None)
+        .await
+    {
+        Ok(runtime) => Joined::Connected(JoinedInterface::Lan { runtime }),
+        Err(err) => {
+            detach_interface(
+                transport,
+                host_iface,
+                "lan",
+                tokio::time::Instant::now() + SHUTDOWN_GRACE,
+            )
+            .await;
+            Joined::Failed {
+                reason: err.to_string(),
+                message: lan_bind_failure_message(&err),
+            }
+        }
+    }
+}
+
+fn lan_bind_failure_message(err: &dyn fmt::Display) -> String {
+    format!(
+        "Failed to bind the mesh lan interface: {err}. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process. Two Coyote sessions on one host need a local relay; see Mesh-Deployment."
+    )
+}
+
+/// Attaches the transport to rnsd's shared instance at `endpoint` as a shared-instance
+/// client and waits up to `connect_timeout` for that client's first `Connected`. The
+/// attach returns once the client task is spawned, not once it has a stream, so the
+/// client's own event is what decides `Connected` at start; a client still dialing when
+/// the wait runs out stays attached, with its events left on the receiver for the
+/// watcher, and the last dial failure it reported during the wait is the reason the row
+/// and the refusal carry. From there the client's state events drive the row, and the
+/// transport owns redialing and re-announcing. When the rnsd is the only interface
+/// (`alone`), the first dial failure ends the wait: the start is refused on it, as
+/// quickly as the failed dial, rather than after the whole `connect_timeout`.
+async fn join_local(
+    transport: &Transport,
+    endpoint: &LocalEndpoint,
+    connect_timeout: Duration,
+    alone: bool,
+) -> Joined {
+    let not_reachable = |reason: &str| {
+        format!(
+            "Local rnsd at {endpoint} (type: local) is not reachable: {reason}. The node cannot join the mesh until rnsd's shared instance answers there; start rnsd or fix mesh.interfaces."
+        )
+    };
+    let not_reached = |reason: String| Joined::NotReached {
+        message: not_reachable(&reason),
+        reason,
+    };
+    let mut events = match attach_local(transport, endpoint).await {
+        Ok(events) => events,
+        Err(reason) => return not_reached(reason),
+    };
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let dial_failure = match await_local_start(&mut events, deadline, alone, endpoint).await {
+        LocalStart::Connected => {
+            return Joined::Attached {
+                label: local_label(endpoint),
+                endpoint: endpoint.clone(),
+                events,
+            };
+        }
+        LocalStart::NotConnected { dial_failure } => dial_failure,
+        LocalStart::StoppedReporting => {
+            return not_reached("the shared-instance client stopped reporting".to_string());
+        }
+    };
+    let reason = dial_failure
+        .as_ref()
+        .map(|failure| failure.reason.clone())
+        .unwrap_or_else(|| format!("the client did not connect within {connect_timeout:?}"));
+    Joined::Dialing {
+        label: local_label(endpoint),
+        endpoint: endpoint.clone(),
+        events,
+        dial_failure,
+        message: not_reachable(&reason),
+        reason,
+    }
+}
+
+/// How a `local` client's start wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalStart {
+    Connected,
+    /// The wait ran out, or the first dial failed while the rnsd is the only interface;
+    /// `dial_failure` is the last dial that failed, `None` when none had.
+    NotConnected {
+        dial_failure: Option<DialFailure>,
+    },
+    /// The client's state stream ended before it connected.
+    StoppedReporting,
+}
+
+/// Reads a `local` client's state events until its first `Connected` or `deadline`.
+/// When the rnsd is the only interface (`alone`) the first dial failure ends the wait,
+/// since the start is refused either way.
+async fn await_local_start(
+    events: &mut mpsc::Receiver<SharedInstanceEvent>,
+    deadline: tokio::time::Instant,
+    alone: bool,
+    endpoint: &LocalEndpoint,
+) -> LocalStart {
+    let mut dial_failure = None;
+    loop {
+        match timeout_at(deadline, events.recv()).await {
+            Ok(Some(SharedInstanceEvent::Connected)) => return LocalStart::Connected,
+            Ok(Some(SharedInstanceEvent::DialFailed { reason })) => {
+                dial_failure = Some(DialFailure::of(reason, endpoint));
+                if alone {
+                    return LocalStart::NotConnected { dial_failure };
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return LocalStart::StoppedReporting,
+            Err(_) => return LocalStart::NotConnected { dial_failure },
+        }
+    }
+}
+
+/// Attaches the transport to rnsd's shared instance at `endpoint` and returns the stream
+/// its client reports `SharedInstanceEvent`s on, the first `Connecting` already queued.
+async fn attach_local(
+    transport: &Transport,
+    endpoint: &LocalEndpoint,
+) -> Result<mpsc::Receiver<SharedInstanceEvent>, String> {
+    let shared = match endpoint {
+        LocalEndpoint::Tcp(addr) => SharedInstanceEndpoint::Tcp(*addr),
+        #[cfg(unix)]
+        LocalEndpoint::Abstract(value) => {
+            SharedInstanceEndpoint::Unix(LocalUnixEndpoint::from_config_value(value))
+        }
+        #[cfg(not(unix))]
+        LocalEndpoint::Abstract(value) => {
+            return Err(format!(
+                "{value} is an abstract socket, which only Linux and Android have"
+            ));
+        }
+    };
+    let (events, receiver) = mpsc::channel(LOCAL_EVENT_CAPACITY);
+    let options = SharedInstanceOptions::default()
+        .with_reconnect_wait(LOCAL_RECONNECT_WAIT)
+        .with_disconnect_reasons(true)
+        .with_state_events(events);
+    transport
+        .attach_shared_instance(shared, options)
+        .await
+        .map(|_| receiver)
+        .map_err(|err| redact_hashes(&format!("attach to the shared instance failed: {err}")))
+}
+
+/// The row's reason for a `local` rnsd whose established stream ended with `reason`.
+fn disconnect_sentence(reason: DisconnectReason) -> String {
+    match reason {
+        DisconnectReason::PeerClosed => "rnsd closed the socket".to_string(),
+        DisconnectReason::Reset => "the connection was reset".to_string(),
+        DisconnectReason::Timeout => "the connection timed out".to_string(),
+        DisconnectReason::Io(kind) => kind.to_string(),
+        _ => CONNECTION_ENDED.to_string(),
+    }
+}
+
+/// The row's reason for a `local` rnsd whose stream ended for a reason the client did
+/// not name: a kind this build does not know, or a plain `Disconnected`. It claims no
+/// cause, as nothing says rnsd was the side that closed.
+const CONNECTION_ENDED: &str = "the connection ended";
+
+/// The row's reason for a `local` rnsd whose last dial to `endpoint` failed with `kind`.
+fn dial_failure_sentence(kind: DialFailureKind, endpoint: &LocalEndpoint) -> String {
+    match kind {
+        DialFailureKind::Refused => format!("nothing is listening at {endpoint}"),
+        DialFailureKind::NotFound => format!("no rnsd socket at {endpoint}"),
+        DialFailureKind::Timeout => "rnsd did not answer".to_string(),
+        DialFailureKind::Io(kind) => kind.to_string(),
+        _ => "the dial failed".to_string(),
+    }
+}
+
+/// Joins a TCP relay. The first connect is what the bounded wait below reads off
+/// `status`; from there the client's events on the transport's interface events drive
+/// the row.
+async fn join_tcp(
+    transport: &Transport,
+    kind: &'static str,
+    endpoint: &str,
+    connect_timeout: Duration,
+) -> Joined {
+    let client = TcpClient::new(endpoint).with_connect_timeout(connect_timeout);
+    let status = client.runtime_status_handle();
+    let context = transport.iface_manager().lock().await.new_context(client);
+    let hash = *context.channel.address();
+    let handle = tokio::spawn(TcpClient::spawn(context));
+    let label = format!("{kind} {endpoint}");
+
+    let deadline = Instant::now() + connect_timeout + Duration::from_secs(1);
+    let reason = loop {
+        let snapshot = status.to_json();
+        match snapshot["stream_state"].as_str() {
+            Some("connected") => {
+                return Joined::Connected(JoinedInterface::Tcp {
+                    hash,
+                    handle,
+                    label,
+                    status,
+                });
+            }
+            // The client's first connect failed; it now retries forever on its own.
+            Some("reconnecting" | "closed") => {
+                break snapshot["last_error"]
+                    .as_str()
+                    .unwrap_or("connection refused")
+                    .to_string();
+            }
+            _ if Instant::now() >= deadline => break "connection timed out".to_string(),
+            _ => sleep(CONNECT_POLL).await,
+        }
+    };
+    let message = format!(
+        "Mesh relay {endpoint} (type: {kind}) is unreachable: {reason}. The node cannot join the mesh until that relay is reachable; fix mesh.interfaces or the relay."
+    );
+    Joined::Pending {
+        iface: JoinedInterface::Tcp {
+            hash,
+            handle,
+            label,
+            status,
+        },
+        reason,
+        message,
+    }
+}
+
+/// Detaches the interface at `iface` from the transport, giving up at `deadline`; `false`
+/// when it did not go.
+async fn detach_interface(
+    transport: &Transport,
+    iface: AddressHash,
+    label: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if timeout_at(deadline, transport.stop_interface(iface))
+        .await
+        .is_err()
+    {
+        warn!(
+            "Mesh interface {label} could not be detached from the transport within {}s",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        return false;
+    }
+    true
+}
+
+/// Stops `transport` with every interface joined to it. The LAN discovery runtime is
+/// Coyote's own and goes first; `Transport::stop` then detaches every interface, which
+/// also cancels the TCP client tasks Coyote spawned, and those are joined under
+/// `deadline` since the transport's own wait does not cover them. `deadline` is taken by
+/// the caller before the transport stops and bounds the transport's stop and the client
+/// joins together, except that the joins keep at least `POST_STOP_GRACE` after the stop
+/// returns; a client still running past that is aborted with a warning. Returns the
+/// deadline the joins used, for whatever the caller still bounds after them.
+async fn stop_transport(
+    transport: Arc<Transport>,
+    interfaces: Vec<JoinedInterface>,
+    deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let mut left = Vec::with_capacity(interfaces.len());
+    let mut clients = Vec::new();
+    for iface in interfaces {
+        match iface {
+            JoinedInterface::Lan { runtime, .. } => {
+                runtime.stop().await;
+                left.push("lan".to_string());
+            }
+            JoinedInterface::Local { label, .. } => left.push(label),
+            JoinedInterface::Tcp { handle, label, .. } => clients.push((handle, label)),
+        }
+    }
+    transport.stop().await;
+    drop(transport);
+    let deadline = deadline.max(tokio::time::Instant::now() + POST_STOP_GRACE);
+    for label in left {
+        debug!("Left mesh interface {label}");
+    }
+    for (mut handle, label) in clients {
+        if timeout_at(deadline, &mut handle).await.is_err() {
+            handle.abort();
+            warn!("Mesh interface {label} did not stop within the shutdown window; aborted it");
+            continue;
+        }
+        debug!("Left mesh interface {label}");
+    }
+    deadline
+}
+
+/// What `record_announce` read off a Coyote announce and did with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FiledAnnounce {
+    change: PeerChange,
+    display_name: Option<String>,
+    protocol_version: u16,
+    compatibility: Compatibility,
+}
+
+/// The app data of a received announce; `None`, logged, when it is not a Coyote announce.
+fn decode_announce(destination_hash: &str, app_data: &[u8], hops: u8) -> Option<AnnounceAppData> {
+    let Some(decoded) = AnnounceAppData::decode(app_data) else {
+        debug!(
+            "Ignored announce from {} ({hops} hops): not a Coyote node",
+            short(destination_hash)
+        );
+        return None;
+    };
+    debug!(
+        "Received mesh announce from {} ({hops} hops, protocol version {})",
+        short(destination_hash),
+        decoded.version
+    );
+    Some(decoded)
+}
+
+/// Who a received announce says it is: its destination, identity and name hashes, and
+/// the identity's key as `Identity::to_hex_string` writes it. The transport verified
+/// that these derive one another before handing the announce over.
+struct AnnouncedDestination {
+    destination_hash: String,
+    identity_hash: String,
+    name_hash: String,
+    public_key: Option<String>,
+}
+
+#[cfg(test)]
+impl AnnouncedDestination {
+    fn without_key(
+        destination_hash: impl Into<String>,
+        identity_hash: impl Into<String>,
+        name_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            destination_hash: destination_hash.into(),
+            identity_hash: identity_hash.into(),
+            name_hash: name_hash.into(),
+            public_key: None,
+        }
+    }
+}
+
+/// Files one received announce in the peer table; `None` when it is not a Coyote announce.
+fn record_announce(
+    peers: &PeerTable,
+    announced: AnnouncedDestination,
+    app_data: &[u8],
+    hops: u8,
+    now: SystemTime,
+) -> Option<FiledAnnounce> {
+    let AnnouncedDestination {
+        destination_hash,
+        identity_hash,
+        name_hash,
+        public_key,
+    } = announced;
+    let decoded = decode_announce(&destination_hash, app_data, hops)?;
+    let compatibility = Compatibility::of(decoded.version);
+    if let Compatibility::Incompatible { found } = compatibility {
+        debug!(
+            "Mesh peer {} is incompatible: it speaks protocol {found}, this Coyote supports {MESH_PROTOCOL_MIN_SUPPORTED}..={MESH_PROTOCOL_VERSION}",
+            short(&destination_hash)
+        );
+    }
+    let change = peers.observe(
+        PeerSighting {
+            destination_hash: destination_hash.clone(),
+            identity_hash,
+            name_hash,
+            public_key,
+            display_name: decoded.display_name.clone(),
+            protocol_version: decoded.version,
+            hops,
+        },
+        now,
+    );
+    match change {
+        PeerChange::Added => debug!("Added mesh peer {}", short(&destination_hash)),
+        PeerChange::Refreshed => debug!("Refreshed mesh peer {}", short(&destination_hash)),
+    }
+    Some(FiledAnnounce {
+        change,
+        display_name: decoded.display_name,
+        protocol_version: decoded.version,
+        compatibility,
+    })
+}
+
+/// Fires of `mesh.peer.discovered` per second across all peers, and the most the bucket
+/// holds. A filer that has spent its tokens drops the fire rather than queueing it.
+const DISCOVERED_FIRES_PER_SEC: f64 = 16.0;
+
+/// A destination's last `mesh.peer.discovered` fire and the facts it carried.
+struct DiscoveredFire {
+    at: SystemTime,
+    display_name: Option<String>,
+    protocol_version: u16,
+    hops: u8,
+}
+
+/// Which `mesh.peer.discovered` fires get through. A peer's first sighting is always due;
+/// a refresh only when its name, protocol version or hop count differ from what was last
+/// fired for it, or that fire is at least `HEARTBEAT_SECS` old. On top of that a token
+/// bucket caps the rate across all peers and may drop a due fire, in which case the peer's
+/// next refresh fires with `COYOTE_MESH_FIRST_SEEN=false`. The map forgets destinations
+/// whose last fire is older than two heartbeats and is capped at the peer table's size,
+/// so a flood of distinct destinations cannot grow it without bound.
+#[derive(Default)]
+struct DiscoveredThrottle {
+    fired: HashMap<String, DiscoveredFire>,
+    tokens: f64,
+    refilled_at: Option<SystemTime>,
+    dropping: bool,
+}
+
+impl DiscoveredThrottle {
+    fn admits(
+        &mut self,
+        destination: &str,
+        filed: &FiledAnnounce,
+        hops: u8,
+        now: SystemTime,
+    ) -> bool {
+        let due = match (filed.change, self.fired.get(destination)) {
+            (PeerChange::Added, _) | (PeerChange::Refreshed, None) => true,
+            (PeerChange::Refreshed, Some(last)) => {
+                last.display_name != filed.display_name
+                    || last.protocol_version != filed.protocol_version
+                    || last.hops != hops
+                    || now
+                        .duration_since(last.at)
+                        .is_ok_and(|since| since.as_secs() >= HEARTBEAT_SECS)
+            }
+        };
+        if !due {
+            return false;
+        }
+        self.refill(now);
+        if self.tokens < 1.0 {
+            if !self.dropping {
+                debug!(
+                    "Mesh peer discovery is firing hooks faster than {DISCOVERED_FIRES_PER_SEC} a second; dropping fires until the rate falls"
+                );
+                self.dropping = true;
+            }
+            return false;
+        }
+        self.tokens -= 1.0;
+        self.dropping = false;
+        self.remember(destination, filed, hops, now);
+        true
+    }
+
+    fn refill(&mut self, now: SystemTime) {
+        self.tokens = match self.refilled_at {
+            None => DISCOVERED_FIRES_PER_SEC,
+            Some(at) => {
+                let elapsed = now.duration_since(at).unwrap_or_default();
+                (self.tokens + elapsed.as_secs_f64() * DISCOVERED_FIRES_PER_SEC)
+                    .min(DISCOVERED_FIRES_PER_SEC)
+            }
+        };
+        self.refilled_at = Some(now);
+    }
+
+    fn remember(&mut self, destination: &str, filed: &FiledAnnounce, hops: u8, now: SystemTime) {
+        if !self.fired.contains_key(destination) {
+            if let Some(forgotten_before) = now.checked_sub(PEER_STALE_AFTER) {
+                self.fired.retain(|_, last| last.at > forgotten_before);
+            }
+            if self.fired.len() >= PEER_TABLE_MAX_ENTRIES {
+                let oldest = self
+                    .fired
+                    .iter()
+                    .min_by_key(|(_, last)| last.at)
+                    .map(|(hash, _)| hash.clone());
+                if let Some(oldest) = oldest {
+                    self.fired.remove(&oldest);
+                }
+            }
+        }
+        self.fired.insert(
+            destination.to_string(),
+            DiscoveredFire {
+                at: now,
+                display_name: filed.display_name.clone(),
+                protocol_version: filed.protocol_version,
+                hops,
+            },
+        );
+    }
+}
+
+/// Where a heard announce goes: the peer table, the trust list's sightings, and
+/// `mesh.peer.discovered`, trusted or not, compatible or not, as far as the throttle
+/// lets it through. An announce the peer sent as a path response goes to the peer table's
+/// route facts only.
+struct AnnounceFiler<'a> {
+    peers: &'a PeerTable,
+    trust: &'a TrustStore,
+    hooks: &'a MeshHooks,
+    throttle: DiscoveredThrottle,
+}
+
+impl AnnounceFiler<'_> {
+    /// Files an announce the peer sent as a path response. Keyed on the announced
+    /// destination, never on the identity: a path response says where the peer is, not
+    /// that it is there, so for a known row it moves no sighting time and fires no
+    /// discovery. A rotated key is still a rotated key. A destination without a row files
+    /// as a first sighting through `file`.
+    fn file_path_response(
+        &mut self,
+        announced: AnnouncedDestination,
+        app_data: &[u8],
+        hops: u8,
+        now: SystemTime,
+    ) -> Option<PeerChange> {
+        if self.peers.get(&announced.destination_hash).is_some() {
+            let decoded = decode_announce(&announced.destination_hash, app_data, hops)?;
+            let refreshed = self.peers.refresh_route(PeerSighting {
+                destination_hash: announced.destination_hash.clone(),
+                identity_hash: announced.identity_hash.clone(),
+                name_hash: announced.name_hash.clone(),
+                public_key: announced.public_key.clone(),
+                display_name: decoded.display_name,
+                protocol_version: decoded.version,
+                hops,
+            });
+            // A row swept away between the gate above and the refresh files as a first
+            // sighting, like any announce for a destination the table does not hold.
+            if refreshed {
+                debug!(
+                    "Refreshed the route to mesh peer {} from a path response",
+                    short(&announced.destination_hash)
+                );
+                self.note_key_change(&announced.identity_hash, &announced.name_hash, now);
+                return Some(PeerChange::Refreshed);
+            }
+        }
+        self.file(announced, app_data, hops, now)
+    }
+
+    fn file(
+        &mut self,
+        announced: AnnouncedDestination,
+        app_data: &[u8],
+        hops: u8,
+        now: SystemTime,
+    ) -> Option<PeerChange> {
+        let destination_hash = announced.destination_hash.clone();
+        let identity_hash = announced.identity_hash.clone();
+        let name_hash = announced.name_hash.clone();
+        let filed = record_announce(self.peers, announced, app_data, hops, now)?;
+        self.trust
+            .mark_seen(&destination_hash, &identity_hash, &name_hash, now);
+        self.note_key_change(&identity_hash, &name_hash, now);
+        if self.throttle.admits(&destination_hash, &filed, hops, now) {
+            self.hooks.fire(MeshEvent::PeerDiscovered {
+                destination: destination_hash,
+                identity: identity_hash,
+                name: filed.display_name,
+                hops,
+                protocol_version: filed.protocol_version,
+                compatibility: filed.compatibility,
+                change: filed.change,
+            });
+        }
+        Some(filed.change)
+    }
+
+    fn note_key_change(&self, identity_hash: &str, name_hash: &str, now: SystemTime) {
+        let (Some(identity), Some(name_hash_bytes)) =
+            (parse_hash(identity_hash), decode_name_hash(name_hash))
+        else {
+            return;
+        };
+        // The line the owner gets says how the identity fares when it asks, so it is
+        // judged as its request would be.
+        let outcome = match self
+            .trust
+            .authorize_origin_at(&identity, &name_hash_bytes, now)
+            .verdict
+            .decision
+        {
+            Decision::Allow => KeyChangeOutcome::Served,
+            Decision::Refuse => KeyChangeOutcome::Refused,
+        };
+        self.trust
+            .note_key_change(identity_hash, name_hash, outcome, now);
+    }
+}
+
+/// The pre-flight half of the version gate: a peer the table knows speaks a protocol this
+/// node does not is refused before any link is opened. A peer the table does not know
+/// proceeds; the wire decides.
+fn refuse_incompatible_peer(
+    peers: &PeerTable,
+    dest_hex: &str,
+    path: &str,
+) -> Result<(), RequestError> {
+    match peers.get(dest_hex).map(|record| record.compatibility) {
+        Some(Compatibility::Incompatible { found }) => {
+            debug!(
+                "Mesh request for {path} to {} was not sent: the peer speaks protocol {found}, this Coyote supports {MESH_PROTOCOL_MIN_SUPPORTED}..={MESH_PROTOCOL_VERSION}",
+                short(dest_hex)
+            );
+            Err(RequestError::UnsupportedVersion {
+                found: Some(found),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            })
+        }
+        Some(Compatibility::Compatible) | None => Ok(()),
+    }
+}
+
+/// The other half: a peer that refused this node's version over the wire is marked so the
+/// next request stops at `refuse_incompatible_peer`. The peer's `max` is the newest
+/// protocol it speaks, which is what the record names. A refusal whose window is empty or
+/// contains the version this node sent is not a version mismatch, and marks nothing: the
+/// peer's word alone does not get to cut a compatible peer off.
+fn note_version_refusal(
+    peers: &PeerTable,
+    dest_hex: &str,
+    path: &str,
+    sent: u16,
+    outcome: &Result<rmpv::Value, RequestError>,
+) {
+    let Err(RequestError::UnsupportedVersion { min, max, .. }) = outcome else {
+        return;
+    };
+    if min > max || (*min..=*max).contains(&sent) {
+        debug!(
+            "Mesh request for {path} to {} was refused for protocol version {sent} with an inconsistent window {min}..={max}; the peer is not marked",
+            short(dest_hex)
+        );
+        return;
+    }
+    peers.mark_incompatible(dest_hex, *max);
+    debug!(
+        "Mesh request for {path} to {} was refused for its protocol version; the peer speaks protocol {max} and is marked incompatible",
+        short(dest_hex)
+    );
+}
+
+async fn receive_announces(
+    mut announces: broadcast::Receiver<AnnounceEvent>,
+    peers: Arc<PeerTable>,
+    trust: Arc<TrustStore>,
+    propagation_nodes: Arc<PropagationNodeTable>,
+    hooks: MeshHooks,
+    cancel: CancellationToken,
+) {
+    let mut filer = AnnounceFiler {
+        peers: &peers,
+        trust: &trust,
+        hooks: &hooks,
+        throttle: DiscoveredThrottle::default(),
+    };
+    loop {
+        let event = tokio::select! {
+            () = cancel.cancelled() => break,
+            event = announces.recv() => match event {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    debug!("Mesh announce receiver fell behind and skipped {skipped} announces");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        };
+        let desc = event.destination.lock().await.desc;
+        let now = SystemTime::now();
+        if propagation_nodes.observe_announce(
+            &desc,
+            event.app_data.as_slice(),
+            event.hops,
+            event.is_path_response,
+            now,
+        ) {
+            continue;
+        }
+        let announced = AnnouncedDestination {
+            destination_hash: desc.address_hash.to_hex_string(),
+            identity_hash: desc.identity.address_hash.to_hex_string(),
+            name_hash: hex_lower(&event.name_hash),
+            public_key: Some(desc.identity.to_hex_string()),
+        };
+        let app_data = event.app_data.as_slice();
+        if event.is_path_response {
+            filer.file_path_response(announced, app_data, event.hops, now);
+        } else {
+            filer.file(announced, app_data, event.hops, now);
+        }
+    }
+}
+
+fn log_aged_out_peers(aged_out: &[String]) {
+    for hash in aged_out {
+        debug!("Aged out mesh peer {}", short(hash));
+    }
+}
+
+async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
+    // The first tick of an interval fires immediately; the table was already swept on load.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => {
+                log_aged_out_peers(&peers.sweep(SystemTime::now()));
+            }
+        }
+    }
+}
+
+/// An edge of one TCP client the watcher tells the user about.
+#[derive(Debug, PartialEq, Eq)]
+enum Transition {
+    /// A client that was unreachable at start reports `connected` for the first time.
+    FirstConnect,
+    /// A client that had connected before is `connected` again after a drop.
+    Reconnect,
+}
+
+/// The next event on the transport's interface events, or `Err(n)` once the watcher fell
+/// `n` events behind and they are gone. Never resolves once the stream is closed, so the
+/// watcher's `select!` keeps serving the `local` arm.
+async fn next_interface_event(
+    events: &mut broadcast::Receiver<InterfaceEvent>,
+) -> Result<InterfaceEvent, u64> {
+    match events.recv().await {
+        Ok(event) => Ok(event),
+        Err(broadcast::error::RecvError::Lagged(missed)) => Err(missed),
+        Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+    }
+}
+
+/// The next state event of the attached `local` rnsd's client, `None` once its stream has
+/// ended. Never resolves while no stream is open.
+async fn next_shared_instance_event(local: &mut Option<LocalWatch>) -> Option<SharedInstanceEvent> {
+    match local {
+        Some(local) => local.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The watcher's own copy of one TCP client, with what it keeps between events.
+struct TcpWatch {
+    index: usize,
+    label: String,
+    hash: AddressHash,
+    status: TcpRuntimeStatusHandle,
+    /// Whether the client's stream is up, as far as the watcher has heard.
+    connected: bool,
+    /// Whether the client has connected since start, or was connected at start; its
+    /// next connect is then a reconnect rather than its first.
+    has_connected: bool,
+    /// The streams the client had established when the watcher last read its count,
+    /// `status.connected_streams()`. A higher count read while the client is still
+    /// marked connected is a drop and redial whose events the watcher never read. A
+    /// `Connected` that does not raise it belongs to a stream already credited, by the
+    /// seed at start or by a catch-up after a lag, and tells nothing.
+    connect_count: u64,
+}
+
+impl TcpWatch {
+    fn of(watched: &WatchedInterface) -> Option<Self> {
+        match watched {
+            WatchedInterface::Tcp {
+                index,
+                label,
+                hash,
+                status,
+                connected_at_start,
+            } => Some(Self {
+                index: *index,
+                label: label.clone(),
+                hash: *hash,
+                status: status.clone(),
+                connected: *connected_at_start,
+                has_connected: *connected_at_start,
+                // A client connected at start has a stream up even while its count,
+                // bumped just after the stream is marked up, still reads one behind.
+                connect_count: status
+                    .connected_streams()
+                    .max(u64::from(*connected_at_start)),
+            }),
+            WatchedInterface::Local { .. } => None,
+        }
+    }
+
+    /// Folds a fresh read of the client's stream count into the one kept and returns
+    /// whether it rose.
+    fn recount(&mut self, streams: u64) -> bool {
+        let rose = streams > self.connect_count;
+        self.connect_count = self.connect_count.max(streams);
+        rose
+    }
+
+    /// Records a connect and returns what it is to the user; `None` for a client already
+    /// marked connected, such as one whose connect at start the stream still held.
+    fn connect(&mut self) -> Option<Transition> {
+        if self.connected {
+            return None;
+        }
+        self.connected = true;
+        if std::mem::replace(&mut self.has_connected, true) {
+            Some(Transition::Reconnect)
+        } else {
+            Some(Transition::FirstConnect)
+        }
+    }
+}
+
+/// The watcher's own copy of the attached `local` rnsd. A transport attaches at most one
+/// shared instance, so the watcher holds at most one of these.
+struct LocalWatch {
+    index: usize,
+    label: String,
+    endpoint: LocalEndpoint,
+    events: mpsc::Receiver<SharedInstanceEvent>,
+    /// The dial failure last logged for the row, so a client redialing into the same
+    /// failure logs it once; cleared on `Connected`.
+    logged_dial_failure: Option<String>,
+}
+
+impl LocalWatch {
+    /// `None` for a TCP client and once the start receiver has been taken.
+    fn of(watched: &WatchedInterface) -> Option<Self> {
+        let WatchedInterface::Local {
+            index,
+            label,
+            endpoint,
+            events,
+        } = watched
+        else {
+            return None;
+        };
+        // The start receiver is taken one-shot, the way `watch_interfaces` takes the
+        // interface events: the first watcher is its only reader.
+        let events = events.lock().take()?;
+        Some(Self {
+            index: *index,
+            label: label.clone(),
+            endpoint: endpoint.clone(),
+            events,
+            logged_dial_failure: None,
+        })
+    }
+}
+
+/// Folds one interface event into the TCP client it belongs to and returns the
+/// transition to tell, if any. A `Connected` tells a transition only when it raises the
+/// client's stream count or the client has never connected. The client counts a stream
+/// before it publishes its `Connected`, so a redial the watcher reads always raises the
+/// count, while one whose stream the count already credited tells nothing: that covers
+/// the events still held after a lag, whose streams `reconcile_tcp_after_lag` already
+/// told. An event of any other interface is not the watcher's to read here: the
+/// shared-instance client publishes on the same stream.
+fn follow_tcp_event(
+    watches: &mut [TcpWatch],
+    hash: AddressHash,
+    kind: InterfaceEventKind,
+) -> Option<(AddressHash, Transition)> {
+    let watch = watches.iter_mut().find(|watch| watch.hash == hash)?;
+    match kind {
+        InterfaceEventKind::Connected => {
+            let rose = watch.recount(watch.status.connected_streams());
+            if rose || !watch.has_connected {
+                watch.connect().map(|transition| (hash, transition))
+            } else {
+                watch.connected = true;
+                None
+            }
+        }
+        InterfaceEventKind::Disconnected { reason } => {
+            watch.connected = false;
+            debug!(
+                "Mesh interface {} dropped its connection ({reason:?}); the client is redialing it",
+                watch.label
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Catches the TCP clients up after the watcher fell `missed` interface events behind,
+/// from each client's status: a client whose stream is up and is not marked connected
+/// gets the transition its missed `Connected` would have brought, one marked connected
+/// whose stream is up and whose stream count rose dropped and redialed inside the gap
+/// and gets a reconnect, and one marked connected whose stream is down is unmarked, so
+/// its next `Connected` counts as a reconnect if it raises the count. A count that did
+/// not move tells nothing: the client bumps it just after marking a stream up, and the
+/// `Connected` that follows the bump is still on its way. The `Connected` events the
+/// receiver still holds after the lag, and one published after this read, find their
+/// streams already counted and tell nothing, so each catch-up is told once.
+fn reconcile_tcp_after_lag(
+    watches: &mut [TcpWatch],
+    missed: u64,
+) -> Vec<(AddressHash, Transition)> {
+    warn!(
+        "Mesh interface watcher fell behind and missed {missed} interface event(s); re-reading every relay's state"
+    );
+    watches
+        .iter_mut()
+        .filter_map(|watch| {
+            // Read before the state: the client marks a stream up before it counts it,
+            // so every stream this count includes was up before the state is read.
+            let streams = watch.status.connected_streams();
+            if watch.status.to_json()["stream_state"].as_str() == Some("connected") {
+                if watch.recount(streams) && watch.connected {
+                    return Some((watch.hash, Transition::Reconnect));
+                }
+                watch.connect().map(|transition| (watch.hash, transition))
+            } else {
+                watch.recount(streams);
+                watch.connected = false;
+                None
+            }
+        })
+        .collect()
+}
+
+/// Follows every TCP client and the `local` rnsd for the node's lifetime through the
+/// events their clients send. The first `Connected` on the transport's interface events
+/// of a TCP client that was unreachable at start is recorded on the node, told to the
+/// user and announced over, so the line never waits on the announce. That announce skips
+/// the floor, as the peers behind that relay have never heard this destination. Each
+/// `Connected` after a drop, for a client that connected at start as for one that
+/// connected later, gets an announce through `announce_now`: the relay forgot every path
+/// it held through the closed socket, and the heartbeat is up to an hour away. That
+/// announce honours and resets the floor, so a relay that flaps cannot make this node
+/// announce more often than once per `REANNOUNCE_FLOOR_SECS`; the first connect of a
+/// relay that was down at start is the one announce without it. Every reconnect is told
+/// to the user with what became of its announce: sent, deferred to the heartbeat, failed,
+/// or not sent at all by a node that does not announce. A `Connected` whose stream the
+/// client's count already credited, such as the connect at start the stream still held
+/// when the watcher began or an event still held after a lag, tells nothing. A drop is
+/// only logged: the client redials on its own. A watcher that fell behind the stream
+/// reads each client's status instead, see `reconcile_tcp_after_lag`. The `local`
+/// rnsd's shared-instance client's state events drive its row, see
+/// `follow_local_event`. That client re-announces and redials
+/// by itself, so no line is printed and no announce sent for an rnsd. The watcher holds
+/// no peer-controlled state: a fixed list from the node's own config, two flags and a
+/// stream count per client and one dial failure for the rnsd. Ends when the node or its
+/// slot is gone.
+async fn watch_interfaces(
+    slot: Weak<MeshSlot>,
+    runtime: Weak<MeshRuntime>,
+    cancel: CancellationToken,
+) {
+    let Some((mut watches, mut local, events)) = runtime.upgrade().map(|runtime| {
+        let watched = runtime.watched_interfaces();
+        (
+            watched.iter().filter_map(TcpWatch::of).collect::<Vec<_>>(),
+            watched.iter().find_map(LocalWatch::of),
+            runtime.interface_events.lock().take(),
+        )
+    }) else {
+        return;
+    };
+    let Some(mut events) = events else {
+        return;
+    };
+    loop {
+        let mut transitions = Vec::new();
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            received = next_interface_event(&mut events) => match received {
+                Ok(event) => {
+                    transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
+                }
+                Err(missed) => transitions = reconcile_tcp_after_lag(&mut watches, missed),
+            },
+            // The `local` row reads its client's own state stream, not the interface
+            // events: the shared-instance client exposes no state to re-read, so an event
+            // lost to a broadcast `Lagged` could not be caught up. This stream drops when
+            // full too, which `LOCAL_EVENT_CAPACITY` is sized to keep out of reach.
+            event = next_shared_instance_event(&mut local) => {
+                let Some(runtime) = runtime.upgrade() else {
+                    return;
+                };
+                follow_local_event(&runtime, &mut local, event);
+            }
+        }
+        if transitions.is_empty() {
+            continue;
+        }
+        let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
+            return;
+        };
+        // A TCP row only ever moves to `Connected` here; `Disconnected` and `Connecting`
+        // are the local arm's, and the remedies worded for them assume that.
+        for (hash, transition) in transitions {
+            let Some(TcpWatch { index, label, .. }) =
+                watches.iter().find(|watch| watch.hash == hash)
+            else {
+                continue;
+            };
+            let index = *index;
+            // Awaiting an announce here can hold back another client's line by up to
+            // `REKEY_GRACE`; accepted, as its event waits in the stream.
+            match transition {
+                Transition::FirstConnect => {
+                    let Some(label) = runtime.mark_interface_connected(index) else {
+                        continue;
+                    };
+                    info!("Mesh interface {label} connected");
+                    slot.push_idle(IdleNotify {
+                        source: Source::Mesh,
+                        text: format!("{label} connected").into(),
+                        origin: Origin::Local,
+                        model_note: None,
+                    });
+                    tokio::select! {
+                        () = cancel.cancelled() => return,
+                        outcome = runtime.announce_on_connect() => if let Err(err) = outcome {
+                            warn!(
+                                "Failed to announce the mesh node over {label}; the heartbeat will announce it: {}",
+                                redact_hashes(&format!("{err:#}"))
+                            );
+                        }
+                    }
+                }
+                Transition::Reconnect => {
+                    let announced = if runtime.announce {
+                        Some(tokio::select! {
+                            () = cancel.cancelled() => return,
+                            outcome = runtime.announce_after_reconnect() => outcome,
+                        })
+                    } else {
+                        None
+                    };
+                    let line = reconnect_line(label, announced.as_ref());
+                    match &announced {
+                        Some(Err(err)) => warn!(
+                            "Mesh interface {line} Cause: {}",
+                            redact_hashes(&format!("{err:#}"))
+                        ),
+                        _ => info!("Mesh interface {line}"),
+                    }
+                    slot.push_idle(IdleNotify {
+                        source: Source::Mesh,
+                        text: line.into(),
+                        origin: Origin::Local,
+                        model_note: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The idle line for a relay that reconnected, by what became of the announce over it:
+/// `None` for a node that does not announce, else what `announce_after_reconnect`
+/// returned. A failure is told in plain words only; its cause goes to the log.
+fn reconnect_line(label: &str, announced: Option<&Result<Option<Duration>>>) -> String {
+    match announced {
+        Some(Ok(None)) => format!("{label} reconnected; announced"),
+        Some(Ok(Some(age))) => format!(
+            "{label} reconnected; this node announced {}, so it waits for the next heartbeat to announce again",
+            elapsed_text(*age)
+        ),
+        Some(Err(_)) => format!(
+            "{label} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log)."
+        ),
+        None => format!(
+            "{label} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
+        ),
+    }
+}
+
+/// Folds one state event of the attached `local` rnsd's client into its row. `Connected`
+/// is the row's `connected`, logged at info when it moved the row (a client that
+/// connected during start had its `Connected` read there). A drop is `lost, retrying`
+/// with the sentence for the client's reason; a plain `Disconnected`, which the attach
+/// does not ask for, reads as an orderly close. `Connecting` leaves the row alone: the
+/// client sends it right after every drop, before a redial has landed, and the drop stays
+/// the row's until a stream is back. A `DialFailed` puts its sentence on a row that is
+/// still `connecting` and leaves a lost or connected row alone; it is logged at debug
+/// only when its sentence differs from the last one logged since the last `Connected`,
+/// as the client redials every `LOCAL_RECONNECT_WAIT`. No idle line and no announce for
+/// any of it: the client re-announces over a restored socket itself. `None` is the end
+/// of the stream, which the detach at stop brings, and the receiver is let go.
+fn follow_local_event(
+    runtime: &MeshRuntime,
+    local: &mut Option<LocalWatch>,
+    event: Option<SharedInstanceEvent>,
+) {
+    let Some(watch) = local.as_mut() else {
+        return;
+    };
+    let Some(event) = event else {
+        debug!(
+            "Mesh interface {} stopped reporting; its client is detached",
+            watch.label
+        );
+        *local = None;
+        return;
+    };
+    let LocalWatch {
+        index,
+        label,
+        endpoint,
+        logged_dial_failure,
+        ..
+    } = watch;
+    let index = *index;
+    let lose = |reason: String| {
+        let state = InterfaceState::Disconnected { reason };
+        if runtime.mark_interface_state(index, state).is_some() {
+            warn!("Mesh interface {label} lost rnsd; the transport is redialing it");
+        }
+    };
+    match event {
+        SharedInstanceEvent::Connected => {
+            *logged_dial_failure = None;
+            if runtime.mark_interface_connected(index).is_some() {
+                info!("Mesh interface {label} connected");
+            } else {
+                debug!("Mesh interface {label} reported its connection to rnsd");
+            }
+        }
+        SharedInstanceEvent::DisconnectedWithReason { reason } => {
+            lose(disconnect_sentence(reason));
+        }
+        // The attach opts in to reasoned drops, so a plain one names no cause.
+        SharedInstanceEvent::Disconnected => lose(CONNECTION_ENDED.to_string()),
+        SharedInstanceEvent::Connecting => {}
+        SharedInstanceEvent::DialFailed { reason } => {
+            let failure = DialFailure::of(reason, endpoint);
+            let sentence = failure.reason.clone();
+            let connecting = matches!(
+                runtime
+                    .interface_states
+                    .read()
+                    .get(index)
+                    .map(|status| &status.state),
+                Some(InterfaceState::Connecting { .. })
+            );
+            if connecting {
+                runtime.mark_interface_state(
+                    index,
+                    InterfaceState::Connecting {
+                        dial_failure: Some(failure),
+                    },
+                );
+            }
+            if logged_dial_failure.as_deref() != Some(sentence.as_str()) {
+                debug!("Mesh interface {label} could not dial rnsd: {sentence}");
+                *logged_dial_failure = Some(sentence);
+            }
+        }
+        // Guard for future variants.
+        other => debug!("Mesh interface {label} reported {other:?}"),
+    }
+}
+
+/// One sweep of the envoy's memory. Memory is best-effort: a store that cannot be pruned
+/// is logged and the node serves on without it being swept.
+fn prune_envoy_memory(store: &EnvoySessions) {
+    match store.prune(SystemTime::now()) {
+        Ok(0) => {}
+        Ok(removed) => debug!("Forgot {removed} remembered envoy conversation(s)"),
+        Err(err) => warn!(
+            "Failed to prune the envoy's conversation memory: {}",
+            redact_hashes(&err.to_string())
+        ),
+    }
+}
+
+/// A revoked identity's conversations go with its trust, out of every instance's store
+/// under the cache directory and not only the one the node currently serves: trust is
+/// per config directory, the stores per instance. The sweep runs whether or not the
+/// memory is on, since records may remain from a time it was.
+impl EnvoyMemorySink for MeshRuntime {
+    fn forget_identity(&self, identity: &str) {
+        match EnvoySessions::delete_identity_everywhere(
+            &self.cache_dir,
+            &self.envoy_memory_config,
+            identity,
+        ) {
+            Ok(Forgotten {
+                removed: 0,
+                unreadable_stores: 0,
+            }) => {}
+            Ok(Forgotten {
+                removed,
+                unreadable_stores,
+            }) => debug!(
+                "Mesh forgot {removed} remembered envoy conversation(s) of {}; {unreadable_stores} store(s) could not be swept",
+                short(identity)
+            ),
+            Err(err) => warn!(
+                "Mesh could not forget the remembered envoy conversations of {}: {}",
+                short(identity),
+                redact_hashes(&err.to_string())
+            ),
+        }
+    }
+
+    fn remembered_of(&self, identity: &str) -> Result<RememberedOf, EnvoyMemoryError> {
+        let identity = canonical_hash(identity)
+            .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
+        let all = EnvoySessions::remembered_everywhere(&self.cache_dir, &self.envoy_memory_config)?;
+        Ok(RememberedOf {
+            threads: all.by_identity.get(&identity).map_or(0, Vec::len),
+            unreadable_stores: all.unreadable_stores,
+        })
+    }
+}
+
+/// Prunes whatever store `current` hands back on each heartbeat, so a re-key that
+/// re-points the node's memory moves the sweep with it.
+async fn sweep_envoy_memory(
+    current: impl Fn() -> Option<Arc<EnvoySessions>> + Send + 'static,
+    cancel: CancellationToken,
+) {
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
+    // The first tick of an interval fires immediately; the store was already pruned at start.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => if let Some(store) = current() {
+                prune_envoy_memory(&store);
+            },
+        }
+    }
+}
+
+/// Lets the slot's expired escalations go on each heartbeat, so a question nobody
+/// answers is reported while the node runs and not only when `.mesh pending` is next
+/// typed. The slot is held weakly, since it owns the node that owns this task.
+async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
+    // The first tick of an interval fires immediately, which would put expiry lines in
+    // the middle of `.mesh on`'s output; the first heartbeat or `.mesh pending` sweeps.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => {
+                let Some(slot) = slot.upgrade() else { break };
+                slot.sweep_expired_pending(SystemTime::now());
+            }
+        }
+    }
+}
+
+/// A node loaded from the persisted table may have no path yet, and a link needs one: this
+/// transport does not rebroadcast announces, so the path comes only from an answered
+/// request. One request, waited on for `PATH_REQUEST_TIMEOUT`; without an answer the link
+/// fails as it would have. Stopping the node ends the wait with `cancelled`, the caller's
+/// own error for a stop. Whether a request was sent: the post or fetch that follows opens
+/// its link as one whose path was already asked for when it was, so it never waits again
+/// outside this cancellable wait.
+async fn request_path_to_node<E>(
+    transport: &Transport,
+    node: &PropagationNode,
+    cancel: &CancellationToken,
+    cancelled: E,
+) -> Result<bool, E> {
+    let hash = node.destination.address_hash;
+    if transport.has_path(&hash).await {
+        return Ok(false);
+    }
+    debug!(
+        "Mesh has no path to propagation node {}; asking the mesh for one",
+        short(&hash.to_hex_string())
+    );
+    tokio::select! {
+        () = cancel.cancelled() => return Err(cancelled),
+        found = transport.await_path(&hash, PATH_REQUEST_TIMEOUT, None) => {
+            if !found {
+                debug!(
+                    "Mesh heard no path to propagation node {} within {}s; the link to it \
+                     will likely fail for want of one, and the next attempt asks again",
+                    short(&hash.to_hex_string()),
+                    PATH_REQUEST_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn persist_tables_periodically(
+    peers: Arc<PeerTable>,
+    propagation_nodes: Arc<PropagationNodeTable>,
+    cancel: CancellationToken,
+) {
+    let mut ticks = interval(Duration::from_secs(PEER_PERSIST_INTERVAL_SECS));
+    // The first tick of an interval fires immediately; nothing has changed since load.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => {
+                if let Err(err) = peers.persist_if_dirty() {
+                    warn!(
+                        "Failed to persist the mesh peer table: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                }
+                propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Timer);
+            }
+        }
+    }
+}
+
+async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationToken) {
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_PERIOD_SECS));
+    // The first tick fires immediately; `start` already sent that announce.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => {
+                if let Err(err) = runtime.announce_now().await {
+                    warn!(
+                        "Failed to send the mesh heartbeat announce: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The (sending identity, message id) pairs handed to the envoy within
+/// `BODY_DEDUP_HORIZON`, at most `BODY_DEDUP_CAPACITY` of them with the oldest forgotten
+/// first. Consulted on the envoy path alone: a reply, a bulletin or a body arriving while
+/// no envoy is attached never enters it. A pair the envoy refused is forgotten at once,
+/// since the envoy never had that body: its repeat is offered afresh, and a second
+/// refusal is bounded by the refusal path's own per-identity, per-reason, per-hour gate.
+/// A pair the envoy accepted but could not run (the node went off, the run timed out,
+/// was interrupted or failed) stays remembered: the envoy had the body, and the human
+/// already has the fallback line in the inbox, so its repeat is filed and not run again.
+#[derive(Default)]
+struct BodyDedup {
+    at: BTreeMap<(String, String), SystemTime>,
+    by_age: BTreeSet<(SystemTime, (String, String))>,
+}
+
+impl BodyDedup {
+    fn key(message: &PeerMessage) -> (String, String) {
+        (message.source_identity.clone(), message.message_id.clone())
+    }
+
+    /// `true` when the pair is new to the window, `false` when it was recorded within the
+    /// horizon.
+    fn insert_at(&mut self, key: (String, String), now: SystemTime) -> bool {
+        self.expire(now);
+        if self.at.contains_key(&key) {
+            return false;
+        }
+        self.at.insert(key.clone(), now);
+        self.by_age.insert((now, key));
+        while self.at.len() > BODY_DEDUP_CAPACITY {
+            let (_, oldest) = self
+                .by_age
+                .pop_first()
+                .expect("a window over its capacity is not empty");
+            self.at.remove(&oldest);
+            debug!(
+                "Forgot envoy body {} from {} to stay within {BODY_DEDUP_CAPACITY} remembered",
+                oldest.1,
+                short(&oldest.0)
+            );
+        }
+        true
+    }
+
+    fn forget(&mut self, key: &(String, String)) {
+        if let Some(recorded_at) = self.at.remove(key) {
+            self.by_age.remove(&(recorded_at, key.clone()));
+        }
+    }
+
+    fn expire(&mut self, now: SystemTime) {
+        while let Some((recorded_at, key)) = self.by_age.first()
+            && now.duration_since(*recorded_at).unwrap_or_default() >= BODY_DEDUP_HORIZON
+        {
+            self.at.remove(key);
+            debug!(
+                "Forgot envoy body {} from {} older than {} s",
+                key.1,
+                short(&key.0),
+                BODY_DEDUP_HORIZON.as_secs()
+            );
+            self.by_age.pop_first();
+        }
+    }
+}
+
+/// The (source destination, message id) pairs of the inbox entries this node filed
+/// itself, at most `OWN_ENTRY_MARKS` of them with the oldest forgotten first. Marked by
+/// the two producers of such entries as they mint the reply, so provenance never
+/// depends on the destination the node has at read time: a bare slot's reply has an
+/// empty source and is marked all the same, while a peer's message never matches, since
+/// both ingress paths overwrite its source from the verified identity. The pair, not
+/// the id alone, is the key: a peer echoing one of our ids under its own source is not
+/// this node.
+#[derive(Default)]
+struct OwnEntryMarks {
+    marks: HashSet<(String, String)>,
+    by_age: VecDeque<(String, String)>,
+}
+
+impl OwnEntryMarks {
+    fn key(message: &PeerMessage) -> (String, String) {
+        (
+            message.source_destination.clone(),
+            message.message_id.clone(),
+        )
+    }
+
+    /// Re-marking a key already held keeps its original age; keys are fresh UUIDs, so
+    /// this does not arise in practice.
+    fn mark(&mut self, message: &PeerMessage) {
+        let key = Self::key(message);
+        if !self.marks.insert(key.clone()) {
+            return;
+        }
+        self.by_age.push_back(key);
+        while self.by_age.len() > OWN_ENTRY_MARKS {
+            let oldest = self
+                .by_age
+                .pop_front()
+                .expect("a mark set over its capacity is not empty");
+            self.marks.remove(&oldest);
+        }
+    }
+
+    fn contains(&self, message: &PeerMessage) -> bool {
+        self.marks.contains(&Self::key(message))
+    }
+}
+
+/// The process-wide home of the running node. Empty until the mesh is turned on; shared by
+/// every `AppState` clone so replacing the config never detaches the runtime.
+///
+/// The snapshot, objective override, digest, user brief and brief live in lock-free slots:
+/// the REPL holds the session context write-locked for a whole turn, so anything that
+/// serves peers must be readable without it.
+///
+/// `snapshot()` is the picture taken at the last turn boundary, or at the last progress
+/// point inside a long turn. `objective_override()`,
+/// `digest()` and `user_brief()` are live and may be newer than it. Consumers overlay
+/// `objective_override()` on `snapshot().objective` when it is `Some`. `brief()` is
+/// derived: `reassemble_brief` rebuilds it from the snapshot, the digest and the user
+/// brief whenever any of them changes. The live `brief()` is authoritative, including
+/// `None`: a cleared brief must not fall back to `snapshot().brief`, which is the value
+/// at capture, kept so a snapshot is self-describing.
+///
+/// `digest_epoch` counts the clears made by `clear_digest_for_new_epoch`. A generation
+/// records the epoch it started under and publishes through `publish_digest_at`, which
+/// refuses once the epoch has moved on, so a digest of one session cannot land after the
+/// switch to another. Both run under `reassembly`, so the check and the store are one step.
+///
+/// The notifier slot is where lines meant for the person at the keyboard go, filled by
+/// whichever front end owns the terminal so mesh code never needs to know which one is
+/// running. The idle slot is where events that also concern the model go, filled by the
+/// interactive REPL's idle-time driver. Without one, `push_idle` keeps the human line and
+/// drops the model's copy, since a headless run has no transcript for it to reach.
+///
+/// Peer messages land in `peer_inbox` for the model to read on its next `mesh__check_inbox`,
+/// with a note in `model_notes` so it knows to look; replies to questions this node asked
+/// are matched in `correlations` first. With an envoy attached, messages and questions
+/// go to it instead of the inbox; the questions it escalates to the person at the
+/// keyboard wait in `inbound`, a per-instance file like `correlations`' store.
+///
+/// `limits` holds each peer's hourly windows and in-flight envoy runs. It belongs to the
+/// slot rather than the node so a `.mesh off`/`.mesh on` does not hand a flooding peer
+/// a fresh window; `install` configures it from the node's config.
+///
+/// `envoy_bodies` is the window of bodies already handed to the envoy, so one that comes
+/// back by store-and-forward after a lost link acknowledgement is filed and not run again.
+///
+/// `own_entries` marks the inbox entries this node filed itself, written as they are
+/// filed and read by `is_from_self`; `stop` and `rekey` leave it alone, so an entry filed
+/// before a `.mesh off` or a re-key still reads as this node's.
+///
+/// `command_prefix` is the session's configured prefix, kept in step with the config by
+/// whoever writes it, so every line printed for the human shows command hints the way
+/// the human types them.
+///
+/// `last_progress_capture` is when a progress point inside a turn last captured a
+/// snapshot, and `digest_hook` is who may regenerate the digest after one; only the
+/// interactive REPL installs a hook.
+///
+/// `pending_progress` is the latest snapshot a progress point captured too soon after
+/// the last one. While it is set, `trailing_armed` marks the one timer task that will
+/// publish it once the interval has passed. Every `publish` clears it under the same
+/// lock, so a turn boundary is never overwritten by an older progress snapshot.
+///
+/// `progress_without_node` lets a test slot take progress points with no node running.
+#[derive(Default)]
+pub(crate) struct MeshSlot {
+    inner: RwLock<Option<Arc<MeshRuntime>>>,
+    snapshot: ArcSwapOption<MeshSnapshot>,
+    objective_override: ArcSwapOption<String>,
+    digest: ArcSwapOption<Digest>,
+    digest_epoch: AtomicU64,
+    user_brief: ArcSwapOption<String>,
+    brief: ArcSwapOption<Brief>,
+    reassembly: parking_lot::Mutex<()>,
+    notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
+    idle: ArcSwapOption<Arc<dyn IdleSink>>,
+    envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
+    envoy_bodies: parking_lot::Mutex<BodyDedup>,
+    own_entries: parking_lot::Mutex<OwnEntryMarks>,
+    hooks: MeshHooks,
+    limits: Arc<PeerLimits>,
+    peer_inbox: PeerInbox,
+    correlations: Correlations,
+    model_notes: ModelNotes,
+    inbound: parking_lot::Mutex<Option<Arc<InboundStore>>>,
+    command_prefix: LivePrefix,
+    last_progress_capture: parking_lot::Mutex<Option<tokio::time::Instant>>,
+    pending_progress: parking_lot::Mutex<Option<MeshSnapshot>>,
+    trailing_armed: AtomicBool,
+    digest_hook: ArcSwapOption<Arc<dyn MeshDigestHook>>,
+    #[cfg(test)]
+    progress_without_node: bool,
+    #[cfg(test)]
+    envoy_memory_override: ArcSwapOption<EnvoySessions>,
+}
+
+impl MeshSlot {
+    #[cfg(test)]
+    pub(crate) fn without_node_gate() -> Self {
+        Self {
+            progress_without_node: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<Arc<MeshRuntime>> {
+        self.inner.read().clone()
+    }
+
+    /// Whether a progress point has anyone to publish for. Without a running node no
+    /// peer can read the snapshot, so the capture and its timer are skipped.
+    pub(crate) fn takes_progress_points(&self) -> bool {
+        #[cfg(test)]
+        if self.progress_without_node {
+            return true;
+        }
+        self.get().is_some()
+    }
+
+    pub(crate) fn command_prefix(&self) -> &LivePrefix {
+        &self.command_prefix
+    }
+
+    pub(crate) fn limits(&self) -> &Arc<PeerLimits> {
+        &self.limits
+    }
+
+    /// The envoy's conversation memory of the instance the node serves; `None` while
+    /// the mesh is off or `mesh.envoy_memory` is disabled. Looked up per run, never
+    /// kept: a re-key swaps the node's store.
+    pub(crate) fn envoy_memory(&self) -> Option<Arc<EnvoySessions>> {
+        #[cfg(test)]
+        if let Some(store) = self.envoy_memory_override.load_full() {
+            return Some(store);
+        }
+        self.get().and_then(|runtime| runtime.envoy_memory())
+    }
+
+    /// Gives a slot with no node an envoy memory, so a run that resumes a peer's
+    /// thread can be tested without a runtime to `install`.
+    #[cfg(test)]
+    pub(crate) fn set_envoy_memory_for_tests(&self, store: Arc<EnvoySessions>) {
+        self.envoy_memory_override.store(Some(store));
+    }
+
+    /// Refuses while a node is already running, and for nothing else: two nodes in one
+    /// process would fight over the same instance lock and identity. Installing puts this
+    /// slot behind the node's `/status`, `/message`, `/list`, `/fetch` and `/access`
+    /// providers, knock gate and peer and access surfaces, held weakly since the slot owns
+    /// the node. The questions the node's instance left pending on disk are adopted
+    /// before the `/message` provider is registered, so a reply admitted in between still
+    /// finds its question; a pending file this Coyote cannot read is logged with its
+    /// remedy and the node serves with none pending, a late reply landing as an ordinary
+    /// message. A knock the gate admits between `MeshRuntime::start` and this call is
+    /// cached but not surfaced, and not marked as surfaced either, so a repeat from that
+    /// identity still earns its one line. The caller refreshes the session's tool catalog
+    /// once this returns, since the `mesh__*` tools are declared only while a node is on.
+    /// The interface watcher is spawned here, so this must run inside a tokio runtime; an
+    /// interface event sent between `MeshRuntime::start` and this call waits in the
+    /// stream `start` subscribed, and the watcher reads it first.
+    pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
+        if self.get().is_some() {
+            bail!(MESH_ALREADY_ON);
+        }
+        let store = PendingStore::new(runtime.cache_dir(), &runtime.current_instance_id());
+        let inbound = InboundStore::new(runtime.cache_dir(), &runtime.current_instance_id());
+        let pending = reopen_pending(&store);
+        // Nothing may `.await` while this guard is held: the status handler reads the same
+        // lock for the display name.
+        let mut slot = self.inner.write();
+        if slot.is_some() {
+            bail!(MESH_ALREADY_ON);
+        }
+        self.correlations.adopt(store, pending);
+        *self.inbound.lock() = Some(Arc::new(inbound));
+        self.limits.configure(runtime.peer_limits());
+        let source = Arc::downgrade(self) as Weak<dyn CardSource>;
+        runtime
+            .dispatcher()
+            .register(STATUS_PATH, Arc::new(StatusHandler::new(source)))?;
+        let surface = Arc::downgrade(self) as Weak<dyn PeerSurface>;
+        runtime.dispatcher().register(
+            MESSAGE_PATH,
+            Arc::new(PeerMessageHandler::new(surface.clone())),
+        )?;
+        let shares = Arc::downgrade(self) as Weak<dyn ShareSource>;
+        runtime
+            .dispatcher()
+            .register(LIST_PATH, Arc::new(ListHandler::new(shares.clone())))?;
+        runtime
+            .dispatcher()
+            .register(FETCH_PATH, Arc::new(FetchHandler::new(shares)))?;
+        let access = Arc::downgrade(self) as Weak<dyn AccessSurface>;
+        runtime
+            .dispatcher()
+            .register(ACCESS_PATH, Arc::new(AccessHandler::new(access.clone())))?;
+        runtime.attach_peer_surface(surface);
+        runtime.attach_access_surface(access);
+        runtime
+            .knock_gate()
+            .attach(Arc::downgrade(self) as Weak<dyn KnockSurface>);
+        runtime
+            .trust()
+            .attach_surface(Arc::downgrade(self) as Weak<dyn KnockSurface>);
+        runtime
+            .trust()
+            .attach_presence(Arc::downgrade(&runtime.peers()) as Weak<dyn InstancePresence>);
+        // A node started on its own handle takes the slot's sink, so what it fires
+        // reaches the same place as what the slot fires.
+        if !self.hooks.same_handle(runtime.hooks())
+            && let Some(sink) = self.hooks.current()
+        {
+            runtime.hooks().set(sink);
+        }
+        let facts = node_facts(&runtime);
+        *slot = Some(runtime.clone());
+        // Fired outside the lock: the sink is not the slot's to trust with it.
+        drop(slot);
+        self.hooks.fire(MeshEvent::Started(facts));
+        if !runtime.watched_interfaces().is_empty() {
+            runtime.register_task(tokio::spawn(watch_interfaces(
+                Arc::downgrade(self),
+                Arc::downgrade(&runtime),
+                runtime.cancellation_token(),
+            )));
+        }
+        runtime.register_task(tokio::spawn(sweep_pending(
+            Arc::downgrade(self),
+            runtime.cancellation_token(),
+        )));
+        self.request_sync();
+        Ok(())
+    }
+
+    /// Takes the node out of the slot and shuts it down, letting go of its pending
+    /// questions with it: they stay on disk for the next install of that instance.
+    /// Detaching before the shutdown grace means a reply served during the grace lands as
+    /// an ordinary message and its question stays open on disk, which is the price of
+    /// never writing a stopped node's file. An envoy run in flight is cut short first:
+    /// its reply would go out through the node being stopped. `Ok(false)` when nothing
+    /// was running. The caller refreshes the session's tool catalog afterwards so the
+    /// `mesh__*` tools go with the node.
+    pub(crate) async fn stop(&self) -> Result<bool> {
+        let taken = self.inner.write().take();
+        match taken {
+            Some(runtime) => {
+                if let Some(envoy) = self.envoy.load_full() {
+                    envoy.interrupt();
+                }
+                self.correlations.detach_store();
+                self.inbound.lock().take();
+                let facts = node_facts(&runtime);
+                let shutdown = runtime.shutdown().await;
+                self.hooks.fire(MeshEvent::Stopped(facts));
+                shutdown?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Re-keys the running node for a forked session and binds the pending questions,
+    /// the grants and the envoy's memory to the fork's own files, since a fork asks its
+    /// own questions, answers its own access requests and remembers its own peer
+    /// threads, and must not collect, hand out or read the original's; a no-op while the
+    /// mesh is off. The sent-threads list is one per config dir and is left as it is, so
+    /// the fork may continue every thread the original could. The fork's files are
+    /// adopted before the node re-keys so a reply or fetch the fork's destination serves
+    /// at once finds them, and a re-key that fails puts the original's back, since the
+    /// original is what stays served.
+    /// Questions peers escalated before the fork are copied into the fork's inbound file
+    /// so `.mesh answer` still finds them after the switch. A fork pending file this
+    /// Coyote cannot read is logged and the fork starts with no questions pending, as
+    /// `install` does: the node must not be reported as failed for a cache file. A fork
+    /// grants file that cannot be opened refuses the re-key, as it would refuse `start`.
+    pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
+        let Some(runtime) = self.get() else {
+            return Ok(());
+        };
+        let now = SystemTime::now();
+        // The carry copies only live rows, so an expired one left in the original's
+        // file would never be announced once the slot serves the fork's. The sweep and
+        // the carries share one reading of the clock so no row can cross `PENDING_TTL`
+        // between them and be neither pruned nor carried.
+        self.sweep_expired_pending(now);
+        let fork_store = PendingStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
+        let pending = reopen_pending(&fork_store);
+        self.correlations.adopt(fork_store, pending);
+        let fork_inbound = Arc::new(InboundStore::new(
+            runtime.cache_dir(),
+            &rekey.fork_instance_id,
+        ));
+        let current_inbound = self.inbound.lock().clone();
+        let carry = || {
+            let Some(current) = &current_inbound else {
+                return;
+            };
+            match fork_inbound.adopt_from(current, now) {
+                Ok(adopted) => self.announce_expired(adopted.displaced),
+                Err(err) => warn!(
+                    "Mesh questions escalated before the fork could not be carried into it, so `.mesh answer` will not find them: {}",
+                    redact_hashes(&format!("{err:#}"))
+                ),
+            }
+        };
+        carry();
+        *self.inbound.lock() = Some(Arc::clone(&fork_inbound));
+        // A record filed into the old store between the first carry and the swap would
+        // otherwise be lost; adoption is by id, so repeating it is harmless.
+        carry();
+        let grants_rebound = runtime
+            .serving()
+            .rebind_grants(&rekey.fork_instance_id, SystemTime::now())
+            .context(
+                "The fork's grant store could not be opened, so the node still serves the original instance",
+            );
+        let (rekeyed, displaced) = match grants_rebound {
+            Ok(displaced_grants) => {
+                let displaced_envoy_memory = runtime.rebind_envoy_memory(&rekey.fork_instance_id);
+                let rekeyed = runtime.rekey(rekey).await;
+                (rekeyed, Some((displaced_grants, displaced_envoy_memory)))
+            }
+            Err(err) => (Err(err), None),
+        };
+        if rekeyed.is_err() {
+            let instance_id = runtime.current_instance_id();
+            let original = PendingStore::new(runtime.cache_dir(), &instance_id);
+            let pending = reopen_pending(&original);
+            self.correlations.adopt(original, pending);
+            *self.inbound.lock() = Some(Arc::new(InboundStore::new(
+                runtime.cache_dir(),
+                &instance_id,
+            )));
+            // The original's stores were never closed, so putting them back cannot fail.
+            if let Some((original_grants, original_envoy_memory)) = displaced {
+                runtime.serving().restore_grants(original_grants);
+                runtime.restore_envoy_memory(original_envoy_memory);
+            }
+        }
+        rekeyed
+    }
+
+    pub(crate) fn publish(&self, snapshot: MeshSnapshot) {
+        {
+            let mut pending = self.pending_progress.lock();
+            *pending = None;
+            self.snapshot.store(Some(Arc::new(snapshot)));
+        }
+        self.reassemble_brief();
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
+        self.snapshot.load_full()
+    }
+
+    /// Claims the next progress-point capture: `true`, and `now` recorded, when none was
+    /// made in the `MESH_PROGRESS_MIN_INTERVAL` before `now`. A claim already being
+    /// decided elsewhere counts as too soon, so this never waits.
+    pub(crate) fn progress_capture_due_at(&self, now: tokio::time::Instant) -> bool {
+        let Some(mut last) = self.last_progress_capture.try_lock() else {
+            return false;
+        };
+        if last.is_some_and(|prev| now.saturating_duration_since(prev) < MESH_PROGRESS_MIN_INTERVAL)
+        {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
+    /// Keeps `snapshot`, captured at a progress point that came too soon, for the timer
+    /// task to publish when the interval since the last capture has passed. One task is
+    /// armed at a time; a later deferral only replaces what it will publish. Without an
+    /// async runtime there is no timer, and the next publish supersedes the snapshot.
+    pub(crate) fn defer_progress(self: &Arc<Self>, snapshot: MeshSnapshot) {
+        *self.pending_progress.lock() = Some(snapshot);
+        if self.trailing_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.trailing_armed.store(false, Ordering::SeqCst);
+            return;
+        };
+        let slot = Arc::clone(self);
+        handle.spawn(async move { slot.publish_deferred_progress().await });
+    }
+
+    /// The armed timer: waits out the interval since the last capture, which a capture
+    /// made meanwhile pushes back, then publishes whatever is still pending. It has no
+    /// context, so it never runs the digest hook.
+    async fn publish_deferred_progress(&self) {
+        loop {
+            let due = self
+                .last_progress_capture
+                .lock()
+                .map(|prev| prev + MESH_PROGRESS_MIN_INTERVAL);
+            match due {
+                Some(due) if due > tokio::time::Instant::now() => {
+                    tokio::time::sleep_until(due).await
+                }
+                _ => break,
+            }
+        }
+        // Disarmed before the take, so a deferral racing it either lands in this publish
+        // or arms the next timer.
+        self.trailing_armed.store(false, Ordering::SeqCst);
+        {
+            let mut pending = self.pending_progress.lock();
+            let Some(snapshot) = pending.take() else {
+                return;
+            };
+            *self.last_progress_capture.lock() = Some(tokio::time::Instant::now());
+            self.snapshot.store(Some(Arc::new(snapshot)));
+        }
+        self.reassemble_brief();
+    }
+
+    /// Moves the last progress-point capture `by` into the past, as if that much time
+    /// had gone by, so a test can cross the interval without sleeping.
+    #[cfg(test)]
+    pub(crate) fn rewind_progress_clock_for_tests(&self, by: Duration) {
+        let mut last = self.last_progress_capture.lock();
+        *last = last.and_then(|prev| prev.checked_sub(by));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_progress_for_tests(&self) -> Option<MeshSnapshot> {
+        self.pending_progress.lock().clone()
+    }
+
+    pub(crate) fn set_objective_override(&self, objective: Option<String>) {
+        self.objective_override.store(non_blank(objective));
+        self.reassemble_brief();
+    }
+
+    pub(crate) fn objective_override(&self) -> Option<Arc<String>> {
+        self.objective_override.load_full()
+    }
+
+    /// Stores or clears the digest unconditionally and rebuilds the brief. Production
+    /// clears through `clear_digest_for_new_epoch` and stores through `publish_digest_at`,
+    /// so a generation that outlived its session is refused; tests seed a digest directly.
+    #[cfg(test)]
+    pub(crate) fn publish_digest(&self, digest: Option<Digest>) {
+        let rebuilding = self.reassembly.lock();
+        self.digest.store(digest.map(Arc::new));
+        self.reassemble_brief_locked(&rebuilding);
+    }
+
+    pub(crate) fn digest(&self) -> Option<Arc<Digest>> {
+        self.digest.load_full()
+    }
+
+    pub(crate) fn digest_epoch(&self) -> u64 {
+        self.digest_epoch.load(Ordering::Acquire)
+    }
+
+    /// Clears the digest and opens a new epoch in one step, returning it. A generation
+    /// started under the previous epoch is refused by `publish_digest_at` from here on,
+    /// even if it finishes after this call.
+    pub(crate) fn clear_digest_for_new_epoch(&self) -> u64 {
+        let rebuilding = self.reassembly.lock();
+        let epoch = self.digest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.digest.store(None);
+        self.reassemble_brief_locked(&rebuilding);
+        epoch
+    }
+
+    /// Stores `digest` and rebuilds the brief only while `epoch` is still the current one;
+    /// `false` means the session changed while the digest was being generated and it was
+    /// dropped.
+    pub(crate) fn publish_digest_at(&self, epoch: u64, digest: Digest) -> bool {
+        let rebuilding = self.reassembly.lock();
+        if self.digest_epoch.load(Ordering::Acquire) != epoch {
+            return false;
+        }
+        self.digest.store(Some(Arc::new(digest)));
+        if self.reassemble_brief_locked(&rebuilding) {
+            self.fire_brief_updated(BriefUpdateSource::Digest);
+        }
+        true
+    }
+
+    pub(crate) fn set_user_brief(&self, text: Option<String>) {
+        let rebuilding = self.reassembly.lock();
+        self.user_brief.store(non_blank(text));
+        if self.reassemble_brief_locked(&rebuilding) {
+            self.fire_brief_updated(BriefUpdateSource::User);
+        }
+    }
+
+    pub(crate) fn user_brief(&self) -> Option<Arc<String>> {
+        self.user_brief.load_full()
+    }
+
+    pub(crate) fn brief(&self) -> Option<Arc<Brief>> {
+        self.brief.load_full()
+    }
+
+    /// Rebuilds the served brief from the current snapshot, digest and user brief. The
+    /// snapshot's `brief.mode` decides what goes in; with no snapshot yet there is no mode
+    /// to honour, so nothing is served. Rebuilds are serialised: the digest task and the
+    /// turn boundary may both store and rebuild at once, and without the lock the later
+    /// store could be overwritten by a rebuild that read before it.
+    pub(crate) fn reassemble_brief(&self) {
+        let rebuilding = self.reassembly.lock();
+        self.reassemble_brief_locked(&rebuilding);
+    }
+
+    /// The rebuild itself; the guard proves the caller holds `reassembly`, which is not
+    /// reentrant. `true` when the served brief changed.
+    fn reassemble_brief_locked(&self, _rebuilding: &parking_lot::MutexGuard<'_, ()>) -> bool {
+        let brief = self.snapshot().and_then(|snapshot| {
+            let now = SystemTime::now();
+            let objective_override = self.objective_override();
+            let digest = self.digest();
+            let digest_objective = digest_objective_for(&snapshot, digest.as_deref());
+            let display_name = CardSource::display_name(self);
+            let about = CardSource::about(self);
+            let card = build_card(
+                Some(&snapshot),
+                objective_override.as_deref().map(String::as_str),
+                digest_objective.as_deref(),
+                display_name.as_deref(),
+                about.as_deref(),
+                &CardSource::caps(self),
+                now,
+            );
+            let user_brief = self.user_brief();
+            assemble_brief(
+                snapshot.brief.mode,
+                Some(&card),
+                digest.as_deref(),
+                user_brief.as_deref().map(String::as_str),
+                &snapshot.todo,
+            )
+        });
+        let changed = self.brief.load().as_deref() != brief.as_ref();
+        self.brief.store(brief.map(Arc::new));
+        changed
+    }
+
+    /// `mesh.brief.updated` with the size of what is served now; never the text.
+    fn fire_brief_updated(&self, source: BriefUpdateSource) {
+        let chars = self.brief().map_or(0, |brief| brief.text.chars().count());
+        self.hooks.fire(MeshEvent::BriefUpdated { source, chars });
+    }
+
+    /// Installs where human-facing lines go. The interactive REPL installs its prompt
+    /// printer at start-up; headless runs (`-e`, macros, the ACP server) install nothing.
+    pub(crate) fn set_notifier(&self, sink: Arc<dyn NotificationSink>) {
+        self.notifier.store(Some(Arc::new(sink)));
+    }
+
+    /// The REPL calls this once its loop has exited, so a line notified during teardown
+    /// falls back to stderr instead of a printer nobody drains any more.
+    pub(crate) fn clear_notifier(&self) {
+        self.notifier.store(None);
+    }
+
+    /// Installs who regenerates the digest at progress points. The interactive REPL
+    /// installs its digest driver at start-up; headless runs and the ACP server never
+    /// digest and install nothing.
+    pub(crate) fn set_digest_hook(&self, hook: Arc<dyn MeshDigestHook>) {
+        self.digest_hook.store(Some(Arc::new(hook)));
+    }
+
+    pub(crate) fn digest_hook(&self) -> Option<Arc<dyn MeshDigestHook>> {
+        self.digest_hook.load_full().map(|hook| Arc::clone(&*hook))
+    }
+
+    /// The REPL calls this as it exits, so the slot does not keep its driver alive.
+    pub(crate) fn clear_digest_hook(&self) {
+        self.digest_hook.store(None);
+    }
+
+    /// Renders once, then hands the lines to the installed sink. With no sink installed
+    /// they go to stderr, so headless modes still see them. A stderr that has gone away
+    /// (the parent of a headless run closed it) loses the line rather than panicking the
+    /// task that carried it.
+    pub(crate) fn notify(&self, note: Notification) {
+        let rendered = note.render();
+        match self.notifier.load_full() {
+            Some(sink) => sink.notify(rendered),
+            None => {
+                use std::io::Write as _;
+                let mut stderr = std::io::stderr().lock();
+                for line in rendered.render_notification_lines(self.command_prefix.load()) {
+                    let _ = writeln!(stderr, "{line}");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_idle(&self, sink: Arc<dyn IdleSink>) {
+        self.idle.store(Some(Arc::new(sink)));
+    }
+
+    pub(crate) fn clear_idle(&self) {
+        self.idle.store(None);
+    }
+
+    /// Asks the idle-time driver for a propagation fetch; without a driver nothing is
+    /// fetched until `.mesh sync`.
+    pub(crate) fn request_sync(&self) {
+        if let Some(sink) = self.idle.load_full() {
+            sink.request_sync();
+        }
+    }
+
+    /// Installs the envoy that answers inbound messages and questions. Its owner is the
+    /// session that runs it, so the slot holds it behind a hook it can drop at any time.
+    pub(crate) fn set_envoy(&self, sink: Arc<dyn EnvoySink>) {
+        self.envoy.store(Some(Arc::new(sink)));
+    }
+
+    pub(crate) fn clear_envoy(&self) {
+        self.envoy.store(None);
+    }
+
+    /// Installs who runs the `mesh.*` hooks, on this slot's handle and on the installed
+    /// node's when that is a separate one, so this may come before or after `install`.
+    pub(crate) fn set_hook_sink(&self, sink: Arc<dyn MeshHookSink>) {
+        self.hooks.set(Arc::clone(&sink));
+        if let Some(hooks) = self.separate_runtime_hooks() {
+            hooks.set(sink);
+        }
+    }
+
+    pub(crate) fn clear_hook_sink(&self) {
+        self.hooks.clear();
+        if let Some(hooks) = self.separate_runtime_hooks() {
+            hooks.clear();
+        }
+    }
+
+    fn separate_runtime_hooks(&self) -> Option<MeshHooks> {
+        self.get()
+            .map(|runtime| runtime.hooks().clone())
+            .filter(|hooks| !hooks.same_handle(&self.hooks))
+    }
+
+    /// The handle to start a node with, so its events reach the sink installed here.
+    pub(crate) fn hooks(&self) -> MeshHooks {
+        self.hooks.clone()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn envoy_attached(&self) -> bool {
+        self.envoy.load().is_some()
+    }
+
+    /// Hands an event to the idle-time driver. With no driver installed the human line
+    /// goes out through `notify` and the model's copy is dropped, since there is no
+    /// transcript to deliver it to. With a driver whose queue is full the whole event is
+    /// dropped: the driver counts the overflow (reported at its next summary tick while it
+    /// is running, logged once when it stops), and printing the line anyway would let a
+    /// flood heavy enough to fill the queue skip the driver's rate limiter. `false` only
+    /// for that drop.
+    pub(crate) fn push_idle(&self, note: IdleNotify) -> bool {
+        match self.idle.load_full() {
+            Some(sink) => sink.push(note).is_ok(),
+            None => {
+                self.notify(Notification::new(note.source, note.text));
+                true
+            }
+        }
+    }
+
+    pub(crate) fn peer_inbox(&self) -> &PeerInbox {
+        &self.peer_inbox
+    }
+
+    pub(crate) fn correlations(&self) -> &Correlations {
+        &self.correlations
+    }
+
+    /// The notes queued since the last take, for the model's next tool batch.
+    pub(crate) fn take_model_notes(&self) -> Vec<SystemNotification> {
+        self.model_notes.take()
+    }
+
+    /// The store of questions peers asked that the envoy escalated; `None` while the
+    /// mesh is off.
+    pub(crate) fn inbound_store(&self) -> Option<Arc<InboundStore>> {
+        self.inbound.lock().clone()
+    }
+
+    /// The threads any session on this cache dir has sent or received; `None` while the
+    /// mesh is off.
+    pub(crate) fn sent_threads(&self) -> Option<Arc<SentThreads>> {
+        self.get().map(|runtime| runtime.sent_threads())
+    }
+
+    /// Records `thread` as one this identity sent or opened, so the tools of every
+    /// session on this cache dir accept it as a thread to continue.
+    pub(crate) fn remember_sent_thread(&self, thread: &str) {
+        self.remember_thread(|store| store.record_sent(thread));
+    }
+
+    /// Records `thread` as one a peer sent, so the tools of every session on this cache
+    /// dir accept it as a thread to continue. A delivery may run on an async worker, so
+    /// the lock is waited for only briefly here; when that wait or the write fails, the
+    /// record is tried once more with the full wait on a thread of its own.
+    pub(crate) fn remember_received_thread(&self, thread: &str) {
+        let Some(store) = self.sent_threads() else {
+            return;
+        };
+        if store.record_received(thread).is_ok() {
+            return;
+        }
+        let thread = thread.to_string();
+        let retry = std::thread::Builder::new()
+            .name("mesh-sent-threads".to_string())
+            .spawn(move || {
+                if let Err(err) = store.record_received_waiting(&thread) {
+                    warn_thread_not_remembered(&err);
+                }
+            });
+        if let Err(err) = retry {
+            warn_thread_not_remembered(&anyhow::Error::from(err));
+        }
+    }
+
+    /// A failed write is only logged: the send or delivery it follows has already
+    /// happened.
+    fn remember_thread(&self, record: impl FnOnce(&SentThreads) -> Result<()>) {
+        let Some(store) = self.sent_threads() else {
+            return;
+        };
+        if let Err(err) = record(&store) {
+            warn_thread_not_remembered(&err);
+        }
+    }
+
+    /// Lets go of the escalated questions and access requests that have outlived
+    /// `PENDING_TTL`, one idle line each, so the person at the keyboard learns what went
+    /// without an answer. Run on the heartbeat and first thing under `.mesh pending`,
+    /// `.mesh answer`, `.mesh dismiss`, `.mesh grant` and `.mesh refuse`, so a row that
+    /// expired never renders and an expired id reads as no question or request once its
+    /// expiry line has been pushed. A store that cannot be read or rewritten is logged
+    /// and left for the next sweep: nothing here may stop the node.
+    pub(crate) fn sweep_expired_pending(&self, now: SystemTime) {
+        let Some(store) = self.inbound_store() else {
+            return;
+        };
+        let expired = match store.prune_expired(now) {
+            Ok(expired) => expired,
+            Err(err) => {
+                warn!(
+                    "Mesh inbound store could not be swept for expired questions and access requests: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+                return;
+            }
+        };
+        self.announce_expired(expired);
+    }
+
+    /// One idle line per expired question or access request, keyed on the asker's
+    /// identity like every other. The sweep pushes these for the rows it prunes; a
+    /// writer that took an expired row's id for a fresh filing pushes one for the row
+    /// it displaced, so no expiry goes unannounced.
+    pub(crate) fn announce_expired(&self, expired: impl IntoIterator<Item = InboundRecord>) {
+        for record in expired {
+            let id8 = short(&record.id);
+            let name = self.peer_name_at(&record.peer_destination);
+            let (what, outcome) = match record.kind {
+                InboundKind::Question => ("question", "expired unanswered"),
+                InboundKind::Access => ("access request", "expired"),
+            };
+            self.push_idle(IdleNotify {
+                source: Source::Message,
+                text: NoticeText::default()
+                    .frame(format!("{what} "))
+                    .peer(id8)
+                    .frame(" from ")
+                    .peer(name)
+                    .frame(format!(" {outcome}")),
+                origin: Origin::Peer(short(&record.peer_identity).to_string()),
+                model_note: None,
+            });
+        }
+    }
+
+    /// Gives a slot with no node a store, so an envoy escalation can be tested without
+    /// a runtime to `install`.
+    #[cfg(test)]
+    pub(crate) fn set_inbound_store_for_tests(&self, store: Arc<InboundStore>) {
+        *self.inbound.lock() = Some(store);
+    }
+
+    /// Where every admitted inbound peer message ends up, from a link or a propagation
+    /// node (one refused admission is filed by `file_peer` instead). A reply to a
+    /// question this node asked answers its correlation and goes to the inbox. A message
+    /// or a question goes to the envoy when one is attached, which owns it from then on:
+    /// what it answered comes back through `record_envoy_exchange`, what it could not
+    /// through `record_envoy_fallback`. A bulletin, no envoy, or an envoy that refuses
+    /// (its queue is full, or the sender is over one of its ceilings) means the inbox
+    /// path; a refusal also goes back to the peer with its typed reason, every time over
+    /// a link and once per identity, per reason, per hour by store-and-forward, and earns
+    /// the person at the keyboard one refusal line per reason per hour, so a flood cannot
+    /// flood the terminal or the peer's inbox (the inbox summary line still prints per
+    /// message, bounded by the inbox and idle-sink caps). Anything naming a message in
+    /// `in_reply_to` takes the inbox path too, whatever its kind: a peer's envoy replying
+    /// to our envoy's reply would otherwise keep the two talking forever. A body whose
+    /// sending identity and id the envoy already has within `BODY_DEDUP_HORIZON` is filed
+    /// in the inbox instead of being run again: the acknowledgement precedes the run, so
+    /// one lost on a link brings the same body back by store-and-forward. Runs on a
+    /// blocking thread off the server's request path or on the fetch task, so nothing
+    /// here awaits. Whatever the route, the message's thread is recorded as received
+    /// (as `file_peer` records it too), so the tools accept it as one to continue.
+    pub(crate) fn deliver_peer(&self, message: PeerMessage) {
+        self.deliver_peer_at(message, SystemTime::now());
+    }
+
+    pub(crate) fn deliver_peer_at(&self, mut message: PeerMessage, now: SystemTime) {
+        let answered = self.answer_correlation(&mut message);
+        self.remember_references(&message);
+        self.remember_received_thread(message.thread());
+        let for_envoy = !answered && envoy_bound(message.kind, message.in_reply_to.as_deref());
+        let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
+        let received = ReceivedFacts::of(&message);
+        let routed = match envoy {
+            None => {
+                self.deliver_to_inbox(message, answered);
+                Routed::Inbox
+            }
+            Some(sink) => {
+                let (kind, id) = (message.kind, message.message_id.clone());
+                let id8 = short(&message.source_identity).to_string();
+                let key = BodyDedup::key(&message);
+                if !self.envoy_bodies.lock().insert_at(key.clone(), now) {
+                    debug!(
+                        "Mesh {kind} {id} from {id8} already handed to the envoy; delivering the repeat to the inbox"
+                    );
+                    self.deliver_to_inbox(message, answered);
+                    Routed::Inbox
+                } else {
+                    match sink.accept(EnvoyJob {
+                        message: message.clone(),
+                        reservation: None,
+                    }) {
+                        Ok(()) => {
+                            debug!("Mesh {kind} {id} from {id8} handed to the envoy");
+                            Routed::Envoy
+                        }
+                        Err(refusal) => {
+                            self.envoy_bodies.lock().forget(&key);
+                            debug!(
+                                "Mesh {kind} {id} from {id8} refused by the envoy: {}; delivering it to the inbox",
+                                refusal.reason.as_str()
+                            );
+                            self.refuse_for_envoy(message, refusal);
+                            Routed::Inbox
+                        }
+                    }
+                }
+            }
+        };
+        self.hooks.fire(received.event(routed));
+    }
+
+    /// The envoy refused `original` with a typed reason: it takes the inbox path and the
+    /// person at the keyboard gets the folded notice rather than a line per message,
+    /// which is what a flood would flood the terminal with.
+    pub(crate) fn record_envoy_refusal(&self, original: PeerMessage, refusal: &PeerRefusal) {
+        let who = self.peer_label(&original.source_identity, &original.source_destination);
+        let identity = original.source_identity.clone();
+        let via = original.via;
+        self.deliver_to_inbox(original, false);
+        self.surface_refusal(&identity, refusal, &who, RefusalPath::Filed(via));
+    }
+
+    /// `record_envoy_refusal` plus the correlated reply that tells the peer why, sent
+    /// off the request path since this runs where nothing may await. A loop-guard
+    /// refusal is never sent: a reply to a reply is the loop it guards against. Over a
+    /// link the reply goes every time, since the peer is waiting on it; by
+    /// store-and-forward it goes once per identity, per reason, per hour, on the same
+    /// claim the admission refusal spends, so a flood of stored messages does not come
+    /// back as a flood of replies.
+    pub(crate) fn refuse_for_envoy(&self, message: PeerMessage, refusal: PeerRefusal) {
+        let destination = message.source_destination.clone();
+        let id = message.message_id.clone();
+        let thread = message.thread().to_string();
+        let identity = message.source_identity.clone();
+        let via = message.via;
+        self.record_envoy_refusal(message, &refusal);
+        if refusal.reason == RefusalReason::LoopGuard {
+            return;
+        }
+        let owed = via == PeerVia::Direct
+            || self
+                .limits
+                .claim_peer_reply(&identity, refusal.reason, Instant::now());
+        if owed {
+            self.send_refusal_reply(&destination, &id, Some(&thread), &refusal);
+        }
+    }
+
+    /// Sends the peer at `destination` the typed refusal of its message `id`, off the
+    /// request path since this runs where nothing may await. A reply that cannot go is
+    /// logged; the REPL has its line and the inbox the original. `thread` is the
+    /// original's when the caller still has it; `None` means the original was its own.
+    fn send_refusal_reply(
+        &self,
+        destination: &str,
+        id: &str,
+        thread: Option<&str>,
+        refusal: &PeerRefusal,
+    ) {
+        let dest8 = short(destination).to_string();
+        let out = match refusal_reply(id, thread, refusal) {
+            Ok(out) => out,
+            Err(err) => {
+                warn!(
+                    "Mesh refusal of {id} to instance {dest8} could not be built: {}",
+                    redact_hashes(&err.to_string())
+                );
+                return;
+            }
+        };
+        match (self.get(), tokio::runtime::Handle::try_current()) {
+            (Some(runtime), Ok(handle)) => {
+                let destination = destination.to_string();
+                let id = id.to_string();
+                handle.spawn(async move {
+                    if let Err(err) = runtime.send_peer(&destination, &out).await {
+                        warn!(
+                            "Mesh refusal of {id} to instance {dest8} could not be sent: {}",
+                            redact_hashes(&err.to_string())
+                        );
+                    }
+                });
+            }
+            (Some(_), Err(_)) => warn!(
+                "Mesh refusal of {id} to instance {dest8} could not be sent: no async runtime to send it with"
+            ),
+            (None, _) => {
+                warn!("Mesh refusal of {id} to instance {dest8} could not be sent: mesh is off")
+            }
+        }
+    }
+
+    /// Whether a message arriving over a link could start an envoy run right now, asked
+    /// before the link acknowledges it. Only a message or question with no `in_reply_to`
+    /// is the envoy's, and only when one is attached; anything else, and anything that
+    /// arrived store-and-forward, passes here and is judged by the hourly count alone.
+    /// Reserves nothing: `EnvoySink::accept` takes the slot and remains the backstop.
+    /// A repeat of a pair the envoy already has is still gated here when it arrives over a
+    /// link; a conforming sender re-sends only by store-and-forward, which skips this gate,
+    /// so the window is consulted after admission by design.
+    fn link_run_admissible(
+        &self,
+        request: &PeerAdmission,
+        now: Instant,
+    ) -> Result<(), PeerRefusal> {
+        let for_envoy =
+            request.via == PeerVia::Direct && envoy_bound(request.kind, request.in_reply_to);
+        let Some(sink) = for_envoy.then(|| self.envoy.load_full()).flatten() else {
+            return Ok(());
+        };
+        self.limits
+            .check_run_admissible(request.source_identity, now)?;
+        if sink.has_room() {
+            Ok(())
+        } else {
+            Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+        }
+    }
+
+    /// Notes one refusal of `identity` for folding and prints what the fold says: the
+    /// first refusal of each reason in the hour, and the counts of any window that has
+    /// since rolled over.
+    fn surface_refusal(&self, identity: &str, refusal: &PeerRefusal, who: &str, path: RefusalPath) {
+        let notice = self
+            .limits
+            .note_refusal(identity, refusal.reason, Instant::now());
+        self.push_peer_lines(identity, fold_lines(who, refusal.reason, path, &notice));
+    }
+
+    /// Prints the folded counts of a rolled-over window when a message from `identity`
+    /// is admitted, so they surface even once the refusals have stopped.
+    fn surface_fold_reports(&self, identity: &str, who: &str) {
+        let reports = self.limits.take_fold_reports(identity, Instant::now());
+        self.push_peer_lines(identity, fold_report_lines(who, &reports));
+    }
+
+    fn push_peer_lines(&self, identity: &str, lines: Vec<NoticeText>) {
+        let id8 = short(identity).to_string();
+        for text in lines {
+            self.push_idle(IdleNotify {
+                source: Source::Message,
+                origin: Origin::Peer(id8.clone()),
+                text,
+                model_note: None,
+            });
+        }
+    }
+
+    /// The envoy answered `original` with `reply_text`. Both land in the inbox, the
+    /// original first, so the model reads the exchange in order on its next
+    /// `mesh__check_inbox`; the model gets one note for the pair and the person at the
+    /// keyboard one line naming both sides. The reply is minted through the one
+    /// sanitiser as a message from this node's destination, so it reads back like any
+    /// other peer message, and marked as this node's own before it is filed, so
+    /// `is_from_self` knows it whatever destination the node has later, or none.
+    pub(crate) fn record_envoy_exchange(&self, original: &PeerMessage, reply_text: &str) {
+        let runtime = self.get();
+        let reply = PeerMessage::new(RawPeerMessage {
+            source_identity: runtime
+                .as_ref()
+                .map(|runtime| runtime.fingerprint().to_string())
+                .unwrap_or_default(),
+            source_destination: runtime
+                .as_ref()
+                .map(|runtime| runtime.current_destination_hash())
+                .unwrap_or_default(),
+            destination: original.source_destination.clone(),
+            title: None,
+            content: reply_text.to_string(),
+            fields: None,
+            timestamp: unix_now(),
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            in_reply_to: Some(original.message_id.clone()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+            thread: Some(original.thread().to_string()),
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        });
+        let who = self.peer_name(original);
+        let asked = match original.kind {
+            PeerKind::Ask => "asked",
+            _ => "said",
+        };
+        let half = PEER_LINE_MAX_CHARS / 2;
+        let asked_words = original.capped_words(half);
+        let replied_words = reply.capped_words(half);
+        let cut = asked_words.cut || replied_words.cut;
+        let mut text = NoticeText::default()
+            .peer(who)
+            .frame(format!(" {asked}: "))
+            .peer(asked_words.text)
+            .frame("; envoy replied: ")
+            .peer(replied_words.text);
+        if cut {
+            text = text.frame(format!(" {INBOX_FULL_TEXT_POINTER}"));
+        }
+        let local_id = format!("peer:{}", short(&original.source_destination));
+        let id8 = short(&original.source_identity).to_string();
+        self.own_entries.lock().mark(&reply);
+        self.peer_inbox.deliver(original.clone());
+        self.peer_inbox.deliver(reply);
+        self.model_notes.push(mesh_notification(
+            "peer_message",
+            &local_id,
+            "mesh",
+            true,
+            CHECK_INBOX_NEXT_ACTION.to_string(),
+        ));
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// The envoy took `original` but did not answer it (timed out, unavailable or
+    /// failed): it goes down the inbox path as if no envoy were attached, and the person
+    /// at the keyboard gets one line carrying `reason` in place of the plain summary,
+    /// since the summary alone would not tell them the envoy was tried.
+    pub(crate) fn record_envoy_fallback(&self, original: PeerMessage, reason: &str) {
+        self.record_envoy_fallback_with_next(original, reason, "");
+    }
+
+    /// `record_envoy_fallback` with `next` after the summary, for a fallback whose line
+    /// should also say what the person at the keyboard can do about it.
+    pub(crate) fn record_envoy_fallback_with_next(
+        &self,
+        original: PeerMessage,
+        reason: &str,
+        next: &str,
+    ) {
+        let text = NoticeText::default().frame(format!("{reason}; ")).then(
+            original.summary_line_with_tail(
+                self.display_name_of(&original).as_deref(),
+                &format!(" is in the inbox{next}"),
+            ),
+        );
+        let id8 = short(&original.source_identity).to_string();
+        self.file_in_inbox(original, false);
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// The envoy asked the human about `original` and the answer will go out through
+    /// `answer_inbound`. The original takes the inbox path so the model can read it,
+    /// but its note tells the model to wait for `.mesh answer {id}` rather than reply to
+    /// a question the human is already being asked; `id` is the peer's message id as
+    /// `PeerMessage::new` cleaned it, the same one the idle line shows. The person at
+    /// the keyboard gets one line saying the envoy escalated.
+    pub(crate) fn record_envoy_escalated(&self, original: PeerMessage, id: &str) {
+        let summary = original.summary_line_with_tail(
+            self.display_name_of(&original).as_deref(),
+            " is in the inbox",
+        );
+        let id8 = short(&original.source_identity).to_string();
+        let local_id = format!("peer:{}", short(&original.source_destination));
+        let event = match original.kind {
+            PeerKind::Ask => "peer_ask",
+            _ => "peer_message",
+        };
+        self.peer_inbox.deliver(original);
+        self.model_notes.push(mesh_notification(
+            event,
+            &local_id,
+            "mesh",
+            true,
+            format!("the human was asked; wait for `.mesh answer {id}` instead of replying"),
+        ));
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(id8),
+            text: NoticeText::default()
+                .frame("envoy escalated to the human; ")
+                .then(summary),
+            model_note: None,
+        });
+    }
+
+    /// A human answer to the escalated inbound question `id`. A live envoy run still
+    /// holding the question takes it, and the question stays filed until that run
+    /// delivers; otherwise it goes to the peer as a reply, leaves the store here and is
+    /// recorded for the leader, whose earlier note said to wait for it.
+    /// Never touches `correlations`: this answers a peer's question, not one of ours.
+    pub(crate) async fn answer_inbound(&self, id: &str, text: &str) -> Result<()> {
+        let (store, record) = self.open_question(id, SystemTime::now())?;
+        if self
+            .envoy
+            .load_full()
+            .is_some_and(|sink| sink.answer(id, text))
+        {
+            return Ok(());
+        }
+        let runtime = self.runtime_to_answer(id, &record)?;
+        let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
+        self.send_human_reply(&runtime, &store, &record, reply, text, HumanReply::Answered)
+            .await?;
+        Ok(())
+    }
+
+    /// `answer_inbound` carrying one file part, which goes to the peer from this node
+    /// alone: no live run is offered the answer, so the file's bytes never reach a model.
+    /// A run still holding the question is not bypassed either, since its own reply
+    /// would follow this one once the hold lapsed; `refuse_held_by_envoy` says so.
+    pub(crate) async fn answer_inbound_with_file(
+        &self,
+        id: &str,
+        text: &str,
+        part: RawPart,
+    ) -> Result<SendOutcome> {
+        let (store, record) = self.open_question(id, SystemTime::now())?;
+        self.refuse_held_by_envoy(id)?;
+        let runtime = self.runtime_to_answer(id, &record)?;
+        let reply = OutboundPeer::with_parts(
+            PeerKind::Reply,
+            text,
+            None,
+            Some(id),
+            None,
+            vec![part],
+            &runtime.part_limits(),
+        )?;
+        self.send_human_reply(&runtime, &store, &record, reply, text, HumanReply::Answered)
+            .await
+    }
+
+    /// The human's refusal of the escalated inbound question `id`: the record goes, and
+    /// unless `silent` the asker hears a `refused` reply in the question's thread, filed
+    /// for the leader like an answer. A run still holding the question is not bypassed,
+    /// since its own reply would follow this one once the hold lapsed. A send that fails
+    /// leaves the question filed and says so with the retry and the silent form.
+    /// Never touches `correlations`: this closes a peer's question, not one of ours.
+    pub(crate) async fn dismiss_inbound(&self, id: &str, silent: bool) -> Result<()> {
+        let (store, record) = self.open_question(id, SystemTime::now())?;
+        self.refuse_dismiss_held_by_envoy(id)?;
+        if silent {
+            take_question(&store, &record)?;
+            return Ok(());
+        }
+        let runtime = self.runtime_to_answer(id, &record)?;
+        let reply = OutboundPeer::new(PeerKind::Reply, HUMAN_DECLINED, None, Some(id), None)?;
+        let sent = self
+            .send_human_reply(
+                &runtime,
+                &store,
+                &record,
+                reply,
+                HUMAN_DECLINED,
+                HumanReply::Declined,
+            )
+            .await;
+        // A failure that left the question filed (the send, or a store that would not
+        // give it up) is worded as a retry; one that found it already gone is not.
+        match sent {
+            Ok(_) => Ok(()),
+            Err(err) if matches!(store.get(id), Ok(Some(_))) => Err(decline_not_told(
+                &self.peer_name_at(&record.peer_destination),
+                id,
+                &err,
+            )),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Refuses a dismissal while a live run holds `id`: the run's own reply would follow
+    /// the refusal once the hold lapsed, so the peer would hear two answers.
+    pub(crate) fn refuse_dismiss_held_by_envoy(&self, id: &str) -> Result<()> {
+        if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
+            return Err(dismiss_held_by_envoy(id));
+        }
+        Ok(())
+    }
+
+    /// Refuses an answer that cannot go through a live run while that run holds `id`,
+    /// so a verb can say so before it prints what it would have sent.
+    pub(crate) fn refuse_held_by_envoy(&self, id: &str) -> Result<()> {
+        if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
+            return Err(answer_held_by_envoy(id));
+        }
+        Ok(())
+    }
+
+    /// The escalated question `id` as the store holds it. The verbs that reach here
+    /// have already found the row open, so one that is gone or past `PENDING_TTL` was
+    /// closed by another process (or swept) under the verb and reads as
+    /// `AlreadyClosed`: nothing closes or answers it in the window before its expiry
+    /// is announced.
+    fn open_question(
+        &self,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<(Arc<InboundStore>, InboundRecord)> {
+        let Some(store) = self.inbound_store() else {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off; turn it on with `.mesh on` before answering {id}",
+                &[],
+                &[("id", id)],
+            )));
+        };
+        let record = match store.get(id)? {
+            Some(record) if !record.is_expired(now) => record,
+            _ => bail!(already_closed(id)),
+        };
+        if record.kind == InboundKind::Access {
+            return Err(access_not_a_question(id));
+        }
+        Ok((store, record))
+    }
+
+    fn runtime_to_answer(&self, id: &str, record: &InboundRecord) -> Result<Arc<MeshRuntime>> {
+        let Some(runtime) = self.get() else {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "Mesh is off, so the answer to {id} cannot be sent to {peer}",
+                &[("peer", short(&record.peer_destination))],
+                &[("id", id)],
+            )));
+        };
+        Ok(runtime)
+    }
+
+    /// The tail the human's answers and dismissals share: in the question's thread,
+    /// worded with `reply_kind`, taken out of the store first so two processes closing
+    /// the same question cannot both tell the peer, then sent with any reference lent
+    /// and filed for the leader. A send that fails puts the question back as pending.
+    async fn send_human_reply(
+        &self,
+        runtime: &MeshRuntime,
+        store: &InboundStore,
+        record: &InboundRecord,
+        reply: OutboundPeer,
+        text: &str,
+        reply_kind: HumanReply,
+    ) -> Result<SendOutcome> {
+        let reply = reply
+            .with_thread(Some(record.thread.clone()))?
+            .with_disposition(reply_kind.disposition(), None);
+        take_question(store, record)?;
+        let outcome = match runtime
+            .send_peer_lending_reference(&record.peer_destination, &reply)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => return Err(put_back(self, store, record, err)),
+        };
+        self.record_human_reply(record, text, reply_kind);
+        self.remember_human_answer(record, &reply.content);
+        Ok(outcome)
+    }
+
+    /// The owner's late answer, or the refusal `.mesh dismiss` sent, joins the thread
+    /// the envoy remembers, as the turn after the escalation line the run stored when
+    /// it ended without an answer of its own, and after whatever a run in the thread
+    /// wrote meanwhile. Written only once the send succeeded: a
+    /// send that fails puts the question back, and the answer is remembered when it
+    /// is next sent. An answer the run itself held and wrote before a send that then
+    /// failed is already the thread's last turn, so a retry of it adds nothing. A
+    /// thread the store does not hold gets no record: an answer with no question before
+    /// it is not a conversation. The session is the one the run used: the record names
+    /// it when the escalation filed it, and a session gone since gets nothing. A record
+    /// filed before it named its session falls back to the run's footprint: a new
+    /// session always wrote under the question's own id and a resumed one never did, so
+    /// a record under the id is the session, and only with none there is it the wire
+    /// thread. Choosing afresh could pick a thread that became held after the run, hours
+    /// before this answer. No standing is re-checked here: the send that just
+    /// succeeded was authorized, and an append that never creates a thread cannot undo
+    /// a sweep. A record that cannot be read or saved is left as it is.
+    fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
+        let Some(store) = self.envoy_memory() else {
+            return;
+        };
+        if !is_wire_id(&record.thread) {
+            return;
+        }
+        let now = SystemTime::now();
+        let thread = if !record.session_thread.is_empty() {
+            record.session_thread.as_str()
+        } else {
+            // A record under the id that cannot be read is still the session: the
+            // append below refuses it and says so, rather than landing in the wire
+            // thread.
+            match store.load(&record.peer_identity, &record.id, now) {
+                Ok(None) => record.thread.as_str(),
+                Ok(Some(_)) | Err(_) => record.id.as_str(),
+            }
+        };
+        let answer = EnvoyTurn {
+            role: EnvoyRole::Assistant,
+            text: spoken.to_string(),
+        };
+        if let Err(err) = store.append_once(&record.peer_identity, thread, answer, now) {
+            warn!(
+                "Mesh envoy memory for thread {thread} could not be saved; the owner's answer was not remembered: {}",
+                redact_hashes(&err.to_string())
+            );
+        }
+    }
+
+    /// The human's `.mesh answer` or `.mesh dismiss` of `record` went to the peer with
+    /// no live run. The reply lands in the inbox, minted like the envoy's and carrying
+    /// the disposition of `reply_kind`, so the model reads what the peer heard, and
+    /// marked as this node's own like the envoy's; one note supersedes the "wait for
+    /// `.mesh answer`" one and the person at the keyboard gets one line saying what they
+    /// did.
+    fn record_human_reply(&self, record: &InboundRecord, text: &str, reply_kind: HumanReply) {
+        let runtime = self.get();
+        let reply = PeerMessage::new(RawPeerMessage {
+            source_identity: runtime
+                .as_ref()
+                .map(|runtime| runtime.fingerprint().to_string())
+                .unwrap_or_default(),
+            source_destination: runtime
+                .as_ref()
+                .map(|runtime| runtime.current_destination_hash())
+                .unwrap_or_default(),
+            destination: record.peer_destination.clone(),
+            title: None,
+            content: text.to_string(),
+            fields: None,
+            timestamp: unix_now(),
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            in_reply_to: Some(record.id.clone()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+            thread: Some(record.thread.clone()),
+            disposition: Some(reply_kind.disposition()),
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        });
+        let dest8 = short(&record.peer_destination).to_string();
+        let (text, note) = match reply_kind {
+            HumanReply::Declined => (
+                NoticeText::from(format!("you declined {dest8}'s question")),
+                "the human declined via `.mesh dismiss`; nothing to do",
+            ),
+            HumanReply::Answered => {
+                let words = reply.capped_words(PEER_LINE_MAX_CHARS);
+                let mut text = NoticeText::default()
+                    .frame(format!("you answered {dest8}: "))
+                    .peer(words.text);
+                if words.cut {
+                    text = text.frame(format!(" {INBOX_FULL_TEXT_POINTER}"));
+                }
+                (text, "the human answered via `.mesh answer`; nothing to do")
+            }
+        };
+        self.own_entries.lock().mark(&reply);
+        self.peer_inbox.deliver(reply);
+        self.model_notes.push(mesh_notification(
+            "peer_message",
+            &format!("peer:{dest8}"),
+            "mesh",
+            true,
+            note.to_string(),
+        ));
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(short(&record.peer_identity).to_string()),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// Matches a reply to the question of ours it answers; a reply that named no thread
+    /// inherits the question's, on the filed answer and the delivered copy alike, but
+    /// only once `answer` has taken it. A reply that answers nothing is downgraded to a
+    /// message, since to this node it is one, and sheds the thread, disposition and
+    /// retry hint a reply earns and a message cannot carry; `true` when it matched. An
+    /// escalated reply matches without closing the question, so a pending access
+    /// request it names stays filed for the decision that follows.
+    fn answer_correlation(&self, message: &mut PeerMessage) -> bool {
+        if message.kind != PeerKind::Reply {
+            return false;
+        }
+        let answered = match message.in_reply_to.as_deref() {
+            Some(id) => {
+                let mut reply = message.clone();
+                if reply.thread.is_none() {
+                    reply.thread = self.correlations.thread_of(id);
+                }
+                let thread = reply.thread.clone();
+                let answered = self.correlations.answer(id, reply);
+                if answered {
+                    message.thread = thread;
+                    if message.disposition() != Disposition::Escalated
+                        && let Some(runtime) = self.get()
+                    {
+                        runtime.memory().settle_pending_access(id, &message.parts);
+                    }
+                }
+                answered
+            }
+            None => false,
+        };
+        if !answered {
+            debug!(
+                "Mesh reply {} from {} answers no open question of ours; delivering it as a message",
+                message.message_id,
+                short(&message.source_identity)
+            );
+            message.kind = PeerKind::Message;
+            message.thread = None;
+            message.disposition = None;
+            message.retry_after = None;
+        }
+        answered
+    }
+
+    /// Files every reference attachment on a received message as a path the sender
+    /// offers this node to fetch. A message filed over the per-peer limit records its
+    /// references all the same: the inbox shows it and its attachments are fetchable
+    /// like any other.
+    fn remember_references(&self, message: &PeerMessage) {
+        let Some(runtime) = self.get() else {
+            return;
+        };
+        for part in &message.parts {
+            if let Part::File {
+                reference: Some(path),
+                staged: None,
+                ..
+            } = part
+            {
+                runtime.memory().remember_reference(
+                    &message.source_destination,
+                    &message.source_identity,
+                    &message.message_id,
+                    path,
+                );
+            }
+        }
+    }
+
+    /// The display name the peer table filed for `destination`, as the peer announced it.
+    pub(crate) fn display_name_at(&self, destination: &str) -> Option<String> {
+        self.get()
+            .and_then(|runtime| runtime.peers().get(destination))
+            .and_then(|peer| peer.display_name)
+    }
+
+    fn display_name_of(&self, message: &PeerMessage) -> Option<String> {
+        self.display_name_at(&message.source_destination)
+    }
+
+    /// The sender as `summary_line` names it: the peer table's display name, cleaned,
+    /// or the short hash of its instance.
+    pub(crate) fn peer_name(&self, message: &PeerMessage) -> String {
+        self.peer_name_at(&message.source_destination)
+    }
+
+    /// `peer_name` for any instance by its destination hash.
+    pub(crate) fn peer_name_at(&self, destination: &str) -> String {
+        self.display_name_at(destination)
+            .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
+            .unwrap_or_else(|| short(destination).to_string())
+    }
+
+    /// `MeshRuntime::address_names`, empty while the mesh is off.
+    pub(crate) fn address_names(&self) -> Vec<AddressName> {
+        self.get()
+            .map(|runtime| runtime.address_names())
+            .unwrap_or_default()
+    }
+
+    /// `MeshRuntime::rename_session`; a no-op while the mesh is off.
+    pub(crate) fn rename_session(&self, session: &str) {
+        if let Some(runtime) = self.get() {
+            runtime.rename_session(session);
+        }
+    }
+
+    /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
+    /// person typed with `.mesh answer`. Read from the marks those two producers set as
+    /// they filed, keyed on the entry's source destination and message id, which `stop`
+    /// and `rekey` leave alone, so an entry filed before a `.mesh off` or a re-key still
+    /// reads as its own and a bare slot's reply does too. Only the newest
+    /// `OWN_ENTRY_MARKS` filings are remembered.
+    pub(crate) fn is_from_self(&self, message: &PeerMessage) -> bool {
+        self.own_entries.lock().contains(message)
+    }
+
+    /// The sender as a refusal line names it, the same on every path a refusal takes:
+    /// the peer table's display name for its instance, cleaned, or the short hash of
+    /// its identity.
+    pub(crate) fn peer_label(&self, identity: &str, destination: &str) -> String {
+        self.display_name_at(destination)
+            .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
+            .unwrap_or_else(|| short(identity).to_string())
+    }
+
+    /// The inbox path: the message lands in the inbox, the model is told what arrived
+    /// and what to call, and the person at the keyboard gets one line. The id in the
+    /// model's note is as `file_in_inbox` mints it.
+    fn deliver_to_inbox(&self, message: PeerMessage, answered: bool) {
+        let id8 = short(&message.source_identity).to_string();
+        let text = self.file_in_inbox(message, answered);
+        let source = if answered {
+            Source::Reply
+        } else {
+            Source::Message
+        };
+        self.push_idle(IdleNotify {
+            source,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// The inbox path without its idle line: the message lands in the inbox and the
+    /// model is told what arrived and what to call. Returns the summary line, which
+    /// `deliver_to_inbox` shows the person at the keyboard; the envoy fallback words a
+    /// line of its own and drops it. The id in the model's note is minted here from the
+    /// sending instance, never the peer's own: an answered question is named by our
+    /// correlation id, anything else (a message, an ask or a bulletin, each its own
+    /// event) by `peer:<instance>`, so no peer-chosen text reaches the note. An
+    /// escalated reply has no answer to collect yet, so its note points at the inbox
+    /// rather than at a `mesh__collect` that would block for its whole timeout.
+    fn file_in_inbox(&self, message: PeerMessage, answered: bool) -> NoticeText {
+        let text = message.summary_line(self.display_name_of(&message).as_deref());
+        let local_id = format!("peer:{}", short(&message.source_destination));
+        let (event, id, next_action) = match (answered, message.kind) {
+            (true, _) if message.disposition == Some(Disposition::Escalated) => (
+                "peer_escalated",
+                message.in_reply_to.clone().unwrap_or_default(),
+                CHECK_INBOX_NEXT_ACTION.to_string(),
+            ),
+            (true, _) => {
+                let id = message.in_reply_to.clone().unwrap_or_default();
+                let next_action = collect_next_action(&id);
+                ("peer_reply", id, next_action)
+            }
+            (false, PeerKind::Bulletin) => (
+                "peer_bulletin",
+                local_id,
+                CHECK_INBOX_NEXT_ACTION.to_string(),
+            ),
+            (false, PeerKind::Ask) => ("peer_ask", local_id, CHECK_INBOX_NEXT_ACTION.to_string()),
+            (false, _) => (
+                "peer_message",
+                local_id,
+                CHECK_INBOX_NEXT_ACTION.to_string(),
+            ),
+        };
+        self.peer_inbox.deliver(message);
+        self.model_notes
+            .push(mesh_notification(event, &id, "mesh", true, next_action));
+        text
+    }
+}
+
+/// The correlated reply that closes a peer's message `id` with a typed refusal:
+/// `budget_exhausted` whatever the budget, `retry_after` how long to wait, and `fields`
+/// naming the reason and repeating the wait for readers of the old shape. A loop-guard
+/// refusal is built `refused`, since it is never sent. The reply inherits `thread`, or
+/// names the original as its own root.
+pub(crate) fn refusal_reply(
+    id: &str,
+    thread: Option<&str>,
+    refusal: &PeerRefusal,
+) -> Result<OutboundPeer, SendError> {
+    let disposition = match refusal.reason {
+        RefusalReason::LoopGuard => Disposition::Refused,
+        _ => Disposition::BudgetExhausted,
+    };
+    let retry_after = u32::try_from(refusal.retry_after_secs()).unwrap_or(u32::MAX);
+    let text = refusal.reason.peer_text();
+    OutboundPeer::new(
+        PeerKind::Reply,
+        text,
+        None,
+        Some(id),
+        Some(refusal.fields()),
+    )?
+    .with_thread(Some(thread.unwrap_or(id).to_string()))
+    .map(|out| out.with_disposition(disposition, Some(retry_after)))
+}
+
+/// Takes `record` out of `store` before anything is sent for it, so two processes
+/// closing the same question cannot both tell the peer.
+fn take_question(store: &InboundStore, record: &InboundRecord) -> Result<()> {
+    if !store.remove(&record.id)? {
+        bail!(already_closed(&record.id));
+    }
+    Ok(())
+}
+
+/// A question or access request another process closed under a verb that had found it
+/// open: nothing was sent and nothing is left to retry. Typed so a loop over many ids
+/// can tell this apart from a failure that left the row filed. It carries its sentence
+/// as runs, so the id is quoted as typed wherever the error is shown.
+#[derive(Debug)]
+pub(crate) struct AlreadyClosed(NoticeText);
+
+impl AlreadyClosed {
+    pub(crate) fn notice(&self) -> &NoticeText {
+        &self.0
+    }
+}
+
+impl fmt::Display for AlreadyClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for AlreadyClosed {}
+
+pub(crate) fn already_closed(id: &str) -> AlreadyClosed {
+    AlreadyClosed(NoticeText::from_template(
+        "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+        &[],
+        &[("id", id)],
+    ))
+}
+
+/// An answer with a file refused while the envoy holds `id`, quoting the id as
+/// `dismiss_held_by_envoy` does.
+fn answer_held_by_envoy(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{id}` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer {id} --attach <path>.",
+        &[],
+        &[("id", id)],
+    ))
+}
+
+/// A decline the asker did not hear, `err` saying why. The asker's name and the id are
+/// quoted as they stand, since a peer chose them, and so are the parts `err` quotes.
+fn decline_not_told(name: &str, id: &str, err: &anyhow::Error) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::from_template(
+            "Could not tell {name} that you declined (",
+            &[],
+            &[("name", name)],
+        )
+        .then(error_notice(err))
+        .then(NoticeText::from_template(
+            "); {short} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent.",
+            &[],
+            &[("short", short(id)), ("id", id)],
+        )),
+    )
+}
+
+/// A dismiss refused while the envoy holds `id`; the id is quoted as it stands, since a
+/// peer chose it.
+pub(crate) fn dismiss_held_by_envoy(id: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}.",
+        &[],
+        &[("id", id)],
+    ))
+}
+
+#[cfg(test)]
+mod held_and_declined_quoting_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::render::{MeshVerbError, command_error_text};
+
+    fn shown(err: anyhow::Error, prefix: CommandPrefix) -> String {
+        command_error_text(&MeshVerbError::wrap(err), prefix)
+    }
+
+    /// A send that failed with a sentence quoting the peer's `.vault`.
+    fn send_failure() -> anyhow::Error {
+        QuotingError::wrap(
+            NoticeText::default()
+                .frame("No path to ")
+                .peer(".vault")
+                .frame(" is known; `.mesh peers` lists what this node has heard from"),
+        )
+    }
+
+    #[test]
+    fn under_dot_the_hold_and_decline_errors_read_as_they_did() {
+        assert_eq!(
+            shown(answer_held_by_envoy(".vault"), CommandPrefix::Dot),
+            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer .vault --attach <path>."
+        );
+        let declined = decline_not_told(".session", ".vault", &send_failure());
+        assert_eq!(
+            declined.to_string(),
+            "Could not tell .session that you declined (No path to .vault is known; `.mesh peers` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with .mesh dismiss .vault --silent."
+        );
+        assert_eq!(
+            shown(declined, CommandPrefix::Dot),
+            format!(
+                "Error: {}",
+                decline_not_told(".session", ".vault", &send_failure())
+            )
+        );
+    }
+
+    #[test]
+    fn under_slash_the_hold_and_decline_errors_keep_peer_text_and_slash_their_hints() {
+        assert_eq!(
+            shown(answer_held_by_envoy(".vault"), CommandPrefix::Slash),
+            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then /mesh answer .vault --attach <path>."
+        );
+        assert_eq!(
+            shown(
+                decline_not_told(".session", ".vault", &send_failure()),
+                CommandPrefix::Slash
+            ),
+            "Error: Could not tell .session that you declined (No path to .vault is known; `/mesh peers` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with /mesh dismiss .vault --silent."
+        );
+    }
+
+    #[test]
+    fn a_decline_keeps_each_link_of_an_unquoted_send_failure() {
+        let err = anyhow!("`.mesh peers` shows when it was last heard").context("The link failed");
+        assert_eq!(
+            shown(decline_not_told("Tia", "p1", &err), CommandPrefix::Slash),
+            "Error: Could not tell Tia that you declined (The link failed: `/mesh peers` shows when it was last heard); p1 stays pending. Retry, or remove it without a message with /mesh dismiss p1 --silent."
+        );
+    }
+}
+
+fn non_blank(value: Option<String>) -> Option<Arc<String>> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(Arc::new)
+}
+
+fn node_facts(runtime: &MeshRuntime) -> NodeFacts {
+    NodeFacts {
+        instance_id: runtime.current_instance_id(),
+        destination: runtime.current_destination_hash(),
+        identity: runtime.fingerprint().to_string(),
+        interfaces: runtime.interface_kinds(),
+    }
+}
+
+/// What `mesh.message.received` and `mesh.bulletin.received` say about a message, taken
+/// before it is handed on, since that consumes it. Never its content or fields.
+struct ReceivedFacts {
+    kind: PeerKind,
+    id: String,
+    in_reply_to: Option<String>,
+    identity: String,
+    destination: String,
+    title: Option<String>,
+    via: PeerVia,
+}
+
+impl ReceivedFacts {
+    fn of(message: &PeerMessage) -> Self {
+        Self {
+            kind: message.kind,
+            id: message.message_id.clone(),
+            in_reply_to: message.in_reply_to.clone(),
+            identity: message.source_identity.clone(),
+            destination: message.source_destination.clone(),
+            title: message.title.clone(),
+            via: message.via,
+        }
+    }
+
+    fn event(self, routed: Routed) -> MeshEvent {
+        match self.kind {
+            PeerKind::Bulletin => MeshEvent::BulletinReceived {
+                id: self.id,
+                identity: self.identity,
+                destination: self.destination,
+                title: self.title,
+                via: self.via,
+            },
+            PeerKind::Message | PeerKind::Ask | PeerKind::Reply => MeshEvent::MessageReceived {
+                kind: self.kind,
+                id: self.id,
+                in_reply_to: self.in_reply_to,
+                identity: self.identity,
+                destination: self.destination,
+                title: self.title,
+                via: self.via,
+                routed,
+            },
+        }
+    }
+}
+
+fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
+    in_reply_to.is_none() && matches!(kind, PeerKind::Message | PeerKind::Ask)
+}
+
+/// The two replies a human sends to a peer's question by hand: `.mesh answer` and
+/// `.mesh dismiss`. Narrower than `Disposition` so the wording that files them does
+/// not have to speak for the envoy's outcomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HumanReply {
+    Answered,
+    Declined,
+}
+
+impl HumanReply {
+    fn disposition(self) -> Disposition {
+        match self {
+            Self::Answered => Disposition::Answered,
+            Self::Declined => Disposition::Refused,
+        }
+    }
+}
+
+/// What became of a refused message, for the REPL line: refused on its link before the
+/// acknowledgement with nothing filed, or filed in the inbox after arriving by `via`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefusalPath {
+    Link,
+    Filed(PeerVia),
+}
+
+/// The REPL lines for one refusal of `reason` from `who`, as `note_refusal` folds it:
+/// the rolled-over counts first, then the one line the first refusal of the hour earns.
+/// `who` is the peer's label and is printed as it is.
+fn fold_lines(
+    who: &str,
+    reason: RefusalReason,
+    path: RefusalPath,
+    notice: &FoldNotice,
+) -> Vec<NoticeText> {
+    let mut lines = fold_report_lines(who, &notice.reports);
+    if notice.surface {
+        lines.push(NoticeText::default().peer(who).frame(format!(
+            ": {}; further {} refusals from this peer are folded for the hour",
+            refusal_phrase(reason, path),
+            reason.as_str()
+        )));
+    }
+    lines
+}
+
+fn fold_report_lines(who: &str, reports: &[(RefusalReason, u32)]) -> Vec<NoticeText> {
+    reports
+        .iter()
+        .map(|(reason, count)| {
+            let (plural, verb) = if *count == 1 {
+                ("", "was")
+            } else {
+                ("s", "were")
+            };
+            NoticeText::default()
+                .frame(format!(
+                    "{count} more {} refusal{plural} from ",
+                    reason.as_str()
+                ))
+                .peer(who)
+                .frame(format!(" {verb} folded in the last hour"))
+        })
+        .collect()
+}
+
+fn refusal_phrase(reason: RefusalReason, path: RefusalPath) -> &'static str {
+    use RefusalPath::{Filed, Link};
+    match (reason, path) {
+        (RefusalReason::RateLimited, Filed(PeerVia::StoreAndForward)) => {
+            "over the hourly message limit; arrived store-and-forward, the peer is told once an hour"
+        }
+        (RefusalReason::RateLimited, Link) => "over the hourly message limit, refused on its link",
+        (RefusalReason::RateLimited, Filed(PeerVia::Direct)) => {
+            "over the hourly message limit, filed in the inbox"
+        }
+        (RefusalReason::EnvoyBusy, Link) => "the envoy queue is full, refused on its link",
+        (RefusalReason::EnvoyBusy, Filed(_)) => "the envoy queue is full, filed in the inbox",
+        (RefusalReason::EnvoyStopping, Link) => "the envoy is stopping, refused on its link",
+        (RefusalReason::EnvoyStopping, Filed(_)) => "the envoy is stopping, filed in the inbox",
+        (RefusalReason::PeerConcurrency, Link) => {
+            "already has a message with the envoy, refused on its link"
+        }
+        (RefusalReason::PeerConcurrency, Filed(_)) => {
+            "already has a message with the envoy, filed in the inbox"
+        }
+        (RefusalReason::TokenCeiling, Link) => "over its hourly token ceiling, refused on its link",
+        (RefusalReason::TokenCeiling, Filed(_)) => {
+            "over its hourly token ceiling, filed in the inbox"
+        }
+        (RefusalReason::CostCeiling, Link) => "over its hourly cost ceiling, refused on its link",
+        (RefusalReason::CostCeiling, Filed(_)) => {
+            "over its hourly cost ceiling, filed in the inbox"
+        }
+        (RefusalReason::LoopGuard, Link) => {
+            "sent a reply the envoy will not answer, refused on its link"
+        }
+        (RefusalReason::LoopGuard, Filed(_)) => {
+            "sent a reply the envoy will not answer, filed in the inbox"
+        }
+    }
+}
+
+/// The warning for a thread sent or received that the sent-threads list could not take:
+/// the send or delivery has already happened, so only the follow-up is lost.
+fn warn_thread_not_remembered(err: &anyhow::Error) {
+    warn!(
+        "Mesh sent-threads list could not be written, so mesh__send and mesh__ask will refuse the thread just sent or received as one to continue; omit thread to start a new conversation instead. Check the permissions and free space of the mesh cache directory; the error says which file: {}",
+        redact_hashes(&format!("{err:#}"))
+    );
+}
+
+/// The questions `store` holds open or answered and uncollected. A file this Coyote
+/// cannot read is logged with its remedy and read as empty, so the node serves either
+/// way; a late reply to one of the forgotten questions lands as an ordinary message.
+fn reopen_pending(store: &PendingStore) -> Vec<PendingRecord> {
+    match store.load_pending(SystemTime::now()) {
+        Ok(pending) => {
+            if !pending.is_empty() {
+                debug!("Reopened {} pending mesh questions", pending.len());
+            }
+            pending
+        }
+        Err(err) => {
+            warn!(
+                "Mesh pending questions could not be reopened, so none are waiting on a reply: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+            Vec::new()
+        }
+    }
+}
+
+impl KnockSurface for MeshSlot {
+    fn surface(&self, note: IdleNotify) -> bool {
+        self.push_idle(note)
+    }
+}
+
+impl PeerSurface for MeshSlot {
+    /// A reply to a question this Coyote asked is admitted without being counted: a peer
+    /// past its limit must still be able to answer a `mesh__ask`, and the correlation
+    /// only accepts the one reply (one escalation, then the answer), from the identity
+    /// it was asked of, so the exemption is spent with it. On a link, a message or
+    /// question the envoy would run is refused before the hourly count is consulted
+    /// when the sender already has a run in flight, when its token or cost window for
+    /// the hour is already spent, or when the envoy's queue is full: the link caller's
+    /// code is the refusal, nothing is filed, and the refused message is not counted. A
+    /// bulletin, an interim notice (a message carrying `in_reply_to`), a reply to a
+    /// question nobody here asked, and anything that arrived store-and-forward see the
+    /// hourly count alone; what the envoy then refuses is handled where it is offered.
+    /// A refusal on the store-and-forward path also earns the peer one typed reply per
+    /// identity, per reason, per hour, since no link carries a code back. A refused
+    /// reply neither earns nor spends one: a reply to a reply is the loop the envoy
+    /// guards against. The REPL line is folded on its own count, so it prints whether
+    /// or not the peer is told.
+    fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal> {
+        if request.kind == PeerKind::Reply
+            && let Some(id) = request.in_reply_to
+            && self.correlations.accepts_reply_from(
+                id,
+                request.source_identity,
+                request.disposition.unwrap_or_default(),
+            )
+        {
+            return Ok(());
+        }
+        let identity = request.source_identity;
+        let who = self.peer_label(identity, request.source_destination);
+        let now = Instant::now();
+        let admitted = self
+            .link_run_admissible(request, now)
+            .and_then(|()| self.limits.admit_message(identity, now));
+        match admitted {
+            Ok(()) => {
+                self.surface_fold_reports(identity, &who);
+                Ok(())
+            }
+            Err(refusal) => {
+                let path = match request.via {
+                    PeerVia::Direct => RefusalPath::Link,
+                    PeerVia::StoreAndForward => RefusalPath::Filed(PeerVia::StoreAndForward),
+                };
+                self.surface_refusal(identity, &refusal, &who, path);
+                if request.via == PeerVia::StoreAndForward
+                    && request.in_reply_to.is_none()
+                    && self.limits.claim_peer_reply(identity, refusal.reason, now)
+                {
+                    self.send_refusal_reply(
+                        request.source_destination,
+                        request.message_id,
+                        request.thread,
+                        &refusal,
+                    );
+                }
+                Err(refusal)
+            }
+        }
+    }
+
+    fn deliver_peer(&self, message: PeerMessage) {
+        MeshSlot::deliver_peer(self, message);
+    }
+
+    fn file_peer(&self, mut message: PeerMessage) {
+        let answered = self.answer_correlation(&mut message);
+        self.remember_references(&message);
+        self.remember_received_thread(message.thread());
+        self.deliver_to_inbox(message, answered);
+    }
+
+    fn local_destination(&self) -> Option<String> {
+        self.get().map(|runtime| runtime.current_destination_hash())
+    }
+
+    fn part_limits(&self) -> PartLimits {
+        self.get()
+            .map(|runtime| runtime.part_limits())
+            .unwrap_or_default()
+    }
+
+    /// The running instance's inbox; with the mesh off there is nowhere to stage a file.
+    fn inbox_staging(&self) -> Option<InboxStaging> {
+        self.get().map(|runtime| runtime.inbox_staging())
+    }
+}
+
+impl ShareSource for MeshSlot {
+    /// The snapshot's `cwd` is `std::env::current_dir()` at capture (the session's
+    /// snapshot publisher), so in production it is absolute or, when that call failed,
+    /// empty. An empty or relative root names nothing: the share set
+    /// resolves against its root, and the process's own directory is not the session's.
+    /// A hand-built snapshot with a relative `cwd` is refused by the same check.
+    fn share_root(&self) -> Option<PathBuf> {
+        self.snapshot()
+            .map(|snapshot| snapshot.cwd.clone())
+            .filter(|cwd| cwd.is_absolute())
+    }
+
+    fn serving(&self) -> Option<Arc<FetchServing>> {
+        self.get().map(|runtime| Arc::clone(runtime.serving()))
+    }
+}
+
+impl MeshSlot {
+    /// The share root, the published snapshot's `cwd`, and where its two share files
+    /// live; `None` before a snapshot exists. With a running node this is the node's own
+    /// `FetchServing::share_locations`, cache dir and configured inbox protected, and
+    /// `inbox_dir` is never called; while the mesh is off it is built from
+    /// `MeshPaths::from_env()` with the directory `inbox_dir` resolves, the configured
+    /// `mesh.fetch.inbox_dir`, protected the same way, so `.mesh shares` and the
+    /// `.mesh on` preview see exactly what the node will serve.
+    pub(crate) fn share_locations(
+        &self,
+        inbox_dir: impl FnOnce() -> Option<PathBuf>,
+    ) -> Option<(PathBuf, ShareLocations)> {
+        let root = ShareSource::share_root(self)?;
+        let locations = match self.get() {
+            Some(runtime) => runtime.serving().share_locations(&root),
+            None => {
+                let paths = MeshPaths::from_env();
+                let locations =
+                    ShareLocations::new(&paths.config_dir, &root).with_cache_dir(&paths.cache_dir);
+                match inbox_dir() {
+                    Some(inbox_dir) => locations.with_protected(&inbox_dir),
+                    None => locations,
+                }
+            }
+        };
+        Some((root, locations))
+    }
+}
+
+/// An envoy that keeps every job it is offered, or refuses them all with one reason
+/// (a full queue unless told otherwise); answers are consumed or not as configured, and
+/// it reports a hold on whichever question `held` names.
+#[cfg(test)]
+pub(crate) struct RecordingEnvoy {
+    refusal: Option<PeerRefusal>,
+    consume_answers: bool,
+    pub(crate) jobs: parking_lot::Mutex<Vec<PeerMessage>>,
+    pub(crate) answers: parking_lot::Mutex<Vec<(String, String)>>,
+    pub(crate) interrupts: std::sync::atomic::AtomicUsize,
+    pub(crate) held: parking_lot::Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl RecordingEnvoy {
+    pub(crate) fn new(accept: bool, consume_answers: bool) -> Arc<Self> {
+        let refusal = (!accept).then(|| PeerRefusal::capacity(RefusalReason::EnvoyBusy));
+        Self::with_refusal(refusal, consume_answers)
+    }
+
+    pub(crate) fn refusing(reason: RefusalReason) -> Arc<Self> {
+        Self::with_refusal(Some(PeerRefusal::capacity(reason)), false)
+    }
+
+    fn with_refusal(refusal: Option<PeerRefusal>, consume_answers: bool) -> Arc<Self> {
+        Arc::new(Self {
+            refusal,
+            consume_answers,
+            jobs: parking_lot::Mutex::new(Vec::new()),
+            answers: parking_lot::Mutex::new(Vec::new()),
+            interrupts: std::sync::atomic::AtomicUsize::new(0),
+            held: parking_lot::Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn job_ids(&self) -> Vec<String> {
+        self.jobs
+            .lock()
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl EnvoySink for RecordingEnvoy {
+    fn accept(&self, job: EnvoyJob) -> Result<(), PeerRefusal> {
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
+        self.jobs.lock().push(job.message);
+        Ok(())
+    }
+
+    fn answer(&self, id: &str, text: &str) -> bool {
+        self.answers.lock().push((id.to_string(), text.to_string()));
+        self.consume_answers
+    }
+
+    fn holds(&self, id: &str) -> bool {
+        self.held.lock().as_deref() == Some(id)
+    }
+
+    fn interrupt(&self) {
+        self.interrupts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// An envoy whose queue reads as full before anything is offered to it. Used only by the
+/// loopback runtime tests, which run on unix alone.
+#[cfg(all(test, unix))]
+pub(crate) struct FullEnvoy;
+
+#[cfg(all(test, unix))]
+impl EnvoySink for FullEnvoy {
+    fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+        Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+    }
+
+    fn has_room(&self) -> bool {
+        false
+    }
+
+    fn answer(&self, _id: &str, _text: &str) -> bool {
+        false
+    }
+
+    fn holds(&self, _id: &str) -> bool {
+        false
+    }
+
+    fn interrupt(&self) {}
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A knock whose wait ran out on this node's side, or with the peer's answer still
+    /// arriving, is told as the retry, neither unreachable nor unanswered.
+    #[test]
+    fn a_knock_wait_short_of_silence_reads_as_the_retry() {
+        use super::KnockError;
+        use crate::mesh::request::{RequestError, request_remedy};
+        use std::time::Duration;
+
+        let (path, after) = ("/knock".to_string(), Duration::from_secs(15));
+        for err in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete { path, after },
+        ] {
+            let remedy = request_remedy(&err);
+            let text = KnockError::Direct(err).to_string();
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(!text.contains("unreachable"), "{text}");
+            assert!(!text.contains("no answer"), "{text}");
+        }
+    }
+
+    /// A knock on a peer gone before the link could come up was never heard, so with no
+    /// propagation node known it is reported unreachable rather than unanswered.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_knock_whose_link_never_comes_up_is_unreachable_not_unanswered() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("knock-never-linked").await;
+        let runtime = &started.runtime;
+        let desc = runtime
+            .resolve_destination(&stub.destination_hex())
+            .await
+            .unwrap();
+        stub.stop().await;
+        let options = KnockOptions {
+            request: RequestOptions {
+                request_timeout: Duration::from_secs(2),
+                link_timeout: Duration::from_secs(2),
+                path_requested: false,
+            },
+            propagation: PropagationOptions::default(),
+        };
+
+        let err = runtime
+            .knock_with(&desc, &KnockIntro::new("hello").unwrap(), options)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, KnockError::NoPropagationNode);
+        assert!(slot.stop().await.unwrap());
+    }
+}
+
+// Tests that start a runtime are unix-only: they run on the loopback fixtures under
+// `test_support`, which have only been run on unix so far. Lifting that gate is future work.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::mesh_config::{EnvoyMemoryConfig, MAX_TIMEOUT_SECS, MeshBrief};
+    use crate::hooks::HookEvent;
+    use crate::mesh::access::{AccessOptions, access_message, validate_access};
+    #[cfg(unix)]
+    use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
+    use crate::mesh::destination_address;
+    use crate::mesh::envoy_sessions::{EnvoyMemoryError, session_key};
+    use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
+    use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
+    use crate::mesh::message::{
+        PEER_ID_MAX_CHARS, PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PeerSendOptions,
+        is_received_reply, peer_lxmf_message, to_request_body,
+    };
+    use crate::mesh::notify::RenderedNotification;
+    use crate::mesh::peers::PEER_TTL;
+    #[cfg(unix)]
+    use crate::mesh::peers::{PEER_TABLE_VERSION, PeerTableFile};
+    use crate::mesh::pending::{
+        DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
+        PENDING_RECORD_VERSION, PendingState,
+    };
+    use crate::mesh::propagation_fetch::InboundMessage;
+    use crate::mesh::request::{
+        AdmittedRequest, DEFAULT_LINK_TIMEOUT, Deadline, Handler, NAME_HASH_LEN, PathHash, Reply,
+        RequestId,
+    };
+    use crate::mesh::rfc3339_utc;
+    #[cfg(unix)]
+    use crate::mesh::test_support::{
+        PeerStub, StartedRuntime, TransportRelay, closed_port, held_port, loopback_relay,
+        serve_as_daemon, serve_as_sink, started_runtime, started_runtime_on,
+        started_runtime_on_with, started_runtime_with, started_runtime_with_options,
+        status_round_trip,
+    };
+    use crate::mesh::test_support::{
+        TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
+    };
+    use crate::mesh::trust::KeyChange;
+    #[cfg(unix)]
+    use crate::mesh::trust::{KeyChangeOutcome, TrustOptions};
+    use crate::supervisor::mailbox::EnvelopePayload;
+    use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
+    #[cfg(unix)]
+    use async_trait::async_trait;
+    use rns_transport::destination::link::LinkId;
+    #[cfg(unix)]
+    use rns_transport::iface::tcp_server::TcpServer;
+    use rns_transport::rand_core::OsRng;
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicBool;
+    #[cfg(unix)]
+    use tokio::net::TcpListener;
+
+    #[cfg(unix)]
+    const POLL: Duration = Duration::from_millis(100);
+    #[cfg(unix)]
+    const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Covers the transport's fixed 5 s reconnect sleep plus one connect and the watcher's
+    /// handling of it.
+    #[cfg(unix)]
+    const CONNECT_LATER_TIMEOUT: Duration = Duration::from_secs(12);
+    /// How long a test leaves the interface watcher to act on events already sent, before
+    /// it checks that nothing more happened.
+    #[cfg(unix)]
+    const WATCH_SETTLE: Duration = Duration::from_secs(1);
+
+    /// Unset timers leave every path's deadlines as they are; set ones apply only where
+    /// they are the longer, so a configured value can never shorten a deadline: the one
+    /// `validate` refuses would, if it got this far, leave each path's own in place.
+    /// The floors `validate` enforces are the shortest request and link defaults among the
+    /// five governed paths.
+    #[test]
+    fn request_timeouts_raise_a_deadline_and_never_lower_one() {
+        let message = PeerSendOptions::default().request;
+        let knock = KnockOptions::default().request;
+        let list = RequestOptions {
+            request_timeout: PEER_REQUEST_TIMEOUT,
+            link_timeout: PEER_LINK_TIMEOUT,
+            path_requested: false,
+        };
+        let access = AccessOptions::default().request;
+        let status = RequestOptions::default();
+        assert_eq!(message.request_timeout, Duration::from_secs(15));
+        assert_eq!(knock.request_timeout, Duration::from_secs(15));
+        assert_eq!(status.request_timeout, Duration::from_secs(30));
+        assert_eq!(status.link_timeout, Duration::from_secs(10));
+        let governed = [message, knock, list, access, status];
+        assert_eq!(
+            governed.iter().map(|options| options.request_timeout).min(),
+            Some(PEER_REQUEST_TIMEOUT)
+        );
+        assert_eq!(
+            governed.iter().map(|options| options.link_timeout).min(),
+            Some(DEFAULT_LINK_TIMEOUT)
+        );
+
+        let unset = RequestTimeouts::from(&MeshConfig::default());
+        assert_eq!(
+            unset,
+            RequestTimeouts {
+                request: None,
+                link: None
+            }
+        );
+        for defaults in governed {
+            assert_eq!(unset.raise(defaults), defaults);
+        }
+
+        let lower = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(1),
+            link_timeout_secs: Some(1),
+            ..Default::default()
+        });
+        for defaults in governed {
+            assert_eq!(lower.raise(defaults), defaults, "{defaults:?}");
+        }
+
+        let between = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(20),
+            link_timeout_secs: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(
+            between.raise(message).request_timeout,
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            between.raise(status).request_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(between.raise(status).link_timeout, Duration::from_secs(10));
+
+        let higher = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(90),
+            link_timeout_secs: Some(45),
+            ..Default::default()
+        });
+        for defaults in governed {
+            assert_eq!(
+                higher.raise(defaults),
+                RequestOptions {
+                    request_timeout: Duration::from_secs(90),
+                    link_timeout: Duration::from_secs(45),
+                    path_requested: false,
+                }
+            );
+        }
+    }
+
+    /// The cap `validate` puts on both timers keeps a raised deadline within what the
+    /// clock can hold: at `MAX_TIMEOUT_SECS` every governed path still gets a `Deadline`,
+    /// where `u64::MAX` seconds would overflow `Instant` on the first request.
+    #[test]
+    fn timers_at_the_cap_still_make_a_deadline() {
+        let capped = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(MAX_TIMEOUT_SECS),
+            link_timeout_secs: Some(MAX_TIMEOUT_SECS),
+            ..Default::default()
+        });
+        for defaults in [
+            PeerSendOptions::default().request,
+            RequestOptions::default(),
+        ] {
+            let options = capped.raise(defaults);
+            assert_eq!(
+                options.request_timeout,
+                Duration::from_secs(MAX_TIMEOUT_SECS)
+            );
+            assert!(
+                Deadline::after(options.request_timeout).remaining() > defaults.request_timeout
+            );
+            assert!(Deadline::after(options.link_timeout).remaining() > defaults.link_timeout);
+        }
+    }
+
+    #[test]
+    fn slot_publish_then_read_returns_the_latest_snapshot() {
+        let slot = MeshSlot::default();
+        assert!(slot.snapshot().is_none());
+
+        let first = snapshot_fixture();
+        let first_at = first.captured_at;
+        slot.publish(first);
+        assert_eq!(slot.snapshot().unwrap().captured_at, first_at);
+
+        let mut second = snapshot_fixture();
+        second.captured_at = first_at + Duration::from_secs(1);
+        slot.publish(second);
+        assert_eq!(
+            slot.snapshot().unwrap().captured_at,
+            first_at + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn slot_override_and_brief_round_trip_and_clear() {
+        let slot = MeshSlot::default();
+        assert!(slot.objective_override().is_none());
+        assert!(slot.digest().is_none());
+        assert!(slot.user_brief().is_none());
+        assert!(slot.brief().is_none());
+
+        slot.set_objective_override(Some("review the mesh".into()));
+        assert_eq!(
+            slot.objective_override().unwrap().as_str(),
+            "review the mesh"
+        );
+        slot.set_objective_override(None);
+        assert!(slot.objective_override().is_none());
+
+        slot.publish(snapshot_fixture());
+        slot.publish_digest(Some(Digest {
+            text: "- Working on the mesh".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 4,
+        }));
+        assert_eq!(slot.digest().unwrap().covered_messages, 4);
+        let brief = slot.brief().unwrap();
+        let heading = format!(
+            "## Digest (as of {})\n- Working on the mesh",
+            rfc3339_utc(slot.digest().unwrap().generated_at)
+        );
+        assert!(brief.text.contains(&heading), "{}", brief.text);
+        assert_eq!(
+            brief.digest_generated_at,
+            Some(slot.digest().unwrap().generated_at)
+        );
+
+        slot.set_objective_override(Some("override goal".into()));
+        let brief = slot.brief().unwrap();
+        assert!(
+            brief.text.contains("Objective: override goal"),
+            "{}",
+            brief.text
+        );
+        slot.set_objective_override(None);
+        let brief = slot.brief().unwrap();
+        assert!(brief.text.contains("Objective: ship it"), "{}", brief.text);
+
+        slot.set_user_brief(Some("Ask before merging".into()));
+        assert_eq!(slot.user_brief().unwrap().as_str(), "Ask before merging");
+        let brief = slot.brief().unwrap();
+        assert!(
+            brief
+                .text
+                .contains("## Note from the user\nAsk before merging"),
+            "{}",
+            brief.text
+        );
+
+        slot.publish_digest(None);
+        assert!(slot.digest().is_none());
+        let brief = slot.brief().unwrap();
+        assert!(!brief.text.contains("## Digest"), "{}", brief.text);
+        assert_eq!(brief.digest_generated_at, None);
+        slot.set_user_brief(None);
+        assert!(slot.user_brief().is_none());
+        assert!(!slot.brief().unwrap().text.contains("## Note from the user"));
+    }
+
+    #[test]
+    fn slot_refuses_a_digest_from_a_closed_epoch() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        let digest = Digest {
+            text: "- Working on the mesh".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 4,
+        };
+        let epoch = slot.digest_epoch();
+        assert!(slot.publish_digest_at(epoch, digest.clone()));
+        assert!(slot.brief().unwrap().text.contains("## Digest (as of "));
+
+        let next = slot.clear_digest_for_new_epoch();
+        assert_eq!(next, epoch + 1);
+        assert_eq!(slot.digest_epoch(), next);
+        assert!(slot.digest().is_none());
+        assert!(!slot.brief().unwrap().text.contains("## Digest"));
+
+        assert!(!slot.publish_digest_at(epoch, digest.clone()));
+        assert!(slot.digest().is_none());
+        assert!(!slot.brief().unwrap().text.contains("## Digest"));
+
+        assert!(slot.publish_digest_at(next, digest));
+        assert_eq!(slot.digest().unwrap().covered_messages, 4);
+    }
+
+    #[test]
+    fn an_unchanged_digest_keeps_its_age_anchor_across_publishes() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        slot.publish_digest(Some(Digest {
+            text: "- Working on the mesh".into(),
+            generated_at: SystemTime::now() - Duration::from_secs(30),
+            covered_messages: 4,
+        }));
+        let first = slot.brief().unwrap();
+        let heading_line = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("## Digest (as of "))
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("no digest heading in {text}"))
+        };
+        let first_heading = heading_line(&first.text);
+
+        slot.publish(snapshot_fixture());
+        let second = slot.brief().unwrap();
+        assert_eq!(second.digest_generated_at, first.digest_generated_at);
+        assert_eq!(heading_line(&second.text), first_heading);
+    }
+
+    #[test]
+    fn slot_setters_trim_and_treat_blank_as_cleared() {
+        let slot = MeshSlot::default();
+
+        slot.set_objective_override(Some("  review the mesh \n".into()));
+        assert_eq!(
+            slot.objective_override().unwrap().as_str(),
+            "review the mesh"
+        );
+        slot.set_objective_override(Some("  ".into()));
+        assert!(slot.objective_override().is_none());
+
+        slot.set_user_brief(Some("\tWorking on the mesh  ".into()));
+        assert_eq!(slot.user_brief().unwrap().as_str(), "Working on the mesh");
+        slot.set_user_brief(Some(" \n".into()));
+        assert!(slot.user_brief().is_none());
+    }
+
+    #[test]
+    fn publish_reassembles_the_brief() {
+        let slot = MeshSlot::default();
+        slot.set_user_brief(Some("Ask before merging".into()));
+        assert!(
+            slot.brief().is_none(),
+            "no snapshot means no mode to honour, so nothing is served"
+        );
+
+        slot.publish(snapshot_fixture());
+        let brief = slot.brief().unwrap();
+        assert!(
+            brief
+                .text
+                .starts_with("## Status\nObjective: ship it\nCaps: fetch\nState: idle"),
+            "{}",
+            brief.text
+        );
+        assert!(
+            brief
+                .text
+                .contains("## Note from the user\nAsk before merging"),
+            "{}",
+            brief.text
+        );
+
+        let mut manual = snapshot_fixture();
+        manual.brief.mode = MeshBrief::Manual;
+        manual.todo.goal = "ship it".into();
+        manual.todo.add("write the seam");
+        slot.publish_digest(Some(Digest {
+            text: "- from the digest".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 2,
+        }));
+        slot.publish(manual);
+        let brief = slot.brief().unwrap();
+        assert!(!brief.text.contains("from the digest"), "{}", brief.text);
+        assert!(
+            brief.text.contains("## Todo\nGoal: ship it"),
+            "{}",
+            brief.text
+        );
+
+        let mut off = snapshot_fixture();
+        off.brief.mode = MeshBrief::Off;
+        slot.publish(off);
+        assert!(slot.brief().is_none());
+    }
+
+    #[test]
+    fn slot_consumer_reports_snapshot_age() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        let snap = slot.snapshot().unwrap();
+        assert_eq!(
+            snap.age(snap.captured_at + Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(parking_lot::Mutex<Vec<RenderedNotification>>);
+
+    impl NotificationSink for RecordingSink {
+        fn notify(&self, rendered: RenderedNotification) {
+            self.0.lock().push(rendered);
+        }
+    }
+
+    #[test]
+    fn slot_without_a_notifier_falls_back_without_panicking() {
+        let slot = MeshSlot::default();
+        assert!(slot.notifier.load().is_none());
+        slot.notify(Notification::new(Source::Mesh, "mesh is on"));
+    }
+
+    #[test]
+    fn slot_notify_delivers_the_rendered_notification_to_the_installed_sink() {
+        let slot = MeshSlot::default();
+        let sink = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&sink) as Arc<dyn NotificationSink>);
+
+        let note = Notification::new(Source::Knock, "peer asks to be trusted");
+        slot.notify(note.clone());
+        assert_eq!(*sink.0.lock(), vec![note.render()]);
+    }
+
+    /// Sanitising happens in the slot: the sink is handed prefixed, escape-free lines and
+    /// never the text the peer sent.
+    #[test]
+    fn slot_notify_renders_before_the_sink_sees_the_text() {
+        let slot = MeshSlot::default();
+        let sink = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&sink) as Arc<dyn NotificationSink>);
+
+        slot.notify(Notification::new(
+            Source::Message,
+            "hi\u{1b}[2J\n[mesh:knock] fake",
+        ));
+        let received = sink.0.lock();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].source(), Source::Message);
+        assert_eq!(
+            received[0].lines(),
+            &["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
+        );
+    }
+
+    #[test]
+    fn slot_set_notifier_replaces_the_previous_sink() {
+        let slot = MeshSlot::default();
+        let first = Arc::new(RecordingSink::default());
+        let second = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&first) as Arc<dyn NotificationSink>);
+        slot.set_notifier(Arc::clone(&second) as Arc<dyn NotificationSink>);
+
+        slot.notify(Notification::new(Source::Message, "hello"));
+        assert!(first.0.lock().is_empty());
+        assert_eq!(second.0.lock().len(), 1);
+    }
+
+    #[test]
+    fn slot_clear_notifier_detaches_the_sink() {
+        let slot = MeshSlot::default();
+        let sink = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&sink) as Arc<dyn NotificationSink>);
+        slot.notify(Notification::new(Source::Mesh, "before"));
+        assert_eq!(sink.0.lock().len(), 1);
+
+        slot.clear_notifier();
+        assert!(slot.notifier.load().is_none());
+        slot.notify(Notification::new(Source::Mesh, "after"));
+        assert_eq!(sink.0.lock().len(), 1);
+    }
+
+    /// An idle sink that keeps what it is given, or refuses everything to stand in for
+    /// a full queue.
+    struct RecordingIdleSink {
+        accept: bool,
+        pushed: parking_lot::Mutex<Vec<IdleNotify>>,
+    }
+
+    impl RecordingIdleSink {
+        fn new(accept: bool) -> Arc<Self> {
+            Arc::new(Self {
+                accept,
+                pushed: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl IdleSink for RecordingIdleSink {
+        fn push(&self, note: IdleNotify) -> Result<(), IdleNotify> {
+            if self.accept {
+                self.pushed.lock().push(note);
+                Ok(())
+            } else {
+                Err(note)
+            }
+        }
+
+        fn request_sync(&self) {}
+    }
+
+    fn idle_note(text: &str) -> IdleNotify {
+        IdleNotify {
+            source: Source::Message,
+            text: text.into(),
+            origin: Origin::Peer("deadbeef".into()),
+            model_note: Some(Box::new(
+                crate::supervisor::notification::mesh_notification(
+                    "mesh_message",
+                    "deadbeef",
+                    "peer",
+                    true,
+                    "read it".into(),
+                ),
+            )),
+        }
+    }
+
+    #[test]
+    fn slot_push_idle_hands_the_whole_note_to_the_installed_idle_sink() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        assert!(slot.push_idle(idle_note("hello")));
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].text.plain(), "hello");
+        assert!(pushed[0].model_note.is_some());
+        assert!(notifier.0.lock().is_empty());
+    }
+
+    #[test]
+    fn slot_push_idle_without_a_driver_keeps_the_human_line_and_drops_the_model_note() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+
+        assert!(slot.push_idle(idle_note("hello")));
+        let received = notifier.0.lock();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].lines(), &["[mesh:message] hello"]);
+    }
+
+    #[test]
+    fn slot_push_idle_drops_the_note_when_the_driver_queue_is_full() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        let idle = RecordingIdleSink::new(false);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        assert!(
+            !slot.push_idle(idle_note("hello")),
+            "the caller must learn the line was dropped"
+        );
+        assert!(idle.pushed.lock().is_empty());
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a full driver queue must not become a path around the rate limiter"
+        );
+    }
+
+    #[test]
+    fn slot_clear_idle_routes_later_pushes_to_the_notifier() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.clear_idle();
+        slot.push_idle(idle_note("hello"));
+        assert!(idle.pushed.lock().is_empty());
+        assert_eq!(notifier.0.lock().len(), 1);
+    }
+
+    const PEER_IDENTITY: [u8; 16] = [0xcd; 16];
+    const PEER_INSTANCE: [u8; 16] = [0xab; 16];
+
+    fn peer_message(kind: PeerKind, id: &str, in_reply_to: Option<&str>) -> PeerMessage {
+        PeerMessage {
+            source_identity: hex_lower(&PEER_IDENTITY),
+            source_destination: hex_lower(&PEER_INSTANCE),
+            destination: hex_lower(&[0x01; 16]),
+            title: None,
+            content: format!("words of {id}"),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: id.to_string(),
+            in_reply_to: in_reply_to.map(str::to_string),
+            kind,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        }
+    }
+
+    fn pending(id: &str) -> PendingRecord {
+        let now = SystemTime::now();
+        PendingRecord {
+            version: PENDING_RECORD_VERSION,
+            id: id.to_string(),
+            peer_destination: hex_lower(&PEER_INSTANCE),
+            peer_identity: hex_lower(&PEER_IDENTITY),
+            thread: id.to_string(),
+            question: "what now".to_string(),
+            sent_at: rfc3339_utc(now),
+            timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+            state: PendingState::Open,
+            reply: None,
+        }
+    }
+
+    fn peer_ids(envelopes: &[crate::supervisor::mailbox::Envelope]) -> Vec<&str> {
+        envelopes
+            .iter()
+            .map(|envelope| match &envelope.payload {
+                EnvelopePayload::Peer(message) => message.message_id.as_str(),
+                other => panic!("not a peer envelope: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn peer_of(envelope: &crate::supervisor::mailbox::Envelope) -> &PeerMessage {
+        match &envelope.payload {
+            EnvelopePayload::Peer(message) => message,
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deliver_peer_on_a_bare_slot_lands_in_the_inbox_and_queues_a_model_note_and_a_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Bulletin, "b-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-2", Some("q-unknown")));
+
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(peer_ids(&envelopes), ["m-1", "b-1", "a-1", "r-1", "r-2"]);
+        assert_eq!(envelopes[0].from, hex_lower(&PEER_INSTANCE));
+        assert_eq!(envelopes[0].to, hex_lower(&[0x01; 16]));
+
+        let notes = slot.take_model_notes();
+        let summary: Vec<(&str, &str, &str, usize)> = notes
+            .iter()
+            .map(|note| {
+                (
+                    note.event,
+                    note.id.as_str(),
+                    note.next_action.as_str(),
+                    note.count,
+                )
+            })
+            .collect();
+        let peer_id = format!("peer:{}", &hex_lower(&PEER_INSTANCE)[..8]);
+        assert_eq!(
+            summary,
+            [
+                ("peer_message", peer_id.as_str(), "mesh__check_inbox", 2),
+                ("peer_bulletin", peer_id.as_str(), "mesh__check_inbox", 1),
+                ("peer_ask", peer_id.as_str(), "mesh__check_inbox", 1),
+                ("peer_reply", "q-1", "mesh__collect --id q-1", 1),
+            ],
+            "a reply to nothing this node asked is an ordinary message, folded into the first"
+        );
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.tool_or_agent == "mesh" && note.status == "success")
+        );
+        assert!(slot.take_model_notes().is_empty());
+
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 5);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        for note in pushed.iter() {
+            assert_eq!(
+                note.origin,
+                Origin::Peer(hex_lower(&PEER_IDENTITY)[..8].to_string())
+            );
+            assert!(
+                note.model_note.is_none(),
+                "the model's copy waits in the slot's notes, not on the idle line"
+            );
+        }
+        let sources: Vec<Source> = pushed.iter().map(|note| note.source).collect();
+        assert_eq!(
+            sources,
+            [
+                Source::Message,
+                Source::Message,
+                Source::Message,
+                Source::Reply,
+                Source::Message
+            ],
+            "only a reply that answers an open question is a reply line"
+        );
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("{dest8} says: words of m-1")
+        );
+        assert_eq!(
+            pushed[1].text.plain(),
+            format!("{dest8} announces: words of b-1")
+        );
+        assert_eq!(
+            pushed[2].text.plain(),
+            format!("{dest8} asks: words of a-1")
+        );
+        assert_eq!(
+            pushed[3].text.plain(),
+            format!("{dest8} replies: words of r-1")
+        );
+        drop(pushed);
+        assert_eq!(
+            slot.correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.message_id),
+            Some("r-1".to_string())
+        );
+    }
+
+    fn peer_payload(envelope: &crate::supervisor::mailbox::Envelope) -> &PeerMessage {
+        match &envelope.payload {
+            EnvelopePayload::Peer(message) => message,
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_accepting_envoy_takes_messages_and_asks_and_nothing_else() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Bulletin, "b-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-2", Some("q-unknown")));
+
+        assert_eq!(
+            envoy.job_ids(),
+            ["m-1", "a-1"],
+            "a reply to nothing we asked is a message, but one that never reaches the envoy"
+        );
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            peer_ids(&envelopes),
+            ["b-1", "r-1", "r-2"],
+            "a bulletin, an answer to our question and a stray reply take the inbox path"
+        );
+        assert_eq!(peer_of(&envelopes[2]).kind, PeerKind::Message);
+        let notes = slot.take_model_notes();
+        let events: Vec<&str> = notes.iter().map(|note| note.event).collect();
+        assert_eq!(events, ["peer_bulletin", "peer_reply", "peer_message"]);
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 3);
+        assert!(
+            pushed
+                .iter()
+                .all(|note| !note.text.plain().contains("envoy"))
+        );
+    }
+
+    #[test]
+    fn a_wire_reply_that_answers_nothing_never_reaches_the_envoy() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-2", Some("whatever")));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-3", Some("unknown")));
+
+        assert!(envoy.job_ids().is_empty(), "{:?}", envoy.job_ids());
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(peer_ids(&envelopes), ["m-2", "r-3"]);
+    }
+
+    fn assert_no_content(envs: &[(&'static str, String)], message: &PeerMessage) {
+        for (key, value) in envs {
+            assert!(
+                !value.contains(&message.content) && !message.content.contains(value.as_str()),
+                "{key}={value} carries the content"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_peer_fires_message_received_with_where_it_went_and_never_the_content() {
+        let slot = MeshSlot::default();
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let mut message = peer_message(PeerKind::Ask, "a-1", None);
+        message.title = Some("hello".to_string());
+        message.content = "the secret words of the peer".to_string();
+        message.via = PeerVia::StoreAndForward;
+
+        slot.deliver_peer(message.clone());
+
+        let envs = one_fire(&sink, HookEvent::MeshMessageReceived);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"), Some("ask"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("a-1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_IN_REPLY_TO"), None);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(hex_lower(&PEER_IDENTITY).as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(hex_lower(&PEER_INSTANCE).as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_TITLE"), Some("hello"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_VIA"),
+            Some("store-and-forward")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), Some("inbox"));
+        assert_no_content(&envs, &message);
+
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        let envs = one_fire(&sink, HookEvent::MeshMessageReceived);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), Some("envoy"));
+        assert_eq!(envoy.job_ids(), ["m-1"]);
+
+        slot.correlations().open(pending("q-1")).unwrap();
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        let envs = one_fire(&sink, HookEvent::MeshMessageReceived);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_IN_REPLY_TO"), Some("q-1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), Some("inbox"));
+    }
+
+    #[test]
+    fn deliver_peer_fires_bulletin_received_for_a_bulletin() {
+        let slot = MeshSlot::default();
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut message = peer_message(PeerKind::Bulletin, "b-1", None);
+        message.content = "the secret words of the peer".to_string();
+
+        slot.deliver_peer(message.clone());
+
+        let envs = one_fire(&sink, HookEvent::MeshBulletinReceived);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"),
+            Some("bulletin")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("b-1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_VIA"), Some("direct"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), None);
+        assert_no_content(&envs, &message);
+        assert!(envoy.job_ids().is_empty());
+    }
+
+    #[test]
+    fn deliver_peer_with_no_hook_sink_delivers_and_records_nothing() {
+        let slot = MeshSlot::default();
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["m-1"]);
+    }
+
+    #[test]
+    fn set_user_brief_fires_brief_updated_only_when_the_served_brief_changes() {
+        let slot = MeshSlot::default();
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let note = "Ask before merging";
+
+        slot.set_user_brief(Some(note.to_string()));
+        assert!(
+            sink.drain().is_empty(),
+            "with no snapshot nothing is served, so nothing changed"
+        );
+
+        slot.publish(snapshot_fixture());
+        sink.drain();
+        slot.set_user_brief(Some(note.to_string()));
+        assert!(sink.drain().is_empty(), "the same text changes nothing");
+
+        slot.set_user_brief(Some("Merge freely".to_string()));
+        let envs = one_fire(&sink, HookEvent::MeshBriefUpdated);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_BRIEF_SOURCE"), Some("user"));
+        let served = slot.brief().unwrap().text.chars().count();
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_BRIEF_CHARS"),
+            Some(served.to_string().as_str())
+        );
+        for (key, value) in &envs {
+            assert!(!value.contains("Merge"), "{key}={value} carries the brief");
+        }
+
+        slot.set_user_brief(Some("Merge freely".to_string()));
+        assert!(sink.drain().is_empty());
+    }
+
+    #[test]
+    fn publish_digest_at_fires_brief_updated_from_the_digest_for_the_current_epoch_only() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let digest = Digest {
+            text: "- Working on the mesh hooks".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 4,
+        };
+        let epoch = slot.digest_epoch();
+
+        assert!(slot.publish_digest_at(epoch, digest.clone()));
+
+        let envs = one_fire(&sink, HookEvent::MeshBriefUpdated);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_BRIEF_SOURCE"), Some("digest"));
+        let served = slot.brief().unwrap().text.chars().count();
+        assert!(served > 0);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_BRIEF_CHARS"),
+            Some(served.to_string().as_str())
+        );
+        for (key, value) in &envs {
+            assert!(
+                !value.contains("mesh hooks"),
+                "{key}={value} carries the digest"
+            );
+        }
+
+        assert!(slot.publish_digest_at(epoch, digest.clone()));
+        assert!(sink.drain().is_empty(), "the same digest changes nothing");
+
+        assert!(!slot.publish_digest_at(epoch + 1, digest.clone()));
+        assert!(!slot.publish_digest_at(epoch.wrapping_sub(1), digest));
+        assert!(
+            sink.drain().is_empty(),
+            "a digest from another epoch is dropped"
+        );
+    }
+
+    #[test]
+    fn an_interim_message_naming_our_question_leaves_its_correlation_open() {
+        let slot = MeshSlot::default();
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "n-1", Some("q-1")));
+
+        assert!(slot.correlations().is_open("q-1"));
+        assert!(slot.correlations().take_answer("q-1").is_none());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["n-1"]);
+        assert_eq!(slot.take_model_notes()[0].event, "peer_message");
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        assert!(!slot.correlations().is_open("q-1"));
+        assert_eq!(
+            slot.correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.content),
+            Some("words of r-1".to_string())
+        );
+    }
+
+    #[test]
+    fn clearing_the_envoy_returns_messages_to_the_inbox_path() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.clear_envoy();
+
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-1"]);
+        assert_eq!(slot.take_model_notes()[0].event, "peer_ask");
+    }
+
+    #[test]
+    fn a_body_handed_to_the_envoy_once_is_filed_not_run_again_when_it_returns_by_store_and_forward()
+    {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let first = peer_message(PeerKind::Message, "m-1", None);
+        let mut repeat = first.clone();
+        repeat.via = PeerVia::StoreAndForward;
+
+        slot.deliver_peer(first.clone());
+        slot.record_envoy_exchange(&first, "answered");
+        slot.deliver_peer(repeat);
+
+        assert_eq!(envoy.job_ids(), ["m-1"]);
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let ids = peer_ids(&envelopes);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids.iter().filter(|id| **id == "m-1").count(), 2);
+        assert_eq!(peer_of(&envelopes[2]).via, PeerVia::StoreAndForward);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let pushed = idle.pushed.lock();
+        assert_eq!(
+            pushed.len(),
+            2,
+            "the exchange line and the repeat's summary line"
+        );
+        assert!(
+            pushed[0].text.plain().contains("envoy replied: answered"),
+            "{}",
+            pushed[0].text
+        );
+        assert_eq!(
+            pushed[1].text.plain(),
+            format!("{dest8} says: words of m-1")
+        );
+    }
+
+    #[test]
+    fn the_envoy_window_keys_on_the_sending_identity_and_the_id_together() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut other_identity = peer_message(PeerKind::Ask, "a-1", None);
+        other_identity.source_identity = hex_lower(&[0xdc; 16]);
+
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        slot.deliver_peer(other_identity);
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-2", None));
+
+        assert_eq!(envoy.job_ids(), ["a-1", "a-1", "a-2"]);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+    }
+
+    #[test]
+    fn a_body_the_envoy_refused_is_offered_to_it_afresh_when_it_returns() {
+        let slot = MeshSlot::default();
+        slot.set_envoy(RecordingEnvoy::new(false, false) as Arc<dyn EnvoySink>);
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        assert_eq!(peer_ids(&slot.peer_inbox().drain().0), ["a-1"]);
+
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut repeat = peer_message(PeerKind::Ask, "a-1", None);
+        repeat.via = PeerVia::StoreAndForward;
+        slot.deliver_peer(repeat);
+
+        assert_eq!(envoy.job_ids(), ["a-1"]);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+    }
+
+    #[test]
+    fn the_envoy_window_forgets_a_body_past_its_horizon() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        slot.deliver_peer_at(peer_message(PeerKind::Message, "m-1", None), t0);
+        slot.deliver_peer_at(
+            peer_message(PeerKind::Message, "m-1", None),
+            t0 + BODY_DEDUP_HORIZON - Duration::from_secs(1),
+        );
+        slot.deliver_peer_at(
+            peer_message(PeerKind::Message, "m-1", None),
+            t0 + BODY_DEDUP_HORIZON,
+        );
+
+        assert_eq!(envoy.job_ids(), ["m-1", "m-1"]);
+        assert_eq!(peer_ids(&slot.peer_inbox().drain().0), ["m-1"]);
+
+        let mut window = BodyDedup::default();
+        let key = ("cd".repeat(16), "m-1".to_string());
+        assert!(window.insert_at(key.clone(), t0));
+        assert!(!window.insert_at(
+            key.clone(),
+            t0 + BODY_DEDUP_HORIZON - Duration::from_secs(1)
+        ));
+        assert!(window.insert_at(key.clone(), t0 + BODY_DEDUP_HORIZON));
+        assert!(
+            !window.insert_at(key, t0),
+            "a clock stepped back reads as just recorded"
+        );
+    }
+
+    /// An inline file is staged and so claims nothing; only a reference the sender left
+    /// for this node to fetch is remembered, on the envoy route and the inbox route alike.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admitted_messages_reference_attachments_are_remembered_for_the_sender() {
+        let started = started_runtime("node-reference-claims").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let file = |name: &str, reference: Option<&str>, staged: Option<&str>| Part::File {
+            name: name.to_string(),
+            size: 3,
+            sha256: "ab".repeat(32),
+            staged: staged.map(PathBuf::from),
+            reference: reference.map(str::to_string),
+        };
+        let mut to_inbox = peer_message(PeerKind::Bulletin, "b-1", None);
+        to_inbox.parts = vec![
+            file("a.pdf", Some("shared/a.pdf"), None),
+            file("b.pdf", None, Some("/inbox/b.pdf")),
+        ];
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut to_envoy = peer_message(PeerKind::Message, "m-1", None);
+        to_envoy.parts = vec![file("c.pdf", Some("shared/c.pdf"), None)];
+
+        slot.deliver_peer(to_inbox);
+        slot.deliver_peer(to_envoy);
+
+        assert_eq!(envoy.job_ids(), ["m-1"]);
+        let claims = runtime
+            .memory()
+            .claims_for_tests(&hex_lower(&PEER_INSTANCE))
+            .unwrap();
+        assert_eq!(
+            claims
+                .references()
+                .map(|claim| (claim.path.as_str(), claim.message_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("shared/a.pdf", "b-1"), ("shared/c.pdf", "m-1")]
+        );
+        assert!(claims.references().all(|claim| claim.staged.is_none()));
+
+        runtime.memory().forget_identity(&hex_lower(&PEER_IDENTITY));
+        assert!(
+            runtime
+                .memory()
+                .claims_for_tests(&hex_lower(&PEER_INSTANCE))
+                .is_none()
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The store-and-forward route files a message straight into the inbox, and its
+    /// references are remembered on that route too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_filed_messages_reference_attachments_are_remembered_for_the_sender() {
+        let started = started_runtime("node-filed-reference-claims").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let mut filed = peer_message(PeerKind::Message, "m-1", None);
+        filed.parts = vec![Part::File {
+            name: "a.pdf".to_string(),
+            size: 3,
+            sha256: "ab".repeat(32),
+            staged: None,
+            reference: Some("shared/a.pdf".to_string()),
+        }];
+
+        PeerSurface::file_peer(slot.as_ref(), filed);
+
+        assert_eq!(peer_ids(&slot.peer_inbox().drain().0), ["m-1"]);
+        let claims = runtime
+            .memory()
+            .claims_for_tests(&hex_lower(&PEER_INSTANCE))
+            .unwrap();
+        assert_eq!(
+            claims
+                .references()
+                .map(|claim| (claim.path.as_str(), claim.message_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("shared/a.pdf", "m-1")]
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn the_envoy_window_forgets_the_oldest_body_past_its_capacity() {
+        let mut window = BodyDedup::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let key = |n: usize| ("cd".repeat(16), format!("m-{n}"));
+
+        for n in 0..BODY_DEDUP_CAPACITY {
+            assert!(window.insert_at(key(n), t0 + Duration::from_secs(n as u64)));
+        }
+        assert!(!window.insert_at(key(0), t0 + Duration::from_secs(5_000)));
+        assert!(window.insert_at(key(BODY_DEDUP_CAPACITY), t0 + Duration::from_secs(5_000)));
+
+        assert_eq!(window.at.len(), BODY_DEDUP_CAPACITY);
+        assert_eq!(window.by_age.len(), BODY_DEDUP_CAPACITY);
+        assert!(
+            window.insert_at(key(0), t0 + Duration::from_secs(5_001)),
+            "the oldest pair is forgotten and admitted as fresh"
+        );
+        assert!(
+            !window.insert_at(key(2), t0 + Duration::from_secs(5_001)),
+            "a pair inside the capacity is still remembered"
+        );
+    }
+
+    /// The window lives in the slot alone: `BodyDedup` derives nothing that could write
+    /// it to disk, and nothing but the delivery path reads or records through it.
+    #[test]
+    fn the_envoy_window_is_held_in_memory_alone_and_touched_only_on_delivery() {
+        let source = include_str!("node.rs");
+        let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        let production = &source[..source.find(&test_module).expect("the test module opens")];
+
+        let declared = production
+            .find("struct BodyDedup {")
+            .expect("the window is declared");
+        let block_start = production[..declared]
+            .rfind("\n\n")
+            .expect("a blank line precedes the declaration");
+        let block_end = declared
+            + production[declared..]
+                .find("\n}\n")
+                .expect("the declaration closes");
+        let block = &production[block_start..block_end];
+        assert!(
+            block.contains("#[derive("),
+            "the derives sit in the scanned block"
+        );
+        assert!(
+            !block.contains("Serialize") && !block.contains("Deserialize"),
+            "the window is never written to disk:\n{block}"
+        );
+
+        let delivery_start = production
+            .find("fn deliver_peer_at(")
+            .expect("the delivery path is declared");
+        let delivery_end = delivery_start
+            + ["\n    pub(crate) fn ", "\n    fn "]
+                .iter()
+                .filter_map(|opener| production[delivery_start..].find(opener))
+                .min()
+                .expect("another method follows the delivery path");
+        let field = "    envoy_bodies: parking_lot::Mutex<BodyDedup>,";
+        let rustdoc = "/// `envoy_bodies` is the window";
+        let (mut field_lines, mut rustdoc_lines, mut delivery_lines) = (0, 0, 0);
+        let mut strays = Vec::new();
+        let mut offset = 0;
+        for (index, line) in production.lines().enumerate() {
+            let at = offset;
+            offset += line.len() + 1;
+            if !line.contains("envoy_bodies") {
+                continue;
+            }
+            if line == field {
+                field_lines += 1;
+            } else if line.starts_with(rustdoc) {
+                rustdoc_lines += 1;
+            } else if (delivery_start..delivery_end).contains(&at) {
+                delivery_lines += 1;
+            } else {
+                strays.push(format!("{}: {}", index + 1, line.trim()));
+            }
+        }
+        assert_eq!((field_lines, rustdoc_lines), (1, 1));
+        assert_eq!(
+            delivery_lines, 2,
+            "the delivery path records and forgets, nothing more"
+        );
+        assert!(
+            strays.is_empty(),
+            "envoy_bodies is touched outside deliver_peer_at:\n{}",
+            strays.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_refusing_envoy_leaves_the_inbox_path_as_it_was_plus_one_busy_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(false, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-1"]);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_ask");
+        assert_eq!(notes[0].next_action, "mesh__check_inbox");
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 2, "the summary line and one busy line");
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("{dest8} asks: words of a-1")
+        );
+        assert_eq!(
+            pushed[1].text.plain(),
+            format!(
+                "{id8}: the envoy queue is full, filed in the inbox; further envoy_busy refusals from this peer are folded for the hour"
+            )
+        );
+        for note in pushed.iter() {
+            assert_eq!(note.source, Source::Message);
+            assert_eq!(
+                note.origin,
+                Origin::Peer(hex_lower(&PEER_IDENTITY)[..8].to_string())
+            );
+            assert!(note.model_note.is_none());
+        }
+    }
+
+    /// Five refusals of one reason from one identity in an hour earn one REPL line; the
+    /// originals all reach the inbox, and the peer's reply is not attempted with no
+    /// runtime to send it (this test runs with no tokio runtime at all).
+    #[test]
+    fn repeated_envoy_refusals_from_one_peer_fold_to_one_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::refusing(RefusalReason::PeerConcurrency);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        for n in 0..5 {
+            slot.deliver_peer(peer_message(PeerKind::Ask, &format!("a-{n}"), None));
+        }
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-0", "a-1", "a-2", "a-3", "a-4"]);
+        let pushed = idle.pushed.lock();
+        let folded: Vec<String> = pushed
+            .iter()
+            .map(|note| note.text.plain())
+            .filter(|text| text.contains("already has a message with the envoy"))
+            .collect();
+        assert_eq!(folded.len(), 1, "{pushed:?}");
+        assert_eq!(
+            pushed.len(),
+            6,
+            "five summary lines and one folded refusal line: {pushed:?}"
+        );
+    }
+
+    /// An envoy refusal of a stored message owes the peer one typed reply per identity,
+    /// per reason, per hour, like a refused admission; over a link the peer is waiting,
+    /// so every refusal is answered. Both originals are filed either way. With the mesh
+    /// off the reply has nowhere to go, and the warning that says so is the one
+    /// observable attempt.
+    #[test]
+    fn a_store_and_forward_envoy_refusal_is_answered_once_per_identity_per_reason_per_hour() {
+        install_log_collector();
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::refusing(RefusalReason::EnvoyBusy);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        for id in ["stored-envoy-0", "stored-envoy-1"] {
+            let mut message = peer_message(PeerKind::Message, id, None);
+            message.via = PeerVia::StoreAndForward;
+            slot.deliver_peer(message);
+        }
+        for id in ["linked-envoy-0", "linked-envoy-1"] {
+            slot.deliver_peer(peer_message(PeerKind::Message, id, None));
+        }
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(
+            peer_ids(&envelopes),
+            [
+                "stored-envoy-0",
+                "stored-envoy-1",
+                "linked-envoy-0",
+                "linked-envoy-1"
+            ]
+        );
+        let warned = warn_snapshot();
+        let attempts: Vec<&String> = warned
+            .iter()
+            .filter(|line| line.starts_with("Mesh refusal of "))
+            .filter(|line| line.contains("-envoy-"))
+            .collect();
+        let dest8 = short(&hex_lower(&PEER_INSTANCE)).to_string();
+        assert_eq!(
+            attempts,
+            [
+                &format!(
+                    "Mesh refusal of stored-envoy-0 to instance {dest8} could not be sent: mesh is off"
+                ),
+                &format!(
+                    "Mesh refusal of linked-envoy-0 to instance {dest8} could not be sent: mesh is off"
+                ),
+                &format!(
+                    "Mesh refusal of linked-envoy-1 to instance {dest8} could not be sent: mesh is off"
+                ),
+            ],
+            "{warned:#?}"
+        );
+    }
+
+    #[test]
+    fn fold_lines_report_rolled_counts_then_the_first_refusal_of_the_hour() {
+        let fold_lines = |who, reason, path, notice: &FoldNotice| -> Vec<String> {
+            super::fold_lines(who, reason, path, notice)
+                .iter()
+                .map(NoticeText::plain)
+                .collect()
+        };
+        let surfaced = FoldNotice {
+            surface: true,
+            reports: vec![
+                (RefusalReason::RateLimited, 39),
+                (RefusalReason::TokenCeiling, 1),
+            ],
+        };
+        assert_eq!(
+            fold_lines(
+                "alice",
+                RefusalReason::PeerConcurrency,
+                RefusalPath::Filed(PeerVia::Direct),
+                &surfaced
+            ),
+            [
+                "39 more rate_limited refusals from alice were folded in the last hour",
+                "1 more token_ceiling refusal from alice was folded in the last hour",
+                "alice: already has a message with the envoy, filed in the inbox; further peer_concurrency refusals from this peer are folded for the hour",
+            ]
+        );
+        assert!(
+            fold_lines(
+                "alice",
+                RefusalReason::RateLimited,
+                RefusalPath::Link,
+                &FoldNotice::default()
+            )
+            .is_empty()
+        );
+        let first = FoldNotice {
+            surface: true,
+            reports: Vec::new(),
+        };
+        for path in [
+            RefusalPath::Link,
+            RefusalPath::Filed(PeerVia::Direct),
+            RefusalPath::Filed(PeerVia::StoreAndForward),
+        ] {
+            for reason in RefusalReason::ALL {
+                let lines = fold_lines("cdcdcdcd", reason, path, &first);
+                assert_eq!(lines.len(), 1);
+                assert!(lines[0].starts_with("cdcdcdcd: "), "{}", lines[0]);
+                let became = match (reason, path) {
+                    (_, RefusalPath::Link) => "refused on its link",
+                    (RefusalReason::RateLimited, RefusalPath::Filed(PeerVia::StoreAndForward)) => {
+                        "arrived store-and-forward, the peer is told once an hour"
+                    }
+                    (_, RefusalPath::Filed(_)) => "filed in the inbox",
+                };
+                assert!(lines[0].contains(became), "{}", lines[0]);
+                assert!(
+                    lines[0].contains(&format!("further {} refusals", reason.as_str())),
+                    "{}",
+                    lines[0]
+                );
+                assert!(lines[0].is_ascii(), "{}", lines[0]);
+            }
+        }
+        assert_eq!(
+            fold_lines(
+                "alice",
+                RefusalReason::RateLimited,
+                RefusalPath::Link,
+                &first
+            ),
+            [
+                "alice: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+            ]
+        );
+        assert_eq!(
+            fold_lines(
+                "alice",
+                RefusalReason::RateLimited,
+                RefusalPath::Filed(PeerVia::StoreAndForward),
+                &first
+            ),
+            [
+                "alice: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+            ]
+        );
+        assert_eq!(
+            fold_lines(
+                "alice",
+                RefusalReason::PeerConcurrency,
+                RefusalPath::Link,
+                &first
+            ),
+            [
+                "alice: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this peer are folded for the hour"
+            ]
+        );
+    }
+
+    /// Both ways a peer message arrives, off a link through the `/message` provider and
+    /// off a propagation node through `PeerRouting`, end in the same `deliver_peer`, so
+    /// the envoy sees both.
+    #[tokio::test]
+    async fn both_inbound_entry_points_route_to_the_envoy() {
+        let slot = Arc::new(MeshSlot::default());
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let identity_hex = identity.address_hash().to_hex_string();
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+
+        let handler = PeerMessageHandler::new(Arc::downgrade(&slot) as Weak<dyn PeerSurface>);
+        let direct = OutboundPeer::new(PeerKind::Ask, "over the link", None, None, None).unwrap();
+        let reply = handler
+            .handle(AdmittedRequest {
+                link_id: LinkId::new_from_rand(OsRng),
+                identity: *identity.as_identity(),
+                destination_hash: AddressHash::new_from_hex_string(&destination).unwrap(),
+                request_id: RequestId::from([1u8; 16]),
+                path_hash: PathHash::of(MESSAGE_PATH),
+                body: to_request_body(&direct, 1_700_000_000.0),
+            })
+            .await;
+        match reply {
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &direct.id), "{value}")
+            }
+            Reply::Code(code) => panic!("refused: {code:?}"),
+            Reply::Silent => panic!("the message was not acknowledged"),
+        }
+
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&destination, &identity_hex)
+            .open("node-envoy-routing");
+        let stored =
+            OutboundPeer::new(PeerKind::Message, "from the node", None, None, None).unwrap();
+        let lxmf = peer_lxmf_message(&stored, &origin);
+        let inner = NullSink;
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        routing.deliver(InboundMessage {
+            transient_id: [1u8; 32],
+            message_id: [2u8; 32],
+            source_identity_hash: identity_hex.clone(),
+            source_delivery_hash: hex_lower(&[0x03; 16]),
+            timestamp: 1_700_000_000.0,
+            title: None,
+            content: Some(lxmf.content),
+            fields: lxmf.fields,
+            stamp_value: None,
+        });
+
+        assert_eq!(envoy.job_ids(), [direct.id.as_str(), stored.id.as_str()]);
+        let jobs = envoy.jobs.lock();
+        assert_eq!(jobs[0].kind, PeerKind::Ask);
+        assert_eq!(jobs[0].via, PeerVia::Direct);
+        assert_eq!(jobs[0].source_destination, destination);
+        assert_eq!(jobs[1].kind, PeerKind::Message);
+        assert_eq!(jobs[1].via, PeerVia::StoreAndForward);
+        assert_eq!(jobs[1].source_destination, destination);
+        drop(jobs);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+        assert!(slot.take_model_notes().is_empty());
+    }
+
+    struct NullSink;
+
+    impl InboundSink for NullSink {
+        fn deliver(&self, message: InboundMessage) {
+            panic!("a peer message must not fall through to the plain inbox: {message:?}");
+        }
+    }
+
+    /// An admitted `/message` request from `identity` at the instance `destination`.
+    fn admitted_request(
+        identity: &TransportIdentity,
+        destination: &str,
+        message: &OutboundPeer,
+    ) -> AdmittedRequest {
+        AdmittedRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: *identity.as_identity(),
+            destination_hash: AddressHash::new_from_hex_string(destination).unwrap(),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(MESSAGE_PATH),
+            body: to_request_body(message, 1_700_000_000.0),
+        }
+    }
+
+    /// A third message in an hour from one identity is refused on its link with
+    /// `Throttled` before the envoy sees it, while another identity's first message is
+    /// acknowledged; the refusal earns one REPL line, folded thereafter.
+    #[tokio::test]
+    async fn the_message_provider_throttles_the_third_message_in_an_hour_per_identity() {
+        let slot = Arc::new(MeshSlot::default());
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 2,
+            concurrency: 64,
+            ..PeerLimitConfig::default()
+        });
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let a = TransportIdentity::new_from_rand(OsRng);
+        let a_destination = destination_address(&origin.0, a.address_hash()).to_hex_string();
+        let b = TransportIdentity::new_from_rand(OsRng);
+        let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
+        let handler = PeerMessageHandler::new(Arc::downgrade(&slot) as Weak<dyn PeerSurface>);
+
+        let mut acked = Vec::new();
+        let mut throttled = 0;
+        for n in 0..4 {
+            let out =
+                OutboundPeer::new(PeerKind::Ask, &format!("a {n}"), None, None, None).unwrap();
+            match handler
+                .handle(admitted_request(&a, &a_destination, &out))
+                .await
+            {
+                Reply::Value(value) | Reply::Settled { value, .. } => {
+                    assert!(is_received_reply(&value, &out.id), "{value}");
+                    acked.push(out.id.clone());
+                }
+                Reply::Code(code) => {
+                    assert_eq!(code, RefusalCode::Throttled);
+                    throttled += 1;
+                }
+                Reply::Silent => panic!("message {n} was neither acknowledged nor refused"),
+            }
+        }
+        assert_eq!(acked.len(), 2);
+        assert_eq!(throttled, 2);
+        assert_eq!(
+            envoy.job_ids(),
+            acked,
+            "the refused messages never reach the envoy"
+        );
+
+        let from_b = OutboundPeer::new(PeerKind::Ask, "b 0", None, None, None).unwrap();
+        assert!(matches!(
+            handler
+                .handle(admitted_request(&b, &b_destination, &from_b))
+                .await,
+            Reply::Value(_)
+        ));
+        assert_eq!(envoy.job_ids().len(), 3);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+        let a8 = &a.address_hash().to_hex_string()[..8];
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!(
+                "{a8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+            )
+        );
+        assert_eq!(pushed[0].origin, Origin::Peer(a8.to_string()));
+    }
+
+    /// The same limit on the store-and-forward path: the third propagated message in an
+    /// hour is filed in the inbox and the envoy never sees it; the one typed reply the
+    /// sender is owed has nowhere to go with the mesh off.
+    #[test]
+    fn peer_routing_files_the_third_message_in_an_hour_per_identity() {
+        let slot = Arc::new(MeshSlot::default());
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 2,
+            concurrency: 64,
+            ..PeerLimitConfig::default()
+        });
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let a = TransportIdentity::new_from_rand(OsRng);
+        let a_hex = a.address_hash().to_hex_string();
+        let a_destination = destination_address(&origin.0, a.address_hash()).to_hex_string();
+        let b = TransportIdentity::new_from_rand(OsRng);
+        let b_hex = b.address_hash().to_hex_string();
+        let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&a_destination, &a_hex)
+            .destination(&b_destination, &b_hex)
+            .open("node-routing-throttle");
+        let inner = NullSink;
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let propagated = |from: &str, content: &str| {
+            let out = OutboundPeer::new(PeerKind::Message, content, None, None, None).unwrap();
+            let lxmf = peer_lxmf_message(&out, &origin);
+            (
+                out.id,
+                InboundMessage {
+                    transient_id: [1u8; 32],
+                    message_id: [2u8; 32],
+                    source_identity_hash: from.to_string(),
+                    source_delivery_hash: hex_lower(&[0x03; 16]),
+                    timestamp: 1_700_000_000.0,
+                    title: None,
+                    content: Some(lxmf.content),
+                    fields: lxmf.fields,
+                    stamp_value: None,
+                },
+            )
+        };
+
+        let mut sent = Vec::new();
+        for n in 0..3 {
+            let (id, message) = propagated(&a_hex, &format!("a {n}"));
+            routing.deliver(message);
+            sent.push(id);
+        }
+        assert_eq!(
+            envoy.job_ids(),
+            sent[..2],
+            "the third never reaches the envoy"
+        );
+        let (id, message) = propagated(&b_hex, "b 0");
+        routing.deliver(message);
+        assert_eq!(envoy.job_ids().len(), 3);
+        assert_eq!(envoy.job_ids()[2], id);
+        let (filed, dropped) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&filed), [sent[2].as_str()]);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            idle.pushed
+                .lock()
+                .iter()
+                .filter(|note| note.text.plain().contains("over the hourly message limit"))
+                .count(),
+            1
+        );
+    }
+
+    /// The fetch path's chain, mirroring the chain `fetch_propagated` builds: knocks peel
+    /// off first, then access requests, then peer messages, and whatever is none of those
+    /// reaches the plain inbox sink.
+    #[test]
+    fn the_lxmf_routing_chain_hands_each_type_to_its_own_stage_and_the_rest_to_the_inbox() {
+        let tmp = TempDir::new("node-routing-chain");
+        let slot = Arc::new(slot_with_inbound(&tmp));
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let knock_origin = OriginName([8u8; NAME_HASH_LEN]);
+        let peer = TransportIdentity::new_from_rand(OsRng);
+        let peer_hex = peer.address_hash().to_hex_string();
+        let peer_destination = destination_address(&origin.0, peer.address_hash()).to_hex_string();
+        let knocker = TransportIdentity::new_from_rand(OsRng);
+        let knocker_hex = knocker.address_hash().to_hex_string();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&peer_destination, &peer_hex)
+            .identity(&knocker_hex, false)
+            .open("node-routing-chain-trust");
+        let peers =
+            Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
+        let gate = KnockGate::new(
+            trust.clone(),
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        );
+        let inbox = CountingSink::default();
+        let peer_stage = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inbox,
+        };
+        let access_stage = AccessRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn AccessSurface>),
+            inner: &peer_stage,
+        };
+        let chain = KnockRouting {
+            gate: &gate,
+            inner: &access_stage,
+        };
+        let fetched = |message: &OutboundMessage, from: &str| InboundMessage {
+            transient_id: [1u8; 32],
+            message_id: [2u8; 32],
+            source_identity_hash: from.to_string(),
+            source_delivery_hash: hex_lower(&[0x03; 16]),
+            timestamp: 1_700_000_000.0,
+            title: message.title.clone(),
+            content: Some(message.content.clone()),
+            fields: message.fields.clone(),
+            stamp_value: None,
+        };
+
+        let knock = knock_message(&KnockIntro::new("let me in").unwrap(), &knock_origin);
+        chain.deliver(fetched(&knock, &knocker_hex));
+        let request = validate_access("a-1", vec!["src/x.rs".to_string()], "please").unwrap();
+        chain.deliver(fetched(&access_message(&request, &origin), &peer_hex));
+        let stored =
+            OutboundPeer::new(PeerKind::Message, "from the node", None, None, None).unwrap();
+        chain.deliver(fetched(&peer_lxmf_message(&stored, &origin), &peer_hex));
+        let plain = OutboundMessage {
+            title: None,
+            content: b"plain lxmf".to_vec(),
+            fields: None,
+        };
+        chain.deliver(fetched(&plain, &peer_hex));
+
+        let knocks = gate.cache().list(SystemTime::now()).unwrap();
+        assert_eq!(knocks.len(), 1, "the gate saw the knock and nothing else");
+        assert_eq!(knocks[0].identity_hash, knocker_hex);
+        assert_eq!(knocks[0].intro.as_deref(), Some("let me in"));
+
+        let filed = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert_eq!(
+            filed.len(),
+            1,
+            "the access surface saw the request and nothing else"
+        );
+        assert_eq!(filed[0].id, "a-1");
+        assert_eq!(filed[0].kind, InboundKind::Access);
+        assert_eq!(filed[0].peer_identity, peer_hex);
+        assert_eq!(filed[0].peer_destination, peer_destination);
+
+        let (delivered, dropped) = slot.peer_inbox().drain();
+        assert_eq!(
+            peer_ids(&delivered),
+            [stored.id.as_str()],
+            "the peer surface saw the message and nothing else"
+        );
+        assert_eq!(dropped, 0);
+
+        let plain_messages = inbox.0.lock();
+        assert_eq!(
+            plain_messages.len(),
+            1,
+            "only the plain message reaches the inbox sink"
+        );
+        assert_eq!(
+            plain_messages[0].content.as_deref(),
+            Some(b"plain lxmf".as_slice())
+        );
+        assert_eq!(plain_messages[0].source_identity_hash, peer_hex);
+    }
+
+    #[derive(Default)]
+    struct CountingSink(parking_lot::Mutex<Vec<InboundMessage>>);
+
+    impl InboundSink for CountingSink {
+        fn deliver(&self, message: InboundMessage) {
+            self.0.lock().push(message);
+        }
+    }
+
+    /// The store-and-forward path owes a refused sender one typed reply per identity,
+    /// per reason, per hour; the link path owes none, since its code is the refusal.
+    /// A refused reply is owed none either, since answering it would answer a reply,
+    /// and it does not spend the hour's reply: the refused ask after it is still
+    /// answered. With the mesh off the reply has nowhere to go, and the warning that
+    /// says so is the one observable attempt.
+    #[test]
+    fn a_store_and_forward_refusal_is_answered_once_per_identity_per_reason_per_hour() {
+        install_log_collector();
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        let (a, a_instance) = (hex_lower(&[0x1a; 16]), hex_lower(&[0x2a; 16]));
+        let (b, b_instance) = (hex_lower(&[0x1b; 16]), hex_lower(&[0x2b; 16]));
+        let (c, c_instance) = (hex_lower(&[0x1c; 16]), hex_lower(&[0x2c; 16]));
+        let admit = |identity: &str, instance: &str, id: &str, in_reply_to: bool, via: PeerVia| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: identity,
+                    source_destination: instance,
+                    message_id: id,
+                    kind: PeerKind::Message,
+                    in_reply_to: in_reply_to.then_some("a-question-nobody-here-asked"),
+                    thread: None,
+                    disposition: None,
+                    via,
+                },
+            )
+        };
+
+        assert!(
+            admit(
+                &a,
+                &a_instance,
+                "stored-a-0",
+                false,
+                PeerVia::StoreAndForward
+            )
+            .is_ok()
+        );
+        for id in ["stored-a-1", "stored-a-2", "stored-a-3"] {
+            assert_eq!(
+                admit(&a, &a_instance, id, false, PeerVia::StoreAndForward)
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::RateLimited
+            );
+        }
+        assert!(admit(&b, &b_instance, "link-b-0", false, PeerVia::Direct).is_ok());
+        for id in ["link-b-1", "link-b-2"] {
+            assert_eq!(
+                admit(&b, &b_instance, id, false, PeerVia::Direct)
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::RateLimited
+            );
+        }
+        assert!(
+            admit(
+                &c,
+                &c_instance,
+                "stored-c-0",
+                false,
+                PeerVia::StoreAndForward
+            )
+            .is_ok()
+        );
+        for (id, in_reply_to) in [("stored-c-1", true), ("stored-c-2", false)] {
+            assert_eq!(
+                admit(&c, &c_instance, id, in_reply_to, PeerVia::StoreAndForward)
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::RateLimited
+            );
+        }
+
+        let warned = warn_snapshot();
+        let attempts: Vec<&String> = warned
+            .iter()
+            .filter(|line| line.starts_with("Mesh refusal of "))
+            .filter(|line| line.contains("-a-") || line.contains("-b-") || line.contains("-c-"))
+            .collect();
+        assert_eq!(
+            attempts,
+            [
+                &format!(
+                    "Mesh refusal of stored-a-1 to instance {} could not be sent: mesh is off",
+                    short(&a_instance)
+                ),
+                &format!(
+                    "Mesh refusal of stored-c-2 to instance {} could not be sent: mesh is off",
+                    short(&c_instance)
+                ),
+            ],
+            "{warned:#?}"
+        );
+        let texts: Vec<String> = idle
+            .pushed
+            .lock()
+            .iter()
+            .map(|note| note.text.plain())
+            .filter(|text| text.contains("hourly message limit"))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                format!(
+                    "{}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    short(&a)
+                ),
+                format!(
+                    "{}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour",
+                    short(&b)
+                ),
+                format!(
+                    "{}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    short(&c)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reply_to_our_open_question_is_never_throttled() {
+        let slot = MeshSlot::default();
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        slot.correlations().open(pending("q-ours")).unwrap();
+        let identity = hex_lower(&PEER_IDENTITY);
+        let instance = hex_lower(&PEER_INSTANCE);
+        let admit_with = |identity: &str,
+                          kind: PeerKind,
+                          id: &str,
+                          in_reply_to: Option<&str>,
+                          disposition: Option<Disposition>| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: identity,
+                    source_destination: &instance,
+                    message_id: id,
+                    kind,
+                    in_reply_to,
+                    thread: None,
+                    disposition,
+                    via: PeerVia::Direct,
+                },
+            )
+        };
+        let admit_kind = |identity: &str, kind: PeerKind, id: &str, in_reply_to: Option<&str>| {
+            admit_with(identity, kind, id, in_reply_to, None)
+        };
+        let admit_as = |identity: &str, id: &str, in_reply_to: Option<&str>| {
+            let kind = if in_reply_to.is_some() {
+                PeerKind::Reply
+            } else {
+                PeerKind::Ask
+            };
+            admit_kind(identity, kind, id, in_reply_to)
+        };
+        let admit = |id: &str, in_reply_to: Option<&str>| admit_as(&identity, id, in_reply_to);
+
+        assert!(admit("ask-0", None).is_ok());
+        assert_eq!(
+            admit("ask-1", None).unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "the identity is past its limit"
+        );
+        assert_eq!(
+            admit_kind(&identity, PeerKind::Ask, "ask-2", Some("q-ours"))
+                .unwrap_err()
+                .reason,
+            RefusalReason::RateLimited,
+            "an ask naming our open question is not a reply to it and is counted like any message"
+        );
+        assert!(
+            slot.correlations()
+                .accepts_reply_from("q-ours", &identity, Disposition::Answered),
+            "the refused ask leaves the question open"
+        );
+        assert!(
+            admit("reply-1", Some("q-ours")).is_ok(),
+            "a reply to a question we asked is admitted regardless"
+        );
+        assert_eq!(
+            admit("reply-2", Some("q-not-ours")).unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "a reply to a question we never asked is counted like any message"
+        );
+        let other = hex_lower(&[0x77; 16]);
+        assert!(admit_as(&other, "other-0", Some("q-ours")).is_ok());
+        assert_eq!(
+            admit_as(&other, "other-1", Some("q-ours"))
+                .unwrap_err()
+                .reason,
+            RefusalReason::RateLimited,
+            "citing our open question from another identity spends that identity's own count"
+        );
+        let escalated = |id: &str| {
+            admit_with(
+                &identity,
+                PeerKind::Reply,
+                id,
+                Some("q-ours"),
+                Some(Disposition::Escalated),
+            )
+        };
+        assert!(escalated("esc-1").is_ok());
+        let mut escalation = peer_message(PeerKind::Reply, "esc-1", Some("q-ours"));
+        escalation.disposition = Some(Disposition::Escalated);
+        assert!(
+            slot.correlations().answer("q-ours", escalation),
+            "the asked identity's escalation is the one it earns"
+        );
+        assert_eq!(
+            escalated("esc-2").unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "a second escalation of an escalated question is counted like any message"
+        );
+        assert!(
+            admit("reply-1", Some("q-ours")).is_ok(),
+            "the answer to an escalated question is still admitted"
+        );
+        assert!(
+            slot.correlations().answer(
+                "q-ours",
+                peer_message(PeerKind::Reply, "reply-1", Some("q-ours"))
+            ),
+            "the asked identity's reply closes the question"
+        );
+        assert_eq!(
+            admit("reply-3", Some("q-ours")).unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "once the question is answered a further reply citing it is counted like any message"
+        );
+    }
+
+    /// The early return for a reply to our own open question comes first, ahead of every
+    /// link gate. With an envoy attached, the identity's hourly count spent and one of its
+    /// runs in flight, its correlated reply is still admitted and not counted; its
+    /// question is refused for the run in flight (the pre-ack gate runs before the hourly
+    /// count) and its bulletin for the hourly count alone. Nothing is counted by any
+    /// refusal.
+    #[test]
+    fn a_reply_to_our_open_question_passes_every_link_gate_uncounted() {
+        let slot = MeshSlot::default();
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.correlations().open(pending("q-ours")).unwrap();
+        let identity = hex_lower(&PEER_IDENTITY);
+        let instance = hex_lower(&PEER_INSTANCE);
+        let admit = |kind: PeerKind, id: &str, in_reply_to: Option<&str>| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: &identity,
+                    source_destination: &instance,
+                    message_id: id,
+                    kind,
+                    in_reply_to,
+                    thread: None,
+                    disposition: None,
+                    via: PeerVia::Direct,
+                },
+            )
+        };
+        let messages = || {
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .messages
+        };
+
+        assert!(admit(PeerKind::Ask, "ask-0", None).is_ok());
+        assert_eq!(messages(), 1, "the hour is spent");
+        let _held = slot
+            .limits()
+            .try_reserve(&identity, Instant::now())
+            .unwrap();
+
+        assert!(
+            admit(PeerKind::Reply, "reply-1", Some("q-ours")).is_ok(),
+            "a reply to our open question passes before any gate"
+        );
+        assert_eq!(messages(), 1, "and is not counted");
+        assert_eq!(
+            admit(PeerKind::Ask, "ask-1", None).unwrap_err().reason,
+            RefusalReason::PeerConcurrency,
+            "an envoy-bound question meets the run in flight before the hourly count"
+        );
+        assert_eq!(
+            admit(PeerKind::Message, "msg-1", None).unwrap_err().reason,
+            RefusalReason::PeerConcurrency
+        );
+        assert_eq!(
+            admit(PeerKind::Bulletin, "bulletin-1", None)
+                .unwrap_err()
+                .reason,
+            RefusalReason::RateLimited,
+            "a bulletin sees the hourly count alone"
+        );
+        assert_eq!(
+            admit(
+                PeerKind::Message,
+                "notice-1",
+                Some("a-question-of-ours-to-them")
+            )
+            .unwrap_err()
+            .reason,
+            RefusalReason::RateLimited,
+            "an interim notice sees the hourly count alone"
+        );
+        assert_eq!(messages(), 1, "no refusal counts");
+        assert!(
+            envoy.job_ids().is_empty(),
+            "admission offers nothing to the envoy"
+        );
+    }
+
+    /// The link gate counts the sender's own runs against `peer_max_concurrent`:
+    /// under a concurrency of two an identity with one run in flight is
+    /// still admitted, with two it is refused before the ack; a second identity's
+    /// question is admitted while the first sits at its cap; a message the envoy would
+    /// not run (a bulletin) passes the gate at the cap. No refusal counts, and the gate
+    /// itself reserves nothing.
+    #[test]
+    fn the_link_gate_admits_up_to_the_configured_concurrency_per_identity() {
+        let slot = MeshSlot::default();
+        slot.limits().configure(PeerLimitConfig {
+            concurrency: 2,
+            ..PeerLimitConfig::default()
+        });
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let x = hex_lower(&PEER_IDENTITY);
+        let z = hex_lower(&[0x5a; 16]);
+        let instance = hex_lower(&PEER_INSTANCE);
+        let admit = |identity: &str, kind: PeerKind, id: &str| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: identity,
+                    source_destination: &instance,
+                    message_id: id,
+                    kind,
+                    in_reply_to: None,
+                    thread: None,
+                    disposition: None,
+                    via: PeerVia::Direct,
+                },
+            )
+        };
+        let window = |identity: &str| slot.limits().window_of(identity, Instant::now()).unwrap();
+
+        let first = slot.limits().try_reserve(&x, Instant::now()).unwrap();
+        assert!(
+            admit(&x, PeerKind::Ask, "x-ask-1").is_ok(),
+            "one run in flight under a concurrency of two is admitted"
+        );
+        assert_eq!(window(&x).messages, 1);
+        assert_eq!(
+            window(&x).in_flight,
+            1,
+            "admission reserves nothing; the envoy's accept takes the slot"
+        );
+
+        let second = slot.limits().try_reserve(&x, Instant::now()).unwrap();
+        let refused = admit(&x, PeerKind::Ask, "x-ask-2").unwrap_err();
+        assert_eq!(refused.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(refused.retry_after, PEER_RETRY_AFTER_CAPACITY);
+        assert_eq!(
+            admit(&x, PeerKind::Message, "x-msg-2").unwrap_err().reason,
+            RefusalReason::PeerConcurrency
+        );
+        assert_eq!(window(&x).messages, 1, "a refusal is not counted");
+
+        assert!(
+            admit(&z, PeerKind::Ask, "z-ask-1").is_ok(),
+            "another identity's question is admitted while x sits at its cap"
+        );
+        assert_eq!(window(&z).messages, 1);
+        assert_eq!(window(&z).in_flight, 0);
+        assert!(
+            admit(&x, PeerKind::Bulletin, "x-bulletin").is_ok(),
+            "a bulletin is not the envoy's and passes the gate at the cap"
+        );
+        assert_eq!(window(&x).messages, 2);
+
+        drop(second);
+        assert!(
+            admit(&x, PeerKind::Ask, "x-ask-3").is_ok(),
+            "one run ended: back under the cap"
+        );
+        drop(first);
+        assert_eq!(window(&x).in_flight, 0);
+        assert!(
+            envoy.job_ids().is_empty(),
+            "admission offers nothing to the envoy"
+        );
+    }
+
+    /// With one envoy-bound message and a run in flight, the gate answers the same
+    /// whether the body is a `message` or an `ask`, and never for a `reply` or a
+    /// `bulletin`: the envoy-bound predicate is one and the same for the gate and for
+    /// delivery, so nothing the gate waves through is later handed to the envoy.
+    #[test]
+    fn envoy_bound_is_one_predicate_for_the_gate_and_for_delivery() {
+        for (kind, in_reply_to, expected) in [
+            (PeerKind::Message, None, true),
+            (PeerKind::Ask, None, true),
+            (PeerKind::Message, Some("q-1"), false),
+            (PeerKind::Ask, Some("q-1"), false),
+            (PeerKind::Bulletin, None, false),
+            (PeerKind::Reply, None, false),
+            (PeerKind::Reply, Some("q-1"), false),
+        ] {
+            assert_eq!(
+                envoy_bound(kind, in_reply_to),
+                expected,
+                "{kind:?} in_reply_to={in_reply_to:?}"
+            );
+        }
+    }
+
+    /// `retry_after` is whole seconds, at least 1. A window ceiling whose
+    /// remainder is under a second still says 1; a whole-second remainder is reported as
+    /// it is, never rounded past itself.
+    #[test]
+    fn a_sub_second_window_remainder_is_told_as_one_second() {
+        for reason in [
+            RefusalReason::RateLimited,
+            RefusalReason::TokenCeiling,
+            RefusalReason::CostCeiling,
+        ] {
+            let name = reason.as_str();
+            for (left, expected) in [
+                (Duration::from_millis(1), 1),
+                (Duration::from_millis(300), 1),
+                (Duration::from_millis(999), 1),
+                (Duration::from_secs(1), 1),
+                (Duration::from_millis(1_001), 2),
+                (Duration::from_secs(3_600), 3_600),
+            ] {
+                let refusal = PeerRefusal {
+                    reason,
+                    retry_after: left,
+                };
+                let reply = refusal_reply("m-1", None, &refusal).unwrap();
+                assert_eq!(
+                    reply.disposition,
+                    Some(Disposition::BudgetExhausted),
+                    "{name}"
+                );
+                assert_eq!(reply.retry_after, Some(expected), "{name} {left:?}");
+                let fields = reply.fields.as_ref().unwrap();
+                assert_eq!(fields["refusal"], name);
+                assert_eq!(
+                    fields["retry_after_secs"].as_u64(),
+                    Some(u64::from(expected)),
+                    "{name} {left:?}: the advisory key agrees with the top-level hint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn record_envoy_exchange_files_both_sides_with_one_note_and_one_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, "  the envoy's\u{1b}[2J answer ");
+
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(peer_payload(&envelopes[0]), &original);
+        let reply = peer_payload(&envelopes[1]);
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(reply.content, "the envoy's answer");
+        assert_eq!(reply.destination, original.source_destination);
+        assert_eq!(reply.via, PeerVia::Direct);
+        assert_eq!(reply.message_id.len(), 32, "a fresh simple-form uuid");
+        assert_ne!(reply.message_id, original.message_id);
+        assert!(reply.timestamp > 1_700_000_000.0);
+        assert_eq!(
+            (envelopes[1].from.as_str(), envelopes[1].to.as_str()),
+            ("", original.source_destination.as_str()),
+            "a bare slot has no destination of its own"
+        );
+
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        assert_eq!(
+            notes[0].id,
+            format!("peer:{}", &hex_lower(&PEER_INSTANCE)[..8])
+        );
+        assert_eq!(notes[0].next_action, "mesh__check_inbox");
+
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("{dest8} asked: words of a-1; envoy replied: the envoy's answer")
+        );
+        assert_eq!(pushed[0].source, Source::Message);
+        assert_eq!(
+            pushed[0].origin,
+            Origin::Peer(hex_lower(&PEER_IDENTITY)[..8].to_string())
+        );
+        assert!(pushed[0].model_note.is_none());
+    }
+
+    #[test]
+    fn record_envoy_exchange_caps_the_line_like_a_summary() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        // Eleven-character words: the half budget's last character falls inside the
+        // seventh word, so a cut on the budget alone and a cut on the last word
+        // boundary differ.
+        let words = |letter: char, count: usize| {
+            (0..count)
+                .map(|i| format!("{letter}{i:010}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut original = peer_message(PeerKind::Message, "m-1", None);
+        original.content = words('q', 30);
+        assert_eq!(original.content.chars().count(), 359);
+        let half = PEER_LINE_MAX_CHARS / 2;
+        assert_eq!(original.content.chars().nth(half), Some('0'));
+
+        slot.record_envoy_exchange(&original, &words('r', 30));
+
+        let pushed = idle.pushed.lock();
+        // Six words and their spaces are 71 characters; the seventh would run past the
+        // half budget, so each side keeps exactly those six and the pointer comes once.
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!(
+                "{} said: {}...; envoy replied: {}... (full text: .mesh inbox)",
+                &hex_lower(&PEER_INSTANCE)[..8],
+                words('q', 6),
+                words('r', 6)
+            )
+        );
+        assert_eq!(words('q', 6).chars().count(), 71);
+        assert!(words('q', 7).chars().count() > half);
+        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
+    }
+
+    #[test]
+    fn record_envoy_exchange_points_at_the_inbox_when_only_one_half_was_cut() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, &"r".repeat(300));
+
+        let pushed = idle.pushed.lock();
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!(
+                "{} asked: words of a-1; envoy replied: {}... (full text: .mesh inbox)",
+                &hex_lower(&PEER_INSTANCE)[..8],
+                "r".repeat(PEER_LINE_MAX_CHARS / 2)
+            )
+        );
+    }
+
+    /// With the mesh off a reply the bare slot mints has an empty `source_destination`,
+    /// and is this node's own all the same, since the slot filed it; the original it
+    /// answers is not, and neither is a message with an empty source that reached the
+    /// inbox without passing through a producer.
+    #[test]
+    fn is_from_self_marks_what_the_bare_slot_files_and_nothing_delivered_raw() {
+        let slot = MeshSlot::default();
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, "the envoy's answer");
+        let mut raw = peer_message(PeerKind::Message, "m-1", None);
+        raw.source_destination = String::new();
+        slot.peer_inbox().deliver(raw.clone());
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let reply = peer_payload(&envelopes[1]);
+        assert_eq!(reply.source_destination, "");
+        assert!(slot.is_from_self(reply), "{reply:?}");
+        assert!(!slot.is_from_self(&original), "{original:?}");
+        assert_eq!(peer_payload(&envelopes[2]), &raw);
+        assert!(!slot.is_from_self(&raw), "{raw:?}");
+    }
+
+    /// A peer that answers one of our replies could echo its id back under its own
+    /// source; the mark is on the pair, so that message is the peer's.
+    #[test]
+    fn is_from_self_rejects_a_peer_echoing_one_of_our_reply_ids() {
+        let slot = MeshSlot::default();
+        slot.record_envoy_exchange(&peer_message(PeerKind::Ask, "a-1", None), "answer");
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let reply = peer_payload(&envelopes[1]);
+        assert!(slot.is_from_self(reply), "{reply:?}");
+
+        let echo = peer_message(PeerKind::Reply, &reply.message_id, None);
+
+        assert_eq!(echo.message_id, reply.message_id);
+        assert!(!slot.is_from_self(&echo), "{echo:?}");
+    }
+
+    /// The mark set is bounded at `OWN_ENTRY_MARKS`, oldest forgotten first; by then the
+    /// marked entry has left the inbox, which holds fewer.
+    #[test]
+    fn is_from_self_forgets_the_oldest_marks_past_the_bound() {
+        let slot = MeshSlot::default();
+        let mut replies = Vec::new();
+        for n in 0..OWN_ENTRY_MARKS + 3 {
+            slot.record_envoy_exchange(&peer_message(PeerKind::Ask, &format!("a-{n}"), None), "x");
+            let (envelopes, _) = slot.peer_inbox().drain();
+            replies.push(peer_payload(&envelopes[1]).clone());
+        }
+
+        for reply in &replies[..3] {
+            assert!(!slot.is_from_self(reply), "{reply:?}");
+        }
+        for reply in &replies[3..] {
+            assert!(slot.is_from_self(reply), "{reply:?}");
+        }
+    }
+
+    /// Filed without a drain in between, the same count of exchanges overruns the mark
+    /// bound while the inbox keeps only its newest `PEER_INBOX_CAPACITY` envelopes, so
+    /// every reply still in the inbox is one whose mark survived: a forgotten mark
+    /// belongs to an entry the inbox has already pushed out.
+    #[test]
+    fn is_from_self_still_marks_every_own_entry_the_inbox_kept_past_the_bound() {
+        let slot = MeshSlot::default();
+        for n in 0..OWN_ENTRY_MARKS + 3 {
+            slot.record_envoy_exchange(&peer_message(PeerKind::Ask, &format!("a-{n}"), None), "x");
+        }
+
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+
+        assert_eq!(envelopes.len(), PEER_INBOX_CAPACITY);
+        assert_eq!(dropped, 2 * (OWN_ENTRY_MARKS + 3) - PEER_INBOX_CAPACITY);
+        for (at, envelope) in envelopes.iter().enumerate() {
+            let message = peer_payload(envelope);
+            if at % 2 == 1 {
+                assert_eq!(message.kind, PeerKind::Reply, "{message:?}");
+                assert!(slot.is_from_self(message), "{message:?}");
+            } else {
+                assert_eq!(message.kind, PeerKind::Ask, "{message:?}");
+                assert!(!slot.is_from_self(message), "{message:?}");
+            }
+        }
+    }
+
+    /// Both producers of this node's own inbox entries, the envoy's reply and the
+    /// human's `.mesh answer`, mint the reply from the running instance's destination,
+    /// and mark it as they file it; the original they answer stays a peer's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_from_self_marks_the_replies_both_producers_mint_on_a_started_slot() {
+        let started = started_runtime("node-from-self").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, "the envoy's answer");
+        slot.record_human_reply(
+            &inbound_record("a-2"),
+            "yes, merge it",
+            HumanReply::Answered,
+        );
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 3, "{envelopes:?}");
+        let filed_original = peer_payload(&envelopes[0]);
+        assert_eq!(filed_original, &original);
+        assert!(!slot.is_from_self(filed_original));
+        let own = runtime.current_destination_hash();
+        for (envelope, answered) in [(&envelopes[1], "a-1"), (&envelopes[2], "a-2")] {
+            let reply = peer_payload(envelope);
+            assert_eq!(reply.in_reply_to.as_deref(), Some(answered));
+            assert_eq!(reply.source_destination, own, "{reply:?}");
+            assert_eq!(reply.destination, hex_lower(&PEER_INSTANCE));
+            assert!(slot.is_from_self(reply), "{reply:?}");
+        }
+
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// `stop` takes the runtime but not the inbox, so what this node filed while it ran
+    /// must still read as its own once the mesh is off.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_from_self_survives_a_stop_for_entries_filed_while_running() {
+        let started = started_runtime("node-from-self-stopped").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+        slot.record_envoy_exchange(&original, "the envoy's answer");
+
+        assert!(slot.stop().await.unwrap());
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 2, "{envelopes:?}");
+        assert!(!slot.is_from_self(peer_payload(&envelopes[0])));
+        let reply = peer_payload(&envelopes[1]);
+        assert!(slot.is_from_self(reply), "{reply:?}");
+        started.relay_handle.abort();
+    }
+
+    /// A re-key moves the node to a fresh destination; replies minted under the old one
+    /// and under the new one are both this node's, while a message that arrives from the
+    /// old destination afterwards, as the resumed original would send it, is a peer's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_from_self_keeps_entries_filed_before_a_rekey() {
+        let started = started_runtime("node-from-self-rekey").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.record_envoy_exchange(&peer_message(PeerKind::Ask, "a-1", None), "before");
+        let old_hash = runtime.current_destination_hash();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(runtime.current_instance_id()),
+            fork_instance_id: fresh_instance_id(),
+        })
+        .await
+        .unwrap();
+        slot.record_envoy_exchange(&peer_message(PeerKind::Ask, "a-2", None), "after");
+
+        let new_hash = runtime.current_destination_hash();
+        assert_ne!(new_hash, old_hash);
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 4, "{envelopes:?}");
+        let before = peer_payload(&envelopes[1]);
+        let after = peer_payload(&envelopes[3]);
+        assert_eq!(before.source_destination, old_hash);
+        assert_eq!(after.source_destination, new_hash);
+        assert!(slot.is_from_self(before), "{before:?}");
+        assert!(slot.is_from_self(after), "{after:?}");
+        assert!(!slot.is_from_self(peer_payload(&envelopes[0])));
+
+        let resumed = PeerMessage::new(RawPeerMessage {
+            source_identity: hex_lower(&PEER_IDENTITY),
+            source_destination: old_hash.clone(),
+            destination: new_hash.clone(),
+            title: None,
+            content: "from the original, now a peer".to_string(),
+            fields: None,
+            timestamp: unix_now(),
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            in_reply_to: None,
+            kind: PeerKind::Message,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        });
+        slot.deliver_peer(resumed.clone());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        assert_eq!(peer_payload(&envelopes[0]).source_destination, old_hash);
+        assert!(!slot.is_from_self(&resumed), "{resumed:?}");
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn record_envoy_fallback_words_the_one_idle_line_with_the_reason() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.record_envoy_fallback(
+            peer_message(PeerKind::Message, "m-1", None),
+            "envoy timed out",
+        );
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["m-1"]);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        assert_eq!(notes[0].next_action, "mesh__check_inbox");
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("envoy timed out; {dest8} says: words of m-1 is in the inbox")
+        );
+    }
+
+    #[test]
+    fn record_envoy_fallback_names_the_inbox_once_when_the_words_were_cut() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let mut original = peer_message(PeerKind::Message, "m-1", None);
+        original.content = "q".repeat(300);
+
+        slot.record_envoy_fallback(original, "envoy timed out");
+
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!(
+                "envoy timed out; {dest8} says: {}... is in the inbox (full text: .mesh inbox)",
+                "q".repeat(PEER_LINE_MAX_CHARS)
+            )
+        );
+        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
+    }
+
+    #[test]
+    fn record_envoy_escalated_points_the_model_at_the_human_answer_not_the_inbox() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.record_envoy_escalated(peer_message(PeerKind::Ask, "a-1", None), "a-1");
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-1"]);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_ask");
+        assert!(
+            notes[0].next_action.contains(".mesh answer a-1"),
+            "{}",
+            notes[0].next_action
+        );
+        assert!(!notes[0].next_action.contains("check_inbox"));
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("envoy escalated to the human; {dest8} asks: words of a-1 is in the inbox")
+        );
+    }
+
+    #[test]
+    fn record_envoy_escalated_names_the_inbox_once_when_the_words_were_cut() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let mut original = peer_message(PeerKind::Ask, "a-1", None);
+        original.content = "q".repeat(300);
+
+        slot.record_envoy_escalated(original, "a-1");
+
+        let pushed = idle.pushed.lock();
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!(
+                "envoy escalated to the human; {dest8} asks: {}... is in the inbox (full text: .mesh inbox)",
+                "q".repeat(PEER_LINE_MAX_CHARS)
+            )
+        );
+        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
+    }
+
+    fn inbound_record(id: &str) -> InboundRecord {
+        InboundRecord {
+            version: INBOUND_RECORD_VERSION,
+            id: id.to_string(),
+            peer_destination: hex_lower(&PEER_INSTANCE),
+            peer_identity: hex_lower(&PEER_IDENTITY),
+            thread: id.to_string(),
+            question: format!("words of {id}"),
+            envoy_question: String::new(),
+            received_at: rfc3339_utc(SystemTime::now()),
+            kind: InboundKind::Question,
+            paths: Vec::new(),
+            reason: String::new(),
+            session_thread: String::new(),
+        }
+    }
+
+    /// A bare slot with an inbound store, as `install` would leave it.
+    fn slot_with_inbound(tmp: &TempDir) -> MeshSlot {
+        let slot = MeshSlot::default();
+        *slot.inbound.lock() = Some(Arc::new(InboundStore::new(&tmp.path, "inst")));
+        slot
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_refuses_an_unknown_id_and_a_slot_with_no_store() {
+        let bare = MeshSlot::default();
+        let err = bare.answer_inbound("a-1", "yes").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Mesh is off; turn it on with `.mesh on` before answering a-1"),
+            "{err}"
+        );
+
+        let tmp = TempDir::new("slot-answer-unknown");
+        let slot = slot_with_inbound(&tmp);
+        slot.inbound_store()
+            .unwrap()
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let err = slot.answer_inbound("a-2", "yes").await.unwrap_err();
+        assert_eq!(err.to_string(), already_closed("a-2").to_string());
+        assert!(slot.inbound_store().unwrap().get("a-1").unwrap().is_some());
+    }
+
+    mod answer_refusal_quoting_tests {
+        use super::*;
+        use crate::config::CommandPrefix;
+        use crate::render::{MeshVerbError, command_error_text};
+
+        /// The refusals an answer to a question a peer filed under the id `.vault` meets:
+        /// no store, an id that names an access request, a closed id, and a filed
+        /// question with no node to send the answer. Each comes with its dot sentence.
+        async fn refusals() -> Vec<(anyhow::Error, String)> {
+            let off = MeshSlot::default().answer_inbound(".vault", "yes").await;
+            let tmp = TempDir::new("slot-answer-quoting");
+            let slot = slot_with_inbound(&tmp);
+            let store = slot.inbound_store().unwrap();
+            store
+                .upsert(inbound_record(".vault"), SystemTime::now())
+                .unwrap();
+            store
+                .upsert(
+                    InboundRecord {
+                        kind: InboundKind::Access,
+                        paths: vec!["src/x.rs".into()],
+                        question: String::new(),
+                        ..inbound_record(".session")
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let peer = short(&hex_lower(&PEER_INSTANCE)).to_string();
+            vec![
+                (
+                    off.unwrap_err(),
+                    "Mesh is off; turn it on with `.mesh on` before answering .vault".to_string(),
+                ),
+                (
+                    slot.answer_inbound(".session", "yes").await.unwrap_err(),
+                    "`.session` is an access request, not a question; decide it with `.mesh grant .session` or `.mesh refuse .session`".to_string(),
+                ),
+                (
+                    slot.answer_inbound(".info", "yes").await.unwrap_err(),
+                    "`.info` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.".to_string(),
+                ),
+                (
+                    slot.answer_inbound(".vault", "yes").await.unwrap_err(),
+                    format!("Mesh is off, so the answer to .vault cannot be sent to {peer}"),
+                ),
+            ]
+        }
+
+        #[tokio::test]
+        async fn under_dot_each_answer_refusal_reads_as_it_did() {
+            for (err, dot) in refusals().await {
+                assert_eq!(err.to_string(), dot);
+                assert_eq!(
+                    command_error_text(&MeshVerbError::wrap(err), CommandPrefix::Dot),
+                    format!("Error: {dot}")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn under_slash_each_answer_refusal_keeps_the_id_and_slashes_its_hints() {
+            let peer = short(&hex_lower(&PEER_INSTANCE)).to_string();
+            let slashed = [
+                "Mesh is off; turn it on with `/mesh on` before answering .vault".to_string(),
+                "`.session` is an access request, not a question; decide it with `/mesh grant .session` or `/mesh refuse .session`".to_string(),
+                "`.info` was already closed by another process, so nothing more was done. /mesh pending shows what is still open.".to_string(),
+                format!("Mesh is off, so the answer to .vault cannot be sent to {peer}"),
+            ];
+            for ((err, _), slash) in refusals().await.into_iter().zip(slashed) {
+                assert_eq!(
+                    command_error_text(&MeshVerbError::wrap(err), CommandPrefix::Slash),
+                    format!("Error: {slash}")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_refuses_an_access_request_and_leaves_it_filed() {
+        let tmp = TempDir::new("slot-answer-access");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".into()],
+                    question: String::new(),
+                    ..inbound_record("acc-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        let err = slot.answer_inbound("acc-1", "yes").await.unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`"
+            ),
+            "{err}"
+        );
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "an access request is never handed to a run as an answer"
+        );
+        assert!(store.get("acc-1").unwrap().is_some());
+        assert!(slot.correlations().list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_hands_the_answer_to_a_live_run_and_leaves_the_question_filed() {
+        let tmp = TempDir::new("slot-answer-live");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        slot.answer_inbound("a-1", "yes, go ahead").await.unwrap();
+
+        assert_eq!(
+            *envoy.answers.lock(),
+            [("a-1".to_string(), "yes, go ahead".to_string())]
+        );
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "the run that took the answer forgets the question once it delivers"
+        );
+        assert!(
+            slot.correlations().list().is_empty(),
+            "a peer's question is never one of ours"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_with_file_is_refused_while_a_live_run_holds_the_question() {
+        let tmp = TempDir::new("slot-answer-file-held");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        *envoy.held.lock() = Some("a-1".to_string());
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let part = RawPart::File {
+            name: "docs/notes.md".to_string(),
+            size: 1,
+            sha256: [0; 32],
+            bytes: Some(b"x".to_vec()),
+            reference: None,
+        };
+
+        let err = slot
+            .answer_inbound_with_file("a-1", "see this", part.clone())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`a-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer a-1 --attach <path>."
+        );
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "the hold is only looked at, never offered the file"
+        );
+        assert!(store.get("a-1").unwrap().is_some());
+
+        envoy.held.lock().take();
+        let err = slot
+            .answer_inbound_with_file("a-1", "see this", part)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Mesh is off"),
+            "once the hold lapses the answer goes the no-run way: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_with_no_live_run_and_the_mesh_off_keeps_the_question() {
+        let tmp = TempDir::new("slot-answer-off");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        let err = slot.answer_inbound("a-1", "yes").await.unwrap_err();
+
+        assert!(err.to_string().contains("Mesh is off"), "{err}");
+        assert_eq!(
+            envoy.answers.lock().len(),
+            1,
+            "the live run was asked first"
+        );
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "an answer that went nowhere leaves the question open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_inbound_sends_the_reply_to_the_peer_when_no_run_holds_it() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-answer-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-answer-inbound", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: stub.identity_hex(),
+                    ..inbound_record("a-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        slot.answer_inbound("a-1", "the human says yes")
+            .await
+            .unwrap();
+
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].content, "the human says yes");
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("a-1"));
+        assert!(store.get("a-1").unwrap().is_none());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        let recorded = peer_payload(&envelopes[0]);
+        assert_eq!(recorded.kind, PeerKind::Reply);
+        assert_eq!(recorded.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(
+            recorded.source_destination,
+            runtime.current_destination_hash()
+        );
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].next_action.contains(".mesh answer"),
+            "{}",
+            notes[0].next_action
+        );
+        assert!(slot.stop().await.unwrap());
+        assert!(
+            slot.inbound_store().is_none(),
+            "stopping lets go of the store"
+        );
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismiss_inbound_sends_a_refused_reply_and_removes_the_record() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-dismiss-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-dismiss-inbound", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: stub.identity_hex(),
+                    thread: "t-root".to_string(),
+                    ..inbound_record("a-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        slot.dismiss_inbound("a-1", false).await.unwrap();
+
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+        assert_eq!(seen[0].retry_after, None);
+        assert_eq!(seen[0].content, HUMAN_DECLINED);
+        assert_eq!(seen[0].thread.as_deref(), Some("t-root"));
+        assert!(store.get("a-1").unwrap().is_none());
+        assert!(slot.correlations().list().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        let recorded = peer_payload(&envelopes[0]);
+        assert_eq!(recorded.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(recorded.content, HUMAN_DECLINED);
+        assert_eq!(
+            recorded.disposition,
+            Some(Disposition::Refused),
+            "the inbox copy is filed as the refusal it was"
+        );
+        assert!(
+            slot.is_from_self(recorded),
+            "the filed copy reads as this node's own, like an answer"
+        );
+        let dest8 = &to[..8];
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(
+            notes[0].next_action,
+            "the human declined via `.mesh dismiss`; nothing to do"
+        );
+        let idle_lines: Vec<String> = idle
+            .pushed
+            .lock()
+            .iter()
+            .map(|note| note.text.plain())
+            .collect();
+        assert_eq!(idle_lines, [format!("you declined {dest8}'s question")]);
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dismiss_inbound_silent_removes_without_a_wire_message() {
+        let tmp = TempDir::new("slot-dismiss-silent");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        store
+            .upsert(inbound_record("a-2"), SystemTime::now())
+            .unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        // No runtime is installed, so any send would have been refused as "Mesh is off".
+        slot.dismiss_inbound("a-1", true).await.unwrap();
+
+        assert!(store.get("a-1").unwrap().is_none());
+        assert!(
+            store.get("a-2").unwrap().is_some(),
+            "only the named one goes"
+        );
+        assert!(slot.peer_inbox().drain().0.is_empty(), "nothing is filed");
+        assert!(idle.pushed.lock().is_empty(), "nothing is announced");
+        assert!(slot.take_model_notes().is_empty());
+
+        let err = slot.dismiss_inbound("a-1", true).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<AlreadyClosed>().is_some(),
+            "a second dismissal finds the question gone: {err}"
+        );
+        assert_eq!(err.to_string(), already_closed("a-1").to_string());
+    }
+
+    #[tokio::test]
+    async fn dismiss_inbound_refuses_an_access_request_and_leaves_it_filed() {
+        let tmp = TempDir::new("slot-dismiss-access");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".into()],
+                    question: String::new(),
+                    ..inbound_record("acc-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        for silent in [false, true] {
+            let err = slot.dismiss_inbound("acc-1", silent).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`"
+            );
+        }
+        assert!(store.get("acc-1").unwrap().is_some());
+
+        let bare = MeshSlot::default();
+        let err = bare.dismiss_inbound("acc-1", false).await.unwrap_err();
+        assert!(err.to_string().contains("Mesh is off"), "{err}");
+    }
+
+    /// A run holding the question keeps it from being dismissed: its own reply would
+    /// follow the refusal once the hold lapsed.
+    #[tokio::test]
+    async fn dismiss_inbound_waits_for_a_live_run_to_let_go() {
+        let tmp = TempDir::new("slot-dismiss-held");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        *envoy.held.lock() = Some("a-1".to_string());
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        let err = slot.dismiss_inbound("a-1", true).await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`a-1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss a-1."
+        );
+        assert!(store.get("a-1").unwrap().is_some());
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "a dismissal is never handed to the run as an answer"
+        );
+    }
+
+    /// The peer is unheard, so the send is refused at the trust check before any
+    /// network; the question is put back and the error names the retry and the silent
+    /// form.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismiss_inbound_keeps_the_record_when_the_send_fails() {
+        let started = started_runtime("node-dismiss-send-fails").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let store = slot.inbound_store().unwrap();
+        let record = inbound_record("a-1");
+        store.upsert(record.clone(), SystemTime::now()).unwrap();
+
+        let err = slot.dismiss_inbound("a-1", false).await.unwrap_err();
+
+        let text = err.to_string();
+        let dest8 = &record.peer_destination[..8];
+        assert!(
+            text.starts_with(&format!("Could not tell {dest8} that you declined (")),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "); a-1 stays pending. Retry, or remove it without a message with .mesh dismiss a-1 --silent."
+            ),
+            "{text}"
+        );
+        assert!(text.contains(&record.peer_destination), "{text}");
+        assert_eq!(store.get("a-1").unwrap(), Some(record));
+        assert!(slot.peer_inbox().drain().0.is_empty(), "nothing is filed");
+        assert!(slot.take_model_notes().is_empty());
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A dismissal reports through the hooks exactly as an answer does: one
+    /// `mesh.message.sent` for the refused reply (kind `reply`, the id the peer
+    /// received), no event of its own, and nothing when the `--silent` form removes
+    /// the record without a send. A dismissal whose reply
+    /// cannot go out fires the same `mesh.message.failed` an answer would, naming the
+    /// peer and the class, never the refusal text.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismiss_fires_the_answer_paths_hooks_and_the_silent_form_fires_none() {
+        use crate::mesh::trust::TrustOptions;
+        let stub = PeerStub::listen("node-dismiss-hooks-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-dismiss-hooks", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let sink = RecordingHookSink::attach(runtime.hooks());
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let from_stub = |id: &str| InboundRecord {
+            peer_destination: to.clone(),
+            peer_identity: stub.identity_hex(),
+            ..inbound_record(id)
+        };
+        store.upsert(from_stub("told"), SystemTime::now()).unwrap();
+        store.upsert(from_stub("quiet"), SystemTime::now()).unwrap();
+        // A third question from a peer this node has never heard of: the reply has
+        // nowhere to go.
+        let stranger = inbound_record("stranded");
+        store.upsert(stranger.clone(), SystemTime::now()).unwrap();
+        sink.drain();
+
+        slot.dismiss_inbound("told", false).await.unwrap();
+
+        let fired = sink.drain();
+        let sent = fires_of(&fired, HookEvent::MeshMessageSent);
+        assert_eq!(sent.len(), 1, "{fired:?}");
+        assert!(
+            fires_of(&fired, HookEvent::MeshMessageFailed).is_empty(),
+            "{fired:?}"
+        );
+        assert_eq!(fired.len(), 1, "no event of its own: {fired:?}");
+        let envs = sent[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(to.as_str())
+        );
+        let on_the_wire = stub.seen();
+        assert_eq!(on_the_wire.len(), 1, "{on_the_wire:?}");
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_MESSAGE_ID"),
+            Some(on_the_wire[0].id.as_str()),
+            "the hook names the reply the stub received"
+        );
+        for (key, value) in envs {
+            assert!(
+                !value.contains(HUMAN_DECLINED),
+                "{key}={value} carries the refusal text"
+            );
+        }
+
+        slot.dismiss_inbound("quiet", true).await.unwrap();
+
+        assert!(sink.drain().is_empty(), "the silent form fires nothing");
+        assert_eq!(stub.seen().len(), 1, "and sends nothing");
+        assert!(store.get("quiet").unwrap().is_none());
+
+        let err = slot.dismiss_inbound("stranded", false).await.unwrap_err();
+
+        assert!(err.to_string().starts_with("Could not tell "), "{err:#}");
+        let fired = sink.drain();
+        let failed = fires_of(&fired, HookEvent::MeshMessageFailed);
+        assert_eq!(failed.len(), 1, "{fired:?}");
+        assert!(
+            fires_of(&fired, HookEvent::MeshMessageSent).is_empty(),
+            "{fired:?}"
+        );
+        let envs = failed[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_ERROR_CLASS"),
+            Some("not_trusted")
+        );
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(stranger.peer_destination.as_str())
+        );
+        for (key, value) in envs {
+            assert!(
+                !value.contains(HUMAN_DECLINED),
+                "{key}={value} carries the refusal text"
+            );
+        }
+        assert_eq!(store.get("stranded").unwrap(), Some(stranger));
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// Two nodes on one relay: A asks B, B escalates and the human dismisses, so A's
+    /// question closes with the refused reply in its inbox and B keeps nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismissing_an_escalated_question_closes_the_askers_pending() {
+        use crate::mesh::test_support::wait_for_peer;
+        use crate::mesh::trust::TrustOptions;
+
+        let relay = TransportRelay::start().await;
+        let a = started_runtime_on("node-dismiss-pair-a", relay.port).await;
+        let b = started_runtime_on("node-dismiss-pair-b", relay.port).await;
+        let to_a = a.runtime.current_destination_hash();
+        let to_b = b.runtime.current_destination_hash();
+        wait_for_peer(&a.runtime, &to_b).await;
+        wait_for_peer(&b.runtime, &to_a).await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        a.runtime
+            .trust()
+            .trust_destination(slot_a.as_ref(), &to_b, TrustOptions::default(), now)
+            .unwrap();
+        b.runtime
+            .trust()
+            .trust_destination(slot_b.as_ref(), &to_a, TrustOptions::default(), now)
+            .unwrap();
+
+        let ask = OutboundPeer::new(PeerKind::Ask, "may I archive it?", None, None, None).unwrap();
+        slot_a
+            .correlations()
+            .open(PendingRecord {
+                id: ask.id.clone(),
+                peer_destination: to_b.clone(),
+                peer_identity: b.runtime.fingerprint().to_string(),
+                thread: ask.id.clone(),
+                question: "may I archive it?".to_string(),
+                ..pending("unused")
+            })
+            .unwrap();
+        a.runtime.send_peer(&to_b, &ask).await.unwrap();
+        slot_b
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    id: ask.id.clone(),
+                    peer_destination: to_a.clone(),
+                    peer_identity: a.runtime.fingerprint().to_string(),
+                    thread: ask.id.clone(),
+                    question: "may I archive it?".to_string(),
+                    ..inbound_record("unused")
+                },
+                now,
+            )
+            .unwrap();
+
+        slot_b.dismiss_inbound(&ask.id, false).await.unwrap();
+
+        wait_until("A's question to close", || {
+            !slot_a.correlations().is_open(&ask.id)
+        })
+        .await;
+        let reply = slot_a
+            .correlations()
+            .take_answer(&ask.id)
+            .expect("the refusal is the answer");
+        assert_eq!(reply.disposition(), Disposition::Refused);
+        assert_eq!(reply.content, HUMAN_DECLINED);
+        assert_eq!(reply.thread.as_deref(), Some(ask.id.as_str()));
+        assert!(slot_a.correlations().get(&ask.id).is_none());
+        let (envelopes, _) = slot_a.peer_inbox().drain();
+        let refused = envelopes
+            .iter()
+            .map(peer_payload)
+            .find(|message| message.in_reply_to.as_deref() == Some(ask.id.as_str()))
+            .unwrap_or_else(|| panic!("A's inbox holds the refused reply: {envelopes:?}"));
+        assert_eq!(refused.kind, PeerKind::Reply);
+        assert_eq!(refused.disposition(), Disposition::Refused);
+        assert!(
+            slot_b
+                .inbound_store()
+                .unwrap()
+                .get(&ask.id)
+                .unwrap()
+                .is_none(),
+            "B's record is gone"
+        );
+        assert!(slot_a.stop().await.unwrap());
+        assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// An answer sent once the run has ended joins the thread the envoy remembers, as
+    /// its own turn after the line the run left behind; one for a thread the store does
+    /// not hold writes nothing: an answer with no question before it is no conversation.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_answer_joins_the_remembered_thread_and_never_starts_one() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-late-answer-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on_with("node-late-answer-memory", stub.port(), |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let memory = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        memory.save(&identity, "a-1", peer_turns(), now).unwrap();
+        let store = slot.inbound_store().unwrap();
+        for id in ["a-1", "a-2"] {
+            store
+                .upsert(
+                    InboundRecord {
+                        peer_destination: to.clone(),
+                        peer_identity: identity.clone(),
+                        ..inbound_record(id)
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+
+        slot.answer_inbound("a-1", "the owner says yes")
+            .await
+            .unwrap();
+        slot.answer_inbound("a-2", "and no to that").await.unwrap();
+
+        let turns = memory
+            .load(&identity, "a-1", now)
+            .unwrap()
+            .expect("the thread stays remembered")
+            .turns;
+        assert_eq!(turns.len(), 3, "{turns:?}");
+        assert_eq!(turns[2].role, EnvoyRole::Assistant);
+        assert_eq!(turns[2].text, "the owner says yes");
+        assert!(memory.load(&identity, "a-2", now).unwrap().is_none());
+        assert!(
+            !memory
+                .dir()
+                .join(format!("{}.yaml", session_key(&identity, "a-2").unwrap()))
+                .exists(),
+            "an answer alone starts no conversation"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// Serves `/message` on a stub in the recorder's place: refuses every message
+    /// while `refusing` is set, acknowledges them as the recorder would once cleared.
+    #[cfg(unix)]
+    struct RefusingUntilCleared {
+        refusing: AtomicBool,
+        acknowledged: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for RefusingUntilCleared {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            if self.refusing.load(Ordering::SeqCst) {
+                return Reply::Code(RefusalCode::Throttled);
+            }
+            match crate::mesh::message::from_request_body(&request.body) {
+                Ok(body) => {
+                    self.acknowledged.fetch_add(1, Ordering::SeqCst);
+                    Reply::Value(crate::mesh::message::received_reply(&body.id))
+                }
+                Err(_) => Reply::Code(RefusalCode::InvalidData),
+            }
+        }
+    }
+
+    /// The owner's late answer is remembered only once the peer heard it. A send the peer
+    /// refuses puts the question back and leaves the thread as the ended run left it,
+    /// nothing of the unheard words in it; the retry that lands, with other words, is the
+    /// one turn the thread gains, and no second copy of it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_answer_the_peer_refused_is_not_remembered_until_the_retry_that_lands() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub =
+            PeerStub::listen("node-late-answer-retry-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let peer = Arc::new(RefusingUntilCleared {
+            refusing: AtomicBool::new(true),
+            acknowledged: std::sync::atomic::AtomicUsize::new(0),
+        });
+        stub.serve(MESSAGE_PATH, Arc::clone(&peer) as Arc<dyn Handler>);
+        let started = started_runtime_on_with("node-late-answer-retry-memory", stub.port(), |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let memory = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        memory.save(&identity, "a-1", peer_turns(), now).unwrap();
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: identity.clone(),
+                    ..inbound_record("a-1")
+                },
+                now,
+            )
+            .unwrap();
+        let held = || memory.load(&identity, "a-1", now).unwrap().unwrap().turns;
+
+        let err = slot
+            .answer_inbound("a-1", "yes, go ahead")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "the question is put back"
+        );
+        assert_eq!(held(), peer_turns(), "an unheard answer is not remembered");
+
+        peer.refusing.store(false, Ordering::SeqCst);
+        slot.answer_inbound("a-1", "on second thought: not yet")
+            .await
+            .unwrap();
+        assert_eq!(peer.acknowledged.load(Ordering::SeqCst), 1);
+        assert!(
+            store.get("a-1").unwrap().is_none(),
+            "the answer settles the question"
+        );
+        let turns = held();
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().role, EnvoyRole::Assistant);
+        assert_eq!(turns.last().unwrap().text, "on second thought: not yet");
+        assert!(
+            !turns.iter().any(|turn| turn.text == "yes, go ahead"),
+            "the refused words never joined the thread: {turns:?}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// The owner's late answer to a thread the memory has let go, past `ttl_hours` since
+    /// it was last written, still reaches the peer and settles the question, and revives
+    /// nothing: the expired record goes rather than being written to, no record of the
+    /// answer alone takes its place, and a live thread of the same sender answered right
+    /// after is the one that gains the turn.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_answer_to_an_expired_thread_is_sent_and_revives_nothing() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen(
+            "node-late-answer-expired-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let started =
+            started_runtime_on_with("node-late-answer-expired-memory", stub.port(), |c| {
+                c.envoy_memory.enabled = true;
+                c.envoy_memory.ttl_hours = 1;
+            })
+            .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let memory = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let two_hours_ago = now - Duration::from_secs(2 * 3_600);
+        // The live thread first: a save sweeps the other expired threads of the store.
+        memory.save(&identity, "a-2", peer_turns(), now).unwrap();
+        memory
+            .save(&identity, "a-1", peer_turns(), two_hours_ago)
+            .unwrap();
+        let expired = memory
+            .dir()
+            .join(format!("{}.yaml", session_key(&identity, "a-1").unwrap()));
+        assert!(
+            expired.exists(),
+            "the expired thread is on disk before the answer"
+        );
+        let store = slot.inbound_store().unwrap();
+        for id in ["a-1", "a-2"] {
+            store
+                .upsert(
+                    InboundRecord {
+                        peer_destination: to.clone(),
+                        peer_identity: identity.clone(),
+                        ..inbound_record(id)
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+
+        slot.answer_inbound("a-1", "the owner says yes")
+            .await
+            .unwrap();
+        assert!(
+            store.get("a-1").unwrap().is_none(),
+            "the answer went out and settled the question"
+        );
+        assert_eq!(
+            memory.load(&identity, "a-1", now).unwrap(),
+            None,
+            "an expired thread is not revived by the answer"
+        );
+        assert!(
+            !expired.exists(),
+            "the expired record goes rather than being written to"
+        );
+
+        slot.answer_inbound("a-2", "and no to that").await.unwrap();
+        let turns = memory
+            .load(&identity, "a-2", now)
+            .unwrap()
+            .expect("the live thread stays remembered")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().role, EnvoyRole::Assistant);
+        assert_eq!(turns.last().unwrap().text, "and no to that");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_inbound_with_file_sends_without_the_envoy_and_removes_the_record() {
+        use sha2::{Digest as _, Sha256};
+
+        let stub = PeerStub::listen("node-answer-file-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-answer-file", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: stub.identity_hex(),
+                    ..inbound_record("a-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        let bytes = b"# notes\n".to_vec();
+        let part = RawPart::File {
+            name: "docs/notes.md".to_string(),
+            size: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+            bytes: Some(bytes),
+            reference: None,
+        };
+
+        let outcome = slot
+            .answer_inbound_with_file("a-1", "see this", part.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.via, PeerVia::Direct);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].id, outcome.id);
+        assert_eq!(seen[0].content, "see this");
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(seen[0].thread.as_deref(), Some("a-1"));
+        assert_eq!(seen[0].disposition, Some(Disposition::Answered));
+        assert_eq!(seen[0].parts, [part]);
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "the live run holding the question is never offered an answer that carries a file"
+        );
+        assert!(store.get("a-1").unwrap().is_none());
+        assert!(runtime.serving().grants().list().unwrap().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// Serves `/message` on a stub in the recorder's place and refuses every message.
+    #[cfg(unix)]
+    struct Throttling;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for Throttling {
+        async fn handle(&self, _request: AdmittedRequest) -> Reply {
+            Reply::Code(RefusalCode::Throttled)
+        }
+    }
+
+    /// The answer takes the question out of the store before it sends, as a decision
+    /// does: a question another process already took is not sent again, and one whose
+    /// send the peer refuses goes back as pending, with nothing filed for the leader.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_human_answer_takes_the_question_before_it_sends_and_puts_it_back_when_the_send_fails()
+     {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-answer-take-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        stub.serve(MESSAGE_PATH, Arc::new(Throttling) as Arc<dyn Handler>);
+        let started = started_runtime_on("node-answer-take", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let record = InboundRecord {
+            peer_destination: to.clone(),
+            peer_identity: stub.identity_hex(),
+            ..inbound_record("a-1")
+        };
+        let reply = OutboundPeer::new(PeerKind::Reply, "yes", None, Some("a-1"), None).unwrap();
+
+        let err = slot
+            .send_human_reply(
+                &runtime,
+                &store,
+                &record,
+                reply,
+                "yes",
+                HumanReply::Answered,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+
+        store.upsert(record, SystemTime::now()).unwrap();
+        let err = slot.answer_inbound("a-1", "yes").await.unwrap_err();
+
+        let err = err.to_string();
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
+        assert!(!err.contains("another process"), "{err}");
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "a send the peer refused leaves the question pending"
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(slot.take_model_notes().is_empty(), "nothing was answered");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// The answer path mirrors the decision path, exercised with a reference part (the
+    /// one form that writes a grant): a question another process already took is refused
+    /// with the one sentence and no one-off grant is lent for the reference, since the
+    /// take comes before the lend; a reference answer whose send the peer refuses lends
+    /// and then takes the grant back, puts the question back, and files nothing for the
+    /// leader.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reference_answer_on_a_taken_question_lends_nothing_and_a_refused_one_takes_it_back()
+    {
+        use crate::mesh::trust::TrustOptions;
+        use sha2::{Digest as _, Sha256};
+
+        let stub =
+            PeerStub::listen("node-answer-ref-take-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        stub.serve(MESSAGE_PATH, Arc::new(Throttling) as Arc<dyn Handler>);
+        let started = started_runtime_on("node-answer-ref-take", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let record = InboundRecord {
+            peer_destination: to.clone(),
+            peer_identity: stub.identity_hex(),
+            ..inbound_record("q-1")
+        };
+        let bytes = vec![0x5A; 4096];
+        let part = RawPart::File {
+            name: "big.bin".to_string(),
+            size: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+            bytes: None,
+            reference: Some("big.bin".to_string()),
+        };
+        let reply = OutboundPeer::with_parts(
+            PeerKind::Reply,
+            "see this",
+            None,
+            Some("q-1"),
+            None,
+            vec![part.clone()],
+            &runtime.part_limits(),
+        )
+        .unwrap();
+
+        // Taken by another process: nothing is lent, nothing is sent.
+        let err = slot
+            .send_human_reply(
+                &runtime,
+                &store,
+                &record,
+                reply,
+                "see this",
+                HumanReply::Answered,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`q-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(
+            runtime.serving().grants().list().unwrap().is_empty(),
+            "no grant is lent for an answer that was never sent"
+        );
+
+        // Pending again, but the peer refuses the message: the lend is taken back and
+        // the question is put back.
+        store.upsert(record, SystemTime::now()).unwrap();
+        let err = slot
+            .answer_inbound_with_file("q-1", "see this", part)
+            .await
+            .unwrap_err();
+
+        let err = err.to_string();
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
+        assert!(!err.contains("another process"), "{err}");
+        assert!(!err.contains("could not be taken back"), "{err}");
+        assert!(store.get("q-1").unwrap().is_some(), "put back as pending");
+        assert!(
+            runtime.serving().grants().list().unwrap().is_empty(),
+            "the grant lent for the refused send is revoked: {:?}",
+            runtime.serving().grants().list().unwrap()
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(slot.take_model_notes().is_empty(), "nothing was answered");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_store_and_forward_refusal_reply_inherits_the_refused_message_thread() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub =
+            PeerStub::listen("node-refusal-thread-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-refusal-thread", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let admit = |id: &str, thread: Option<&str>| {
+            PeerSurface::admit_peer_message(
+                slot.as_ref(),
+                &PeerAdmission {
+                    source_identity: &identity,
+                    source_destination: &to,
+                    message_id: id,
+                    kind: PeerKind::Message,
+                    in_reply_to: None,
+                    thread,
+                    disposition: None,
+                    via: PeerVia::StoreAndForward,
+                },
+            )
+        };
+
+        assert!(admit("stored-0", Some("t-9")).is_ok());
+        assert_eq!(
+            admit("stored-1", Some("t-9")).unwrap_err().reason,
+            RefusalReason::RateLimited
+        );
+
+        wait_until("the stub to receive the refusal", || {
+            !stub.seen().is_empty()
+        })
+        .await;
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("stored-1"));
+        assert_eq!(seen[0].thread.as_deref(), Some("t-9"));
+        assert_eq!(seen[0].disposition, Some(Disposition::BudgetExhausted));
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[test]
+    fn record_human_reply_files_the_reply_with_one_note_and_one_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.record_human_reply(
+            &inbound_record("a-1"),
+            "yes, merge it",
+            HumanReply::Answered,
+        );
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        let reply = peer_payload(&envelopes[0]);
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(reply.content, "yes, merge it");
+        assert_eq!(reply.destination, hex_lower(&PEER_INSTANCE));
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(notes[0].id, format!("peer:{dest8}"));
+        assert!(
+            notes[0].next_action.contains(".mesh answer"),
+            "{}",
+            notes[0].next_action
+        );
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("you answered {dest8}: yes, merge it")
+        );
+    }
+
+    #[test]
+    fn record_human_reply_cuts_a_long_answer_and_points_at_the_inbox() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let answer = (0..60)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(answer.chars().count(), 299);
+
+        slot.record_human_reply(&inbound_record("a-1"), &answer, HumanReply::Answered);
+
+        let pushed = idle.pushed.lock();
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let kept = (0..32)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(kept.chars().count(), PEER_LINE_MAX_CHARS - 1);
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("you answered {dest8}: {kept}... (full text: .mesh inbox)")
+        );
+    }
+
+    #[test]
+    fn a_reply_that_answers_nothing_lands_in_the_inbox_as_a_message_keeping_in_reply_to() {
+        install_log_collector();
+        let slot = MeshSlot::default();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-unknown")));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Message);
+        assert_eq!(delivered.in_reply_to.as_deref(), Some("q-unknown"));
+        assert_eq!(delivered.message_id, "r-1");
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
+        assert_logged(
+            &debug_snapshot(),
+            &format!(
+                "Mesh reply r-1 from {id8} answers no open question of ours; delivering it as a message"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_reply_answering_no_open_question_inherits_no_thread_from_the_questions_that_are_open() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+
+        // Without a thread of its own: it is its own thread, not `q-1`'s.
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-unknown")));
+        // Claiming a thread of its own: the claim is shed, like every downgraded reply.
+        let mut claiming = peer_message(PeerKind::Reply, "r-2", Some("q-unknown"));
+        claiming.thread = Some("t-claimed".to_string());
+        claiming.disposition = Some(Disposition::Escalated);
+        slot.deliver_peer(claiming);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["r-1", "r-2"]);
+        for envelope in &envelopes {
+            let delivered = peer_payload(envelope);
+            assert_eq!(
+                delivered.kind,
+                PeerKind::Message,
+                "{}",
+                delivered.message_id
+            );
+            assert_eq!(
+                delivered.in_reply_to.as_deref(),
+                Some("q-unknown"),
+                "{} keeps the id it named",
+                delivered.message_id
+            );
+            assert_eq!(delivered.thread, None, "{}", delivered.message_id);
+            assert_eq!(delivered.disposition, None, "{}", delivered.message_id);
+        }
+        assert!(
+            slot.correlations().is_open("q-1"),
+            "an unrelated reply leaves the open question open"
+        );
+        assert!(slot.correlations().take_answer("q-1").is_none());
+        let notes = slot.take_model_notes();
+        assert!(
+            notes.iter().all(|note| note.event == "peer_message"),
+            "{notes:#?}"
+        );
+    }
+
+    #[test]
+    fn a_reply_that_answers_an_open_question_keeps_its_kind_in_the_inbox() {
+        let slot = MeshSlot::default();
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Reply);
+        assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
+        assert_eq!(slot.take_model_notes()[0].event, "peer_reply");
+    }
+
+    #[test]
+    fn an_accepted_reply_without_a_thread_inherits_the_question_thread() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Reply);
+        assert_eq!(delivered.thread.as_deref(), Some("t-root"));
+        assert_eq!(
+            slot.correlations()
+                .get("q-1")
+                .unwrap()
+                .record
+                .reply
+                .unwrap()
+                .thread
+                .as_deref(),
+            Some("t-root"),
+            "the filed answer carries the inherited thread too"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_another_identity_is_a_message_with_neither_thread_nor_disposition() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+        let mut forged = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
+        forged.source_identity = hex_lower(&[0x77; 16]);
+        forged.thread = Some("t-forged".to_string());
+        forged.disposition = Some(Disposition::Refused);
+        forged.retry_after = Some(30);
+
+        slot.deliver_peer(forged);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Message);
+        assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
+        assert_eq!(
+            delivered.thread, None,
+            "a reply that answers nothing sheds the thread it claimed"
+        );
+        assert_eq!(delivered.disposition, None);
+        assert_eq!(delivered.retry_after, None);
+        assert!(
+            slot.correlations().accepts_reply_from(
+                "q-1",
+                &hex_lower(&PEER_IDENTITY),
+                Disposition::Answered
+            ),
+            "the question stays open for the identity it was asked of"
+        );
+    }
+
+    #[test]
+    fn a_forged_reply_carrying_its_own_thread_never_inherits_ours() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+        let mut forged = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
+        forged.source_identity = hex_lower(&[0x77; 16]);
+        forged.thread = Some("t-forged".to_string());
+        forged.disposition = Some(Disposition::BudgetExhausted);
+        forged.retry_after = Some(120);
+
+        slot.deliver_peer(forged);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Message);
+        assert_eq!(delivered.disposition, None);
+        assert_eq!(delivered.retry_after, None);
+        assert_eq!(delivered.thread, None);
+        assert!(
+            slot.correlations().accepts_reply_from(
+                "q-1",
+                &hex_lower(&PEER_IDENTITY),
+                Disposition::Answered
+            ),
+            "the question stays open for the identity it was asked of"
+        );
+    }
+
+    /// The first answer stays filed for `collect`, untouched by the late one.
+    #[test]
+    fn a_late_duplicate_reply_is_a_message_and_the_first_answer_stays() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-first", Some("q-1")));
+        let mut late = peer_message(PeerKind::Reply, "r-late", Some("q-1"));
+        late.disposition = Some(Disposition::Refused);
+        late.retry_after = Some(5);
+        slot.deliver_peer(late);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 2, "{envelopes:?}");
+        let first = peer_payload(&envelopes[0]);
+        assert_eq!(
+            (first.kind, first.thread.as_deref()),
+            (PeerKind::Reply, Some("t-root"))
+        );
+        let second = peer_payload(&envelopes[1]);
+        assert_eq!(second.kind, PeerKind::Message);
+        assert_eq!(second.disposition, None);
+        assert_eq!(second.retry_after, None);
+        let filed = slot
+            .correlations()
+            .take_answer("q-1")
+            .expect("the first answer is filed");
+        assert_eq!(filed.message_id, "r-first");
+        assert_eq!(filed.disposition(), Disposition::Answered);
+    }
+
+    /// A `bulletin` that names one of our open questions in `in_reply_to` arrives on both
+    /// routes as a bulletin naming nothing. Off the link it is acknowledged and filed with
+    /// `in_reply_to` absent, its own thread and no disposition; the question stays open
+    /// for the identity it was asked of and its hook env carries no
+    /// `COYOTE_MESH_IN_REPLY_TO`. A `reply` from the same identity over the same route
+    /// then closes the question, so the bulletin was the one thing that did not. A
+    /// bulletin whose `in_reply_to` is not a wire id is still refused before the ack off
+    /// the link and dropped as malformed off the propagation node.
+    #[tokio::test]
+    async fn a_bulletin_naming_our_open_question_names_nothing_on_either_route_and_leaves_it_open()
+    {
+        use rmpv::Value;
+        let slot = Arc::new(MeshSlot::default());
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let identity_hex = identity.address_hash().to_hex_string();
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        for id in ["q-link", "q-stored"] {
+            slot.correlations()
+                .open(PendingRecord {
+                    peer_destination: destination.clone(),
+                    peer_identity: identity_hex.clone(),
+                    thread: "t-root".to_string(),
+                    ..pending(id)
+                })
+                .unwrap();
+        }
+        let still_open = |id: &str| {
+            slot.correlations().is_open(id)
+                && slot
+                    .correlations()
+                    .accepts_reply_from(id, &identity_hex, Disposition::Answered)
+        };
+        let drained = || {
+            let (envelopes, dropped) = slot.peer_inbox().drain();
+            assert_eq!(dropped, 0);
+            envelopes
+                .iter()
+                .map(|envelope| peer_payload(envelope).clone())
+                .collect::<Vec<_>>()
+        };
+        let no_in_reply_to = |sink: &RecordingHookSink| {
+            let envs = one_fire(sink, HookEvent::MeshBulletinReceived);
+            assert_eq!(env_value(&envs, "COYOTE_MESH_IN_REPLY_TO"), None);
+        };
+
+        // ---- off the link
+        let handler = PeerMessageHandler::new(Arc::downgrade(&slot) as Weak<dyn PeerSurface>);
+        let naming = |named: Value| {
+            let out = OutboundPeer::new(PeerKind::Bulletin, "heads up", None, None, None).unwrap();
+            let Value::Map(mut entries) = to_request_body(&out, 1_700_000_000.0) else {
+                unreachable!()
+            };
+            entries.retain(|(key, _)| key.as_str() != Some("in_reply_to"));
+            entries.push((Value::from("in_reply_to"), named));
+            let mut request = admitted_request(&identity, &destination, &out);
+            request.body = Value::Map(entries);
+            (out.id, request)
+        };
+
+        let (bulletin_id, request) = naming(Value::from("q-link"));
+        match handler.handle(request).await {
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &bulletin_id), "{value}")
+            }
+            Reply::Code(code) => panic!("the bulletin was refused: {code:?}"),
+            Reply::Silent => panic!("the bulletin was not acknowledged"),
+        }
+        let filed = drained();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+        assert_eq!(filed[0].message_id, bulletin_id);
+        assert_eq!(filed[0].kind, PeerKind::Bulletin);
+        assert_eq!(
+            filed[0].in_reply_to, None,
+            "a bulletin's in_reply_to is read as absent off the link"
+        );
+        assert_eq!(filed[0].thread, None, "a bulletin is its own thread");
+        assert_eq!(filed[0].disposition, None);
+        assert!(still_open("q-link"), "a bulletin answers nothing");
+        assert!(slot.correlations().take_answer("q-link").is_none());
+        no_in_reply_to(&sink);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].event, "peer_bulletin");
+
+        let (_, invalid) = naming(Value::from("q link"));
+        assert!(matches!(
+            handler.handle(invalid).await,
+            Reply::Code(RefusalCode::InvalidData)
+        ));
+        let (_, invalid) = naming(Value::from(7));
+        assert!(matches!(
+            handler.handle(invalid).await,
+            Reply::Code(RefusalCode::InvalidData)
+        ));
+        assert!(drained().is_empty(), "a refused bulletin is never filed");
+        assert!(sink.drain().is_empty(), "a refused bulletin fires nothing");
+        assert!(still_open("q-link"));
+
+        let answer =
+            OutboundPeer::new(PeerKind::Reply, "the answer", None, Some("q-link"), None).unwrap();
+        match handler
+            .handle(admitted_request(&identity, &destination, &answer))
+            .await
+        {
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &answer.id), "{value}")
+            }
+            Reply::Code(code) => panic!("the reply was refused: {code:?}"),
+            Reply::Silent => panic!("the reply was not acknowledged"),
+        }
+        assert!(
+            !slot.correlations().is_open("q-link"),
+            "a reply from the asked identity naming the question closes it"
+        );
+        let taken = slot
+            .correlations()
+            .take_answer("q-link")
+            .expect("the reply is the filed answer");
+        assert_eq!(taken.message_id, answer.id);
+        assert_eq!(taken.in_reply_to.as_deref(), Some("q-link"));
+        assert_eq!(taken.thread.as_deref(), Some("t-root"));
+        let filed = drained();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].kind, PeerKind::Reply);
+        sink.drain();
+        slot.take_model_notes();
+
+        // ---- off the propagation node
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&destination, &identity_hex)
+            .open("node-bulletin-in-reply-to");
+        let inner = NullSink;
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let stored_naming = |named: Value| {
+            let out =
+                OutboundPeer::new(PeerKind::Bulletin, "stored heads up", None, None, None).unwrap();
+            let lxmf = peer_lxmf_message(&out, &origin);
+            let Some(Value::Map(mut fields)) = lxmf.fields else {
+                panic!("a peer message carries custom data")
+            };
+            let custom = fields
+                .iter_mut()
+                .find_map(|(key, value)| match value {
+                    Value::Map(custom)
+                        if key.as_u64()
+                            == Some(u64::from(lxmf_core::constants::FIELD_CUSTOM_DATA)) =>
+                    {
+                        Some(custom)
+                    }
+                    _ => None,
+                })
+                .expect("the custom data map");
+            custom.retain(|(key, _)| key.as_str() != Some("in_reply_to"));
+            custom.push((Value::from("in_reply_to"), named));
+            (
+                out.id,
+                InboundMessage {
+                    transient_id: [1u8; 32],
+                    message_id: [2u8; 32],
+                    source_identity_hash: identity_hex.clone(),
+                    source_delivery_hash: hex_lower(&[0x03; 16]),
+                    timestamp: 1_700_000_000.0,
+                    title: None,
+                    content: Some(lxmf.content),
+                    fields: Some(Value::Map(fields)),
+                    stamp_value: None,
+                },
+            )
+        };
+
+        let (stored_id, stored) = stored_naming(Value::from("q-stored"));
+        routing.deliver(stored);
+        let filed = drained();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+        assert_eq!(filed[0].message_id, stored_id);
+        assert_eq!(filed[0].kind, PeerKind::Bulletin);
+        assert_eq!(filed[0].via, PeerVia::StoreAndForward);
+        assert_eq!(
+            filed[0].in_reply_to, None,
+            "a bulletin's in_reply_to is read as absent off the propagation node"
+        );
+        assert_eq!(filed[0].thread, None);
+        assert!(still_open("q-stored"), "a stored bulletin answers nothing");
+        no_in_reply_to(&sink);
+        assert_eq!(slot.take_model_notes()[0].event, "peer_bulletin");
+
+        let (_, malformed) = stored_naming(Value::from("q stored"));
+        routing.deliver(malformed);
+        let (_, malformed) = stored_naming(Value::from(7));
+        routing.deliver(malformed);
+        assert!(
+            drained().is_empty(),
+            "a malformed stored bulletin is never filed"
+        );
+        assert!(sink.drain().is_empty());
+        assert!(still_open("q-stored"));
+
+        let answer = OutboundPeer::new(
+            PeerKind::Reply,
+            "the stored answer",
+            None,
+            Some("q-stored"),
+            None,
+        )
+        .unwrap();
+        let lxmf = peer_lxmf_message(&answer, &origin);
+        routing.deliver(InboundMessage {
+            transient_id: [4u8; 32],
+            message_id: [5u8; 32],
+            source_identity_hash: identity_hex.clone(),
+            source_delivery_hash: hex_lower(&[0x03; 16]),
+            timestamp: 1_700_000_000.0,
+            title: None,
+            content: Some(lxmf.content),
+            fields: lxmf.fields,
+            stamp_value: None,
+        });
+        assert!(!slot.correlations().is_open("q-stored"));
+        assert_eq!(
+            slot.correlations()
+                .take_answer("q-stored")
+                .map(|reply| reply.message_id),
+            Some(answer.id)
+        );
+    }
+
+    #[test]
+    fn an_escalated_reply_tells_the_model_to_check_the_inbox_rather_than_collect() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        slot.correlations().open(pending("q-1")).unwrap();
+        let mut escalated = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
+        escalated.disposition = Some(Disposition::Escalated);
+
+        slot.deliver_peer(escalated);
+
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_escalated");
+        assert_eq!(notes[0].id, "q-1");
+        assert_eq!(notes[0].next_action, CHECK_INBOX_NEXT_ACTION);
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed[0].source, Source::Reply);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("{dest8} replies: words of r-1"),
+            "the asker's notice is the reply's summary line"
+        );
+        assert_eq!(
+            slot.correlations().get("q-1").unwrap().record.state,
+            PendingState::Escalated,
+            "the question stays open for the human's answer"
+        );
+    }
+
+    #[test]
+    fn a_second_escalated_reply_is_a_message_and_the_store_is_written_once() {
+        let tmp = TempDir::new("slot-escalated-twice");
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+            .unwrap();
+        slot.correlations().open(pending("q-1")).unwrap();
+        let escalated = |id: &str| {
+            let mut reply = peer_message(PeerKind::Reply, id, Some("q-1"));
+            reply.disposition = Some(Disposition::Escalated);
+            reply
+        };
+        slot.deliver_peer(escalated("r-1"));
+        let store_file = mesh_cache_dir(&tmp.path).join("pending-inst.jsonl");
+        assert!(store_file.is_file());
+        std::fs::remove_file(&store_file).unwrap();
+        assert_eq!(slot.take_model_notes().len(), 1);
+
+        slot.deliver_peer(escalated("r-2"));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["r-1", "r-2"]);
+        let second = peer_payload(&envelopes[1]);
+        assert_eq!(second.kind, PeerKind::Message);
+        assert_eq!(second.thread, None);
+        assert_eq!(second.disposition, None);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].event, "peer_message");
+        assert!(
+            !store_file.exists(),
+            "the second escalation is not recorded"
+        );
+        assert_eq!(
+            slot.correlations().get("q-1").unwrap().record.state,
+            PendingState::Escalated
+        );
+    }
+
+    #[test]
+    fn a_refusal_reply_closes_the_original_with_its_disposition_thread_and_retry_after() {
+        let refusal = PeerRefusal {
+            reason: RefusalReason::RateLimited,
+            retry_after: Duration::from_millis(90_500),
+        };
+
+        let reply = refusal_reply("m-1", Some("t-root"), &refusal).unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("m-1"));
+        assert_eq!(reply.thread.as_deref(), Some("t-root"));
+        assert_eq!(reply.disposition, Some(Disposition::BudgetExhausted));
+        assert_eq!(reply.retry_after, Some(91), "rounded up like the fields");
+        assert_eq!(reply.fields, Some(refusal.fields()));
+        assert_eq!(reply.content, RefusalReason::RateLimited.peer_text());
+
+        let rooted = refusal_reply("m-1", None, &refusal).unwrap();
+        assert_eq!(
+            rooted.thread.as_deref(),
+            Some("m-1"),
+            "an original with no thread of its own is the root"
+        );
+    }
+
+    /// Every reason a peer can be told goes out `budget_exhausted`, with `retry_after`
+    /// the rounded-up window remainder for a window ceiling and the capacity wait for the
+    /// rest; `fields` keeps the typed reason and the same wait. The loop guard, which is
+    /// never sent, is the one `refused`.
+    #[test]
+    fn every_sent_refusal_reason_is_a_budget_exhausted_reply_with_its_retry_after() {
+        let window_left = Duration::from_millis(1_800_200);
+        for reason in RefusalReason::ALL {
+            let refusal = match reason {
+                RefusalReason::RateLimited
+                | RefusalReason::TokenCeiling
+                | RefusalReason::CostCeiling => PeerRefusal {
+                    reason,
+                    retry_after: window_left,
+                },
+                RefusalReason::EnvoyBusy
+                | RefusalReason::EnvoyStopping
+                | RefusalReason::PeerConcurrency
+                | RefusalReason::LoopGuard => PeerRefusal::capacity(reason),
+            };
+            let name = reason.as_str();
+            let expected_wait = if refusal.retry_after == window_left {
+                1_801
+            } else {
+                u32::try_from(PEER_RETRY_AFTER_CAPACITY.as_secs()).unwrap()
+            };
+            let expected_disposition = if reason == RefusalReason::LoopGuard {
+                Disposition::Refused
+            } else {
+                Disposition::BudgetExhausted
+            };
+
+            let reply = refusal_reply("m-1", Some("t-root"), &refusal).unwrap();
+
+            assert_eq!(reply.disposition, Some(expected_disposition), "{name}");
+            assert_eq!(reply.retry_after, Some(expected_wait), "{name}");
+            assert!(reply.retry_after.is_some_and(|secs| secs >= 1), "{name}");
+            let fields = reply.fields.as_ref().unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(fields["refusal"], name, "{name}");
+            assert_eq!(
+                fields["retry_after_secs"].as_u64(),
+                Some(u64::from(expected_wait)),
+                "{name}"
+            );
+            assert_eq!(reply.fields, Some(refusal.fields()), "{name}");
+            assert_eq!(reply.content, reason.peer_text(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_reply_in_a_later_process_resolves_the_persisted_correlation() {
+        let tmp = TempDir::new("slot-pending-carry");
+        let slot_a = MeshSlot::default();
+        slot_a
+            .correlations()
+            .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+            .unwrap();
+        slot_a.correlations().open(pending("q-1")).unwrap();
+        drop(slot_a);
+
+        let slot_b = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot_b.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        assert_eq!(
+            slot_b
+                .correlations()
+                .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+                .unwrap(),
+            1
+        );
+        assert!(slot_b.correlations().is_open("q-1"));
+
+        slot_b.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        let (envelopes, dropped) = slot_b.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(peer_ids(&envelopes), ["r-1"]);
+        let notes = slot_b.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_reply");
+        assert_eq!(notes[0].id, "q-1");
+        assert_eq!(notes[0].next_action, "mesh__collect --id q-1");
+        assert_eq!(
+            notifier.0.lock().len(),
+            1,
+            "the person at the keyboard gets one line"
+        );
+        assert_eq!(
+            slot_b
+                .correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.content),
+            Some("words of r-1".to_string())
+        );
+        assert!(
+            PendingStore::new(&tmp.path, "inst")
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty(),
+            "collecting the answer removes the question from disk"
+        );
+    }
+
+    #[test]
+    fn an_uncollected_reply_survives_a_restart() {
+        let tmp = TempDir::new("slot-pending-uncollected");
+        let slot_a = MeshSlot::default();
+        slot_a.set_notifier(Arc::new(RecordingSink::default()) as Arc<dyn NotificationSink>);
+        slot_a
+            .correlations()
+            .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+            .unwrap();
+        slot_a.correlations().open(pending("q-1")).unwrap();
+        slot_a.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        assert!(!slot_a.correlations().is_open("q-1"));
+        drop(slot_a);
+
+        let slot_b = MeshSlot::default();
+        assert_eq!(
+            slot_b
+                .correlations()
+                .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+                .unwrap(),
+            1
+        );
+        let listed = slot_b.correlations().list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].record.state, PendingState::Answered);
+        assert!(
+            listed[0].reply.is_some(),
+            "the answer waits to be collected"
+        );
+        assert_eq!(
+            slot_b
+                .correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.content),
+            Some("words of r-1".to_string())
+        );
+        assert!(
+            PendingStore::new(&tmp.path, "inst")
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    fn fresh_instance_id() -> String {
+        Session::default().ensure_mesh_instance_id().to_string()
+    }
+
+    #[cfg(unix)]
+    fn lock_path(cache_dir: &std::path::Path, id: &str) -> PathBuf {
+        mesh_cache_dir(cache_dir).join(format!("{id}.lock"))
+    }
+
+    #[cfg(unix)]
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            sleep(POLL).await;
+        }
+    }
+
+    fn assert_logged(debugs: &[String], needle: &str) {
+        assert!(
+            debugs.iter().any(|message| message.contains(needle)),
+            "no debug message contains {needle:?}; captured: {debugs:#?}"
+        );
+    }
+
+    #[test]
+    fn record_announce_and_sweep_log_peer_lifecycle() {
+        install_log_collector();
+        let tmp = TempDir::new("node-log-peers");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let coyote_hash = "log-lifecycle-coyote-peer";
+        let other_hash = "log-lifecycle-other-app";
+        let app_data = AnnounceAppData {
+            version: 1,
+            display_name: Some("Bea".to_string()),
+        }
+        .encode()
+        .unwrap();
+
+        let added = record_announce(
+            &peers,
+            AnnouncedDestination::without_key(coyote_hash, "identity", "name"),
+            &app_data,
+            2,
+            now,
+        );
+        let ignored = record_announce(
+            &peers,
+            AnnouncedDestination::without_key(other_hash, "identity", "name"),
+            b"LXMF\x00\x01",
+            1,
+            now,
+        );
+        let aged_out = peers.sweep(now + PEER_TTL);
+        log_aged_out_peers(&aged_out);
+
+        assert_eq!(added.map(|filed| filed.change), Some(PeerChange::Added));
+        assert_eq!(ignored, None);
+        assert_eq!(aged_out, vec![coyote_hash.to_string()]);
+        let debugs = debug_snapshot();
+        let (coyote8, other8) = (short(coyote_hash), short(other_hash));
+        assert_logged(
+            &debugs,
+            &format!("Received mesh announce from {coyote8} (2 hops, protocol version 1)"),
+        );
+        assert_logged(&debugs, &format!("Added mesh peer {coyote8}"));
+        assert_logged(
+            &debugs,
+            &format!("Ignored announce from {other8} (1 hops): not a Coyote node"),
+        );
+        assert_logged(&debugs, &format!("Aged out mesh peer {coyote8}"));
+        assert!(
+            debugs
+                .iter()
+                .all(|message| !message.contains(coyote_hash) && !message.contains(other_hash)),
+            "a log line carries a full hash: {debugs:#?}"
+        );
+    }
+
+    #[test]
+    fn record_announce_keeps_an_emoji_name_with_its_presentation_selector() {
+        let tmp = TempDir::new("node-emoji-name");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let name = "Alex \u{2764}\u{FE0F}";
+        let app_data = AnnounceAppData {
+            version: 1,
+            display_name: Some(name.to_string()),
+        }
+        .encode()
+        .unwrap();
+
+        let change = record_announce(
+            &peers,
+            AnnouncedDestination::without_key("emoji-peer", "identity", "name"),
+            &app_data,
+            1,
+            now,
+        );
+
+        assert_eq!(change.map(|filed| filed.change), Some(PeerChange::Added));
+        let recorded = peers.snapshot();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].display_name.as_deref(), Some(name));
+    }
+
+    /// A table this version wrote before keys were kept loads with no key, and the next
+    /// announce filed through `record_announce` fills it in without a version change.
+    #[test]
+    fn a_table_without_keys_loads_and_the_next_announce_fills_the_key() {
+        let tmp = TempDir::new("node-peer-key-fill");
+        let path = tmp.path.join("peers.json");
+        let now = SystemTime::now();
+        let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let name = session_destination_name("instance");
+        let name_hash = <[u8; NAME_HASH_LEN]>::try_from(name.as_name_hash_slice()).unwrap();
+        let announced = || AnnouncedDestination {
+            destination_hash: destination_address(&name_hash, &identity.address_hash)
+                .to_hex_string(),
+            identity_hash: identity.address_hash.to_hex_string(),
+            name_hash: hex_lower(&name_hash),
+            public_key: Some(identity.to_hex_string()),
+        };
+        let destination = announced().destination_hash;
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: Some("Ada".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let writer = PeerTable::load(path.clone(), now).unwrap();
+        record_announce(&writer, announced(), &app_data, 1, now).unwrap();
+        writer.persist_if_dirty().unwrap();
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("public_key");
+        assert_eq!(
+            file["version"],
+            serde_json::json!(crate::mesh::peers::PEER_TABLE_VERSION)
+        );
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let table = PeerTable::load(path.clone(), now).unwrap();
+        let row = table.get(&destination).unwrap();
+        assert_eq!(row.public_key, None);
+        assert!(row.verified_destination().is_none());
+
+        let later = now + Duration::from_secs(60);
+        let change = record_announce(&table, announced(), &app_data, 1, later);
+        assert_eq!(
+            change.map(|filed| filed.change),
+            Some(PeerChange::Refreshed)
+        );
+        table.persist_if_dirty().unwrap();
+
+        let row = PeerTable::load(path, now)
+            .unwrap()
+            .get(&destination)
+            .unwrap();
+        assert_eq!(row.public_key, Some(identity.to_hex_string()));
+        let desc = row
+            .verified_destination()
+            .expect("the announced key verifies");
+        assert_eq!(desc.address_hash.to_hex_string(), destination);
+    }
+
+    #[test]
+    fn filing_an_announce_fires_peer_discovered_for_untrusted_and_incompatible_peers_alike() {
+        let tmp = TempDir::new("node-announce-hook");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let (trust, _trust_dir) = TrustList::default().open("node-announce-hook-trust");
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let newer = MESH_PROTOCOL_VERSION + 1;
+        let app_data = AnnounceAppData {
+            version: newer,
+            display_name: Some("Bea".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let destination = "ab".repeat(16);
+        let identity = "cd".repeat(16);
+
+        let change = filer.file(
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
+            &app_data,
+            3,
+            now,
+        );
+        assert_eq!(change, Some(PeerChange::Added));
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(destination.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(identity.as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_NAME"), Some("Bea"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_HOPS"), Some("3"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_PROTOCOL_VERSION"),
+            Some(newer.to_string().as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_COMPATIBLE"),
+            Some("false")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_FIRST_SEEN"), Some("true"));
+
+        let change = filer.file(
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
+            &app_data,
+            3,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        assert!(
+            sink.drain().is_empty(),
+            "a refresh that changes nothing visible fires nothing"
+        );
+
+        let change = filer.file(
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
+            &app_data,
+            2,
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_FIRST_SEEN"), Some("false"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_HOPS"), Some("2"));
+
+        let renamed = AnnounceAppData {
+            version: newer,
+            display_name: Some("Beatrix".to_string()),
+        }
+        .encode()
+        .unwrap();
+        filer.file(
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
+            &renamed,
+            2,
+            now + Duration::from_secs(3),
+        );
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_NAME"), Some("Beatrix"));
+
+        filer.file(
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
+            &renamed,
+            2,
+            now + Duration::from_secs(4),
+        );
+        assert!(sink.drain().is_empty());
+
+        filer.file(
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
+            &renamed,
+            2,
+            now + Duration::from_secs(3 + HEARTBEAT_SECS),
+        );
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_FIRST_SEEN"),
+            Some("false"),
+            "a heartbeat after the last fire an unchanged peer fires again"
+        );
+
+        let ignored = filer.file(
+            AnnouncedDestination::without_key("12".repeat(16), identity, "ef".repeat(10)),
+            b"LXMF\x00\x01",
+            1,
+            now,
+        );
+        assert_eq!(ignored, None);
+        assert!(
+            sink.drain().is_empty(),
+            "a non-Coyote announce fires nothing"
+        );
+    }
+
+    /// An announce the peer sent as a path response says where a known peer is, not that
+    /// it is alive: the row's route facts follow it, its `last_seen` and the trust list's
+    /// sighting do not, and no discovery fires. A plain announce after it is a sighting
+    /// again, a destination without a row files as a first sighting even from a path
+    /// response, and a rotated key seen in a path response is still noted.
+    #[test]
+    fn a_path_response_for_a_known_row_refreshes_its_route_but_not_its_liveness() {
+        // Past the trust list's own `last_seen_at`, so the sighting overlay is what is read.
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000 + secs);
+        let origin = OriginName([0x5d_u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let derive = || {
+            let identity = TransportIdentity::new_from_rand(OsRng);
+            let hex = identity.address_hash().to_hex_string();
+            let destination =
+                destination_address(&origin.0, identity.address_hash()).to_hex_string();
+            (hex, destination)
+        };
+        let (a_hex, a_destination) = derive();
+        let (b_hex, b_destination) = derive();
+        let (c_hex, c_destination) = derive();
+        let app_data = |name: &str| {
+            AnnounceAppData {
+                version: MESH_PROTOCOL_VERSION,
+                display_name: Some(name.to_string()),
+            }
+            .encode()
+            .unwrap()
+        };
+        let tmp = TempDir::new("node-path-response");
+        let peers = PeerTable::load(tmp.path.join("peers.json"), at(1_000)).unwrap();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&a_destination, &a_hex)
+            .open("node-path-response-trust");
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let trust_seen = |destination: &str| {
+            trust
+                .records()
+                .into_iter()
+                .find(|record| record.hash == destination)
+                .expect("the trusted record is listed")
+                .last_seen_at
+        };
+
+        let heard_at = at(2_000);
+        let change = filer.file(
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            ),
+            &app_data("Ada"),
+            2,
+            heard_at,
+        );
+        assert_eq!(change, Some(PeerChange::Added));
+        one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(trust_seen(&a_destination), heard_at);
+
+        let responded_at = at(2_100);
+        let change = filer.file_path_response(
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            ),
+            &app_data("Ada"),
+            4,
+            responded_at,
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        let row = peers.get(&a_destination).unwrap();
+        assert_eq!(row.hops, 4, "the route facts follow the path response");
+        assert_eq!(row.last_seen, heard_at, "a path response is not a sighting");
+        assert_eq!(row.first_seen, heard_at);
+        assert!(
+            sink.drain().is_empty(),
+            "a path response fires no discovery"
+        );
+        assert_eq!(trust_seen(&a_destination), heard_at);
+
+        let announced_at = at(2_200);
+        let change = filer.file(
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            ),
+            &app_data("Ada"),
+            4,
+            announced_at,
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        assert_eq!(
+            peers.get(&a_destination).unwrap().last_seen,
+            announced_at,
+            "the peer's own announce is a sighting again"
+        );
+        assert_eq!(trust_seen(&a_destination), announced_at);
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_HOPS"),
+            Some("4"),
+            "the hop count the path response brought is first announced by the peer itself"
+        );
+
+        // The same instance under another key, in a row the trust list was never told
+        // about: the path response still marks the trusted record's key as changed.
+        peers.observe(
+            PeerSighting {
+                destination_hash: b_destination.clone(),
+                identity_hash: b_hex.clone(),
+                name_hash: name_hex.clone(),
+                public_key: None,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            heard_at,
+        );
+        let rotated_at = at(2_400);
+        let change = filer.file_path_response(
+            AnnouncedDestination::without_key(
+                b_destination.clone(),
+                b_hex.clone(),
+                name_hex.clone(),
+            ),
+            &app_data("Ada"),
+            1,
+            rotated_at,
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        assert_eq!(peers.get(&b_destination).unwrap().last_seen, heard_at);
+        let a_record = trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == a_destination)
+            .unwrap();
+        assert_eq!(
+            a_record.key_changed,
+            Some(KeyChange {
+                seen_identity: b_hex.clone(),
+                at: rotated_at,
+            })
+        );
+
+        let change = filer.file_path_response(
+            AnnouncedDestination::without_key(c_destination.clone(), c_hex, name_hex),
+            &app_data("Cy"),
+            1,
+            rotated_at,
+        );
+        assert_eq!(
+            change,
+            Some(PeerChange::Added),
+            "a destination without a row is a first sighting, path response or not"
+        );
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(c_destination.as_str())
+        );
+        assert_eq!(peers.get(&c_destination).unwrap().last_seen, rotated_at);
+    }
+
+    #[test]
+    fn filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity() {
+        let tmp = TempDir::new("node-announce-key-change");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let origin = OriginName([9u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let old = TransportIdentity::new_from_rand(OsRng);
+        let old_hex = old.address_hash().to_hex_string();
+        let old_destination = destination_address(&origin.0, old.address_hash()).to_hex_string();
+        let new = TransportIdentity::new_from_rand(OsRng);
+        let new_hex = new.address_hash().to_hex_string();
+        let new_destination = destination_address(&origin.0, new.address_hash()).to_hex_string();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&old_destination, &old_hex)
+            .open("node-announce-key-change-trust");
+        let hooks = MeshHooks::default();
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: None,
+        }
+        .encode()
+        .unwrap();
+
+        let change = filer.file(
+            AnnouncedDestination::without_key(new_destination.clone(), new_hex.clone(), name_hex),
+            &app_data,
+            1,
+            now,
+        );
+
+        assert_eq!(change, Some(PeerChange::Added));
+        let old_record = trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == old_destination)
+            .expect("the trusted record stays listed");
+        assert_eq!(old_record.identity.as_deref(), Some(old_hex.as_str()));
+        assert_eq!(
+            old_record.key_changed,
+            Some(KeyChange {
+                seen_identity: new_hex.clone(),
+                at: now,
+            })
+        );
+        assert_eq!(
+            peers.get(&new_destination).map(|peer| peer.identity_hash),
+            Some(new_hex),
+            "the announce is filed under the identity that signed it"
+        );
+    }
+
+    /// The announce path judges the owner line at the instant the announce is filed, the
+    /// same instant it hands `note_key_change`, so the rows the verdict sees expired are
+    /// the rows the line sees expired. Identity A, trusted for all destinations, announced
+    /// the instance at t(2000); its row lives for `PEER_TTL` after that. Under
+    /// `collision_protection` an announce of the same instance by B, also trusted for all
+    /// destinations, filed one second before the row expires (long past the row's life on
+    /// the real clock) is a presence collision judged as B's request would be at that
+    /// instant: one `error:` line, B refused, nothing marked, `trust.yaml` unchanged.
+    /// Filed at the instant the row expires instead, A's row is no presence for the
+    /// verdict or the line: no line at all, and B is served. Neither announce yields a
+    /// `warning:` for an identity the rung refuses.
+    #[test]
+    fn an_announces_owner_line_is_judged_at_the_instant_it_is_filed() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let a_seen = at(2_000);
+        let a_row_gone = a_seen + PEER_TTL;
+        let origin = OriginName([0x6c_u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let a = TransportIdentity::new_from_rand(OsRng);
+        let a_hex = a.address_hash().to_hex_string();
+        let a_destination = destination_address(&origin.0, a.address_hash()).to_hex_string();
+        let b = TransportIdentity::new_from_rand(OsRng);
+        let b_hex = b.address_hash().to_hex_string();
+        let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: None,
+        }
+        .encode()
+        .unwrap();
+        let fixture = |tag: &str| {
+            let tmp = TempDir::new(tag);
+            let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+            let (trust, trust_dir) = TrustList::default()
+                .identity(&a_hex, true)
+                .identity(&b_hex, true)
+                .open(&format!("{tag}-trust"));
+            trust.set_collision_protection(true);
+            let surface = Arc::new(crate::mesh::knock::RecordingSurface::default());
+            trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+            trust.attach_presence(Arc::downgrade(&peers) as Weak<dyn InstancePresence>);
+            (tmp, trust_dir, peers, trust, surface)
+        };
+        let file =
+            |filer: &mut AnnounceFiler<'_>, destination: &str, identity: &str, when: SystemTime| {
+                filer.file(
+                    AnnouncedDestination::without_key(destination, identity, name_hex.clone()),
+                    &app_data,
+                    1,
+                    when,
+                )
+            };
+
+        let (_tmp, _trust_dir, peers, trust, surface) = fixture("node-announce-one-clock-live");
+        let hooks = MeshHooks::default();
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        assert_eq!(
+            file(&mut filer, &a_destination, &a_hex, a_seen),
+            Some(PeerChange::Added)
+        );
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+        let before = std::fs::read(trust.path()).unwrap();
+        assert_eq!(
+            file(
+                &mut filer,
+                &b_destination,
+                &b_hex,
+                a_row_gone - Duration::from_secs(1)
+            ),
+            Some(PeerChange::Added)
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains(&a_hex), "{}", texts[0]);
+        assert!(texts[0].contains(&b_hex), "{}", texts[0]);
+        assert!(texts[0].contains("is refused when it asks"), "{}", texts[0]);
+        assert!(
+            !texts[0].contains("is served while it asks"),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            texts[0].contains(&format!(".mesh trust {b_destination}")),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(std::fs::read(trust.path()).unwrap(), before);
+        let (b_identity, b_name) = (parse_hash(&b_hex).unwrap(), origin.0);
+        assert_eq!(
+            trust
+                .authorize_origin_at(&b_identity, &b_name, a_row_gone - Duration::from_secs(1))
+                .verdict,
+            crate::mesh::trust::Verdict {
+                decision: Decision::Refuse,
+                rule: crate::mesh::trust::Rule::IdentityChanged
+            },
+            "the request B would make at that instant is refused as the line says"
+        );
+
+        let (_tmp, _trust_dir, peers, trust, surface) = fixture("node-announce-one-clock-gone");
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        file(&mut filer, &a_destination, &a_hex, a_seen);
+        assert_eq!(
+            file(&mut filer, &b_destination, &b_hex, a_row_gone),
+            Some(PeerChange::Added)
+        );
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+        assert_eq!(
+            trust
+                .authorize_origin_at(&parse_hash(&b_hex).unwrap(), &origin.0, a_row_gone)
+                .verdict,
+            crate::mesh::trust::Verdict {
+                decision: Decision::Allow,
+                rule: crate::mesh::trust::Rule::IdentityTrusted
+            },
+            "no live row and nothing remembered: B's own grant admits it"
+        );
+    }
+
+    #[test]
+    fn peer_discovered_fires_are_capped_across_peers_and_refill_with_time() {
+        let tmp = TempDir::new("node-announce-hook-bucket");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let (trust, _trust_dir) = TrustList::default().open("node-announce-hook-bucket-trust");
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: None,
+        }
+        .encode()
+        .unwrap();
+        let file_new = |filer: &mut AnnounceFiler<'_>, n: u32, at: SystemTime| {
+            let change = filer.file(
+                AnnouncedDestination::without_key(
+                    hex_lower(&n.to_be_bytes()).repeat(4),
+                    "cd".repeat(16),
+                    "ef".repeat(10),
+                ),
+                &app_data,
+                1,
+                at,
+            );
+            assert_eq!(change, Some(PeerChange::Added));
+        };
+
+        for n in 0..100 {
+            file_new(&mut filer, n, now);
+        }
+
+        let fired = sink.drain();
+        assert_eq!(fired.len(), DISCOVERED_FIRES_PER_SEC as usize, "{fired:?}");
+        assert!(
+            fired
+                .iter()
+                .all(|(event, _)| *event == HookEvent::MeshPeerDiscovered)
+        );
+
+        for n in 100..120 {
+            file_new(&mut filer, n, now + Duration::from_millis(500));
+        }
+        let fired = sink.drain();
+        assert_eq!(
+            fired.len(),
+            (DISCOVERED_FIRES_PER_SEC / 2.0) as usize,
+            "half a second refills half the bucket: {fired:?}"
+        );
+        assert_eq!(
+            env_value(&fired[0].1, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(hex_lower(&100u32.to_be_bytes()).repeat(4).as_str()),
+            "the first peer filed once tokens are back is the first to fire"
+        );
+    }
+
+    #[test]
+    fn peer_discovered_throttle_forgets_stale_destinations_and_caps_its_map() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut throttle = DiscoveredThrottle::default();
+        let filed = FiledAnnounce {
+            change: PeerChange::Added,
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            compatibility: Compatibility::Compatible,
+        };
+        let destination = |n: usize| hex_lower(&(n as u32).to_be_bytes()).repeat(4);
+        let file_at = |throttle: &mut DiscoveredThrottle, n: usize, at: SystemTime| {
+            // Keep the bucket out of the way: this test is about the map, not the rate.
+            throttle.tokens = DISCOVERED_FIRES_PER_SEC;
+            throttle.refilled_at = Some(at);
+            assert!(throttle.admits(&destination(n), &filed, 1, at));
+        };
+
+        for n in 0..=PEER_TABLE_MAX_ENTRIES {
+            file_at(&mut throttle, n, now);
+        }
+        assert_eq!(
+            throttle.fired.len(),
+            PEER_TABLE_MAX_ENTRIES,
+            "one more destination than the cap evicts the oldest"
+        );
+
+        let later = now + PEER_STALE_AFTER + Duration::from_secs(1);
+        file_at(&mut throttle, PEER_TABLE_MAX_ENTRIES + 1, later);
+        assert_eq!(
+            throttle.fired.len(),
+            1,
+            "every destination last fired over two heartbeats ago is forgotten"
+        );
+        assert!(
+            throttle
+                .fired
+                .contains_key(&destination(PEER_TABLE_MAX_ENTRIES + 1))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_and_stop_log_node_lifecycle_and_fire_the_mesh_hooks() {
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let started = started_runtime("node-log-lifecycle").await;
+        let runtime = started.runtime.clone();
+        let fingerprint = runtime.fingerprint().to_string();
+        let instance_id = runtime.instance_id().await;
+        let hash = runtime.destination_hash().await;
+        let interface = runtime.interfaces().remove(0);
+        assert!(interface.starts_with("private 127.0.0.1:"), "{interface}");
+        let private_hex = runtime.private_key_hex();
+        let slot = Arc::new(MeshSlot::default());
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        slot.install(runtime.clone()).unwrap();
+
+        let envs = one_fire(&sink, HookEvent::MeshStarted);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_INSTANCE_ID"),
+            Some(instance_id.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_DESTINATION"),
+            Some(hash.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_IDENTITY"),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("private"));
+
+        // The node was started on its own handle; installing bound it to the slot's sink.
+        let identity = "ab".repeat(16);
+        runtime
+            .trust()
+            .trust_identity(
+                slot.as_ref(),
+                &identity,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let granted = one_fire(&sink, HookEvent::MeshTrustGranted);
+        assert_eq!(
+            env_value(&granted, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(identity.as_str())
+        );
+
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+
+        let stopped = one_fire(&sink, HookEvent::MeshStopped);
+        assert_eq!(stopped, envs);
+        assert_eq!(private_hex.len(), 128);
+        for (key, value) in envs.iter().chain(&stopped) {
+            assert!(!value.contains(&private_hex), "{key} carries the key");
+            for at in 0..=private_hex.len() - 8 {
+                let window = &private_hex[at..at + 8];
+                assert!(
+                    fingerprint.contains(window) || !value.contains(window),
+                    "{key}={value} carries {window} of the private key"
+                );
+            }
+        }
+
+        let debugs = debug_snapshot();
+        let (fingerprint8, hash8) = (short(&fingerprint), short(&hash));
+        assert_logged(
+            &debugs,
+            &format!(
+                "Started mesh node {fingerprint8} (instance {instance_id}) as destination {hash8}"
+            ),
+        );
+        assert_logged(&debugs, &format!("Joined mesh interface {interface}"));
+        assert_logged(
+            &debugs,
+            &format!("Sent mesh announce for destination {hash8}"),
+        );
+        assert_logged(&debugs, &format!("Left mesh interface {interface}"));
+        assert_logged(
+            &debugs,
+            &format!(
+                "Stopped mesh node {fingerprint8} (instance {instance_id}, destination {hash8})"
+            ),
+        );
+        assert!(
+            debugs
+                .iter()
+                .all(|message| !message.contains(&fingerprint) && !message.contains(&hash)),
+            "a log line carries a full hash: {debugs:#?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_peer_to_an_untrusted_destination_fires_message_failed_without_the_content() {
+        use crate::mesh::message::SendError;
+
+        let started = started_runtime("node-send-untrusted-hook").await;
+        let runtime = &started.runtime;
+        let sink = RecordingHookSink::attach(runtime.hooks());
+        let destination = "ab".repeat(16);
+        let message = OutboundPeer {
+            kind: PeerKind::Message,
+            id: "m-1".to_string(),
+            in_reply_to: None,
+            title: None,
+            content: "secret body".to_string(),
+            fields: None,
+            parts: Vec::new(),
+            thread: None,
+            disposition: None,
+            retry_after: None,
+        };
+
+        let err = runtime.send_peer(&destination, &message).await.unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: destination.clone(),
+            }
+        );
+        let envs = one_fire(&sink, HookEvent::MeshMessageFailed);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_ERROR_CLASS"),
+            Some("not_trusted")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"),
+            Some("message")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("m-1"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(destination.as_str())
+        );
+        for (key, value) in &envs {
+            assert!(
+                !value.contains(&message.content),
+                "{key}={value} carries the content"
+            );
+        }
+
+        let err = runtime
+            .send_peer("\u{1b}[2Jnot-a-hash", &message)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: "not-a-hash".to_string(),
+            }
+        );
+        let envs = one_fire(&sink, HookEvent::MeshMessageFailed);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_ERROR_CLASS"),
+            Some("not_trusted")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            None,
+            "a destination that is not a hash is not passed on"
+        );
+        assert!(env_value(&envs, "COYOTE_MESH_ERROR").is_some());
+        for (key, value) in &envs {
+            assert!(
+                !value.contains('\u{1b}'),
+                "{key}={value:?} carries an escape"
+            );
+        }
+
+        let bulletin = OutboundPeer {
+            kind: PeerKind::Bulletin,
+            ..message
+        };
+        let err = runtime
+            .send_peer(&destination, &bulletin)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: destination.clone(),
+            }
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "a bulletin's fan-out reports through mesh.bulletin.sent alone"
+        );
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// A trusted peer the table knows but nothing on the network can route to: the send
+    /// asks for a path once, waits out `PATH_REQUEST_TIMEOUT` and no longer, and the
+    /// refusal says so in plain words with the number the constant renders. The peer
+    /// announced just now, so the refusal adds that it may have left the mesh. A peer
+    /// whose key the table kept is asked for the same one time: its send still waits one
+    /// `PATH_REQUEST_TIMEOUT`, since the link that follows the unanswered request does not
+    /// ask again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_destination_is_refused_within_the_path_request_timeout_with_the_new_wording()
+     {
+        use crate::mesh::message::SendError;
+        use crate::mesh::test_support::derived_sighting;
+        use crate::mesh::trust::TrustOptions;
+
+        let relay = TransportRelay::start().await;
+        let started = started_runtime_on("node-send-unreachable", relay.port).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let silent = derived_sighting("node-send-unreachable-silent", Some("Sol"));
+        let destination = silent.destination_hash.clone();
+        runtime.peers().observe(silent, SystemTime::now());
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &destination,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let message = OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap();
+
+        let asked = Instant::now();
+        let err = runtime.send_peer(&destination, &message).await.unwrap_err();
+        let waited = asked.elapsed();
+
+        assert_eq!(
+            err,
+            SendError::UnknownDestination {
+                destination: destination.clone(),
+                recently_seen: true,
+            }
+        );
+        assert!(
+            waited >= PATH_REQUEST_TIMEOUT
+                && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "the send waited {waited:?} for the path request"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that exits says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
+            )
+        );
+
+        let keyed = SingleInputDestination::new(
+            TransportIdentity::new_from_rand(OsRng),
+            session_destination_name("node-send-unreachable-keyed"),
+        )
+        .desc;
+        let keyed_destination = keyed.address_hash.to_hex_string();
+        runtime.peers().observe(
+            PeerSighting {
+                destination_hash: keyed_destination.clone(),
+                identity_hash: keyed.identity.address_hash.to_hex_string(),
+                name_hash: hex_lower(keyed.name.as_name_hash_slice()),
+                public_key: Some(keyed.identity.to_hex_string()),
+                display_name: Some("Kay".to_string()),
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &keyed_destination,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let asked = Instant::now();
+        let err = runtime
+            .send_peer(&keyed_destination, &message)
+            .await
+            .unwrap_err();
+        let waited = asked.elapsed();
+
+        assert_eq!(err, SendError::NoPropagationNode);
+        assert!(
+            waited >= PATH_REQUEST_TIMEOUT
+                && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "the keyed send waited {waited:?}, one path request and no second"
+        );
+        slot.stop().await.unwrap();
+        relay.stop().await;
+    }
+
+    /// Two nodes through a relay that never replays an announce. B is restarted on its
+    /// own config dir, so it knows A only from `peers.json` and its transport holds no
+    /// route to A. Resolving A asks the network once: the relay answers from its path
+    /// table well inside `PATH_REQUEST_TIMEOUT`, the description comes back, and the
+    /// answer is filed as a route, not a sighting: A's row keeps its `last_seen`, the
+    /// trust list keeps its sighting time, and no `mesh.peer.discovered` fires on B. A
+    /// second resolve, with the identity now held, does not wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolving_a_peer_known_only_from_the_persisted_table_asks_for_a_path_and_files_the_answer_as_a_route()
+     {
+        use crate::mesh::test_support::wait_for_peer;
+        use crate::mesh::trust::TrustOptions;
+
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on("node-path-route-a", relay.port).await;
+        let mut b = started_runtime_on("node-path-route-b", relay.port).await;
+        let to_a = a.runtime.current_destination_hash();
+        let to_b = b.runtime.current_destination_hash();
+        wait_for_peer(&a.runtime, &to_b).await;
+        wait_for_peer(&b.runtime, &to_a).await;
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        a.runtime
+            .trust()
+            .trust_destination(
+                slot_a.as_ref(),
+                &to_b,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        b.runtime
+            .trust()
+            .trust_destination(
+                slot_b.as_ref(),
+                &to_a,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let trust_seen = |runtime: &MeshRuntime| {
+            runtime
+                .trust()
+                .records()
+                .into_iter()
+                .find(|record| record.hash == to_a)
+                .expect("A is on B's trust list")
+                .last_seen_at
+        };
+        let row_before = b.runtime.peers().get(&to_a).expect("B filed A");
+        let trust_before = trust_seen(&b.runtime);
+
+        // `.mesh off` then `.mesh on` on B: the slot's stop writes the peer table.
+        let mut relay_announces = relay.announces().await;
+        assert!(slot_b.stop().await.unwrap());
+        b.restart_on(relay.port).await;
+        TransportRelay::heard_from(&mut relay_announces, &to_b).await;
+        let peers_b = b.runtime.peers();
+        let row_read_back = peers_b.get(&to_a).expect("B reads A back from peers.json");
+        assert_eq!(row_read_back.last_seen, row_before.last_seen);
+        assert!(
+            !b.knows_identity_of(&to_a).await,
+            "the restarted B already holds A's identity, so this run proves nothing about path requests"
+        );
+        let sink = RecordingHookSink::attach(b.runtime.hooks());
+
+        let asked = Instant::now();
+        let desc = b.runtime.resolve_destination(&to_a).await;
+        let waited = asked.elapsed();
+        assert!(
+            desc.is_some(),
+            "the relay answers the path request from its table"
+        );
+        assert!(
+            waited < PATH_REQUEST_TIMEOUT,
+            "the answer came back in {waited:?}, inside the path-request bound"
+        );
+        assert_eq!(
+            desc.unwrap().address_hash.to_hex_string(),
+            to_a,
+            "the description is A's"
+        );
+        assert!(b.knows_identity_of(&to_a).await);
+
+        // Let any second copy of the answer land before judging what was filed.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let row_after = peers_b.get(&to_a).unwrap();
+        assert_eq!(
+            row_after.last_seen, row_before.last_seen,
+            "a path response is not a sighting: last_seen stays where A's own announce left it"
+        );
+        assert_eq!(row_after.identity_hash, row_before.identity_hash);
+        assert_eq!(
+            trust_seen(&b.runtime),
+            trust_before,
+            "the trust list's sighting time does not move either"
+        );
+        let fired: Vec<HookEvent> = sink.drain().into_iter().map(|(event, _)| event).collect();
+        assert!(
+            !fired.contains(&HookEvent::MeshPeerDiscovered),
+            "no discovery fires for the answer to this node's own request: {fired:?}"
+        );
+
+        // With the identity held, resolving again is immediate.
+        let again = Instant::now();
+        assert!(b.runtime.resolve_destination(&to_a).await.is_some());
+        assert!(
+            again.elapsed() < Duration::from_secs(1),
+            "a held identity is not asked for: {:?}",
+            again.elapsed()
+        );
+
+        // The route works: a message goes over a link without A ever re-announcing.
+        let message =
+            OutboundPeer::new(PeerKind::Message, "still here?", None, None, None).unwrap();
+        let outcome = b.runtime.send_peer(&to_a, &message).await.unwrap();
+        assert_eq!(
+            outcome.via,
+            PeerVia::Direct,
+            "delivered over the requested route: {outcome:?}"
+        );
+
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        slot_b.stop().await.unwrap();
+        slot_a.stop().await.unwrap();
+        relay.stop().await;
+    }
+
+    /// First contact with a destination this node has not heard: B, restarted with no
+    /// peer table, learns A only by asking for it.
+    #[cfg(unix)]
+    mod first_contact_tests {
+        use super::*;
+        use crate::mesh::message::FirstContactMiss;
+        use crate::mesh::test_support::{
+            derived_sighting, pair_where_b_has_not_heard_a, wait_for_peer,
+        };
+
+        struct LateJoiner {
+            relay: TransportRelay,
+            a: StartedRuntime,
+            b: StartedRuntime,
+            slot_a: Arc<MeshSlot>,
+            slot_b: Arc<MeshSlot>,
+            to_a: String,
+            to_b: String,
+        }
+
+        impl LateJoiner {
+            async fn start(tag: &str) -> Self {
+                let (relay, a, b) = pair_where_b_has_not_heard_a(tag).await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let slot_b = Arc::new(MeshSlot::default());
+                slot_b.install(b.runtime.clone()).unwrap();
+                Self {
+                    relay,
+                    a,
+                    b,
+                    slot_a,
+                    slot_b,
+                    to_a,
+                    to_b,
+                }
+            }
+
+            async fn assert_b_lacks_a(&self) {
+                assert!(
+                    self.b.runtime.peers().get(&self.to_a).is_none(),
+                    "B has no row for A"
+                );
+                assert!(
+                    !self.b.knows_identity_of(&self.to_a).await,
+                    "B's transport holds nothing of A"
+                );
+            }
+
+            fn identity_of_a(&self) -> String {
+                self.a
+                    .runtime
+                    .transport_identity
+                    .address_hash()
+                    .to_hex_string()
+            }
+
+            async fn stop(self) {
+                self.slot_b.stop().await.unwrap();
+                self.slot_a.stop().await.unwrap();
+                self.relay.stop().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unheard_destination_is_asked_for_filed_trusted_and_answers_status_both_ways() {
+            let pair = LateJoiner::start("first-contact-trust").await;
+
+            let asked = Instant::now();
+            let row = pair
+                .b
+                .runtime
+                .peer_asking_if_unheard(&pair.to_a)
+                .await
+                .expect("the relay answers the path request with A's announce");
+            assert!(
+                asked.elapsed() < PATH_REQUEST_TIMEOUT + Duration::from_secs(1),
+                "one path request and a short grace: {:?}",
+                asked.elapsed()
+            );
+            assert_eq!(row.destination_hash, pair.to_a);
+            assert_eq!(row.identity_hash, pair.identity_of_a());
+            assert!(pair.b.runtime.peers().get(&pair.to_a).is_some());
+
+            pair.b
+                .runtime
+                .trust()
+                .trust_destination(
+                    pair.slot_b.as_ref(),
+                    &pair.to_a,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .expect("B trusts A once the row is filed");
+            status_round_trip(&pair.slot_b, &pair.slot_a).await;
+            status_round_trip(&pair.slot_a, &pair.slot_b).await;
+            pair.stop().await;
+        }
+
+        /// A send to an unheard instance of an identity trusted for all destinations asks
+        /// for it, then judges the identity the answer carries.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_to_an_unheard_instance_of_a_trusted_identity_asks_and_is_delivered() {
+            let pair = LateJoiner::start("first-contact-send").await;
+            pair.b
+                .runtime
+                .trust()
+                .trust_identity(
+                    pair.slot_b.as_ref(),
+                    &pair.identity_of_a(),
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            pair.a
+                .runtime
+                .trust()
+                .trust_destination(
+                    pair.slot_a.as_ref(),
+                    &pair.to_b,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+            let outcome = pair.b.runtime.send_peer(&pair.to_a, &message).await;
+            assert!(outcome.is_ok(), "the send reached A: {outcome:?}");
+            assert!(pair.b.runtime.peers().get(&pair.to_a).is_some());
+            pair.stop().await;
+        }
+
+        /// With no grant that could cover the destination, or with the destination
+        /// blocked, a send is refused before any path request: it returns at once and B
+        /// still holds nothing of A.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_no_grant_could_allow_is_refused_without_asking() {
+            let pair = LateJoiner::start("first-contact-refused").await;
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+            let refused = |outcome: Result<SendOutcome, SendError>| {
+                assert!(
+                    matches!(outcome, Err(SendError::NotTrusted { .. })),
+                    "{outcome:?}"
+                );
+            };
+
+            let asked = Instant::now();
+            refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
+            pair.assert_b_lacks_a().await;
+
+            let trust = pair.b.runtime.trust();
+            trust
+                .trust_identity(
+                    pair.slot_b.as_ref(),
+                    &pair.identity_of_a(),
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            trust
+                .deny_destination(
+                    pair.slot_b.as_ref(),
+                    &pair.to_a,
+                    None,
+                    SystemTime::now(),
+                    false,
+                )
+                .unwrap();
+            let asked = Instant::now();
+            refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
+            pair.assert_b_lacks_a().await;
+            pair.stop().await;
+        }
+
+        /// The grant B's start seeds for its own identity covers every destination, but
+        /// only of B's own identity, so it is no reason to ask for a foreign one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_under_only_the_own_identitys_grant_is_refused_without_asking() {
+            let pair = LateJoiner::start("first-contact-own-grant").await;
+            let own = pair
+                .b
+                .runtime
+                .transport_identity
+                .address_hash()
+                .to_hex_string();
+            let records = pair.b.runtime.trust().records();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| (record.hash.as_str(), record.all_destinations))
+                    .collect::<Vec<_>>(),
+                vec![(own.as_str(), true)],
+                "B's trust list holds only its own seeded grant"
+            );
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+
+            let asked = Instant::now();
+            let outcome = pair.b.runtime.send_peer(&pair.to_a, &message).await;
+            assert!(
+                matches!(outcome, Err(SendError::NotTrusted { .. })),
+                "{outcome:?}"
+            );
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
+            pair.assert_b_lacks_a().await;
+            pair.stop().await;
+        }
+
+        /// A row swept after `PEER_TTL` leaves the transport's path standing. Asking for
+        /// the destination still sends a path request, and A's answer files the row
+        /// again; the held path alone would file nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_destination_the_transport_holds_without_a_row_is_asked_for_and_filed_again() {
+            let relay = TransportRelay::start().await;
+            let a = started_runtime_on("first-contact-held-a", relay.port).await;
+            let b = started_runtime_on("first-contact-held-b", relay.port).await;
+            let to_a = a.runtime.current_destination_hash();
+            let peers = b.runtime.peers();
+            wait_for_peer(&b.runtime, &to_a).await;
+            assert_eq!(
+                peers.sweep(SystemTime::now() + PEER_TTL + Duration::from_secs(60)),
+                vec![to_a.clone()]
+            );
+            assert!(peers.get(&to_a).is_none());
+            assert!(
+                b.runtime.path_known(&to_a).await,
+                "the transport still holds a path to A"
+            );
+
+            let asked = Instant::now();
+            let row = b
+                .runtime
+                .peer_asking_if_unheard(&to_a)
+                .await
+                .expect("A answers the path request and is filed again");
+            assert!(
+                asked.elapsed() < PATH_REQUEST_TIMEOUT,
+                "{:?}",
+                asked.elapsed()
+            );
+            assert_eq!(row.destination_hash, to_a);
+            assert!(peers.get(&to_a).is_some());
+
+            for started in [b, a] {
+                let slot = Arc::new(MeshSlot::default());
+                slot.install(started.runtime.clone()).unwrap();
+                slot.stop().await.unwrap();
+            }
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_destination_nothing_answers_for_is_given_up_within_the_path_request_bound() {
+            let relay = TransportRelay::start().await;
+            let started = started_runtime_on("first-contact-unreachable", relay.port).await;
+            let stranger =
+                derived_sighting("first-contact-unreachable-stranger", None).destination_hash;
+
+            let asked = Instant::now();
+            assert_eq!(
+                started
+                    .runtime
+                    .peer_asking_if_unheard(&stranger)
+                    .await
+                    .err(),
+                Some(FirstContactMiss::NoAnswer)
+            );
+            let waited = asked.elapsed();
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(2),
+                "{waited:?}"
+            );
+            assert!(started.runtime.peers().get(&stranger).is_none());
+
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(started.runtime.clone()).unwrap();
+            slot.stop().await.unwrap();
+            relay.stop().await;
+        }
+    }
+
+    /// The peer table is no gate on resolving: a destination the transport does not hold
+    /// is asked for once, row or no row. The cached twin a listing uses returns `None` at
+    /// once for either, so a sweep over silent peers never pays the path-request wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_destination_the_transport_lacks_is_asked_for_once_and_the_cached_resolve_never_asks()
+    {
+        use crate::mesh::test_support::derived_sighting;
+
+        let relay = TransportRelay::start().await;
+        let started = started_runtime_on("node-resolve-no-ask", relay.port).await;
+        let runtime = started.runtime.clone();
+        let peers = runtime.peers();
+
+        let stranger = derived_sighting("node-resolve-no-ask-stranger", None).destination_hash;
+        let asked = Instant::now();
+        assert!(
+            runtime
+                .resolve_destination_cached(&stranger)
+                .await
+                .is_none()
+        );
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the cached resolve of a destination without a row does not wait: {:?}",
+            asked.elapsed()
+        );
+        let asked = Instant::now();
+        assert!(runtime.resolve_destination(&stranger).await.is_none());
+        assert!(
+            asked.elapsed() >= PATH_REQUEST_TIMEOUT,
+            "a destination without a row is still asked for: {:?}",
+            asked.elapsed()
+        );
+
+        let silent = derived_sighting("node-resolve-no-ask-silent", Some("Sol"));
+        let silent_destination = silent.destination_hash.clone();
+        peers.observe(silent, SystemTime::now());
+        let asked = Instant::now();
+        assert!(
+            runtime
+                .resolve_destination_cached(&silent_destination)
+                .await
+                .is_none()
+        );
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the cached resolve does not wait: {:?}",
+            asked.elapsed()
+        );
+
+        // The waiting resolve on the same row does ask.
+        let asked = Instant::now();
+        assert!(
+            runtime
+                .resolve_destination(&silent_destination)
+                .await
+                .is_none()
+        );
+        assert!(asked.elapsed() >= PATH_REQUEST_TIMEOUT);
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+        relay.stop().await;
+    }
+
+    /// Without a row the description is the transport's: a peer whose row the sweep has
+    /// aged out still resolves, at once, for as long as the transport holds what its
+    /// announce taught.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_row_was_swept_still_resolves_through_the_transport() {
+        let stub = PeerStub::listen("node-resolve-swept-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-resolve-swept", stub.port()).await;
+        let runtime = started.runtime.clone();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        assert_eq!(desc.address_hash.to_hex_string(), to);
+
+        assert_eq!(peers.sweep(SystemTime::now() + PEER_TTL), vec![to.clone()]);
+        assert!(peers.get(&to).is_none());
+
+        let asked = Instant::now();
+        let cached = runtime.resolve_destination_cached(&to).await.unwrap();
+        let again = runtime.resolve_destination(&to).await.unwrap();
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "a held description is not asked for: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(cached.address_hash, desc.address_hash);
+        assert_eq!(again.address_hash, desc.address_hash);
+        assert_eq!(
+            again.name.as_name_hash_slice(),
+            desc.name.as_name_hash_slice()
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+    }
+
+    /// A filed peer, trusted both ways, whose path this node's transport has dropped while
+    /// it keeps the description: what a held peer looks like once its route has expired.
+    #[cfg(unix)]
+    async fn held_peer_whose_path_expired(
+        tag: &str,
+    ) -> (PeerStub, StartedRuntime, Arc<MeshSlot>, DestinationDesc) {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on(tag, stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        stub.wait_to_be_filed(&runtime.peers(), &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(
+            transport.expire_path(&desc.address_hash).await,
+            "the announce left a path to expire"
+        );
+        assert!(!transport.has_path(&desc.address_hash).await);
+        (stub, started, slot, desc)
+    }
+
+    /// A held description whose path expired still resolves at once and asks nothing, and
+    /// the request to it asks the network for the path once, inside its link: the peer
+    /// answers, the link is tried again and the message is delivered directly, well
+    /// inside one `PATH_REQUEST_TIMEOUT`. The peer is resolved by its stored key, which
+    /// asked nothing because the description was held, so the link is the one that asks.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_destination_whose_path_expired_resolves_at_once_and_its_request_asks_for_the_path()
+     {
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-resolve-stale-reachable").await;
+        let runtime = started.runtime.clone();
+        let to = stub.destination_hex();
+
+        let asked = Instant::now();
+        let resolved = runtime.resolve_destination(&to).await;
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "a held description is answered at once: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(resolved.unwrap().address_hash, desc.address_hash);
+
+        let message = OutboundPeer::new(PeerKind::Message, "still here", None, None, None).unwrap();
+        let asked = Instant::now();
+        let sent = runtime.send_peer(&to, &message).await.unwrap();
+        let waited = asked.elapsed();
+
+        assert_eq!(sent.via, PeerVia::Direct);
+        assert!(
+            waited < PATH_REQUEST_TIMEOUT,
+            "one answered path request, not a timed-out one: {waited:?}"
+        );
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(transport.has_path(&desc.address_hash).await);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].content, "still here");
+
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// The same held peer with nothing left to answer for it: the request's one path
+    /// request goes unanswered, so it fails as `LinkFailed` naming no known path after
+    /// one `PATH_REQUEST_TIMEOUT`, not at once and not after a second wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_destination_whose_path_expired_and_whose_peer_is_gone_fails_after_one_path_request()
+     {
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-resolve-stale-unreachable").await;
+        let runtime = started.runtime.clone();
+        stub.stop().await;
+
+        let asked = Instant::now();
+        let result = runtime
+            .request(&desc, "/echo", rmpv::Value::Nil, RequestOptions::default())
+            .await;
+        let waited = asked.elapsed();
+
+        assert!(
+            matches!(&result, Err(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+            "{result:?}"
+        );
+        assert!(
+            waited >= PATH_REQUEST_TIMEOUT
+                && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "the request waited {waited:?} for the path request"
+        );
+
+        assert!(slot.stop().await.unwrap());
+    }
+
+    /// After a restart the runtime has heard no announce, so its transport holds neither
+    /// the peer's description nor a path, and the key the peer table kept is what resolves
+    /// it. The one path request the resolve sends is answered by the peer, and the
+    /// description returned is the one rebuilt from the stored key.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_node_resolves_a_peer_by_its_stored_key_once_a_path_request_is_answered() {
+        let stub = PeerStub::listen(
+            "node-resolve-stored-key-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let mut started = started_runtime_on("node-resolve-stored-key", stub.port()).await;
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        stub.wait_to_be_filed(&started.runtime.peers(), &to).await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        assert!(slot.stop().await.unwrap());
+        started.restart_on(stub.port()).await;
+
+        let stored = started
+            .runtime
+            .peers()
+            .get(&to)
+            .expect("the row is read back from peers.json");
+        let expected = stored
+            .verified_destination()
+            .expect("the announce's key was stored with the row and verifies");
+        let hash = expected.address_hash;
+        let transport = started.runtime.transport_handle().await.unwrap();
+        assert!(!started.knows_identity_of(&to).await);
+        assert!(transport.destination_desc(&hash).await.is_none());
+        assert!(!transport.has_path(&hash).await);
+
+        let desc = started
+            .runtime
+            .resolve_destination(&to)
+            .await
+            .expect("the peer answers the path request");
+
+        assert_eq!(desc.address_hash, hash);
+        assert_eq!(
+            desc.identity.to_hex_string(),
+            expected.identity.to_hex_string()
+        );
+        assert_eq!(
+            desc.name.as_name_hash_slice(),
+            expected.name.as_name_hash_slice()
+        );
+        assert!(transport.has_path(&hash).await);
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+        stub.stop().await;
+    }
+
+    /// A reference the send never carried is not left lent: the one-off grant written
+    /// before the send is taken back when the send fails, and the error is the send's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lend_whose_send_fails_takes_the_grant_back() {
+        use crate::mesh::message::SendError;
+
+        let started = started_runtime("node-lend-unsent").await;
+        let runtime = &started.runtime;
+        let destination = "ab".repeat(16);
+        let message = OutboundPeer {
+            kind: PeerKind::Message,
+            id: "m-1".to_string(),
+            in_reply_to: None,
+            title: None,
+            content: "see the attached".to_string(),
+            fields: None,
+            parts: vec![RawPart::File {
+                name: "docs/big.md".to_string(),
+                size: 4_096,
+                sha256: [7u8; 32],
+                bytes: None,
+                reference: Some("docs/big.md".to_string()),
+            }],
+            thread: None,
+            disposition: None,
+            retry_after: None,
+        };
+
+        let err = runtime
+            .send_peer_lending_reference(&destination, &message)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: destination.clone()
+            }
+            .to_string()
+        );
+        assert!(runtime.serving().grants().list().unwrap().is_empty());
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    fn fires_of<'a>(
+        fired: &'a [(HookEvent, Vec<(&'static str, String)>)],
+        event: HookEvent,
+    ) -> Vec<&'a Vec<(&'static str, String)>> {
+        fired
+            .iter()
+            .filter(|(fired_event, _)| *fired_event == event)
+            .map(|(_, envs)| envs)
+            .collect()
+    }
+
+    /// A trusted, reachable peer: a message reports once through `mesh.message.sent`, a
+    /// bulletin once through `mesh.bulletin.sent`, and neither carries the content.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_peer_fires_message_sent_and_broadcast_fires_bulletin_sent_alone() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-sent-hook-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-sent-hook", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let sink = RecordingHookSink::attach(runtime.hooks());
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        sink.drain();
+        let message = OutboundPeer {
+            kind: PeerKind::Message,
+            id: "m-1".to_string(),
+            in_reply_to: None,
+            title: Some("hello".to_string()),
+            content: "the secret words for the peer".to_string(),
+            fields: None,
+            parts: Vec::new(),
+            thread: None,
+            disposition: None,
+            retry_after: None,
+        };
+
+        let sent = runtime.send_peer(&to, &message).await.unwrap();
+
+        assert_eq!(sent.via, PeerVia::Direct);
+        let fired = sink.drain();
+        let sent_fires = fires_of(&fired, HookEvent::MeshMessageSent);
+        assert_eq!(sent_fires.len(), 1, "{fired:?}");
+        assert!(fires_of(&fired, HookEvent::MeshMessageFailed).is_empty());
+        let envs = sent_fires[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_VIA"), Some("direct"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("message"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_ID"), Some("m-1"));
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(to.as_str())
+        );
+        for (key, value) in envs {
+            assert!(
+                !value.contains(&message.content) && !value.contains("hello"),
+                "{key}={value} carries the message"
+            );
+        }
+
+        let bulletin = OutboundPeer {
+            kind: PeerKind::Bulletin,
+            id: "b-1".to_string(),
+            in_reply_to: None,
+            title: None,
+            content: "the bulletin words for everyone".to_string(),
+            fields: None,
+            parts: Vec::new(),
+            thread: None,
+            disposition: None,
+            retry_after: None,
+        };
+
+        let outcome = runtime.broadcast(&bulletin).await.unwrap();
+
+        assert_eq!(outcome.recipients.len(), 1, "{:?}", outcome.recipients);
+        let fired = sink.drain();
+        let bulletin_fires = fires_of(&fired, HookEvent::MeshBulletinSent);
+        assert_eq!(bulletin_fires.len(), 1, "{fired:?}");
+        assert!(
+            fires_of(&fired, HookEvent::MeshMessageSent).is_empty()
+                && fires_of(&fired, HookEvent::MeshMessageFailed).is_empty(),
+            "the per-recipient sends of a bulletin report nothing of their own: {fired:?}"
+        );
+        let envs = bulletin_fires[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_ID"), Some("b-1"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_RECIPIENTS"), Some("1"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_DELIVERED"), Some("1"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_STORED"), Some("0"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_UNREACHABLE"), Some("0"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_REFUSED"), Some("0"));
+        for (key, value) in envs {
+            assert!(
+                !value.contains(&bulletin.content),
+                "{key}={value} carries the bulletin"
+            );
+        }
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[test]
+    fn plan_interfaces_maps_configured_list_one_to_one() {
+        let plans = plan_interfaces(&[
+            MeshInterface::Lan,
+            MeshInterface::Private {
+                host: "127.0.0.1".to_string(),
+                port: 4242,
+            },
+            MeshInterface::Public {
+                host: "relay.example".to_string(),
+                port: 4965,
+            },
+        ]);
+
+        assert_eq!(
+            plans,
+            vec![
+                InterfacePlan::Lan,
+                InterfacePlan::Tcp {
+                    kind: "private",
+                    endpoint: "127.0.0.1:4242".to_string(),
+                },
+                InterfacePlan::Tcp {
+                    kind: "public",
+                    endpoint: "relay.example:4965".to_string(),
+                },
+            ]
+        );
+        assert_eq!(plan_interfaces(&[]), Vec::<InterfacePlan>::new());
+    }
+
+    #[test]
+    fn lan_bind_failure_message_keeps_its_prefix_and_names_the_local_relay() {
+        let message = lan_bind_failure_message(&"boom");
+        assert_eq!(
+            message,
+            "Failed to bind the mesh lan interface: boom. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process. Two Coyote sessions on one host need a local relay; see Mesh-Deployment."
+        );
+        assert!(message.starts_with("Failed to bind the mesh lan interface"));
+    }
+
+    /// Once `start` has built the request handler, every `abandon_start` below it hands
+    /// the handler over, so an unwinding start drains it like `stop` does; only the
+    /// failure before the handler exists passes `None`.
+    #[test]
+    fn every_abandon_after_the_handler_exists_drains_it() {
+        let source = include_str!("node.rs");
+        // Assembled at run time so this test's own text is not a second match.
+        let handler = ["let request_handler = Arc::new(", "LibraryHandler::new("].concat();
+        let start = source.split(handler.as_str()).collect::<Vec<_>>();
+        assert_eq!(start.len(), 2, "one handler construction in start");
+        let before = start[0]
+            .rsplit("async fn start(")
+            .next()
+            .expect("start precedes the handler");
+        let after = start[1]
+            .split("\n    }\n")
+            .next()
+            .expect("start ends after the handler");
+        let call = "abandon_start(";
+        assert_eq!(
+            before
+                .matches(&format!("{call}transport, joined, None)"))
+                .count(),
+            1,
+            "exactly one abandon before the handler, passing None"
+        );
+        let calls: Vec<&str> = after
+            .match_indices(call)
+            .map(|(at, _)| &after[at..])
+            .collect();
+        assert!(!calls.is_empty(), "start unwinds after the handler exists");
+        for call in calls {
+            let args = call.split(')').next().unwrap_or_default();
+            assert!(
+                args.contains("Some(&request_handler"),
+                "an abandon after the handler exists must drain it: {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_hint_names_the_endpoint() {
+        assert_eq!(
+            loopback_hint("127.0.0.1:4242"),
+            " Nothing is listening on 127.0.0.1:4242. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+        );
+    }
+
+    #[test]
+    fn interface_state_display_distinguishes_retrying_from_given_up() {
+        assert_eq!(InterfaceState::Connected.to_string(), "connected");
+        assert_eq!(
+            InterfaceState::Unreachable {
+                reason: "x".to_string(),
+                retrying: true,
+            }
+            .to_string(),
+            "unreachable, retrying: x"
+        );
+        assert_eq!(
+            InterfaceState::Unreachable {
+                reason: "x".to_string(),
+                retrying: false,
+            }
+            .to_string(),
+            "unreachable: x"
+        );
+        assert_eq!(
+            InterfaceState::Connecting { dial_failure: None }.to_string(),
+            "connecting"
+        );
+        for advice in [DialAdvice::StartRnsd, DialAdvice::Redialing] {
+            assert_eq!(
+                InterfaceState::Connecting {
+                    dial_failure: Some(DialFailure {
+                        reason: "x".to_string(),
+                        advice,
+                    }),
+                }
+                .to_string(),
+                "connecting, retrying: x"
+            );
+        }
+        assert_eq!(
+            InterfaceState::Disconnected {
+                reason: "x".to_string(),
+            }
+            .to_string(),
+            "lost, retrying: x"
+        );
+    }
+
+    #[test]
+    fn is_loopback_covers_the_loopback_block_and_localhost() {
+        fn relay(endpoint: &str) -> InterfaceStatus {
+            InterfaceStatus {
+                label: format!("private {endpoint}"),
+                kind: "private",
+                endpoint: Some(endpoint.to_string()),
+                state: InterfaceState::Connected,
+            }
+        }
+
+        for endpoint in [
+            "127.0.0.1:4242",
+            "127.0.0.2:4242",
+            "[::1]:4242",
+            "LOCALHOST:4242",
+        ] {
+            assert!(relay(endpoint).is_loopback(), "{endpoint}");
+        }
+        for endpoint in ["10.0.0.1:4242", "relay.example:4965"] {
+            assert!(!relay(endpoint).is_loopback(), "{endpoint}");
+        }
+        assert!(
+            !InterfaceStatus {
+                label: "lan".to_string(),
+                kind: "lan",
+                endpoint: None,
+                state: InterfaceState::Connected,
+            }
+            .is_loopback()
+        );
+        for endpoint in ["@rns/default", "127.0.0.1:37428"] {
+            assert!(
+                InterfaceStatus {
+                    label: format!("local rnsd at {endpoint}"),
+                    kind: "local",
+                    endpoint: Some(endpoint.to_string()),
+                    state: InterfaceState::Connected,
+                }
+                .is_loopback(),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_plans_carry_the_endpoint_text_and_the_local_kind() {
+        assert_eq!(
+            LocalEndpoint::on_platform(true, None, None).to_string(),
+            "@rns/default"
+        );
+        assert_eq!(
+            LocalEndpoint::on_platform(true, Some(1), Some("lab")).to_string(),
+            "@rns/lab"
+        );
+        assert_eq!(
+            LocalEndpoint::on_platform(false, None, None).to_string(),
+            "127.0.0.1:37428"
+        );
+        assert_eq!(
+            LocalEndpoint::on_platform(false, Some(37429), Some("lab")).to_string(),
+            "127.0.0.1:37429"
+        );
+        let plans = plan_interfaces(&[MeshInterface::Local {
+            port: Some(37429),
+            instance: Some("lab".to_string()),
+        }]);
+        let endpoint = LocalEndpoint::of(Some(37429), Some("lab"));
+        assert_eq!(
+            plans,
+            vec![InterfacePlan::Local {
+                endpoint: endpoint.clone()
+            }]
+        );
+        let status = plans[0].status(InterfaceState::Connecting { dial_failure: None });
+        assert_eq!(status.kind, "local");
+        assert_eq!(status.label, format!("local rnsd at {endpoint}"));
+        assert_eq!(status.endpoint, Some(endpoint.to_string()));
+        assert!(status.is_loopback());
+    }
+
+    #[tokio::test]
+    async fn start_refuses_invalid_config_before_touching_disk() {
+        let tmp = TempDir::new("node-invalid");
+        let paths = mesh_paths(&tmp);
+        let identity_path = paths.identity_path.clone();
+        let config = MeshConfig {
+            interfaces: vec![],
+            ..MeshConfig::default()
+        };
+        let mut session = Session::default();
+
+        let err = MeshRuntime::start(&config, true, &mut session, paths, NodeOptions::default())
+            .await
+            .err()
+            .expect("an empty interface list must be refused")
+            .to_string();
+
+        assert!(err.contains("mesh.interfaces"), "{err}");
+        assert!(!tmp.path.join("cache").exists());
+        assert!(!identity_path.exists());
+        assert_eq!(session.mesh_instance_id(), None);
+    }
+
+    #[tokio::test]
+    async fn start_refuses_invisible_display_name_before_touching_disk() {
+        let tmp = TempDir::new("node-invisible-name");
+        let paths = mesh_paths(&tmp);
+        let identity_path = paths.identity_path.clone();
+        let config = MeshConfig {
+            display_name: Some("Al\u{202E}ex".into()),
+            ..MeshConfig::default()
+        };
+        let mut session = Session::default();
+
+        let err = MeshRuntime::start(&config, true, &mut session, paths, NodeOptions::default())
+            .await
+            .err()
+            .expect("a display name with a bidi override must be refused")
+            .to_string();
+
+        assert!(err.contains("mesh.display_name"), "{err}");
+        assert!(!tmp.path.join("cache").join("mesh").exists());
+        assert!(!identity_path.exists());
+        assert_eq!(session.mesh_instance_id(), None);
+    }
+
+    #[tokio::test]
+    async fn start_with_function_calling_disabled_is_refused() {
+        let tmp = TempDir::new("node-no-fc");
+        let paths = mesh_paths(&tmp);
+        let identity_path = paths.identity_path.clone();
+        let mut session = Session::default();
+
+        let err = MeshRuntime::start(
+            &private_config(1),
+            false,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .err()
+        .expect("a node without function calling must be refused")
+        .to_string();
+
+        assert!(err.contains("function_calling_support"), "{err}");
+        assert!(!tmp.path.join("cache").exists());
+        assert!(!identity_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_fails_naming_unreachable_private_relay() {
+        let port = closed_port().await;
+        let tmp = TempDir::new("node-unreachable");
+        let paths = mesh_paths(&tmp);
+        let cache_dir = paths.cache_dir.clone();
+        let mut session = Session::default();
+
+        let err = MeshRuntime::start(
+            &private_config(port),
+            true,
+            &mut session,
+            paths,
+            NodeOptions {
+                connect_timeout: Duration::from_millis(300),
+                ..NodeOptions::default()
+            },
+        )
+        .await
+        .err()
+        .expect("a closed relay port must be refused")
+        .to_string();
+
+        assert!(err.contains(&format!("127.0.0.1:{port}")), "{err}");
+        assert!(err.contains("private"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "Nothing is listening on 127.0.0.1:{port}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+            )),
+            "{err}"
+        );
+        let instance_id = session.mesh_instance_id().unwrap();
+        assert!(lock_path(&cache_dir, instance_id).exists());
+        let _reacquired = InstanceLock::acquire(&cache_dir, instance_id)
+            .expect("a failed start must release the instance lock");
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A node configured on every port in `ports`, each a private relay on loopback.
+    #[cfg(unix)]
+    fn private_relays(ports: &[u16]) -> MeshConfig {
+        MeshConfig {
+            interfaces: ports
+                .iter()
+                .map(|port| MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: *port,
+                })
+                .collect(),
+            ..MeshConfig::default()
+        }
+    }
+
+    /// Keeps the sequential join quick when a plan in the list is refused or unroutable.
+    #[cfg(unix)]
+    fn short_connect() -> NodeOptions {
+        NodeOptions {
+            connect_timeout: Duration::from_millis(300),
+            ..NodeOptions::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn private_label(port: u16) -> String {
+        format!("private 127.0.0.1:{port}")
+    }
+
+    /// How a reconnect line left to the heartbeat ends, after the age of the last announce.
+    #[cfg(unix)]
+    const DEFERRED_SUFFIX: &str = " ago, so it waits for the next heartbeat to announce again";
+
+    #[cfg(unix)]
+    fn states_of(runtime: &MeshRuntime) -> Vec<(String, InterfaceState)> {
+        runtime
+            .interface_states()
+            .into_iter()
+            .map(|status| (status.label, status.state))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn is_retrying(state: &InterfaceState) -> bool {
+        matches!(state, InterfaceState::Unreachable { retrying: true, .. })
+    }
+
+    #[cfg(unix)]
+    fn all_connected(runtime: &MeshRuntime) -> bool {
+        runtime
+            .interface_states()
+            .iter()
+            .all(|status| status.state == InterfaceState::Connected)
+    }
+
+    /// Waits up to `CONNECT_LATER_TIMEOUT` for the slot's notifier to have been handed the
+    /// `[mesh]` line for `text`.
+    #[cfg(unix)]
+    async fn wait_for_mesh_line(sink: &RecordingSink, text: &str) {
+        let expected = Notification::new(Source::Mesh, text).render();
+        let deadline = tokio::time::Instant::now() + CONNECT_LATER_TIMEOUT;
+        while !sink.0.lock().contains(&expected) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the line {text:?}; saw {:?}",
+                sink.0.lock()
+            );
+            sleep(POLL).await;
+        }
+    }
+
+    /// The relay is named by a `.invalid` host, which no resolver answers, rather than an
+    /// unroutable address: a sandbox whose egress proxy accepts every connect would make
+    /// an address reachable.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_fails_without_the_loopback_hint_for_a_non_loopback_relay() {
+        let tmp = TempDir::new("node-unresolvable");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            interfaces: vec![MeshInterface::Private {
+                host: "relay.invalid".to_string(),
+                port: 4242,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let err = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("a relay that cannot be reached must be refused")
+        .to_string();
+
+        assert!(err.contains("relay.invalid:4242"), "{err}");
+        assert!(err.contains("is unreachable"), "{err}");
+        assert!(!err.contains("Nothing is listening on"), "{err}");
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_comes_up_on_the_reachable_relay_and_keeps_the_refused_one_pending() {
+        let closed = closed_port().await;
+        let relay = TransportRelay::start().await;
+        let tmp = TempDir::new("node-partial");
+        let mut session = Session::default();
+
+        let runtime = MeshRuntime::start(
+            &private_relays(&[closed, relay.port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .expect("one reachable relay is enough to come up");
+
+        let states = states_of(&runtime);
+        assert_eq!(states.len(), 2, "{states:?}");
+        assert_eq!(states[0].0, private_label(closed));
+        assert!(is_retrying(&states[0].1), "{states:?}");
+        // A relay's reason is the TCP client's own last error, not a `local` sentence.
+        let InterfaceState::Unreachable { reason, .. } = &states[0].1 else {
+            unreachable!()
+        };
+        let Some(WatchedInterface::Tcp { status, .. }) = runtime.watched_interfaces.first() else {
+            panic!("the refused relay is watched first");
+        };
+        assert_eq!(
+            status.to_json()["last_error"].as_str(),
+            Some(reason.as_str())
+        );
+        let endpoint = LocalEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, closed)));
+        let dial_sentences = [
+            DialFailureKind::Refused,
+            DialFailureKind::NotFound,
+            DialFailureKind::Timeout,
+            DialFailureKind::Io(std::io::ErrorKind::ConnectionRefused),
+        ]
+        .map(|kind| dial_failure_sentence(kind, &endpoint));
+        let drop_sentences = [
+            DisconnectReason::PeerClosed,
+            DisconnectReason::Reset,
+            DisconnectReason::Timeout,
+            DisconnectReason::Io(std::io::ErrorKind::ConnectionRefused),
+        ]
+        .map(disconnect_sentence);
+        assert!(
+            !dial_sentences.contains(reason) && !drop_sentences.contains(reason),
+            "{reason}"
+        );
+        assert_eq!(
+            states[1],
+            (private_label(relay.port), InterfaceState::Connected)
+        );
+        assert_eq!(runtime.interfaces(), vec![private_label(relay.port)]);
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+        let peer_tmp = TempDir::new("node-partial-peer");
+        let mut peer_session = Session::default();
+        let peer = MeshRuntime::start(
+            &private_config(relay.port),
+            true,
+            &mut peer_session,
+            mesh_paths(&peer_tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let peer_slot = Arc::new(MeshSlot::default());
+        peer_slot.install(peer).unwrap();
+
+        let card = status_round_trip(&slot, &peer_slot).await;
+
+        assert!(card.served_at_secs > 0);
+        assert!(slot.stop().await.unwrap());
+        assert!(peer_slot.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_interface_connects_later_and_pushes_the_idle_line() {
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-connect-later");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let states = states_of(&runtime);
+        assert_eq!(
+            states[0],
+            (private_label(relay.port()), InterfaceState::Connected)
+        );
+        assert_eq!(states[1].0, private_label(held));
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{} connected", private_label(held))).await;
+
+        assert_eq!(
+            states_of(&runtime),
+            vec![
+                (private_label(relay.port()), InterfaceState::Connected),
+                (private_label(held), InterfaceState::Connected),
+            ]
+        );
+        assert_eq!(
+            runtime.interfaces(),
+            vec![private_label(relay.port()), private_label(held)]
+        );
+        assert!(all_connected(&runtime));
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+    }
+
+    /// A `local` entry nothing answers at start: where the client dials an abstract
+    /// socket, one under a name no rnsd uses; elsewhere the loopback `port`, which the
+    /// caller holds closed.
+    #[cfg(unix)]
+    fn local_entry(port: u16) -> MeshInterface {
+        MeshInterface::Local {
+            port: Some(port),
+            instance: Some(format!("coyote-test-{port}")),
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_endpoint(port: u16) -> LocalEndpoint {
+        let MeshInterface::Local { port, instance } = local_entry(port) else {
+            unreachable!()
+        };
+        LocalEndpoint::of(port, instance.as_deref())
+    }
+
+    /// Stands in for rnsd's shared-instance listener at `endpoint`: every connection is
+    /// accepted and drained. `socket` is the held port the TCP shape listens on. The
+    /// listener and every stream it accepted close with the returned task, so the
+    /// attached client sees the drop.
+    #[cfg(unix)]
+    async fn serve_local_stub(
+        endpoint: &LocalEndpoint,
+        socket: tokio::net::TcpSocket,
+    ) -> JoinHandle<()> {
+        match endpoint {
+            LocalEndpoint::Tcp(_) => serve_as_daemon(socket.listen(16).unwrap()).await,
+            #[cfg(target_os = "linux")]
+            LocalEndpoint::Abstract(value) => serve_abstract_stub(value),
+            #[cfg(not(target_os = "linux"))]
+            LocalEndpoint::Abstract(value) => {
+                panic!("{value}: abstract sockets exist on Linux only")
+            }
+        }
+    }
+
+    /// Serves the stub at `endpoint` where nothing holds the port: a closed one, or one
+    /// whose listener went away (an aborted `serve_local_stub`, or
+    /// `accept_once_then_close` done with its one connection), the way a restarted rnsd
+    /// listens where the old one did.
+    #[cfg(unix)]
+    async fn restart_local_stub(endpoint: &LocalEndpoint) -> JoinHandle<()> {
+        match endpoint {
+            LocalEndpoint::Tcp(addr) => serve_as_daemon(rebind_local_port(addr).await).await,
+            #[cfg(target_os = "linux")]
+            LocalEndpoint::Abstract(value) => serve_abstract_stub(value),
+            #[cfg(not(target_os = "linux"))]
+            LocalEndpoint::Abstract(value) => {
+                panic!("{value}: abstract sockets exist on Linux only")
+            }
+        }
+    }
+
+    /// Binds `addr` afresh, retrying while the listener that held it is still letting
+    /// it go.
+    #[cfg(unix)]
+    async fn rebind_local_port(addr: &SocketAddr) -> tokio::net::TcpListener {
+        let deadline = tokio::time::Instant::now() + CONNECT_LATER_TIMEOUT;
+        loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => return listener,
+                Err(err) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the stub's port {addr} was not released: {err}"
+                    );
+                    sleep(POLL).await;
+                }
+            }
+        }
+    }
+
+    /// Stands in for an rnsd that takes one connection and nothing after it: the task
+    /// accepts one connection, closes the listener and only then that stream, so the
+    /// client's first sight of the drop comes after the port is closed. A dial that
+    /// reached the backlog before the close can still land one short cycle, so a test
+    /// counting connects ties them to the drops it saw. Awaiting the task proves the port
+    /// is free for `restart_local_stub`.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    fn accept_once_then_close(listener: tokio::net::TcpListener) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            drop(stream);
+        })
+    }
+
+    /// `serve_as_daemon` for the abstract socket `value` names.
+    #[cfg(target_os = "linux")]
+    fn serve_abstract_stub(value: &str) -> JoinHandle<()> {
+        use std::os::linux::net::SocketAddrExt;
+        use tokio::io::AsyncReadExt;
+        let name = value.strip_prefix('@').unwrap();
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            let mut streams = tokio::task::JoinSet::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                streams.spawn(async move {
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+                });
+            }
+        })
+    }
+
+    /// Waits up to `CONNECT_LATER_TIMEOUT` for the interface at `index` to read `state`.
+    #[cfg(unix)]
+    async fn wait_for_state(
+        runtime: &MeshRuntime,
+        index: usize,
+        what: &str,
+        state: impl Fn(&InterfaceState) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + CONNECT_LATER_TIMEOUT;
+        while !state(&runtime.interface_states()[index].state) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}; states {:?}",
+                states_of(runtime)
+            );
+            sleep(POLL).await;
+        }
+    }
+
+    /// Whether `reason` is the dial failure of a `local` client with nothing listening at
+    /// `endpoint`. A loopback port reads as refused; an unbound abstract name reads as
+    /// refused from the Linux kernel, and as a missing socket is accepted too there.
+    #[cfg(unix)]
+    fn names_nothing_listening(reason: &str, endpoint: &LocalEndpoint) -> bool {
+        reason == dial_failure_sentence(DialFailureKind::Refused, endpoint)
+            || (matches!(endpoint, LocalEndpoint::Abstract(_))
+                && reason == dial_failure_sentence(DialFailureKind::NotFound, endpoint))
+    }
+
+    /// A `local`-only config with no rnsd bails on the client's dial failure with one next
+    /// step (its own), not the relay hint stacked on it, and nothing stays attached.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_fails_with_one_next_step_when_the_local_rnsd_is_not_listening() {
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let tmp = TempDir::new("node-local-absent");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            interfaces: vec![local_entry(port)],
+            ..MeshConfig::default()
+        };
+
+        let err = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("a local rnsd that is not listening must be refused")
+        .to_string();
+
+        let reason = err
+            .strip_prefix(&format!(
+                "Local rnsd at {endpoint} (type: local) is not reachable: "
+            ))
+            .and_then(|rest| rest.split_once(". The node cannot join"))
+            .map(|(reason, _)| reason)
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(names_nothing_listening(reason, &endpoint), "{err}");
+        assert!(err.ends_with("start rnsd or fix mesh.interfaces."), "{err}");
+        assert!(!err.contains("Nothing is listening on"), "{err}");
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// The `local` row follows the shared-instance client's events: `connecting` with the
+    /// client's dial failure until a listener answers, `connected` on the client's
+    /// `Connected` (and the kind joins `interface_kinds`), `lost, retrying` with the
+    /// orderly close's sentence when the listener goes away again, and it stays there
+    /// while the client's redials are refused, with no idle line for any of it. When the
+    /// listener is back on the same port the client's redial lands and the row is
+    /// `connected` again, each connect told at info exactly once; `stop` detaches the
+    /// shared-instance client.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_row_follows_the_events_from_connecting_to_connected_to_lost() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let connected_line = format!("Mesh interface {label} connected");
+        let connects_told = || {
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count()
+        };
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-local-later");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay.port(),
+                    },
+                    local_entry(port),
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let states = states_of(&runtime);
+        assert_eq!(states[1].0, label);
+        assert!(
+            matches!(&states[1].1, InterfaceState::Connecting { dial_failure: Some(DialFailure { reason, advice: DialAdvice::StartRnsd }) } if names_nothing_listening(reason, &endpoint)),
+            "{states:?}"
+        );
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        let stub = restart_local_stub(&endpoint).await;
+        wait_for_state(&runtime, 1, "the local row to connect", |state| {
+            *state == InterfaceState::Connected
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+        assert_eq!(
+            runtime.interfaces(),
+            vec![private_label(relay.port()), label.clone()]
+        );
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(connects_told(), 1, "{:?}", info_snapshot());
+
+        stub.abort();
+        let lost = InterfaceState::Disconnected {
+            reason: "rnsd closed the socket".to_string(),
+        };
+        wait_for_state(&runtime, 1, "the local row to report the drop", |state| {
+            *state == lost
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        // The client's `Connecting` follows the drop at once; the row keeps the drop
+        // through it and through the redials the held port refuses.
+        sleep(LOCAL_RECONNECT_WAIT + WATCH_SETTLE).await;
+        assert_eq!(states_of(&runtime)[1].1, lost);
+
+        // rnsd is back where it was: the client's next redial lands, the row moves from
+        // the drop to `connected` and that move is the second connect told.
+        let restarted = restart_local_stub(&endpoint).await;
+        wait_for_state(&runtime, 1, "the local row to reconnect", |state| {
+            *state == InterfaceState::Connected
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(connects_told(), 2, "{:?}", info_snapshot());
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a local row prints no idle line: {:?}",
+            notifier.0.lock()
+        );
+
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(transport.shared_instance().is_some());
+        assert!(slot.stop().await.unwrap());
+        assert!(transport.shared_instance().is_none());
+        restarted.abort();
+        relay_handle.abort();
+    }
+
+    /// The shipped default as it is used: a `local`-only config with rnsd already
+    /// listening comes up at once with the row `connected`, because the client's first
+    /// `Connected` arrived within the start wait and was told at info there; the kind is
+    /// the one the node serves on (`interface_kinds`, the `mesh.started` hook's
+    /// `COYOTE_MESH_INTERFACES`), no idle line is printed for it, the watcher does not
+    /// tell the connect a second time, and `stop` detaches the shared-instance client.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_only_node_with_rnsd_listening_is_connected_at_start() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
+        let (port, socket) = held_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let stub = serve_local_stub(&endpoint, socket).await;
+        let tmp = TempDir::new("node-local-present");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(port)],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            states_of(&runtime),
+            vec![(label.clone(), InterfaceState::Connected)],
+            "the client's first Connected arrived within the start wait"
+        );
+        assert_eq!(runtime.interface_kinds(), vec!["local"]);
+        assert_eq!(runtime.interfaces(), vec![label.clone()]);
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(
+            transport.shared_instance().is_some(),
+            "the transport is attached to the shared instance"
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        let hooks = RecordingHookSink::attach(&slot.hooks());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let envs = one_fire(&hooks, HookEvent::MeshStarted);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("local"));
+
+        // A while later the row is still `connected`, nothing was said, and the watcher,
+        // which only tells a connect that moved the row, has not repeated the one start
+        // told.
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(states_of(&runtime)[0].1, InterfaceState::Connected);
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a local row prints no idle line: {:?}",
+            notifier.0.lock()
+        );
+        let connected_line = format!("Mesh interface {label} connected");
+        assert_eq!(
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count(),
+            1,
+            "the connect is told once, at start: {:?}",
+            info_snapshot()
+        );
+
+        assert!(slot.stop().await.unwrap());
+        assert!(transport.shared_instance().is_none());
+        stub.abort();
+    }
+
+    /// While the attached client's redials are refused, the row keeps `connecting` with
+    /// the dial failure's sentence, the kind has not joined, nothing is told at info, no
+    /// idle line is printed, and the watcher logs the repeated failure once rather than
+    /// on every redial. Once rnsd takes the client's redial the row is `connected`, told
+    /// at info exactly once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_row_keeps_its_dial_reason_while_the_attached_client_redials() {
+        use crate::testing::{debug_snapshot, info_snapshot};
+
+        install_log_collector();
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-local-dial-reason");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay.port(),
+                    },
+                    local_entry(port),
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let InterfaceState::Connecting {
+            dial_failure: Some(failure),
+        } = states_of(&runtime)[1].1.clone()
+        else {
+            panic!("{:?}", states_of(&runtime));
+        };
+        let reason = failure.reason.clone();
+        assert!(names_nothing_listening(&reason, &endpoint), "{reason}");
+        assert_eq!(failure.advice, DialAdvice::StartRnsd);
+        let dial_line = format!("Mesh interface {label} could not dial rnsd: {reason}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(
+            transport.shared_instance().is_some(),
+            "the transport is attached while its client dials"
+        );
+        // The client redials into a refusal for two redial waits; the row holds the
+        // reason, the kind stays out, nothing is told and the failure is logged once.
+        sleep(LOCAL_RECONNECT_WAIT * 2).await;
+        assert_eq!(
+            states_of(&runtime)[1].1,
+            InterfaceState::Connecting {
+                dial_failure: Some(failure.clone()),
+            },
+            "{:?}",
+            states_of(&runtime)
+        );
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        assert_eq!(
+            debug_snapshot()
+                .iter()
+                .filter(|line| *line == &dial_line)
+                .count(),
+            1,
+            "a repeated dial failure is logged once: {:?}",
+            debug_snapshot()
+        );
+        let connected_line = format!("Mesh interface {label} connected");
+        assert!(
+            !info_snapshot().iter().any(|line| line == &connected_line),
+            "nothing is connected while the client dials: {:?}",
+            info_snapshot()
+        );
+
+        // rnsd starts taking connections: the client's next redial lands and the row
+        // moves once.
+        let daemon = restart_local_stub(&endpoint).await;
+        wait_for_state(&runtime, 1, "the local row to connect", |state| {
+            *state == InterfaceState::Connected
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count(),
+            1,
+            "the connect is told once: {:?}",
+            info_snapshot()
+        );
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a local row prints no idle line: {:?}",
+            notifier.0.lock()
+        );
+
+        assert!(slot.stop().await.unwrap());
+        assert!(transport.shared_instance().is_none());
+        daemon.abort();
+        relay_handle.abort();
+    }
+
+    /// An rnsd that takes the client's connection and closes it at once: the client's
+    /// `Connected` arrives within the start wait, so a `local`-only config starts with the
+    /// row `connected`, told once, and the drop that follows is the watcher's to read,
+    /// which moves the row to `lost, retrying` with the kind out and no idle line. The
+    /// row keeps the drop until a listener is back on the port and the client's redial
+    /// lands. The client redials at once after a short-lived first stream, and under
+    /// load that redial can land one extra cycle before the restart; every move into
+    /// `connected` is told once, so the count is one per drop told plus the start's. The
+    /// lever is written for the TCP shape, so the test runs where that shape is the
+    /// `local` endpoint (Linux and Android dial an abstract socket there).
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_rnsd_that_drops_the_client_at_once_starts_connected_then_reads_lost() {
+        use crate::testing::{info_snapshot, warn_snapshot};
+
+        install_log_collector();
+        let (port, socket) = held_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let connected_line = format!("Mesh interface {label} connected");
+        let connects_told = || {
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count()
+        };
+        let stub = accept_once_then_close(socket.listen(16).unwrap());
+        let tmp = TempDir::new("node-local-drop-at-once");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(port)],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            states_of(&runtime),
+            vec![(label.clone(), InterfaceState::Connected)]
+        );
+        assert_eq!(connects_told(), 1, "{:?}", info_snapshot());
+        stub.await.unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        wait_for_state(&runtime, 0, "the local row to report the drop", |state| {
+            matches!(state, InterfaceState::Disconnected { .. })
+        })
+        .await;
+        assert!(runtime.interface_kinds().is_empty());
+
+        let daemon = restart_local_stub(&endpoint).await;
+        wait_for_state(&runtime, 0, "the local row to reconnect", |state| {
+            *state == InterfaceState::Connected
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["local"]);
+        sleep(WATCH_SETTLE * 2).await;
+        let lost_line = format!("Mesh interface {label} lost rnsd; the transport is redialing it");
+        let losses_told = warn_snapshot()
+            .iter()
+            .filter(|line| **line == lost_line)
+            .count();
+        assert!(losses_told >= 1, "{:?}", warn_snapshot());
+        assert_eq!(
+            connects_told(),
+            losses_told + 1,
+            "{:?} / {:?}",
+            info_snapshot(),
+            warn_snapshot()
+        );
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a local row prints no idle line: {:?}",
+            notifier.0.lock()
+        );
+
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(slot.stop().await.unwrap());
+        assert!(transport.shared_instance().is_none());
+        daemon.abort();
+    }
+
+    /// Beside a relay the start wait reads past the client's refused dial: a listener
+    /// that comes up after it, inside `connect_timeout`, takes the client's redial, and
+    /// the row is `connected` when `start` returns.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_rnsd_beside_a_relay_that_listens_after_a_refused_dial_starts_connected() {
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-local-listens-during-start");
+        let mut session = Session::default();
+        let started = tokio::time::Instant::now();
+        let (stub_up, late_stub) = tokio::sync::oneshot::channel();
+        {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                sleep(LOCAL_RECONNECT_WAIT / 4).await;
+                let _ = stub_up.send(restart_local_stub(&endpoint).await);
+            });
+        }
+
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay.port(),
+                    },
+                    local_entry(port),
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions {
+                connect_timeout: Duration::from_secs(10),
+                ..NodeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            states_of(&runtime),
+            vec![
+                (private_label(relay.port()), InterfaceState::Connected),
+                (label, InterfaceState::Connected),
+            ]
+        );
+        // The first dial was refused, so the connect that landed was a redial.
+        assert!(
+            started.elapsed() >= LOCAL_RECONNECT_WAIT,
+            "{:?}",
+            started.elapsed()
+        );
+        let stub = late_stub.await.unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+        assert!(slot.stop().await.unwrap());
+        stub.abort();
+        relay_handle.abort();
+    }
+
+    /// The client is attached with reasoned drops: an rnsd that resets the stream reads
+    /// as a reset on the row, not as the orderly close.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_rnsd_that_resets_the_stream_reads_lost_with_the_reset() {
+        let (port, socket) = held_port().await;
+        let listener = socket.listen(16).unwrap();
+        let (reset, reset_now) = tokio::sync::oneshot::channel::<()>();
+        let stub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = reset_now.await;
+            stream.set_zero_linger().unwrap();
+            drop(stream);
+        });
+        let tmp = TempDir::new("node-local-reset");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(port)],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(states_of(&runtime)[0].1, InterfaceState::Connected);
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+
+        reset.send(()).unwrap();
+        stub.await.unwrap();
+        wait_for_state(&runtime, 0, "the local row to report the reset", |state| {
+            matches!(state, InterfaceState::Disconnected { .. })
+        })
+        .await;
+
+        let lost = InterfaceState::Disconnected {
+            reason: disconnect_sentence(DisconnectReason::Reset),
+        };
+        assert_eq!(states_of(&runtime)[0].1, lost);
+        assert_ne!(lost.to_string(), "lost, retrying: rnsd closed the socket");
+        assert!(slot.stop().await.unwrap());
+    }
+
+    /// Starts a node whose `local` entry is a closed port, next to a relay, and returns it
+    /// with its local row at `connecting` with the refused dial's reason.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    async fn start_beside_a_relay_with_a_dialing_local(
+        tmp: &TempDir,
+        relay_port: u16,
+    ) -> (Arc<MeshRuntime>, LocalEndpoint) {
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay_port,
+                    },
+                    local_entry(port),
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            states_of(&runtime)[1].1,
+            InterfaceState::Connecting {
+                dial_failure: Some(DialFailure::of(DialFailureKind::Refused, &endpoint)),
+            }
+        );
+        (runtime, endpoint)
+    }
+
+    /// A `local` row that is still `connecting` when the operator turns the mesh off:
+    /// `stop` detaches the shared-instance client while it is dialing, nothing hangs
+    /// on the start wait's leftover receiver, the client does not keep dialing the
+    /// endpoint after the detach (an rnsd that comes up afterwards hears nothing), no
+    /// connect is ever told, and the same config dir starts again at once against that
+    /// rnsd with the row `connected`.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dialing_local_row_stops_cleanly_and_its_detached_client_dials_no_more() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-local-dialing-stop");
+        let (runtime, endpoint) =
+            start_beside_a_relay_with_a_dialing_local(&tmp, relay.port()).await;
+        let label = format!("local rnsd at {endpoint}");
+        let connected_line = format!("Mesh interface {label} connected");
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(transport.shared_instance().is_some());
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+
+        let stopped_at = tokio::time::Instant::now();
+        assert!(slot.stop().await.unwrap(), "stop while the client dials");
+        assert!(
+            stopped_at.elapsed() < SHUTDOWN_GRACE,
+            "stop did not wait on the dialing client: {:?}",
+            stopped_at.elapsed()
+        );
+        assert!(
+            transport.shared_instance().is_none(),
+            "the dialing client is detached with the node"
+        );
+
+        // rnsd comes up after the stop: the detached client is gone and dials nothing.
+        let LocalEndpoint::Tcp(addr) = &endpoint else {
+            unreachable!("the TCP shape is the local endpoint on this platform")
+        };
+        let listener = rebind_local_port(addr).await;
+        let dial = tokio::time::timeout(LOCAL_RECONNECT_WAIT * 2 + Duration::from_secs(1), async {
+            listener.accept().await.map(|_| ())
+        })
+        .await;
+        assert!(
+            dial.is_err(),
+            "a client the stop detached must not dial the endpoint again: {dial:?}"
+        );
+        assert!(
+            !info_snapshot().iter().any(|line| line == &connected_line),
+            "nothing was ever connected: {:?}",
+            info_snapshot()
+        );
+
+        // The same config dir starts again against that rnsd, `local`-only, at once.
+        let daemon = serve_as_daemon(listener).await;
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(addr.port())],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            states_of(&runtime),
+            vec![(label.clone(), InterfaceState::Connected)]
+        );
+        assert_eq!(
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count(),
+            1,
+            "the restart tells its connect once: {:?}",
+            info_snapshot()
+        );
+        runtime.shutdown().await.unwrap();
+        daemon.abort();
+        relay_handle.abort();
+    }
+
+    /// On a `local`-only config the start is refused on the client's first dial failure,
+    /// not after the whole `connect_timeout`: with a timeout far longer than any refused
+    /// dial takes, `start` still bails within a few seconds, and the reason is the dial
+    /// failure the client reported.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_only_start_is_refused_on_the_first_dial_failure_not_the_timeout() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
+        let connect_timeout = Duration::from_secs(60);
+        let tmp = TempDir::new("node-local-dialing-bound");
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let mut session = Session::default();
+        let started_at = tokio::time::Instant::now();
+        let err = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(port)],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions {
+                connect_timeout,
+                ..NodeOptions::default()
+            },
+        )
+        .await
+        .err()
+        .expect("a local rnsd that refuses every dial must be refused")
+        .to_string();
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the refusal waits for the first dial failure, not connect_timeout ({connect_timeout:?}); took {elapsed:?}"
+        );
+        let reason = err
+            .strip_prefix(&format!(
+                "Local rnsd at {endpoint} (type: local) is not reachable: "
+            ))
+            .and_then(|rest| rest.split_once(". The node cannot join"))
+            .map(|(reason, _)| reason)
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(names_nothing_listening(reason, &endpoint), "{err}");
+        let label = format!("local rnsd at {endpoint}");
+        assert!(
+            !info_snapshot()
+                .iter()
+                .any(|line| line == &format!("Mesh interface {label} connected")),
+            "a bailed start tells no connect: {:?}",
+            info_snapshot()
+        );
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// The peer table is not a routing input: a row whose stored name hash is not the
+    /// announce's (a hand-edited or corrupted `peers.json`) still resolves at once, because
+    /// the description is the transport's, and the operator's upper-case spelling of the
+    /// hash resolves the same destination, lower-cased first. No path request is paid for
+    /// either.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreign_name_hash_in_the_row_and_an_upper_case_hash_still_resolve() {
+        let stub = PeerStub::listen(
+            "node-resolve-foreign-name-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let started = started_runtime_on("node-resolve-foreign-name", stub.port()).await;
+        let runtime = started.runtime.clone();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+
+        let row = peers.get(&to).unwrap();
+        let foreign = "00".repeat(NAME_HASH_LEN);
+        assert_ne!(row.name_hash, foreign);
+        peers.observe(
+            PeerSighting {
+                destination_hash: row.destination_hash.clone(),
+                identity_hash: row.identity_hash.clone(),
+                name_hash: foreign.clone(),
+                public_key: None,
+                display_name: row.display_name.clone(),
+                protocol_version: row.protocol_version,
+                hops: row.hops,
+            },
+            SystemTime::now(),
+        );
+        assert_eq!(peers.get(&to).unwrap().name_hash, foreign);
+
+        let asked = Instant::now();
+        let again = runtime
+            .resolve_destination(&to)
+            .await
+            .expect("a row with a foreign name hash does not gate the transport's description");
+        let upper = runtime
+            .resolve_destination_cached(&to.to_uppercase())
+            .await
+            .expect("an upper-case hash is lower-cased before the lookup");
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "a held description is not asked for: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(again.address_hash, desc.address_hash);
+        assert_eq!(
+            again.name.as_name_hash_slice(),
+            desc.name.as_name_hash_slice()
+        );
+        assert_eq!(upper.address_hash, desc.address_hash);
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn traffic_flows_over_an_interface_that_connected_after_start() {
+        let late_port = closed_port().await;
+        let relay_a = TransportRelay::start().await;
+        let tmp = TempDir::new("node-late-traffic");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay_a.port, late_port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let states = states_of(&runtime);
+        assert_eq!(
+            states[0],
+            (private_label(relay_a.port), InterfaceState::Connected)
+        );
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime).unwrap();
+
+        let relay_b = TransportRelay::start_on(late_port).await;
+        wait_for_mesh_line(
+            &notifier,
+            &format!("{} connected", private_label(late_port)),
+        )
+        .await;
+        let peer_tmp = TempDir::new("node-late-traffic-peer");
+        let mut peer_session = Session::default();
+        let peer = MeshRuntime::start(
+            &private_config(late_port),
+            true,
+            &mut peer_session,
+            mesh_paths(&peer_tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let peer_slot = Arc::new(MeshSlot::default());
+        peer_slot.install(peer).unwrap();
+
+        let card = status_round_trip(&slot, &peer_slot).await;
+
+        assert!(card.served_at_secs > 0);
+        assert!(slot.stop().await.unwrap());
+        assert!(peer_slot.stop().await.unwrap());
+        relay_a.stop().await;
+        relay_b.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_aborts_the_connect_poller() {
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let closed = closed_port().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let tmp = TempDir::new("node-poller-stop");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), closed]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(is_retrying(&states_of(&runtime)[1].1));
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        wait_until(
+            "the node's tasks, the interface watcher among them, to exit",
+            || metrics.num_alive_tasks() == baseline,
+        )
+        .await;
+        relay_handle.abort();
+    }
+
+    /// Every plan a loopback relay by a different spelling of the loopback host, every one
+    /// refused: the hint is appended and names the first plan's endpoint as written.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hint_names_the_first_endpoint_when_every_refused_plan_is_loopback() {
+        let first = closed_port().await;
+        let second = closed_port().await;
+        let tmp = TempDir::new("node-all-loopback-refused");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            interfaces: vec![
+                MeshInterface::Private {
+                    host: "localhost".to_string(),
+                    port: first,
+                },
+                MeshInterface::Public {
+                    host: "::1".to_string(),
+                    port: second,
+                },
+            ],
+            ..MeshConfig::default()
+        };
+
+        let err = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("two refused relays leave nothing to come up on")
+        .to_string();
+
+        assert!(
+            err.starts_with(&format!(
+                "Mesh relay localhost:{first} (type: private) is unreachable: "
+            )),
+            "{err}"
+        );
+        assert!(
+            err.ends_with(&format!(
+                " Nothing is listening on localhost:{first}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+            )),
+            "{err}"
+        );
+        assert_eq!(err.matches("Nothing is listening on").count(), 1, "{err}");
+        assert!(!err.contains(&format!("::1:{second}")), "{err}");
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A loopback relay and a non-loopback one both refused: the hint is for the case
+    /// where EVERY failed plan is loopback, so it stays off even though the first is.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_hint_when_a_refused_plan_is_not_loopback() {
+        let closed = closed_port().await;
+        let tmp = TempDir::new("node-mixed-refused");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            interfaces: vec![
+                MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: closed,
+                },
+                MeshInterface::Private {
+                    host: "relay.invalid".to_string(),
+                    port: 4242,
+                },
+            ],
+            ..MeshConfig::default()
+        };
+
+        let err = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("no relay connected, so the node must not come up")
+        .to_string();
+
+        assert!(
+            err.starts_with(&format!(
+                "Mesh relay 127.0.0.1:{closed} (type: private) is unreachable: "
+            )),
+            "{err}"
+        );
+        assert!(!err.contains("Nothing is listening on"), "{err}");
+        assert!(
+            !err.contains("relay.invalid"),
+            "only the first failure is named: {err}"
+        );
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// `mesh.started` names the kinds connected at install, not the configured list, and
+    /// a pending interface connecting later refires nothing: the hook consumer saw one
+    /// `private`, not `private,private`, and sees no second fire.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mesh_started_names_connected_kinds_only_and_a_late_connect_refires_nothing() {
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-started-connected-only");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        let slot = Arc::new(MeshSlot::default());
+        let hooks = RecordingHookSink::attach(&slot.hooks());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        let envs = one_fire(&hooks, HookEvent::MeshStarted);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("private"));
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{} connected", private_label(held))).await;
+
+        assert_eq!(runtime.interface_kinds(), vec!["private", "private"]);
+        let refired = hooks.snapshot();
+        assert!(
+            !refired
+                .iter()
+                .any(|(event, _)| *event == HookEvent::MeshStarted),
+            "a later connect must not refire mesh.started: {refired:?}"
+        );
+        // The idle line is the one announcement of the connect, and only one.
+        let line =
+            Notification::new(Source::Mesh, format!("{} connected", private_label(held))).render();
+        assert_eq!(
+            notifier
+                .0
+                .lock()
+                .iter()
+                .filter(|seen| **seen == line)
+                .count(),
+            1,
+            "{:?}",
+            notifier.0.lock()
+        );
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+    }
+
+    /// The only plan a relay on a loopback address other than `127.0.0.1`, refused: the
+    /// refusal still carries the local-daemon hint and names the endpoint as written,
+    /// because the whole 127/8 block is this machine.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hint_covers_a_relay_anywhere_in_the_loopback_block() {
+        let closed = closed_port().await;
+        let tmp = TempDir::new("node-loopback-block-hint");
+        let mut session = Session::default();
+
+        let err = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![MeshInterface::Private {
+                    host: "127.0.0.2".to_string(),
+                    port: closed,
+                }],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("a refused relay on 127.0.0.2 must be refused")
+        .to_string();
+
+        assert!(err.contains(&format!("127.0.0.2:{closed}")), "{err}");
+        assert!(err.contains("private"), "{err}");
+        assert!(
+            err.ends_with(&format!(
+                " Nothing is listening on 127.0.0.2:{closed}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+            )),
+            "{err}"
+        );
+        assert!(
+            !err.contains("127.0.0.1"),
+            "the hint must name the endpoint as the operator wrote it: {err}"
+        );
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A node that comes up degraded says so once in the log, at warn, per unreachable
+    /// interface and by its label, where `--tail-logs` shows it, and says nothing of the
+    /// interfaces that connected. The refused relay sits on `127.0.0.3`, a host no other
+    /// test dials, and only the lines appended during this start are read: the warn buffer
+    /// is process-global and ephemeral ports recur across the suite.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_degraded_start_warns_once_per_unreachable_interface_in_the_log() {
+        install_log_collector();
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let closed = closed_port().await;
+        let refused_label = format!("private 127.0.0.3:{closed}");
+        let tmp = TempDir::new("node-degraded-warn");
+        let mut session = Session::default();
+        let before = warn_snapshot().len();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay.port(),
+                    },
+                    MeshInterface::Private {
+                        host: "127.0.0.3".to_string(),
+                        port: closed,
+                    },
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let during: Vec<String> = warn_snapshot().into_iter().skip(before).collect();
+
+        let states = states_of(&runtime);
+        let InterfaceState::Unreachable { reason, .. } = &states[1].1 else {
+            panic!("{states:?}");
+        };
+        let about_refused: Vec<String> = during
+            .iter()
+            .filter(|line| line.contains(&refused_label))
+            .cloned()
+            .collect();
+        assert_eq!(
+            about_refused,
+            vec![format!(
+                "Mesh interface {refused_label} is unreachable and keeps reconnecting: {reason}"
+            )],
+            "{during:?}"
+        );
+        assert!(
+            !during
+                .iter()
+                .any(|line| line.contains(&private_label(relay.port()))),
+            "a connected interface is not warned about: {during:?}"
+        );
+        assert!(!about_refused[0].contains('\n'), "{about_refused:?}");
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+    }
+
+    /// The user is told of a late connect before the node announces over it, so the line
+    /// never waits on the announce. The announce takes the destination lock first; the test
+    /// holds that lock while the held port starts listening, which stalls the announce for
+    /// as long as the test likes: the line, the state flip and the single info log line
+    /// must all land regardless. Released, the announce completes and the node stops clean.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_connected_line_does_not_wait_on_the_announce() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-line-before-announce");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(is_retrying(&states_of(&runtime)[1].1));
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let info_before = crate::testing::info_snapshot().len();
+        let warn_before = warn_snapshot().len();
+
+        let busy_destination = runtime.destination.lock().await;
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+
+        assert_eq!(
+            states_of(&runtime)[1],
+            (held_label.clone(), InterfaceState::Connected),
+            "the state flips before the user is told"
+        );
+        assert!(all_connected(&runtime));
+        let about_held: Vec<String> = crate::testing::info_snapshot()
+            .into_iter()
+            .skip(info_before)
+            .filter(|line| line.contains(&held_label))
+            .collect();
+        assert_eq!(
+            about_held,
+            vec![format!("Mesh interface {held_label} connected")],
+            "the connect is logged once, at info"
+        );
+        let expected_line =
+            Notification::new(Source::Mesh, format!("{held_label} connected")).render();
+        let lines_told = notifier
+            .0
+            .lock()
+            .iter()
+            .filter(|line| **line == expected_line)
+            .count();
+        assert_eq!(lines_told, 1, "{:?}", notifier.0.lock());
+        // Other nodes in the suite warn about announces of their own, so only this
+        // interface's announce failure would count.
+        assert!(
+            !warn_snapshot()
+                .into_iter()
+                .skip(warn_before)
+                .any(|line| line.contains("announce") && line.contains(&held_label)),
+            "a stalled announce is not a failed one"
+        );
+        drop(busy_destination);
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// The "Sent mesh announce" debug lines for `hash8` logged since `before`; the debug
+    /// buffer is shared by every node in the suite, so the count is scoped to one node.
+    #[cfg(unix)]
+    fn announces_since(before: usize, hash8: &str) -> usize {
+        let needle = format!("Sent mesh announce for destination {hash8}");
+        crate::testing::debug_snapshot()
+            .into_iter()
+            .skip(before)
+            .filter(|line| *line == needle)
+            .count()
+    }
+
+    /// The connect announce is a floor exception, not a floor reset: `last_announce` still
+    /// holds the start announce's instant afterwards, so a manual announce right after the
+    /// connect is still inside the original window and sends nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_connect_announce_leaves_last_announce_unchanged() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-connect-keeps-floor");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let (started_at, hash8) = {
+            let state = runtime.destination.lock().await;
+            (
+                state.last_announce,
+                short(&state.hash.to_hex_string()).to_string(),
+            )
+        };
+        assert!(started_at.is_some(), "the start announce sets the floor");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = crate::testing::debug_snapshot().len();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+        wait_until("the connect announce to be sent", || {
+            announces_since(before, &hash8) == 1
+        })
+        .await;
+
+        assert_eq!(
+            runtime.destination.lock().await.last_announce,
+            started_at,
+            "the connect announce must not move the floor"
+        );
+        assert!(
+            !runtime.announce_now().await.unwrap(),
+            "a manual announce is still inside the start announce's floor"
+        );
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// `last_announce_at` is the moment of the node's last announce of any kind: set by
+    /// the start announce, unset for a node that never announces, moved by the connect
+    /// announce even though the floor `DestinationState` keeps stays put, and moved by
+    /// the heartbeat's announce once the floor has aged out.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn last_announce_at_counts_every_announce_including_the_connect_one() {
+        let silent = started_runtime_with("node-last-announce-at-silent", |config| {
+            config.announce = false;
+        })
+        .await;
+        assert_eq!(silent.runtime.last_announce_at(), None);
+        assert!(!silent.runtime.announces());
+        silent.runtime.announce_on_connect().await.unwrap();
+        assert_eq!(
+            silent.runtime.last_announce_at(),
+            None,
+            "a node that does not announce sends nothing on a connect either"
+        );
+        silent.runtime.shutdown().await.unwrap();
+        silent.relay_handle.abort();
+
+        let started = started_runtime("node-last-announce-at").await;
+        let runtime = &started.runtime;
+        assert!(runtime.announces());
+        let at_start = runtime
+            .last_announce_at()
+            .expect("the start announce is recorded");
+        let floor = runtime.destination.lock().await.last_announce;
+        assert!(floor.is_some());
+        sleep(Duration::from_millis(20)).await;
+
+        runtime.announce_on_connect().await.unwrap();
+
+        let after_connect = runtime.last_announce_at().unwrap();
+        assert!(
+            after_connect > at_start,
+            "the connect announce moves the mirror: {at_start:?} then {after_connect:?}"
+        );
+        assert_eq!(
+            runtime.destination.lock().await.last_announce,
+            floor,
+            "the connect announce leaves the floor alone"
+        );
+
+        // The heartbeat finds the floor aged out and announces through `announce_now`.
+        runtime.destination.lock().await.last_announce =
+            Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        sleep(Duration::from_millis(20)).await;
+        assert!(runtime.announce_now().await.unwrap());
+        let after_heartbeat = runtime.last_announce_at().unwrap();
+        assert!(
+            after_heartbeat > after_connect,
+            "the heartbeat announce moves the mirror: {after_connect:?} then {after_heartbeat:?}"
+        );
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod agent_label {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_announces_the_agent_from_the_options_after_the_name() {
+            let named = |config: &mut MeshConfig| config.display_name = Some("alice".to_string());
+            let options = NodeOptions {
+                agent: Some("pr-reviewer".to_string()),
+                ..NodeOptions::default()
+            };
+            let agent = started_runtime_with_options("node-agent-label", options, named).await;
+            assert_eq!(
+                agent.runtime.announced_name().as_deref(),
+                Some("alice . pr-reviewer")
+            );
+            agent.runtime.shutdown().await.unwrap();
+            agent.relay_handle.abort();
+
+            let plain = started_runtime_with("node-agent-label-plain", named).await;
+            assert_eq!(plain.runtime.announced_name().as_deref(), Some("alice"));
+            plain.runtime.shutdown().await.unwrap();
+            plain.relay_handle.abort();
+        }
+    }
+
+    /// The heartbeat and the reconnect announce both go through `announce_now`; once the
+    /// floor lets one through it moves the mirror like any other announce, a refused one
+    /// (the floor still holding) moves nothing, and a re-key neither clears the mirror
+    /// nor restarts the join clock: the fork's announce is just the newest announce.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn announce_now_moves_the_mirror_and_a_rekey_keeps_it_and_the_join_clock() {
+        let started = started_runtime("node-mirror-announce-now-rekey").await;
+        let runtime = &started.runtime;
+        let joined_at = runtime.joined_at();
+        let at_start = runtime
+            .last_announce_at()
+            .expect("the start announce is recorded");
+        assert!(
+            at_start <= joined_at,
+            "the start announce is sent before the join completes: {at_start:?} vs {joined_at:?}"
+        );
+
+        // Within the floor nothing is sent and the mirror stays put.
+        assert!(!runtime.announce_now().await.unwrap());
+        assert_eq!(runtime.last_announce_at(), Some(at_start));
+
+        // Floor lifted (as the heartbeat finds it a period later): the announce moves it.
+        runtime.destination.lock().await.last_announce = None;
+        sleep(Duration::from_millis(20)).await;
+        assert!(runtime.announce_now().await.unwrap());
+        let after_heartbeat = runtime.last_announce_at().unwrap();
+        assert!(
+            after_heartbeat > at_start,
+            "{at_start:?} then {after_heartbeat:?}"
+        );
+        assert_eq!(
+            runtime.joined_at(),
+            joined_at,
+            "an announce never moves the join"
+        );
+
+        // A re-key announces the fork at once; the mirror advances and the join holds.
+        sleep(Duration::from_millis(20)).await;
+        runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(runtime.instance_id().await),
+                fork_instance_id: fresh_instance_id(),
+            })
+            .await
+            .unwrap();
+        let after_rekey = runtime
+            .last_announce_at()
+            .expect("a re-key never clears the mirror");
+        assert!(
+            after_rekey > after_heartbeat,
+            "{after_heartbeat:?} then {after_rekey:?}"
+        );
+        assert_eq!(
+            runtime.joined_at(),
+            joined_at,
+            "a re-key never restarts the join clock"
+        );
+        assert!(runtime.announces());
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+
+        // A silent node re-keys without announcing: the mirror stays empty afterwards too.
+        let silent = started_runtime_with("node-mirror-silent-rekey", |config| {
+            config.announce = false;
+        })
+        .await;
+        let joined_at = silent.runtime.joined_at();
+        assert_eq!(silent.runtime.last_announce_at(), None);
+        silent
+            .runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(silent.runtime.instance_id().await),
+                fork_instance_id: fresh_instance_id(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(silent.runtime.last_announce_at(), None);
+        assert_eq!(silent.runtime.joined_at(), joined_at);
+        silent.runtime.shutdown().await.unwrap();
+        silent.relay_handle.abort();
+    }
+
+    /// One connect announce per pending interface: the client's first `Connected` is its
+    /// one first connect, and a connection that holds sends no further event, so nothing
+    /// is announced later.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_connected_poll_never_reannounces() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-connect-announces-once");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let hash8 = short(&runtime.destination_hash().await).to_string();
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = crate::testing::debug_snapshot().len();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+        wait_until("the connect announce to be sent", || {
+            announces_since(before, &hash8) == 1
+        })
+        .await;
+
+        sleep(WATCH_SETTLE * 3).await;
+        assert!(all_connected(&runtime));
+        assert_eq!(
+            announces_since(before, &hash8),
+            1,
+            "a connection that holds announces nothing more"
+        );
+        assert!(
+            runtime.mark_interface_connected(1).is_none(),
+            "a connect is recorded once"
+        );
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// The watcher's copy of a TCP client at `hash` whose status reads as never connected.
+    fn tcp_watch(hash: AddressHash, connected_at_start: bool) -> TcpWatch {
+        TcpWatch::of(&WatchedInterface::Tcp {
+            index: 0,
+            label: "relay".into(),
+            hash,
+            status: TcpClient::new("127.0.0.1:1").runtime_status_handle(),
+            connected_at_start,
+        })
+        .unwrap()
+    }
+
+    /// How long a test waits on a client the listener dropped to redial or close its side.
+    #[cfg(unix)]
+    const REDIAL_WAIT: Duration = Duration::from_secs(5);
+
+    #[cfg(unix)]
+    async fn accept(listener: &TcpListener) -> tokio::net::TcpStream {
+        tokio::time::timeout(REDIAL_WAIT, listener.accept())
+            .await
+            .expect("the client to redial")
+            .unwrap()
+            .0
+    }
+
+    /// Shuts down and reads to the client's EOF, so it reads a FIN, not a reset.
+    #[cfg(unix)]
+    async fn close_orderly(mut stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        stream.shutdown().await.unwrap();
+        let mut sink = [0u8; 1024];
+        tokio::time::timeout(REDIAL_WAIT, async {
+            while stream.read(&mut sink).await.unwrap_or(0) > 0 {}
+        })
+        .await
+        .expect("the client to close its side");
+    }
+
+    /// A client connected at start reads the `Connected` the stream held from the start
+    /// as nothing. A client pending at start tells one first connect on its first
+    /// `Connected` and nothing on a repeat. After a drop, a `Connected` whose stream count
+    /// did not rise was already credited and tells nothing. Dial events, and every event
+    /// of an interface that is not a TCP client (the shared-instance client publishes on
+    /// the same stream), tell nothing.
+    #[test]
+    fn tcp_events_tell_one_first_connect_and_nothing_for_a_stream_already_counted() {
+        let up = AddressHash::new_from_rand(OsRng);
+        let pending = AddressHash::new_from_rand(OsRng);
+        let other = AddressHash::new_from_rand(OsRng);
+        let mut watches = [tcp_watch(up, true), tcp_watch(pending, false)];
+        let connected = InterfaceEventKind::Connected;
+        let dropped = InterfaceEventKind::Disconnected {
+            reason: DisconnectReason::PeerClosed,
+        };
+
+        assert_eq!(
+            follow_tcp_event(&mut watches, up, InterfaceEventKind::Connecting),
+            None
+        );
+        assert_eq!(
+            follow_tcp_event(&mut watches, up, connected),
+            None,
+            "the connect at start the stream still held"
+        );
+        assert_eq!(follow_tcp_event(&mut watches, up, dropped), None);
+        assert_eq!(
+            follow_tcp_event(&mut watches, up, connected),
+            None,
+            "a count that did not rise"
+        );
+        assert!(watches[0].connected);
+
+        assert_eq!(
+            follow_tcp_event(
+                &mut watches,
+                pending,
+                InterfaceEventKind::DialFailed {
+                    reason: DialFailureKind::Refused,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            follow_tcp_event(&mut watches, pending, connected),
+            Some((pending, Transition::FirstConnect))
+        );
+        assert_eq!(follow_tcp_event(&mut watches, pending, connected), None);
+        assert_eq!(follow_tcp_event(&mut watches, pending, dropped), None);
+        assert_eq!(follow_tcp_event(&mut watches, pending, connected), None);
+        assert!(watches[1].connected);
+
+        assert_eq!(follow_tcp_event(&mut watches, other, connected), None);
+        assert_eq!(follow_tcp_event(&mut watches, other, dropped), None);
+    }
+
+    /// After the watcher fell behind, each client's status decides: a client whose stream
+    /// is up and is not marked connected gets a first connect if it never connected and a
+    /// reconnect if it had, one already marked connected gets nothing, and one marked
+    /// connected whose stream is down is unmarked, and a later `Connected` whose count
+    /// did not rise only marks it connected again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_watcher_reconciles_each_tcp_client_from_its_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let transport = Transport::new(TransportConfig::new(
+            SCOPE_APP_NAME,
+            &TransportIdentity::new_from_rand(OsRng),
+            false,
+        ));
+        let client = TcpClient::new(addr.to_string());
+        let up = client.runtime_status_handle();
+        let context = transport.iface_manager().lock().await.new_context(client);
+        let handle = tokio::spawn(TcpClient::spawn(context));
+        let (_stream, _) = listener.accept().await.unwrap();
+        wait_until("the client to connect", || {
+            up.to_json()["stream_state"].as_str() == Some("connected")
+        })
+        .await;
+        let watch = |status: &TcpRuntimeStatusHandle, connected_at_start| {
+            TcpWatch::of(&WatchedInterface::Tcp {
+                index: 0,
+                label: "relay".into(),
+                hash: AddressHash::new_from_rand(OsRng),
+                status: status.clone(),
+                connected_at_start,
+            })
+            .unwrap()
+        };
+        let down = TcpClient::new("127.0.0.1:1").runtime_status_handle();
+        let mut dropped_after_connecting = watch(&up, false);
+        dropped_after_connecting.has_connected = true;
+        let mut watches = [
+            watch(&up, false),
+            dropped_after_connecting,
+            watch(&up, true),
+            watch(&down, true),
+        ];
+        let hashes: Vec<_> = watches.iter().map(|watch| watch.hash).collect();
+
+        let transitions = reconcile_tcp_after_lag(&mut watches, 7);
+
+        assert_eq!(
+            transitions,
+            vec![
+                (hashes[0], Transition::FirstConnect),
+                (hashes[1], Transition::Reconnect),
+            ]
+        );
+        assert!(watches[..3].iter().all(|watch| watch.connected));
+        assert!(!watches[3].connected);
+        assert_eq!(
+            follow_tcp_event(&mut watches, hashes[3], InterfaceEventKind::Connected),
+            None
+        );
+        assert!(watches[3].connected);
+        handle.abort();
+    }
+
+    /// A relay that drops and redials while the watcher is not reading leaves the same
+    /// `connected` state behind, so only its stream count shows what happened. Before
+    /// any drop, a relay connected at start reads nothing after a lag. The listener then
+    /// drops the client past what the interface-event broadcast holds, the watcher reads
+    /// `Lagged`, and its catch-up tells exactly one reconnect for the relay it held
+    /// connected and one first connect for a client it never saw connect. The events the
+    /// receiver still holds after the lag, and a last `Connected` published after the
+    /// catch-up read the count, tell nothing more. A second catch-up with the count
+    /// unmoved tells nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_watcher_tells_one_reconnect_for_drops_and_redials_it_never_read() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        use tokio::time::timeout;
+
+        /// Overflows the 1024-event broadcast: each drop publishes three events.
+        const DROPS: u64 = 400;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = Transport::new(TransportConfig::new(
+            SCOPE_APP_NAME,
+            &TransportIdentity::new_from_rand(OsRng),
+            false,
+        ));
+        let mut events = transport.interface_events();
+        let client = TcpClient::new(listener.local_addr().unwrap().to_string())
+            .with_reconnect_wait(Duration::from_millis(1));
+        let status = client.runtime_status_handle();
+        let context = transport.iface_manager().lock().await.new_context(client);
+        let hash = *context.channel.address();
+        let handle = tokio::spawn(TcpClient::spawn(context));
+        let mut stream = accept(&listener).await;
+        timeout(REDIAL_WAIT, async {
+            while !matches!(
+                next_interface_event(&mut events).await,
+                Ok(event) if event.iface() == hash && event.kind() == InterfaceEventKind::Connected
+            ) {}
+        })
+        .await
+        .expect("the first Connected");
+        let watched = |hash, connected_at_start| WatchedInterface::Tcp {
+            index: 0,
+            label: "relay".into(),
+            hash,
+            status: status.clone(),
+            connected_at_start,
+        };
+        let never = AddressHash::new_from_rand(OsRng);
+        let mut watches = [
+            TcpWatch::of(&watched(hash, true)).unwrap(),
+            TcpWatch::of(&watched(never, false)).unwrap(),
+        ];
+
+        assert_eq!(
+            reconcile_tcp_after_lag(&mut watches[..1], 1),
+            vec![],
+            "a relay connected at start that never dropped"
+        );
+
+        for _ in 0..DROPS {
+            close_orderly(stream).await;
+            stream = accept(&listener).await;
+        }
+        wait_until("every redial to be counted", || {
+            status.connected_streams() == 1 + DROPS
+                && status.to_json()["stream_state"].as_str() == Some("connected")
+        })
+        .await;
+        let missed = match next_interface_event(&mut events).await {
+            Err(missed) => missed,
+            Ok(event) => panic!("a watcher behind {DROPS} drops reads a lag, got {event:?}"),
+        };
+
+        let mut told = reconcile_tcp_after_lag(&mut watches, missed);
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    told.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()))
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(error) => panic!("the held events read in order, got {error:?}"),
+            }
+        }
+        while let Ok(received) = timeout(WATCH_SETTLE, events.recv()).await {
+            let event = received.expect("no events past the first lag");
+            told.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
+        }
+
+        assert_eq!(
+            told,
+            vec![
+                (hash, Transition::Reconnect),
+                (never, Transition::FirstConnect)
+            ]
+        );
+        assert!(watches[0].connected);
+        assert_eq!(reconcile_tcp_after_lag(&mut watches, missed), vec![]);
+        handle.abort();
+    }
+
+    /// A relay the watcher reads promptly tells one reconnect for each drop and redial:
+    /// every redial's `Connected` finds the stream count risen, and its drop tells nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_prompt_redial_tells_one_reconnect() {
+        use tokio::time::timeout;
+
+        const DROPS: usize = 3;
+
+        /// Follows every event up to and including the client's next `Connected`.
+        async fn follow_to_connected(
+            events: &mut broadcast::Receiver<InterfaceEvent>,
+            watches: &mut [TcpWatch],
+            hash: AddressHash,
+        ) -> Vec<(AddressHash, Transition)> {
+            let mut told = Vec::new();
+            timeout(REDIAL_WAIT, async {
+                loop {
+                    let event = next_interface_event(events)
+                        .await
+                        .expect("a watcher that reads promptly does not lag");
+                    told.extend(follow_tcp_event(watches, event.iface(), event.kind()));
+                    if event.iface() == hash && event.kind() == InterfaceEventKind::Connected {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("the client's Connected");
+            told
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = Transport::new(TransportConfig::new(
+            SCOPE_APP_NAME,
+            &TransportIdentity::new_from_rand(OsRng),
+            false,
+        ));
+        let mut events = transport.interface_events();
+        let client = TcpClient::new(listener.local_addr().unwrap().to_string())
+            .with_reconnect_wait(Duration::from_millis(1));
+        let status = client.runtime_status_handle();
+        let context = transport.iface_manager().lock().await.new_context(client);
+        let hash = *context.channel.address();
+        let handle = tokio::spawn(TcpClient::spawn(context));
+        let mut stream = accept(&listener).await;
+        let mut watches = [TcpWatch::of(&WatchedInterface::Tcp {
+            index: 0,
+            label: "relay".into(),
+            hash,
+            status,
+            connected_at_start: false,
+        })
+        .unwrap()];
+
+        assert_eq!(
+            follow_to_connected(&mut events, &mut watches, hash).await,
+            vec![(hash, Transition::FirstConnect)]
+        );
+        for redial in 1..=DROPS {
+            close_orderly(stream).await;
+            stream = accept(&listener).await;
+            assert_eq!(
+                follow_to_connected(&mut events, &mut watches, hash).await,
+                vec![(hash, Transition::Reconnect)],
+                "redial {redial}"
+            );
+        }
+        handle.abort();
+    }
+
+    /// A node on a `TransportRelay`, installed in its own slot with a recording notifier.
+    #[cfg(unix)]
+    struct RelayNode {
+        runtime: Arc<MeshRuntime>,
+        slot: Arc<MeshSlot>,
+        notifier: Arc<RecordingSink>,
+        hash: String,
+        _tmp: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl RelayNode {
+        async fn start(tag: &str, port: u16) -> Self {
+            let tmp = TempDir::new(tag);
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let hash = runtime.destination_hash().await;
+            let slot = Arc::new(MeshSlot::default());
+            let notifier = Arc::new(RecordingSink::default());
+            slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+            slot.install(runtime.clone()).unwrap();
+            Self {
+                runtime,
+                slot,
+                notifier,
+                hash,
+                _tmp: tmp,
+            }
+        }
+
+        fn hash8(&self) -> &str {
+            short(&self.hash)
+        }
+
+        /// Moves the start announce out of the floor, so the next `announce_now` sends.
+        async fn expire_announce_floor(&self) {
+            self.runtime.destination.lock().await.last_announce =
+                Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        }
+    }
+
+    /// Two nodes on a fresh relay, both heard by it, connected long enough that the
+    /// transport counts the relay's stop as a drop and not as a failed connect.
+    #[cfg(unix)]
+    async fn two_nodes_on_a_relay(tag: &str) -> (TransportRelay, RelayNode, RelayNode) {
+        let relay = TransportRelay::start().await;
+        let mut announces = relay.announces().await;
+        let a = RelayNode::start(&format!("{tag}-a"), relay.port).await;
+        let b = RelayNode::start(&format!("{tag}-b"), relay.port).await;
+        TransportRelay::heard_from(&mut announces, &a.hash).await;
+        TransportRelay::heard_from(&mut announces, &b.hash).await;
+        sleep(Duration::from_secs(2)).await;
+        (relay, a, b)
+    }
+
+    /// The relay goes away and comes back on the same port: each node's client reconnects
+    /// on its own, each node announces again (the relay forgot every path it held), the
+    /// relay hears both, and nothing more is announced after that.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_nodes_reannounce_when_the_relay_restarts_on_the_same_port() {
+        install_log_collector();
+        let (relay, a, b) = two_nodes_on_a_relay("node-relay-restart").await;
+        let port = relay.port;
+        let label = private_label(port);
+        a.expire_announce_floor().await;
+        b.expire_announce_floor().await;
+        let before = debug_snapshot().len();
+
+        relay.stop().await;
+        let (relay, mut announces) = TransportRelay::start_on_subscribed(port).await;
+        TransportRelay::heard_from_each(&mut announces, &[&a.hash, &b.hash]).await;
+        let line = format!("{label} reconnected; announced");
+        wait_for_mesh_line(&a.notifier, &line).await;
+        wait_for_mesh_line(&b.notifier, &line).await;
+
+        sleep(WATCH_SETTLE * 3).await;
+        assert_eq!(
+            announces_since(before, a.hash8()),
+            1,
+            "one re-announce from a"
+        );
+        assert_eq!(
+            announces_since(before, b.hash8()),
+            1,
+            "one re-announce from b"
+        );
+        assert!(all_connected(&a.runtime));
+        assert!(all_connected(&b.runtime));
+
+        assert!(a.slot.stop().await.unwrap());
+        assert!(b.slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the nodes' tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A reconnect inside the floor announces nothing and says so: the start announce was
+    /// seconds ago, so the line defers to the heartbeat and names the age.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnect_inside_the_floor_defers_to_the_heartbeat() {
+        install_log_collector();
+        let (relay, a, b) = two_nodes_on_a_relay("node-relay-restart-floor").await;
+        let port = relay.port;
+        let label = private_label(port);
+        let before = debug_snapshot().len();
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on(port).await;
+        let prefix = format!(
+            "{} {label} reconnected; this node announced ",
+            Source::Mesh.prefix()
+        );
+        for node in [&a, &b] {
+            wait_until("the deferred reconnect line", || {
+                node.notifier.0.lock().iter().any(|rendered| {
+                    rendered
+                        .lines()
+                        .iter()
+                        .any(|line| line.starts_with(&prefix) && line.ends_with(DEFERRED_SUFFIX))
+                })
+            })
+            .await;
+        }
+
+        sleep(WATCH_SETTLE * 3).await;
+        assert_eq!(
+            announces_since(before, a.hash8()),
+            0,
+            "a stays inside the floor"
+        );
+        assert_eq!(
+            announces_since(before, b.hash8()),
+            0,
+            "b stays inside the floor"
+        );
+
+        assert!(a.slot.stop().await.unwrap());
+        assert!(b.slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the nodes' tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// Every `[mesh]` line the sink was handed, flattened.
+    #[cfg(unix)]
+    fn mesh_lines(sink: &RecordingSink) -> Vec<String> {
+        sink.0
+            .lock()
+            .iter()
+            .flat_map(|rendered| rendered.lines().to_vec())
+            .collect()
+    }
+
+    /// The first line starting with `prefix`, if any.
+    #[cfg(unix)]
+    fn line_starting_with(sink: &RecordingSink, prefix: &str) -> Option<String> {
+        mesh_lines(sink)
+            .into_iter()
+            .find(|line| line.starts_with(prefix))
+    }
+
+    /// A relay that goes away twice in a row. The first return announces (the start
+    /// announce had lapsed) and that announce resets the floor, so the second return,
+    /// seconds later, sends nothing and says the heartbeat will carry it, naming how long
+    /// ago the first one went out. Two returns, one announce: a relay that flaps cannot
+    /// make the node announce faster than the floor. Between a drop and the return nothing
+    /// is said and the interface still reads connected: the watcher reports returns, not
+    /// outages.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_that_flaps_announces_once_per_floor_and_the_second_return_defers() {
+        install_log_collector();
+        let (relay, a, b) = two_nodes_on_a_relay("node-relay-flap").await;
+        let port = relay.port;
+        let label = private_label(port);
+        a.expire_announce_floor().await;
+        b.expire_announce_floor().await;
+        let before = debug_snapshot().len();
+
+        relay.stop().await;
+        sleep(WATCH_SETTLE * 3).await;
+        for node in [&a, &b] {
+            assert!(
+                all_connected(&node.runtime),
+                "a drop alone flips no interface state"
+            );
+            assert!(
+                !mesh_lines(&node.notifier)
+                    .iter()
+                    .any(|line| line.contains("reconnected")),
+                "nothing is said until the client is back: {:?}",
+                mesh_lines(&node.notifier)
+            );
+        }
+
+        let relay = TransportRelay::start_on(port).await;
+        let announced = format!("{label} reconnected; announced");
+        wait_for_mesh_line(&a.notifier, &announced).await;
+        wait_for_mesh_line(&b.notifier, &announced).await;
+        for node in [&a, &b] {
+            let last_announce = node
+                .runtime
+                .destination
+                .lock()
+                .await
+                .last_announce
+                .expect("the reconnect announce sets the floor");
+            assert!(
+                last_announce.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS),
+                "the reconnect announce resets the floor, unlike a first-connect announce"
+            );
+        }
+        // Stay connected past the client's stability window, so the next stop counts as a
+        // drop of a working connection rather than as a failed connect attempt.
+        sleep(Duration::from_millis(2500)).await;
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on(port).await;
+        let prefix = format!(
+            "{} {label} reconnected; this node announced ",
+            Source::Mesh.prefix()
+        );
+        for node in [&a, &b] {
+            wait_until("the deferred reconnect line", || {
+                line_starting_with(&node.notifier, &prefix).is_some()
+            })
+            .await;
+            let line = line_starting_with(&node.notifier, &prefix).unwrap();
+            let age = line
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(DEFERRED_SUFFIX))
+                .unwrap_or_else(|| panic!("the line does not end in `{DEFERRED_SUFFIX}`: {line}"));
+            let secs: u64 = age
+                .strip_suffix('s')
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("the age is seconds, as `12s`: {line}"));
+            assert!(
+                secs < REANNOUNCE_FLOOR_SECS,
+                "the age named is the first reconnect announce's, inside the floor: {line}"
+            );
+        }
+
+        sleep(WATCH_SETTLE * 3).await;
+        assert_eq!(
+            announces_since(before, a.hash8()),
+            1,
+            "two returns, one announce from a"
+        );
+        assert_eq!(
+            announces_since(before, b.hash8()),
+            1,
+            "two returns, one announce from b"
+        );
+
+        assert!(a.slot.stop().await.unwrap());
+        assert!(b.slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the nodes' tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A relay that was down when the node started: its failed attempts before the first
+    /// connect announce nothing, the first connect announces exactly once, and from then
+    /// on the client is watched like one that was up at start, so the relay's restart
+    /// announces again and the relay hears the node both times.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_down_at_start_is_watched_for_restarts_after_its_first_connect() {
+        install_log_collector();
+        let late_port = closed_port().await;
+        let relay_a = TransportRelay::start().await;
+        let tmp = TempDir::new("node-late-then-restart");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay_a.port, late_port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(is_retrying(&states_of(&runtime)[1].1));
+        let hash = runtime.destination_hash().await;
+        let hash8 = short(&hash).to_string();
+        let late_label = private_label(late_port);
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+        // Let the client fail a few attempts first: attempts that fail before the first
+        // connect send no event.
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(announces_since(before, &hash8), 0);
+
+        let (relay_b, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
+        wait_for_mesh_line(&notifier, &format!("{late_label} connected")).await;
+        TransportRelay::heard_from(&mut heard, &hash).await;
+        sleep(WATCH_SETTLE * 3).await;
+        assert_eq!(
+            announces_since(before, &hash8),
+            1,
+            "the first connect announces once, whatever the attempts before it"
+        );
+        assert!(all_connected(&runtime));
+        runtime.destination.lock().await.last_announce =
+            Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        sleep(Duration::from_millis(2500)).await;
+
+        relay_b.stop().await;
+        let (relay_b, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
+        wait_for_mesh_line(&notifier, &format!("{late_label} reconnected; announced")).await;
+        TransportRelay::heard_from(&mut heard, &hash).await;
+        sleep(WATCH_SETTLE * 3).await;
+        assert_eq!(
+            announces_since(before, &hash8),
+            2,
+            "the restart announces once more"
+        );
+        assert!(
+            !mesh_lines(&notifier)
+                .iter()
+                .any(|line| line.contains(&format!("{} reconnected", private_label(relay_a.port)))),
+            "the relay that never went away is not reported: {:?}",
+            mesh_lines(&notifier)
+        );
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay_a.stop().await;
+        relay_b.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A node configured not to announce: when its relay returns nothing goes out and no
+    /// line claims an announce went out or that the heartbeat will carry one, since
+    /// neither is true for it; its floor stays unset.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_does_not_announce_claims_no_announce_when_its_relay_returns() {
+        install_log_collector();
+        let relay = TransportRelay::start().await;
+        let port = relay.port;
+        let tmp = TempDir::new("node-relay-restart-silent");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                announce: false,
+                ..private_config(port)
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let hash8 = short(&runtime.destination_hash().await).to_string();
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+        sleep(Duration::from_millis(2500)).await;
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on(port).await;
+        // Wait for the client itself to report the drop and the return, then give the
+        // watcher a while on the restored connection.
+        let WatchedInterface::Tcp { status, .. } = &runtime.watched_interfaces()[0] else {
+            panic!("the relay is a TCP client");
+        };
+        let status = status.clone();
+        wait_until("the client to be back after the drop", || {
+            let json = status.to_json();
+            json["closed_events"].as_u64().unwrap_or_default()
+                + json["error_events"].as_u64().unwrap_or_default()
+                >= 1
+                && json["stream_state"].as_str() == Some("connected")
+        })
+        .await;
+        sleep(WATCH_SETTLE * 3).await;
+
+        assert_eq!(announces_since(before, &hash8), 0);
+        assert!(runtime.destination.lock().await.last_announce.is_none());
+        let lines = mesh_lines(&notifier);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("announced") || line.contains("will announce")),
+            "no line may claim an announce for a node that never announces: {lines:?}"
+        );
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// Every reconnect of a TCP relay is told, whatever became of the announce over it.
+    mod reconnect_line_tests {
+        use super::*;
+        use crate::mesh::card::StatusError;
+        use crate::mesh::fetch::FetchError as FileFetchError;
+
+        /// A node configured not to announce still says its relay is back, that nothing
+        /// was sent over it, and how to turn announcing on.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_that_does_not_announce_says_its_relay_reconnected() {
+            let relay = TransportRelay::start().await;
+            let port = relay.port;
+            let tmp = TempDir::new("node-reconnect-line-silent");
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &MeshConfig {
+                    announce: false,
+                    ..private_config(port)
+                },
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let slot = Arc::new(MeshSlot::default());
+            let notifier = Arc::new(RecordingSink::default());
+            slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+            slot.install(runtime.clone()).unwrap();
+            sleep(Duration::from_millis(2500)).await;
+
+            relay.stop().await;
+            let relay = TransportRelay::start_on(port).await;
+            wait_for_mesh_line(
+                &notifier,
+                &format!(
+                    "{} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote.",
+                    private_label(port)
+                ),
+            )
+            .await;
+
+            assert!(slot.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        /// An announce that fails after a reconnect is told on the reconnect line in plain
+        /// words, with the heartbeat that will carry the announce instead; the cause stays
+        /// in the log.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_failed_reconnect_announce_is_told_on_the_reconnect_line() {
+            let (relay, a, b) = two_nodes_on_a_relay("node-reconnect-line-failed").await;
+            let port = relay.port;
+            a.expire_announce_floor().await;
+            fail_next_announce_of(AddressHash::new_from_hex_string(&a.hash).unwrap());
+
+            relay.stop().await;
+            let relay = TransportRelay::start_on(port).await;
+            wait_for_mesh_line(
+                &a.notifier,
+                &format!(
+                    "{} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log).",
+                    private_label(port)
+                ),
+            )
+            .await;
+
+            assert!(a.slot.stop().await.unwrap());
+            assert!(b.slot.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        /// The sentences this node prints for a reconnect, a silent peer and a link that
+        /// never came up are plain ASCII.
+        #[test]
+        fn the_reconnect_no_answer_and_unlinked_sentences_are_ascii() {
+            let label = "private 127.0.0.1:4242";
+            let failed: Result<Option<Duration>> = Err(anyhow!("the transport said no"));
+            let reconnect_lines = [
+                reconnect_line(label, None),
+                reconnect_line(label, Some(&Ok(None))),
+                reconnect_line(label, Some(&Ok(Some(Duration::from_secs(12))))),
+                reconnect_line(label, Some(&failed)),
+            ];
+            assert!(
+                !reconnect_lines[3].contains("the transport said no"),
+                "{}",
+                reconnect_lines[3]
+            );
+            let peer = "bb".repeat(16);
+            let own = "aa".repeat(16);
+            let no_answer = NoAnswer::new(&peer, own);
+            let never_linked = RequestError::LinkActivationTimeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(10),
+            };
+            let sentences = reconnect_lines.into_iter().chain([
+                no_answer.to_string(),
+                no_answer.next_action(),
+                SendError::NoAnswer(no_answer.clone()).to_string(),
+                StatusError::NoAnswer(no_answer.clone()).to_string(),
+                StatusError::Transport(never_linked.clone()).to_string(),
+                FileFetchError::Transport(never_linked.clone()).to_string(),
+                SendError::Propagation(PropagationError::Link(never_linked)).to_string(),
+            ]);
+            for sentence in sentences {
+                assert!(sentence.is_ascii(), "{sentence}");
+                assert!(!sentence.contains(STATUS_PATH), "{sentence}");
+            }
+        }
+    }
+
+    /// Stopping a node whose relay has just gone away, beside a relay it never reached,
+    /// is as prompt as stopping a connected one: both clients sit in their redial loop,
+    /// which ends on the stop the transport sends them, so neither is aborted, neither is
+    /// reported as slow, and both are logged as left. The node's tasks exit, the instance
+    /// lock comes free, and a node restarted on the same config dir carries the same
+    /// identity under a fresh session's destination, is heard over the returned relay at
+    /// once and still watches the late one, which it announces over once on its first
+    /// connect.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_with_one_relay_down_and_one_never_reached_is_prompt_and_restartable() {
+        install_log_collector();
+        let late_port = closed_port().await;
+        let relay = TransportRelay::start().await;
+        let port = relay.port;
+        let label = private_label(port);
+        let late_label = private_label(late_port);
+        let tmp = TempDir::new("node-stop-while-down");
+        let paths = mesh_paths(&tmp);
+        let cache_dir = paths.cache_dir.clone();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[port, late_port]),
+            true,
+            &mut session,
+            paths,
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let instance_id = runtime.instance_id().await;
+        let fingerprint = runtime.fingerprint.clone();
+        let states = states_of(&runtime);
+        assert_eq!(states[0], (label.clone(), InterfaceState::Connected));
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let WatchedInterface::Tcp { status, .. } = &runtime.watched_interfaces()[0] else {
+            panic!("the first relay is a TCP client");
+        };
+        let status = status.clone();
+        // Stay connected past the client's stability window, so the relay's stop counts
+        // as a drop of a working connection and not as a failed connect attempt.
+        sleep(Duration::from_millis(2500)).await;
+        let before_drop = debug_snapshot().len();
+
+        relay.stop().await;
+        wait_until("the client to notice the drop", || {
+            let json = status.to_json();
+            json["closed_events"].as_u64().unwrap_or_default()
+                + json["error_events"].as_u64().unwrap_or_default()
+                >= 1
+                && json["stream_state"].as_str() != Some("connected")
+        })
+        .await;
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(
+            states_of(&runtime)[0].1,
+            InterfaceState::Connected,
+            "a drop alone flips no TCP row"
+        );
+        assert!(
+            !mesh_lines(&notifier)
+                .iter()
+                .any(|line| line.contains("reconnected")),
+            "nothing is said about a drop: {:?}",
+            mesh_lines(&notifier)
+        );
+        let dropped = format!("Mesh interface {label} dropped its connection (");
+        assert!(
+            debug_snapshot()
+                .into_iter()
+                .skip(before_drop)
+                .any(|line| line.starts_with(&dropped)
+                    && line.ends_with("); the client is redialing it")),
+            "the drop is logged once the client reports it: {:?}",
+            debug_snapshot()
+                .into_iter()
+                .skip(before_drop)
+                .collect::<Vec<_>>()
+        );
+
+        let before = debug_snapshot().len();
+        let started = Instant::now();
+        assert!(slot.stop().await.unwrap());
+        let took = started.elapsed();
+        assert!(
+            took < SHUTDOWN_GRACE,
+            "stopping two clients that are redialing took {took:?}"
+        );
+        let slow = |label: &str| format!("Mesh interface {label} did not stop within");
+        let warned = warn_snapshot();
+        for label in [&label, &late_label] {
+            assert!(
+                !warned.iter().any(|line| line.contains(&slow(label))),
+                "a redialing client ends on the stop and is not aborted: {warned:?}"
+            );
+        }
+        let left: Vec<String> = debug_snapshot().into_iter().skip(before).collect();
+        for label in [&label, &late_label] {
+            let line = format!("Left mesh interface {label}");
+            assert!(left.contains(&line), "{line:?} missing from {left:?}");
+        }
+        let reacquired = InstanceLock::acquire(&cache_dir, &instance_id)
+            .expect("stop must release the instance lock");
+        drop(reacquired);
+        // The relay is already stopped, so once the node's own tasks and its clients are
+        // gone nothing is left running.
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+
+        let (relay, mut announces) = TransportRelay::start_on_subscribed(port).await;
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[port, late_port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .expect("the same config dir starts again once the first node has stopped");
+        assert_eq!(
+            runtime.fingerprint, fingerprint,
+            "the restarted node is the same identity"
+        );
+        let hash = runtime.destination_hash().await;
+        assert_ne!(runtime.instance_id().await, instance_id);
+        TransportRelay::heard_from(&mut announces, &hash).await;
+        let states = states_of(&runtime);
+        assert_eq!(states[0], (label.clone(), InterfaceState::Connected));
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+
+        let (late_relay, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
+        wait_for_mesh_line(&notifier, &format!("{late_label} connected")).await;
+        TransportRelay::heard_from(&mut heard, &hash).await;
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(announces_since(before, short(&hash)), 1);
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay.stop().await;
+        late_relay.stop().await;
+        wait_until("the restarted node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// Two relays that were down at start come up together, so their clients' first
+    /// `Connected` events land back to back: each is told once, each first connect
+    /// announces once without the floor, and no `reconnected` line is printed for either,
+    /// since a first connect is not a reconnect. Both rows then follow their events: a
+    /// restart of one of them is reported for that relay alone, announced once more past
+    /// the floor, while the other two relays, which never went away, stay silent.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_relays_down_at_start_that_come_up_together_each_connect_once_and_then_follow_their_events()
+     {
+        install_log_collector();
+        let late_a = closed_port().await;
+        let late_b = closed_port().await;
+        let relay = TransportRelay::start().await;
+        let tmp = TempDir::new("node-two-late");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port, late_a, late_b]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let states = states_of(&runtime);
+        assert_eq!(states[0].1, InterfaceState::Connected);
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        assert!(is_retrying(&states[2].1), "{states:?}");
+        let hash = runtime.destination_hash().await;
+        let hash8 = short(&hash).to_string();
+        let label_a = private_label(late_a);
+        let label_b = private_label(late_b);
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(announces_since(before, &hash8), 0);
+
+        // Both relays listen long before the clients' next redial, which they took at the
+        // same moment, so both first connects land together.
+        let (relay_a, mut heard_a) = TransportRelay::start_on_subscribed(late_a).await;
+        let (relay_b, mut heard_b) = TransportRelay::start_on_subscribed(late_b).await;
+        wait_for_mesh_line(&notifier, &format!("{label_a} connected")).await;
+        wait_for_mesh_line(&notifier, &format!("{label_b} connected")).await;
+        TransportRelay::heard_from(&mut heard_a, &hash).await;
+        TransportRelay::heard_from(&mut heard_b, &hash).await;
+        sleep(WATCH_SETTLE * 3).await;
+        let lines = mesh_lines(&notifier);
+        for label in [&label_a, &label_b] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!("{label} connected")))
+                    .count(),
+                1,
+                "one connected line per relay: {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("reconnected")),
+            "a first connect is never reported as a reconnect: {lines:?}"
+        );
+        assert_eq!(
+            announces_since(before, &hash8),
+            2,
+            "each first connect announces once and nothing else does"
+        );
+        assert!(all_connected(&runtime));
+
+        runtime.destination.lock().await.last_announce =
+            Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        sleep(Duration::from_millis(2500)).await;
+        relay_b.stop().await;
+        let (relay_b, mut heard_b) = TransportRelay::start_on_subscribed(late_b).await;
+        wait_for_mesh_line(&notifier, &format!("{label_b} reconnected; announced")).await;
+        TransportRelay::heard_from(&mut heard_b, &hash).await;
+        sleep(WATCH_SETTLE * 3).await;
+        let lines = mesh_lines(&notifier);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("reconnected"))
+                .count(),
+            1,
+            "only the relay that went away is reported: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| {
+                line.contains(&format!("{label_a} reconnected"))
+                    || line.contains(&format!("{} reconnected", private_label(relay.port)))
+            }),
+            "{lines:?}"
+        );
+        assert_eq!(
+            announces_since(before, &hash8),
+            3,
+            "the restart announces once more"
+        );
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay.stop().await;
+        relay_a.stop().await;
+        relay_b.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A node configured not to announce stays silent on a late connect too, and its
+    /// floor stays unset.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_connect_announce_when_the_node_does_not_announce() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-connect-silent");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                announce: false,
+                ..private_relays(&[relay.port(), held])
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let hash8 = {
+            let state = runtime.destination.lock().await;
+            assert!(state.last_announce.is_none());
+            short(&state.hash.to_hex_string()).to_string()
+        };
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = crate::testing::debug_snapshot().len();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+        sleep(WATCH_SETTLE * 2).await;
+
+        assert_eq!(announces_since(before, &hash8), 0);
+        assert!(runtime.destination.lock().await.last_announce.is_none());
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// `.mesh off` while the connect announce is still in flight: the watcher yields to the
+    /// stop at once rather than being aborted after the grace window, so the stop reports
+    /// no task it had to kill. The announce is stalled the same way, the destination lock
+    /// held by the test, and released only once the stop has waited longer than the grace
+    /// window, which is when a watcher that did not yield would have been aborted.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_during_the_connect_announce_aborts_no_task() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-stop-mid-announce");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let warn_before = warn_snapshot().len();
+
+        let busy_destination = runtime.destination.lock().await;
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+
+        let stopping = tokio::spawn({
+            let slot = Arc::clone(&slot);
+            async move { slot.stop().await }
+        });
+        // The stop cannot finish while the destination is busy; hold it past the grace
+        // window so a watcher still inside its announce would have been aborted by now.
+        sleep(SHUTDOWN_GRACE + Duration::from_secs(1)).await;
+        assert!(!stopping.is_finished(), "stop needs the destination");
+        drop(busy_destination);
+        let stopped = tokio::time::timeout(SHUTDOWN_GRACE, stopping)
+            .await
+            .expect("stop must not wait out the grace window once the destination is free")
+            .unwrap()
+            .unwrap();
+        assert!(stopped);
+
+        let during: Vec<String> = warn_snapshot().into_iter().skip(warn_before).collect();
+        // The aborted-task line names no node; an interface that did not stop is another
+        // node's business and reads differently.
+        assert!(
+            !during
+                .iter()
+                .any(|line| line.starts_with("Mesh task did not stop within")),
+            "{during:?}"
+        );
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_joins_only_the_configured_relay() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-join");
+        let mut session = Session::default();
+
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime.interfaces(),
+            vec![format!("private 127.0.0.1:{}", addr.port())]
+        );
+        let instance_id = runtime.instance_id().await;
+        assert_eq!(session.mesh_instance_id(), Some(instance_id.as_str()));
+        assert!(
+            runtime
+                .has_destination(&runtime.destination_hash().await)
+                .await
+        );
+        assert_eq!(runtime.fingerprint().len(), 32);
+
+        runtime.shutdown().await.unwrap();
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_persists_peer_table_under_cache_dir_mesh() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-persist-peers");
+        let paths = mesh_paths(&tmp);
+        let cache_dir = paths.cache_dir.clone();
+        let peers_path = mesh_cache_dir(&cache_dir).join("peers.json");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        runtime.peers().observe(
+            PeerSighting {
+                destination_hash: "persisted-on-stop".to_string(),
+                identity_hash: "identity".to_string(),
+                name_hash: "name".to_string(),
+                public_key: None,
+                display_name: None,
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        assert!(
+            !peers_path.exists(),
+            "a change must not be written before the persist interval or stop"
+        );
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        let bytes = std::fs::read(&peers_path)
+            .unwrap_or_else(|err| panic!("{} must exist after stop: {err}", peers_path.display()));
+        let file: PeerTableFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(file.version, PEER_TABLE_VERSION);
+        assert_eq!(file.peers.len(), 1);
+        assert_eq!(file.peers[0].destination_hash, "persisted-on-stop");
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod persisted_propagation_node_tests {
+        use super::*;
+        use crate::mesh::propagation::test_support::FakeNode as PostingNode;
+        use crate::mesh::propagation_fetch::FETCH_TRANSFER_LIMIT_KB;
+        use crate::mesh::test_support::FakeNode;
+
+        const FETCH_DEADLINE: Duration = Duration::from_secs(30);
+
+        async fn start_on(tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            let mut session = Session::default();
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn stop(runtime: &Arc<MeshRuntime>) {
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            assert!(slot.stop().await.unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_heard_before_stop_is_fetched_from_after_a_restart_without_an_announce() {
+            // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the fake matches it.
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-persist-propagation-nodes");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+
+            let first = start_on(&tmp, fake.listener.port).await;
+            fake.announce().await;
+            wait_until("the runtime to file the propagation node", || {
+                first.propagation_nodes().select().is_ok()
+            })
+            .await;
+            stop(&first).await;
+            assert!(
+                table_path.exists(),
+                "{} must exist after stop",
+                table_path.display()
+            );
+
+            let second = start_on(&tmp, fake.listener.port).await;
+            let selected = second.propagation_nodes().select().unwrap();
+            assert_eq!(
+                selected.destination.address_hash.to_hex_string(),
+                fake.hex()
+            );
+            let sink = CountingSink::default();
+            fake.script.reply_with([rmpv::Value::Array(vec![])]);
+            let report = tokio::time::timeout(FETCH_DEADLINE, second.fetch_propagated(&sink))
+                .await
+                .expect("the fetch must finish within FETCH_DEADLINE")
+                .unwrap();
+            assert_eq!(report.node, fake.hex());
+            assert_eq!(report.listed, 0);
+
+            stop(&second).await;
+            fake.stop().await;
+        }
+
+        /// The node never announces, so the only way the runtime learns a path to it is the
+        /// request the post makes before opening its link.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_post_to_a_persisted_node_with_no_path_asks_for_one_and_succeeds() {
+            let mut node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-post-persisted-node");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: node.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, node.port).await;
+            let selected = runtime.propagation_nodes().select().unwrap();
+            let transport = runtime.transport_handle().await.unwrap();
+            assert!(
+                !transport.has_path(&node.desc.address_hash).await,
+                "a node that never announced has no path yet"
+            );
+
+            let recipient = *TransportIdentity::new_from_rand(OsRng).as_identity();
+            let options = PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..PropagationOptions::default()
+            };
+            runtime
+                .post_to_node(
+                    &recipient,
+                    &selected,
+                    |_| OutboundMessage {
+                        title: None,
+                        content: b"posted after a path request".to_vec(),
+                        fields: None,
+                    },
+                    &options,
+                )
+                .await
+                .unwrap();
+            assert!(transport.has_path(&node.desc.address_hash).await);
+            node.next_received().await;
+
+            stop(&runtime).await;
+            node.stop().await;
+        }
+
+        /// The persisted node is gone: nothing answers the one path request the post makes
+        /// before opening its link, so the post fails as a link with no known path after
+        /// that one `PATH_REQUEST_TIMEOUT`, and the link does not ask a second time. A
+        /// post caught in that wait still ends promptly with `Cancelled` when the node is
+        /// stopped.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_post_to_a_persisted_node_that_does_not_answer_waits_one_path_request_and_a_stop_ends_it()
+         {
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-post-persisted-node-gone");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let gone = crate::mesh::propagation::propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            );
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: gone,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, relay.port).await;
+            let selected = runtime.propagation_nodes().select().unwrap();
+            let recipient = *TransportIdentity::new_from_rand(OsRng).as_identity();
+            let options = PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..PropagationOptions::default()
+            };
+            let build = |_: &OriginName| OutboundMessage {
+                title: None,
+                content: b"posted to a node that is gone".to_vec(),
+                fields: None,
+            };
+
+            let asked = Instant::now();
+            let err = runtime
+                .post_to_node(&recipient, &selected, build, &options)
+                .await
+                .unwrap_err();
+            let waited = asked.elapsed();
+
+            assert!(
+                matches!(&err, PropagationError::Link(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+                "{err:?}"
+            );
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                "the post waited {waited:?} for the path request"
+            );
+
+            let waiting = tokio::spawn({
+                let runtime = runtime.clone();
+                let selected = selected.clone();
+                async move {
+                    runtime
+                        .post_to_node(&recipient, &selected, build, &options)
+                        .await
+                }
+            });
+            sleep(Duration::from_secs(1)).await;
+            let stopping = Instant::now();
+            stop(&runtime).await;
+            let outcome = tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .expect("stopping the node must end the post's path-request wait")
+                .unwrap();
+            assert!(
+                matches!(outcome, Err(PropagationError::Cancelled)),
+                "{outcome:?}"
+            );
+            assert!(
+                stopping.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                stopping.elapsed()
+            );
+            relay.stop().await;
+        }
+
+        /// The fetch side of the same gone node: the one path request the fetch makes
+        /// before its link goes unanswered, so the fetch fails as a link with no known path
+        /// after that one `PATH_REQUEST_TIMEOUT` without the link asking again, and a fetch
+        /// caught in that wait ends promptly with `Cancelled` when the node is stopped.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fetch_from_a_persisted_node_that_does_not_answer_waits_one_path_request_and_a_stop_ends_it()
+         {
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-fetch-persisted-node-gone");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let gone = crate::mesh::propagation::propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            );
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: gone,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+            let runtime = start_on(&tmp, relay.port).await;
+            let sink = Arc::new(CountingSink::default());
+
+            let asked = Instant::now();
+            let err = runtime.fetch_propagated(&*sink).await.unwrap_err();
+            let waited = asked.elapsed();
+
+            assert!(
+                matches!(&err, FetchError::Link(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+                "{err:?}"
+            );
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                "the fetch waited {waited:?} for the path request"
+            );
+
+            let waiting = tokio::spawn({
+                let runtime = runtime.clone();
+                let sink = sink.clone();
+                async move { runtime.fetch_propagated(&*sink).await }
+            });
+            sleep(Duration::from_secs(1)).await;
+            let stopping = Instant::now();
+            stop(&runtime).await;
+            let outcome = tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .expect("stopping the node must end the fetch's path-request wait")
+                .unwrap();
+            assert!(matches!(outcome, Err(FetchError::Cancelled)), "{outcome:?}");
+            assert!(
+                stopping.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                stopping.elapsed()
+            );
+            relay.stop().await;
+        }
+
+        /// A restarted runtime knows an offline peer only from its kept row and key: the
+        /// transport holds no description for it and nothing answers its path request. The
+        /// stored key is still enough to hold the message on the persisted propagation node,
+        /// and the send pays the resolve's one path-request wait: the link that follows
+        /// fails without asking again, so the fallback comes after one
+        /// `PATH_REQUEST_TIMEOUT` plus the post, not two.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_message_to_an_offline_peer_known_by_its_stored_key_is_held_on_a_propagation_node()
+         {
+            use crate::mesh::trust::TrustOptions;
+
+            let mut node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-send-offline-stored-key");
+            let cache = mesh_cache_dir(&tmp.path.join("cache"));
+            let nodes = PropagationNodeTable::load(
+                cache.join(PROPAGATION_NODE_TABLE_FILE),
+                SystemTime::now(),
+            )
+            .unwrap();
+            nodes.observe(
+                PropagationNode {
+                    destination: node.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            nodes.persist_if_dirty().unwrap();
+            let peer = TransportIdentity::new_from_rand(OsRng);
+            let desc = SingleInputDestination::new(peer, session_destination_name("offline")).desc;
+            let destination = desc.address_hash.to_hex_string();
+            let peers = PeerTable::load(cache.join("peers.json"), SystemTime::now()).unwrap();
+            peers.observe(
+                PeerSighting {
+                    destination_hash: destination.clone(),
+                    identity_hash: desc.identity.address_hash.to_hex_string(),
+                    name_hash: hex_lower(desc.name.as_name_hash_slice()),
+                    public_key: Some(desc.identity.to_hex_string()),
+                    display_name: Some("Off".to_string()),
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            peers.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, node.port).await;
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    &destination,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let transport = runtime.transport_handle().await.unwrap();
+            assert!(
+                transport
+                    .destination_desc(&desc.address_hash)
+                    .await
+                    .is_none()
+            );
+            assert!(!transport.has_path(&desc.address_hash).await);
+
+            let message =
+                OutboundPeer::new(PeerKind::Message, "held for later", None, None, None).unwrap();
+            let asked = Instant::now();
+            let outcome = runtime.send_peer(&destination, &message).await.unwrap();
+            let waited = asked.elapsed();
+
+            assert_eq!(outcome.via, PeerVia::StoreAndForward);
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                "the send waited {waited:?} before falling back"
+            );
+            node.next_received().await;
+
+            assert!(slot.stop().await.unwrap());
+            node.stop().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_configures_the_slot_limits_from_the_node_config() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-install-limits");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            peer_max_messages_per_hour: 3,
+            ..private_config(addr.port())
+        };
+        let runtime = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.peer_limits().messages_per_hour, 3);
+        let slot = Arc::new(MeshSlot::default());
+        assert_eq!(slot.limits().config(), PeerLimitConfig::default());
+
+        slot.install(runtime).unwrap();
+
+        assert_eq!(slot.limits().config().messages_per_hour, 3);
+        assert_eq!(
+            slot.limits().config(),
+            PeerLimitConfig {
+                messages_per_hour: 3,
+                ..PeerLimitConfig::default()
+            }
+        );
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_tolerates_corrupt_peer_table_left_by_previous_run() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-corrupt-peers");
+        let paths = mesh_paths(&tmp);
+        let peers_dir = mesh_cache_dir(&paths.cache_dir);
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        std::fs::write(peers_dir.join("peers.json"), b"").unwrap();
+        let mut session = Session::default();
+
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .expect("a corrupt peer table must not keep the node from starting");
+
+        assert!(runtime.peers().snapshot().is_empty());
+        assert!(peers_dir.join("peers.json.corrupt").exists());
+        runtime.shutdown().await.unwrap();
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_tears_down_the_relay_socket_and_releases_the_lock() {
+        let (addr, relay_handle, relay_closed) = loopback_relay().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let tmp = TempDir::new("node-teardown");
+        let paths = mesh_paths(&tmp);
+        let cache_dir = paths.cache_dir.clone();
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let instance_id = runtime.instance_id().await;
+        assert!(
+            InstanceLock::acquire(&cache_dir, &instance_id).is_err(),
+            "the running node must hold its instance lock"
+        );
+        assert_eq!(relay_closed.load(Ordering::SeqCst), 0);
+        assert!(metrics.num_alive_tasks() > baseline);
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        let _reacquired = InstanceLock::acquire(&cache_dir, &instance_id)
+            .expect("stop must release the instance lock");
+        wait_until("the relay to see its stream closed", || {
+            relay_closed.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == baseline
+        })
+        .await;
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_node_holds_the_identity_lock_and_stop_releases_it() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-identity-lock");
+        let paths = mesh_paths(&tmp);
+        let identity_path = paths.identity_path.clone();
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let before = std::fs::read(&identity_path).unwrap();
+        assert!(
+            IdentityLock::exclusive(&identity_path).is_err(),
+            "the running node must hold the identity lock"
+        );
+        let err = match identity::rotate_identity(
+            &identity_path,
+            &runtime.fingerprint,
+            SystemTime::now(),
+        ) {
+            Ok(_) => panic!("rotating under a running node must fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains(".mesh off"), "{err}");
+        assert_eq!(std::fs::read(&identity_path).unwrap(), before);
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        let _rotation =
+            IdentityLock::exclusive(&identity_path).expect("stop must release the identity lock");
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_nodes_on_one_config_dir_both_start_and_rotation_is_refused_until_both_stop() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-shared-identity-lock");
+        let identity_path = mesh_paths(&tmp).identity_path;
+        let mut first_session = Session::default();
+        let mut second_session = Session::default();
+        let first = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut first_session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let second = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut second_session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .expect("a second session on the same config dir must start alongside the first");
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert!(IdentityLock::exclusive(&identity_path).is_err());
+
+        first.shutdown().await.unwrap();
+
+        assert!(
+            IdentityLock::exclusive(&identity_path).is_err(),
+            "one node still running keeps rotation refused"
+        );
+
+        second.shutdown().await.unwrap();
+
+        let _rotation = IdentityLock::exclusive(&identity_path)
+            .expect("rotation is possible once every node has stopped");
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod self_trust_tests {
+        use super::*;
+        use crate::mesh::card::{StatusCard, StatusError};
+        use crate::mesh::test_support::wait_for_peer;
+        use crate::mesh::trust::{IdentityStanding, SELF_TRUST_LABEL};
+        use std::fs;
+
+        async fn start_in(tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut Session::default(),
+                mesh_paths(tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        fn installed(runtime: &Arc<MeshRuntime>) -> Arc<MeshSlot> {
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            slot
+        }
+
+        async fn status_of(
+            asker: &MeshRuntime,
+            answerer: &MeshRuntime,
+        ) -> Result<StatusCard, StatusError> {
+            let desc = asker
+                .resolve_destination(&answerer.current_destination_hash())
+                .await
+                .expect("the answerer's destination resolves from its announce");
+            asker.request_status(Route::unasked(desc)).await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn two_sessions_on_a_fresh_config_dir_answer_each_other_with_no_trust_command() {
+            let relay = TransportRelay::start().await;
+            let tmp = TempDir::new("node-self-trust-fresh");
+            let a = start_in(&tmp, relay.port).await;
+            let b = start_in(&tmp, relay.port).await;
+            let (slot_a, slot_b) = (installed(&a), installed(&b));
+            assert_eq!(a.fingerprint(), b.fingerprint());
+            assert!(!a.self_trust_seeded_on_upgrade());
+            assert!(!b.self_trust_seeded_on_upgrade());
+            wait_for_peer(&a, &b.current_destination_hash()).await;
+            wait_for_peer(&b, &a.current_destination_hash()).await;
+
+            status_of(&a, &b).await.expect("b answers a");
+            status_of(&b, &a).await.expect("a answers b");
+
+            let text = fs::read_to_string(a.trust().path()).unwrap();
+            assert!(
+                text.contains(&format!("label: {SELF_TRUST_LABEL}\n")),
+                "{text}"
+            );
+            assert!(text.contains("\nself_trust_seeded: true\n"), "{text}");
+            let own: Vec<_> = a
+                .trust()
+                .records()
+                .into_iter()
+                .filter(|record| record.hash == a.fingerprint())
+                .collect();
+            assert_eq!(own.len(), 1, "{own:?}");
+            assert!(own[0].all_destinations);
+            assert!(slot_a.stop().await.unwrap());
+            assert!(slot_b.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn blocking_one_own_instance_refuses_it_while_the_other_is_served() {
+            let relay = TransportRelay::start().await;
+            let tmp = TempDir::new("node-self-trust-block");
+            let a = start_in(&tmp, relay.port).await;
+            let b = start_in(&tmp, relay.port).await;
+            let (slot_a, slot_b) = (installed(&a), installed(&b));
+            wait_for_peer(&a, &b.current_destination_hash()).await;
+            wait_for_peer(&b, &a.current_destination_hash()).await;
+
+            b.trust()
+                .deny_destination(
+                    slot_b.as_ref(),
+                    &a.current_destination_hash(),
+                    None,
+                    SystemTime::now(),
+                    false,
+                )
+                .unwrap();
+
+            let refused = status_of(&a, &b).await;
+            assert!(
+                matches!(refused, Err(StatusError::NotTrustedByPeer(_))),
+                "{refused:?}"
+            );
+            status_of(&b, &a)
+                .await
+                .expect("the instance that is not blocked is still served");
+            assert!(slot_a.stop().await.unwrap());
+            assert!(slot_b.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_existing_key_is_seeded_on_the_first_start_only() {
+            let (addr, relay_handle, _) = loopback_relay().await;
+            let tmp = TempDir::new("node-self-trust-upgrade");
+            let identity = identity::load_or_mint_identity(&mesh_paths(&tmp).identity_path)
+                .map(|key| identity::fingerprint(&key))
+                .unwrap();
+
+            let first = start_in(&tmp, addr.port()).await;
+            assert!(first.self_trust_seeded_on_upgrade());
+            assert_eq!(
+                first.trust().identity_standing(&identity),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            );
+            first.shutdown().await.unwrap();
+
+            let second = start_in(&tmp, addr.port()).await;
+            assert!(!second.self_trust_seeded_on_upgrade());
+            second.shutdown().await.unwrap();
+            relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    mod own_session_rows_tests {
+        use super::*;
+
+        async fn start_as(name: &str, tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            let mut session = Session::default();
+            session.set_name(name.to_string());
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                NodeOptions {
+                    agent: Some("coder".to_string()),
+                    ..NodeOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Two sessions on one cache dir each file their row at start, each sees the
+        /// other's session by its destination, a re-key moves the row to the fork's id
+        /// and destination, and a stop removes only the stopped node's row.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_files_the_row_rekey_moves_it_and_stop_removes_it() {
+            let (addr, relay_handle, _) = loopback_relay().await;
+            let tmp = TempDir::new("node-own-session-rows");
+            let a = start_as("a", &tmp, addr.port()).await;
+            let temp = start_as("temp", &tmp, addr.port()).await;
+            let temp_slot = Arc::new(MeshSlot::default());
+            temp_slot.install(temp.clone()).unwrap();
+            let (a_dest, temp_dest) = (
+                a.current_destination_hash(),
+                temp.current_destination_hash(),
+            );
+
+            let rows = instances::live(&a.cache_dir);
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_eq!(rows[&temp_dest].session, "temp");
+            assert_eq!(rows[&temp_dest].agent.as_deref(), Some("coder"));
+            assert_eq!(
+                rows[&temp_dest].process,
+                crate::utils::process::ProcessStamp::current()
+            );
+            assert_eq!(
+                a.own_sessions().get(&temp_dest).map(String::as_str),
+                Some("temp")
+            );
+            assert_eq!(
+                temp.own_sessions().get(&a_dest).map(String::as_str),
+                Some("a")
+            );
+
+            temp_slot
+                .rekey(ForkRekey {
+                    original_instance_id: Some(temp.current_instance_id()),
+                    fork_instance_id: fresh_instance_id(),
+                })
+                .await
+                .unwrap();
+            let fork_dest = temp.current_destination_hash();
+            assert_ne!(fork_dest, temp_dest);
+            let rows = a.own_sessions();
+            assert!(!rows.contains_key(&temp_dest), "{rows:?}");
+            assert_eq!(rows.get(&fork_dest).map(String::as_str), Some("temp"));
+            temp_slot.rename_session("temp-fork");
+            assert_eq!(
+                a.own_sessions().get(&fork_dest).map(String::as_str),
+                Some("temp-fork")
+            );
+
+            assert!(temp_slot.stop().await.unwrap());
+            let rows = a.own_sessions();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows.get(&a_dest).map(String::as_str), Some("a"));
+
+            a.shutdown().await.unwrap();
+            assert!(instances::live(&tmp.path.join("cache")).is_empty());
+            relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    mod name_addressing_tests {
+        use super::*;
+        use crate::mesh::trust::TrustOptions;
+
+        fn labelled(label: &str) -> TrustOptions {
+            TrustOptions {
+                label: Some(label.to_string()),
+                note: None,
+            }
+        }
+
+        /// Your named sessions come first in destination order, then each label in the
+        /// trust list's order; an identity label carries every instance the peer table
+        /// holds of it, and an unnamed session or a blank label names nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn address_names_lists_sessions_then_labels_with_their_instances() {
+            let started = started_runtime("node-address-names").await;
+            let runtime = started.runtime.clone();
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            let now = SystemTime::now();
+            let (temp, blank) = (hex_lower(&[0x10; 16]), hex_lower(&[0x11; 16]));
+            for (id, destination, session) in
+                [("temp-id", &temp, "temp"), ("blank-id", &blank, "  ")]
+            {
+                instances::register(
+                    &runtime.cache_dir,
+                    id,
+                    InstanceRow::started_now(destination.clone(), session.to_string(), None),
+                );
+            }
+            let identities: Vec<String> = [0x21, 0x22, 0x23]
+                .iter()
+                .map(|byte| hex_lower(&[*byte; 16]))
+                .collect();
+            let mut heard = Vec::new();
+            for (identity, origin) in [
+                (&identities[1], 1u8),
+                (&identities[2], 2),
+                (&identities[2], 3),
+            ] {
+                let origin = [origin; NAME_HASH_LEN];
+                let instance =
+                    destination_address(&origin, &parse_hash(identity).unwrap()).to_hex_string();
+                runtime.peers().observe(
+                    PeerSighting {
+                        destination_hash: instance.clone(),
+                        identity_hash: identity.clone(),
+                        name_hash: hex_lower(&origin),
+                        public_key: None,
+                        display_name: None,
+                        protocol_version: MESH_PROTOCOL_VERSION,
+                        hops: 1,
+                    },
+                    now,
+                );
+                heard.push(instance);
+            }
+            let trust = runtime.trust();
+            for (identity, label) in identities
+                .iter()
+                .zip(["none-heard", "one-heard", "two-heard"])
+            {
+                trust
+                    .trust_identity(slot.as_ref(), identity, labelled(label), now)
+                    .unwrap();
+            }
+            trust
+                .trust_destination(slot.as_ref(), &heard[0], labelled("laptop"), now)
+                .unwrap();
+            trust
+                .trust_destination(slot.as_ref(), &heard[1], labelled("  "), now)
+                .unwrap();
+
+            let names = runtime.address_names();
+            let temp_at = names.iter().position(|name| name.name == "temp").unwrap();
+            let first_label = names
+                .iter()
+                .position(|name| !matches!(name.target, NameTarget::Session { .. }))
+                .unwrap();
+            assert!(temp_at < first_label, "sessions come first: {names:?}");
+            assert_eq!(
+                names[temp_at].target,
+                NameTarget::Session {
+                    destination: temp.clone(),
+                    identity: runtime.fingerprint.clone(),
+                }
+            );
+            assert!(
+                !names.iter().any(|name| name.name.trim().is_empty()),
+                "{names:?}"
+            );
+            let instances_of = |label: &str| match &names
+                .iter()
+                .find(|name| name.name == label)
+                .unwrap_or_else(|| panic!("{label} is missing: {names:?}"))
+                .target
+            {
+                NameTarget::IdentityLabel { instances, .. } => instances.clone(),
+                other => panic!("{label} is {other:?}"),
+            };
+            assert!(instances_of("none-heard").is_empty());
+            assert_eq!(instances_of("one-heard"), [heard[0].clone()]);
+            let mut two = vec![heard[1].clone(), heard[2].clone()];
+            two.sort_unstable();
+            assert_eq!(instances_of("two-heard"), two);
+            let laptop = names.iter().find(|name| name.name == "laptop").unwrap();
+            assert_eq!(laptop.target.destination(), Some(heard[0].as_str()));
+            assert!(slot.stop().await.unwrap());
+            started.relay_handle.abort();
+        }
+    }
+
+    const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";
+
+    mod own_grant_seed_tests {
+        use super::*;
+        #[cfg(unix)]
+        use crate::mesh::trust::SELF_TRUST_LABEL;
+
+        const OWN: &str = "00112233445566778899aabbccddeeff";
+
+        #[test]
+        fn a_seed_that_writes_reads_as_granted() {
+            let tmp = TempDir::new("node-seed-own-grant");
+            let trust = TrustStore::open(&tmp.path).unwrap();
+
+            assert!(seed_own_grant(&trust, OWN, true));
+        }
+
+        /// The trust file turns unreadable after the store loaded it, so the seed's
+        /// write is refused while the start has nothing left that can fail.
+        #[test]
+        fn a_seed_that_fails_is_a_warning_naming_the_trust_command() {
+            install_log_collector();
+            let tmp = TempDir::new("node-seed-own-grant-fails");
+            let trust = TrustStore::open(&tmp.path).unwrap();
+            std::fs::create_dir_all(trust.path().parent().unwrap()).unwrap();
+            std::fs::write(trust.path(), "{not yaml").unwrap();
+
+            assert!(!seed_own_grant(&trust, OWN, true));
+
+            let remedy = format!(
+                "make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity <hash>` with the identity hash `.mesh info` shows",
+                trust.path().display()
+            );
+            let warned = warn_snapshot();
+            assert!(
+                warned.iter().any(|line| {
+                    line.contains(&format!("own identity {} could not be trusted", short(OWN)))
+                        && line.contains(&remedy)
+                        && !line.contains(OWN)
+                }),
+                "{warned:#?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_start_writes_no_own_grant_and_no_marker() {
+            let port = closed_port().await;
+            let tmp = TempDir::new("node-refused-start-no-seed");
+            let paths = mesh_paths(&tmp);
+            let trust_path = crate::mesh::mesh_config_dir(&paths.config_dir).join("trust.yaml");
+            let mut session = Session::default();
+
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                paths,
+                NodeOptions {
+                    connect_timeout: Duration::from_millis(300),
+                    ..NodeOptions::default()
+                },
+            )
+            .await
+            .err()
+            .expect("a closed relay port must be refused");
+
+            let written = std::fs::read_to_string(&trust_path).unwrap_or_default();
+            assert!(!written.contains("self_trust_seeded"), "{written}");
+            assert!(!written.contains(SELF_TRUST_LABEL), "{written}");
+        }
+    }
+
+    fn peer_turns() -> Vec<EnvoyTurn> {
+        vec![
+            EnvoyTurn {
+                role: EnvoyRole::User,
+                text: "where were we?".to_string(),
+            },
+            EnvoyTurn {
+                role: EnvoyRole::Assistant,
+                text: "the build".to_string(),
+            },
+        ]
+    }
+
+    fn remembered_record(store: &EnvoySessions, thread: &str) -> PathBuf {
+        store.dir().join(format!(
+            "{}.yaml",
+            session_key(REMEMBERED_PEER, thread).unwrap()
+        ))
+    }
+
+    fn two_hours_ago() -> SystemTime {
+        SystemTime::now() - Duration::from_secs(2 * 3_600)
+    }
+
+    /// The record's thread comes off disk, so the late answer gates it like every
+    /// other path to the store: a thread that is not a wire id touches nothing, even
+    /// when a record was planted under it.
+    #[test]
+    fn a_late_answer_to_a_thread_that_is_not_a_wire_id_remembers_nothing() {
+        let tmp = TempDir::new("node-late-answer-thread-gate");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "not a wire id!", peer_turns(), now)
+            .unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "not a wire id!".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "not a wire id!", now)
+            .unwrap()
+            .expect("the planted record is left as it was")
+            .turns;
+        assert_eq!(turns, peer_turns());
+    }
+
+    /// A held answer the run wrote before a send that failed is the thread's last turn
+    /// already; the owner's retry of the same words adds no second copy.
+    #[test]
+    fn a_late_answer_sent_again_is_remembered_once() {
+        let tmp = TempDir::new("node-late-answer-retry");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "t-9", peer_turns(), now)
+            .unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+        let record = InboundRecord {
+            peer_identity: REMEMBERED_PEER.to_string(),
+            thread: "t-9".to_string(),
+            ..inbound_record("a-1")
+        };
+
+        slot.remember_human_answer(&record, "the owner says yes");
+        slot.remember_human_answer(&record, "the owner says yes");
+
+        let turns = store
+            .load(REMEMBERED_PEER, "t-9", now)
+            .unwrap()
+            .unwrap()
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+    }
+
+    /// An escalated question naming a thread the store did not hold ran in a new
+    /// session under its own id, so the owner's late answer joins that session, and
+    /// nothing is written under the thread the question named.
+    #[test]
+    fn a_late_answer_in_a_fresh_session_lands_under_the_question_id() {
+        let tmp = TempDir::new("node-late-answer-fresh-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-authored".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the run used holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert!(
+            store
+                .load(REMEMBERED_PEER, "t-authored", now)
+                .unwrap()
+                .is_none(),
+            "nothing is kept under the thread the question named"
+        );
+        assert!(!remembered_record(&store, "t-authored").exists());
+    }
+
+    /// The thread the question named became held after its run, as another message
+    /// in it opened that session meanwhile. The owner's answer still joins the session
+    /// the run used, under the question's id, and the newer one is left as it was.
+    #[test]
+    fn a_late_answer_stays_in_its_session_when_the_wire_thread_is_held_since() {
+        let tmp = TempDir::new("node-late-answer-thread-held-since");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the run used holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the thread held since is untouched"
+        );
+    }
+
+    /// A record under the asked key that names another identity is the store's
+    /// refusal, not the late answer's to override: the file is left byte for byte.
+    #[test]
+    fn a_late_answer_never_writes_over_another_identitys_record() {
+        let tmp = TempDir::new("node-late-answer-wrong-identity");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "t-9", peer_turns(), now)
+            .unwrap();
+        let path = remembered_record(&store, "t-9");
+        let other = "fedcba9876543210fedcba9876543210";
+        let planted = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(REMEMBERED_PEER, other);
+        std::fs::write(&path, &planted).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-9".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), planted);
+        assert!(matches!(
+            store.load(REMEMBERED_PEER, "t-9", now),
+            Err(EnvoyMemoryError::WrongIdentity { .. })
+        ));
+    }
+
+    /// A record that names the session its run wrote to is answered there, whatever
+    /// the wire thread holds by then: the thread that became held after the run is
+    /// left as it was.
+    #[test]
+    fn a_late_answer_lands_in_the_session_the_record_names() {
+        let tmp = TempDir::new("node-late-answer-named-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                session_thread: "a-1".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the record names holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the thread held since is untouched"
+        );
+    }
+
+    /// The session the record names was deleted before the answer came, while the wire
+    /// thread became held: the answer is remembered nowhere, and never in the wire
+    /// thread, which belongs to another conversation.
+    #[test]
+    fn a_late_answer_whose_session_is_gone_is_remembered_nowhere() {
+        let tmp = TempDir::new("node-late-answer-session-gone");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        store.delete(REMEMBERED_PEER, "a-1").unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                session_thread: "a-1".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert!(store.load(REMEMBERED_PEER, "a-1", now).unwrap().is_none());
+        assert!(!remembered_record(&store, "a-1").exists());
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the wire thread is untouched"
+        );
+    }
+
+    /// A record filed before it named its session, with an unreadable record under the
+    /// question's id: that record is still the session, so the append refuses it and
+    /// nothing is written to the wire thread.
+    #[test]
+    fn a_late_answer_over_an_unreadable_session_writes_nothing_to_the_wire_thread() {
+        let tmp = TempDir::new("node-late-answer-unreadable-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        std::fs::write(remembered_record(&store, "a-1"), "turns: [unclosed").unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert!(store.load(REMEMBERED_PEER, "a-1", now).is_err());
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the wire thread is untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_prunes_the_envoy_memory_it_opens() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-envoy-memory-start");
+        let paths = mesh_paths(&tmp);
+        let config = MeshConfig {
+            envoy_memory: EnvoyMemoryConfig {
+                enabled: true,
+                ttl_hours: 1,
+                ..EnvoyMemoryConfig::default()
+            },
+            ..private_config(addr.port())
+        };
+        let mut session = Session::default();
+        let instance_id = session.ensure_mesh_instance_id().to_string();
+        let planted =
+            EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).unwrap();
+        planted
+            .save(REMEMBERED_PEER, "fresh", peer_turns(), SystemTime::now())
+            .unwrap();
+        planted
+            .save(REMEMBERED_PEER, "stale", peer_turns(), two_hours_ago())
+            .unwrap();
+        assert!(
+            remembered_record(&planted, "stale").exists(),
+            "a save never evicts the thread it writes, so the stale one is planted"
+        );
+
+        let runtime =
+            MeshRuntime::start(&config, true, &mut session, paths, NodeOptions::default())
+                .await
+                .unwrap();
+
+        let store = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        assert_eq!(store.dir(), planted.dir());
+        assert!(
+            !remembered_record(&planted, "stale").exists(),
+            "the thread past its ttl went on load"
+        );
+        assert!(remembered_record(&planted, "fresh").exists());
+        assert_eq!(store.stats().unwrap(), (1, 1));
+        runtime.shutdown().await.unwrap();
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_envoy_memory_off_creates_no_store_directory() {
+        let started = started_runtime("node-envoy-memory-off").await;
+
+        assert!(started.runtime.envoy_memory().is_none());
+        assert!(
+            !mesh_cache_dir(started.runtime.cache_dir())
+                .join("envoy-sessions")
+                .exists()
+        );
+        started.runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// The real sweep future under a paused clock: nothing goes on the immediate first
+    /// tick, then each heartbeat lets the expired escalations go with one idle line
+    /// each, in the shape their kind takes, and leaves the fresh ones filed.
+    #[tokio::test(start_paused = true)]
+    async fn the_pending_sweep_expires_a_question_and_an_access_request_with_one_idle_line_each() {
+        let tmp = TempDir::new("node-pending-sweep");
+        let slot = Arc::new(slot_with_inbound(&tmp));
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let store = slot.inbound_store().unwrap();
+        let now = SystemTime::now();
+        store.upsert(inbound_record("fresh"), now).unwrap();
+        let then = now - Duration::from_secs(8 * 86_400);
+        store
+            .upsert(
+                InboundRecord {
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-q")
+                },
+                then,
+            )
+            .unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".into()],
+                    question: String::new(),
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-a")
+                },
+                then,
+            )
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let sweep = tokio::spawn(sweep_pending(Arc::downgrade(&slot), cancel.clone()));
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+        settle().await;
+        assert!(
+            idle.pushed.lock().is_empty(),
+            "the immediate first tick is skipped"
+        );
+        assert!(store.get("stale-q").unwrap().is_some());
+
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
+        {
+            let pushed = idle.pushed.lock();
+            assert_eq!(
+                pushed
+                    .iter()
+                    .map(|note| note.text.plain())
+                    .collect::<Vec<_>>(),
+                [
+                    format!("access request stale-a from {dest8} expired"),
+                    format!("question stale-q from {dest8} expired unanswered"),
+                ]
+            );
+            for note in pushed.iter() {
+                assert_eq!(note.source, Source::Message);
+                assert_eq!(
+                    note.origin,
+                    Origin::Peer(id8.to_string()),
+                    "the idle line is keyed on the identity, like every other"
+                );
+                assert!(note.model_note.is_none());
+            }
+        }
+        let left: Vec<String> = store
+            .list(now)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(left, ["fresh"]);
+        cancel.cancel();
+        sweep.await.unwrap();
+    }
+
+    /// A filing made after a row expired used to drop that row on the way, so the sweep
+    /// never saw it; now the filing leaves it and the next heartbeat announces it once,
+    /// with the fresh question still filed.
+    #[tokio::test(start_paused = true)]
+    async fn the_pending_sweep_announces_an_expiry_that_a_later_filing_would_once_have_dropped() {
+        let tmp = TempDir::new("node-pending-sweep-after-filing");
+        let slot = Arc::new(slot_with_inbound(&tmp));
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let store = slot.inbound_store().unwrap();
+        let now = SystemTime::now();
+        let then = now - Duration::from_secs(8 * 86_400);
+        store
+            .upsert(
+                InboundRecord {
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-q")
+                },
+                then,
+            )
+            .unwrap();
+        store.upsert(inbound_record("fresh"), now).unwrap();
+        assert!(
+            store.get("stale-q").unwrap().is_some(),
+            "the fresh filing leaves the expired row for the sweep"
+        );
+        let cancel = CancellationToken::new();
+        let sweep = tokio::spawn(sweep_pending(Arc::downgrade(&slot), cancel.clone()));
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+        settle().await;
+
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            idle.pushed
+                .lock()
+                .iter()
+                .map(|note| note.text.plain())
+                .collect::<Vec<_>>(),
+            [format!("question stale-q from {dest8} expired unanswered")]
+        );
+        assert!(store.get("stale-q").unwrap().is_none());
+        assert!(store.get("fresh").unwrap().is_some());
+        cancel.cancel();
+        sweep.await.unwrap();
+    }
+
+    /// A row past its TTL that no sweep has taken out yet is no question to answer or
+    /// dismiss: the verbs reach the node only after finding the row open, so both read
+    /// it as closed under them, with the typed race marker a `--all` loop tells apart
+    /// from a failure; the row stays for the sweep to announce.
+    #[tokio::test]
+    async fn open_question_reads_an_expired_row_as_already_closed() {
+        let tmp = TempDir::new("slot-open-question-expired");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        let stale = InboundRecord {
+            received_at: rfc3339_utc(then),
+            ..inbound_record("stale-q")
+        };
+        store.upsert(stale.clone(), then).unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        for silent in [false, true] {
+            let err = slot.dismiss_inbound("stale-q", silent).await.unwrap_err();
+            assert!(err.downcast_ref::<AlreadyClosed>().is_some(), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "`stale-q` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            );
+        }
+        let err = slot.answer_inbound("stale-q", "yes").await.unwrap_err();
+        assert!(err.downcast_ref::<AlreadyClosed>().is_some(), "{err}");
+        assert_eq!(err.to_string(), already_closed("stale-q").to_string());
+
+        assert_eq!(store.get("stale-q").unwrap(), Some(stale));
+        assert!(idle.pushed.lock().is_empty(), "nothing is announced here");
+        assert!(slot.peer_inbox().drain().0.is_empty(), "nothing is filed");
+    }
+
+    /// The real sweep future under a paused clock: its first tick is the start's prune
+    /// and does nothing; every heartbeat after it prunes, so a thread that expires while
+    /// the node runs goes without a load or save to notice it. Once the store is swapped,
+    /// as a re-key does, the next tick prunes the new store and leaves the old one alone.
+    #[tokio::test(start_paused = true)]
+    async fn the_envoy_memory_sweep_prunes_on_each_tick() {
+        let tmp = TempDir::new("node-envoy-memory-sweep");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ttl_hours: 1,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        store
+            .save(REMEMBERED_PEER, "first", peer_turns(), two_hours_ago())
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let bound = Arc::new(ArcSwapOption::new(Some(store.clone())));
+        let sweep = tokio::spawn(sweep_envoy_memory(
+            {
+                let bound = bound.clone();
+                move || bound.load_full()
+            },
+            cancel.clone(),
+        ));
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+        settle().await;
+        assert!(
+            remembered_record(&store, "first").exists(),
+            "the immediate first tick is skipped"
+        );
+
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+        assert!(!remembered_record(&store, "first").exists());
+
+        store
+            .save(REMEMBERED_PEER, "second", peer_turns(), two_hours_ago())
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+        assert!(
+            !remembered_record(&store, "second").exists(),
+            "the tick after prunes too"
+        );
+        assert_eq!(store.stats().unwrap(), (0, 0));
+
+        store
+            .save(
+                REMEMBERED_PEER,
+                "left-behind",
+                peer_turns(),
+                two_hours_ago(),
+            )
+            .unwrap();
+        let fork_store = Arc::new(EnvoySessions::open(&tmp.path, "fork", &config).unwrap());
+        fork_store
+            .save(REMEMBERED_PEER, "third", peer_turns(), two_hours_ago())
+            .unwrap();
+        bound.store(Some(fork_store.clone()));
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+        assert!(
+            !remembered_record(&fork_store, "third").exists(),
+            "the tick after the swap prunes the store now bound"
+        );
+        assert!(
+            remembered_record(&store, "left-behind").exists(),
+            "the displaced store is no longer swept"
+        );
+
+        cancel.cancel();
+        sweep.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_moves_destination_and_never_reuses_original_hash() {
+        let started = started_runtime("node-rekey").await;
+        let runtime = &started.runtime;
+        let original_id = runtime.instance_id().await;
+        let old_hash = runtime.destination_hash().await;
+        let fork_id = fresh_instance_id();
+
+        runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(original_id.clone()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        let new_hash = runtime.destination_hash().await;
+        assert_ne!(new_hash, old_hash);
+        assert_eq!(runtime.instance_id().await, fork_id);
+        assert_eq!(
+            started.session.mesh_instance_id(),
+            Some(original_id.as_str()),
+            "re-keying moves the node, not the original session's id"
+        );
+        assert!(lock_path(&runtime.cache_dir, &fork_id).exists());
+        assert!(!runtime.has_destination(&old_hash).await);
+        assert!(runtime.has_destination(&new_hash).await);
+        let _original_lock = InstanceLock::acquire(&runtime.cache_dir, &original_id)
+            .expect("re-keying must release the original instance lock");
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// A peer's refusal tells the owner on the other side which destination to trust:
+    /// this node's current one. After a re-key (a `.session` switch moves the node to a
+    /// fork instance) the sentence and the tool's `next_action` name the fork's
+    /// destination and never the retired one, in every place the hash appears.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_after_a_rekey_names_the_forks_destination_not_the_retired_one() {
+        let started = started_runtime("node-rekey-refusal").await;
+        let runtime = &started.runtime;
+        let peer = "ab".repeat(16);
+        let old_hash = runtime.destination_hash().await;
+        let before = runtime.remote_refusal(&peer).to_string();
+        assert_eq!(before.matches(&old_hash).count(), 3, "{before}");
+
+        runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(runtime.instance_id().await),
+                fork_instance_id: fresh_instance_id(),
+            })
+            .await
+            .unwrap();
+        let new_hash = runtime.destination_hash().await;
+        assert_ne!(new_hash, old_hash);
+
+        let refusal = runtime.remote_refusal(&peer);
+        let sentence = refusal.to_string();
+        assert!(
+            !sentence.contains(&old_hash),
+            "the retired destination must not be the one the peer's owner is told to trust: {sentence}"
+        );
+        assert_eq!(sentence.matches(&new_hash).count(), 3, "{sentence}");
+        assert!(
+            sentence.contains(&format!(
+                "Its owner can run .mesh trust {new_hash} (or .mesh unblock {new_hash} if it blocked this instance)."
+            )),
+            "{sentence}"
+        );
+        let next_action = refusal.next_action();
+        assert!(!next_action.contains(&old_hash), "{next_action}");
+        assert!(
+            next_action.contains(&format!("to run .mesh trust {new_hash};")),
+            "{next_action}"
+        );
+        let json = serde_json::to_value(&refusal).unwrap();
+        assert_eq!(json["kind"], "refused");
+        assert_eq!(json["message"], sentence);
+        assert_eq!(json["next_action"], next_action);
+        assert!(
+            !json.to_string().contains("0xf1"),
+            "the code stays out of the words: {json}"
+        );
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_refuses_when_original_instance_does_not_match() {
+        let started = started_runtime("node-rekey-mismatch").await;
+        let runtime = &started.runtime;
+        let original_id = runtime.instance_id().await;
+        let hash = runtime.destination_hash().await;
+
+        let err = runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(fresh_instance_id()),
+                fork_instance_id: fresh_instance_id(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(".mesh off"), "{err}");
+        assert_eq!(runtime.destination_hash().await, hash);
+        assert_eq!(runtime.instance_id().await, original_id);
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_refuses_when_fork_lock_is_held_and_keeps_original() {
+        let started = started_runtime("node-rekey-locked").await;
+        let runtime = &started.runtime;
+        let original_id = runtime.instance_id().await;
+        let hash = runtime.destination_hash().await;
+        let fork_id = fresh_instance_id();
+        let _held = InstanceLock::acquire(&runtime.cache_dir, &fork_id).unwrap();
+
+        let result = runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(original_id.clone()),
+                fork_instance_id: fork_id,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(runtime.instance_id().await, original_id);
+        assert_eq!(runtime.destination_hash().await, hash);
+        assert!(runtime.has_destination(&hash).await);
+        assert!(
+            InstanceLock::acquire(&runtime.cache_dir, &original_id).is_err(),
+            "a refused re-key must keep the original instance lock"
+        );
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_cancels_and_awaits_registered_tasks() {
+        let started = started_runtime("node-stop").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        let token = runtime.cancellation_token();
+        let done = Arc::new(AtomicBool::new(false));
+        let task_done = done.clone();
+        runtime.register_task(tokio::spawn(async move {
+            token.cancelled().await;
+            sleep(Duration::from_millis(50)).await;
+            task_done.store(true, Ordering::SeqCst);
+        }));
+        slot.install(runtime).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "stop must wait for registered tasks, not just cancel them"
+        );
+        assert!(slot.get().is_none());
+        assert!(!slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_interrupts_the_attached_envoy_once_and_leaves_it_attached() {
+        let started = started_runtime("node-stop-envoy").await;
+        let slot = Arc::new(MeshSlot::default());
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.install(started.runtime.clone()).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        assert_eq!(envoy.interrupts.load(Ordering::SeqCst), 1);
+        assert!(
+            slot.envoy.load_full().is_some(),
+            "the envoy belongs to the session, not the node; stop leaves it attached"
+        );
+        assert!(!slot.stop().await.unwrap());
+        assert_eq!(
+            envoy.interrupts.load(Ordering::SeqCst),
+            1,
+            "a stop with no node interrupts nothing"
+        );
+        started.relay_handle.abort();
+    }
+
+    /// A `local` client's events fold into the row with the renderers' sentences: a
+    /// `DialFailed` puts its reason on a `connecting` row and leaves a connected or lost
+    /// row alone, a drop is `lost, retrying` with its reason's sentence and a plain
+    /// `Disconnected` reads as a connection that ended, never as rnsd closing it,
+    /// `Connecting` never moves a lost row, and the end of the stream lets the client go.
+    /// No watcher runs, since the slot is never installed, so the started node's one row
+    /// stands in for the `local` one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_clients_reasoned_events_fold_like_their_plain_counterparts() {
+        let started = started_runtime("node-local-reasoned-events").await;
+        let runtime = &started.runtime;
+        let (_sender, events) = mpsc::channel(1);
+        let mut local = Some(LocalWatch {
+            index: 0,
+            label: "local rnsd at 127.0.0.1:37428".to_string(),
+            endpoint: LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap()),
+            events,
+            logged_dial_failure: None,
+        });
+        let row = |runtime: &MeshRuntime| runtime.interface_states()[0].state.clone();
+        let refused = || {
+            Some(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Refused,
+            })
+        };
+        let lost = |reason: &str| InterfaceState::Disconnected {
+            reason: reason.to_string(),
+        };
+        runtime.mark_interface_state(0, InterfaceState::Connecting { dial_failure: None });
+
+        follow_local_event(runtime, &mut local, refused());
+        assert_eq!(
+            row(runtime),
+            InterfaceState::Connecting {
+                dial_failure: Some(DialFailure {
+                    reason: "nothing is listening at 127.0.0.1:37428".to_string(),
+                    advice: DialAdvice::StartRnsd,
+                }),
+            }
+        );
+
+        follow_local_event(
+            runtime,
+            &mut local,
+            Some(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Timeout,
+            }),
+        );
+        assert_eq!(
+            row(runtime),
+            InterfaceState::Connecting {
+                dial_failure: Some(DialFailure {
+                    reason: "rnsd did not answer".to_string(),
+                    advice: DialAdvice::Redialing,
+                }),
+            },
+            "a later dial failure of another kind replaces the reason and its advice"
+        );
+
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
+        assert_eq!(row(runtime), InterfaceState::Connected);
+
+        follow_local_event(runtime, &mut local, refused());
+        assert_eq!(row(runtime), InterfaceState::Connected);
+
+        follow_local_event(
+            runtime,
+            &mut local,
+            Some(SharedInstanceEvent::DisconnectedWithReason {
+                reason: DisconnectReason::Reset,
+            }),
+        );
+        assert_eq!(row(runtime), lost("the connection was reset"));
+
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connecting));
+        assert_eq!(row(runtime), lost("the connection was reset"));
+        follow_local_event(runtime, &mut local, refused());
+        assert_eq!(row(runtime), lost("the connection was reset"));
+
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Disconnected));
+        assert_eq!(row(runtime), lost("the connection ended"));
+
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
+        follow_local_event(
+            runtime,
+            &mut local,
+            Some(SharedInstanceEvent::DisconnectedWithReason {
+                reason: DisconnectReason::PeerClosed,
+            }),
+        );
+        assert_eq!(row(runtime), lost("rnsd closed the socket"));
+
+        follow_local_event(runtime, &mut local, None);
+        assert!(local.is_none());
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn disconnect_sentence_names_each_reason() {
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::PeerClosed),
+            "rnsd closed the socket"
+        );
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::Reset),
+            "the connection was reset"
+        );
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::Timeout),
+            "the connection timed out"
+        );
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::Io(std::io::ErrorKind::BrokenPipe)),
+            "broken pipe"
+        );
+    }
+
+    #[test]
+    fn dial_failure_sentence_names_each_kind() {
+        let endpoint = LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap());
+        assert_eq!(
+            dial_failure_sentence(DialFailureKind::Refused, &endpoint),
+            "nothing is listening at 127.0.0.1:37428"
+        );
+        assert_eq!(
+            dial_failure_sentence(
+                DialFailureKind::NotFound,
+                &LocalEndpoint::Abstract("@rns/default".to_string())
+            ),
+            "no rnsd socket at @rns/default"
+        );
+        assert_eq!(
+            dial_failure_sentence(DialFailureKind::Timeout, &endpoint),
+            "rnsd did not answer"
+        );
+        assert_eq!(
+            dial_failure_sentence(
+                DialFailureKind::Io(std::io::ErrorKind::PermissionDenied),
+                &endpoint
+            ),
+            "permission denied"
+        );
+    }
+
+    /// The advice follows the dial failure's typed kind, never its sentence: a refusal or
+    /// a missing socket means no rnsd runs at the endpoint, a timeout or an I/O error is
+    /// left to the client's redials.
+    #[test]
+    fn a_dial_failures_advice_follows_its_kind() {
+        let endpoint = LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap());
+        for (kind, advice) in [
+            (DialFailureKind::Refused, DialAdvice::StartRnsd),
+            (DialFailureKind::NotFound, DialAdvice::StartRnsd),
+            (DialFailureKind::Timeout, DialAdvice::Redialing),
+            (
+                DialFailureKind::Io(std::io::ErrorKind::PermissionDenied),
+                DialAdvice::Redialing,
+            ),
+        ] {
+            let failure = DialFailure::of(kind, &endpoint);
+            assert_eq!(failure.advice, advice, "{kind:?}");
+            assert_eq!(
+                failure.reason,
+                dial_failure_sentence(kind, &endpoint),
+                "{kind:?}"
+            );
+        }
+    }
+
+    fn start_wait_endpoint() -> LocalEndpoint {
+        LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_with_only_connecting_runs_to_the_deadline_without_a_reason() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender.send(SharedInstanceEvent::Connecting).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(outcome, LocalStart::NotConnected { dial_failure: None });
+        assert!(tokio::time::Instant::now() >= deadline);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_beside_other_interfaces_reads_past_a_dial_failure_to_the_deadline()
+    {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender.send(SharedInstanceEvent::Connecting).await.unwrap();
+        sender
+            .send(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Refused,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(
+            outcome,
+            LocalStart::NotConnected {
+                dial_failure: Some(DialFailure {
+                    reason: "nothing is listening at 127.0.0.1:37428".to_string(),
+                    advice: DialAdvice::StartRnsd,
+                }),
+            }
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_alone_ends_on_the_first_dial_failure() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender
+            .send(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::NotFound,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_local_start(&mut events, deadline, true, &endpoint),
+        )
+        .await
+        .expect("the first dial failure ends a lone rnsd's wait");
+
+        assert_eq!(
+            outcome,
+            LocalStart::NotConnected {
+                dial_failure: Some(DialFailure {
+                    reason: "no rnsd socket at 127.0.0.1:37428".to_string(),
+                    advice: DialAdvice::StartRnsd,
+                }),
+            }
+        );
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_ends_connected_on_the_clients_connected() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        for event in [
+            SharedInstanceEvent::Connecting,
+            SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Refused,
+            },
+            SharedInstanceEvent::Connected,
+        ] {
+            sender.send(event).await.unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(outcome, LocalStart::Connected);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_on_a_closed_stream_reads_stopped_reporting() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender.send(SharedInstanceEvent::Connecting).await.unwrap();
+        drop(sender);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(outcome, LocalStart::StoppedReporting);
+    }
+
+    /// Attaching a second shared instance is refused by the transport, so nothing is
+    /// left to retry the entry: its row reads `unreachable` with the attach's reason
+    /// and never `retrying`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_rnsd_the_transport_cannot_attach_reads_unreachable_and_not_retrying() {
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let transport = Transport::new(TransportConfig::new(SCOPE_APP_NAME, &identity, false));
+        let first = LocalEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        let _held = attach_local(&transport, &first).await.unwrap();
+        let endpoint = LocalEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 2)));
+
+        let joined = join_local(&transport, &endpoint, Duration::from_millis(300), false).await;
+
+        let Joined::NotReached { reason, message } = &joined else {
+            panic!("a second attach must not reach: {}", joined.start_state());
+        };
+        assert!(
+            reason.starts_with("attach to the shared instance failed: "),
+            "{reason}"
+        );
+        assert!(
+            message.starts_with("Local rnsd at 127.0.0.1:2 (type: local) is not reachable: "),
+            "{message}"
+        );
+        let state = joined.start_state();
+        assert_eq!(
+            state,
+            InterfaceState::Unreachable {
+                reason: reason.clone(),
+                retrying: false,
+            }
+        );
+        assert!(!state.to_string().contains("retrying"), "{state}");
+        transport.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_on_a_stopped_runtime_is_not_running() {
+        let started = started_runtime("node-request-stopped").await;
+        let runtime = &started.runtime;
+        let peer = SingleInputDestination::new(
+            TransportIdentity::new_from_rand(OsRng),
+            session_destination_name("peer"),
+        )
+        .desc;
+        runtime.shutdown().await.unwrap();
+
+        let result = runtime
+            .request(&peer, "/echo", rmpv::Value::Nil, RequestOptions::default())
+            .await;
+
+        assert_eq!(result.unwrap_err(), RequestError::NotRunning);
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_refuses_when_a_runtime_is_already_installed() {
+        let started = started_runtime("node-install").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+
+        let err = slot
+            .install(started.runtime.clone())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(".mesh off"), "{err}");
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// `install` attaches the slot to the trust list as well as to the knock gate, so a key
+    /// change the list notes reaches the same sink a knock would.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_change_noted_after_install_reaches_the_slots_sink() {
+        let started = started_runtime("node-install-key-change").await;
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let origin = [9u8; NAME_HASH_LEN];
+        let old = TransportIdentity::new_from_rand(OsRng);
+        let old_destination = destination_address(&origin, old.address_hash()).to_hex_string();
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: old_destination.clone(),
+                identity_hash: old.address_hash().to_hex_string(),
+                name_hash: hex_lower(&origin),
+                public_key: None,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            now,
+        );
+        let trust = started.runtime.trust();
+        trust
+            .trust_destination(&*slot, &old_destination, TrustOptions::default(), now)
+            .unwrap();
+        let new_hex = TransportIdentity::new_from_rand(OsRng)
+            .address_hash()
+            .to_hex_string();
+
+        let marked = trust.note_key_change(
+            &new_hex,
+            &hex_lower(&origin),
+            KeyChangeOutcome::Refused,
+            now,
+        );
+
+        assert_eq!(marked.len(), 1);
+        let received = notifier.0.lock().clone();
+        assert_eq!(received.len(), 1, "{received:#?}");
+        let line = &received[0].lines()[0];
+        assert!(line.contains("presented under"), "{line}");
+        assert!(line.contains(&new_hex), "{line}");
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_carries_escalated_questions_into_the_fork_store() {
+        let started = started_runtime("node-rekey-inbound").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.inbound_store()
+            .unwrap()
+            .upsert(inbound_record("q-before-fork"), SystemTime::now())
+            .unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let fork_store = slot.inbound_store().unwrap();
+        assert_eq!(
+            fork_store.path(),
+            InboundStore::new(&cache_dir, &fork_id).path(),
+            "the slot serves the fork's inbound file"
+        );
+        assert!(fork_store.get("q-before-fork").unwrap().is_some());
+        assert!(
+            InboundStore::new(&cache_dir, &original_id)
+                .get("q-before-fork")
+                .unwrap()
+                .is_some(),
+            "the original's file is left as it was"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A question that expired before the fork is announced once, by the sweep the
+    /// re-key runs before it carries anything, and is in neither file afterwards: the
+    /// carry copies live rows only, so without that sweep the row would sit in the
+    /// original's orphaned file and never be announced. An expired row the fork's own
+    /// file already held under a live row's id gives way to the carried row and is
+    /// announced too, once, though the carry runs twice.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_announces_the_expired_rows_once_and_carries_only_the_live_one() {
+        let started = started_runtime("node-rekey-expired-inbound").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let store = slot.inbound_store().unwrap();
+        let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        store
+            .upsert(
+                InboundRecord {
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-q")
+                },
+                then,
+            )
+            .unwrap();
+        let fresh = inbound_record("fresh");
+        store.upsert(fresh.clone(), SystemTime::now()).unwrap();
+        InboundStore::new(&cache_dir, &fork_id)
+            .upsert(
+                InboundRecord {
+                    question: "an earlier asking".to_string(),
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("fresh")
+                },
+                then,
+            )
+            .unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            idle.pushed
+                .lock()
+                .iter()
+                .map(|note| note.text.plain())
+                .collect::<Vec<_>>(),
+            [
+                format!("question stale-q from {dest8} expired unanswered"),
+                format!("question fresh from {dest8} expired unanswered"),
+            ],
+            "the sweep's line first, then the displaced twin's, each once"
+        );
+        let fork_store = slot.inbound_store().unwrap();
+        assert!(fork_store.get("stale-q").unwrap().is_none());
+        assert_eq!(
+            fork_store.get("fresh").unwrap(),
+            Some(fresh),
+            "the carried live row took the expired twin's id"
+        );
+        assert_eq!(fork_store.list(SystemTime::now()).unwrap().len(), 1);
+        let original = InboundStore::new(&cache_dir, &original_id);
+        assert!(
+            original.get("stale-q").unwrap().is_none(),
+            "the sweep took the expired row out of the original's file"
+        );
+        assert!(original.get("fresh").unwrap().is_some());
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The re-key judges expiry on one reading of the clock: the sweep that runs before
+    /// the first carry and both carries take the same `now`, so a row that is live when
+    /// the sweep looks cannot cross `PENDING_TTL` a moment later and be dropped by the
+    /// carry as neither pruned, announced nor carried. The window is sub-millisecond
+    /// and the clock is not injectable here, so the contract is pinned on the shape:
+    /// one clock read ahead of the sweep, the sweep ahead of the carry closure, and the
+    /// carry handing that reading to `adopt_from`.
+    #[test]
+    fn the_rekey_sweeps_and_carries_on_one_reading_of_the_clock() {
+        let source = include_str!("node.rs");
+        let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        let production = &source[..source.find(&test_module).expect("the test module opens")];
+
+        let opener = "async fn rekey(&self, rekey: ForkRekey)";
+        let body = production
+            .match_indices(opener)
+            .map(|(start, _)| {
+                let end = start
+                    + [
+                        "\n    pub(crate) fn ",
+                        "\n    pub(crate) async fn ",
+                        "\n    fn ",
+                    ]
+                    .iter()
+                    .filter_map(|next| production[start + opener.len()..].find(next))
+                    .min()
+                    .expect("another method follows the re-key")
+                    + opener.len();
+                &production[start..end]
+            })
+            .find(|body| body.contains("adopt_from("))
+            .expect("the slot's re-key carries the inbound rows");
+        let before_grants = &body[..body
+            .find("rebind_grants(")
+            .expect("the grants are rebound after the inbound carry")];
+
+        assert_eq!(
+            before_grants.matches("SystemTime::now()").count(),
+            1,
+            "the sweep and the carries read the clock once between them:\n{before_grants}"
+        );
+        let clock = before_grants
+            .find("let now = SystemTime::now();")
+            .expect("the one reading is bound to `now`");
+        let sweep = before_grants
+            .find("self.sweep_expired_pending(now);")
+            .expect("the sweep takes that reading");
+        let carry = before_grants
+            .find("let carry = ||")
+            .expect("the carry is a closure the re-key runs twice");
+        assert!(
+            clock < sweep && sweep < carry,
+            "clock, then sweep, then carry"
+        );
+        assert_eq!(
+            before_grants.matches("adopt_from(").count(),
+            1,
+            "one carry shape, run twice"
+        );
+        assert!(
+            before_grants.contains("adopt_from(current, now)"),
+            "the carry hands adopt_from the same reading"
+        );
+        assert_eq!(before_grants.matches("carry();").count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_detaches_the_pending_store_and_leaves_the_file_for_the_next_install() {
+        let started = started_runtime("node-stop-pending").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let instance_id = started.runtime.current_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        assert!(slot.correlations().list().is_empty());
+        assert_eq!(
+            PendingStore::new(&cache_dir, &instance_id)
+                .list(SystemTime::now())
+                .unwrap()
+                .len(),
+            1,
+            "the question waits on disk for the next install"
+        );
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_with_an_unreadable_pending_file_still_serves_and_warns() {
+        install_log_collector();
+        let started = started_runtime("node-install-unreadable").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let instance_id = started.runtime.current_instance_id();
+        let store = PendingStore::new(&cache_dir, &instance_id);
+        std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        std::fs::write(store.path(), "not a record\n").unwrap();
+        let slot = Arc::new(MeshSlot::default());
+
+        slot.install(started.runtime.clone()).unwrap();
+
+        assert!(slot.get().is_some(), "the node serves");
+        assert!(slot.correlations().list().is_empty());
+        let warned = warn_snapshot();
+        // The warning passes the error text through `redact_hashes`, which cuts the
+        // instance id run in the file name to eight hex digits.
+        let full_path = store.path().display().to_string();
+        let path = redact_hashes(&full_path);
+        assert_ne!(
+            path, full_path,
+            "the store path carries a full instance-id hash"
+        );
+        assert!(
+            warned.iter().any(|message| {
+                message.contains("could not be reopened")
+                    && message.contains(&path)
+                    && !message.contains(&full_path)
+                    && message.contains("move the file aside")
+            }),
+            "{warned:#?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.path()).unwrap(),
+            "not a record\n",
+            "the unreadable file is left for the person to move aside"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_rebinds_the_pending_store_to_the_fork_instance() {
+        install_log_collector();
+        let started = started_runtime("node-rekey-pending").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.correlations().open(pending("q-original")).unwrap();
+        let fork_store = PendingStore::new(&cache_dir, &fork_id);
+        fork_store
+            .upsert(pending("q-fork-earlier"), SystemTime::now())
+            .unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            slot.correlations().get("q-original").is_none(),
+            "the fork does not collect the original's questions"
+        );
+        assert!(
+            slot.correlations().is_open("q-fork-earlier"),
+            "the fork's own file is reopened"
+        );
+        slot.correlations().open(pending("q-fork")).unwrap();
+        let now = SystemTime::now();
+        let ids = |instance: &str| -> Vec<String> {
+            PendingStore::new(&cache_dir, instance)
+                .list(now)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.id)
+                .collect()
+        };
+        assert_eq!(ids(&original_id), ["q-original"]);
+        assert_eq!(ids(&fork_id), ["q-fork", "q-fork-earlier"]);
+
+        let second_fork_id = fresh_instance_id();
+        let second_store = PendingStore::new(&cache_dir, &second_fork_id);
+        std::fs::write(second_store.path(), "not a record\n").unwrap();
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(fork_id.clone()),
+            fork_instance_id: second_fork_id.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.runtime.current_instance_id(), second_fork_id);
+        assert!(
+            slot.correlations().list().is_empty(),
+            "an unreadable fork file leaves nothing pending"
+        );
+        let full_path = second_store.path().display().to_string();
+        let path = redact_hashes(&full_path);
+        assert_ne!(
+            path, full_path,
+            "the store path carries a full instance-id hash"
+        );
+        assert!(
+            warn_snapshot().iter().any(|message| {
+                message.contains("could not be reopened")
+                    && message.contains(&path)
+                    && !message.contains(&full_path)
+            }),
+            "{:#?}",
+            warn_snapshot()
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The slot names a share root only from a published snapshot whose `cwd` is absolute:
+    /// no snapshot, an empty `cwd` (a failed `current_dir()` at capture) and a relative one
+    /// all share nothing, so a share list can never resolve against the process's own
+    /// directory by accident.
+    #[test]
+    fn the_slot_names_a_share_root_only_from_an_absolute_snapshot_cwd() {
+        let slot = MeshSlot::default();
+        assert_eq!(slot.share_root(), None, "nothing published");
+
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = PathBuf::new();
+        slot.publish(snapshot);
+        assert_eq!(slot.share_root(), None, "an empty cwd");
+
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = PathBuf::from("relative/dir");
+        slot.publish(snapshot);
+        assert_eq!(slot.share_root(), None, "a relative cwd");
+
+        let root = std::env::temp_dir();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = root.clone();
+        slot.publish(snapshot);
+        assert_eq!(slot.share_root(), Some(root));
+    }
+
+    /// The workspace share file is named relative to the root under the default config
+    /// directory name, so the test holds the override unset for its whole body.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn the_slot_names_the_share_files_only_once_a_snapshot_names_a_root() {
+        let _default_name =
+            crate::testing::EnvVarGuard::unset(crate::utils::get_env_name("workspace_config_dir"));
+        let slot = MeshSlot::default();
+        assert!(slot.share_locations(|| None).is_none(), "nothing published");
+
+        let tmp = TempDir::new("slot-share-locations");
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        slot.publish(snapshot);
+
+        let (root, locations) = slot.share_locations(|| None).unwrap();
+        assert_eq!(root, tmp.path);
+        assert!(
+            locations.global.ends_with("mesh/shares.yaml"),
+            "{locations:?}"
+        );
+        assert!(locations.workspace.starts_with(&tmp.path), "{locations:?}");
+    }
+
+    #[test]
+    fn the_slot_without_a_node_resolves_the_inbox_dir_once_and_protects_it() {
+        let slot = MeshSlot::default();
+        let tmp = TempDir::new("slot-share-locations-inbox");
+        let inbox = tmp.path.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        slot.publish(snapshot);
+        let resolutions = std::cell::Cell::new(0);
+
+        let (_, locations) = slot
+            .share_locations(|| {
+                resolutions.set(resolutions.get() + 1);
+                Some(inbox.clone())
+            })
+            .unwrap();
+
+        assert_eq!(resolutions.get(), 1);
+        assert!(locations.protected_dirs().contains(&inbox), "{locations:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_slot_with_a_running_node_never_resolves_the_inbox_dir_itself() {
+        let started = started_runtime("node-share-locations-live").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = started.tmp.path.clone();
+        slot.publish(snapshot);
+
+        let (root, locations) = slot
+            .share_locations(|| panic!("a running node protects its own inbox"))
+            .unwrap();
+
+        assert_eq!(root, started.tmp.path);
+        assert_eq!(locations, started.runtime.serving().share_locations(&root));
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The info lines announcing an `inbox_dir` translation that mention `configured`.
+    #[cfg(unix)]
+    fn inbox_translation_lines(configured: &Path) -> Vec<String> {
+        let needle = format!("mesh.fetch.inbox_dir '{}' not found", configured.display());
+        crate::testing::info_snapshot()
+            .into_iter()
+            .filter(|line| line.contains(&needle))
+            .collect()
+    }
+
+    /// An `inbox_dir` that exists is the node's staging root as configured, with no
+    /// translation announced at start; the node protects exactly that directory.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_adopts_an_existing_inbox_dir_as_is_and_announces_nothing() {
+        install_log_collector();
+        let inbox_home = TempDir::new("node-inbox-exists");
+        let configured = inbox_home.path.join("inbox");
+        std::fs::create_dir_all(&configured).unwrap();
+        let configured_for_node = configured.clone();
+
+        let started = started_runtime_with("node-inbox-exists-rt", move |config| {
+            config.fetch.inbox_dir = Some(configured_for_node);
+        })
+        .await;
+
+        let instance = started.runtime.current_instance_id();
+        assert_eq!(
+            started.runtime.inbox_staging().root(),
+            configured.join(&instance)
+        );
+        assert!(
+            inbox_translation_lines(&configured).is_empty(),
+            "{:?}",
+            inbox_translation_lines(&configured)
+        );
+        let root = started.tmp.path.clone();
+        let locations = started.runtime.serving().share_locations(&root);
+        assert!(
+            locations.protected_dirs().contains(&configured),
+            "{locations:?}"
+        );
+        started.runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// An `inbox_dir` that does not exist but whose sandbox-home translation does is
+    /// taken as the staging root, announced at info level exactly once by the node
+    /// start, and never again by later resolutions of the same config. A temp dir stands
+    /// in for the sandbox home through `NodeOptions::translate_inbox_dir`, so the test
+    /// needs no writable `/home/agent`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_announces_a_translated_inbox_dir_once_at_start() {
+        install_log_collector();
+        let home = TempDir::new("node-inbox-translated-home");
+        let configured = home.path.join("probe-user").join("inbox");
+        let translated = home.path.join("agent").join("inbox");
+        std::fs::create_dir_all(&translated).unwrap();
+        assert!(!configured.exists());
+        let translate: InboxDirTranslation = {
+            let (configured, translated) = (configured.clone(), translated.clone());
+            Arc::new(move |path: &Path| (path == configured).then(|| translated.clone()))
+        };
+        let configured_for_node = configured.clone();
+
+        let started = started_runtime_with_options(
+            "node-inbox-translated",
+            NodeOptions {
+                translate_inbox_dir: Arc::clone(&translate),
+                ..NodeOptions::default()
+            },
+            move |config| {
+                config.fetch.inbox_dir = Some(configured_for_node);
+            },
+        )
+        .await;
+
+        let instance = started.runtime.current_instance_id();
+        assert_eq!(
+            started.runtime.inbox_staging().root(),
+            translated.join(&instance),
+            "the node stages under the translation"
+        );
+        let lines = inbox_translation_lines(&configured);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(&format!(
+                "resolved to sandboxed path '{}'",
+                translated.display()
+            )),
+            "{}",
+            lines[0]
+        );
+        let root = started.tmp.path.clone();
+        let locations = started.runtime.serving().share_locations(&root);
+        assert!(
+            locations.protected_dirs().contains(&translated),
+            "the translated inbox is protected: {locations:?}"
+        );
+
+        // Later resolutions, as the REPL's `.mesh shares` would do with no node, are quiet.
+        let fetch = crate::config::mesh_config::MeshFetch {
+            inbox_dir: Some(configured.clone()),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                fetch.inbox_dir_with(|path| translate(path)),
+                Some(translated.clone())
+            );
+        }
+        assert_eq!(
+            inbox_translation_lines(&configured).len(),
+            1,
+            "the resolver announces nothing at info level"
+        );
+        assert!(
+            !configured.exists(),
+            "nothing is created at the configured path"
+        );
+        started.runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// The node's default translation is the sandboxed-home one, so a configured
+    /// `/home/<user>/...` inbox resolves under `/home/agent` only inside a sandbox.
+    #[test]
+    #[serial_test::serial]
+    fn the_default_inbox_dir_translation_is_the_sandboxed_home_one() {
+        let configured = Path::new("/home/probe-user/inbox");
+        let translate = NodeOptions::default().translate_inbox_dir;
+        {
+            let _outside = crate::testing::EnvVarGuard::unset("IS_SANDBOX");
+            assert_eq!(translate(configured), None);
+        }
+        let _sandbox = crate::testing::EnvVarGuard::set("IS_SANDBOX", "1");
+        assert_eq!(
+            translate(configured).as_deref(),
+            Some(Path::new("/home/agent/inbox"))
+        );
+    }
+
+    /// A fork serves from its own grants file: a path granted to the fork's instance is
+    /// honoured after the re-key, one granted to the original is not, and a refund after
+    /// the re-key lands in the fork's file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_rebinds_the_grant_store_to_the_fork_instance() {
+        use crate::mesh::shares::PeerRef;
+
+        let started = started_runtime("node-rekey-grants").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3c; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        let grant = |instance: &str, path: &str| {
+            GrantStore::new(&cache_dir, instance)
+                .grant(
+                    "0123456789abcdef",
+                    &peer_destination,
+                    &[path.into()],
+                    None,
+                    now,
+                )
+                .unwrap();
+        };
+        grant(&original_id, "docs/original.md");
+        grant(&fork_id, "docs/fork.md");
+        let serving = started.runtime.serving();
+        assert!(
+            serving
+                .grants()
+                .is_granted(&peer, "docs/original.md", now)
+                .unwrap()
+        );
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let grants = serving.grants();
+        assert!(grants.is_granted(&peer, "docs/fork.md", now).unwrap());
+        assert!(
+            !grants.is_granted(&peer, "docs/original.md", now).unwrap(),
+            "the fork does not serve the original instance's grants"
+        );
+        assert!(grants.consume(&peer, "docs/fork.md", now).unwrap());
+        assert!(!grants.is_granted(&peer, "docs/fork.md", now).unwrap());
+        assert!(grants.refund(&peer, "docs/fork.md", now).unwrap());
+        assert!(
+            GrantStore::new(&cache_dir, &fork_id)
+                .is_granted(&peer, "docs/fork.md", now)
+                .unwrap(),
+            "the refund landed in the fork's own file"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A fork remembers into its own envoy memory: after the re-key the node's store is
+    /// the fork's, pruned on the way in, and a thread the original remembered is not
+    /// found there while its record stays on the original's disk.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_rebinds_the_envoy_memory_to_the_fork_instance() {
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ttl_hours: 1,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-rekey-envoy-memory", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let now = SystemTime::now();
+        let original_store = started
+            .runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        original_store
+            .save(REMEMBERED_PEER, "original", peer_turns(), now)
+            .unwrap();
+        let fork_store = EnvoySessions::open(&cache_dir, &fork_id, &config).unwrap();
+        fork_store
+            .save(REMEMBERED_PEER, "fork", peer_turns(), now)
+            .unwrap();
+        fork_store
+            .save(REMEMBERED_PEER, "stale", peer_turns(), two_hours_ago())
+            .unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id),
+            fork_instance_id: fork_id,
+        })
+        .await
+        .unwrap();
+
+        let bound = started.runtime.envoy_memory().unwrap();
+        assert_eq!(bound.dir(), fork_store.dir());
+        assert!(bound.load(REMEMBERED_PEER, "fork", now).unwrap().is_some());
+        assert!(
+            bound
+                .load(REMEMBERED_PEER, "original", now)
+                .unwrap()
+                .is_none(),
+            "the fork does not read the original's conversations"
+        );
+        assert!(
+            !remembered_record(&fork_store, "stale").exists(),
+            "the fork's store was pruned on rebind"
+        );
+        assert!(
+            remembered_record(&original_store, "original").exists(),
+            "the original's record is left on its own disk"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// Forgetting an identity forgets every thread the envoy remembered of it, out of the
+    /// store the node serves; another identity's thread stays. Untrusting the identity
+    /// withdraws its grant and leaves the threads while a record of its instance stays
+    /// bound: it is still a name the list holds.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forgetting_an_identity_forgets_its_remembered_threads_where_untrusting_does_not() {
+        use crate::mesh::trust::TrustOptions;
+
+        let started = started_runtime_with("node-untrust-envoy-memory", |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let store = started
+            .runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let other = hex_lower(&[0x77; 16]);
+        for thread in ["first", "second"] {
+            store
+                .save(REMEMBERED_PEER, thread, peer_turns(), now)
+                .unwrap();
+        }
+        store.save(&other, "theirs", peer_turns(), now).unwrap();
+        let trust = started.runtime.trust();
+        let origin = [9u8; NAME_HASH_LEN];
+        let instance =
+            destination_address(&origin, &parse_hash(REMEMBERED_PEER).unwrap()).to_hex_string();
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: instance.clone(),
+                identity_hash: REMEMBERED_PEER.to_string(),
+                name_hash: hex_lower(&origin),
+                public_key: None,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            now,
+        );
+        trust
+            .trust_destination(slot.as_ref(), &instance, TrustOptions::default(), now)
+            .unwrap();
+        trust
+            .trust_identity(slot.as_ref(), REMEMBERED_PEER, TrustOptions::default(), now)
+            .unwrap();
+
+        assert_eq!(
+            trust
+                .untrust_identity(slot.as_ref(), REMEMBERED_PEER, false)
+                .unwrap(),
+            1,
+            "the instance record stays bound"
+        );
+        for thread in ["first", "second"] {
+            assert!(
+                store.load(REMEMBERED_PEER, thread, now).unwrap().is_some(),
+                "{thread} went with an untrust"
+            );
+        }
+
+        trust
+            .forget_identity(slot.as_ref(), REMEMBERED_PEER, false)
+            .unwrap();
+
+        for thread in ["first", "second"] {
+            assert!(
+                store.load(REMEMBERED_PEER, thread, now).unwrap().is_none(),
+                "{thread} outlived the forget"
+            );
+            assert!(!remembered_record(&store, thread).exists());
+        }
+        assert!(store.load(&other, "theirs", now).unwrap().is_some());
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// Trust is per config directory, the stores per instance: revoking an identity
+    /// forgets its threads in every instance's store under the cache directory, not only
+    /// the one the node serves, other identities' threads left in each.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoking_an_identity_forgets_its_threads_in_every_instance_store() {
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-forget-every-instance", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let served = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let other_instance =
+            EnvoySessions::open(runtime.cache_dir(), &fresh_instance_id(), &config).unwrap();
+        let now = SystemTime::now();
+        let other = hex_lower(&[0x77; 16]);
+        for store in [served.as_ref(), &other_instance] {
+            store
+                .save(REMEMBERED_PEER, "first", peer_turns(), now)
+                .unwrap();
+            store.save(&other, "theirs", peer_turns(), now).unwrap();
+        }
+        assert_eq!(
+            runtime
+                .remembered_of(&REMEMBERED_PEER.to_uppercase())
+                .unwrap()
+                .threads,
+            1,
+            "the identity is taken in either case and a thread two stores hold is one"
+        );
+        assert!(matches!(
+            runtime.remembered_of("not-a-hash"),
+            Err(EnvoyMemoryError::NotAnIdentity(_))
+        ));
+
+        runtime.forget_identity(REMEMBERED_PEER);
+
+        assert_eq!(runtime.remembered_of(REMEMBERED_PEER).unwrap().threads, 0);
+        for store in [served.as_ref(), &other_instance] {
+            assert_eq!(
+                store.load(REMEMBERED_PEER, "first", now).unwrap(),
+                None,
+                "{}",
+                store.dir().display()
+            );
+            assert!(!remembered_record(store, "first").exists());
+            assert!(
+                store.load(&other, "theirs", now).unwrap().is_some(),
+                "{}",
+                store.dir().display()
+            );
+        }
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// The runtime's sweep tells the log what it did, and only when it did something.
+    /// With a store whose index cannot be read beside the served one, forgetting an
+    /// identity logs one debug line that counts the conversations forgotten and the one
+    /// store that could not be swept, naming the identity by its short form only; the
+    /// store it could not sweep is left byte-for-byte as it was. An identity nothing is
+    /// remembered of, with no such store around, logs nothing at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forgetting_an_identity_logs_what_it_forgot_and_the_store_it_could_not_sweep() {
+        install_log_collector();
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-forget-logs-the-sweep", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let served = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let identity = hex_lower(&[0x5c; 16]);
+        let short_form = short(&identity).to_string();
+        served.save(&identity, "first", peer_turns(), now).unwrap();
+        let broken = runtime
+            .cache_dir()
+            .join("mesh")
+            .join("envoy-sessions")
+            .join("inst-unread");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("index.json"), "{not json").unwrap();
+        let record = broken.join(format!("{}.yaml", "ad".repeat(16)));
+        std::fs::write(&record, "version: 1\n").unwrap();
+        let sweep_lines = |since: usize| -> Vec<String> {
+            debug_snapshot()
+                .into_iter()
+                .skip(since)
+                .filter(|line| line.starts_with("Mesh forgot ") && line.contains(&short_form))
+                .collect()
+        };
+
+        let since = debug_snapshot().len();
+        runtime.forget_identity(&identity);
+
+        let logged = sweep_lines(since);
+        assert_eq!(
+            logged,
+            [format!(
+                "Mesh forgot 1 remembered envoy conversation(s) of {short_form}; 1 store(s) could not be swept"
+            )],
+            "one sweep, one line: {:?}",
+            debug_snapshot()
+        );
+        assert!(
+            !logged[0].contains(&identity),
+            "the identity is named by its short form only: {}",
+            logged[0]
+        );
+        assert_eq!(served.load(&identity, "first", now).unwrap(), None);
+        assert_eq!(
+            std::fs::read_to_string(broken.join("index.json")).unwrap(),
+            "{not json",
+            "the store that could not be swept is left as it was"
+        );
+        assert!(record.exists());
+
+        // A second sweep of the same identity still finds the unread store and says so,
+        // with nothing left to forget beside it.
+        let since = debug_snapshot().len();
+        runtime.forget_identity(&identity);
+        assert_eq!(
+            sweep_lines(since),
+            [format!(
+                "Mesh forgot 0 remembered envoy conversation(s) of {short_form}; 1 store(s) could not be swept"
+            )]
+        );
+
+        // With the unread store gone and nothing remembered, the sweep is silent.
+        std::fs::remove_dir_all(&broken).unwrap();
+        let since = debug_snapshot().len();
+        runtime.forget_identity(&identity);
+        assert_eq!(sweep_lines(since), Vec::<String>::new());
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// The envoy memory is rebound before the runtime re-keys; when the runtime then
+    /// refuses (here: the caller named the wrong original instance), the store rolls back
+    /// with the grants, so the node remembers into the original's store and never the
+    /// fork's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_rekey_leaves_the_original_envoy_memory_bound() {
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ttl_hours: 1,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-rekey-envoy-memory-refused", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let fork_id = fresh_instance_id();
+        let now = SystemTime::now();
+        let original_store = started.runtime.envoy_memory().unwrap();
+        original_store
+            .save(REMEMBERED_PEER, "original", peer_turns(), now)
+            .unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+
+        let refused = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(fresh_instance_id()),
+                fork_instance_id: fork_id,
+            })
+            .await;
+
+        assert!(refused.is_err());
+        let bound = started.runtime.envoy_memory().unwrap();
+        assert_eq!(bound.dir(), original_store.dir());
+        assert!(
+            bound
+                .load(REMEMBERED_PEER, "original", now)
+                .unwrap()
+                .is_some(),
+            "the original's memory is back in force"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The grant store is rebound before the runtime re-keys; when the runtime then
+    /// refuses (here: the caller named the wrong original instance), the store rolls back
+    /// with the pending store, so the node keeps serving the original's grants and never
+    /// the fork's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_rekey_rolls_the_grant_store_back_to_the_original() {
+        use crate::mesh::shares::PeerRef;
+
+        let started = started_runtime("node-probe-rekey-grants-rollback").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3d; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        for (instance, path) in [
+            (&original_id, "docs/original.md"),
+            (&fork_id, "docs/fork.md"),
+        ] {
+            GrantStore::new(&cache_dir, instance)
+                .grant(
+                    "0123456789abcdef",
+                    &peer_destination,
+                    &[path.into()],
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+        let serving = started.runtime.serving();
+
+        let err = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(fresh_instance_id()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(".mesh off"), "{err}");
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        let grants = serving.grants();
+        assert!(
+            grants.is_granted(&peer, "docs/original.md", now).unwrap(),
+            "the original's grants are back in force"
+        );
+        assert!(
+            !grants.is_granted(&peer, "docs/fork.md", now).unwrap(),
+            "the fork's grants are not served by a node that never re-keyed"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A fork grants file that cannot be read refuses the re-key the way it would refuse
+    /// `start`: the error names the store, the node stays the original instance, keeps
+    /// serving the original's grants, and its pending questions are still open.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_fork_grants_file_refuses_the_rekey_and_keeps_the_original() {
+        use crate::mesh::shares::PeerRef;
+
+        let started = started_runtime("node-probe-rekey-grants-unreadable").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let original_hash = started.runtime.destination_hash().await;
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.correlations().open(pending("q-original")).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3e; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        GrantStore::new(&cache_dir, &original_id)
+            .grant(
+                "0123456789abcdef",
+                &peer_destination,
+                &["docs/original.md".into()],
+                None,
+                now,
+            )
+            .unwrap();
+        let fork_store = GrantStore::new(&cache_dir, &fork_id);
+        std::fs::create_dir_all(fork_store.path().parent().unwrap()).unwrap();
+        std::fs::write(fork_store.path(), "not a grant record\n").unwrap();
+
+        let err = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(original_id.clone()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap_err();
+        let chain = format!("{err:#}");
+
+        assert!(
+            chain.contains("The fork's grant store could not be opened"),
+            "{chain}"
+        );
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        assert_eq!(started.runtime.destination_hash().await, original_hash);
+        assert!(
+            started
+                .runtime
+                .serving()
+                .grants()
+                .is_granted(&peer, "docs/original.md", now)
+                .unwrap(),
+            "the original's grants are still served"
+        );
+        assert!(
+            slot.correlations().is_open("q-original"),
+            "the original's pending questions are reopened after the refused re-key"
+        );
+        assert!(
+            InstanceLock::acquire(&cache_dir, &original_id).is_err(),
+            "a refused re-key keeps the original instance lock"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A re-key leaves the sent-threads list alone: it is one per config dir, so the
+    /// fork continues the original's threads and what the fork sends is in the same file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fork_shares_the_sent_threads_list_across_the_rekey() {
+        let started = started_runtime("node-rekey-sent-threads").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.remember_sent_thread("m-original");
+        let path = slot.sent_threads().unwrap().path().to_path_buf();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id),
+            fork_instance_id: fresh_instance_id(),
+        })
+        .await
+        .unwrap();
+
+        let threads = slot.sent_threads().unwrap();
+        assert_eq!(threads.path(), path);
+        assert_eq!(path, cache_dir.join("mesh").join("sent-threads.json"));
+        assert!(threads.contains("m-original"));
+        slot.remember_sent_thread("m-fork");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["sent"], serde_json::json!(["m-original", "m-fork"]));
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A received thread whose short lock wait runs out, because another session holds
+    /// the list's lock, is still recorded: the retry waits the holder out.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_received_thread_is_recorded_once_a_lock_held_past_the_short_wait_is_let_go() {
+        use crate::mesh::lock::acquire_mesh_lock;
+        use crate::mesh::sent_threads::RECEIVED_LOCK_WAIT;
+
+        let started = started_runtime("node-sent-threads-retry").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let lock_path = started
+            .runtime
+            .cache_dir()
+            .join("mesh")
+            .join("sent-threads.json.lock");
+        let held = acquire_mesh_lock(&lock_path, "test holder", Duration::ZERO).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(RECEIVED_LOCK_WAIT * 3);
+            drop(held);
+        });
+
+        slot.remember_received_thread("t-held");
+
+        releaser.join().unwrap();
+        let threads = slot.sent_threads().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !threads.contains("t-held") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the received thread was never recorded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn deliver_peer_notes_name_the_sending_instance_never_the_peers_own_id() {
+        let slot = MeshSlot::default();
+        let message = PeerMessage::new(RawPeerMessage {
+            source_identity: hex_lower(&PEER_IDENTITY),
+            source_destination: hex_lower(&PEER_INSTANCE),
+            destination: hex_lower(&[0x01; 16]),
+            title: None,
+            content: "hello".to_string(),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: format!("\u{1b}[2J{}", "i".repeat(PEER_ID_MAX_CHARS + 5)),
+            in_reply_to: None,
+            kind: PeerKind::Message,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        });
+
+        slot.deliver_peer(message);
+
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].id,
+            format!("peer:{}", &hex_lower(&PEER_INSTANCE)[..8])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_nodes_exchange_announces_over_tcp() {
+        let port = closed_port().await;
+        let node_b = Transport::new(TransportConfig::new(
+            "b",
+            &TransportIdentity::new_from_rand(OsRng),
+            false,
+        ));
+        let server = TcpServer::new(format!("127.0.0.1:{port}"), node_b.iface_manager());
+        let server_status = server.runtime_status_handle();
+        let server_iface = node_b
+            .iface_manager()
+            .lock()
+            .await
+            .spawn(server, TcpServer::spawn);
+        wait_until("node B to listen", || {
+            server_status.to_json()["listener_state"].as_str() == Some("listening")
+        })
+        .await;
+        let mut b_announces = node_b.recv_announces().await;
+
+        let tmp = TempDir::new("node-interop");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            display_name: Some("Alex".to_string()),
+            ..private_config(port)
+        };
+        let node_a = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let a_hash = node_a.destination_hash().await;
+
+        let event = timeout(INTEROP_TIMEOUT, b_announces.recv())
+            .await
+            .expect("node B must hear node A's start announce")
+            .unwrap();
+        assert_eq!(
+            event
+                .destination
+                .lock()
+                .await
+                .desc
+                .address_hash
+                .to_hex_string(),
+            a_hash
+        );
+        assert_eq!(
+            AnnounceAppData::decode(event.app_data.as_slice()),
+            Some(AnnounceAppData {
+                version: 1,
+                display_name: Some("Alex".to_string()),
+            })
+        );
+
+        let b_name = session_destination_name(&fresh_instance_id());
+        let b_dest = node_b
+            .add_destination(TransportIdentity::new_from_rand(OsRng), b_name)
+            .await;
+        let (b_hash, b_identity_hash) = {
+            let desc = &b_dest.lock().await.desc;
+            (
+                desc.address_hash.to_hex_string(),
+                desc.identity.address_hash.to_hex_string(),
+            )
+        };
+        let b_app_data = AnnounceAppData {
+            version: 1,
+            display_name: Some("Bea".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let packet = b_dest
+            .lock()
+            .await
+            .announce(OsRng, Some(&b_app_data))
+            .unwrap();
+        node_b.send_packet(packet).await;
+
+        let peers = node_a.peers();
+        wait_until("node A to file node B as a peer", || {
+            peers
+                .snapshot()
+                .iter()
+                .any(|peer| peer.destination_hash == b_hash)
+        })
+        .await;
+        let snapshot = peers.snapshot();
+        let bea = snapshot
+            .iter()
+            .find(|peer| peer.destination_hash == b_hash)
+            .unwrap();
+        assert_eq!(bea.display_name.as_deref(), Some("Bea"));
+        assert_eq!(bea.protocol_version, 1);
+        assert_eq!(bea.name_hash, hex_lower(b_name.as_name_hash_slice()));
+        assert_eq!(bea.identity_hash, b_identity_hash);
+        assert!(
+            !snapshot.iter().any(|peer| peer.destination_hash == a_hash),
+            "a node must not file its own announce as a peer"
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(node_a).unwrap();
+        assert!(slot.stop().await.unwrap());
+        node_b
+            .iface_manager()
+            .lock()
+            .await
+            .stop_interface(server_iface);
+        drop(node_b);
+    }
+
+    /// The debug lines logged after `mark` that report a link to `destination_hex` coming
+    /// up: `open_link` names the truncated hash, so the filter is this test's own.
+    #[cfg(unix)]
+    fn links_opened_since(mark: usize, destination_hex: &str) -> Vec<String> {
+        let needle = format!("to destination {} is active", short(destination_hex));
+        debug_snapshot()
+            .into_iter()
+            .skip(mark)
+            .filter(|line| line.contains(&needle))
+            .collect()
+    }
+
+    /// A peer the announce called compatible refuses this node's version over the wire:
+    /// the refusal comes back typed, the peer is marked, and the next send stops at the
+    /// table without a link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_refusing_our_protocol_version_is_marked_incompatible() {
+        use crate::mesh::message::SendError;
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let stub = PeerStub::listen("node-version-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-version-refused", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        assert_eq!(
+            peers.get(&to).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let newer = MESH_PROTOCOL_VERSION + 1;
+        let mut envelope = runtime.envelope(rmpv::Value::Nil).await;
+        envelope.version = newer;
+
+        let err = runtime
+            .request_envelope(&desc, STATUS_PATH, envelope, RequestOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            RequestError::UnsupportedVersion {
+                found: Some(newer),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            }
+        );
+        assert_eq!(
+            peers.get(&to).unwrap().compatibility,
+            Compatibility::Incompatible {
+                found: MESH_PROTOCOL_VERSION
+            }
+        );
+
+        let mark = debug_snapshot().len();
+        let message = OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap();
+        let err = runtime.send_peer(&to, &message).await.unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::IncompatibleVersion {
+                destination: to.clone(),
+                found: Some(MESH_PROTOCOL_VERSION),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            }
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "a marked peer is never linked to: {links:?}"
+        );
+        assert!(stub.seen().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// An announce at a version this node does not speak is filed like any other, marked
+    /// incompatible, and a send to it is refused at the table without a link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incompatible_announce_is_recorded_but_refused_outbound() {
+        use crate::mesh::message::SendError;
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let newer = MESH_PROTOCOL_VERSION + 1;
+        let app_data = AnnounceAppData {
+            version: newer,
+            display_name: Some("Newer".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let now = SystemTime::now();
+        let tmp = TempDir::new("node-incompatible-announce");
+        let table = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let hash = "ab".repeat(16);
+
+        let change = record_announce(
+            &table,
+            AnnouncedDestination::without_key(hash.clone(), "cd".repeat(16), "ef".repeat(10)),
+            &app_data,
+            1,
+            now,
+        );
+
+        assert_eq!(change.map(|filed| filed.change), Some(PeerChange::Added));
+        let record = table.get(&hash).unwrap();
+        assert_eq!(record.protocol_version, newer);
+        assert_eq!(
+            record.compatibility,
+            Compatibility::Incompatible { found: newer }
+        );
+        assert_eq!(
+            record.compatibility_line().as_deref(),
+            Some("incompatible: speaks protocol 2, this Coyote supports 1..=1")
+        );
+        let expected = format!(
+            "Mesh peer {} is incompatible: it speaks protocol {newer}, this Coyote supports 1..=1",
+            &hash[..8]
+        );
+        assert!(
+            debug_snapshot().iter().any(|line| line == &expected),
+            "expected {expected:?} in {:#?}",
+            debug_snapshot()
+        );
+
+        // The stub announces at the current version so the transport learns a path to it;
+        // the same announce at the newer version is then what the runtime's table says.
+        let stub = PeerStub::listen("node-incompatible-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-incompatible-outbound", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        let filed = peers.get(&to).unwrap();
+        assert_eq!(
+            record_announce(
+                peers.as_ref(),
+                AnnouncedDestination::without_key(to.clone(), filed.identity_hash, filed.name_hash),
+                &app_data,
+                filed.hops,
+                SystemTime::now(),
+            )
+            .map(|filed| filed.change),
+            Some(PeerChange::Refreshed)
+        );
+        assert_eq!(
+            peers.get(&to).unwrap().compatibility,
+            Compatibility::Incompatible { found: newer }
+        );
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let mark = debug_snapshot().len();
+        let message = OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap();
+        let err = runtime.send_peer(&to, &message).await.unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::IncompatibleVersion {
+                destination: to.clone(),
+                found: Some(newer),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            }
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "an incompatible peer is never linked to: {links:?}"
+        );
+        assert!(stub.seen().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    fn compatible_peer_table(tag: &str) -> (TempDir, PeerTable, String) {
+        let tmp = TempDir::new(tag);
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let hash = "ab".repeat(16);
+        peers.observe(
+            PeerSighting {
+                destination_hash: hash.clone(),
+                identity_hash: "cd".repeat(16),
+                name_hash: "ef".repeat(10),
+                public_key: None,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            now,
+        );
+        (tmp, peers, hash)
+    }
+
+    /// Only a refusal whose window is consistent and excludes the version this node sent
+    /// marks the peer, and it is marked with the peer's `max`; an inverted or containing
+    /// window, and any other outcome, leave the record alone.
+    #[test]
+    fn version_refusal_marks_only_a_consistent_window_that_excludes_our_version() {
+        let refusal = |min, max| {
+            Err(RequestError::UnsupportedVersion {
+                found: Some(2),
+                min,
+                max,
+            })
+        };
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-excluding");
+        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &refusal(2, 3));
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Incompatible { found: 3 }
+        );
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-inverted");
+        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &refusal(3, 2));
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-containing");
+        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &refusal(1, 2));
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-other");
+        note_version_refusal(
+            &peers,
+            &hash,
+            STATUS_PATH,
+            1,
+            &Err(RequestError::Timeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(1),
+            }),
+        );
+        note_version_refusal(
+            &peers,
+            &hash,
+            STATUS_PATH,
+            1,
+            &Err(RequestError::NotRunning),
+        );
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+    }
+
+    /// A stub filed as compatible, then marked incompatible in the table as a wire refusal
+    /// would, with a link mark taken after the marking. The temp dir comes back with them:
+    /// dropping it removes the node's `trust.yaml`, and a vanished trust file trusts nobody.
+    #[cfg(unix)]
+    async fn marked_incompatible_stub(
+        tag: &str,
+    ) -> (
+        PeerStub,
+        Arc<MeshRuntime>,
+        Arc<MeshSlot>,
+        DestinationDesc,
+        String,
+        usize,
+        TempDir,
+    ) {
+        marked_incompatible_stub_with(tag, |_| {}).await
+    }
+
+    /// `marked_incompatible_stub` with the node's config adjusted first.
+    #[cfg(unix)]
+    async fn marked_incompatible_stub_with(
+        tag: &str,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> (
+        PeerStub,
+        Arc<MeshRuntime>,
+        Arc<MeshSlot>,
+        DestinationDesc,
+        String,
+        usize,
+        TempDir,
+    ) {
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let StartedRuntime { runtime, tmp, .. } =
+            started_runtime_on_with(tag, stub.port(), adjust).await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        peers.mark_incompatible(&to, 7);
+        let mark = debug_snapshot().len();
+        (stub, runtime, slot, desc, to, mark, tmp)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn knock_with_stops_at_a_peer_already_marked_incompatible() {
+        let (stub, runtime, slot, desc, to, mark, _tmp) =
+            marked_incompatible_stub("node-knock-incompatible").await;
+
+        let err = runtime
+            .knock_with(
+                &desc,
+                &KnockIntro::new("hi").unwrap(),
+                KnockOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            KnockError::Direct(RequestError::UnsupportedVersion {
+                found: Some(7),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            })
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "a marked peer is never knocked over a link: {links:?}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_status_with_stops_at_a_peer_already_marked_incompatible() {
+        use crate::mesh::card::StatusError;
+
+        let (stub, runtime, slot, desc, to, mark, _tmp) =
+            marked_incompatible_stub("node-status-incompatible").await;
+
+        let err = runtime
+            .request_status_with(&desc, RequestOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            StatusError::Transport(RequestError::UnsupportedVersion {
+                found: Some(7),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            })
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "a marked peer is never asked for status over a link: {links:?}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// The deadlines `path` hands the client when driven once against a node whose
+    /// `mesh.request_timeout_secs` / `mesh.link_timeout_secs` are `timers`. The peer is
+    /// marked incompatible, so every request is recorded and refused before a link opens.
+    #[cfg(unix)]
+    async fn deadlines_handed_to(
+        tag: &str,
+        timers: (Option<u64>, Option<u64>),
+        path: &str,
+    ) -> RequestOptions {
+        let (stub, runtime, slot, desc, to, _, _tmp) =
+            marked_incompatible_stub_with(tag, |config| {
+                config.request_timeout_secs = timers.0;
+                config.link_timeout_secs = timers.1;
+            })
+            .await;
+        drive(&runtime, &slot, Route::unasked(desc), &to, path).await;
+        let recorded = runtime.requests_made();
+        let options = recorded
+            .iter()
+            .find(|(made, _)| made == path)
+            .map(|(_, options)| *options)
+            .unwrap_or_else(|| panic!("{path} made no request: {recorded:?}"));
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+        options
+    }
+
+    /// Makes one request on `path` through the entry point a caller of the runtime uses,
+    /// over `route`, so the recorded options are the ones that entry point chose.
+    #[cfg(unix)]
+    async fn drive(
+        runtime: &Arc<MeshRuntime>,
+        slot: &Arc<MeshSlot>,
+        route: Route,
+        to: &str,
+        path: &str,
+    ) {
+        match path {
+            MESSAGE_PATH => {
+                let message = OutboundPeer::new(PeerKind::Message, "hi", None, None, None).unwrap();
+                runtime.send_peer(to, &message).await.unwrap_err();
+            }
+            KNOCK_PATH => {
+                runtime
+                    .knock(route, &KnockIntro::new("hi").unwrap())
+                    .await
+                    .unwrap_err();
+            }
+            LIST_PATH => {
+                runtime.list_shares(route, None, None).await.unwrap_err();
+            }
+            ACCESS_PATH => {
+                slot.request_access(to, &["docs/a.md".to_string()], "", Some(route))
+                    .await
+                    .unwrap_err();
+            }
+            STATUS_PATH => {
+                runtime.request_status(route).await.unwrap_err();
+            }
+            FETCH_PATH => {
+                runtime
+                    .fetch_file(route, "docs/a.md", None)
+                    .await
+                    .unwrap_err();
+            }
+            other => panic!("no driver for {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    const RAISED_TIMERS: (Option<u64>, Option<u64>) = (Some(90), Some(45));
+    #[cfg(unix)]
+    const RAISED: RequestOptions = RequestOptions {
+        request_timeout: Duration::from_secs(90),
+        link_timeout: Duration::from_secs(45),
+        path_requested: false,
+    };
+
+    /// With both timers unset every path hands the client its own constants: 15 s / 10 s
+    /// on the four peer paths, 30 s / 10 s on `/status`, 120 s / 10 s on `/fetch`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unset_timers_leave_every_paths_own_deadlines() {
+        let (stub, runtime, slot, desc, to, _, _tmp) =
+            marked_incompatible_stub("node-timers-unset").await;
+        for path in [
+            MESSAGE_PATH,
+            KNOCK_PATH,
+            LIST_PATH,
+            ACCESS_PATH,
+            STATUS_PATH,
+            FETCH_PATH,
+        ] {
+            drive(&runtime, &slot, Route::unasked(desc), &to, path).await;
+        }
+
+        let peer = RequestOptions {
+            request_timeout: Duration::from_secs(15),
+            link_timeout: Duration::from_secs(10),
+            path_requested: false,
+        };
+        assert_eq!(
+            runtime.requests_made(),
+            vec![
+                (MESSAGE_PATH.to_string(), peer),
+                (KNOCK_PATH.to_string(), peer),
+                (LIST_PATH.to_string(), peer),
+                (ACCESS_PATH.to_string(), peer),
+                (
+                    STATUS_PATH.to_string(),
+                    RequestOptions {
+                        request_timeout: Duration::from_secs(30),
+                        link_timeout: Duration::from_secs(10),
+                        path_requested: false,
+                    }
+                ),
+                (
+                    FETCH_PATH.to_string(),
+                    RequestOptions {
+                        request_timeout: Duration::from_secs(120),
+                        link_timeout: Duration::from_secs(10),
+                        path_requested: false,
+                    }
+                ),
+            ]
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// A route whose resolve already sent a path request reaches the request options of
+    /// every verb that takes a route, so none of their links asks a second time.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_route_that_asked_for_its_path_reaches_every_verbs_request_options() {
+        let (stub, runtime, slot, desc, to, _, _tmp) =
+            marked_incompatible_stub("node-route-asked").await;
+        let asked = Route {
+            desc,
+            path_requested: true,
+        };
+        let paths = [KNOCK_PATH, LIST_PATH, ACCESS_PATH, STATUS_PATH, FETCH_PATH];
+        for path in paths {
+            drive(&runtime, &slot, asked, &to, path).await;
+        }
+
+        let recorded = runtime.requests_made();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|(made, _)| made.as_str())
+                .collect::<Vec<_>>(),
+            paths,
+            "{recorded:?}"
+        );
+        for (path, options) in &recorded {
+            assert!(
+                options.path_requested,
+                "{path} dropped the route's path request: {options:?}"
+            );
+        }
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-message", RAISED_TIMERS, MESSAGE_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn knock_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-knock", RAISED_TIMERS, KNOCK_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-list", RAISED_TIMERS, LIST_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn access_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-access", RAISED_TIMERS, ACCESS_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-status", RAISED_TIMERS, STATUS_PATH).await,
+            RAISED
+        );
+    }
+
+    /// A request timer between the floors is raise-only per path.
+    /// `request_timeout_secs: 20` with `link_timeout_secs: 10` (its floor) gives
+    /// `/message` 20 s where its own is 15 s, and leaves `/status` its own 30 s, the
+    /// link deadline staying 10 s on both; the same timers raise `/knock` to 20 s.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timer_between_the_floors_raises_the_short_paths_and_leaves_status_its_own() {
+        let between = (Some(20), Some(10));
+        assert_eq!(
+            deadlines_handed_to("node-timers-between-message", between, MESSAGE_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(20),
+                link_timeout: Duration::from_secs(10),
+                path_requested: false,
+            }
+        );
+        assert_eq!(
+            deadlines_handed_to("node-timers-between-status", between, STATUS_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(30),
+                link_timeout: Duration::from_secs(10),
+                path_requested: false,
+            }
+        );
+        assert_eq!(
+            deadlines_handed_to("node-timers-between-knock", between, KNOCK_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(20),
+                link_timeout: Duration::from_secs(10),
+                path_requested: false,
+            }
+        );
+    }
+
+    /// `/fetch` is not governed: under the raised timers it still hands the client its own
+    /// 120 s / 10 s.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_deadlines_ignore_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-fetch", RAISED_TIMERS, FETCH_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(120),
+                link_timeout: Duration::from_secs(10),
+                path_requested: false,
+            }
+        );
+    }
+
+    /// `mesh__peers --with_status` sweeps with `request_status_with` at 5 s / 5 s; the
+    /// caller's deadlines pass through untouched under the raised timers.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_status_with_keeps_the_callers_deadlines_under_the_configured_timers() {
+        let (stub, runtime, slot, desc, _, _, _tmp) =
+            marked_incompatible_stub_with("node-timers-sweep", |config| {
+                config.request_timeout_secs = RAISED_TIMERS.0;
+                config.link_timeout_secs = RAISED_TIMERS.1;
+            })
+            .await;
+        let sweep = RequestOptions {
+            request_timeout: Duration::from_secs(5),
+            link_timeout: Duration::from_secs(5),
+            path_requested: false,
+        };
+
+        runtime.request_status_with(&desc, sweep).await.unwrap_err();
+
+        assert_eq!(
+            runtime.requests_made(),
+            vec![(STATUS_PATH.to_string(), sweep)]
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// A trusted destination last heard ten days ago announces: the trust record's
+    /// `last_seen_at` moves forward in memory while `trust.yaml` keeps its bytes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_announce_refreshes_a_trusted_destinations_last_seen_without_writing() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-seen-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-seen-refresh", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let to = stub.destination_hex();
+        // The trust file keeps whole seconds, so the seeded sighting is a whole second too
+        // and the record reads back equal to it.
+        let since_epoch = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ten_days_ago = std::time::UNIX_EPOCH + Duration::from_secs(since_epoch - 10 * 86_400);
+        runtime.peers().observe(
+            PeerSighting {
+                destination_hash: to.clone(),
+                identity_hash: stub.identity_hex(),
+                name_hash: hex_lower(
+                    session_destination_name("node-seen-stub").as_name_hash_slice(),
+                ),
+                display_name: Some("Stub".to_string()),
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+                public_key: None,
+            },
+            ten_days_ago,
+        );
+        let trust = runtime.trust();
+        trust
+            .trust_destination(slot.as_ref(), &to, TrustOptions::default(), ten_days_ago)
+            .unwrap();
+        let last_seen = |records: Vec<crate::mesh::trust::TrustRecord>| {
+            records
+                .into_iter()
+                .find(|record| record.hash == to)
+                .unwrap()
+                .last_seen_at
+        };
+        assert_eq!(last_seen(trust.records()), ten_days_ago);
+        let bytes_before = std::fs::read(trust.path()).unwrap();
+
+        stub.announce(Some("Stub")).await;
+
+        wait_until("the announce to refresh the trusted destination", || {
+            last_seen(trust.records()) > ten_days_ago
+        })
+        .await;
+        assert_eq!(std::fs::read(trust.path()).unwrap(), bytes_before);
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// When a re-key is refused the node goes on serving the ORIGINAL instance's grants
+    /// even if the original's grant file cannot be re-opened at that moment: the store
+    /// that was displaced is the one put back (same handle, same path), never the fork's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_rekey_puts_back_the_displaced_grant_store_even_when_its_file_is_unreadable()
+    {
+        use crate::mesh::shares::PeerRef;
+        use std::os::unix::fs::PermissionsExt;
+
+        let started = started_runtime("node-probe-rekey-grants-no-reopen").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3f; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        for (instance, path) in [
+            (&original_id, "docs/original.md"),
+            (&fork_id, "docs/fork.md"),
+        ] {
+            GrantStore::new(&cache_dir, instance)
+                .grant(
+                    "0123456789abcdef",
+                    &peer_destination,
+                    &[path.into()],
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+        let serving = started.runtime.serving();
+        let before = serving.grants();
+        let original_file = before.path().to_path_buf();
+        assert!(
+            original_file.to_string_lossy().contains(&original_id),
+            "{}",
+            original_file.display()
+        );
+        let set_mode = |mode| {
+            std::fs::set_permissions(&original_file, std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        set_mode(0o000);
+        if std::fs::read(&original_file).is_ok() {
+            // Root reads anything; nothing to show here.
+            set_mode(0o600);
+            assert!(slot.stop().await.unwrap());
+            started.relay_handle.abort();
+            return;
+        }
+
+        let err = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(fresh_instance_id()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".mesh off"), "{err}");
+
+        let after = serving.grants();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the displaced store itself is put back, not a re-opened copy"
+        );
+        assert_eq!(after.path(), original_file.as_path());
+        assert!(
+            !matches!(after.is_granted(&peer, "docs/fork.md", now), Ok(true)),
+            "the fork's grants are never in force on a node that did not re-key"
+        );
+
+        // Once the file is readable again the original's accounting resumes untouched.
+        set_mode(0o600);
+        assert!(
+            after.is_granted(&peer, "docs/original.md", now).unwrap(),
+            "the original's grant is still there"
+        );
+        assert!(
+            !after.is_granted(&peer, "docs/fork.md", now).unwrap(),
+            "the fork's grant file was never consulted"
+        );
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        assert!(
+            GrantStore::new(&cache_dir, &fork_id)
+                .is_granted(&peer, "docs/fork.md", now)
+                .unwrap(),
+            "the fork's own file still holds its grant: the rollback did not touch disk"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+}

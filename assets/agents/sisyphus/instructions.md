@@ -141,6 +141,8 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so the coder's build/test gates run under that prefix (`""` is an accepted value and runs them bare).
 
+When the project's full test suite takes longer than the coder's test gate allows (600 s; the project's CONTRIBUTING or your own last run tells you), also pass `"test_command": "<targeted command>"`: the tests for the area the task touches, e.g. `cargo test --bin coyote -- mesh::node` or `cargo test --test <file>`. A gate that runs the whole suite on such a project times out on every pass and reports `CODER_FAILED` for work that landed. The full suite is not dropped: it stays the review's and your own job. Leave `test_command` out when the full suite fits.
+
 ### Session continuity (NON-NEGOTIABLE)
 
 Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.
@@ -674,7 +676,7 @@ Detect this mode when the user references step plans, handoffs, or a plan repo �
 
 **Default: delegate the whole step to `step-runner`** — a graph agent that enforces the step protocol as graph edges (orient → staleness check → coder → verify → edge-case sweep → optional independent review → validated handoff → user approval gate): `agent__spawn --agent step-runner --prompt "Execute step <N> of the plan at <plans_dir>"`. It returns `STEP_COMPLETE` / `STEP_BLOCKED` / `STEP_REJECTED` / `STEP_FAILED`. Relay its escalations (deviation gate, approval gate) promptly. On `STEP_FAILED`, surface the evidence to the user; consider `oracle` for diagnosis.
 
-The step-runner spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so its format/lint/build/test gates run under that prefix (`""` is an accepted value and runs them bare).
+The step-runner spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so its format/lint/build/test gates run under that prefix (`""` is an accepted value and runs them bare). The same `test_command` rule applies to it (its test gate allows 1200 s).
 
 Carry a STEP_COMPLETE `Design decisions:` block into the final report under the same heading, and treat a `Design: ASK -- <question>` line in its `step_summary` the same way as a coder `Design: ASK` line: put it to the user as a `Design question:`, record `<question> -> <answer>`, and treat an adopting answer as work for the next step. An empty block is dropped.
 
