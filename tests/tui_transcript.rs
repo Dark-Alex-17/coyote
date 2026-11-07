@@ -30,6 +30,17 @@
 //! - cells that land while the view is scrolled up count on the follow
 //!   chip and `End` brings them into view;
 //! - `todo__*` calls never take a transcript row; the Todo panel shows them.
+//! - Shift+Up and a mouse wheel notch detach the view like PgUp does; PgDn
+//!   walks back to the bottom, and Shift+G jumps there only while the
+//!   composer is empty;
+//! - a streamed `<think>` span never shows in the assistant cell, during
+//!   the stream or after it;
+//! - a folded header cuts a long argument to its budget;
+//! - a bookkeeping call (`job__list`) takes one line with no status;
+//! - a mouse click on a folded tool row opens it and a second click folds
+//!   it again;
+//! - a narrower terminal re-wraps the cells in place without duplicating
+//!   a row.
 #![cfg(unix)]
 
 mod common;
@@ -52,12 +63,18 @@ const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 
 const F2: &[u8] = b"\x1bOQ";
 const PAGE_UP: &[u8] = b"\x1b[5~";
+const PAGE_DOWN: &[u8] = b"\x1b[6~";
 const END: &[u8] = b"\x1b[F";
+const SHIFT_UP: &[u8] = b"\x1b[1;2A";
 const CTRL_UP: &[u8] = b"\x1b[1;5A";
 const ESC: &[u8] = b"\x1b";
 const CTRL_L: &[u8] = b"\x0c";
 const CTRL_D: &[u8] = b"\x04";
 const CTRL_C: &[u8] = b"\x03";
+/// One SGR-encoded wheel-up notch at column 50, row 5.
+const WHEEL_UP: &[u8] = b"\x1b[<64;50;5M";
+
+const CHIP: &str = "End=follow";
 
 struct TempDirGuard(PathBuf);
 
@@ -266,6 +283,62 @@ fn repaint(pty: &mut Pty) -> String {
     pty.send(CTRL_L).unwrap();
     pty.read_for(Duration::from_secs(1));
     squeezed(&strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..])))
+}
+
+/// Ctrl+L, then the frame split into screen rows by following the
+/// cursor-position sequences the repaint carries. Rows are 1-based as a
+/// terminal reports them; each is the squeezed text written on it.
+fn repaint_rows(pty: &mut Pty) -> Vec<(u16, String)> {
+    let at = pty.raw().len();
+    pty.send(CTRL_L).unwrap();
+    pty.read_for(Duration::from_secs(1));
+    let text = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
+    let chars: Vec<char> = text.chars().collect();
+    let mut rows: std::collections::BTreeMap<u16, String> = Default::default();
+    let mut row: u16 = 1;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '\x1b' {
+            if !chars[i].is_whitespace() && !chars[i].is_control() {
+                rows.entry(row).or_default().push(chars[i]);
+            }
+            i += 1;
+            continue;
+        }
+        match chars.get(i + 1) {
+            Some('[') => {
+                let start = i + 2;
+                let mut j = start;
+                while matches!(chars.get(j), Some(c) if ('\x30'..='\x3f').contains(c)) {
+                    j += 1;
+                }
+                while matches!(chars.get(j), Some(c) if ('\x20'..='\x2f').contains(c)) {
+                    j += 1;
+                }
+                let fin = chars.get(j).copied();
+                if matches!(fin, Some('H') | Some('f')) {
+                    let params: String = chars[start..j].iter().collect();
+                    row = params
+                        .split(';')
+                        .next()
+                        .and_then(|r| r.parse().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                }
+                i = if fin.is_some() { j + 1 } else { j };
+            }
+            Some(']' | 'P' | '_' | '^' | 'X') => {
+                i += 2;
+                while i < chars.len() && chars[i] != '\x07' && chars[i] != '\x1b' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            Some(_) => i += 2,
+            None => i += 1,
+        }
+    }
+    rows.into_iter().collect()
 }
 
 fn boot(scenario: &str, extra_env: &[(&str, &str)]) -> (TempDirGuard, Pty) {
@@ -515,6 +588,471 @@ fn undo_removes_the_last_exchange_and_keeps_the_one_before() {
     // Ctrl+C clears the undone prompt out of the composer; Ctrl+D would
     // not quit over it.
     pty.send(CTRL_C).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit(pty);
+}
+
+// =====================================================================
+// The scroll paths the page keys do not cover, the think span of a
+// streamed reply, the folded header's argument budget, a bookkeeping
+// call's single line, a mouse click on a folded row, and a resize that
+// must re-wrap without duplicating rows.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// Shift+Up detaches the view like PgUp does and raises the chip; enough
+// PgDn presses walk back to the bottom and clear it without End.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn shift_up_raises_the_chip_and_page_down_walks_back_to_the_bottom() {
+    let (_guard, mut pty) = boot("shift-up", &[]);
+    overflow_a_short_terminal(&mut pty);
+
+    pty.read_for(HOTKEY_GAP);
+    let before = pty.raw().len();
+    pty.send(SHIFT_UP).unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "End = follow",
+        before,
+        "the follow chip after Shift+Up",
+    );
+
+    let mut frame = String::new();
+    for _ in 0..6 {
+        pty.send(PAGE_DOWN).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        frame = repaint(&mut pty);
+        if !frame.contains(CHIP) {
+            break;
+        }
+    }
+    assert!(
+        !frame.contains(CHIP),
+        "six PgDn presses did not bring the view back to the bottom:\n{frame}"
+    );
+    assert!(
+        frame.contains("fillerline05"),
+        "the bottom of the transcript is not in view after PgDn:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// A mouse wheel notch upward scrolls the view and raises the chip; End
+// clears it again.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn the_mouse_wheel_raises_the_chip_and_end_clears_it() {
+    let (_guard, mut pty) = boot("wheel", &[]);
+    overflow_a_short_terminal(&mut pty);
+
+    pty.read_for(HOTKEY_GAP);
+    let before = pty.raw().len();
+    pty.send(WHEEL_UP).unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "End = follow",
+        before,
+        "the follow chip after a wheel-up notch",
+    );
+
+    pty.send(END).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(CHIP),
+        "End did not clear the follow chip after a wheel scroll:\n{frame}"
+    );
+    assert!(
+        frame.contains("fillerline05"),
+        "End did not bring the newest output back into view:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// Shift+G is the keyboard's other way back to the bottom, but only from
+// an empty composer: with a draft the letter is typed and the view stays
+// where it is; once the draft is gone the same key clears the chip.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn shift_g_follows_the_bottom_only_from_an_empty_composer() {
+    let (_guard, mut pty) = boot("shift-g", &[]);
+    overflow_a_short_terminal(&mut pty);
+
+    let before = pty.raw().len();
+    pty.send(PAGE_UP).unwrap();
+    wait_for_squeezed_after(&mut pty, "End = follow", before, "the chip after PgUp");
+
+    pty.send(b"draftG").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains(CHIP),
+        "G typed into a draft moved the view:\n{frame}"
+    );
+    assert!(
+        frame.contains("draftG"),
+        "G typed into a draft did not reach the composer:\n{frame}"
+    );
+
+    pty.send(CTRL_C).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"G").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        !frame.contains(CHIP),
+        "Shift+G on the empty composer did not follow the bottom (the chip is still up):\n{frame}"
+    );
+    assert!(
+        frame.contains("fillerline05"),
+        "Shift+G did not bring the newest output back into view:\n{frame}"
+    );
+    assert!(
+        !frame.contains("draftG"),
+        "the cleared draft is still on screen:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// A reasoning model streams its thinking as a `<think>` span ahead of
+// the answer. The assistant cell shows the answer alone: no tag and no
+// word of the reasoning, during the stream or once the reply is done.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_streamed_think_span_never_shows_in_the_assistant_cell() {
+    let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+        Chunk::Reasoning("weighing the options v4w".to_string()),
+        Chunk::Text("the answer n7p".to_string()),
+    ])]);
+    let (_guard, mut pty) = boot_with_fake("think-span", &fake);
+
+    let before = pty.raw().len();
+    pty.send(b"think first\r").unwrap();
+    let streamed = wait_for_squeezed_after(
+        &mut pty,
+        "the answer n7p",
+        before,
+        "the answer after the think span",
+    );
+    assert!(
+        !streamed.contains("<think>") && !streamed.contains("</think>"),
+        "a think tag was painted while the reply streamed:\n{streamed}"
+    );
+    assert!(
+        !squeezed(&streamed).contains(&squeezed("weighing the options")),
+        "the reasoning was painted while the reply streamed:\n{streamed}"
+    );
+
+    pty.read_for(Duration::from_millis(500));
+    let frame = repaint(&mut pty);
+    assert!(
+        frame.contains(&squeezed("the answer n7p")),
+        "the answer is not on screen:\n{frame}"
+    );
+    assert!(
+        !frame.contains("<think>") && !frame.contains("</think>"),
+        "a think tag is on screen after the reply finished:\n{frame}"
+    );
+    assert!(
+        !frame.contains(&squeezed("weighing the options")),
+        "the reasoning is on screen after the reply finished:\n{frame}"
+    );
+
+    quit(pty);
+}
+
+/// A tool that takes a free-text note besides its marker and echoes a
+/// fixed line, so the folded header has long arguments to cut.
+const NOTE_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Take a note.\n\
+    # @option --note! The note text.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   echo \"note taken t6y\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+// ---------------------------------------------------------------------
+// The folded header carries `name(short args)`: a long argument is cut
+// to the header's budget, never spilled whole across the row, and the
+// row stays one folded line that ends in its status.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn long_tool_args_are_cut_short_in_the_folded_header() {
+    let dir = fresh_config_dir("short-args");
+    let _guard = TempDirGuard(dir.clone());
+    let note: String = (0..40).map(|i| format!("seg{i:02}xx")).collect();
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_note".to_string(),
+            arguments: format!("{{\"note\": \"{note}\"}}"),
+        },
+        Reply::Text("note reply h3d".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_note.sh", NOTE_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"take a long note\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "note reply h3d",
+        0,
+        "the reply after the note tool",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    let folded = repaint(&mut pty);
+    assert!(
+        folded.contains("fixture_note("),
+        "no folded header names the note tool:\n{folded}"
+    );
+    assert!(
+        folded.contains("seg00xx"),
+        "the folded header shows none of the arguments:\n{folded}"
+    );
+    assert!(
+        !folded.contains("seg39xx"),
+        "the folded header spilled the whole 320-character argument:\n{folded}"
+    );
+    let header_end = folded.find("ok").unwrap_or(folded.len());
+    assert!(
+        folded[..header_end].contains("fixture_note("),
+        "the folded header does not end in its status:\n{folded}"
+    );
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// A bookkeeping call (`job__list` here; `memory__*`, `skill__*` and
+// `agent__list_*` are the same class) takes one dim line: the name is on
+// screen once, with neither a running nor a failed status attached.
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_bookkeeping_call_takes_one_line() {
+    let dir = fresh_config_dir("bookkeeping");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "job__list".to_string(),
+            arguments: "{}".to_string(),
+        },
+        Reply::Text("listing reply b8k".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"list the jobs\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "listing reply b8k",
+        0,
+        "the reply after the bookkeeping call",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    let frame = repaint(&mut pty);
+    let names = frame.matches("job__list").count();
+    assert_eq!(
+        names, 1,
+        "a bookkeeping call should take exactly one line naming it (saw {names}):\n{frame}"
+    );
+    assert!(
+        !frame.contains("failed"),
+        "the bookkeeping line reads as a failure:\n{frame}"
+    );
+    assert_eq!(fake.served(), 2, "{frame}");
+
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// A mouse click on a folded tool row focuses and opens it. The row's
+// screen position is not known from outside, so the click lands on the
+// row the repaint put the header on; a second click folds it again.
+// ---------------------------------------------------------------------
+
+const ECHO_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Say something.\n\
+    # @option --word! The word.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   echo \"clicked output c4v\" >&2\n\
+    \x20   echo \"clicked output c4v\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+#[test]
+#[serial]
+fn a_mouse_click_on_the_folded_tool_row_opens_it() {
+    let dir = fresh_config_dir("click");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_echo".to_string(),
+            arguments: "{\"word\": \"hi\"}".to_string(),
+        },
+        Reply::Text("echo reply m9s".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_echo.sh", ECHO_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"say hi\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "echo reply m9s",
+        0,
+        "the reply after the echo tool",
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    let output = squeezed("clicked output c4v");
+    let folded = repaint(&mut pty);
+    assert!(
+        folded.contains("fixture_echo("),
+        "no folded header names the echo tool:\n{folded}"
+    );
+    assert!(
+        !folded.contains(&output),
+        "the tool row is already open before any click:\n{folded}"
+    );
+    let raw = String::from_utf8_lossy(pty.raw()).into_owned();
+    assert!(
+        raw.contains("\x1b[?1000h") || raw.contains("\x1b[?1002h"),
+        "the UI never asked the terminal for mouse reports"
+    );
+    assert!(
+        raw.contains("\x1b[?1006h"),
+        "the UI never asked the terminal for SGR-encoded mouse reports"
+    );
+
+    let rows = repaint_rows(&mut pty);
+    let header_row = rows
+        .iter()
+        .find(|(_, text)| text.contains("fixture_echo("))
+        .map(|(row, _)| *row)
+        .unwrap_or_else(|| panic!("no screen row carries the tool header: {rows:?}"));
+
+    // A left click (press and release) on column 4 of the header row.
+    // An escape sequence counts as a hotkey only once the keyboard has
+    // been idle; the repaint before the click was a keystroke.
+    let click = format!("\x1b[<0;4;{header_row}M\x1b[<0;4;{header_row}m");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(click.as_bytes()).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let opened = repaint(&mut pty);
+    assert!(
+        opened.contains(&output),
+        "a left click on the tool header's screen row {header_row} did not open the folded \
+         tool row; rows were {rows:?}; frame:\n{opened}"
+    );
+    assert!(
+        opened.contains("fixture_echo("),
+        "the opened row lost its header:\n{opened}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(click.as_bytes()).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let refolded = repaint(&mut pty);
+    assert!(
+        !refolded.contains(&output),
+        "a second click on row {header_row} did not fold the row again:\n{refolded}"
+    );
+
+    pty.send(ESC).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit(pty);
+}
+
+// ---------------------------------------------------------------------
+// A narrower terminal re-wraps the cells in place: every marker is on
+// screen exactly as often as before (user cell plus dry-run echo), never
+// a duplicated row, and growing back restores the original layout.
+// The terminal is tall enough that the whole transcript stays in view
+// at every width (the dry-run echo repeats the prompt plus a preamble).
+// ---------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn a_resize_rewraps_without_duplicating_rows() {
+    let (_guard, mut pty) = boot("rewrap", &[]);
+    pty.resize(70, 100).unwrap();
+    pty.read_for(Duration::from_millis(500));
+
+    let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor";
+    for n in 1..=2 {
+        let before = pty.raw().len();
+        let marker = format!("rewrapmark{n:02}");
+        pty.send(format!("{marker} {filler} {filler}\r").as_bytes())
+            .unwrap();
+        wait_for_squeezed_after(&mut pty, &marker, before, "a long prompt");
+        pty.read_for(Duration::from_millis(400));
+    }
+    pty.read_for(Duration::from_millis(500));
+
+    let wide = repaint(&mut pty);
+    let counts: Vec<usize> = (1..=2)
+        .map(|n| wide.matches(&format!("rewrapmark{n:02}")).count())
+        .collect();
+    assert!(
+        counts.iter().all(|&c| c == 2),
+        "each exchange should show its marker twice (user cell and echo) at 100 columns, saw {counts:?}:\n{wide}"
+    );
+
+    for (rows, cols) in [(70u16, 50u16), (70, 100), (70, 64), (70, 100)] {
+        pty.resize(rows, cols).unwrap();
+        pty.read_for(Duration::from_millis(700));
+        let frame = repaint(&mut pty);
+        for n in 1..=2 {
+            let marker = format!("rewrapmark{n:02}");
+            let seen = frame.matches(&marker).count();
+            assert_eq!(
+                seen, 2,
+                "{marker} shows {seen} times after a resize to {rows}x{cols} (expected 2):\n{frame}"
+            );
+        }
+        assert!(
+            !frame.contains(CHIP),
+            "a resize detached the view from the bottom:\n{frame}"
+        );
+    }
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(CTRL_UP).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(ESC).unwrap();
     pty.read_for(Duration::from_millis(300));
     quit(pty);
 }
@@ -989,27 +1527,30 @@ fn f2_shows_and_hides_the_todo_panel() {
 // gets is never out of sight.
 // ---------------------------------------------------------------------
 
-#[test]
-#[serial]
-fn follow_chip_appears_on_scroll_up_and_clears_on_end() {
-    let (_guard, mut pty) = boot("follow-chip", &[]);
-
+/// Fills a 14-row terminal past one screen with dry-run exchanges, so
+/// there is something to scroll, and checks the chip is still down.
+fn overflow_a_short_terminal(pty: &mut Pty) {
     pty.resize(14, 100).unwrap();
     pty.read_for(Duration::from_millis(500));
-
     for n in 1..=5 {
         let before = pty.raw().len();
         let marker = format!("fillerline{n:02}");
         pty.send(format!("{marker}\r").as_bytes()).unwrap();
-        wait_for_squeezed_after(&mut pty, &marker, before, "a filler prompt");
+        wait_for_squeezed_after(pty, &marker, before, "a filler prompt");
         pty.read_for(Duration::from_millis(300));
     }
-
-    let frame = repaint(&mut pty);
+    let frame = repaint(pty);
     assert!(
-        !frame.contains("End=follow"),
+        !frame.contains(CHIP),
         "the follow chip is up while the view follows the bottom:\n{frame}"
     );
+}
+
+#[test]
+#[serial]
+fn follow_chip_appears_on_scroll_up_and_clears_on_end() {
+    let (_guard, mut pty) = boot("follow-chip", &[]);
+    overflow_a_short_terminal(&mut pty);
 
     let before = pty.raw().len();
     pty.send(PAGE_UP).unwrap();

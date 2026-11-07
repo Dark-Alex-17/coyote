@@ -8,6 +8,7 @@ use crate::events::NoticeKind;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -349,7 +350,7 @@ impl Cell {
                 source,
                 done,
                 cache,
-            } => cache.lines(source, *done, width, renderer),
+            } => cache.lines(&without_think_spans(source, *done), *done, width, renderer),
             Cell::Notice { kind, text, cache } => {
                 let style = chrome_style(ChromeKind::Notice(*kind), no_color);
                 cache.get(width, || render::plain_lines(text, width, style))
@@ -694,6 +695,56 @@ pub(super) fn append_output((lines, open_line, pending): OutputTarget<'_>, bytes
         total -= lines[0].len() + 1;
         lines.remove(0);
     }
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// The reply as the view shows it: the REPL's `strip_think_tag` applied
+/// to text that may still be arriving. A span is hidden from its open
+/// tag to its close; an open tag with no close yet hides the rest, and a
+/// close whose open never reached this cell hides the text ahead of it.
+/// While the reply is streaming, a tag cut by a delta boundary at the
+/// tail is held back until the rest of it arrives.
+pub(super) fn without_think_spans(source: &str, done: bool) -> Cow<'_, str> {
+    if !source.contains('<') {
+        return Cow::Borrowed(source);
+    }
+    let mut shown = String::with_capacity(source.len());
+    let mut rest = source;
+    loop {
+        match (rest.find(THINK_OPEN), rest.find(THINK_CLOSE)) {
+            (Some(open), Some(close)) if open < close => {
+                shown.push_str(&rest[..open]);
+                rest = rest[close + THINK_CLOSE.len()..].trim_start();
+            }
+            (Some(open), None) => {
+                shown.push_str(&rest[..open]);
+                break;
+            }
+            (_, Some(close)) => rest = rest[close + THINK_CLOSE.len()..].trim_start(),
+            (None, None) => {
+                let kept = if done {
+                    rest.len()
+                } else {
+                    partial_tag_at(rest).unwrap_or(rest.len())
+                };
+                shown.push_str(&rest[..kept]);
+                break;
+            }
+        }
+    }
+    Cow::Owned(shown)
+}
+
+/// Byte offset of a trailing fragment that could still grow into a
+/// think tag, such as `<thi` or `</think`.
+fn partial_tag_at(text: &str) -> Option<usize> {
+    let at = text.rfind('<')?;
+    let fragment = &text[at..];
+    (fragment.len() < THINK_CLOSE.len()
+        && (THINK_OPEN.starts_with(fragment) || THINK_CLOSE.starts_with(fragment)))
+    .then_some(at)
 }
 
 #[cfg(test)]
@@ -1045,6 +1096,73 @@ mod tests {
         assert_eq!(
             kept, "fghijklmnopqrstuvwxy",
             "the oldest lines were not the ones dropped"
+        );
+    }
+
+    /// A streamed reply arrives as the deltas the chat stream emits:
+    /// the open tag, the reasoning, the close tag, then the answer. No
+    /// frame along the way shows a tag or a word of the reasoning, and
+    /// the finished cell shows the answer alone.
+    #[test]
+    fn a_streaming_reply_never_shows_its_think_span() {
+        let mut renderer = renderer();
+        let mut cell = Cell::assistant(String::new(), false);
+        let deltas = [
+            "<thi",
+            "nk>\n",
+            "weighing the ",
+            "options\n",
+            "</thi",
+            "nk>\n\n",
+            "the ",
+            "answer",
+        ];
+        for delta in deltas {
+            let Cell::Assistant { source, .. } = &mut cell else {
+                unreachable!()
+            };
+            source.push_str(delta);
+            let frame: Vec<String> = cell
+                .lines(80, &mut renderer)
+                .iter()
+                .map(Line::to_string)
+                .collect();
+            let frame = frame.join("\n");
+            assert!(!frame.contains('<'), "{delta:?}: a tag showed:\n{frame}");
+            assert!(
+                !frame.contains("weighing") && !frame.contains("options"),
+                "{delta:?}: the reasoning showed:\n{frame}"
+            );
+        }
+        let Cell::Assistant { done, .. } = &mut cell else {
+            unreachable!()
+        };
+        *done = true;
+        let lines = cell.lines(80, &mut renderer);
+        assert_eq!(lines[0].to_string().trim_end(), "the answer");
+    }
+
+    /// A close tag whose open was never seen hides the text ahead of
+    /// it, a tag only partly arrived is held back while the reply is
+    /// streaming, and a finished reply keeps a stray `<` as written.
+    #[test]
+    fn think_spans_are_cut_however_the_deltas_split_them() {
+        assert_eq!(
+            without_think_spans("<think>\nhmm\n</think>\n\nanswer", true),
+            "answer"
+        );
+        assert_eq!(
+            without_think_spans("still thinking\n</think>\n\nanswer", false),
+            "answer"
+        );
+        assert_eq!(without_think_spans("<think>\nhmm", false), "");
+        assert_eq!(without_think_spans("answer</thi", false), "answer");
+        assert_eq!(without_think_spans("answer <", false), "answer ");
+        assert_eq!(without_think_spans("a < b", false), "a < b");
+        assert_eq!(without_think_spans("a <", true), "a <");
+        assert_eq!(
+            without_think_spans("one<think>x</think>two<think>y</think>three", true),
+            "onetwothree"
         );
     }
 }

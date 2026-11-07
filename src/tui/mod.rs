@@ -5180,6 +5180,30 @@ mod tests {
         assert!(!harness.draw().contains("End = follow"));
     }
 
+    /// Shift+G is the keyboard's other way back to the bottom, but only
+    /// while the composer is empty: with a draft the letter is typing,
+    /// and the view stays where it is.
+    #[test]
+    fn shift_g_follows_the_bottom_only_from_an_empty_composer() {
+        let mut harness = Harness::standalone(80, 24);
+        fill_the_view(&mut harness);
+        let shift_g = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+
+        harness.press(KeyCode::PageUp);
+        harness.type_text("draft");
+        assert!(harness.app.handle_key(shift_g).is_none());
+        assert!(harness.app.transcript.scrolled());
+        assert_eq!(harness.app.composer.lines(), ["draftG"]);
+        assert!(harness.draw().contains("End = follow"));
+
+        harness.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert!(harness.app.composer.is_empty());
+        assert!(harness.app.handle_key(shift_g).is_none());
+        assert!(!harness.app.transcript.scrolled());
+        assert!(harness.app.composer.is_empty());
+        assert!(!harness.draw().contains("End = follow"));
+    }
+
     /// Every custom widget draws only inside the buffer it is given, so
     /// a layout handing one an area the frame does not cover (a resize
     /// mid-draw, a zero-height pane) cannot panic or write out of range.
