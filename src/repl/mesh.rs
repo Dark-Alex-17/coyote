@@ -1999,7 +1999,8 @@ async fn route_to(
     destination: &str,
     abort_signal: &AbortSignal,
 ) -> Result<Route, Unrouted> {
-    // A peer whose last link failed is never asked for, so the route line would mislead.
+    // A peer whose last link failed is not waited on while anything to link with is held,
+    // so the route line would mislead.
     let link_failed = runtime.link_failed(destination);
     if let Some(desc) = runtime.resolve_destination_cached(destination).await {
         if !link_failed && !runtime.path_known(destination).await {
@@ -2008,14 +2009,15 @@ async fn route_to(
         }
         return Ok(Route::unasked(desc));
     }
-    if link_failed {
-        return runtime
-            .resolve_route(destination)
-            .await
-            .ok_or(Unrouted::NoAnswer);
+    let key_held = runtime
+        .peers()
+        .get(destination)
+        .and_then(|peer| peer.verified_destination())
+        .is_some();
+    if !(link_failed && key_held) {
+        out_text(&route_request_line(destination));
+        result_follows();
     }
-    out_text(&route_request_line(destination));
-    result_follows();
     tokio::select! {
         resolved = runtime.resolve_route(destination) => resolved.ok_or(Unrouted::NoAnswer),
         _ = wait_user_interrupt(Some(abort_signal)) => Err(Unrouted::Interrupted),
@@ -18682,10 +18684,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _guard = TestConfigDirGuard::new("repl-mesh-own-session-gone");
                     let _capture = capture::install();
                     run_async(async {
-                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let relay = TransportRelay::start().await;
                         let tmp = TempDir::new("repl-mesh-own-session-gone");
-                        let a = start_as("a", &tmp, addr.port()).await;
-                        let temp = start_as("temp", &tmp, addr.port()).await;
+                        let a = start_as("a", &tmp, relay.port).await;
+                        let temp = start_as("temp", &tmp, relay.port).await;
                         let temp_slot = Arc::new(MeshSlot::default());
                         temp_slot.install(temp.clone()).unwrap();
                         let mut ctx = ctx_with(MeshConfig::default(), true);
@@ -18716,6 +18718,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .any(|name| name.name == "temp")
                         };
                         assert!(named_temp(&ctx));
+                        // Asked for while temp still runs, so `a` holds a path to it after.
+                        assert!(a.resolve_route(&temp_dest).await.is_some());
+                        assert!(a.path_known(&temp_dest).await);
 
                         assert!(temp_slot.stop().await.unwrap());
 
@@ -18744,6 +18749,37 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(tool_row["session_gone"], true, "{result}");
                         assert_eq!(tool_row["reachable"], false, "{result}");
 
+                        // A held path and the own identity's grant would let the sweep ask
+                        // it; an ended session is not asked.
+                        assert!(a.path_known(&temp_dest).await);
+                        assert_eq!(
+                            a.trust().authorize(a.fingerprint(), &temp_dest).decision,
+                            crate::mesh::trust::Decision::Allow
+                        );
+                        let result = handle_mesh_tool(
+                            &mut ctx,
+                            "mesh__peers",
+                            &serde_json::json!({"with_status": true}),
+                        )
+                        .await
+                        .unwrap();
+                        let tool_row = result["peers"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|row| row["destination"] == temp_dest.as_str())
+                            .unwrap_or_else(|| panic!("{temp_dest} missing from {result}"))
+                            .clone();
+                        assert!(tool_row.get("status").is_none(), "{result}");
+                        assert!(tool_row.get("status_error").is_none(), "{result}");
+                        assert!(
+                            !a.requests_made()
+                                .iter()
+                                .any(|(path, _)| path == crate::mesh::request::STATUS_PATH),
+                            "no /status request went out: {:?}",
+                            a.requests_made()
+                        );
+
                         let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
                         assert!(
                             out.contains(
@@ -18754,7 +18790,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!named_temp(&ctx), "a gone session is never a name");
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
-                        relay_handle.abort();
+                        relay.stop().await;
                     });
                 }
 
@@ -31082,6 +31118,90 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(notice < knocking && knocking < landed, "{out:?}");
                     assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+
+            /// A peer whose last link failed reads `no route` in `.mesh peers` and
+            /// `reachable: false` in `mesh__peers` even while a path to it is held; a
+            /// request to it still goes straight over that path without a route line, and
+            /// the link that comes up lifts the mark from both listings.
+            #[test]
+            #[serial]
+            fn a_peer_whose_last_link_failed_reads_no_route_but_is_tried_over_a_held_path() {
+                use crate::function::mesh::handle_mesh_tool;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-link-failed-held-path");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-link-failed-held-path-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started =
+                        started_runtime_on("repl-mesh-link-failed-held-path", stub.port()).await;
+                    let runtime = started.runtime.clone();
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(runtime.clone()).unwrap();
+                    stub.know_identity(runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    stub.wait_to_be_filed(&runtime.peers(), &peer).await;
+                    assert!(runtime.path_known(&peer).await);
+                    runtime.peers().mark_link_failed(&peer);
+                    let listed = |out: &str| -> Vec<String> {
+                        table_rows(out)
+                            .into_iter()
+                            .find(|row| row[1] == short(&peer))
+                            .unwrap_or_else(|| panic!("no row for {peer} in {out}"))
+                    };
+                    let reachable = |result: &serde_json::Value| {
+                        result["peers"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|row| row["destination"] == peer.as_str())
+                            .unwrap_or_else(|| panic!("{peer} missing from {result}"))["reachable"]
+                            .clone()
+                    };
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert_eq!(listed(&out)[6], NO_ROUTE_STATE, "{out}");
+                    let result = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
+                        .await
+                        .unwrap();
+                    assert_eq!(reachable(&result), false, "{result}");
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh knock {peer} --yes --intro \"hi\""),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!out.contains(&route_request_line(&peer)), "{out}");
+                    assert!(
+                        out.contains(&format!(
+                            "Knocked on {} directly; the peer decides whether to trust this instance.",
+                            short(&peer)
+                        )),
+                        "{out}"
+                    );
+                    assert!(
+                        !runtime.link_failed(&peer),
+                        "the link that came up lifts the mark"
+                    );
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert_eq!(listed(&out)[6], "", "{out}");
+                    let result = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
+                        .await
+                        .unwrap();
+                    assert_eq!(reachable(&result), true, "{result}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

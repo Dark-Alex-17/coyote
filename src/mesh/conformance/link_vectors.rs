@@ -94,7 +94,7 @@ enum Case {
     /// timeout.
     LinkTimeout,
     /// A destination the transport has no path to is asked for once within the link
-    /// deadline; with no answer the request ends in `LinkFailed` naming the full
+    /// deadline; with no answer the request ends in `LinkNotOpened` naming the full
     /// destination.
     NoKnownPath,
     /// A wire version refusal with this window marks the peer `Incompatible { found: marked }`.
@@ -1141,8 +1141,8 @@ mod loopback {
         .unwrap_err();
         let waited = asked.elapsed();
 
-        let RequestError::LinkFailed(reason) = err else {
-            panic!("expected LinkFailed for a destination without a path, got {err:?}");
+        let RequestError::LinkNotOpened(reason) = err else {
+            panic!("expected LinkNotOpened for a destination without a path, got {err:?}");
         };
         assert!(reason.contains("no known path"), "{reason}");
         let wait = SHORT_LINK_TIMEOUT.min(PATH_REQUEST_TIMEOUT);

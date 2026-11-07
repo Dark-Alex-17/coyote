@@ -541,11 +541,15 @@ pub(crate) enum StatusError {
 impl fmt::Display for StatusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(err) if err.is_retryable_wait() => write!(
-                f,
-                "{err}. {}. A status request is answered live or not at all; nothing queues it for later.",
-                request_remedy(err)
-            ),
+            Self::Transport(err)
+                if err.is_retryable_wait() || matches!(err, RequestError::LinkNotOpened(_)) =>
+            {
+                write!(
+                    f,
+                    "{err}. {}. A status request is answered live or not at all; nothing queues it for later.",
+                    request_remedy(err)
+                )
+            }
             Self::Transport(err) => write!(
                 f,
                 "{err}. A status request is answered live or not at all; nothing queues it for later."
@@ -1898,6 +1902,14 @@ mod tests {
         assert!(
             transport.contains("answered live or not at all"),
             "{transport}"
+        );
+        let unopened = StatusError::Transport(RequestError::LinkNotOpened(
+            "no known path to destination abababab".to_string(),
+        ))
+        .to_string();
+        assert_eq!(
+            unopened,
+            "The mesh link failed: no known path to destination abababab. Try again in a minute; `.mesh peers` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later."
         );
         let malformed = StatusError::Malformed("`v` is 0".into()).to_string();
         assert!(malformed.contains("status card"), "{malformed}");

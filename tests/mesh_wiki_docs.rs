@@ -5582,11 +5582,27 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         .find(|literal| !literal.is_empty())
         .expect("left_mesh_hint_when returns one non-empty hint");
     let hint = hint.trim().to_string();
-    let link_timeout_display = fn_body("src/mesh/request/error.rs", "fmt");
-    assert!(
-        link_timeout_display.contains("left_mesh_hint_when(*recently_seen)"),
-        "src/mesh/request/error.rs no longer adds the left-the-mesh hint to a link that never came up"
+    let error_rs = read(
+        repo_root()
+            .join("src")
+            .join("mesh")
+            .join("request")
+            .join("error.rs"),
     );
+    let (_, display) = error_rs
+        .split_once("impl fmt::Display for RequestError {")
+        .expect("src/mesh/request/error.rs implements Display for RequestError");
+    assert_in_source_order(
+        "RequestError's Display",
+        display,
+        &[
+            "Self::LinkActivationTimeout {",
+            "No mesh link to the peer came up within",
+            "left_mesh_hint_when(*recently_seen)",
+            "Self::LocalTimeout",
+        ],
+    );
+    let link_timeout = const_secs("src/mesh/request/link.rs", "DEFAULT_LINK_TIMEOUT");
 
     let commands = read(wiki.join("Mesh-Commands.md"));
     let status = flat(&section(
@@ -5604,13 +5620,25 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         "Mesh-Commands.md's `.mesh status` entry does not say the refusals add {hint:?} after `cannot reach.`"
     );
     let link_timeout_line = format!(
-        "No mesh link to the peer came up within 10.0s. {hint} {}.",
+        "No mesh link to the peer came up within {link_timeout}.0s. {hint} {}.",
         "Try again in a minute; `.mesh peers` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later"
     );
     assert!(
         status.contains(&link_timeout_line),
         "Mesh-Commands.md's `.mesh status` entry does not quote the link-timeout refusal with the hint: {link_timeout_line:?}"
     );
+    assert!(
+        flat(&read(wiki.join("Mesh-Platform-Support.md"))).contains(&link_timeout_line),
+        "Mesh-Platform-Support.md's walkthrough does not quote the link-timeout refusal with the hint: {link_timeout_line:?}"
+    );
+    let tools = read(repo_root().join("src").join("function").join("mesh.rs"));
+    let mesh_page = read(wiki.join("Mesh.md"));
+    for needle in ["`session_gone: true`", "`reachable`"] {
+        assert!(
+            tools.contains(needle) && mesh_page.contains(needle),
+            "the mesh__peers description and Mesh.md's mesh__peers row do not both name {needle}"
+        );
+    }
     assert!(
         status.contains(&format!("waits up to {timeout} s for the answer")),
         "Mesh-Commands.md's `.mesh status` entry does not say how long the path request waits"

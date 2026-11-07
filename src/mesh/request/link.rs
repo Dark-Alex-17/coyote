@@ -315,7 +315,7 @@ pub(crate) async fn link_to(
 /// link is tried once more if a path arrived. A deadline whose caller already sent a path
 /// request, or one already spent, fails at once instead, so one request never stacks two
 /// waits and no request is sent that nothing would wait on. Either way a
-/// destination still without a path fails as `LinkFailed` naming no known path.
+/// destination still without a path fails as `LinkNotOpened` naming no known path.
 pub(crate) async fn open_link(
     transport: &Transport,
     destination: &DestinationDesc,
@@ -324,9 +324,9 @@ pub(crate) async fn open_link(
 ) -> Result<Arc<tokio::sync::Mutex<Link>>, RequestError> {
     let destination_hex = destination.address_hash.to_hex_string();
     let no_path =
-        || RequestError::LinkFailed(format!("no known path to destination {destination_hex}"));
+        || RequestError::LinkNotOpened(format!("no known path to destination {destination_hex}"));
     let no_link = |err: RnsError| {
-        RequestError::LinkFailed(format!("no link to destination {destination_hex}: {err}"))
+        RequestError::LinkNotOpened(format!("no link to destination {destination_hex}: {err}"))
     };
     let link = match deadline
         .bound_activation(path, transport.link(*destination))
@@ -375,7 +375,7 @@ pub(crate) async fn open_link(
         Err(err) if err.kind() == ErrorKind::TimedOut => {
             return Err(deadline.activation_expired(path));
         }
-        Err(err) => return Err(RequestError::LinkFailed(err.to_string())),
+        Err(err) => return Err(RequestError::LinkNotOpened(err.to_string())),
     }
     let link_id = deadline
         .bound_locally(path, async { *link.lock().await.id() })

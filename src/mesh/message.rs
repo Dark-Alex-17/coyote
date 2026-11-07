@@ -1972,6 +1972,7 @@ impl MeshRuntime {
                 | RequestError::RequestIncomplete { .. }
                 | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
+                | RequestError::LinkNotOpened(_)
                 | RequestError::LinkClosed),
             ) => err,
             Err(RequestError::Refused(RefusalCode::NoAccess)) => {
@@ -2145,8 +2146,10 @@ impl MeshRuntime {
     /// answered at once with no request, even when its path has expired (the link then
     /// asks for the path itself), and one it does not hold is asked for once over the
     /// network and waited for up to `PATH_REQUEST_TIMEOUT`, coming back only with the path
-    /// that answered. `None` otherwise. A peer whose last link failed is never asked for:
-    /// only what the transport already holds is used until a link comes up or it announces.
+    /// that answered. `None` otherwise. For a peer whose last link failed nothing is
+    /// waited on while a stored key or a description is held: that is used now, and the
+    /// path request the request itself sends serves the next attempt. With neither held
+    /// it is asked for and waited on as any other.
     pub(crate) async fn resolve_route(&self, destination_hex: &str) -> Option<Route> {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
@@ -2177,14 +2180,20 @@ impl MeshRuntime {
                     path_requested: !known,
                 })
             }
-            None if link_failed => transport
-                .destination_desc(&address_hash)
-                .await
-                .map(Route::unasked),
-            None => transport
-                .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
-                .await
-                .map(Route::unasked),
+            None => {
+                let held = if link_failed {
+                    transport.destination_desc(&address_hash).await
+                } else {
+                    None
+                };
+                match held {
+                    Some(desc) => Some(Route::unasked(desc)),
+                    None => transport
+                        .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
+                        .await
+                        .map(Route::unasked),
+                }
+            }
         };
         if route.is_none() {
             debug!("Mesh found no route to {}", short(&destination));

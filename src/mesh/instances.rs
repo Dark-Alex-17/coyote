@@ -37,7 +37,6 @@ pub(crate) struct InstanceRow {
     pub agent: Option<String>,
     pub process: ProcessStamp,
     pub started: SystemTime,
-    #[serde(default)]
     pub gone_at: Option<SystemTime>,
 }
 
@@ -103,12 +102,21 @@ pub(crate) fn by_destination(cache_dir: &Path) -> Sessions {
         Ok(rows) => {
             let mut sessions = Sessions::default();
             for row in rows.into_values() {
-                let side = if row.gone_at.is_some() {
-                    &mut sessions.gone
-                } else {
-                    &mut sessions.running
-                };
-                side.insert(row.destination.clone(), row);
+                match row.gone_at {
+                    None => {
+                        sessions.running.insert(row.destination.clone(), row);
+                    }
+                    // Of two tombstones at one destination the one that went last names it.
+                    Some(gone_at) => {
+                        let newer = sessions
+                            .gone
+                            .get(&row.destination)
+                            .is_none_or(|kept| kept.gone_at < Some(gone_at));
+                        if newer {
+                            sessions.gone.insert(row.destination.clone(), row);
+                        }
+                    }
+                }
             }
             sessions
         }
@@ -513,6 +521,31 @@ mod tests {
         assert_eq!(
             sessions_by_instance(&tmp.path).get(ID_A),
             Some(&InstanceSession::Gone("a".to_string()))
+        );
+    }
+
+    /// Two tombstones at one destination: the session that went last names it, whatever
+    /// order their instance ids sort in.
+    #[test]
+    fn of_two_tombstones_at_one_destination_the_latest_names_it() {
+        let tmp = TempDir::new("instances-two-tombstones");
+        let now = SystemTime::now();
+        let gone = |session: &str, ago: u64| InstanceRow {
+            gone_at: Some(now - std::time::Duration::from_secs(ago)),
+            ..row(&"aa".repeat(16), session)
+        };
+        let file = InstancesFile {
+            version: INSTANCES_VERSION,
+            instances: BTreeMap::from([
+                (ID_A.to_string(), gone("later", 10)),
+                (ID_B.to_string(), gone("earlier", 60)),
+            ]),
+        };
+        write_raw(&tmp, &serde_json::to_vec(&file).unwrap());
+
+        assert_eq!(
+            by_destination(&tmp.path).gone[&"aa".repeat(16)].session,
+            "later"
         );
     }
 

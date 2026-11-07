@@ -1130,7 +1130,8 @@ impl MeshRuntime {
 
     /// The questions the other sessions on this cache dir asked and still wait on or
     /// have yet to collect, newest first, each with what the instance registry says of
-    /// the session that asked it (`None` once its row is gone).
+    /// the session that asked it (`None` once its tombstone is pruned, or when it never
+    /// had a row).
     pub(crate) fn other_sessions_asked(
         &self,
         now: SystemTime,
@@ -1619,7 +1620,8 @@ impl MeshRuntime {
     /// peer that refuses this node's version over the wire is marked so the next request is
     /// refused here. A link that could not be opened marks the peer's row `no route` until
     /// a link comes up or it announces again; while marked, the request still runs when the
-    /// transport holds a path but never waits on a path request for it.
+    /// transport holds a path but never waits on a path request for it. One is still sent
+    /// when no path is held, so a peer that is back can be reached on the next attempt.
     async fn request_envelope(
         &self,
         destination: &DestinationDesc,
@@ -1642,8 +1644,18 @@ impl MeshRuntime {
             .clone()
             .ok_or(RequestError::NotRunning)?;
         let sent = envelope.version;
+        let link_failed = self.peers.link_failed(&dest_hex);
+        if link_failed && !transport.has_path(&destination.address_hash).await {
+            debug!(
+                "Mesh asked the network for a path to {} without waiting: its last link failed and it has not linked or announced since",
+                short(&dest_hex)
+            );
+            transport
+                .request_path(&destination.address_hash, None, None)
+                .await;
+        }
         let options = RequestOptions {
-            path_requested: options.path_requested || self.peers.link_failed(&dest_hex),
+            path_requested: options.path_requested || link_failed,
             ..options
         };
         let request = link_request(
@@ -1727,6 +1739,7 @@ impl MeshRuntime {
             Err(
                 err @ (RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
+                | RequestError::LinkNotOpened(_)
                 | RequestError::LinkClosed),
             ) => (KnockFallback::Unreachable, err),
             Err(RequestError::NotRunning | RequestError::Shutdown) => {
@@ -3068,13 +3081,14 @@ fn note_link_outcome(
             *recently_seen = peers.get(dest_hex).is_some_and(|peer| !peer.is_stale(now));
             peers.mark_link_failed(dest_hex);
         }
-        Err(RequestError::LinkFailed(_)) => peers.mark_link_failed(dest_hex),
+        Err(RequestError::LinkNotOpened(_)) => peers.mark_link_failed(dest_hex),
         Ok(_)
         | Err(
             RequestError::Timeout { .. }
             | RequestError::IdentifyTimeout { .. }
             | RequestError::ResponseIncomplete { .. }
             | RequestError::RequestIncomplete { .. }
+            | RequestError::LinkFailed(_)
             | RequestError::LinkClosed
             | RequestError::ResponseOversize { .. }
             | RequestError::Decode(_)
@@ -12762,7 +12776,7 @@ mod tests {
     }
 
     /// The same held peer with nothing left to answer for it: the request's one path
-    /// request goes unanswered, so it fails as `LinkFailed` naming no known path after
+    /// request goes unanswered, so it fails as `LinkNotOpened` naming no known path after
     /// one `PATH_REQUEST_TIMEOUT`, not at once and not after a second wait.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12780,7 +12794,7 @@ mod tests {
         let waited = asked.elapsed();
 
         assert!(
-            matches!(&result, Err(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+            matches!(&result, Err(RequestError::LinkNotOpened(reason)) if reason.contains("no known path")),
             "{result:?}"
         );
         assert!(
@@ -16794,7 +16808,7 @@ mod tests {
             let waited = asked.elapsed();
 
             assert!(
-                matches!(&err, PropagationError::Link(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+                matches!(&err, PropagationError::Link(RequestError::LinkNotOpened(reason)) if reason.contains("no known path")),
                 "{err:?}"
             );
             assert!(
@@ -16865,7 +16879,7 @@ mod tests {
             let waited = asked.elapsed();
 
             assert!(
-                matches!(&err, FetchError::Link(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+                matches!(&err, FetchError::Link(RequestError::LinkNotOpened(reason)) if reason.contains("no known path")),
                 "{err:?}"
             );
             assert!(
@@ -20555,10 +20569,28 @@ mod tests {
         let _ = note_link_outcome(
             &peers,
             &hash,
-            Err(RequestError::LinkFailed("no known path".to_string())),
+            Err(RequestError::LinkNotOpened("no known path".to_string())),
             now,
         );
         assert!(peers.link_failed(&hash));
+        let _ = note_link_outcome(
+            &peers,
+            &hash,
+            Err(RequestError::LinkFailed(
+                "the response resource failed before it completed".to_string(),
+            )),
+            now,
+        );
+        assert!(
+            !peers.link_failed(&hash),
+            "a transfer that failed on a link that came up clears the mark"
+        );
+        let _ = note_link_outcome(
+            &peers,
+            &hash,
+            Err(RequestError::LinkNotOpened("no known path".to_string())),
+            now,
+        );
         let _ = note_link_outcome(&peers, &hash, Ok(rmpv::Value::Nil), now);
         assert!(!peers.link_failed(&hash));
     }

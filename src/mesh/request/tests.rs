@@ -126,6 +126,7 @@ fn every_request_error_has_a_next_step() {
             after: Duration::from_secs(5),
         },
         RequestError::LinkFailed("no path".to_string()),
+        RequestError::LinkNotOpened("no known path".to_string()),
         RequestError::LinkClosed,
         RequestError::Oversize { len: 9, max: 8 },
         RequestError::Decode("short frame".to_string()),
@@ -10620,7 +10621,7 @@ pub(crate) mod network {
     }
 
     /// A link opened on a deadline whose caller already sent a path request does not ask
-    /// again: a destination without a path fails as `LinkFailed` naming no known path at
+    /// again: a destination without a path fails as `LinkNotOpened` naming no known path at
     /// once, long before the link deadline a second path request would have waited on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_link_whose_path_was_already_asked_for_fails_at_once_without_asking_again() {
@@ -10639,8 +10640,8 @@ pub(crate) mod network {
         .await;
         let waited = asked.elapsed();
 
-        let Err(RequestError::LinkFailed(reason)) = opened else {
-            panic!("expected LinkFailed for a destination without a path");
+        let Err(RequestError::LinkNotOpened(reason)) = opened else {
+            panic!("expected LinkNotOpened for a destination without a path");
         };
         assert_eq!(reason, format!("no known path to destination {ghost_hex}"));
         assert!(
@@ -10671,8 +10672,8 @@ pub(crate) mod network {
         .await;
         let waited = asked.elapsed();
 
-        let Err(RequestError::LinkFailed(reason)) = opened else {
-            panic!("expected LinkFailed for a destination without a path");
+        let Err(RequestError::LinkNotOpened(reason)) = opened else {
+            panic!("expected LinkNotOpened for a destination without a path");
         };
         assert_eq!(reason, format!("no known path to destination {ghost_hex}"));
         assert!(

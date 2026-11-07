@@ -35,8 +35,13 @@ pub(crate) enum RequestError {
     /// The request was too large for one packet and went out as a resource whose upload
     /// had not completed within `after`, so the peer never had the whole request to answer.
     RequestIncomplete { path: String, after: Duration },
-    /// The link could not be established or the packet could not be put on its interface.
+    /// The link was up but the request or its proof could not be put on it, or its
+    /// answer failed in transfer.
     LinkFailed(String),
+    /// The link was never established: no path to the peer, or the transport refused to
+    /// open or activate it. Reads as `LinkFailed` does; only callers that track whether
+    /// the peer is reachable tell the two apart.
+    LinkNotOpened(String),
     /// The link closed while the request was pending, or was gone by the time we replied.
     LinkClosed,
     /// The encoded request frame exceeds `MAX_REQUEST_PAYLOAD_BYTES` and was not sent at
@@ -140,7 +145,9 @@ impl fmt::Display for RequestError {
                 "The request was too large for one packet, and its upload to the peer had not finished within {:.1}s, so the peer never had all of it to answer",
                 after.as_secs_f64()
             ),
-            Self::LinkFailed(reason) => write!(f, "The mesh link failed: {reason}"),
+            Self::LinkFailed(reason) | Self::LinkNotOpened(reason) => {
+                write!(f, "The mesh link failed: {reason}")
+            }
             Self::LinkClosed => write!(f, "The mesh link closed before the request completed"),
             Self::Oversize { len, max } => write!(
                 f,
@@ -235,6 +242,7 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
         | RequestError::ResponseIncomplete { .. }
         | RequestError::RequestIncomplete { .. }
         | RequestError::LinkFailed(_)
+        | RequestError::LinkNotOpened(_)
         | RequestError::LinkClosed => {
             "Try again in a minute; `.mesh peers` shows when the peer was last heard"
         }

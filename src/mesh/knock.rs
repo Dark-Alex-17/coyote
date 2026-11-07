@@ -307,6 +307,7 @@ impl KnockError {
         };
         let reason = match request {
             RequestError::LinkFailed(reason)
+            | RequestError::LinkNotOpened(reason)
             | RequestError::Decode(reason)
             | RequestError::Send(reason) => reason,
             _ => return NoticeText::from(whole),

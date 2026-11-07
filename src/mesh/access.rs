@@ -646,6 +646,7 @@ impl MeshRuntime {
                 | RequestError::RequestIncomplete { .. }
                 | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
+                | RequestError::LinkNotOpened(_)
                 | RequestError::LinkClosed),
             ) => err,
             Err(err) if err.is_access_refusal() => {

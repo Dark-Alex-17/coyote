@@ -325,7 +325,9 @@ impl PeerTable {
     /// read it `no route` and a request to it waits on no path request; a destination the
     /// table does not know is left unmarked.
     pub(crate) fn mark_link_failed(&self, destination_hash: &str) {
-        if self.inner.lock().contains_key(destination_hash) {
+        // Nested as `sweep` nests them, so a row swept meanwhile is never left marked.
+        let peers = self.inner.lock();
+        if peers.contains_key(destination_hash) {
             self.link_failed.lock().insert(destination_hash.to_string());
         }
     }
