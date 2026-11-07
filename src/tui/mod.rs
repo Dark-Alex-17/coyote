@@ -8427,6 +8427,19 @@ mod tests {
                 "src/utils/input.rs",
                 "bail!(\"Keyboard prompts are not available in the TUI yet; unanswered: {question}\")",
             ),
+            (
+                "src/config/agent.rs",
+                "eprintln!(\"The agent has documents attached; starting without RAG\");",
+            ),
+            (
+                "src/config/install_remote.rs",
+                "return Ok(ObsoleteAction::Keep);",
+            ),
+            ("src/config/install_remote.rs", "conflict::rerun_hint()"),
+            (
+                "src/config/install_remote.rs",
+                "Ok((Vec::new(), missing.to_vec()))",
+            ),
             ("src/tui/redirect.rs", "String::new()"),
             (
                 "tests/tui_binary.rs",

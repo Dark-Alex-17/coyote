@@ -394,7 +394,7 @@ impl Agent {
             if crate::tui::active() {
                 // The question has no modal of its own yet; the agent
                 // starts without its knowledge base rather than refusing.
-                eprintln!("The agent has documents attached; starting without RAG");
+                eprintln!("The agent has documents attached; starting without RAG"); // TASK-388
             } else if *IS_STDOUT_TERMINAL {
                 ans = Confirm::new("The agent has documents attached, init RAG?")
                     .with_default(true)
