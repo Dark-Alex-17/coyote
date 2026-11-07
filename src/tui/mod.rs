@@ -1366,8 +1366,8 @@ impl App {
 
     /// The output lines of a call without an id, within this turn: the
     /// newest running tool row without one (a finished one has had all
-    /// its output), or the newest such call folded into a job's or
-    /// agent's row.
+    /// its output), or the newest such call folded into a running job's
+    /// or agent's row; a finished job or agent takes nothing more.
     fn anonymous_tool_output_target(&mut self, first_cell: usize) -> Option<OutputTarget<'_>> {
         let cells = self.transcript.cells();
         let index = (first_cell..cells.len())
@@ -1376,8 +1376,13 @@ impl App {
                 Cell::Tool {
                     call_id, status, ..
                 } => call_id.is_empty() && matches!(status, ToolStatus::Running { .. }),
-                Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
-                    calls.iter().any(|call| call.call_id.is_empty())
+                Cell::Job { calls, status, .. } => {
+                    matches!(status, JobStatus::Running)
+                        && calls.iter().any(|call| call.call_id.is_empty())
+                }
+                Cell::Agent { calls, status, .. } => {
+                    matches!(status, AgentStatus::Running)
+                        && calls.iter().any(|call| call.call_id.is_empty())
                 }
                 _ => false,
             })?;
@@ -4812,6 +4817,48 @@ mod tests {
             panic!("the job did not take the start call's row");
         };
         assert_eq!(calls[0].output, ["started"]);
+    }
+
+    /// Output without an id that arrives after the job has finished is
+    /// not the job's: it takes a cell of its own rather than reopening
+    /// the finished row.
+    #[test]
+    fn anonymous_tool_output_never_joins_a_finished_job_row() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("background", false);
+        narrate(
+            &mut harness,
+            "",
+            "Call job__start {\"tool\":\"execute_command\"}",
+        );
+        start_tool(&mut harness, "", "job__start", None);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job_1a2b3c4d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.app.handle_msg(UiMsg::JobFinished {
+            job_id: "job_1a2b3c4d".to_string(),
+            ok: true,
+            error: None,
+        });
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"late\n".to_vec(),
+        });
+        let cells = harness.app.transcript.cells();
+        let Cell::Job { calls, .. } = &cells[1] else {
+            panic!("the job did not take the start call's row");
+        };
+        assert!(calls[0].output.is_empty(), "{:?}", calls[0].output);
+        let Some(Cell::Text {
+            call_id: None,
+            lines,
+            ..
+        }) = cells.last()
+        else {
+            panic!("the late output took no cell of its own");
+        };
+        assert_eq!(lines, &["late"]);
     }
 
     #[test]

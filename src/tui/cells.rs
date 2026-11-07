@@ -8,9 +8,8 @@ use crate::events::NoticeKind;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use std::borrow::Cow;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Plain lines cached per width; the two most recently used widths are kept.
 #[derive(Default)]
@@ -209,12 +208,12 @@ pub(super) fn short_args(args: &str) -> String {
     cut_to(line, SHORT_ARGS_BUDGET)
 }
 
-/// `text` cut so a header with `reserved` other characters (the name,
-/// the state token, their punctuation) fits a row `width` wide, since
-/// the view clips the header from the right and the state token at its
-/// end is the one thing a folded row has to say. The cut never goes
-/// below `MIN_ARGS_BUDGET`, so a very narrow row loses the state rather
-/// than every argument.
+/// `text` cut so a header with `reserved` other columns (the name, the
+/// state token, their punctuation) fits a row `width` wide, since the
+/// view clips the header from the right and the state token at its end
+/// is the one thing a folded row has to say. The cut never goes below
+/// `MIN_ARGS_BUDGET`, so a very narrow row loses the state rather than
+/// every argument.
 fn fit_to_row(text: &str, reserved: usize, width: u16) -> String {
     let budget = usize::from(width)
         .saturating_sub(reserved)
@@ -222,11 +221,22 @@ fn fit_to_row(text: &str, reserved: usize, width: u16) -> String {
     cut_to(text, budget)
 }
 
+/// `text` cut to `budget` columns, `...` included, so a wide character
+/// counts for the two cells it takes on the row.
 fn cut_to(text: &str, budget: usize) -> String {
-    if text.chars().count() <= budget {
+    if text.width() <= budget {
         return text.to_string();
     }
-    let mut short: String = text.chars().take(budget - 3).collect();
+    let mut short = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let columns = c.width().unwrap_or(0);
+        if used + columns > budget - 3 {
+            break;
+        }
+        short.push(c);
+        used += columns;
+    }
     short.push_str("...");
     short
 }
@@ -350,7 +360,7 @@ impl Cell {
                 source,
                 done,
                 cache,
-            } => cache.lines(&without_think_spans(source, *done), *done, width, renderer),
+            } => cache.lines(without_think_spans(source, *done), *done, width, renderer),
             Cell::Notice { kind, text, cache } => {
                 let style = chrome_style(ChromeKind::Notice(*kind), no_color);
                 cache.get(width, || render::plain_lines(text, width, style))
@@ -396,7 +406,7 @@ impl Cell {
                 // narration below it is what the user approves, so that
                 // wraps and is shown whole. The error in the header is
                 // the tool's own text, so it is scrubbed.
-                let reserved = name.chars().count() + "()  ".len() + state.chars().count();
+                let reserved = name.width() + "()  ".len() + state.width();
                 let args = fit_to_row(args, reserved, width);
                 let header = render::plain_text(&format!("{name}({args})  {state}"));
                 let mut lines = vec![Line::from(Span::styled(header, DIM))];
@@ -428,7 +438,7 @@ impl Cell {
                     JobStatus::Failed(error) => Some(error.as_str()),
                     _ => None,
                 };
-                let reserved = "job   ".len() + state.chars().count();
+                let reserved = "job   ".len() + state.width();
                 let subject = fit_to_row(&format!("{tool} {job_id}"), reserved, width);
                 let header = format!("job {subject}  {state}");
                 row_lines(header, error, calls, *expanded, width)
@@ -450,7 +460,7 @@ impl Cell {
                     AgentStatus::Failed(error) => Some(error.as_str()),
                     _ => None,
                 };
-                let reserved = "agent   ".len() + state.chars().count();
+                let reserved = "agent   ".len() + state.width();
                 let subject = fit_to_row(&format!("{name} {agent_id}"), reserved, width);
                 let header = format!("agent {subject}  {state}");
                 row_lines(header, error, calls, *expanded, width)
@@ -560,7 +570,7 @@ fn folded_verb(name: &str) -> &str {
 pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> Vec<Line<'static>> {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let plain = Style::new();
-    let help = prefix.render_hints(r#"Type ".help" for additional help."#);
+    let help = prefix.render_hints(crate::repl::WELCOME_HELP_HINT);
     let mut text = vec![
         (format!("coyote {}", env!("CARGO_PKG_VERSION")), bold),
         (format!("model: {model}"), plain),
@@ -701,40 +711,36 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
 /// The reply as the view shows it: the REPL's `strip_think_tag` applied
-/// to text that may still be arriving. A span is hidden from its open
-/// tag to its close; an open tag with no close yet hides the rest, and a
-/// close whose open never reached this cell hides the text ahead of it.
-/// While the reply is streaming, a tag cut by a delta boundary at the
-/// tail is held back until the rest of it arrives.
-pub(super) fn without_think_spans(source: &str, done: bool) -> Cow<'_, str> {
+/// to text that may still be arriving. Only a span at the start of the
+/// reply is reasoning; a tag quoted later in prose or code is shown as
+/// written. An opening tag with no close yet hides the rest, and a close
+/// with nothing visible ahead of it is the end of reasoning whose open
+/// never reached this cell. While the reply is streaming, a tag cut by
+/// a delta boundary at the tail is held back until the rest arrives.
+pub(super) fn without_think_spans(source: &str, done: bool) -> &str {
     if !source.contains('<') {
-        return Cow::Borrowed(source);
+        return source;
     }
-    let mut shown = String::with_capacity(source.len());
-    let mut rest = source;
-    loop {
-        match (rest.find(THINK_OPEN), rest.find(THINK_CLOSE)) {
-            (Some(open), Some(close)) if open < close => {
-                shown.push_str(&rest[..open]);
-                rest = rest[close + THINK_CLOSE.len()..].trim_start();
-            }
-            (Some(open), None) => {
-                shown.push_str(&rest[..open]);
-                break;
-            }
-            (_, Some(close)) => rest = rest[close + THINK_CLOSE.len()..].trim_start(),
-            (None, None) => {
-                let kept = if done {
-                    rest.len()
-                } else {
-                    partial_tag_at(rest).unwrap_or(rest.len())
-                };
-                shown.push_str(&rest[..kept]);
-                break;
-            }
-        }
-    }
-    Cow::Owned(shown)
+    let body = source.trim_start();
+    let after_reasoning = if let Some(span) = body.strip_prefix(THINK_OPEN) {
+        Some(
+            span.find(THINK_CLOSE)
+                .map_or("", |close| &span[close + THINK_CLOSE.len()..]),
+        )
+    } else if let Some(after) = body.strip_prefix(THINK_CLOSE) {
+        Some(after)
+    } else if !done && partial_tag_at(body) == Some(0) {
+        Some("")
+    } else {
+        None
+    };
+    let shown = after_reasoning.map_or(source, str::trim_start);
+    let kept = if done {
+        shown.len()
+    } else {
+        partial_tag_at(shown).unwrap_or(shown.len())
+    };
+    &shown[..kept]
 }
 
 /// Byte offset of a trailing fragment that could still grow into a
@@ -881,6 +887,9 @@ mod tests {
         assert_eq!(floor.chars().count(), MIN_ARGS_BUDGET);
         assert!(floor.ends_with("..."));
         assert_eq!(fit_to_row("short", 31, 40), "short");
+        let wide = fit_to_row(&"\u{4e2d}".repeat(SHORT_ARGS_BUDGET), 31, 40);
+        assert_eq!(wide, format!("{}...", "\u{4e2d}".repeat(3)));
+        assert_eq!(wide.width(), 9);
     }
 
     /// A `content` argument of kilobytes leaves the collapsed row one
@@ -1142,27 +1151,41 @@ mod tests {
         assert_eq!(lines[0].to_string().trim_end(), "the answer");
     }
 
-    /// A close tag whose open was never seen hides the text ahead of
-    /// it, a tag only partly arrived is held back while the reply is
-    /// streaming, and a finished reply keeps a stray `<` as written.
+    /// A close tag with nothing visible ahead of it ends reasoning
+    /// whose open was never seen, a tag only partly arrived is held
+    /// back while the reply is streaming, and a finished reply keeps a
+    /// stray `<` as written.
     #[test]
     fn think_spans_are_cut_however_the_deltas_split_them() {
         assert_eq!(
             without_think_spans("<think>\nhmm\n</think>\n\nanswer", true),
             "answer"
         );
-        assert_eq!(
-            without_think_spans("still thinking\n</think>\n\nanswer", false),
-            "answer"
-        );
+        assert_eq!(without_think_spans("\n</think>\n\nanswer", false), "answer");
         assert_eq!(without_think_spans("<think>\nhmm", false), "");
+        assert_eq!(without_think_spans("<thi", false), "");
         assert_eq!(without_think_spans("answer</thi", false), "answer");
         assert_eq!(without_think_spans("answer <", false), "answer ");
         assert_eq!(without_think_spans("a < b", false), "a < b");
         assert_eq!(without_think_spans("a <", true), "a <");
+    }
+
+    /// Only the span at the start of a reply is reasoning: a tag the
+    /// model quotes in prose or code stays on screen, as it does in the
+    /// REPL.
+    #[test]
+    fn a_think_tag_quoted_after_visible_text_is_shown_as_written() {
         assert_eq!(
-            without_think_spans("one<think>x</think>two<think>y</think>three", true),
-            "onetwothree"
+            without_think_spans("see </think> in code", true),
+            "see </think> in code"
+        );
+        assert_eq!(
+            without_think_spans("x <think>y</think> z", true),
+            "x <think>y</think> z"
+        );
+        assert_eq!(
+            without_think_spans("<think>x</think>two<think>y</think>three", true),
+            "two<think>y</think>three"
         );
     }
 }

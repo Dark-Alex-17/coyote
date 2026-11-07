@@ -204,7 +204,8 @@ fn hook_env_or_empty(envs: &[(String, String)], key: &str) -> String {
 
 /// Only the root turn's own tools and thinking drive the status row; a
 /// child agent's tool or reasoning starting or finishing says nothing
-/// about what the root is doing.
+/// about what the root is doing. A detached origin (no agent, depth 0)
+/// counts as root: it is what a publisher without a request context has.
 fn is_root(origin: &Origin) -> bool {
     origin.agent_id.is_none() && origin.depth == 0
 }

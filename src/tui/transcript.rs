@@ -139,6 +139,9 @@ impl Transcript {
     }
 
     pub(super) fn truncate(&mut self, len: usize) {
+        self.unseen = self
+            .unseen
+            .saturating_sub(self.cells.len().saturating_sub(len));
         self.cells.truncate(len);
         if self.focus.is_some_and(|focus| focus >= len) {
             self.focus = None;
@@ -495,6 +498,26 @@ mod tests {
         transcript.remove(9);
         assert_eq!(transcript.unseen, 1);
         transcript.remove(9);
+        assert_eq!(transcript.unseen, 0);
+    }
+
+    /// Truncating below a scrolled view takes the cut cells out of the
+    /// chip's count and no more than that.
+    #[test]
+    fn truncating_unseen_cells_drops_them_from_the_count() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-100);
+        transcript.push(Cell::user("late 1"));
+        transcript.push(Cell::user("late 2"));
+        transcript.push(Cell::user("late 3"));
+        assert_eq!(transcript.unseen, 3);
+        transcript.truncate(12);
+        assert_eq!(transcript.unseen, 2);
+        transcript.truncate(5);
         assert_eq!(transcript.unseen, 0);
     }
 

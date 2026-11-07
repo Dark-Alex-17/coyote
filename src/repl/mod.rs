@@ -76,6 +76,9 @@ pub(crate) const WELCOME_INTERRUPT_HINT: &str = "\
 Tip: Press Ctrl-C as the model works to interrupt the turn and send another prompt.
 Press it again at the idle prompt to cancel background work it left running.";
 
+/// Spelled with the dot prefix; `render_hints` swaps in the active one.
+pub(crate) const WELCOME_HELP_HINT: &str = r#"Type ".help" for additional help."#;
+
 /// Brackets one user-visible turn at an outer boundary (`ask`,
 /// `start_directive`, `shell_execute`): `enter` fires `turn.started`, and
 /// `finish` fires exactly one of `turn.completed` / `turn.interrupted` /
@@ -485,9 +488,7 @@ impl Repl {
                 "Welcome to {} {}\n{}\n\n{}\n",
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
-                self.ctx
-                    .read()
-                    .render_hints(r#"Type ".help" for additional help."#),
+                self.ctx.read().render_hints(WELCOME_HELP_HINT),
                 dimmed_text(WELCOME_INTERRUPT_HINT)
             );
             if env::var_os(SANDBOX_ENV_FLAG).is_some() {

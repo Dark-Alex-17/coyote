@@ -379,7 +379,7 @@ mod tests {
     /// move the view belong to the transcript: a modal, answerable or
     /// not, does not take them.
     #[test]
-    fn suspend_and_repaint_work_under_every_modal() {
+    fn terminal_and_view_keys_work_under_every_modal() {
         let confirm = KeyContext {
             modal: Some(ModalKind::Confirm {
                 default: false,
@@ -412,6 +412,52 @@ mod tests {
             for (key, ctx, expected) in cases {
                 assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
             }
+        }
+    }
+
+    /// The keys that act on a row are the modal's while one is up: a
+    /// confirm swallows them (and Enter still answers it with a row
+    /// focused), an input field types them.
+    #[test]
+    fn focus_keys_stay_with_the_modal() {
+        let confirm = KeyContext {
+            modal: Some(ModalKind::Confirm {
+                default: false,
+                tool: true,
+            }),
+            focused: true,
+            scrolled: true,
+            ..IDLE
+        };
+        let input = KeyContext {
+            modal: Some(ModalKind::Input),
+            ..confirm
+        };
+        let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
+        let shift_g = press(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        let cases = [
+            (control(KeyCode::Up), confirm, Action::Nothing),
+            (control(KeyCode::Down), confirm, Action::Nothing),
+            (shift_g, confirm, Action::Nothing),
+            (
+                plain(KeyCode::Enter),
+                confirm,
+                Action::Answer(PromptAnswer::Confirmed(false)),
+            ),
+            (
+                control(KeyCode::Up),
+                input,
+                Action::ModalInput(control(KeyCode::Up)),
+            ),
+            (
+                control(KeyCode::Down),
+                input,
+                Action::ModalInput(control(KeyCode::Down)),
+            ),
+            (shift_g, input, Action::ModalInput(shift_g)),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
         }
     }
 
