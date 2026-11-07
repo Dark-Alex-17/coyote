@@ -1009,6 +1009,10 @@ QUOTED = REPORT_OK.replace("Done.\n", "Done. The brief named no `SISYPHUS_REDIRE
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=QUOTED, delegation_kind="implement"))
 check("route_delegate: a successful report that quotes SISYPHUS_REDIRECT mid-line and says 'could not complete' in prose -> verify_gate",
       u["_next"] == "verify_gate", u.get("decisions"))
+NO_RUN_ID = QUOTED.replace("\nSisyphus run id: 20260101T000000-0badf00d\n", "\n")
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=NO_RUN_ID, delegation_kind="implement"))
+check("route_delegate: a report with no run id that says 'could not complete' mid-line in its opening lines -> verify_gate",
+      "Sisyphus run id" not in NO_RUN_ID and u["_next"] == "verify_gate", u.get("decisions"))
 ANSWER = "Exploration answer: the widget store lives in src/a.go and is read by the worker.\n\nSisyphus run id: 20260101T000000-0badf00d"
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=ANSWER, delegation_kind="implement"))
 check("route_delegate: an answer-shaped return (run id, no HEAD SHA, no ledger section, no sentinel) -> oracle_diagnose, ledgered",

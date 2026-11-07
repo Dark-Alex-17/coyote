@@ -1031,6 +1031,80 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
     );
 }
 
+/// The guards behind delegating to sisyphus-next: a child's parked discussion
+/// relayed to the owner instead of the oracle, the relay parked at once
+/// whatever the policy, the child's exact parent-resume form, the delegation
+/// kind restored after the resumed child returns, the sentinel read only at the
+/// start of a line, the opening-lines heuristic anchored the same way, and a
+/// retried wave member delegated into its own worktree.
+#[test]
+#[ignore = "seven smoke battery runs take about a minute; run with -- --ignored"]
+fn relay_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "relay-detect",
+                "    if text and not text.startswith(\"Agent node failed\") and \
+                 DISCUSSION_SENTINEL_RE.search(text):\n",
+                "    if False:\n",
+                "relay: route_delegate on SISYPHUS_AWAITING_DISCUSSION -> escalate_gate (never the \
+                 oracle) with delegate_discussion carrying the child's question, options, run id \
+                 and task",
+            ),
+            (
+                "relay-park-at-once",
+                "    if kind == \"delegate_discussion\" and data.get(\"relay_pending\"):\n",
+                "    if False:\n",
+                "relay: escalate_gate parks a pending relay at once, whatever the policy (no ask, no \
+                 ladder)",
+            ),
+            (
+                "resume-form",
+                "        text = f\"Sisyphus run id: {run_id}\\ncontinue: \
+                 {state.get('resume_answer') or ''}\"\n",
+                "        text = f\"continue: {state.get('resume_answer') or ''}\"\n",
+                "relay: 'continue: 1' -> the option text relayed; compose_delegation kind=resume \
+                 with exactly the child's resume form",
+            ),
+            (
+                "resume-kind-restored",
+                "        kind = state.get(\"resume_after_kind\") or \"implement\"\n",
+                "        kind = \"resume\"\n",
+                "relay: the resumed child's final report -> route_delegate as normal (verify_gate), \
+                 the delegation kind restored",
+            ),
+            (
+                "sentinel-anchored",
+                "FAILURE_SENTINEL_RE = \
+                 re.compile(r\"(?m)^\\s*SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\\b\")\n",
+                "FAILURE_SENTINEL_RE = re.compile(r\"SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\")\n",
+                "route_delegate: a successful report that quotes SISYPHUS_REDIRECT mid-line and says \
+                 'could not complete' in prose -> verify_gate",
+            ),
+            (
+                "head-anchored",
+                "r\"(?im)^\\W*(cannot|could not|unable to)\\s+(complete|implement|proceed|finish)\\b\", \
+                 head",
+                "r\"(?i)\\b(cannot|could not|unable to)\\s+(complete|implement|proceed|finish)\\b\", \
+                 head",
+                "route_delegate: a report with no run id that says 'could not complete' mid-line in \
+                 its opening lines -> verify_gate",
+            ),
+            (
+                "retry-worktree",
+                "    pd = task.get(\"worktree\") or state.get(\"code_repo_path\", \"\")\n",
+                "    pd = state.get(\"code_repo_path\", \"\")\n",
+                "wave retry: compose_delegation delegates into the task's worktree - \
+                 delegate_project_dir and the prompt's code dir agree",
+            ),
+        ],
+    );
+}
+
 /// One `(label, guard, sabotaged guard, smoke row)` per guard: the guard must
 /// occur exactly once in gates.py, and with it replaced in a scratch copy the
 /// smoke battery must fail with exactly that row's `FAIL` line.
