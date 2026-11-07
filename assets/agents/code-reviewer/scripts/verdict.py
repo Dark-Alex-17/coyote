@@ -149,6 +149,9 @@ def main():
     for flag in state.get("attention_flags") or []:
         if isinstance(flag, str) and flag.strip():
             attention.append(flag.strip())
+    for note in state.get("generated_notes") or []:
+        if isinstance(note, str) and note.strip():
+            attention.append(note.strip())
     placement = (state.get("placement_notes") or "").strip()
     if placement:
         attention.append("Placement question (design intent, never auto-resolved): " + placement)
@@ -289,6 +292,11 @@ def main():
         # unverified findings are a human-attention item, not a re-runnable
         # lane fault.
         reasons.append(f"{len(soft_fv)} finding(s) unverified (verifier branch fault)")
+    generated = [g for g in (state.get("generated_files") or []) if isinstance(g, str)]
+    if generated and not changed:
+        # A diff of generated files only is a review of nothing: never the
+        # "No changes to review." stub, never MERGE-READY.
+        reasons.append(f"{len(generated)} generated file(s) changed, none reviewed")
     if unanchored_red:
         reasons.append(f"{unanchored_red} 🔴 finding(s) could not be anchored in the diff")
     if coverage_notes:

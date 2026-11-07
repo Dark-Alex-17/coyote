@@ -37,7 +37,8 @@ def main():
     faulted = str(v.get("reason") or "").startswith("PIPELINE-FAULT:") or any(
         isinstance(a, str) and a.startswith("PIPELINE-FAULT:") for a in v.get("attention") or []
     )
-    if not changed and not faulted:
+    generated = [g for g in (state.get("generated_files") or []) if isinstance(g, str)]
+    if not changed and not faulted and not generated:
         print(json.dumps({"final_report": "# Code Review Summary\n\nNo changes to review."}))
         return
 
@@ -112,7 +113,6 @@ def main():
             for u in unanchored
         ]
         lines += [""]
-    generated = [g for g in (state.get("generated_files") or []) if isinstance(g, str)]
     if generated:
         lines += ["## Generated, not reviewed", ""]
         lines += [f"- `{one_line(g)}`" for g in generated]

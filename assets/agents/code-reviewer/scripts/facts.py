@@ -42,9 +42,38 @@ DIFF_FLAGS = (
 )
 
 
+# Paths print verbatim (core.quotePath=false), and a rename is a deletion plus
+# an addition (diff.renames=false), so every changed path is a real path of
+# one side and anchor_gate.py reads the same diff.
+GIT_CONFIG = ("-c", "core.quotePath=false", "-c", "diff.renames=false")
+
+
+def unquote_path(path):
+    """git C-quotes a path holding a quote, backslash or control character."""
+    if not (len(path) >= 2 and path.startswith('"') and path.endswith('"')):
+        return path
+    out, body, i = bytearray(), path[1:-1], 0
+    simple = {"n": 10, "t": 9, "r": 13, "a": 7, "b": 8, "f": 12, "v": 11, '"': 34, "\\": 92}
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            nxt = body[i + 1]
+            if nxt in simple:
+                out.append(simple[nxt])
+                i += 2
+                continue
+            if body[i + 1 : i + 4].isdigit():
+                out.append(int(body[i + 1 : i + 4], 8))
+                i += 4
+                continue
+        out.extend(ch.encode("utf-8"))
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
 def git(*args, timeout=60):
     r = subprocess.run(
-        ["git", "-C", proj, *args],
+        ["git", *GIT_CONFIG, "-C", proj, *args],
         capture_output=True,
         encoding="utf-8",
         errors="replace",
@@ -115,24 +144,34 @@ try:
             if added == "-" and deleted == "-":
                 notes.append(f"binary file skipped: {path}")
                 continue
-            files.append(path.strip())
+            files.append(unquote_path(path.strip()))
 except Exception as e:  # noqa: BLE001
     notes.append(f"diff resolution failed for spec {spec!r}: {e}")
 
 # --- generated files ------------------------------------------------------------
 # Generated code is never grouped, reviewed or anchored: the report lists it as
 # "generated, not reviewed". A file is generated when .gitattributes marks it
-# linguist-generated, its head carries the `Code generated ... DO NOT EDIT.`
-# marker, or its path has a generated shape.
-GENERATED_PATH_RE = re.compile(r"(^|/)gen/|_pb\.[^/]*$|\.pb\.go$|_gen\.go$|\.connect\.go$")
-GENERATED_HEADER_RE = re.compile(r"Code generated .* DO NOT EDIT\.")
+# linguist-generated, a whole comment line in its head reads `Code generated
+# ... DO NOT EDIT.`, or its path is a generated-code shape. The path rule takes
+# `gen/` only under a language directory (gen/go/, gen/ts/, ...) so a source
+# directory merely named gen/ is still reviewed.
+# The marks cannot launder a change: a diff that edits .gitattributes is
+# reviewed without the linguist marks, and a file that existed on the base
+# without the header but carries it now is reviewed; both raise an attention
+# line.
+GENERATED_PATH_RE = re.compile(
+    r"(^|/)gen/(go|es|ts|py|proto)/|_pb\.[^/]*$|\.pb\.go$|_gen\.go$|\.connect\.go$"
+)
+GENERATED_HEADER_RE = re.compile(
+    r"^\s*(//|#|--|;|/\*+|\*)\s*Code generated .* DO NOT EDIT\.\s*(\*+/)?\s*$"
+)
 
 
 def linguist_generated(root, paths):
     if not paths:
         return set()
     r = subprocess.run(
-        ["git", "-C", root, "check-attr", "-z", "--stdin", "linguist-generated"],
+        ["git", *GIT_CONFIG, "-C", root, "check-attr", "-z", "--stdin", "linguist-generated"],
         input="\0".join(paths),
         capture_output=True,
         encoding="utf-8",
@@ -149,30 +188,66 @@ def linguist_generated(root, paths):
     }
 
 
+def has_generated_header(lines):
+    return any(GENERATED_HEADER_RE.match(line.rstrip("\r\n")) for line in lines[:10])
+
+
 def generated_header(root, path):
     try:
         with open(os.path.join(root, path), encoding="utf-8", errors="replace") as f:
             head = [f.readline() for _ in range(10)]
     except OSError:
         return False
-    return any(GENERATED_HEADER_RE.search(line) for line in head)
+    return has_generated_header(head)
 
 
-generated = []
+def base_ref():
+    """The commit the diff compares against, for reading a file's old head."""
+    if resolved in ("staged", "worktree"):
+        return "HEAD"
+    if ".." in resolved:
+        return resolved.split("..", 1)[0] or "HEAD"
+    return resolved
+
+
+def base_header(path):
+    """True/False for the base version's header; None when it had no such file."""
+    try:
+        text = git("show", f"{base_ref()}:{path}", timeout=30)
+    except Exception:  # noqa: BLE001
+        return None
+    return has_generated_header(text.splitlines()[:10])
+
+
+generated, generated_notes = [], []
 try:
     top = git("rev-parse", "--show-toplevel").strip() if files else proj
-    by_attr = linguist_generated(top, files)
-    generated = [
-        f
-        for f in files
-        if f in by_attr or GENERATED_PATH_RE.search(f) or generated_header(top, f)
-    ]
+    attrs_changed = any(f == ".gitattributes" or f.endswith("/.gitattributes") for f in files)
+    by_attr = set() if attrs_changed else linguist_generated(top, files)
+    if attrs_changed:
+        generated_notes.append(
+            "The diff changes .gitattributes, so its linguist-generated marks were not trusted: "
+            "every file they would hide is reviewed."
+        )
+    for f in files:
+        if f in by_attr or GENERATED_PATH_RE.search(f):
+            generated.append(f)
+        elif generated_header(top, f):
+            if base_header(f) is False:
+                generated_notes.append(
+                    f"{f} gained a 'Code generated ... DO NOT EDIT.' header in this diff, so it "
+                    "is reviewed, not skipped as generated."
+                )
+            else:
+                generated.append(f)
 except Exception as e:  # noqa: BLE001
+    generated = []
     notes.append(f"generated-file detection failed, every changed file is reviewed: {e}")
 if generated:
     files = [f for f in files if f not in set(generated)]
     notes.append(f"{len(generated)} generated file(s) excluded from review")
 
+out["generated_notes"] = generated_notes
 out["resolved_diff_spec"] = resolved
 out["generated_files"] = generated
 out["changed_files"] = files[:300]

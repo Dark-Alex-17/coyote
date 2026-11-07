@@ -1116,9 +1116,19 @@ fn anchor_gate_faults_and_drops_reach_the_verdict() {
             .contains("pipeline fault(s) recorded"),
         "{verdict}"
     );
+    let nowhere = json!({"project_dir": "/nonexistent/checkout", "findings": []});
+    let empty = run_script("code-reviewer/scripts/anchor_gate.py", &nowhere);
+    assert_eq!(
+        empty,
+        json!({"findings": [], "unanchored": [], "anchor_checked": true, "anchor_error": ""}),
+        "no findings: an empty result without running git"
+    );
     let crashed = run_script(
         "code-reviewer/scripts/anchor_gate.py",
-        &json!({"project_dir": "/nonexistent/checkout", "findings": []}),
+        &json!({
+            "project_dir": "/nonexistent/checkout",
+            "findings": [finding("f1", "🟢 SUGGESTION", "a.go", "1")]
+        }),
     );
     assert!(
         crashed["anchor_error"]
@@ -1291,4 +1301,178 @@ fn synthesis_and_reviewer_wording_is_in_place() {
             assert!(text.contains(needle), "{rel} lacks {needle:?}");
         }
     }
+}
+
+/// A repository whose head renames-and-edits a file, adds files whose names
+/// git would quote or tab-terminate (a space, a quote, non-ASCII), and deletes
+/// lines from another file.
+fn awkward_repo() -> (TempDir, PathBuf, String) {
+    let dir = temp_dir("awkward");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    write(&repo.join("src/old_name.go"), &numbered(20, None));
+    write(&repo.join("src/del.go"), &numbered(20, None));
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["mv", "src/old_name.go", "src/new_name.go"]);
+    write(&repo.join("src/new_name.go"), &numbered(20, Some(10)));
+    let kept: String = numbered(20, None)
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| !(11..15).contains(i))
+        .map(|(_, l)| format!("{l}\n"))
+        .collect();
+    write(&repo.join("src/del.go"), &kept);
+    write(&repo.join("src/with space.go"), &numbered(5, None));
+    write(&repo.join("src/na\u{ef}ve.go"), &numbered(5, None));
+    if cfg!(unix) {
+        write(&repo.join("src/qu\"ote.go"), &numbered(5, None));
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "head"]);
+    (dir, repo, base)
+}
+
+/// Renamed-and-edited, spaced, quoted and non-ASCII paths anchor on their
+/// changed lines; deleted lines anchor by their old-side numbers; several
+/// ranges anchor when one does; an absolute path outside the checkout is
+/// dropped as such, even when its tail matches a changed file.
+#[test]
+fn anchor_gate_reads_renames_and_awkward_paths() {
+    if !python_available() || !tools_available() {
+        return;
+    }
+    let (_dir, repo, base) = awkward_repo();
+    let mut state = run_script(
+        "code-reviewer/scripts/facts.py",
+        &json!({"project_dir_in": s(&repo), "diff_spec": base}),
+    );
+    let changed: Vec<&str> = state["changed_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    for path in ["src/new_name.go", "src/with space.go", "src/na\u{ef}ve.go"] {
+        assert!(changed.contains(&path), "{path} must be a verbatim changed path: {changed:?}");
+    }
+    let mut findings = vec![
+        finding("rename", "🔴 CRITICAL", "src/new_name.go", "10"),
+        finding("space", "🔴 CRITICAL", "src/with space.go", "3"),
+        finding("non-ascii", "🔴 CRITICAL", "src/na\u{ef}ve.go", "3"),
+        finding("deleted-side", "🔴 CRITICAL", "src/del.go", "13-14"),
+        finding("multi-range", "🟡 WARNING", "src/del.go", "1, 11"),
+        finding("outside", "🔴 CRITICAL", &s(&env::temp_dir().join("elsewhere/src/del.go")), "12"),
+    ];
+    if cfg!(unix) {
+        findings.push(finding("quote", "🔴 CRITICAL", "src/qu\"ote.go", "2"));
+    }
+    state["findings"] = json!(findings);
+    state["diff_spec"] = json!(base);
+    let out = run_script("code-reviewer/scripts/anchor_gate.py", &state);
+    let kept: Vec<&str> = out["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    let mut expected = vec!["rename", "space", "non-ascii", "deleted-side", "multi-range"];
+    if cfg!(unix) {
+        expected.push("quote");
+    }
+    assert_eq!(kept, expected, "{out}");
+    let dropped = &out["unanchored"][0];
+    assert_eq!(dropped["id"], "outside", "{out}");
+    assert!(
+        dropped["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cites a file outside the review checkout"),
+        "{out}"
+    );
+}
+
+/// A diff that edits .gitattributes cannot hide files behind linguist marks,
+/// and a file that gains the generated header in this diff is still reviewed;
+/// both say so. `gen/` alone is not a generated shape.
+#[test]
+fn generated_marks_cannot_launder_a_change() {
+    if !python_available() || !tools_available() {
+        return;
+    }
+    let dir = temp_dir("launder");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    write(&repo.join("src/auth.go"), "package auth\n");
+    write(&repo.join("README.md"), "x\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    write(&repo.join(".gitattributes"), "src/*.go linguist-generated\n");
+    write(
+        &repo.join("src/auth.go"),
+        "// Code generated by hand. DO NOT EDIT.\npackage auth // BYPASS\n",
+    );
+    write(&repo.join("tools/gen/main.go"), "package main\n");
+    write(
+        &repo.join("src/note.go"),
+        "package note\n// see Code generated by x. DO NOT EDIT. in the docs\n",
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "head"]);
+    let f = run_script(
+        "code-reviewer/scripts/facts.py",
+        &json!({"project_dir_in": s(&repo), "diff_spec": base}),
+    );
+    assert_eq!(f["generated_files"], json!([]), "{f}");
+    for path in ["src/auth.go", "tools/gen/main.go", "src/note.go"] {
+        assert!(
+            f["changed_files"].as_array().unwrap().contains(&json!(path)),
+            "{path} must be reviewed: {f}"
+        );
+    }
+    let notes = f["generated_notes"].to_string();
+    assert!(notes.contains("changes .gitattributes"), "{f}");
+    assert!(notes.contains("src/auth.go gained a 'Code generated"), "{f}");
+    let mut state = f.clone();
+    state["domain_reports"] = json!(["clean report. DOMAIN_REVIEW_COMPLETE"]);
+    state["findings"] = json!([]);
+    let verdict = run_script("code-reviewer/scripts/verdict.py", &state)["verdict_out"].clone();
+    assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{verdict}");
+    assert!(
+        verdict["attention"].to_string().contains("gained a 'Code generated"),
+        "{verdict}"
+    );
+}
+
+/// A diff of generated files only is NEEDS-HUMAN with the files listed, never
+/// the "No changes to review." stub.
+#[test]
+fn a_generated_only_diff_is_never_a_silent_pass() {
+    if !python_available() {
+        return;
+    }
+    let state = json!({
+        "changed_files": [],
+        "generated_files": ["gen/go/v1/service.pb.go"],
+        "domain_reports": [],
+        "findings": []
+    });
+    let (verdict, report, _) = review_round(state);
+    assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{verdict}");
+    assert!(
+        verdict["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 generated file(s) changed, none reviewed"),
+        "{verdict}"
+    );
+    assert!(!report.contains("No changes to review."), "{report}");
+    assert!(
+        report.contains("## Generated, not reviewed") && report.contains("gen/go/v1/service.pb.go"),
+        "{report}"
+    );
 }

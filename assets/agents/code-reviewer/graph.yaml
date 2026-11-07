@@ -71,6 +71,7 @@ initial_state:
   resolved_diff_spec: ''
   changed_files: []
   generated_files: []
+  generated_notes: []
   file_count: 0
   facts_note: ''
   conventions: ''
