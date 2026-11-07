@@ -18,7 +18,6 @@ pub enum SystemNotification {
     },
     /// Text the user typed while a turn was running, handed to the model at
     /// the next tool-round boundary.
-    #[allow(dead_code)] // TASK-315
     UserMessage { text: String },
 }
 

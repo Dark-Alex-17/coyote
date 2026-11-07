@@ -93,6 +93,11 @@ pub(crate) struct KeyContext {
 pub(crate) enum Action {
     /// Send the composer text as the next line.
     Submit,
+    /// Hold the composer text for the running turn: a prompt reaches the
+    /// model at its next tool round, a command waits for the turn to end.
+    QueueInput,
+    /// Take the newest held line back into the composer.
+    EditQueued,
     InsertNewline,
     ClearComposer,
     /// Soft-interrupt the running turn.
@@ -161,6 +166,7 @@ pub(crate) enum Action {
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     // A chord's letter is matched case-folded once here: with the kitty
     // protocol Ctrl+Shift+C arrives as an uppercase `C`.
     let code = lowercase(key.code);
@@ -250,6 +256,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
             KeyCode::Up if ctrl => Action::FocusPrev,
             KeyCode::Down if ctrl => Action::FocusNext,
+            KeyCode::Up if alt => Action::EditQueued,
             // A draft keeps the letter: `G` mid-sentence is typing.
             KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
                 Action::ScrollToBottom
@@ -299,7 +306,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             }
             KeyCode::Enter if ctx.popup.is_some() => Action::PaletteAccept,
             KeyCode::Enter if ctx.focused && ctx.composer_empty => Action::ToggleFocused,
-            KeyCode::Enter if ctx.turn_running => Action::Nothing,
+            KeyCode::Enter if ctx.turn_running => Action::QueueInput,
             KeyCode::Enter => Action::Submit,
             KeyCode::Up if ctx.single_line && key.modifiers.is_empty() => Action::HistoryPrev,
             KeyCode::Down if ctx.single_line && key.modifiers.is_empty() => Action::HistoryNext,
@@ -489,7 +496,7 @@ mod tests {
         };
         let cases = [
             (plain(KeyCode::Enter), IDLE, Action::Submit),
-            (plain(KeyCode::Enter), running, Action::Nothing),
+            (plain(KeyCode::Enter), running, Action::QueueInput),
             (
                 press(KeyCode::Enter, KeyModifiers::SHIFT),
                 IDLE,
@@ -512,6 +519,55 @@ mod tests {
         let typed = plain(KeyCode::Char('x'));
         assert_eq!(map_key(typed, &IDLE), Action::ComposerInput(typed));
         assert_eq!(map_key(typed, &running), Action::ComposerInput(typed));
+    }
+
+    /// Enter during a turn holds the line; a modal or a popup up at the
+    /// time keeps Enter for itself. Alt+Up takes a held line back whether
+    /// or not a turn runs.
+    #[test]
+    fn queued_input_keys() {
+        let running = KeyContext {
+            turn_running: true,
+            composer_empty: false,
+            ..IDLE
+        };
+        let alt_up = press(KeyCode::Up, KeyModifiers::ALT);
+        let cases = [
+            (plain(KeyCode::Enter), running, Action::QueueInput),
+            (alt_up, IDLE, Action::EditQueued),
+            (alt_up, running, Action::EditQueued),
+            (
+                plain(KeyCode::Enter),
+                KeyContext {
+                    popup: Some(PopupKind::Palette),
+                    ..running
+                },
+                Action::PaletteAccept,
+            ),
+            (
+                plain(KeyCode::Enter),
+                KeyContext {
+                    modal: Some(ModalKind::Confirm {
+                        default: false,
+                        tool: false,
+                    }),
+                    ..running
+                },
+                Action::Answer(PromptAnswer::Confirmed(false)),
+            ),
+            (
+                plain(KeyCode::Enter),
+                KeyContext {
+                    modal: Some(ModalKind::Input),
+                    ..running
+                },
+                Action::SubmitModalInput,
+            ),
+            (plain(KeyCode::Up), running, Action::HistoryPrev),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
     }
 
     /// With the palette open the list keys and Esc go to it, whatever

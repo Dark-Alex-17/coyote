@@ -630,9 +630,13 @@ mod tests {
     use crate::client::{call_chat_completions, call_chat_completions_streaming};
     use crate::config::{AppState, WorkingMode};
     use crate::events::{Event, RecordingSink};
+    use crate::function::{ToolCall, eval_tool_calls};
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
+    use crate::supervisor::notification::SystemNotification;
     use crate::utils::create_abort_signal;
+    use serde_json::json;
     use serial_test::serial;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn silent_ctx() -> RequestContext {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
@@ -768,5 +772,50 @@ mod tests {
             .filter(|event| matches!(event, Event::TextDelta(text) if text == reply))
             .collect();
         assert_eq!(deltas, vec![Event::TextDelta(reply.to_string())]);
+    }
+
+    /// A line the user queued mid-turn rides on the last tool result of
+    /// the round that follows it, so the model reads it before its next
+    /// step.
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_user_message_reaches_the_model_at_the_next_tool_round() {
+        let mut ctx = silent_ctx();
+        let probe = "queued-probe-x7x";
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: probe.to_string(),
+            });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut runner = completion_runner(move |input, ctx, _abort| {
+            match seen.fetch_add(1, Ordering::SeqCst) + 1 {
+                1 => boxed_completion(async move {
+                    let call = ToolCall::new(
+                        "unknown_tool".to_string(),
+                        json!({}),
+                        Some("id-1".to_string()),
+                    );
+                    let results = eval_tool_calls(ctx, vec![call]).await?;
+                    Ok((String::new(), results))
+                }),
+                _ => {
+                    let results = &input
+                        .tool_calls()
+                        .as_ref()
+                        .expect("the second call carries the first round's results")
+                        .tool_results;
+                    let notifications = &results.last().unwrap().output["system_notifications"];
+                    assert_eq!(notifications[0]["event"], "user_message");
+                    assert_eq!(notifications[0]["text"], probe);
+                    boxed_completion(async { Ok(("done".to_string(), vec![])) })
+                }
+            }
+        });
+
+        let outcome = drive(&mut ctx, TurnMode::Repl, "hi", &mut runner).await;
+
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

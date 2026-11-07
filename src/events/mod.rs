@@ -124,7 +124,6 @@ pub enum Event {
         answer: String,
         auto: bool,
     },
-    #[allow(dead_code)] // TASK-315
     QueuedInput {
         text: String,
     },

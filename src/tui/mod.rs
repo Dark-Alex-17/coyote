@@ -11,6 +11,7 @@ mod composer;
 mod events;
 mod history;
 mod keys;
+mod queued;
 mod redirect;
 mod render;
 mod sink;
@@ -22,6 +23,7 @@ use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
+use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, anyhow, bail};
 use bottom_pane::{
@@ -37,6 +39,7 @@ use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
 use history::ComposerHistory;
 use keys::{Action, KeyContext, ModalKind, PopupKind, ViMode};
+use queued::{QueuedLine, QueuedPreview, carry_over, reconcile_queue, take_user_messages};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -128,6 +131,16 @@ impl TtyHandles {
 }
 
 const NOT_LENDING: &str = "the TUI is not lending its terminal";
+
+/// Fails the way `lend_terminal` would, without a job. For callers that
+/// write a file before opening the editor on it and must not leave that
+/// file behind when the lend cannot happen.
+pub(crate) fn ensure_terminal_lendable() -> Result<()> {
+    if active() && lender().is_none() {
+        bail!(NOT_LENDING);
+    }
+    Ok(())
+}
 
 /// Runs `job` with the terminal released to it (alternate screen left,
 /// line discipline cooked), the way Ctrl+O hands it to the editor, and
@@ -799,6 +812,12 @@ fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Submit(String),
+    /// A prompt typed during a turn; the loop offers it to the running
+    /// turn's model.
+    Queue(String),
+    /// A queued prompt taken back into the composer before the model got
+    /// it; the loop withdraws it from the running turn.
+    Unqueue(String),
     Interrupt,
     Quit,
     Suspend,
@@ -833,6 +852,9 @@ pub(crate) struct App {
     transcript: Transcript,
     todo: TodoPanel,
     composer: Composer,
+    /// Lines entered while a turn ran, oldest first; the loop submits
+    /// what the model did not get, one per turn, once it ends.
+    queued: Vec<QueuedLine>,
     prompts: VecDeque<PendingPrompt>,
     /// Work waiting for the terminal to be released to it; the loop runs
     /// each after the step that queued it.
@@ -920,6 +942,7 @@ impl App {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
             composer: Composer::new(background),
+            queued: Vec::new(),
             prompts: VecDeque::new(),
             lend_requests: Vec::new(),
             turn: None,
@@ -1219,7 +1242,9 @@ impl App {
         }
     }
 
-    fn submit_composer(&mut self) -> Option<Command> {
+    /// Takes the trimmed draft out of the composer and into the history;
+    /// None when there is nothing but whitespace.
+    fn take_composer_line(&mut self) -> Option<String> {
         let text = self.composer_text();
         if text.trim().is_empty() {
             return None;
@@ -1231,7 +1256,47 @@ impl App {
         self.vi_mode = self.vi_mode.map(|_| ViMode::Insert);
         let line = text.trim().to_string();
         self.record_history(&line);
-        Some(Command::Submit(line))
+        Some(line)
+    }
+
+    fn submit_composer(&mut self) -> Option<Command> {
+        self.take_composer_line().map(Command::Submit)
+    }
+
+    /// Holds the draft for the running turn. A prompt also goes to the
+    /// loop, which offers it to the model; a command only waits.
+    fn queue_composer(&mut self) -> Option<Command> {
+        if self.exiting {
+            return None;
+        }
+        let line = self.take_composer_line()?;
+        let command = is_command(&line, self.config.command_prefix);
+        self.queued.push(QueuedLine {
+            text: line.clone(),
+            command,
+        });
+        (!command).then_some(Command::Queue(line))
+    }
+
+    /// Takes the newest held line back into the composer, over whatever
+    /// draft is there the way a history recall does.
+    fn edit_queued(&mut self) -> Option<Command> {
+        let line = self.queued.pop()?;
+        self.set_composer_text(&line.text);
+        (!line.command).then_some(Command::Unqueue(line.text))
+    }
+
+    /// An interrupt is for everything the user lined up, not just the
+    /// turn that is running.
+    fn drop_queued(&mut self) {
+        let dropped = self.queued.len();
+        if dropped > 0 {
+            self.queued.clear();
+            self.push_notice(
+                NoticeKind::Interrupted,
+                format!("Dropped {dropped} queued line(s)"),
+            );
+        }
     }
 
     /// A second idle Esc within the gap opens the rewind picker, when
@@ -1355,6 +1420,8 @@ impl App {
         }
         let command = match action {
             Action::Submit => self.submit_composer(),
+            Action::QueueInput => self.queue_composer(),
+            Action::EditQueued => self.edit_queued(),
             Action::InsertNewline => {
                 self.composer.insert_newline();
                 self.palette_dirty = true;
@@ -1366,6 +1433,7 @@ impl App {
             }
             Action::Interrupt => {
                 self.transcript.clear_focus();
+                self.drop_queued();
                 (!self.exiting).then_some(Command::Interrupt)
             }
             Action::IdleEsc => {
@@ -2106,14 +2174,19 @@ impl App {
         }
     }
 
-    /// The rows the view's band takes from the transcript: what it asks
-    /// for, within what the frame can give once the composer, the status
-    /// and footer rows and the transcript's minimum have theirs.
+    /// The rows the band above the composer takes from the transcript:
+    /// what the view asks for, or the queued-lines preview when no view
+    /// is open, within what the frame can give once the composer, the
+    /// status and footer rows and the transcript's minimum have theirs.
     fn band_rows(&self, area: Rect) -> u16 {
         let room = area
             .height
             .saturating_sub(self.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
-        self.view.band_rows().min(room)
+        let wanted = match self.view {
+            View::Composer => queued::preview_rows(&self.queued),
+            _ => self.view.band_rows(),
+        };
+        wanted.min(room)
     }
 
     /// One frame from state; `frame.area()` is the only size consulted.
@@ -2161,7 +2234,7 @@ impl App {
                 ])
                 .areas(bottom);
                 match &self.view {
-                    View::Composer => {}
+                    View::Composer => frame.render_widget(QueuedPreview(&self.queued), band),
                     View::Palette(palette) => frame.render_widget(PaletteView(palette), band),
                     View::HistorySearch(search) => frame.render_widget(SearchView(search), band),
                     View::Rewind(rewind) => frame.render_widget(RewindView(rewind), band),
@@ -2285,6 +2358,9 @@ enum Task {
     Turn {
         handle: JoinHandle<(RequestContext, TurnOutcome)>,
         command: bool,
+        /// The context's notification queue, kept while the context is
+        /// away: how a line typed mid-turn reaches the model.
+        queue: Arc<NotificationQueue>,
     },
     Exit(JoinHandle<(RequestContext, Result<()>, String)>),
 }
@@ -2298,6 +2374,25 @@ async fn join(task: &mut Option<Task>) -> Done {
     match task.as_mut().expect("polled only while a task runs") {
         Task::Turn { handle, .. } => Done::Turn(handle.await),
         Task::Exit(handle) => Done::Exit(handle.await),
+    }
+}
+
+/// Sends `line` off with the context as a turn.
+fn start_turn(
+    app: &mut App,
+    ctx: RequestContext,
+    abort: &AbortSignal,
+    tx: &UnboundedSender<UiMsg>,
+    line: String,
+) -> Task {
+    abort.reset();
+    let command = is_command(&line, ctx.app.config.command_prefix);
+    app.begin_turn(&line, command);
+    let queue = Arc::clone(&ctx.notification_queue);
+    Task::Turn {
+        handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),
+        command,
+        queue,
     }
 }
 
@@ -2838,19 +2933,28 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 match command {
                     Some(Command::Submit(line)) => {
                         if let Some(ctx) = ctx.take() {
-                            abort.reset();
-                            let command = is_command(&line, ctx.app.config.command_prefix);
-                            app.begin_turn(&line, command);
-                            task = Some(Task::Turn {
-                                handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),
-                                command,
-                            });
+                            task = Some(start_turn(app, ctx, abort, tx, line));
                         } else {
                             // Submit is not mapped while a task holds the
                             // context; should that ever change, the draft
                             // goes back rather than vanishing.
                             debug_assert!(false, "a submit while the context was away");
                             app.set_composer_text(&line);
+                        }
+                    }
+                    Some(Command::Queue(text)) => {
+                        if let Some(Task::Turn { queue, .. }) = &task {
+                            queued::queue_user_message(queue, &text);
+                        }
+                    }
+                    Some(Command::Unqueue(text)) => {
+                        if let Some(Task::Turn { queue, .. }) = &task
+                            && !queued::unqueue_user_message(queue, &text)
+                        {
+                            app.handle_msg(UiMsg::Notice {
+                                kind: NoticeKind::ToolWarning,
+                                text: "already sent to the model".to_string(),
+                            });
                         }
                     }
                     Some(Command::Interrupt) => abort.set_ctrlc(),
@@ -2939,7 +3043,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             }
             Step::Work(done) => match *done {
                 Done::Turn(joined) => {
-                    let Some(Task::Turn { command, .. }) = task.take() else {
+                    let Some(Task::Turn { command, queue, .. }) = task.take() else {
                         continue;
                     };
                     match joined {
@@ -2956,7 +3060,17 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             if outcome.exit {
                                 quit_requested = true;
                             }
-                            ctx = Some(returned);
+                            reconcile_queue(&mut app.queued, &take_user_messages(&queue));
+                            if quit_requested || app.queued.is_empty() {
+                                ctx = Some(returned);
+                            } else {
+                                // What the model did not get runs as turns
+                                // of its own, the rest offered to each of
+                                // them in turn.
+                                let next = app.queued.remove(0);
+                                carry_over(&queue, &app.queued);
+                                task = Some(start_turn(app, returned, abort, tx, next.text));
+                            }
                         }
                         Err(err) => {
                             let late = app.turn_late_output();
@@ -3858,9 +3972,10 @@ mod tests {
         );
     }
 
-    /// Enter tapped while the turn runs maps to nothing, but it is still
-    /// a keystroke for the idle gate: a confirm appearing right after one
-    /// is not answered by the next tap of the same key.
+    /// Enter tapped on an empty composer while the turn runs holds
+    /// nothing, but it is still a keystroke for the idle gate: a confirm
+    /// appearing right after one is not answered by the next tap of the
+    /// same key.
     #[test]
     fn enter_ignored_during_a_turn_still_arms_the_idle_gate_for_a_fresh_confirm() {
         let mut harness = Harness::standalone(80, 24);
@@ -3886,6 +4001,88 @@ mod tests {
             asker.join().unwrap().unwrap(),
             PromptAnswer::Confirmed(true)
         );
+    }
+
+    /// A prompt entered during a turn is held and handed to the loop,
+    /// whose step puts it on the turn's queue and announces it; a command
+    /// is only held. Alt+Up takes the newest back, newest first.
+    #[test]
+    #[serial]
+    fn lines_entered_during_a_turn_are_queued_and_prompts_reach_the_model() {
+        let sink = crate::events::RecordingSink::install();
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("hello q9d-q");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("hello q9d-q".to_string()))
+        );
+        assert_eq!(harness.app.composer_text(), "");
+        let frame = harness.draw();
+        assert!(frame.contains("pending: 1"), "{frame}");
+        assert!(frame.contains("hello q9d-q"), "{frame}");
+
+        let queue = NotificationQueue::new();
+        queued::queue_user_message(&queue, "hello q9d-q");
+        assert_eq!(
+            sink.drain(),
+            vec![Event::QueuedInput {
+                text: "hello q9d-q".to_string()
+            }]
+        );
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            &drained[0],
+            crate::supervisor::notification::SystemNotification::UserMessage { text }
+                if text == "hello q9d-q"
+        ));
+
+        harness.type_text(".info");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            harness.app.queued,
+            vec![
+                QueuedLine {
+                    text: "hello q9d-q".to_string(),
+                    command: false
+                },
+                QueuedLine {
+                    text: ".info".to_string(),
+                    command: true
+                },
+            ]
+        );
+        assert!(sink.drain().is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("pending: 2"), "{frame}");
+
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(harness.app.handle_key(alt_up), None);
+        assert_eq!(harness.app.composer_text(), ".info");
+        assert_eq!(
+            harness.app.handle_key(alt_up),
+            Some(Command::Unqueue("hello q9d-q".to_string()))
+        );
+        assert_eq!(harness.app.composer_text(), "hello q9d-q");
+        assert!(harness.app.queued.is_empty());
+        assert!(!harness.draw().contains("pending:"));
+    }
+
+    /// Esc during a turn drops what was lined up behind it and says so.
+    #[test]
+    fn an_interrupt_drops_the_queued_lines_with_a_notice() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("later");
+        harness.press(KeyCode::Enter);
+        harness.type_text(".info");
+        harness.press(KeyCode::Enter);
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(harness.app.queued.is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("Dropped 2 queued line(s)"), "{frame}");
+        assert!(!frame.contains("pending:"), "{frame}");
     }
 
     #[test]
@@ -6280,9 +6477,12 @@ mod tests {
             "{frame}"
         );
         assert!(!frame.contains("late line 2"), "the view moved:\n{frame}");
+        // The chip sits on the transcript's last row; everything above it
+        // must be the held view, unchanged.
+        let above_chip = usize::from(row);
         assert_eq!(
-            frame.lines().take(18).collect::<Vec<_>>(),
-            held.lines().take(18).collect::<Vec<_>>(),
+            frame.lines().take(above_chip).collect::<Vec<_>>(),
+            held.lines().take(above_chip).collect::<Vec<_>>(),
             "the view slid under the new cells:\n{frame}"
         );
 
@@ -6538,6 +6738,9 @@ mod tests {
     #[test]
     fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
         let mut harness = Harness::standalone(80, 24);
+        // The test process's stdout is a pipe, which `NO_COLOR` reads as a
+        // colourless terminal.
+        harness.app.set_no_color(false);
         harness.type_text(".info tools");
         let frame = harness.draw();
         assert_welcome_snapshot("composer_command_80x24", &frame);

@@ -4191,6 +4191,7 @@ impl RequestContext {
             Some(session) => (session.name().to_string(), session.scope()),
             None => bail!("No session"),
         };
+        crate::tui::ensure_terminal_lendable()?;
         let session_path = self.session_file_for(&name, scope);
         self.save_session(Some(&name), None)?;
         let editor = app.editor()?;
@@ -4217,6 +4218,7 @@ impl RequestContext {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
         };
+        crate::tui::ensure_terminal_lendable()?;
         let config_path = paths::agent_config_file(agent_name);
         let graph_path = paths::agent_graph_file(agent_name);
         let target_path = if !config_path.exists() && graph_path.exists() {
@@ -6907,6 +6909,7 @@ impl RequestContext {
 
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
         paths::validate_skill_name(name)?;
+        crate::tui::ensure_terminal_lendable()?;
         let path = paths::skill_file(name);
         ensure_parent_exists(&path)?;
         let is_new = !path.exists();
@@ -7474,6 +7477,7 @@ impl RequestContext {
         }
 
         let document_paths = rag.document_paths();
+        crate::tui::ensure_terminal_lendable()?;
         let temp_file = temp_file(&format!("-rag-{}", rag.name()), ".txt");
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await
@@ -11848,27 +11852,24 @@ mod tests {
         assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
     }
 
-    /// `.skill <name>` under the full-screen UI is refused before the
-    /// scaffold is written: no editor can open it there, and a refusal
-    /// that left the file behind would turn the next `.skill` into an
-    /// edit of an empty template.
+    /// `.skill <name>` under the full-screen UI needs the terminal lent
+    /// to the editor; with nobody lending it the command fails before the
+    /// scaffold is written, since a scaffold left behind would turn the
+    /// next `.skill` into an edit of an empty template.
     #[test]
     #[serial]
-    fn upsert_skill_under_the_tui_refuses_before_scaffolding_the_file() {
+    fn upsert_skill_under_the_tui_without_a_lender_fails_before_scaffolding_the_file() {
         let _guard = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let err = ctx
             .upsert_skill(&ctx.app.config, "tui-refused-skill")
             .unwrap_err();
-        assert!(
-            err.to_string().contains("not available in the TUI"),
-            "{err}"
-        );
+        assert_no_lender_under_the_tui(err);
         let path = paths::skill_file("tui-refused-skill");
         assert!(
             !path.exists(),
-            "the refusal left a scaffold at {}",
+            "the failed lend left a scaffold at {}",
             path.display()
         );
     }
@@ -11886,7 +11887,10 @@ mod tests {
         write(&rag_path, "driver: yaml\n").unwrap();
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
-        assert_refused_under_the_tui(err);
+        assert!(
+            err.to_string().contains("not available in the TUI"),
+            "{err}"
+        );
         assert!(
             rag_path.exists(),
             "the refusal removed {}",
@@ -11895,19 +11899,20 @@ mod tests {
         assert!(ctx.rag.is_none());
     }
 
-    fn assert_refused_under_the_tui(err: anyhow::Error) {
+    fn assert_no_lender_under_the_tui(err: anyhow::Error) {
         assert!(
-            err.to_string().contains("not available in the TUI"),
+            err.to_string()
+                .contains("the TUI is not lending its terminal"),
             "{err}"
         );
     }
 
     /// `.edit session` saves the session before opening it; under the
-    /// full-screen UI the refusal comes first, so the file is never
-    /// written.
+    /// full-screen UI with nobody lending the terminal the failure comes
+    /// first, so the file is never written.
     #[test]
     #[serial]
-    fn edit_session_under_the_tui_refuses_before_saving_the_session() {
+    fn edit_session_under_the_tui_without_a_lender_fails_before_saving_the_session() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
@@ -11916,20 +11921,20 @@ mod tests {
         ctx.session = Some(session);
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let app = ctx.app.config.clone();
-        assert_refused_under_the_tui(ctx.edit_session(&app).unwrap_err());
+        assert_no_lender_under_the_tui(ctx.edit_session(&app).unwrap_err());
         assert!(
             !path.exists(),
-            "the refusal saved the session to {}",
+            "the failed lend saved the session to {}",
             path.display()
         );
     }
 
     /// `.edit agent-config` writes a stub config when the agent has none;
-    /// a stub left behind by a refusal would redirect every later edit of
-    /// a graph-only agent to it.
+    /// a stub left behind by a failed lend would redirect every later edit
+    /// of a graph-only agent to it.
     #[test]
     #[serial]
-    fn edit_agent_config_under_the_tui_refuses_before_writing_the_stub() {
+    fn edit_agent_config_under_the_tui_without_a_lender_fails_before_writing_the_stub() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -11938,20 +11943,21 @@ mod tests {
         }));
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let app = ctx.app.config.clone();
-        assert_refused_under_the_tui(ctx.edit_agent_config(&app).unwrap_err());
+        assert_no_lender_under_the_tui(ctx.edit_agent_config(&app).unwrap_err());
         let path = paths::agent_config_file("tui-refused-agent");
         assert!(
             !path.exists(),
-            "the refusal left a stub config at {}",
+            "the failed lend left a stub config at {}",
             path.display()
         );
     }
 
     /// `.edit rag-docs` hands the document list to the editor through a
-    /// temp file; the refusal comes before that file is created.
+    /// temp file; with nobody lending the terminal the failure comes
+    /// before that file is created.
     #[test]
     #[serial]
-    fn edit_rag_docs_under_the_tui_refuses_before_writing_the_temp_file() {
+    fn edit_rag_docs_under_the_tui_without_a_lender_fails_before_writing_the_temp_file() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let name = "tui-refused-kb";
@@ -11969,7 +11975,7 @@ mod tests {
         })));
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let err = run_async(ctx.edit_rag_docs(utils::create_abort_signal())).unwrap_err();
-        assert_refused_under_the_tui(err);
+        assert_no_lender_under_the_tui(err);
         let needle = format!("-rag-{name}");
         let leftovers: Vec<PathBuf> = read_dir(env::temp_dir())
             .unwrap()
@@ -11978,7 +11984,7 @@ mod tests {
             .collect();
         assert!(
             leftovers.is_empty(),
-            "the refusal left the editor's temp file behind: {leftovers:?}"
+            "the failed lend left the editor's temp file behind: {leftovers:?}"
         );
     }
 
