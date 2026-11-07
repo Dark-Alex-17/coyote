@@ -587,6 +587,10 @@ mod tests {
     }
 }
 
+/// Every test here holds the `io::stdout()` lock for as long as its guard
+/// lives: the harness reports from other threads through `io::stdout()`,
+/// which follows the swapped std handle, so without the lock those lines
+/// would land in the capture pipe and vanish with it.
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
@@ -594,11 +598,10 @@ mod windows_tests {
     use std::process::Command;
     use std::sync::mpsc;
 
-    fn write_std_streams(marker: &str) {
-        io::stdout()
-            .write_all(format!("stdout-{marker}\n").as_bytes())
+    fn write_std_streams(out: &mut io::StdoutLock<'_>, marker: &str) {
+        out.write_all(format!("stdout-{marker}\n").as_bytes())
             .unwrap();
-        io::stdout().flush().unwrap();
+        out.flush().unwrap();
         io::stderr()
             .write_all(format!("stderr-{marker}\n").as_bytes())
             .unwrap();
@@ -611,8 +614,9 @@ mod windows_tests {
     #[test]
     #[serial]
     fn region_output_lands_in_the_cell() {
+        let mut out = io::stdout().lock();
         let guard = FdRedirect::begin(|_| {}).unwrap();
-        write_std_streams("marker-w1x");
+        write_std_streams(&mut out, "marker-w1x");
         let captured = guard.finish();
         assert!(captured.contains("stdout-marker-w1x"), "{captured}");
         assert!(captured.contains("stderr-marker-w1x"), "{captured}");
@@ -623,6 +627,7 @@ mod windows_tests {
     #[test]
     #[serial]
     fn the_capture_flag_tracks_the_guard() {
+        let _out = io::stdout().lock();
         assert!(!output_captured());
         let guard = FdRedirect::begin(|_| {}).unwrap();
         assert!(output_captured());
@@ -637,12 +642,13 @@ mod windows_tests {
     #[test]
     #[serial]
     fn dropping_an_unfinished_guard_forwards_what_it_buffered() {
+        let mut out = io::stdout().lock();
         let (tx, rx) = mpsc::channel();
         let guard = FdRedirect::begin(move |text| {
             let _ = tx.send(text);
         })
         .unwrap();
-        write_std_streams("buffered-w5x");
+        write_std_streams(&mut out, "buffered-w5x");
         // Give the drain thread time to move the bytes into the buffer,
         // so it is the drop that forwards them.
         std::thread::sleep(Duration::from_millis(100));
@@ -656,6 +662,7 @@ mod windows_tests {
     #[test]
     #[serial]
     fn a_child_with_inherited_stdio_writes_into_the_cell() {
+        let _out = io::stdout().lock();
         let guard = FdRedirect::begin(|_| {}).unwrap();
         Command::new("cmd")
             .args(["/c", "echo child-marker-x7x"])
@@ -684,6 +691,7 @@ mod windows_tests {
     #[test]
     #[serial]
     fn the_std_handles_are_put_back_after_finish_and_after_drop() {
+        let _out = io::stdout().lock();
         let before = std_handles();
 
         let guard = FdRedirect::begin(|_| {}).unwrap();

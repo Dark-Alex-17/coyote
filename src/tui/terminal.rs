@@ -289,7 +289,18 @@ mod console {
     /// The console's input buffer, whatever the process's stdin handle
     /// points at right now.
     pub(super) fn open_input() -> io::Result<OwnedHandle> {
-        let name: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+        open_console("CONIN$")
+    }
+
+    /// The console's active screen buffer, whatever the process's stdout
+    /// handle points at right now.
+    #[cfg(test)]
+    pub(super) fn open_output() -> io::Result<OwnedHandle> {
+        open_console("CONOUT$")
+    }
+
+    fn open_console(name: &str) -> io::Result<OwnedHandle> {
+        let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: `name` is NUL terminated; the null attributes and
         // template are the documented defaults.
         let handle = unsafe {
@@ -1001,14 +1012,11 @@ impl Drop for Screen {
 mod tests {
     use super::*;
     use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
-    #[cfg(unix)]
     use ratatui::layout::Rect;
     use ratatui::layout::{Position, Size};
     use ratatui::widgets::Paragraph;
-    #[cfg(unix)]
     use ratatui::{TerminalOptions, Viewport};
     use serial_test::serial;
-    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
 
     // crossterm decides once per process whether its commands emit escape
@@ -1030,11 +1038,9 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 
-    #[cfg(unix)]
     impl Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
@@ -1046,7 +1052,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl SharedBuf {
         fn take(&self) -> String {
             String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().unwrap())).into_owned()
@@ -1055,7 +1060,6 @@ mod tests {
 
     /// A terminal writing into `buf`; the fixed viewport keeps ratatui
     /// from asking the (absent) terminal for its size.
-    #[cfg(unix)]
     fn buffer_terminal(buf: &SharedBuf) -> Terminal<ScreenBackend<SharedBuf>> {
         Terminal::with_options(
             RowTrackingBackend::new(CrosstermBackend::new(buf.clone())),
@@ -1225,7 +1229,6 @@ mod tests {
     /// The repaint helper never asks the terminal anything: a buffer that
     /// cannot answer a cursor-position query gets the clear and the next
     /// frame paints every cell, including the ones unchanged since before.
-    #[cfg(unix)]
     #[test]
     fn repaint_from_scratch_clears_and_repaints_every_cell_without_a_query() {
         let out = SharedBuf::default();
@@ -1252,7 +1255,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_frame_is_bracketed_by_a_synchronized_update() {
         let out = SharedBuf::default();
@@ -1718,15 +1720,66 @@ mod tests {
         CONSOLE_HANDLE.store(0, Ordering::SeqCst);
     }
 
-    /// With nothing recorded the restore touches no console; once a
-    /// snapshot is taken it puts that mode back, extended flags included.
-    /// A runner without a console input buffer cannot take the snapshot,
-    /// so the second half is skipped there.
+    /// The handle `open` produced, or None when the runner has no console
+    /// and says so through `COYOTE_TEST_NO_CONSOLE`. A runner that has
+    /// none and does not say so fails the test: the Windows CI runner has
+    /// a console, and the tests that need one must run there.
+    #[cfg(windows)]
+    fn console_handle_or_skip(
+        open: io::Result<std::os::windows::io::OwnedHandle>,
+        buffer: &str,
+    ) -> Option<std::os::windows::io::OwnedHandle> {
+        match open {
+            Ok(handle) => Some(handle),
+            Err(err) if std::env::var_os("COYOTE_TEST_NO_CONSOLE").is_some() => {
+                eprintln!("skipping: no console {buffer} ({err})");
+                None
+            }
+            Err(err) => panic!(
+                "no console {buffer} ({err}); the Windows CI runner has a console and this \
+                 test must run there, so set COYOTE_TEST_NO_CONSOLE only on a runner without one"
+            ),
+        }
+    }
+
+    /// Puts each handle back to the mode paired with it and returns the
+    /// statics `enter` and `leave` keep to their idle values, so a failed
+    /// assertion leaves neither the runner's console nor the next test
+    /// perturbed.
+    #[cfg(windows)]
+    struct ConsoleModeGuard {
+        restore: Vec<(std::os::windows::io::OwnedHandle, u32)>,
+    }
+
+    #[cfg(windows)]
+    impl Drop for ConsoleModeGuard {
+        fn drop(&mut self) {
+            use std::os::windows::io::AsRawHandle;
+            for (handle, mode) in &self.restore {
+                let _ = console::set_mode(handle.as_raw_handle(), *mode);
+            }
+            CONSOLE_HANDLE.store(0, Ordering::SeqCst);
+            SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+            SCREEN_ENTERED.store(false, Ordering::SeqCst);
+            ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// With nothing recorded the restore touches no console. Once a
+    /// snapshot is taken, a console whose quick-edit bit was flipped and
+    /// whose line input was switched off behind it comes back to the
+    /// recorded mode, extended flags included; without the perturbation
+    /// the restore could be a no-op and the test would not know. Echo
+    /// goes off with line input because the console rejects echo on its
+    /// own.
     #[cfg(windows)]
     #[test]
     #[serial]
     fn the_input_mode_restore_is_a_no_op_until_a_snapshot_round_trips() {
         use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE,
+        };
 
         SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
         restore_input_mode_from_static().unwrap();
@@ -1736,21 +1789,363 @@ mod tests {
             "the sentinel survives a restore"
         );
 
-        let Ok(input) = console::open_input() else {
-            eprintln!("skipping: no console input buffer");
+        let Some(input) = console_handle_or_skip(console::open_input(), "input buffer") else {
             return;
         };
-        let before = console::mode(input.as_raw_handle()).unwrap();
+        let handle = input.as_raw_handle();
+        let before = console::mode(handle).unwrap();
+        let _guard = ConsoleModeGuard {
+            restore: vec![(input, restored_input_mode(before))],
+        };
         let saved = snapshot_input_mode().expect("the open input buffer answers GetConsoleMode");
         assert_eq!(saved, before);
         assert_eq!(SAVED_INPUT_MODE.load(Ordering::SeqCst), u64::from(saved));
 
-        restore_input_mode_from_static().unwrap();
-        assert_eq!(
-            console::mode(input.as_raw_handle()).unwrap(),
-            restored_input_mode(saved)
+        let perturbed = ((saved ^ ENABLE_QUICK_EDIT_MODE)
+            & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+            | ENABLE_EXTENDED_FLAGS;
+        console::set_mode(handle, perturbed).unwrap();
+        assert_ne!(
+            console::mode(handle).unwrap(),
+            saved,
+            "the console took the perturbed mode"
         );
 
+        restore_input_mode_from_static().unwrap();
+        assert_eq!(console::mode(handle).unwrap(), restored_input_mode(saved));
+    }
+
+    /// Escape processing comes back on the recorded console before `leave`
+    /// writes its sequence, before `enter` writes its own, and from the
+    /// check every frame runs first, so a child that reset the console
+    /// mode cannot make the restore or the next frame print raw escapes.
+    /// The bit is cleared on the real screen buffer before each and read
+    /// back after. `Screen::clear` and `Screen::draw` need a tty-backed
+    /// terminal, so `enter` and `ensure_vt_processing` stand in for them.
+    /// The input mode is restored by the guard too: `enter` and `leave`
+    /// switch raw mode on the runner's console input.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn escape_processing_is_restored_before_leave_enter_and_each_frame() {
+        use std::os::windows::io::AsRawHandle;
+
+        const WANTED: u32 = ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
+
+        let Some(output) = console_handle_or_skip(console::open_output(), "screen buffer") else {
+            return;
+        };
+        let handle = output.as_raw_handle();
+        let original = console::mode(handle).unwrap();
+        let mut restore = vec![(output, original)];
+        if let Ok(input) = console::open_input() {
+            let before = console::mode(input.as_raw_handle()).unwrap();
+            restore.push((input, restored_input_mode(before)));
+        }
+        let _guard = ConsoleModeGuard { restore };
+        let clear_escape_processing = || {
+            console::set_mode(handle, original & !ENABLE_VIRTUAL_TERMINAL_PROCESSING).unwrap();
+            assert_eq!(
+                console::mode(handle).unwrap() & ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                0,
+                "the console took the cleared mode"
+            );
+        };
+        let escape_bits = || console::mode(handle).unwrap() & WANTED;
+
+        CONSOLE_HANDLE.store(handle as isize, Ordering::SeqCst);
         SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+
+        clear_escape_processing();
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        // The mouse-capture step fails without crossterm's own enable on
+        // record; only the mode matters here.
+        let _ = leave(&mut Vec::new());
+        assert_eq!(
+            escape_bits(),
+            WANTED,
+            "leave switched escape processing back on"
+        );
+
+        clear_escape_processing();
+        let _ = enter(&mut Vec::new(), false);
+        assert_eq!(
+            escape_bits(),
+            WANTED,
+            "enter switched escape processing back on"
+        );
+
+        clear_escape_processing();
+        ensure_vt_processing();
+        assert_eq!(
+            escape_bits(),
+            WANTED,
+            "the per-frame check switched escape processing back on"
+        );
+    }
+}
+
+/// `utf8_chunk` driven the way `ConsoleWriter` drives it, a byte buffer at
+/// a time with the `pending` carry between calls. Output reaches the
+/// console through `WriteConsoleW` as UTF-16, so every scalar must arrive
+/// whole; the function's own contract adds that a trailing partial
+/// sequence is held back and reported consumed, the units stop at the cap
+/// on a character boundary, and a surrogate pair never straddles two writes.
+#[cfg(test)]
+mod utf8_chunking {
+    use super::*;
+
+    /// Feeds `buf` the way the writer does: each call consumes some prefix
+    /// and the remainder is offered again, until the buffer is spent.
+    fn drive(
+        pending: &mut [u8; 4],
+        pending_len: &mut usize,
+        mut buf: &[u8],
+    ) -> io::Result<Vec<Vec<u16>>> {
+        let mut calls = Vec::new();
+        while !buf.is_empty() {
+            let (units, consumed) = utf8_chunk(pending, pending_len, buf)?;
+            assert!(
+                consumed > 0,
+                "a non-empty buffer must make progress ({} bytes left)",
+                buf.len()
+            );
+            assert!(
+                consumed <= buf.len(),
+                "consumed {consumed} of {} bytes",
+                buf.len()
+            );
+            assert!(
+                units.len() <= MAX_UNITS_PER_WRITE,
+                "{} units exceed the per-write cap",
+                units.len()
+            );
+            if let Some(&last) = units.last() {
+                assert!(
+                    !(0xD800..0xDC00).contains(&last),
+                    "a call ended on a lone high surrogate"
+                );
+            }
+            calls.push(units);
+            buf = &buf[consumed..];
+        }
+        Ok(calls)
+    }
+
+    fn decode(calls: &[Vec<u16>]) -> String {
+        let all: Vec<u16> = calls.iter().flatten().copied().collect();
+        String::from_utf16(&all).expect("well-formed UTF-16 across calls")
+    }
+
+    const SAMPLE: &str = "a\u{e9}\u{20ac}\u{1F600}z \u{4e2d}\u{6587} \u{1F1FA}\u{1F1F8}!";
+
+    // Whatever the byte split, the units concatenate back to the
+    // text and no call ends inside a scalar.
+    #[test]
+    fn every_byte_split_of_mixed_text_reassembles() {
+        let bytes = SAMPLE.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut pending = [0u8; 4];
+            let mut pending_len = 0;
+            let mut calls = drive(&mut pending, &mut pending_len, &bytes[..cut]).unwrap();
+            calls.extend(drive(&mut pending, &mut pending_len, &bytes[cut..]).unwrap());
+            assert_eq!(decode(&calls), SAMPLE, "split at {cut}");
+            assert_eq!(
+                pending_len, 0,
+                "nothing left pending after a complete text (cut {cut})"
+            );
+        }
+    }
+
+    // One byte per write: the worst case for the carry.
+    #[test]
+    fn one_byte_writes_reassemble() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let mut calls = Vec::new();
+        for byte in SAMPLE.as_bytes() {
+            calls
+                .extend(drive(&mut pending, &mut pending_len, std::slice::from_ref(byte)).unwrap());
+        }
+        assert_eq!(decode(&calls), SAMPLE);
+        assert_eq!(pending_len, 0);
+    }
+
+    // An empty write is a no-op; a short write is one call.
+    #[test]
+    fn empty_and_short_writes() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, b"").unwrap();
+        assert!(units.is_empty());
+        assert_eq!(consumed, 0);
+        let calls = drive(&mut pending, &mut pending_len, "hi \u{1F600}".as_bytes()).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(decode(&calls), "hi \u{1F600}");
+    }
+
+    // The cap lands exactly where a scalar straddles it.
+    #[test]
+    fn the_cap_never_splits_a_surrogate_pair() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+
+        // 8191 ASCII units + a pair: the pair would be unit 8192/8193, so
+        // the first call stops at 8191.
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 1);
+        text.push('\u{1F600}');
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "unit counts: {:?}",
+            calls.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].len(), MAX_UNITS_PER_WRITE - 1);
+        assert_eq!(calls[1].len(), 2);
+        assert_eq!(decode(&calls), text);
+
+        // 8192 ASCII + a pair: a full first write, then the pair alone.
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE);
+        text.push('\u{1F600}');
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE, 2]
+        );
+        assert_eq!(decode(&calls), text);
+
+        // 8191 ASCII + a one-unit three-byte scalar fits in one write.
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 1);
+        text.push('\u{20ac}');
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE]
+        );
+        assert_eq!(decode(&calls), text);
+    }
+
+    // ASCII of exactly k * cap bytes is k full writes.
+    #[test]
+    fn ascii_multiples_of_the_cap_are_full_writes() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let text = "x".repeat(3 * MAX_UNITS_PER_WRITE);
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE; 3]
+        );
+        // All pairs: 4 bytes -> 2 units, so a cap's worth of pairs is
+        // 4096 scalars per write.
+        let text = "\u{1F600}".repeat(MAX_UNITS_PER_WRITE);
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE; 2]
+        );
+        assert_eq!(decode(&calls), text);
+    }
+
+    // A write ending inside a scalar has the partial bytes held
+    // back (the writer loop may take a second call to hand them over) and
+    // the next write completes the scalar.
+    #[test]
+    fn a_trailing_partial_scalar_is_held_then_completed() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let bytes = "ab\u{1F600}cd".as_bytes();
+        let calls = drive(&mut pending, &mut pending_len, &bytes[..4]).unwrap();
+        assert_eq!(
+            decode(&calls),
+            "ab",
+            "only the complete scalars are emitted"
+        );
+        assert_eq!(pending_len, 2, "the two partial bytes wait in `pending`");
+        assert_eq!(&pending[..2], &bytes[2..4]);
+        let calls = drive(&mut pending, &mut pending_len, &bytes[4..]).unwrap();
+        assert_eq!(decode(&calls), "\u{1F600}cd");
+        assert_eq!(pending_len, 0);
+    }
+
+    // Malformed input is an error, never a panic, and the stream can
+    // continue afterwards.
+    #[test]
+    fn malformed_bytes_error_without_panicking() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        for bad in [
+            &b"\x80"[..],
+            b"\xff",
+            b"\xc3\x28",
+            b"\xf0\x9f\x98",
+            b"\xed\xa0\x80", // a UTF-8-encoded surrogate
+            b"\xf8\x88\x80\x80\x80",
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut p = [0u8; 4];
+                let mut l = 0;
+                drive(&mut p, &mut l, bad)
+            }));
+            assert!(outcome.is_ok(), "panicked on {bad:?}");
+        }
+        // An unfinished scalar followed by something that is not its
+        // continuation: an error, and the next clean write still works.
+        let (_, consumed) = utf8_chunk(&mut pending, &mut pending_len, b"\xf0\x9f").unwrap();
+        assert_eq!(consumed, 2);
+        let err = utf8_chunk(&mut pending, &mut pending_len, b"ab").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        pending_len = 0;
+        let calls = drive(&mut pending, &mut pending_len, b"ok").unwrap();
+        assert_eq!(decode(&calls), "ok");
+    }
+
+    // Pseudo-random byte soup through the writer loop never
+    // panics or spins.
+    #[test]
+    fn random_bytes_never_panic_or_stall() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..500 {
+            let len = (next() % 64) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            let mut pending = [0u8; 4];
+            let mut pending_len = 0;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drive(&mut pending, &mut pending_len, &bytes)
+            }));
+            assert!(outcome.is_ok(), "panicked on {bytes:?}");
+        }
+        // Valid random text of random length, fed in random slices.
+        for _ in 0..200 {
+            let chars = (next() % 40) as usize;
+            let text: String = (0..chars)
+                .map(|_| match next() % 4 {
+                    0 => 'a',
+                    1 => '\u{e9}',
+                    2 => '\u{20ac}',
+                    _ => '\u{1F600}',
+                })
+                .collect();
+            let bytes = text.as_bytes();
+            let mut pending = [0u8; 4];
+            let mut pending_len = 0;
+            let mut calls = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                let take = ((next() % 5) as usize + 1).min(bytes.len() - at);
+                calls.extend(drive(&mut pending, &mut pending_len, &bytes[at..at + take]).unwrap());
+                at += take;
+            }
+            assert_eq!(decode(&calls), text);
+            assert_eq!(pending_len, 0);
+        }
     }
 }
