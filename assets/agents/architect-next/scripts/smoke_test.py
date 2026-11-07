@@ -1006,7 +1006,8 @@ u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=
                                     delegate_result="SISYPHUS_REDIRECT\nPlan-shaped work: this wants an architect run.\n\nSisyphus run id: 20260101T000000-0badf00d"))
 check("route_delegate: sisyphus-next SISYPHUS_REDIRECT on its own line (no work landed) -> oracle_diagnose", u["_next"] == "oracle_diagnose")
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1,
-                                    delegate_result="SISYPHUS_HANDOFF\nWrote the architect handoff plans/engineer-handoffs/x.md.\n\nSisyphus run id: 20260101T000000-0badf00d"))
+                                    delegate_result="SISYPHUS_HANDOFF\nWrote the architect handoff plans/engineer-handoffs/x.md.\n\n" + REPORT_OK,
+                                    delegation_kind="implement"))
 check("route_delegate: sisyphus-next SISYPHUS_HANDOFF on its own line (no work landed) -> oracle_diagnose", u["_next"] == "oracle_diagnose")
 QUOTED = REPORT_OK.replace("Done.\n", "Done. The brief named no `SISYPHUS_REDIRECT` case; one test could not complete on the first try and passed on rerun.\n")
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=QUOTED, delegation_kind="implement"))

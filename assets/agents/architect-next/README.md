@@ -128,9 +128,9 @@ scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1169:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:1572:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:2138:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:1170:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:1573:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:2139:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
 None of these runs a toolchain: `_lib.py:602` is the alternation of the executable-criterion
