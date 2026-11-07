@@ -652,13 +652,14 @@ struct Candidate {
 }
 
 /// The candidates the REPL completer offers cold (fresh config dir, no
-/// command run yet) for `sigil`, restricted to the REPL's own command
-/// table (`.help` lists it unfiltered) so enabled macros, which the
-/// completer also offers, do not enter the comparison.
+/// command run yet) for `sigil`: the command table plus the enabled
+/// macros, which both UIs offer. The menu is one entry per row and
+/// stops at the terminal's height, so the pty grows past the set first.
 fn repl_completer_candidates(dir: &Path, sigil: char) -> Vec<Candidate> {
     let mut pty = spawn_ui(dir, "repl", &[]);
     pty.wait_for(")> ", PTY_DEADLINE)
         .expect("the REPL prompt never appeared");
+    pty.resize(100, 100).unwrap();
     pty.read_for(Duration::from_millis(500));
     let menu_at = pty.raw().len();
     pty.send(sigil.to_string().as_bytes()).unwrap();
@@ -666,9 +667,9 @@ fn repl_completer_candidates(dir: &Path, sigil: char) -> Vec<Candidate> {
     pty.send(b"\t").unwrap();
     pty.read_for(Duration::from_millis(800));
     pty.send(b"\t").unwrap();
-    pty.read_for(Duration::from_millis(1500));
+    pty.read_for(Duration::from_millis(2500));
     let menu = since(&pty, menu_at);
-    let offered = parse_sigil_rows(&menu, sigil);
+    let mut offered = parse_sigil_rows(&menu, sigil);
     assert!(
         offered.len() > 10,
         "the REPL completer menu was not read ({} rows):\n{menu}",
@@ -679,42 +680,15 @@ fn repl_completer_candidates(dir: &Path, sigil: char) -> Vec<Candidate> {
     pty.read_for(Duration::from_millis(300));
     pty.send(b"\x04").unwrap();
     let _ = pty.wait_for("tty-probe-done", PTY_DEADLINE);
-    drop(pty);
 
-    // A second REPL prints the unfiltered table; the hints render with
-    // whichever sigil the prefix prefers, so both are read.
-    let mut pty = spawn_ui(dir, "repl", &[]);
-    pty.wait_for(")> ", PTY_DEADLINE)
-        .expect("the REPL prompt never appeared");
-    pty.read_for(Duration::from_millis(500));
-    let help_at = pty.raw().len();
-    pty.send(format!("{sigil}help\r").as_bytes()).unwrap();
-    pty.wait_for_after("Press Ctrl+D to exit", help_at, PTY_DEADLINE)
-        .expect("the REPL's help text never appeared");
-    let help = since(&pty, help_at);
-    let table: Vec<String> = parse_sigil_rows(&help, '.')
-        .into_iter()
-        .chain(parse_sigil_rows(&help, '/'))
-        .map(|c| c.name)
-        .collect();
-    assert!(
-        table.len() > 40,
-        "the REPL help table was not read:\n{help}"
-    );
-    pty.send(b"\x04").unwrap();
-    let _ = pty.wait_for("tty-probe-done", PTY_DEADLINE);
-
-    let mut core: Vec<Candidate> = offered
-        .into_iter()
-        .filter(|c| table.contains(&c.name))
-        .collect();
-    core.sort();
-    core.dedup();
-    core
+    offered.sort();
+    offered.dedup();
+    offered
 }
 
 /// Rows of the form `<sigil>name[ sub]<2+ spaces>description`, wherever
-/// they start (the first menu row shares the prompt's line).
+/// they start (the first menu row shares the prompt's line). A macro
+/// without a description is a padded name alone and is kept as such.
 fn parse_sigil_rows(text: &str, sigil: char) -> Vec<Candidate> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -730,21 +704,18 @@ fn parse_sigil_rows(text: &str, sigil: char) -> Vec<Candidate> {
                 && name.split(' ').count() <= 2
                 && name.starts_with(|c: char| c.is_ascii_lowercase());
             if valid {
-                let description = tail[name_end..].trim().to_string();
-                let description = description
+                let description = tail[name_end..]
                     .split("\r")
                     .next()
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if !description.is_empty() {
-                    out.push(Candidate {
-                        name: name.to_string(),
-                        description,
-                    });
-                    rest = &tail[name_end..];
-                    continue;
-                }
+                out.push(Candidate {
+                    name: name.to_string(),
+                    description,
+                });
+                rest = &tail[name_end..];
+                continue;
             }
             rest = tail;
         }
@@ -852,11 +823,12 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
         missing.len(),
         completer.len()
     );
+    let completer_names: Vec<&str> = completer.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         shown + more,
         completer.len(),
         "under `{sigil}` the bare palette band counts {shown} rows + {more} more, the REPL \
-         completer offers {} commands",
+         completer offers {} commands: {completer_names:?}",
         completer.len()
     );
 }

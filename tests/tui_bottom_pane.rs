@@ -442,12 +442,10 @@ fn the_cold_start_palette_matches_the_repl_completer() {
             });
         let repainted = repaint(&mut pty, 40, 101);
         let frame = since(&pty, repainted);
-        for row in rows {
-            assert!(
-                frame.contains(row),
-                "`{row}` is not in the band under {prefix}:\n{frame}"
-            );
-        }
+        // The band pads the name to the description column, so the rows
+        // are matched with whitespace squeezed out on both sides.
+        let [enable, disable] = rows.map(|row| row.split_whitespace().collect::<String>());
+        squeezed_positions(&frame, [enable.as_str(), disable.as_str()]);
 
         pty.send(b"\x03").unwrap();
         pty.read_for(HOTKEY_GAP);
