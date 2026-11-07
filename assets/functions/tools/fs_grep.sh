@@ -11,6 +11,22 @@ set -e
 
 # @env LLM_OUTPUT=/dev/stdout The output path
 
+# Review lanes ground relative paths in the checkout under review and refuse
+# reads in another clone of the same repository (utils/review-paths.sh).
+_review_lib="$(dirname "${LLM_PROMPT_UTILS_FILE:-${BASH_SOURCE[0]%/*}/../utils/x}")/review-paths.sh"
+if [[ -f "$_review_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$_review_lib"
+else
+    review_ground_path() {
+        if [[ "${LLM_AGENT_VAR_REVIEW_GROUNDING:-}" == "1" ]]; then
+            echo "Refused: the review path guard ($_review_lib) is not installed; reinstall the built-in functions." >> "$LLM_OUTPUT"
+            return 1
+        fi
+        REVIEW_GROUNDED_PATH="$1"
+    }
+fi
+
 MAX_RESULTS=50
 MAX_LINE_LENGTH=2000
 
@@ -19,6 +35,8 @@ main() {
     local search_pattern="$argc_pattern"
     local search_path="${argc_path:-.}"
     local include_filter="${argc_include:-}"
+    review_ground_path "$search_path" || return 0
+    search_path="$REVIEW_GROUNDED_PATH"
 
     if [[ ! -e "$search_path" ]]; then
         echo "Error: path not found: $search_path" >&2
