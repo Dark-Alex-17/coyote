@@ -457,6 +457,69 @@ fn the_cold_start_palette_matches_the_repl_completer() {
     }
 }
 
+/// Esc Esc on an idle composer opens the picker; choosing the older of
+/// two exchanges takes both out of the transcript and puts that prompt
+/// back in the composer. A dry run keeps no session, so the prefill has
+/// to come from the picker's row, not from a session pop.
+#[test]
+#[serial]
+fn esc_esc_rewind_prefills_the_chosen_prompt() {
+    let dir = fresh_config_dir("rewind-prefill");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"**older** rw-1a\r").unwrap();
+    wait_for_squeezed(&mut pty, "older rw-1a", "the first rendered reply");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"**newer** rw-2b\r").unwrap();
+    wait_for_squeezed(&mut pty, "newer rw-2b", "the second rendered reply");
+    pty.read_for(Duration::from_millis(500));
+    let settled = repaint(&mut pty, 40, 101);
+    let frame = since(&pty, settled);
+    assert!(
+        !frame.contains("Working") && frame.contains("**older**") && frame.contains("**newer**"),
+        "the two exchanges are not up on an idle screen:\n{frame}"
+    );
+
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(200));
+    pty.send(b"\x1b").unwrap();
+    pty.wait_for("Rewind to", PTY_DEADLINE)
+        .expect("the second Esc never opened the picker");
+    pty.send(b"\x1b[B").unwrap();
+    pty.read_for(Duration::from_millis(200));
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let rewound = repaint(&mut pty, 40, 100);
+    let frame = since(&pty, rewound);
+    assert!(
+        !frame.contains("Rewind to"),
+        "the picker stayed up after Enter:\n{frame}"
+    );
+    assert!(
+        !frame.contains("newer"),
+        "the newer exchange survived the rewind:\n{frame}"
+    );
+    let squeezed: String = frame.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !squeezed.contains("olderrw-1a"),
+        "the chosen exchange's reply survived the rewind:\n{frame}"
+    );
+    assert_eq!(
+        frame.matches("**older** rw-1a").count(),
+        1,
+        "the composer does not hold the chosen prompt alone:\n{frame}"
+    );
+
+    pty.send(b"\x03").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
 /// The field is its own surface: the cells of its text rows are painted
 /// on a background the transcript rows above the rule are not. The screen
 /// is made tall enough for the `.info` table so the `> .info` header is

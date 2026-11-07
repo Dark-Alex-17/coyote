@@ -317,6 +317,14 @@ pub(super) struct RewindRow {
     pub(super) title: String,
 }
 
+/// What the picker chose: its rows down to the highlighted one, newest
+/// first, one per exchange to take back. The last row's opener is where
+/// the transcript goes back to and its title what the composer gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewindTarget {
+    pub(super) rows: Vec<RewindRow>,
+}
+
 /// The Esc-Esc band: this run's exchanges, newest first; choosing the
 /// k-th row takes the k newest back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,13 +361,11 @@ impl RewindState {
         self.highlight = step_highlight(self.highlight, delta, self.rows.len());
     }
 
-    pub(super) fn highlighted(&self) -> Option<&RewindRow> {
-        self.rows.get(self.highlight)
-    }
-
-    /// How many exchanges the highlighted row takes back.
-    pub(super) fn pops(&self) -> usize {
-        self.highlight + 1
+    /// The highlighted row and every newer one; None with no rows.
+    pub(super) fn chosen(&self) -> Option<RewindTarget> {
+        self.rows.get(..=self.highlight).map(|rows| RewindTarget {
+            rows: rows.to_vec(),
+        })
     }
 
     pub(super) fn band_rows(&self) -> u16 {
@@ -896,14 +902,18 @@ mod tests {
                 (0, "first question\nwith detail"),
             ]
         );
-        assert_eq!(rewind.pops(), 1);
+        let chosen = |rewind: &RewindState| rewind.chosen().unwrap().rows.len();
+        assert_eq!(chosen(&rewind), 1);
         rewind.move_highlight(1);
-        assert_eq!(rewind.pops(), 2);
-        assert_eq!(rewind.highlighted().map(|row| row.opener), Some(3));
+        assert_eq!(chosen(&rewind), 2);
+        assert_eq!(
+            rewind.chosen().unwrap().rows.last().map(|row| row.opener),
+            Some(3)
+        );
         rewind.move_highlight(9);
-        assert_eq!(rewind.pops(), 3);
+        assert_eq!(chosen(&rewind), 3);
         rewind.move_highlight(-9);
-        assert_eq!(rewind.pops(), 1);
+        assert_eq!(chosen(&rewind), 1);
         assert_eq!(rewind.band_rows(), 4);
 
         let area = Rect::new(0, 0, 50, 4);

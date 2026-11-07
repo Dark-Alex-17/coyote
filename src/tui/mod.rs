@@ -27,8 +27,8 @@ use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, anyhow, bail};
 use bottom_pane::{
-    PaletteSnapshot, PaletteState, PaletteView, RewindState, RewindView, SearchState, SearchView,
-    View,
+    PaletteSnapshot, PaletteState, PaletteView, RewindState, RewindTarget, RewindView, SearchState,
+    SearchView, View,
 };
 use cells::{
     AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
@@ -836,13 +836,9 @@ pub(crate) enum Command {
     Suspend,
     OpenEditor,
     Redraw,
-    /// Take the `pops` newest exchanges out of the session and the
-    /// transcript back to the cell at `opener`, which opened the oldest
-    /// of them.
-    Rewind {
-        pops: usize,
-        opener: usize,
-    },
+    /// Take the chosen exchanges out of the session and the transcript
+    /// and give the oldest one's prompt back to the composer.
+    Rewind(RewindTarget),
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -1353,10 +1349,7 @@ impl App {
                 None
             }
             View::Rewind(rewind) => {
-                let chosen = rewind.highlighted().map(|row| Command::Rewind {
-                    pops: rewind.pops(),
-                    opener: row.opener,
-                });
+                let chosen = rewind.chosen().map(Command::Rewind);
                 self.close_view();
                 chosen
             }
@@ -2873,13 +2866,46 @@ fn quit_abort(abort: &AbortSignal, turn_running: bool) {
 }
 
 /// Takes the `pops` newest exchanges out of the session, stopping at
-/// the first that cannot be undone. Each pop leaves its prompt as the
-/// pending prefill, so the last one's is what the composer gets back.
-fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> Result<()> {
-    for _ in 0..pops {
-        ctx.undo_last_exchange()?;
+/// the first that cannot be undone: how many came out, and what stopped
+/// it short.
+fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> (usize, Option<anyhow::Error>) {
+    for popped in 0..pops {
+        if let Err(err) = ctx.undo_last_exchange() {
+            return (popped, Some(err));
+        }
     }
-    Ok(())
+    (pops, None)
+}
+
+/// Takes the chosen exchanges out of the session and the transcript and
+/// gives the oldest one's prompt back to the composer. The transcript
+/// goes back only as far as the session did, so the two stay in step,
+/// and a stop short of the choice is said. Without a session there is
+/// nothing to pop and the transcript is the whole of the rewind. The
+/// composer gets the row's own text, not the session's prefill: a
+/// command row holds the command, which the session never did.
+fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
+    let chosen = target.rows.len();
+    let cut = if ctx.session.is_some() {
+        let (popped, stopped) = rewind_exchanges(ctx, chosen);
+        if let Some(err) = stopped {
+            app.handle_msg(UiMsg::Notice {
+                kind: NoticeKind::ToolWarning,
+                text: format!("Rewind stopped: {err}"),
+            });
+        }
+        popped
+    } else {
+        chosen
+    };
+    app.sync_from_ctx(ctx);
+    if let Some(row) = cut
+        .checked_sub(1)
+        .and_then(|oldest| target.rows.get(oldest))
+    {
+        app.transcript.truncate(row.opener);
+        app.set_composer_text(&row.title);
+    }
 }
 
 /// Replaces the event stream, dropping the old one first. Constructing a
@@ -3060,16 +3086,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         }
                         app.schedule_frame();
                     }
-                    Some(Command::Rewind { pops, opener }) => {
+                    Some(Command::Rewind(target)) => {
                         if let Some(ctx) = ctx.as_mut() {
-                            if let Err(err) = rewind_exchanges(ctx, pops) {
-                                app.handle_msg(UiMsg::Notice {
-                                    kind: NoticeKind::ToolWarning,
-                                    text: format!("Rewind stopped: {err}"),
-                                });
-                            }
-                            app.transcript.truncate(opener);
-                            app.sync_from_ctx(ctx);
+                            apply_rewind(app, ctx, target);
                         }
                     }
                     None => {}
@@ -7405,7 +7424,7 @@ mod tests {
     }
 
     #[test]
-    fn rewind_exchanges_pops_the_newest_exchanges_and_prefills_the_last_popped() {
+    fn rewind_exchanges_pops_the_newest_exchanges_and_counts_how_far_it_got() {
         let mut ctx = chat_ctx();
         let mut session = Session::default();
         for prompt in ["first", "second", "third"] {
@@ -7413,7 +7432,9 @@ mod tests {
             session.add_message(&input, "reply").unwrap();
         }
         ctx.session = Some(session);
-        rewind_exchanges(&mut ctx, 2).unwrap();
+        let (popped, stopped) = rewind_exchanges(&mut ctx, 2);
+        assert_eq!(popped, 2);
+        assert!(stopped.is_none());
         let session = ctx.session.as_ref().unwrap();
         let prompts: Vec<&str> = session
             .messages()
@@ -7424,13 +7445,17 @@ mod tests {
         assert_eq!(prompts, ["first"]);
         assert_eq!(ctx.pending_prefill.as_deref(), Some("second"));
 
-        let err = rewind_exchanges(&mut ctx, 3).unwrap_err();
+        let (popped, stopped) = rewind_exchanges(&mut ctx, 3);
+        assert_eq!(popped, 1);
+        let err = stopped.expect("the second pop finds nothing");
         assert!(err.to_string().contains("Nothing to undo"), "{err}");
         assert!(!ctx.session.as_ref().unwrap().has_user_messages());
         assert_eq!(ctx.pending_prefill.as_deref(), Some("first"));
 
         ctx.session = None;
-        let err = rewind_exchanges(&mut ctx, 1).unwrap_err();
+        let (popped, stopped) = rewind_exchanges(&mut ctx, 1);
+        assert_eq!(popped, 0);
+        let err = stopped.expect("no session to pop from");
         assert!(err.to_string().contains("No session"), "{err}");
     }
 
@@ -7478,10 +7503,15 @@ mod tests {
         assert!(frame.contains("third question"), "{frame}");
         assert!(frame.contains("+1 line"), "{frame}");
         harness.press(KeyCode::Down);
-        assert_eq!(
-            harness.press(KeyCode::Enter),
-            Some(Command::Rewind { pops: 2, opener: 2 })
-        );
+        let Some(Command::Rewind(target)) = harness.press(KeyCode::Enter) else {
+            panic!("the second row rewinds two exchanges");
+        };
+        let rows: Vec<(usize, &str)> = target
+            .rows
+            .iter()
+            .map(|row| (row.opener, row.title.as_str()))
+            .collect();
+        assert_eq!(rows, [(4, "third question"), (2, "second\nwith detail")]);
         assert!(rewind(&harness).is_none());
     }
 
@@ -7555,6 +7585,20 @@ mod tests {
         assert!(rewind(&harness).is_none());
     }
 
+    /// Opens the picker on an idle composer and takes the row `down`
+    /// steps below the newest.
+    fn choose_rewind(harness: &mut Harness, down: usize) -> RewindTarget {
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        for _ in 0..down {
+            harness.press(KeyCode::Down);
+        }
+        match harness.press(KeyCode::Enter) {
+            Some(Command::Rewind(target)) => target,
+            other => panic!("the row did not rewind: {other:?}"),
+        }
+    }
+
     #[test]
     fn a_rewind_command_pops_the_session_and_truncates_the_transcript() {
         let mut ctx = chat_ctx();
@@ -7567,18 +7611,57 @@ mod tests {
         let mut harness = Harness::for_ctx(&ctx);
         three_exchanges(&mut harness);
         assert_eq!(harness.app.transcript.len(), 6);
-        harness.press(KeyCode::Esc);
-        harness.press(KeyCode::Esc);
-        harness.press(KeyCode::Down);
-        let Some(Command::Rewind { pops, opener }) = harness.press(KeyCode::Enter) else {
-            panic!("the second row rewinds two exchanges");
-        };
-        rewind_exchanges(&mut ctx, pops).unwrap();
-        harness.app.transcript.truncate(opener);
-        harness.app.sync_from_ctx(&mut ctx);
+        let target = choose_rewind(&mut harness, 1);
+        apply_rewind(&mut harness.app, &mut ctx, target);
         assert_eq!(harness.app.transcript.len(), 2);
         assert_eq!(harness.app.composer_text(), "second\nwith detail");
         assert_eq!(ctx.pending_prefill, None);
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .filter(|m| m.role.is_user())
+                .count(),
+            1
+        );
+        assert!(!harness.draw().contains("Rewind stopped"));
+    }
+
+    /// A dry run keeps no session, so the prefill cannot come from a pop:
+    /// the chosen row's own text is what the composer gets, and the
+    /// transcript goes back to it all the same.
+    #[test]
+    fn a_rewind_without_a_session_still_truncates_and_prefills_the_chosen_prompt() {
+        let mut ctx = chat_ctx();
+        assert!(ctx.session.is_none());
+        let mut harness = Harness::for_ctx(&ctx);
+        three_exchanges(&mut harness);
+        let target = choose_rewind(&mut harness, 1);
+        apply_rewind(&mut harness.app, &mut ctx, target);
+        assert_eq!(harness.app.transcript.len(), 2);
+        assert_eq!(harness.app.composer_text(), "second\nwith detail");
+        assert!(!harness.draw().contains("Rewind stopped"));
+    }
+
+    /// A session shorter than the transcript is popped as far as it goes
+    /// and the transcript cut back only that far, with a notice.
+    #[test]
+    fn a_rewind_the_session_cannot_finish_stops_where_the_session_did() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        let input = Input::from_str(&ctx, "third question", None).unwrap();
+        session.add_message(&input, "an answer").unwrap();
+        ctx.session = Some(session);
+        let mut harness = Harness::for_ctx(&ctx);
+        three_exchanges(&mut harness);
+        let target = choose_rewind(&mut harness, 1);
+        apply_rewind(&mut harness.app, &mut ctx, target);
+        assert_eq!(harness.app.transcript.len(), 4);
+        assert_eq!(harness.app.composer_text(), "third question");
+        assert!(!ctx.session.as_ref().unwrap().has_user_messages());
+        let frame = harness.draw();
+        assert!(frame.contains("Rewind stopped: Nothing to undo"), "{frame}");
     }
 
     #[test]
