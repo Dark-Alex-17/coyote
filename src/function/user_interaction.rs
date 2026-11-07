@@ -461,6 +461,35 @@ mod tests {
         assert_eq!(v.to_string(), expected.to_string());
     }
 
+    /// The refusal a run with no human gives a select still closes the
+    /// prompt's event pair, named as a refusal rather than a failure.
+    #[test]
+    #[serial]
+    fn a_headless_select_publishes_needs_human_as_its_answer() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let sink = RecordingSink::install();
+        let mut ctx = cmd_ctx();
+        run_user_tool(
+            &mut ctx,
+            "user__select",
+            json!({"question": "q-hl-evt-4p", "options": ["a", "b"]}),
+        );
+
+        let (requested, answered) = prompt_events(sink.drain(), "q-hl-evt-4p");
+        let [Event::PromptRequested { id, action, .. }] = requested.as_slice() else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(*action, PromptAction::Select);
+        assert_eq!(
+            answered,
+            vec![Event::PromptAnswered {
+                id: id.clone(),
+                answer: "<needs_human>".to_string(),
+                auto: false,
+            }]
+        );
+    }
+
     #[test]
     #[serial]
     fn headless_confirm_returns_empty_options_when_absent() {

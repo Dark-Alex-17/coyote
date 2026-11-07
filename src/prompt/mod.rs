@@ -214,7 +214,8 @@ pub fn new_prompt_id() -> String {
 
 /// Asks through `prompter` and publishes the prompt as requested and as
 /// answered, so a prompter stays a renderer and the bus stays the observer.
-/// A prompter failure still closes the pair, with `<error>` as the answer.
+/// A prompter failure still closes the pair, with `<error>` as the answer,
+/// or `<needs_human>` when a run with no human refused the prompt.
 pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> {
     let id = req.id.clone();
     let action = req.action;
@@ -222,9 +223,14 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
     let answer = match prompter.prompt(req) {
         Ok(answer) => answer,
         Err(err) => {
+            let answer = if err.is::<NeedsHuman>() {
+                "<needs_human>"
+            } else {
+                "<error>"
+            };
             bus().publish(Event::PromptAnswered {
                 id,
-                answer: "<error>".to_string(),
+                answer: answer.to_string(),
                 auto: false,
             });
             return Err(err);
