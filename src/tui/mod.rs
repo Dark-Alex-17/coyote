@@ -478,15 +478,15 @@ fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
 const EXCHANGE_MODIFYING_COMMANDS: [&str; 2] = [".continue", ".regenerate"];
 
 /// Whether the cell opened an exchange `.undo` would take back: a user
-/// line, or a command turn whose request reached the model and is not in
-/// `EXCHANGE_MODIFYING_COMMANDS`. A request that failed or was interrupted
-/// before any reply still counts: the session keeps the user message with
-/// an interrupted-response marker. One that bailed on usage (bare `.file`,
-/// nothing to `.continue`) or never asks the model (`.info`) recorded
-/// nothing, so it is looked past.
+/// line or a command turn whose request reached the model, the command
+/// not in `EXCHANGE_MODIFYING_COMMANDS`. A request that failed or was
+/// interrupted before any reply still counts: the session keeps the user
+/// message with an interrupted-response marker. A turn that failed
+/// before the request (no API key, a usage bail on bare `.file`) or
+/// never asks the model (`.info`) recorded nothing, so it is looked past.
 fn opens_exchange(cell: &Cell, prefix: crate::config::CommandPrefix) -> bool {
     match cell {
-        Cell::User { .. } => true,
+        Cell::User { opened, .. } => *opened,
         Cell::Command { name, opened, .. } => {
             *opened
                 && command_word(name, prefix)
@@ -629,10 +629,12 @@ impl App {
     /// Records that a line left for the work task. A command gets its cell
     /// now, so the transcript shows what is running under a modal the
     /// command raises; the output fills in when the turn ends. The view
-    /// follows again so the line just sent is not out of sight.
+    /// follows again so the line just sent is not out of sight, and a
+    /// focused row lets go: the line opens a new context.
     pub(crate) fn begin_turn(&mut self, line: &str, command: bool) {
         self.transcript.clear_welcome();
         self.transcript.scroll_to_bottom();
+        self.transcript.clear_focus();
         let first_cell = self.transcript.len();
         self.transcript.push(if command {
             Cell::command(line)
@@ -682,11 +684,18 @@ impl App {
             {
                 self.transcript.truncate(opener);
             }
-        } else if !outcome.captured.trim().is_empty() {
-            self.transcript.push(Cell::notice(
-                NoticeKind::Routing,
-                render::plain_text(&outcome.captured).trim_end().to_string(),
-            ));
+        } else {
+            if let Some(turn) = &turn
+                && let Some(Cell::User { opened, .. }) = self.transcript.cell_mut(turn.first_cell)
+            {
+                *opened = turn.requested;
+            }
+            if !outcome.captured.trim().is_empty() {
+                self.transcript.push(Cell::notice(
+                    NoticeKind::Routing,
+                    render::plain_text(&outcome.captured).trim_end().to_string(),
+                ));
+            }
         }
         if let Some(error) = &outcome.error {
             // Errors arrive painted for the REPL like notices do.
@@ -825,6 +834,7 @@ impl App {
                     None
                 } else {
                     self.composer = new_composer();
+                    self.transcript.clear_focus();
                     Some(Command::Submit(text.trim().to_string()))
                 }
             }
@@ -836,7 +846,10 @@ impl App {
                 self.set_composer_text("");
                 None
             }
-            Action::Interrupt => (!self.exiting).then_some(Command::Interrupt),
+            Action::Interrupt => {
+                self.transcript.clear_focus();
+                (!self.exiting).then_some(Command::Interrupt)
+            }
             Action::Quit => (!self.exiting).then_some(Command::Quit),
             Action::Suspend => Some(Command::Suspend),
             Action::OpenEditor => Some(Command::OpenEditor),
@@ -4355,6 +4368,31 @@ mod tests {
         assert!(frame.contains("fn main()"), "{frame}");
     }
 
+    /// A folded header wider than the row gives up arguments, not its
+    /// state: at 40 columns a 48-character argument string is cut to
+    /// what leaves `failed: exit 2` on screen.
+    #[test]
+    fn a_narrow_folded_header_keeps_its_state_and_cuts_the_arguments() {
+        let mut harness = Harness::standalone(40, 20);
+        harness.app.begin_turn("read it", false);
+        let path = format!("src/{}.rs", "x".repeat(30));
+        let args = serde_json::json!({ "path": path }).to_string();
+        assert_eq!(args.chars().count(), 48);
+        narrate(&mut harness, "call-1", &format!("Call fs_read {args}"));
+        start_tool(&mut harness, "call-1", "fs_read", None);
+        finish_tool(
+            &mut harness,
+            "call-1",
+            false,
+            Some("exit 2\nno such file: src/main.rs"),
+        );
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let frame = harness.draw();
+        insta::assert_snapshot!("tool_failed_40x20", &frame);
+        assert!(frame.contains("1.2s  failed: exit 2"), "{frame}");
+        assert!(frame.contains("fs_read({\"path...)  1.2s"), "{frame}");
+    }
+
     #[test]
     fn a_job_takes_its_start_calls_row_and_folds_the_checks_in() {
         let mut harness = Harness::standalone(80, 24);
@@ -4994,6 +5032,38 @@ mod tests {
         assert!(harness.draw().contains("Tip: Press"));
     }
 
+    /// A prompt whose turn failed before any request (no API key)
+    /// recorded nothing in the session, so the `.undo` after it takes
+    /// the exchange before it, and the transcript drops the failed line
+    /// along with that exchange.
+    #[test]
+    fn an_undo_after_a_prompt_that_never_reached_the_model_takes_the_exchange_before_it() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn("second", false);
+        harness.app.end_turn(
+            false,
+            &TurnOutcome {
+                error: Some("no api key".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        let cells = harness.app.transcript.cells();
+        assert_eq!(cells.len(), 5);
+        assert!(matches!(&cells[0], Cell::User { opened: true, .. }));
+        assert!(matches!(&cells[3], Cell::User { opened: false, .. }));
+        assert!(matches!(&cells[4], Cell::Error { .. }));
+        harness.app.begin_turn(".undo", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        let frame = harness.draw();
+        assert!(matches!(
+            harness.app.transcript.cells(),
+            [Cell::Welcome { .. }]
+        ));
+        assert!(frame.contains("Tip: Press"), "{frame}");
+        assert!(!frame.contains("first question"), "{frame}");
+    }
+
     /// `.regenerate` replaces the last reply inside the exchange it
     /// follows, so the `.undo` after it takes that whole exchange, user
     /// line included, as the session does.
@@ -5369,15 +5439,40 @@ mod tests {
     }
 
     #[test]
-    fn esc_clears_the_focus_before_it_interrupts_the_turn() {
+    fn esc_on_a_focused_row_interrupts_the_running_turn_and_drops_the_focus() {
         let mut harness = Harness::standalone(80, 24);
         running_fs_read(&mut harness);
         finish_tool(&mut harness, "call-1", true, None);
         harness.app.handle_key(ctrl(KeyCode::Up));
         assert!(harness.app.transcript.focused());
-        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(!harness.app.transcript.focused());
+    }
+
+    /// A submitted line is a new context: the focus goes when the line
+    /// leaves the composer and again when its turn begins, so the Esc
+    /// that follows reaches the turn.
+    #[test]
+    fn a_submitted_line_drops_the_focus_so_esc_interrupts_its_turn() {
+        let mut harness = Harness::standalone(80, 24);
+        running_fs_read(&mut harness);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        assert!(harness.app.transcript.focused());
+        harness.type_text("next question");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("next question".to_string()))
+        );
+        assert!(!harness.app.transcript.focused());
+
+        harness.app.handle_key(ctrl(KeyCode::Up));
+        assert!(harness.app.transcript.focused());
+        harness.app.begin_turn("next question", false);
         assert!(!harness.app.transcript.focused());
         assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(!harness.app.transcript.focused());
     }
 
     #[test]

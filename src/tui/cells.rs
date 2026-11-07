@@ -89,6 +89,11 @@ impl FoldedCall {
 pub(super) enum Cell {
     User {
         text: String,
+        /// Whether the line's turn got a request off to the model, so
+        /// the session holds an exchange under it even if no reply came
+        /// back; `.undo` takes that exchange and this cell with it. A
+        /// turn that failed before the request recorded nothing.
+        opened: bool,
         cache: LineCache,
     },
     Assistant {
@@ -109,9 +114,7 @@ pub(super) enum Cell {
     Command {
         name: String,
         output: String,
-        /// Whether the command's turn got a request off to the model, so
-        /// the session holds an exchange under it even if no reply came
-        /// back; `.undo` takes that exchange and this cell with it.
+        /// As `User::opened`.
         opened: bool,
         cache: LineCache,
     },
@@ -193,15 +196,36 @@ pub(super) fn narrated_tool_name(line: &str) -> String {
 /// closing `...` of a cut argument string included.
 const SHORT_ARGS_BUDGET: usize = 48;
 
+/// The fewest argument characters a header keeps when the row is too
+/// narrow for `SHORT_ARGS_BUDGET`, the `...` included.
+const MIN_ARGS_BUDGET: usize = 8;
+
 /// The first line of `args` cut to the header's budget, so a header
 /// with a file's contents in it stays one row.
 pub(super) fn short_args(args: &str) -> String {
     let line = render::plain_text(args);
     let line = line.lines().next().unwrap_or_default();
-    if line.chars().count() <= SHORT_ARGS_BUDGET {
-        return line.to_string();
+    cut_to(line, SHORT_ARGS_BUDGET)
+}
+
+/// `text` cut so a header with `reserved` other characters (the name,
+/// the state token, their punctuation) fits a row `width` wide, since
+/// the view clips the header from the right and the state token at its
+/// end is the one thing a folded row has to say. The cut never goes
+/// below `MIN_ARGS_BUDGET`, so a very narrow row loses the state rather
+/// than every argument.
+fn fit_to_row(text: &str, reserved: usize, width: u16) -> String {
+    let budget = usize::from(width)
+        .saturating_sub(reserved)
+        .clamp(MIN_ARGS_BUDGET, SHORT_ARGS_BUDGET);
+    cut_to(text, budget)
+}
+
+fn cut_to(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_string();
     }
-    let mut short: String = line.chars().take(SHORT_ARGS_BUDGET - 3).collect();
+    let mut short: String = text.chars().take(budget - 3).collect();
     short.push_str("...");
     short
 }
@@ -210,6 +234,7 @@ impl Cell {
     pub(super) fn user(text: &str) -> Self {
         Self::User {
             text: text.to_string(),
+            opened: false,
             cache: LineCache::default(),
         }
     }
@@ -313,7 +338,7 @@ impl Cell {
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
         let no_color = *crate::utils::NO_COLOR;
         match self {
-            Cell::User { text, cache } => cache.get(width, || {
+            Cell::User { text, cache, .. } => cache.get(width, || {
                 render::plain_lines(
                     &format!("> {text}"),
                     width,
@@ -366,9 +391,12 @@ impl Cell {
                     }
                 };
                 // The header is one row; the view clips what does not
-                // fit. The narration below it is what the user approves,
-                // so that wraps and is shown whole. The error in the
-                // header is the tool's own text, so it is scrubbed.
+                // fit, so the arguments give way to the state. The
+                // narration below it is what the user approves, so that
+                // wraps and is shown whole. The error in the header is
+                // the tool's own text, so it is scrubbed.
+                let reserved = name.chars().count() + "()  ".len() + state.chars().count();
+                let args = fit_to_row(args, reserved, width);
                 let header = render::plain_text(&format!("{name}({args})  {state}"));
                 let mut lines = vec![Line::from(Span::styled(header, DIM))];
                 let open = matches!(status, ToolStatus::Running { .. }) || *expanded;
@@ -399,7 +427,9 @@ impl Cell {
                     JobStatus::Failed(error) => Some(error.as_str()),
                     _ => None,
                 };
-                let header = format!("job {tool} {job_id}  {state}");
+                let reserved = "job   ".len() + state.chars().count();
+                let subject = fit_to_row(&format!("{tool} {job_id}"), reserved, width);
+                let header = format!("job {subject}  {state}");
                 row_lines(header, error, calls, *expanded, width)
             }
             Cell::Agent {
@@ -419,7 +449,9 @@ impl Cell {
                     AgentStatus::Failed(error) => Some(error.as_str()),
                     _ => None,
                 };
-                let header = format!("agent {name} {agent_id}  {state}");
+                let reserved = "agent   ".len() + state.chars().count();
+                let subject = fit_to_row(&format!("{name} {agent_id}"), reserved, width);
+                let header = format!("agent {subject}  {state}");
                 row_lines(header, error, calls, *expanded, width)
             }
             Cell::Welcome {
@@ -783,6 +815,21 @@ mod tests {
         );
         assert_eq!(short.chars().count(), SHORT_ARGS_BUDGET);
         assert_eq!(short_args("a\x1b[31mb\x1b[0m\nc"), "ab");
+    }
+
+    /// The row width sets the budget: a wide row keeps the stored
+    /// arguments whole, a narrow one cuts them to what leaves the
+    /// state in view, and no row cuts below the floor.
+    #[test]
+    fn fit_to_row_cuts_the_arguments_to_what_the_width_leaves() {
+        let args = "x".repeat(SHORT_ARGS_BUDGET);
+        assert_eq!(fit_to_row(&args, 20, 80), args);
+        let narrow = fit_to_row(&args, 31, 40);
+        assert_eq!(narrow, format!("{}...", "x".repeat(6)));
+        let floor = fit_to_row(&args, 31, 10);
+        assert_eq!(floor.chars().count(), MIN_ARGS_BUDGET);
+        assert!(floor.ends_with("..."));
+        assert_eq!(fit_to_row("short", 31, 40), "short");
     }
 
     /// A `content` argument of kilobytes leaves the collapsed row one

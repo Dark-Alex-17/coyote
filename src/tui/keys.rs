@@ -36,10 +36,11 @@ pub(crate) struct KeyContext {
     /// enough to show all of it.
     pub(crate) question_fully_shown: bool,
     /// Whether the transcript is scrolled away from its bottom; only
-    /// then does End leave the composer to jump the view back.
+    /// then do End, and Shift+G on an empty composer, leave the
+    /// composer to jump the view back.
     pub(crate) scrolled: bool,
-    /// Whether a transcript row holds the focus; Esc and an Enter on an
-    /// empty composer go to it first.
+    /// Whether a transcript row holds the focus; an Enter on an empty
+    /// composer goes to it, and so does Esc while no turn is running.
     pub(crate) focused: bool,
 }
 
@@ -134,9 +135,14 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Up if ctrl => Action::FocusPrev,
             KeyCode::Down if ctrl => Action::FocusNext,
             KeyCode::End if ctx.scrolled => Action::ScrollToBottom,
-            // A focused row takes the first Esc; a second one interrupts.
-            KeyCode::Esc if ctx.focused => Action::ClearFocus,
+            // A draft keeps the letter: `G` mid-sentence is typing.
+            KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
+                Action::ScrollToBottom
+            }
+            // Interrupting the turn outranks a focused row; the focus
+            // goes with it.
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
+            KeyCode::Esc if ctx.focused => Action::ClearFocus,
             KeyCode::Esc => Action::Nothing,
             // The editor would inherit fds 1 and 2 on the turn's capture pipe.
             KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
@@ -273,9 +279,10 @@ mod tests {
 
     /// The transcript's keys: F2, the page and Shift+arrow scrolls and
     /// the Ctrl+arrow focus walk work whatever the turn is doing; End
-    /// goes to the view only while it is scrolled; Esc and Enter go to a
-    /// focused row first, Enter only while the composer is empty. The
-    /// plain arrows and Tab stay the composer's.
+    /// goes to the view only while it is scrolled, Shift+G only while
+    /// it is scrolled and the composer is empty; Enter goes to a
+    /// focused row while the composer is empty, Esc while no turn runs.
+    /// The plain arrows and Tab stay the composer's.
     #[test]
     fn transcript_keys() {
         let running = KeyContext {
@@ -285,6 +292,10 @@ mod tests {
         let scrolled = KeyContext {
             scrolled: true,
             ..IDLE
+        };
+        let scrolled_typing = KeyContext {
+            composer_empty: false,
+            ..scrolled
         };
         let focused = KeyContext {
             focused: true,
@@ -315,8 +326,19 @@ mod tests {
                 IDLE,
                 Action::ComposerInput(plain(KeyCode::End)),
             ),
+            (shift(KeyCode::Char('G')), scrolled, Action::ScrollToBottom),
+            (
+                shift(KeyCode::Char('G')),
+                scrolled_typing,
+                Action::ComposerInput(shift(KeyCode::Char('G'))),
+            ),
+            (
+                shift(KeyCode::Char('G')),
+                IDLE,
+                Action::ComposerInput(shift(KeyCode::Char('G'))),
+            ),
             (plain(KeyCode::Esc), focused, Action::ClearFocus),
-            (plain(KeyCode::Esc), focused_running, Action::ClearFocus),
+            (plain(KeyCode::Esc), focused_running, Action::Interrupt),
             (plain(KeyCode::Enter), focused, Action::ToggleFocused),
             (
                 plain(KeyCode::Enter),
