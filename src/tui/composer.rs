@@ -132,12 +132,24 @@ impl Composer {
         self.textarea.delete_next_char();
     }
 
-    /// Deletes the cursor's line, and the line break after it when
-    /// there is one, so the lines below move up.
+    /// Deletes the cursor's line and the line break after it, so the
+    /// lines below move up; the last line takes the break before it
+    /// instead, leaving the cursor at the head of the new last line.
     pub(super) fn delete_line(&mut self) {
+        let row = self.textarea.cursor().0;
+        let last = row + 1 == self.textarea.lines().len();
         self.textarea.move_cursor(CursorMove::Head);
-        self.textarea.delete_line_by_end();
-        self.textarea.delete_next_char();
+        // On an empty line the end-of-line delete would take the break
+        // itself and the char delete below would eat into the next line.
+        if !self.textarea.lines()[row].is_empty() {
+            self.textarea.delete_line_by_end();
+        }
+        if last {
+            self.textarea.delete_char();
+            self.textarea.move_cursor(CursorMove::Head);
+        } else {
+            self.textarea.delete_next_char();
+        }
     }
 
     /// Rows the field takes in a frame: its text rows, following the
@@ -359,6 +371,29 @@ mod tests {
         composer.move_cursor(ViMotion::WordBack);
         composer.delete_next_char();
         assert_eq!(composer.text(), "b");
+    }
+
+    #[test]
+    fn deleting_a_line_takes_only_that_line() {
+        let mut composer = Composer::new(BACKGROUND);
+        composer.set_text("one\n\nthree");
+        composer.move_cursor(ViMotion::Up);
+        composer.delete_line();
+        assert_eq!(composer.text(), "one\nthree", "an empty middle line");
+
+        composer.set_text("one\n");
+        composer.delete_line();
+        assert_eq!(composer.text(), "one", "an empty last line");
+        assert_eq!(composer.textarea.cursor(), (0, 0));
+
+        composer.set_text("one\ntwo\nthree");
+        composer.move_cursor(ViMotion::Up);
+        composer.delete_line();
+        assert_eq!(composer.text(), "one\nthree", "a middle line with text");
+
+        composer.set_text("one\ntwo");
+        composer.delete_line();
+        assert_eq!(composer.text(), "one", "the last line with text");
     }
 
     #[test]
