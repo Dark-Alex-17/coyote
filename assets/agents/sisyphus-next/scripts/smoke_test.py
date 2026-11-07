@@ -190,11 +190,16 @@ check("A10: anomalies harvested into anomalies_log and reset", u["anomalies_log"
 # ---------------------------------------------------------------- subtasks (B2/B3)
 subs = [{"title": f"s{i}", "outcome": f"o{i}", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX)]
 u = gates.record_subtasks(base_state(subtasks=subs))
-check("record_subtasks: <=3 recorded", u["_next"] == "next_subtask" and os.path.exists(os.path.join(base_state()["run_dir"], "tasklog.md")))
-u = gates.record_subtasks(base_state(subtasks=subs + [{"title": "s4", "outcome": "o", "acceptance_criteria": []}]))
-check("record_subtasks: B2 >3 -> end_redirect (plan-shaped)", u["_next"] == "end_redirect")
-u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="cross-PR"))
-check("record_subtasks: empty -> end_redirect with reason", u["_next"] == "end_redirect" and "cross-PR" in u["redirect_reason"])
+check("record_subtasks: up to SUBTASK_MAX recorded", u["_next"] == "next_subtask" and os.path.exists(os.path.join(base_state()["run_dir"], "tasklog.md")))
+u = gates.record_subtasks(base_state(subtasks=subs + [{"title": "s7", "outcome": "o", "acceptance_criteria": []}], top_level=False))
+check("record_subtasks: B2 more than SUBTASK_MAX in a delegated run -> end_redirect (plan-shaped)", u["_next"] == "end_redirect")
+u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="cross-PR", top_level=False))
+check("record_subtasks: empty in a delegated run -> end_redirect with reason", u["_next"] == "end_redirect" and "cross-PR" in u["redirect_reason"])
+u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="needs cross-PR sequencing", top_level=True))
+check("record_subtasks: empty at the top level -> sizing_verdict [architect, narrow] with the reason in the question",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "sizing_verdict"
+      and [o["text"] for o in u["escalation"]["options"]] == [gates.SIZING_ARCHITECT, gates.SIZING_NARROW]
+      and "needs cross-PR sequencing" in u["escalation"]["question"])
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=0, intent="implementation"))
 check("next_subtask: first -> plan_research, counters reset", u["_next"] == "plan_research" and u["fix_strikes"] == 0 and u["task_number"] == 1 and f"Subtask 1/{SUBTASK_MAX}" in u["current_task"])
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=SUBTASK_MAX))
@@ -729,6 +734,69 @@ check("sizing: an Other reply that narrows the scope -> interpret_reply's narrow
 check("sizing: a whole-reply abort ends the run; the verdict re-asks at most CLARIFY_MAX times, then redirects",
       gates.apply_answer({**ss, "last_answer": "abort"})["_next"] == "end_aborted"
       and gates.route_intent(base_state(**sz, sizing_rounds=CLARIFY_MAX))["_next"] == "end_redirect")
+SDIR = os.path.join(SREPO, "plans", "engineer-handoffs")
+_before = sorted(os.listdir(SDIR))
+s2, u = chain({**ss, "last_answer": "don't hand it to the architect, do it here", "run_id": "sz3"}, "apply_answer")
+check("sizing: only an exact option counts - a negated reply naming the architect picks none -> end_redirect, nothing written",
+      u["_next"] == "end_redirect" and "picked none of the sizing options" in s2["redirect_reason"]
+      and sorted(os.listdir(SDIR)) == _before and not s2.get("architect_handoff"))
+s2, u = chain({**ss, "last_answer_text": "", "last_answer": "", "reask_rounds": REASK_MAX, "run_id": "sz3"},
+              "parse_answer", "apply_answer")
+check("sizing: an empty reply after the re-asks never picks the hard-trigger recommendation -> end_redirect, no file",
+      u["_next"] == "end_redirect" and s2["last_answer"] == "" and sorted(os.listdir(SDIR)) == _before
+      and not any("the recommended option" in d for d in s2["decisions"]))
+s2, u = chain({**ss, "top_level": False, "last_answer": gates.SIZING_ARCHITECT, "run_id": "sz3"}, "apply_answer")
+check("sizing: the architect option in a delegated run writes no handoff -> end_redirect, ledgered",
+      u["_next"] == "end_redirect" and sorted(os.listdir(SDIR)) == _before
+      and any("delegated run -> end_redirect, nothing written" in d for d in s2["decisions"]))
+s2, u = chain({**ss, "last_answer": gates.SIZING_ARCHITECT, "run_id": "sz2"}, "apply_answer")
+check("sizing: both handoff names taken -> end_redirect saying so, ledgered, the run-dir copy kept",
+      u["_next"] == "end_redirect" and "both names taken" in s2["redirect_reason"]
+      and any("both names taken" in d for d in s2["decisions"]) and sorted(os.listdir(SDIR)) == _before)
+keep = handoff("keep-ready.md")
+s2, u = chain({**ss, "project_dir": BADREPO, "git_root": BADREPO, "handoff_path": keep,
+               "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: a picked-up sisyphus handoff stays ready when the architect handoff was not written",
+      u["_next"] == "end_redirect" and fm(keep)["status"] == "ready")
+RDIR = os.path.join(TMP, "rdir-blocked")
+os.makedirs(os.path.join(RDIR, "architect-handoff.md"))
+s2, u = chain({**ss, "project_dir": BADREPO, "git_root": BADREPO, "run_dir": RDIR,
+               "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: a failing run-dir fallback is ledgered and named in the redirect, never a crash",
+      u["_next"] == "end_redirect" and "run-dir copy failed too" in s2["redirect_reason"]
+      and any("run-dir copy of the architect handoff could not be written" in d for d in s2["decisions"]))
+SYMREPO, OUTSIDE = os.path.join(TMP, "symrepo"), os.path.join(TMP, "outside-handoffs")
+os.makedirs(os.path.join(SYMREPO, "plans"))
+os.makedirs(OUTSIDE)
+os.symlink(OUTSIDE, os.path.join(SYMREPO, "plans", "engineer-handoffs"))
+s2, u = chain({**ss, "project_dir": SYMREPO, "git_root": SYMREPO, "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: a symlinked engineer-handoffs dir outside the project is refused -> run-dir copy, end_redirect, ledgered",
+      u["_next"] == "end_redirect" and os.listdir(OUTSIDE) == [] and "resolves outside the project" in s2["redirect_reason"]
+      and any("resolves outside the project" in d for d in s2["decisions"]))
+TREPO = os.path.join(TMP, "trepo")
+os.makedirs(TREPO)
+s2, u = chain({**ss, "project_dir": TREPO, "git_root": TREPO, "brief": "# ../../../tmp/evil: x/y\\z \"q\"\nsecond line\n\nbody",
+               "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+_hp = s2.get("architect_handoff", "")
+check("sizing: a hostile, path-like title lands under plans/engineer-handoffs with a sanitized name and a one-line title",
+      u["_next"] == "end_handoff" and os.path.dirname(_hp) == os.path.join(os.path.realpath(TREPO), "plans", "engineer-handoffs")
+      and re.fullmatch(r"[a-z0-9-]+\.md", os.path.basename(_hp)) is not None
+      and "\n" not in _lib.frontmatter(open(_hp).read())[0].get("title", "\n") and not os.path.exists(os.path.join(TMP, "evil")))
+two = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("A", True), option("B", True)]))
+check("ladder: an escalation that carried several recommended options is escalated, never auto-picked",
+      two["escalation"]["data"]["recommended_count"] == 2
+      and gates.ladder_route(base_state(escalation=two["escalation"], ladder_resolution="recommended", ladder_choice="A"))["_next"]
+      == "ask_dispatch")
+pdc = gates.raise_escalation(base_state(), {}, pd)["escalation"]
+s2, u = chain(base_state(escalation=pdc, last_answer_text="abort", last_answer="abort"), "parse_answer", "apply_answer")
+check("choice: a whole-reply abort at a multiple-choice prompt goes straight to apply_answer and stops",
+      pdc["data"]["multiple_choice"] and u["_next"] == "end_blocked" and s2["last_answer"] == "abort"
+      and gates.parse_answer(base_state(escalation=dup["escalation"], last_answer_text="abort"))["_next"] == "interpret_reply")
+s2, u = chain(base_state(escalation=mce, last_answer_text="why retry?"), "choice_park")
+check("choice: a parked multiple-choice question carries the Option N labels, the recommended one marked once",
+      [o["label"] for o in s2["discussion"]["options"]] == ["Option 1 (recommended)", "Option 2", "Option 3"]
+      and "Option 1 (recommended): Retry the consult\n" in s2["discussion_message"]
+      and "(recommended) (recommended)" not in s2["discussion_message"])
 oj = escalation("pr_review_owner_judgment", "q", [option("Fix them as the reviewer asks"), option("Skip them and keep watching"),
                                                   option("Stop watching and report")],
                 data={"judgment": [{"id": "c1", "kind": "comment", "url": "u", "body": "b", "question": "q"}], "noaction": []})

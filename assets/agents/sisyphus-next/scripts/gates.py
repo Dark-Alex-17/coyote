@@ -25,7 +25,7 @@ from _lib import (  # noqa: E402
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
-    STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, frontmatter, read_file, render_question,
+    STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, ledger, load_state, match_option,
@@ -416,7 +416,10 @@ def _handoff_title(state):
 
 
 def _write_architect_handoff(state, u):
-    """Write the brief and the assess findings as a ready `vehicle: architect` engineer handoff; its path, or ""."""
+    """Write the brief and the assess findings as a ready `vehicle: architect` engineer handoff.
+
+    Returns (path, "") when written, else ("", the reason for the redirect); the text then goes to the run dir.
+    """
     project = os.path.realpath(state.get("git_root") or state.get("project_dir") or ".")
     title = _handoff_title(state)
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60].strip("-") or "handoff"
@@ -438,20 +441,48 @@ def _write_architect_handoff(state, u):
     lines += [f"- {b}" for b in breakdown] or ["(none proposed)"]
     lines += ["", "## Acceptance criteria (verbatim)", "", str(state.get("spec_text") or "").strip() or "(none stated)"]
     text = "\n".join(lines) + "\n"
+    names = (f"{slug}.md", f"{slug}-{state.get('run_id') or 'run'}.md")
+    why = ""
     try:
-        os.makedirs(folder, exist_ok=True)
-        for name in (f"{slug}.md", f"{slug}-{state.get('run_id') or 'run'}.md"):
-            path = os.path.join(folder, name)
-            try:
-                with open(path, "x", encoding="utf-8", newline="\n") as f:
-                    f.write(text)
-                return path
-            except FileExistsError:
-                continue
+        # a symlinked plans/ or engineer-handoffs/ committed in the repo must not carry the write outside it
+        if _inside(os.path.realpath(folder), project):
+            os.makedirs(folder, exist_ok=True)
+        if not _inside(os.path.realpath(folder), project):
+            why = f"{folder} resolves outside the project ({os.path.realpath(folder)})"
+        else:
+            for name in names:
+                path = os.path.join(folder, name)
+                try:
+                    with open(path, "x", encoding="utf-8", newline="\n") as f:
+                        f.write(text)
+                    return path, ""
+                except FileExistsError:
+                    continue
+            why = f"both names taken under {folder} ({' and '.join(names)})"
     except OSError as e:
-        ledger(state, u, f"sizing: the architect handoff could not be written under {folder}: {e}")
-    write_artifact(state.get("run_dir") or "", "architect-handoff.md", text)
-    return ""
+        why = f"{folder} could not be written ({e})"
+    ledger(state, u, f"sizing: the architect handoff was not written: {why}")
+    kept = os.path.join(state.get("run_dir") or "", "architect-handoff.md")
+    try:
+        write_artifact(state.get("run_dir") or "", "architect-handoff.md", text)
+    except OSError as e:
+        ledger(state, u, f"sizing: the run-dir copy of the architect handoff could not be written either: {e}")
+        return "", f"the handoff was not written ({why}), and its run-dir copy failed too ({e})."
+    return "", f"the handoff was not written ({why}), so its text is at {kept}."
+
+
+def _inside(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:  # another drive on Windows
+        return False
+
+
+def _sizing_pick(answer, options):
+    """The sizing option a reply names exactly (its label, its number or its whole text), or None."""
+    reply = (answer or "").strip()
+    m = re.match(r"(?i)^option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", reply)
+    return _exact_option(m.group(1) if m else reply, options)
 
 
 def _narrow_scope(state, u, scope):
@@ -793,7 +824,8 @@ def normalize_choices(state, u, esc):
         ledger(state, u, f"choice: {len(recommended)} recommended options on {asked!r}; kept the first: "
                          f"{picked[recommended[0]]['text']}")
     picked.insert(0, picked.pop(recommended[0]))
-    return {**esc, "options": picked, "data": {**as_dict(esc.get("data")), "multiple_choice": True}}
+    return {**esc, "options": picked,
+            "data": {**as_dict(esc.get("data")), "multiple_choice": True, "recommended_count": len(recommended)}}
 
 
 def raise_escalation(state, u, esc):
@@ -838,6 +870,10 @@ def ladder_route(state):
     harvest_anomalies(state, u, "ladder_judge")
     esc = as_dict(state.get("escalation"))
     res = state.get("ladder_resolution") or "escalate"
+    if res == "recommended" and as_int(as_dict(esc.get("data")).get("recommended_count")) > 1:
+        # the escalation named several recommended options before normalization kept one: no clear recommendation
+        ledger(state, u, f"ladder: {esc.get('kind')} carried several recommended options; escalating")
+        res = "escalate"
     if res in ("ruling", "recommended"):
         choice = match_option(state.get("ladder_choice") or "", esc.get("options") or [])
         if choice is None and res == "recommended":
@@ -959,6 +995,9 @@ def parse_answer(state):
     else:
         # at a multiple-choice prompt a qualified pick ("Option 2, but ...") names no option and is interpreted
         choice = _choice_pick(text, options) if picker else match_option(text, options)
+        if choice is None and kind in STOP_AWARE_KINDS and re.sub(r"[\W_]+$", "", text.lower()) in STOP_REPLIES:
+            # a whole-reply stop goes straight to apply_answer, which stops; it is never interpreted or re-asked
+            choice = text
         if choice is None and text and not truthy(state.get("reply_interpreted")):
             # the first typed reply that names no option is interpreted once, never re-asked blind
             u["reply_accepts"] = _accepts_text(kind)
@@ -972,7 +1011,8 @@ def parse_answer(state):
                                  f"free text stands after {REASK_MAX} tries).\n\n" + state.get("ask_question", ""))
             u["_next"] = _terminal_prompt(esc)
             return u
-        if not text and options and picker:
+        if not text and options and picker and not esc.get("hard_trigger"):
+            # a hard trigger is the user's call: an empty reply never picks its recommended option
             choice = options[0].get("text", "")
             ledger(state, u, f"choice: {kind}: empty reply after {REASK_MAX} re-asks -> the recommended option: "
                              f"{tail(choice, 200)}")
@@ -1104,7 +1144,8 @@ def _discussion_message(d, delegated=False):
     """
     lines = ["SISYPHUS_AWAITING_DISCUSSION", f"A {d['kind']} question is open for discussion:", d["question"]]
     if d["options"]:
-        lines += ["", "Options:"] + [f"  {o['label']}: {o['text']}" + (" (recommended)" if o["recommended"] else "")
+        lines += ["", "Options:"] + [f"  {o['label']}: {o['text']}"
+                                    + (" (recommended)" if o["recommended"] and "(recommended)" not in o["label"] else "")
                                     for o in d["options"]]
     lines += ["", f"Your reply: {d['reply']}", "", d["resume"], "", f"Sisyphus run id: {d['run_id']}"]
     if delegated:
@@ -1144,9 +1185,11 @@ def choice_park(state):
     parks[key] = count + 1
     run_id = state.get("run_id") or ""
     data = as_dict(esc.get("data"))
+    picker = truthy(data.get("multiple_choice"))
     u["discussion"] = {
         "run_id": run_id, "kind": kind, "question": data.get("asked") or esc.get("question", ""),
-        "options": [{"label": str(i), "text": o.get("text", ""), "recommended": truthy(o.get("recommended")),
+        "options": [{"label": choice_label(i - 1) if picker else str(i), "text": o.get("text", ""),
+                     "recommended": truthy(o.get("recommended")),
                      "evidence": o.get("evidence", "")} for i, o in enumerate(esc.get("options") or [], 1)],
         "reply": (state.get("last_answer_text") or "").strip(), "task": tail(state.get("current_task") or "", 600),
         "resume": ('Discuss it here. When it is settled, say "continue" to be asked this question again, or '
@@ -1208,6 +1251,10 @@ def _answered(state, choices, default=None):
 
 
 STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and report", "stop and report")
+# the kinds whose apply_answer branch reads a whole-reply stop; only these take a bare "abort" without interpreting it
+STOP_AWARE_KINDS = ("clarify", "handoff_confirm", "handoff_path", "sizing_verdict", "sizing_narrow", "oracle_fault",
+                    "engine_fault", "plan_defect", "review_incomplete", "strikeout", "lane_stuck", "review_exhausted",
+                    "scope_breach", "pr_review_owner_judgment")
 
 
 def _whole_reply_stop(answer, options=(), stop_options=None):
@@ -1294,13 +1341,19 @@ def apply_answer(state):
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "sizing_verdict":
-        planned = truthy(as_dict(esc.get("data")).get("planned"))
-        a = _answered(state, {"architect": [SIZING_ARCHITECT.lower()], "here": ["do it here"],
-                              "narrow": [SIZING_NARROW.lower()]})
-        if a == "architect":
-            path = _write_architect_handoff(state, u)
-            _consume_handoff(state, u)
+        # only an exact option or the narrow instruction counts: "don't hand it to the architect" picks nothing
+        picked = _sizing_pick(answer, options)
+        narrowed = answer.strip()[len(SIZING_NARROW_PREFIX):].strip() \
+            if answer.strip().startswith(SIZING_NARROW_PREFIX) else ""
+        if picked == SIZING_ARCHITECT and not truthy(state.get("top_level")):
+            u["redirect_reason"] = ("Plan-shaped work for the architect; a delegated run writes no handoff, its "
+                                    "parent owns the planning.")
+            ledger(state, u, "sizing: the architect option in a delegated run -> end_redirect, nothing written")
+            u["_next"] = "end_redirect"
+        elif picked == SIZING_ARCHITECT:
+            path, why = _write_architect_handoff(state, u)
             if path:
+                _consume_handoff(state, u)
                 u["architect_handoff"] = path
                 u["handoff_report"] = (
                     f"Wrote the architect handoff {path} (status: ready, vehicle: architect). Start an architect-next "
@@ -1309,11 +1362,9 @@ def apply_answer(state):
                 ledger(state, u, f"sizing: handed to the architect: {path}")
                 u["_next"] = "end_handoff"
             else:
-                kept = os.path.join(state.get("run_dir") or "", "architect-handoff.md")
-                u["redirect_reason"] = (f"Plan-shaped work for the architect; the handoff could not be written under "
-                                        f"plans/engineer-handoffs/, so its text is at {kept}.")
+                u["redirect_reason"] = f"Plan-shaped work for the architect; {why}"
                 u["_next"] = "end_redirect"
-        elif a == "here" and not planned:
+        elif picked == SIZING_HERE:
             u["sizing_note"] = (f"The user chose to do this work here despite a plan-shaped sizing verdict "
                                 f"({state.get('sizing_reason') or 'no reason recorded'}). Fit it into at most "
                                 f"{SUBTASK_MAX} sealed subtasks; return an empty list with plan_shaped_reason only "
@@ -1321,10 +1372,9 @@ def apply_answer(state):
             _consume_handoff(state, u)
             ledger(state, u, f"sizing: doing plan-shaped work here in at most {SUBTASK_MAX} subtasks (user's choice)")
             u["_next"] = "plan_subtasks"
-        elif a == "narrow" and answer.strip().startswith(SIZING_NARROW_PREFIX) and \
-                answer.strip()[len(SIZING_NARROW_PREFIX):].strip():
-            _narrow_scope(state, u, answer.strip()[len(SIZING_NARROW_PREFIX):])
-        elif a == "narrow":
+        elif narrowed:
+            _narrow_scope(state, u, narrowed)
+        elif picked == SIZING_NARROW:
             raise_escalation(state, u, escalation(
                 "sizing_narrow", "Which narrower part of the work should this run do? Describe the scope; it is sized "
                                  "again before any work starts.", [], hard_trigger=True, tier3_ok=False))
