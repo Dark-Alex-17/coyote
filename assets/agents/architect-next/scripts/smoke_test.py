@@ -966,6 +966,7 @@ p = u["delegation_prompt"]
 check("compose_delegation: single template - run branch, no PR, MUST NOT branches; never the multi blocks; task file + plan section + quality bar pasted",
       "feat/PLAN-widgets" in p and "Do NOT open a PR" in p and "DRAFT PR" not in p and "### Task file (verbatim)" in p and "Do widget-model" in p
       and "## Quality bar" not in p and "rigor=" in p and "## MODE" not in p and u["delegate_review_cadence"] == "task")
+U_SEQ = u
 ts_m = copy.deepcopy(TS1)
 gates.task_by_id(ts_m, T1)["pr_base"] = "main"
 gates.task_by_id(ts_m, T1)["branch"] = "feat/task-101-widget-model"
@@ -977,9 +978,10 @@ gates.task_by_id(ts_m, T1)["pr_base"] = "feat/task-100-base"
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=ts_m, current_task=T1, pr_strategy="multi", delegation_kind="implement"))
 check("compose_delegation: multi stacked on an unmerged blocker -> STACKED PR block (cascade rule)", MULTI_IS_GROUPS or ("STACKED PR" in u["delegation_prompt"] and "never force-push" in u["delegation_prompt"]))
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, run_branch="feat/PLAN-widgets", task_granularity="micro"))
-check("compose_delegation: micro -> MODE block review_cadence=batch + context pack section + mode-degraded ledger (E9/V9)",
+check("compose_delegation: micro -> MODE block review_cadence=batch + context pack section; the cadence rides delegate_review_cadence, no mode-degraded ledger (V9)",
       "## MODE" in u["delegation_prompt"] and "review_cadence=batch" in u["delegation_prompt"] and "### Context pack" in u["delegation_prompt"]
-      and u["delegate_review_cadence"] == "batch" and any(d.startswith("mode-degraded") for d in u["decisions"]))
+      and u["delegate_review_cadence"] == "batch" and not any(d.startswith("mode-degraded") for d in u["decisions"]))
+U_MICRO = u
 rd = base_state()["run_dir"]
 write(os.path.join(rd, "reports", f"{T1}-r1.md"), "Implemented.\nHEAD SHA abc1234\nSisyphus run id: 20260101T000000-0badf00d\nFOLLOW-UPS: none\n")
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, run_branch="feat/PLAN-widgets", delegation_kind="fix",
@@ -1000,6 +1002,148 @@ check("route_delegate: report stored (reports/<task>-rN.md) + parsed (SHA, follo
       and pr_["design_asks"] == ["ASK -- should the worker share the store?"] and pr_["sisyphus_run_id"] == "20260101T000000-0badf00d")
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="SISYPHUS_FAILED\ncould not complete: build broken"))
 check("route_delegate: failure sentinel -> oracle_diagnose", u["_next"] == "oracle_diagnose")
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1,
+                                    delegate_result="SISYPHUS_REDIRECT\nPlan-shaped work: this wants an architect run.\n\nSisyphus run id: 20260101T000000-0badf00d"))
+check("route_delegate: sisyphus-next SISYPHUS_REDIRECT on its own line (no work landed) -> oracle_diagnose", u["_next"] == "oracle_diagnose")
+QUOTED = REPORT_OK.replace("Done.\n", "Done. The brief named no `SISYPHUS_REDIRECT` case; one test could not complete on the first try and passed on rerun.\n")
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=QUOTED, delegation_kind="implement"))
+check("route_delegate: a successful report that quotes SISYPHUS_REDIRECT mid-line and says 'could not complete' in prose -> verify_gate",
+      u["_next"] == "verify_gate", u.get("decisions"))
+NO_RUN_ID = QUOTED.replace("\nSisyphus run id: 20260101T000000-0badf00d\n", "\n")
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=NO_RUN_ID, delegation_kind="implement"))
+check("route_delegate: a report with no run id that says 'could not complete' mid-line in its opening lines -> verify_gate",
+      "Sisyphus run id" not in NO_RUN_ID and u["_next"] == "verify_gate", u.get("decisions"))
+ANSWER = "Exploration answer: the widget store lives in src/a.go and is read by the worker.\n\nSisyphus run id: 20260101T000000-0badf00d"
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=ANSWER, delegation_kind="implement"))
+check("route_delegate: an answer-shaped return (run id, no HEAD SHA, no ledger section, no sentinel) -> oracle_diagnose, ledgered",
+      u["_next"] == "oracle_diagnose" and any("returned an answer" in d for d in u["decisions"]), u.get("decisions"))
+
+# The delegate's final report as the real sisyphus-next `final_report` renders it, wrapped the way its end_complete node does.
+SN_SCRIPTS = os.path.join(HERE, "..", "..", "sisyphus-next", "scripts")
+SN_ROOT = os.path.join(TMP, "sn-report")
+os.makedirs(SN_ROOT, exist_ok=True)
+SN_STATE = {"run_id": "20260102T030405-0123abcd", "run_dir": os.path.join(SN_ROOT, "run"), "project_dir": SN_ROOT, "git_root": SN_ROOT,
+            "base_sha": "1111111", "head_sha": "2a3b4c5d6e7f", "intent": "implementation", "sizing": "single", "review_cadence": "batch",
+            "coder_result": "CODER_COMPLETE\nBuild: ok\nTests: ok", "coder_sentinel": "CODER_COMPLETE", "gauntlet_verdict": "PASS",
+            "round_heads": [{"round": 1, "head": "2a3b4c5", "verdict": "PASS"}],
+            "debt_left_behind": ["src/a.rs:3 -- #[allow(dead_code)] -- TASK-999"], "debris_exemptions": ["src/b.rs:4 -- the arrow is the point"],
+            "design_decisions": ["introduced a WidgetStore trait in src/a.rs"], "observability_artifact": "## Observability\n\nNo operational surface added.",
+            "follow_ups": ["rotate the widget key before merge"], "anomalies_log": ["a flaky unrelated test"], "git_report": "pushed 2a3b4c5d6e7f"}
+
+
+def sisyphus_next_call(gate, state):
+    """(process, updates): one of sisyphus-next's own gates over `state`, run from its scripts dir without bytecode."""
+    proc = subprocess.run([sys.executable, "-B", "-c", f"import json, sys; import gates; print(json.dumps(gates.{gate}(json.load(sys.stdin)), default=str))"],
+                          input=json.dumps(state), capture_output=True, text=True, cwd=SN_SCRIPTS,
+                          env={**{k: v for k, v in os.environ.items() if k not in ("GRAPH_STATE", "GRAPH_STATE_FILE")},
+                               "COYOTE_CACHE_DIR": os.path.join(TMP, "sn-cache")})
+    return proc, (json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else {})
+
+
+def sisyphus_next_report(state):
+    """(process, report): sisyphus-next's own final_report over `state`."""
+    proc, out = sisyphus_next_call("final_report", state)
+    return proc, out.get("report", "")
+
+
+p, SN_REPORT = sisyphus_next_report(SN_STATE)
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegation_kind="implement",
+                                    delegate_result="Implemented the widget model; build and tests green.\n\n" + SN_REPORT))
+sn_pr = u["report_parsed"]
+check("route_delegate: the real sisyphus-next final report parses - HEAD SHA, run id, debt / exemptions / design / follow-ups, "
+      "each section stopping at the next markdown heading -> verify_gate",
+      SN_REPORT.startswith("# Sisyphus run report") and u["_next"] == "verify_gate" and sn_pr["head_sha"] == "2a3b4c5d6e7f"
+      and "2a3b4c5d6e7f" in sn_pr["shas"] and sn_pr["sisyphus_run_id"] == "20260102T030405-0123abcd"
+      and sn_pr["debt"] == ["src/a.rs:3 -- #[allow(dead_code)] -- TASK-999"] and sn_pr["exemptions"] == ["src/b.rs:4 -- the arrow is the point"]
+      and sn_pr["design"] == ["introduced a WidgetStore trait in src/a.rs"] and sn_pr["design_asks"] == []
+      and sn_pr["follow_ups"] == ["rotate the widget key before merge"] and gates.task_by_id(u["tasks"], T1)["sisyphus_run_id"] == "20260102T030405-0123abcd",
+      f"rc={p.returncode} stderr={p.stderr[-300:]} parsed={sn_pr}")
+empty = dict(SN_STATE, debt_left_behind=[], debris_exemptions=[], design_decisions=[], follow_ups=[], observability_artifact="")
+p, sn_empty = sisyphus_next_report(empty)
+sn_pr = gates._parse_report(sn_empty)
+check("route_delegate: a sisyphus-next report with every ledger section `- none` / `none` parses to empty lists",
+      "Design decisions:\n- none" in sn_empty and sn_pr["debt"] == [] and sn_pr["exemptions"] == [] and sn_pr["design"] == [] and sn_pr["follow_ups"] == [],
+      f"{p.stderr[-300:]} {sn_pr}")
+
+# ---------------------------------------------------------------- relay: a delegated child's discussion (sequential)
+# The child's park as the real sisyphus-next choice_park renders it for a delegated run (its end_discussion output).
+SN_DISC_ID = "20260103T040506-0fedcba9"
+SN_ESC = {"kind": "plan_defect", "question": "Criterion 2 contradicts the schema. Amend the criterion or keep it?",
+          "options": [{"text": "Amend criterion 2 to match the schema", "recommended": True, "evidence": ""},
+                      {"text": "Keep criterion 2 and change the schema", "recommended": False, "evidence": ""}],
+          "evidence": "", "data": {}, "hard_trigger": False, "tier3_ok": True, "return_to": ""}
+p, sn_park = sisyphus_next_call("choice_park", {"run_id": SN_DISC_ID, "run_dir": os.path.join(TMP, "sn-runs", SN_DISC_ID),
+                                                "escalation": SN_ESC, "last_answer_text": "why does the schema win?",
+                                                "delegated": True, "choice_parks": {}, "decisions": []})
+SN_DISC = sn_park.get("discussion_message", "")
+sn_d = gates._child_discussion(SN_DISC)
+check("relay: the real sisyphus-next delegated end_discussion parses - question, options with the recommended one, reply, run id",
+      SN_DISC.startswith("SISYPHUS_AWAITING_DISCUSSION") and sn_d["question"] == SN_ESC["question"] and sn_d["run_id"] == SN_DISC_ID
+      and sn_d["options"] == [{"text": o["text"], "recommended": o["recommended"]} for o in SN_ESC["options"]]
+      and sn_d["reply"] == "why does the schema win?" and sn_d["kind"] == "plan_defect", f"rc={p.returncode} {p.stderr[-300:]} {sn_d}")
+RELAY_ID = _lib.new_run_id("relay of a child discussion")
+RS = base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, delegation_kind="implement", run_id=RELAY_ID,
+                run_dir=_lib.run_dir_for(RELAY_ID), delegate_result=SN_DISC, choice_parks={})
+os.makedirs(RS["run_dir"], exist_ok=True)
+RS.update(gates.route_delegate(RS))
+resc = RS.get("escalation") or {}
+check("relay: route_delegate on SISYPHUS_AWAITING_DISCUSSION -> escalate_gate (never the oracle) with delegate_discussion carrying "
+      "the child's question, options, run id and task",
+      RS["_next"] == "escalate_gate" and resc.get("kind") == "delegate_discussion" and SN_ESC["question"] in resc.get("question", "")
+      and [o["text"] for o in resc.get("options", [])] == [o["text"] for o in SN_ESC["options"]] and resc["options"][0]["recommended"]
+      and resc["data"]["child_run_id"] == SN_DISC_ID and resc["data"]["task"] == T1 and resc["data"]["relay_pending"] is True
+      and resc["hard_trigger"] and RS["last_answer_text"] == "why does the schema win?"
+      and not any("oracle" in d for d in RS["decisions"]), RS.get("decisions"))
+RS.update(gates.escalate_gate(dict(RS, escalation_policy="autonomous")))
+check("relay: escalate_gate parks a pending relay at once, whatever the policy (no ask, no ladder)",
+      RS["_next"] == "choice_park" and RS["escalation"]["data"]["relay_pending"] is False)
+RS.update(gates.choice_park(RS))
+rd_ = RS.get("discussion") or {}
+check("relay: choice_park parks this run on the child's question -> end_discussion, the run id carried, keyed per task + question",
+      RS["_next"] == "end_discussion" and RS["parked"] == gates.DISCUSSION_PARKED and RS["discussion_run_id"] == RELAY_ID
+      and rd_.get("question") == SN_ESC["question"] and rd_.get("kind") == "delegate_discussion" and rd_.get("reply") == "why does the schema win?"
+      and RS["choice_parks"] == {resc["data"]["park_key"]: 1} and RS["discussion_message"].startswith("ARCHITECT_AWAITING_DISCUSSION"), rd_)
+
+
+def relay_reenter(prompt):
+    r = {"initial_prompt": prompt, "discussion_run_id": RELAY_ID, **STORE.variables(DESIGN, TMP)}
+    for gate in (gates.intake, gates.resume_route, gates.choice_resume):
+        r.update(gate(r))
+    return r
+
+
+r = relay_reenter("continue")
+check("relay: a bare 'continue' re-asks the relayed question (escalate_gate, no park, no re-delegation)",
+      r["_next"] == "escalate_gate" and r["escalation"]["kind"] == "delegate_discussion"
+      and r["ask_question"] == _lib.render_question(r["escalation"]), r.get("_next"))
+r.update(gates.escalate_gate(r))
+check("relay: the re-asked question goes to the owner, not straight back into a park", r["_next"] == "ask_dispatch", r.get("_next"))
+r = relay_reenter("continue: 1")
+r.update(gates.parse_answer(r))
+r.update(gates.apply_answer(r))
+U_RESUME = gates.compose_delegation(r)
+check("relay: 'continue: 1' -> the option text relayed; compose_delegation kind=resume with exactly the child's resume form",
+      r["delegation_kind"] == "resume" and U_RESUME["delegation_prompt"] == f"Sisyphus run id: {SN_DISC_ID}\ncontinue: {SN_ESC['options'][0]['text']}"
+      and U_RESUME["delegate_project_dir"] == CODE and U_RESUME["delegate_parallel"] == "0" and U_RESUME["delegate_review_cadence"] == "task",
+      U_RESUME.get("delegation_prompt"))
+r = relay_reenter("continue: keep it, the schema is wrong; fix the schema in src/a.go")
+r.update(gates.parse_answer(r))
+check("relay: a typed answer that names no option is interpreted once (the kind accepts an `answer` instruction)",
+      r["_next"] == "interpret_reply" and "- answer:" in r["reply_accepts"], r.get("_next"))
+r.update(reply_verdict="instruction", reply_instruction="answer", reply_value="keep it")
+r.update(gates.interpret_route(r))
+r.update(gates.apply_answer(r))
+u = gates.compose_delegation(r)
+check("relay: the `answer` instruction keeps the owner's verbatim text in the resume prompt",
+      u["delegation_prompt"] == f"Sisyphus run id: {SN_DISC_ID}\ncontinue: keep it, the schema is wrong; fix the schema in src/a.go", u["delegation_prompt"])
+r.update(u)
+r.update(delegate_result=SN_REPORT)
+r.update(gates.route_delegate(r))
+check("relay: the resumed child's final report -> route_delegate as normal (verify_gate), the delegation kind restored",
+      r["_next"] == "verify_gate" and r["delegation_kind"] == "implement" and r["resume_run_id"] == "", r.get("_next"))
+u = gates.choice_park(base_state(escalation=dict(resc, data=dict(resc["data"], relay_pending=False)), last_answer_text="why?",
+                                 choice_parks={resc["data"]["park_key"]: _lib.DISCUSSION_PARKS_MAX}))
+check("relay: the per-question park cap applies to a relayed question -> choice_reask", u["_next"] == "choice_reask", u.get("_next"))
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="Agent node failed: timeout"))
 check("route_delegate: agent node failed -> oracle_diagnose (evidence = the error)", u["_next"] == "oracle_diagnose" and "timeout" in u["failure_evidence"])
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="STOP: the plan is wrong - criterion 3 contradicts the schema; cannot proceed"))
@@ -1325,17 +1469,47 @@ check("task_done_route: full -> select_tasks", gates.task_done_route(base_state(
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 ts_w = tasks_with()
 u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=ts_w, wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1"))
-check("wave_claim: worktrees + task branches from the run branch; roster in every prompt; mode-degraded ledgered (E9)",
+check("wave_claim: worktrees + task branches from the run branch; roster in every prompt; every item carries review_cadence=task; no mode-degraded ledger",
       len(u["wave"]) == 2 and all(os.path.isdir(w["worktree"]) for w in u["wave"]) and all("Teammate roster" in w["prompt"] and "parallel=1" in w["prompt"] for w in u["wave"])
-      and T3 in u["wave"][0]["prompt"] and u["wave"][0]["branch"].startswith("feat/PLAN-widgets-task-") and any(d.startswith("mode-degraded") for d in u["decisions"]))
+      and T3 in u["wave"][0]["prompt"] and u["wave"][0]["branch"].startswith("feat/PLAN-widgets-task-")
+      and all(w.get("review_cadence") == "task" for w in u["wave"]) and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])))
 WAVE = u["wave"]
 TS_W = u["tasks"]
 u = gates.wave_verify_build(base_state(plan_path=PROMOTED, tasks=TS_W, wtask=WAVE[0], wave_delegate_result=REPORT_OK))
 check("wave_verify_build: fork-local conformance prompt over the worktree", "Post-implementation review gate." in u["gauntlet_prompt"] and WAVE[0]["worktree"] in u["gauntlet_prompt"])
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GPASS, wave_fix_rounds=0))
 check("wave_route: CONFORMS -> result conforms (chain ends)", "_next" not in u and u["wave_result"]["status"] == "conforms")
+u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=QUOTED, wave_gauntlet_result=GPASS, wave_fix_rounds=0))
+check("wave_route: a conforming report that quotes SISYPHUS_REDIRECT mid-line -> conforms, never failed",
+      u["wave_result"]["status"] == "conforms", u["wave_result"].get("status"))
+u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=SN_DISC, wave_gauntlet_result=GPASS, wave_fix_rounds=0))
+wesc = u["wave_result"].get("escalation") or {}
+check("wave_route: a member's AWAITING_DISCUSSION is not relayed - status failed, task_failed with the child's question, options "
+      "and run id in the evidence",
+      u["wave_result"]["status"] == "failed" and wesc.get("kind") == "task_failed" and wesc.get("discussion") is True
+      and SN_ESC["question"] in wesc.get("evidence", "") and f"Sisyphus run id: {SN_DISC_ID}" in wesc.get("evidence", "")
+      and SN_ESC["options"][0]["text"] in wesc.get("evidence", ""), wesc)
+u = gates.wave_integrate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_W), wave_results=[u["wave_result"]], wave_index=0))
+check("wave_integrate: the discussion fallback raises the wave escalation with the child's question, ledgered as not relayed",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "wave_escalation" and SN_ESC["question"] in u["escalation"]["evidence"]
+      and any("discussion is not relayed" in d for d in u["decisions"]), u.get("decisions"))
+ts_r = copy.deepcopy(TS_W)
+RETRY = base_state(plan_path=PROMOTED, tasks=ts_r, current_task=T1, last_answer="Retry the task sequentially (one fix round with the evidence)",
+                   escalation=gates.escalation("wave_escalation", "q", [gates.option("Retry the task sequentially (one fix round with the evidence)")],
+                                               evidence="- criterion 2 DIVERGES"))
+RETRY.update(gates.apply_answer(RETRY))
+U_RETRY = gates.compose_delegation(RETRY)
+check("wave retry: compose_delegation delegates into the task's worktree - delegate_project_dir and the prompt's code dir agree",
+      RETRY["_next"] == "compose_delegation" and U_RETRY["delegate_project_dir"] == WAVE[0]["worktree"]
+      and f"ALL code you WRITE goes in {WAVE[0]['worktree']}" in U_RETRY["delegation_prompt"], U_RETRY.get("delegate_project_dir"))
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=0))
 check("wave_route: findings -> one in-branch fix round (B13 side 1) with the prior report", u["_next"] == "wave_delegate" and "## FIX ROUND 1" in u["wtask"]["prompt"] and u["wave_fix_rounds"] == 1)
+OLD_ITEM = {k: v for k, v in WAVE[0].items() if k != "review_cadence"}
+u_std = gates.wave_route(base_state(wtask=OLD_ITEM, wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=0))
+u_mic = gates.wave_route(base_state(wtask=OLD_ITEM, wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=0, task_granularity="micro"))
+check("wave_route: a fix-round item from an older snapshot (no review_cadence) -> defaulted, task when standard, batch when micro",
+      "review_cadence" not in OLD_ITEM and u_std["wtask"].get("review_cadence") == "task" and u_mic["wtask"].get("review_cadence") == "batch",
+      (u_std.get("wtask", {}).get("review_cadence"), u_mic.get("wtask", {}).get("review_cadence")))
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GBLOCK, wave_fix_rounds=1))
 check("wave_route: B13 used -> needs_escalation (deferred to the wave boundary, E7/V7)", u["wave_result"]["status"] == "needs_escalation" and u["wave_result"]["escalation"]["kind"] == "conformance_stuck")
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report="SISYPHUS_FAILED", wave_gauntlet_result=""))
@@ -2342,9 +2516,9 @@ check("review watch: entry script review_poll.py through GRAPH_STATE -> JSON wit
       p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "review_route", p.stderr[-300:])
 
 # ---------------------------------------------------------------- watch hardening: node timeouts, stale statuses, visit budget, push check
-def read_graph():
+def read_graph(path=os.path.join(HERE, "..", "graph.yaml")):
     try:
-        p = subprocess.run(["yq", "-o=json", ".", os.path.join(HERE, "..", "graph.yaml")], capture_output=True, text=True)
+        p = subprocess.run(["yq", "-o=json", ".", path], capture_output=True, text=True)
     except OSError as e:
         return None, f"yq not runnable: {e}"
     if p.returncode != 0:
@@ -2373,6 +2547,53 @@ check("graph: confirm_seed offers exactly the seed_confirm options intake raises
       NODES.get("confirm_seed", {}).get("options") == [o["text"] for o in E_SEED["options"]], NODES.get("confirm_seed", {}).get("options"))
 check("graph: confirm_draft offers exactly the draft_confirm options draft_route raises",
       NODES.get("confirm_draft", {}).get("options") == [o["text"] for o in E_DRAFT["options"]], NODES.get("confirm_draft", {}).get("options"))
+
+
+def render_inputs(node, state, nodes=None):
+    """An agent node's `inputs:` as the engine resolves them: a lone {{dotted.key}} yields the state value, else the text."""
+    out = {}
+    for key, tpl in ((nodes or NODES).get(node, {}).get("inputs") or {}).items():
+        m = re.fullmatch(r"\{\{([\w.]+)\}\}", str(tpl).strip())
+        if not m:
+            out[key] = tpl
+            continue
+        v = state
+        for part in m.group(1).split("."):
+            v = v.get(part) if isinstance(v, dict) else None
+        out[key] = v
+    return out
+
+
+check("graph: delegate and wave_delegate run sisyphus-next; wave_delegate keeps teammates; their inputs are exactly review_cadence / parallel / project_dir",
+      all(NODES.get(n, {}).get("agent") == "sisyphus-next" and sorted(NODES.get(n, {}).get("inputs") or {}) == ["parallel", "project_dir", "review_cadence"]
+          for n in ("delegate", "wave_delegate")) and NODES.get("wave_delegate", {}).get("teammates") is True
+      and all(SEEDS.get(k) is not None for k in ("delegate_review_cadence", "delegate_parallel", "delegate_project_dir")),
+      {n: (NODES.get(n, {}).get("agent"), NODES.get(n, {}).get("inputs")) for n in ("delegate", "wave_delegate")})
+check("graph: delegate inputs - sequential standard -> review_cadence=task, parallel=0, project_dir=the code repo",
+      render_inputs("delegate", {**base_state(), **U_SEQ}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE},
+      render_inputs("delegate", {**base_state(), **U_SEQ}))
+check("graph: delegate inputs - micro -> review_cadence=batch, parallel=0, project_dir=the code repo",
+      render_inputs("delegate", {**base_state(), **U_MICRO}) == {"review_cadence": "batch", "parallel": "0", "project_dir": CODE},
+      render_inputs("delegate", {**base_state(), **U_MICRO}))
+check("graph: wave_delegate inputs - wave item -> parallel=1, project_dir=the item's worktree, review_cadence=the item's (task)",
+      render_inputs("wave_delegate", {"wtask": WAVE[0]}) == {"parallel": "1", "project_dir": WAVE[0]["worktree"], "review_cadence": "task"},
+      render_inputs("wave_delegate", {"wtask": WAVE[0]}))
+check("graph: delegate inputs - a relay resume carries the same inputs as the delegation it resumes (code repo, task cadence, parallel=0)",
+      render_inputs("delegate", {**base_state(), **U_RESUME}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE},
+      render_inputs("delegate", {**base_state(), **U_RESUME}))
+check("graph: delegate inputs - a wave member retried sequentially keeps its worktree as project_dir",
+      render_inputs("delegate", {**base_state(), **U_RETRY}) == {"review_cadence": "task", "parallel": "0", "project_dir": WAVE[0]["worktree"]},
+      render_inputs("delegate", {**base_state(), **U_RETRY}))
+SN_GRAPH, sn_graph_error = read_graph(os.path.join(SN_SCRIPTS, "..", "graph.yaml"))
+SN_NODES = (SN_GRAPH or {}).get("nodes") or {}
+wave_in = render_inputs("wave_delegate", {"wtask": WAVE[0]})
+p, sn_intake = sisyphus_next_call("intake", {"initial_prompt": WAVE[0]["prompt"], **wave_in})
+sn_state = {**wave_in, **sn_intake}
+chain_dirs = [render_inputs(n, sn_state, SN_NODES).get("project_dir") for n in ("run_coder", "run_gauntlet")]
+check("graph: a wave worktree flows architect wave_delegate inputs -> sisyphus-next intake -> run_coder and run_gauntlet inputs",
+      SN_GRAPH is not None and sn_intake.get("delegated") is True and sn_intake.get("parallel_mode") is True
+      and all(d and os.path.realpath(d) == os.path.realpath(WAVE[0]["worktree"]) for d in chain_dirs),
+      f"{sn_graph_error} rc={p.returncode} {p.stderr[-300:]} {chain_dirs}")
 check("graph: draft_edit returns to draft_brief, which routes to draft_route and falls back to draft_fault",
       NODES.get("draft_edit", {}).get("next") == "draft_brief" and NODES.get("draft_brief", {}).get("next") == "draft_route"
       and NODES.get("draft_brief", {}).get("fallback") == "draft_fault", {k: NODES.get(k) for k in ("draft_edit", "draft_brief")})
@@ -3722,6 +3943,16 @@ check("entry script: GRAPH_STATE_FILE path (>32 KiB) -> JSON with _next", p.retu
 env = {**os.environ, "GRAPH_STATE": json.dumps({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP)})}
 p = subprocess.run([sys.executable, os.path.join(HERE, "intake.py")], capture_output=True, text=True, env=env)
 check("entry script: intake through GRAPH_STATE", p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "orient_read", p.stderr[-300:])
+
+# ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
+git(CODE, "checkout", "-q", "feat/PLAN-widgets")
+u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1",
+                                task_granularity="micro"))
+micro_wave = [render_inputs("wave_delegate", {"wtask": w}) for w in u["wave"]]
+micro_wave_ok = (len(u["wave"]) == 2 and all(w.get("review_cadence") == "batch" for w in u["wave"])
+                 and micro_wave == [{"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch"} for w in u["wave"]]
+                 and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])))
+check("wave_claim: micro -> every item carries review_cadence=batch; wave_delegate renders it with parallel=1 and the item's worktree", micro_wave_ok, micro_wave)
 
 # ---------------------------------------------------------------- summary
 fails = [n for n, ok, _ in RESULTS if not ok]

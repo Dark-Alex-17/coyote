@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 547;
+const SMOKE_FLOOR: usize = 550;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -792,6 +792,10 @@ fn agent_references(value: &serde_yaml::Value, found: &mut Vec<(String, String)>
     }
 }
 
+/// A shipped agent never reaches a candidate. The one allowed edge between
+/// candidates is architect-next delegating to sisyphus-next; any other
+/// candidate reference, from a candidate or not, is a hit, and the allowed
+/// edge must exist.
 #[test]
 fn no_bundled_agent_reaches_a_candidate() {
     let mut agents: Vec<PathBuf> = fs::read_dir(agents_dir())
@@ -807,6 +811,7 @@ fn no_bundled_agent_reaches_a_candidate() {
 
     let mut hits = Vec::new();
     let mut references_checked = 0usize;
+    let mut delegate_edges = 0usize;
     for agent in &agents {
         for file in ["graph.yaml", "config.yaml"] {
             let path = agent.join(file);
@@ -826,8 +831,11 @@ fn no_bundled_agent_reaches_a_candidate() {
                 found.push(("session.chat.agent".to_string(), chat_agent.to_string()));
             }
             references_checked += found.len();
+            let from_architect = agent.ends_with("architect-next");
             for (key, name) in found {
-                if CANDIDATE_NAMES.contains(&name.as_str()) {
+                if from_architect && key == "agent" && name == CANDIDATE {
+                    delegate_edges += 1;
+                } else if CANDIDATE_NAMES.contains(&name.as_str()) {
                     hits.push(format!("{}: {key} = {name}", path.display()));
                 }
             }
@@ -849,10 +857,78 @@ fn no_bundled_agent_reaches_a_candidate() {
         "the sweep saw only {references_checked} agent references; the bundled graphs name far more"
     );
     assert!(
+        delegate_edges >= 1,
+        "architect-next names no `agent: {CANDIDATE}` node; the one allowed candidate edge is missing"
+    );
+    assert!(
         hits.is_empty(),
         "a bundled agent reaches a candidate:\n{}",
         hits.join("\n")
     );
+}
+
+/// A delegated run parked for discussion ends with one `Discussion data:
+/// <json>` line the parent orchestrator relays (architect-next reads it); a
+/// top-level park writes no such line. The JSON keys are the relay contract.
+#[test]
+fn delegated_discussion_park_ends_with_one_discussion_data_line() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("discussion-data");
+    let probe = r#"
+import json, sys
+sys.path.insert(0, "scripts")
+import gates
+d = {"kind": "plan_defect", "question": "Drop AC2?", "reply": "why?", "resume": "continue: <answer>",
+     "run_id": "20261101T000000-bbbbbbbb",
+     "options": [{"label": "1", "text": "Drop it", "recommended": True},
+                 {"label": "2", "text": "Keep it", "recommended": False}]}
+print(json.dumps([gates._discussion_message(d, True), gates._discussion_message(d)]))
+"#;
+    let output = battery(&python, &scratch)
+        .args(["-B", "-c", probe])
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let messages: Vec<String> =
+        serde_json::from_str(stdout.lines().last().unwrap_or_default()).expect(&report);
+    let (delegated, top_level) = (&messages[0], &messages[1]);
+
+    assert_eq!(
+        delegated.lines().next(),
+        Some("SISYPHUS_AWAITING_DISCUSSION")
+    );
+    let data_lines: Vec<&str> = delegated
+        .lines()
+        .filter(|l| l.starts_with("Discussion data: "))
+        .collect();
+    assert_eq!(data_lines.len(), 1, "{delegated}");
+    assert_eq!(delegated.lines().last(), Some(data_lines[0]), "{delegated}");
+    let data: serde_json::Value =
+        serde_json::from_str(&data_lines[0]["Discussion data: ".len()..]).unwrap();
+    assert_eq!(
+        data,
+        json!({
+            "kind": "plan_defect",
+            "question": "Drop AC2?",
+            "options": [
+                {"text": "Drop it", "recommended": true},
+                {"text": "Keep it", "recommended": false}
+            ],
+            "reply": "why?",
+            "run_id": "20261101T000000-bbbbbbbb"
+        })
+    );
+    assert!(
+        delegated.contains("Sisyphus run id: 20261101T000000-bbbbbbbb"),
+        "{delegated}"
+    );
+    assert!(
+        !top_level.contains("Discussion data: "),
+        "a top-level park writes no data line: {top_level}"
+    );
+    assert_no_bytecode_under_candidate();
 }
 
 /// Lists every regular file under `root` as a path relative to it, sorted.

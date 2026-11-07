@@ -916,13 +916,25 @@ def interpret_route(state):
     return u
 
 
-def _discussion_message(d):
-    """The parked run's final message: the question, its options, the reply and how to resume."""
+DISCUSSION_DATA_PREFIX = "Discussion data: "
+
+
+def _discussion_message(d, delegated=False):
+    """The parked run's final message: the question, its options, the reply and how to resume.
+
+    A delegated run also ends with one `Discussion data: <json>` line (kind, question, options with the recommended
+    flag, reply, run_id) so the parent orchestrator can relay the question without parsing the prose.
+    """
     lines = ["SISYPHUS_AWAITING_DISCUSSION", f"A {d['kind']} question is open for discussion:", d["question"]]
     if d["options"]:
         lines += ["", "Options:"] + [f"  {o['label']}: {o['text']}" + (" (recommended)" if o["recommended"] else "")
                                     for o in d["options"]]
     lines += ["", f"Your reply: {d['reply']}", "", d["resume"], "", f"Sisyphus run id: {d['run_id']}"]
+    if delegated:
+        data = {"kind": d["kind"], "question": d["question"],
+                "options": [{"text": o["text"], "recommended": bool(o["recommended"])} for o in d["options"]],
+                "reply": d["reply"], "run_id": d["run_id"]}
+        lines += [DISCUSSION_DATA_PREFIX + json.dumps(data, sort_keys=True)]
     return "\n".join(lines)
 
 
@@ -965,7 +977,7 @@ def choice_park(state):
                    f'A parent orchestrator resumes the run with "Sisyphus run id: {run_id}" plus the continue line.'),
     }
     u.update({"choice_parks": parks, "parked": DISCUSSION_PARKED, "discussion_run_id": run_id,
-              "discussion_message": _discussion_message(u["discussion"])})
+              "discussion_message": _discussion_message(u["discussion"], truthy(state.get("delegated")))})
     ledger(state, u, f"discussion: {kind}: parked for discussion ({count + 1}/{DISCUSSION_PARKS_MAX})")
     snapshot(state, u, DISCUSSION_PARKED)
     full = {k: v for k, v in {**state, **u}.items() if k not in PARK_FRESH_KEYS and k != "discussion_message"}

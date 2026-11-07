@@ -157,6 +157,13 @@ coyote -a coder "Add a foo() function..."
 coyote -a coder --agent-variable project_dir /path/to/your/project "Add..."
 ```
 
+A parent graph that runs the coder as an agent node can pass
+`inputs: project_dir: <path>` instead. `resolve_paths.sh` takes a non-empty
+seeded `project_dir` from the graph state over the `project_dir` variable,
+because a graph child inherits its parent's variables and the inherited value
+may name a different tree (an orchestrator's checkout rather than a task
+worktree). With no seeded value the variable is used as before.
+
 A spawned coder whose caller left `project_dir` unset inherits the engine's
 working directory, which may be a different checkout from the one it edits.
 In that case the verify gates run at the root of the git work tree holding

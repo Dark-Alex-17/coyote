@@ -213,7 +213,7 @@
   "condition": "task_granularity=micro",
   "first": "Micro mode: add `\"review_cadence\": \"batch\"` to the spawn's `",
   "mechanism": "I",
-  "home": "`compose_delegation` `## MODE` block (E9/V9)"
+  "home": "`compose_delegation` `delegate_review_cadence` -> `delegate` `inputs: review_cadence`, plus the `## MODE` block (V9)"
  },
  {
   "ordinal": 28,
@@ -325,7 +325,7 @@
   "condition": "task_granularity=micro",
   "first": "In micro mode add `\"review_cadence\": \"batch\"` to that same o",
   "mechanism": "I",
-  "home": "`_delegation_text` `## MODE` block (shared by `compose_delegation` and `wave_claim`)"
+  "home": "`wave_claim` gives every wave item `review_cadence` (`batch` in micro mode), which `wave_delegate` passes through `inputs:`; the `_delegation_text` `## MODE` block (shared by `compose_delegation` and `wave_claim`) states it too"
  },
  {
   "ordinal": 42,

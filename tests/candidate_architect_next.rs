@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 818;
+const SMOKE_FLOOR: usize = 848;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -1026,6 +1026,89 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "    if False:\n",
                 "interpret_route: reuse_worktree naming a checkout of another repo -> rejected, \
                  ledgered, one clarifying question",
+            ),
+        ],
+    );
+}
+
+/// The guards behind delegating to sisyphus-next: a child's parked discussion
+/// relayed to the owner instead of the oracle, the relay parked at once
+/// whatever the policy, the child's exact parent-resume form, the delegation
+/// kind restored after the resumed child returns, the sentinel read only at the
+/// start of a line, the opening-lines heuristic anchored the same way, a
+/// retried wave member delegated into its own worktree, and the review cadence
+/// defaulted on a wave fix-round item from an older snapshot.
+#[test]
+#[ignore = "eight smoke battery runs take about a minute; run with -- --ignored"]
+fn relay_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "relay-detect",
+                "    if text and not text.startswith(\"Agent node failed\") and \
+                 DISCUSSION_SENTINEL_RE.search(text):\n",
+                "    if False:\n",
+                "relay: route_delegate on SISYPHUS_AWAITING_DISCUSSION -> escalate_gate (never the \
+                 oracle) with delegate_discussion carrying the child's question, options, run id \
+                 and task",
+            ),
+            (
+                "relay-park-at-once",
+                "    if kind == \"delegate_discussion\" and data.get(\"relay_pending\"):\n",
+                "    if False:\n",
+                "relay: escalate_gate parks a pending relay at once, whatever the policy (no ask, no \
+                 ladder)",
+            ),
+            (
+                "resume-form",
+                "        text = f\"Sisyphus run id: {run_id}\\ncontinue: \
+                 {state.get('resume_answer') or ''}\"\n",
+                "        text = f\"continue: {state.get('resume_answer') or ''}\"\n",
+                "relay: 'continue: 1' -> the option text relayed; compose_delegation kind=resume \
+                 with exactly the child's resume form",
+            ),
+            (
+                "resume-kind-restored",
+                "        kind = state.get(\"resume_after_kind\") or \"implement\"\n",
+                "        kind = \"resume\"\n",
+                "relay: the resumed child's final report -> route_delegate as normal (verify_gate), \
+                 the delegation kind restored",
+            ),
+            (
+                "sentinel-anchored",
+                "FAILURE_SENTINEL_RE = \
+                 re.compile(r\"(?m)^\\s*SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\\b\")\n",
+                "FAILURE_SENTINEL_RE = re.compile(r\"SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\")\n",
+                "route_delegate: a successful report that quotes SISYPHUS_REDIRECT mid-line and says \
+                 'could not complete' in prose -> verify_gate",
+            ),
+            (
+                "head-anchored",
+                "r\"(?im)^\\W*(cannot|could not|unable to)\\s+(complete|implement|proceed|finish)\\b\", \
+                 head",
+                "r\"(?i)\\b(cannot|could not|unable to)\\s+(complete|implement|proceed|finish)\\b\", \
+                 head",
+                "route_delegate: a report with no run id that says 'could not complete' mid-line in \
+                 its opening lines -> verify_gate",
+            ),
+            (
+                "retry-worktree",
+                "    pd = task.get(\"worktree\") or state.get(\"code_repo_path\", \"\")\n",
+                "    pd = state.get(\"code_repo_path\", \"\")\n",
+                "wave retry: compose_delegation delegates into the task's worktree - \
+                 delegate_project_dir and the prompt's code dir agree",
+            ),
+            (
+                "snapshot-cadence",
+                "        fixed.setdefault(\"review_cadence\", \"batch\" if is_micro(state) else \
+                 \"task\")  # a wave item from an older snapshot\n",
+                "        pass\n",
+                "wave_route: a fix-round item from an older snapshot (no review_cadence) -> \
+                 defaulted, task when standard, batch when micro",
             ),
         ],
     );
@@ -2011,12 +2094,13 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-/// A scratch tree holding the three agent dirs the batteries reach: the
-/// candidate, the prose `architect` it reads core tools from, and `.shared`.
+/// A scratch tree holding the four agent dirs the batteries reach: the
+/// candidate, the prose `architect` it reads core tools from, `.shared`, and
+/// `sisyphus-next`, whose own `final_report` the smoke battery parses.
 /// Returns the candidate copy.
 fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
     let agents = scratch.0.join("tree").join("agents");
-    for name in [".shared", "architect"] {
+    for name in [".shared", "architect", "sisyphus-next"] {
         copy_tree(&agents_dir().join(name), &agents.join(name));
     }
     let copy = agents.join(CANDIDATE);
@@ -2889,10 +2973,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![46, 3559, 3568],
+        vec![46, 3668, 3677],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [3559, 3568] {
+    for line in [3668, 3677] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -2901,7 +2985,7 @@ fn readme_toolchain_census_matches_the_live_grep() {
 }
 
 /// The README's counts hold against the graph and the prose twin: two
-/// `agent: sisyphus` lines, the `chat_agent_for: architect` chat lane, and
+/// `agent: sisyphus-next` lines, the `chat_agent_for: architect` chat lane, and
 /// one marker region in the map per `<!-- when:` region in the landed
 /// `architect/instructions.md`.
 #[test]
@@ -2910,10 +2994,14 @@ fn readme_counts_match_the_graph_and_the_prose_twin() {
     assert_eq!(
         graph
             .lines()
-            .filter(|l| l.trim() == "agent: sisyphus")
+            .filter(|l| l.trim() == "agent: sisyphus-next")
             .count(),
         2,
-        "the README promises two `agent: sisyphus` lines"
+        "the README promises two `agent: sisyphus-next` lines"
+    );
+    assert!(
+        !graph.lines().any(|l| l.trim() == "agent: sisyphus"),
+        "the prose `sisyphus` is no longer a delegate"
     );
     assert!(
         graph
@@ -3023,8 +3111,8 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         .find(|l| l.starts_with("| `build_lock` variable |"))
         .expect("the README lost its build_lock row");
     for (node, agent) in [
-        ("delegate", "sisyphus"),
-        ("wave_delegate", "sisyphus"),
+        ("delegate", "sisyphus-next"),
+        ("wave_delegate", "sisyphus-next"),
         ("run_gauntlet", "review-gauntlet"),
         ("wave_gauntlet", "review-gauntlet"),
         ("run_adversary", "adversary"),
@@ -3052,7 +3140,7 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         );
     }
     for (agent, file) in [
-        ("sisyphus", "config.yaml"),
+        ("sisyphus-next", "graph.yaml"),
         ("review-gauntlet", "graph.yaml"),
         ("adversary", "graph.yaml"),
     ] {
@@ -5358,7 +5446,7 @@ fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
 
 /// The `build_lock` variable row as it landed with the variable; the
 /// threading row beside it must not reword it.
-const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of the three agents behind those five nodes declares `build_lock` itself |";
+const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus-next`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of the three agents behind those five nodes declares `build_lock` itself |";
 
 /// Every agent the graph delegates to that declares no `build_lock` receives
 /// the inherited value without consuming it: none of its own files names
@@ -5431,21 +5519,70 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
     for clause in [
         "a child that declares no `build_lock` does not consume it",
         "the graph agent librarian and the config agents",
-        "`## MODE` block with the `mode-degraded:` ledger line",
+        "pass those three through `inputs:`",
+        "no `mode-degraded:` ledger line is written",
     ] {
         assert!(row.contains(clause), "the E9 row lost {clause:?}: {row}");
     }
     for agent in expected {
         assert!(row.contains(agent), "{agent} missing from: {row}");
     }
-    assert!(
-        !row.contains("inputs"),
-        "the E9 row must not describe an inputs channel: {row}"
-    );
     assert_eq!(
         adjustments_row("| `build_lock` variable |"),
         BUILD_LOCK_ROW,
         "the build_lock variable row changed"
+    );
+}
+
+/// The delegate's variables travel through `inputs:`, so no gate writes a
+/// `mode-degraded` ledger line any more.
+#[test]
+fn gates_write_no_mode_degraded_ledger_line() {
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    assert!(
+        !gates.contains("mode-degraded"),
+        "gates.py names mode-degraded again; the delegate inputs replace it"
+    );
+}
+
+/// A delegated sisyphus-next run that parks for discussion ends with one
+/// `Discussion data: <json>` line; architect-next relays the question from
+/// that line. Both sides name the same prefix and the same JSON keys.
+#[test]
+fn relay_reads_the_discussion_data_line_sisyphus_next_writes() {
+    let ours = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let child = fs::read_to_string(agents_dir().join("sisyphus-next/scripts/gates.py")).unwrap();
+    assert!(
+        child.contains("DISCUSSION_DATA_PREFIX = \"Discussion data: \""),
+        "sisyphus-next no longer writes the `Discussion data: ` prefix"
+    );
+    assert!(
+        ours.contains(
+            "DISCUSSION_DATA_RE = re.compile(r\"(?m)^Discussion data: (\\{.*\\})[ \\t]*$\")"
+        ),
+        "architect-next no longer reads the `Discussion data: ` line"
+    );
+    for key in [
+        "kind",
+        "question",
+        "options",
+        "recommended",
+        "reply",
+        "run_id",
+    ] {
+        let quoted = format!("\"{key}\"");
+        assert!(child.contains(&quoted), "sisyphus-next writes no {quoted}");
+        assert!(ours.contains(&quoted), "architect-next reads no {quoted}");
+    }
+    assert!(
+        ours.contains(
+            "DISCUSSION_SENTINEL_RE = re.compile(r\"(?m)^\\s*SISYPHUS_AWAITING_DISCUSSION\\b\")"
+        ),
+        "the relay must key on a line-anchored SISYPHUS_AWAITING_DISCUSSION"
+    );
+    assert!(
+        ours.contains("\"delegate_discussion\": (\"answer\",),"),
+        "delegate_discussion must accept the verbatim `answer` instruction"
     );
 }
 

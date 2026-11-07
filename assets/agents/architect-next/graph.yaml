@@ -7,7 +7,7 @@ description: |
   parsing; short single-question llm nodes own the judgment (orient, author/amend the
   plan, answer leaks, integrate findings, task-done edits, batch triage, CI diagnosis);
   gatekeeper / oracle / explore / librarian / review-gauntlet / adversary /
-  whetstone / engineer and the sisyphus delegate run as agent-node islands exactly
+  whetstone / engineer and the sisyphus-next delegate run as agent-node islands exactly
   as they ship. Candidate status: no agent lists this as spawnable, the facade
   agents/architect is untouched, and this directory is replaced by the facade at
   cutover once the artifact-equivalence replay passes. The run-or-chat session
@@ -1446,10 +1446,14 @@ nodes:
   delegate:
     id: delegate
     type: agent
-    agent: sisyphus
-    description: The per-task implementer island - the ONE config value that swaps at sisyphus cutover.
+    agent: sisyphus-next
+    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag and project directory ride `inputs:`.
     prompt: |
       {{delegation_prompt}}
+    inputs:
+      review_cadence: '{{delegate_review_cadence}}'
+      parallel: '{{delegate_parallel}}'
+      project_dir: '{{delegate_project_dir}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1701,11 +1705,15 @@ nodes:
   wave_delegate:
     id: wave_delegate
     type: agent
-    agent: sisyphus
+    agent: sisyphus-next
     teammates: true
-    description: The per-task implementer in its worktree (same swap point as `delegate`).
+    description: The per-task implementer in its worktree (same agent as `delegate`); parallel=1, the worktree and the item's review cadence ride `inputs:`.
     prompt: |
       {{wtask.prompt}}
+    inputs:
+      parallel: '1'
+      project_dir: '{{wtask.worktree}}'
+      review_cadence: '{{wtask.review_cadence}}'
     timeout: 0
     max_attempts: 1
     state_updates:

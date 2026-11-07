@@ -1471,6 +1471,7 @@ nodes:
       {{coder_prompt}}
     inputs:
       build_lock: '{{build_lock}}'
+      project_dir: '{{project_dir}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1676,6 +1677,7 @@ nodes:
       verification_commands: '{{verification_commands}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
+      project_dir: '{{project_dir}}'
     timeout: 0
     max_attempts: 1
     state_updates:
