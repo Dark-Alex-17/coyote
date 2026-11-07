@@ -222,7 +222,9 @@ fn resolve_paths_prefers_a_seeded_state_project_dir_over_the_variable() {
     let seeded = serde_json::json!({ "project_dir": worktree_dir.to_string_lossy() });
     let out = run_script("coder/scripts/resolve_paths.sh", &parent.0, &seeded, &envs);
     assert_eq!(
-        Path::new(str_field(&out, "project_dir")).canonicalize().unwrap(),
+        Path::new(str_field(&out, "project_dir"))
+            .canonicalize()
+            .unwrap(),
         worktree_dir,
         "the seeded state project_dir must win over the variable: {out}"
     );
@@ -235,7 +237,9 @@ fn resolve_paths_prefers_a_seeded_state_project_dir_over_the_variable() {
     ] {
         let out = run_script("coder/scripts/resolve_paths.sh", &worktree.0, &state, &envs);
         assert_eq!(
-            Path::new(str_field(&out, "project_dir")).canonicalize().unwrap(),
+            Path::new(str_field(&out, "project_dir"))
+                .canonicalize()
+                .unwrap(),
             parent_dir,
             "{state}: with no seeded project_dir the variable is used: {out}"
         );
