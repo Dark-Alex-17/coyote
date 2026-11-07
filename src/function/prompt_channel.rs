@@ -1,7 +1,8 @@
 //! Lets a running tool ask the human through Coyote's prompter. The tool
 //! writes one request line to its stdout; the stdout pump spots it, asks,
-//! and writes the answer line to a pipe the tool inherits as
-//! `COYOTE_PROMPT_REPLY`. Lines that are not requests flow through as
+//! and writes the answer line to a pipe the tool reaches through
+//! `COYOTE_PROMPT_REPLY`: an inherited fd on unix, a named pipe the tool
+//! opens by path on Windows. Lines that are not requests flow through as
 //! ordinary output.
 
 use crate::config::sanitize_display_text;
@@ -10,14 +11,20 @@ use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, Pro
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(windows)]
+use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io::{self, PipeWriter, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
 use std::process::Command;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::{Condvar, Mutex};
 
 pub(crate) const REPLY_ENV: &str = "COYOTE_PROMPT_REPLY";
 /// Exported by the bash helper once it has saved its stdout on a spare fd.
@@ -110,29 +117,594 @@ impl Server {
     }
 }
 
-#[cfg(not(unix))]
-pub(crate) enum Server {}
+/// The named-pipe server stands in for the unix fd pipe; these pin the
+/// shape the helpers depend on. Every read that could block runs on a
+/// helper thread and is collected with a generous timeout, so a regression
+/// fails the test instead of hanging it.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-#[cfg(not(unix))]
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Reads one line the way bash's `read` builtin does: a byte at a
+    /// time, stopping at the newline, without pulling in what follows.
+    fn read_line_bytewise(file: &mut File) -> io::Result<Option<String>> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if file.read(&mut byte)? == 0 {
+                break;
+            }
+            let byte = byte[0];
+            line.push(byte);
+            if byte == b'\n' {
+                break;
+            }
+        }
+        if line.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8(line).unwrap()))
+    }
+
+    /// Opens the pipe and reads one line on a helper thread.
+    fn read_one_line(path: &str) -> mpsc::Receiver<io::Result<Option<String>>> {
+        let path = path.to_owned();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = File::open(&path).and_then(|mut file| read_line_bytewise(&mut file));
+            tx.send(result).unwrap();
+        });
+        rx
+    }
+
+    fn reply_line(id: &str, answer: &Value) -> String {
+        let mut line = json!({"id": id, "answer": answer}).to_string();
+        line.push('\n');
+        line
+    }
+
+    #[test]
+    fn env_value_names_a_local_pipe_unique_per_server() {
+        let first = Server::open().unwrap();
+        let second = Server::open().unwrap();
+        for server in [&first, &second] {
+            let path = server.env_value();
+            assert!(
+                path.starts_with(r"\\.\pipe\coyote-prompt-"),
+                "unexpected pipe path {path}"
+            );
+        }
+        assert_ne!(first.env_value(), second.env_value());
+    }
+
+    #[test]
+    fn a_client_waiting_on_the_pipe_receives_the_reply() {
+        let server = Server::open().unwrap();
+        let rx = read_one_line(&server.env_value());
+        // Let the client connect first so the reply is written to a
+        // waiting reader rather than queued.
+        thread::sleep(Duration::from_millis(200));
+        server.reply("p1", &json!(true));
+        let line = rx.recv_timeout(WAIT).unwrap().unwrap();
+        assert_eq!(line, Some(reply_line("p1", &json!(true))));
+    }
+
+    #[test]
+    fn a_reply_queued_before_the_client_connects_is_delivered() {
+        let server = Server::open().unwrap();
+        server.reply("p2", &json!("yes"));
+        let rx = read_one_line(&server.env_value());
+        let line = rx.recv_timeout(WAIT).unwrap().unwrap();
+        assert_eq!(line, Some(reply_line("p2", &json!("yes"))));
+    }
+
+    /// bash's `read <"$path"` opens the pipe anew for every line: a client
+    /// that takes one line and leaves must not swallow the next one, which
+    /// has to reach the client that opens the pipe after it.
+    #[test]
+    fn each_reopen_of_the_pipe_receives_the_next_queued_line() {
+        let server = Server::open().unwrap();
+        server.reply("stray", &json!(null));
+        server.reply("mine", &json!(false));
+        let first = read_one_line(&server.env_value())
+            .recv_timeout(WAIT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, Some(reply_line("stray", &json!(null))));
+        let second = read_one_line(&server.env_value())
+            .recv_timeout(WAIT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, Some(reply_line("mine", &json!(false))));
+    }
+
+    /// A client that stays connected across lines (the python and
+    /// typescript helpers skip stray replies on one open) sees them in
+    /// order on the same connection.
+    #[test]
+    fn one_connection_receives_successive_lines() {
+        let server = Server::open().unwrap();
+        let path = server.env_value();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut file = File::open(&path).unwrap();
+            let first = read_line_bytewise(&mut file);
+            let second = read_line_bytewise(&mut file);
+            tx.send((first, second)).unwrap();
+        });
+        thread::sleep(Duration::from_millis(200));
+        server.reply("a", &json!(1));
+        server.reply("b", &json!(2));
+        let (first, second) = rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(first.unwrap(), Some(reply_line("a", &json!(1))));
+        assert_eq!(second.unwrap(), Some(reply_line("b", &json!(2))));
+    }
+
+    /// Dropping the server with lines nobody collected must end the
+    /// delivery thread: afterwards the path no longer opens.
+    #[test]
+    fn dropping_the_server_with_pending_lines_closes_the_pipe() {
+        let server = Server::open().unwrap();
+        let path = server.env_value();
+        server.reply("unread", &json!(true));
+        server.reply("also-unread", &json!(true));
+        drop(server);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match File::open(&path) {
+                Err(_) => break,
+                Ok(_) if Instant::now() > deadline => panic!("pipe still open after drop"),
+                Ok(_) => thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
+    /// A client blocked in a read sees the channel close when the server
+    /// is dropped, so the helper reports "reply channel closed" rather
+    /// than waiting forever.
+    #[test]
+    fn dropping_the_server_releases_a_waiting_client() {
+        let server = Server::open().unwrap();
+        let rx = read_one_line(&server.env_value());
+        thread::sleep(Duration::from_millis(200));
+        drop(server);
+        let result = rx.recv_timeout(WAIT).unwrap();
+        assert!(
+            matches!(result, Ok(None) | Err(_)),
+            "client should see end of stream, got {result:?}"
+        );
+    }
+}
+
+/// The parent's end of the reply pipe: a named pipe the child opens by the
+/// path in `env_value`. The helpers open that path afresh per prompt, and
+/// bash's `read <"$path"` even per line, so a delivery thread accepts one
+/// client after another and hands each the queued lines; a line leaves the
+/// queue only once a client has read it, so a client that closes early
+/// leaves it for the next one, the way an unread line stays in a unix pipe.
+#[cfg(windows)]
+pub(crate) struct Server {
+    name: Vec<u16>,
+    path: String,
+    shared: Arc<Shared>,
+}
+
+#[cfg(windows)]
+struct Shared {
+    delivery: Mutex<Delivery>,
+    wake: Condvar,
+}
+
+#[cfg(windows)]
+struct Delivery {
+    lines: VecDeque<String>,
+    closed: bool,
+}
+
+#[cfg(windows)]
 impl Server {
     pub(crate) fn open() -> Result<Self> {
-        anyhow::bail!("Prompt reply channel is not implemented on this platform") // TASK-316
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = format!(
+            r"\\.\pipe\coyote-prompt-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let name = win::wide(&path);
+        let descriptor = win::OwnerOnlyDescriptor::new()?;
+        let first = win::create_instance(&name, true, &descriptor)?;
+        let shared = Arc::new(Shared {
+            delivery: Mutex::new(Delivery {
+                lines: VecDeque::new(),
+                closed: false,
+            }),
+            wake: Condvar::new(),
+        });
+        let thread_name = name.clone();
+        let thread_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("prompt-reply".into())
+            .spawn(move || deliver_lines(&thread_name, &descriptor, first, &thread_shared))?;
+        Ok(Self { name, path, shared })
     }
 
     pub(crate) fn env_value(&self) -> String {
-        match *self {}
+        self.path.clone()
     }
 
-    pub(crate) fn configure(&self, _cmd: &mut Command) {
-        match *self {}
+    /// The child reaches the pipe by name; no handle crosses the spawn.
+    pub(crate) fn configure(&self, _cmd: &mut Command) {}
+
+    pub(crate) fn spawned(&mut self) {}
+
+    pub(crate) fn reply(&self, id: &str, answer: &Value) {
+        let mut line = json!({"id": id, "answer": answer}).to_string();
+        line.push('\n');
+        self.shared.delivery.lock().unwrap().lines.push_back(line);
+        self.shared.wake.notify_all();
+    }
+}
+
+/// Ends the delivery thread without joining it: a client that connected
+/// but never reads would otherwise hold the drop hostage. Lines still
+/// queued are lost; the tool they were for is gone.
+#[cfg(windows)]
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.shared.delivery.lock().unwrap().closed = true;
+        self.shared.wake.notify_all();
+        win::wake(&self.name);
+    }
+}
+
+/// The delivery thread: listen, serve the connected client until it goes
+/// away, listen again. A fresh listening instance is created as soon as a
+/// client connects, because a bash helper reopens the path for its next
+/// line before the server has noticed that the previous open went away.
+#[cfg(windows)]
+fn deliver_lines(
+    name: &[u16],
+    descriptor: &win::OwnerOnlyDescriptor,
+    first: OwnedHandle,
+    shared: &Shared,
+) {
+    let mut listener = Some(first);
+    loop {
+        let pipe = match listener.take() {
+            Some(pipe) => pipe,
+            None => match win::create_instance(name, false, descriptor) {
+                Ok(pipe) => pipe,
+                Err(err) => {
+                    warn!("Unable to create a prompt reply pipe instance: {err}");
+                    return;
+                }
+            },
+        };
+        if let Err(err) = win::connect(&pipe) {
+            debug!("Prompt reply client left before it was accepted: {err}");
+            win::disconnect(&pipe);
+            continue;
+        }
+        if shared.delivery.lock().unwrap().closed {
+            win::disconnect(&pipe);
+            return;
+        }
+        listener = match win::create_instance(name, false, descriptor) {
+            Ok(next) => Some(next),
+            Err(err) => {
+                debug!("Unable to create the next prompt reply pipe instance: {err}");
+                None
+            }
+        };
+        let closed = serve(&pipe, shared);
+        win::disconnect(&pipe);
+        if closed {
+            return;
+        }
+    }
+}
+
+/// Hands queued lines to the connected client. Returns `true` when the
+/// server closed, `false` when the client went away; in the latter case the
+/// line it did not take is still at the front of the queue.
+#[cfg(windows)]
+fn serve(pipe: &OwnedHandle, shared: &Shared) -> bool {
+    loop {
+        let line = {
+            let mut delivery = shared.delivery.lock().unwrap();
+            loop {
+                if delivery.closed {
+                    return true;
+                }
+                if let Some(line) = delivery.lines.front() {
+                    break line.clone();
+                }
+                delivery = shared.wake.wait(delivery).unwrap();
+            }
+        };
+        match win::deliver(pipe, line.as_bytes()) {
+            Ok(()) => {
+                shared.delivery.lock().unwrap().lines.pop_front();
+            }
+            Err(err) => {
+                debug!("Prompt reply client closed before the next line: {err}");
+                return false;
+            }
+        }
+    }
+}
+
+/// Owned wrappers around the Win32 named-pipe calls the server makes.
+#[cfg(windows)]
+mod win {
+    use std::ffi::{OsStr, c_void};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_PIPE_CONNECTED, GENERIC_READ, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, FlushFileBuffers,
+        OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, WriteFile,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const OUT_BUFFER: u32 = 64 * 1024;
+
+    pub(super) fn wide(text: &str) -> Vec<u16> {
+        OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
-    pub(crate) fn spawned(&mut self) {
-        match *self {}
+    /// A security descriptor granting the current user full access and
+    /// nobody else anything; the pipe name is guessable, the replies are
+    /// not for other accounts on the machine.
+    pub(super) struct OwnerOnlyDescriptor(*mut c_void);
+
+    // SAFETY: the descriptor is an opaque heap buffer that is only read
+    // after construction; nothing ties it to the thread that built it.
+    unsafe impl Send for OwnerOnlyDescriptor {}
+
+    impl OwnerOnlyDescriptor {
+        pub(super) fn new() -> io::Result<Self> {
+            let sid = current_user_sid()?;
+            let sddl = wide(&format!("D:P(A;;GA;;;{sid})"));
+            let mut descriptor = ptr::null_mut();
+            // SAFETY: `sddl` is NUL terminated and outlives the call; the
+            // out pointer is a valid local and the size out pointer may be
+            // null.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(descriptor))
+        }
+
+        pub(super) fn attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.0,
+                bInheritHandle: 0,
+            }
+        }
     }
 
-    pub(crate) fn reply(&self, _id: &str, _answer: &Value) {
-        match *self {}
+    impl Drop for OwnerOnlyDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: the buffer came from the SDDL conversion, which
+            // documents LocalFree as its release, and is freed once.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+
+    fn current_user_sid() -> io::Result<String> {
+        let mut token = ptr::null_mut();
+        // SAFETY: the process pseudo handle needs no release; the out
+        // pointer is a valid local.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: OpenProcessToken succeeded and this function alone owns
+        // the handle it returned.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut needed = 0u32;
+        // SAFETY: a zero-length query only reports the size needed through
+        // the valid local out pointer.
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // u64 cells keep the TOKEN_USER pointer field aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+        // SAFETY: the buffer holds at least `needed` bytes, the size the
+        // previous call reported for this token.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the call filled the buffer with a TOKEN_USER whose SID
+        // pointer targets the same buffer, which is alive for the read.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text = ptr::null_mut();
+        // SAFETY: `sid` is a valid SID inside `buffer`; the out pointer is a
+        // valid local.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the conversion returned a NUL-terminated wide string that
+        // stays valid until the LocalFree below.
+        let string = unsafe {
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let string = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            string
+        };
+        Ok(string)
+    }
+
+    /// One server end of the pipe `name`, waiting for a client. The first
+    /// instance claims the name, so a pipe some other process already
+    /// created under it is an error rather than a shared channel.
+    pub(super) fn create_instance(
+        name: &[u16],
+        first: bool,
+        descriptor: &OwnerOnlyDescriptor,
+    ) -> io::Result<OwnedHandle> {
+        let mut open_mode = PIPE_ACCESS_OUTBOUND;
+        if first {
+            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+        }
+        let attributes = descriptor.attributes();
+        // SAFETY: `name` is NUL terminated and `attributes` points at a
+        // live descriptor; both outlive the call.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                open_mode,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                OUT_BUFFER,
+                0,
+                0,
+                &attributes,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateNamedPipeW returned a fresh handle nobody else owns.
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+
+    /// Blocks until a client opens `pipe`. A client that opened it between
+    /// creation and this call counts as connected.
+    pub(super) fn connect(pipe: &OwnedHandle) -> io::Result<()> {
+        // SAFETY: `pipe` is a live named-pipe server handle; a null
+        // OVERLAPPED selects the blocking form.
+        if unsafe { ConnectNamedPipe(pipe.as_raw_handle(), ptr::null_mut()) } != 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }
+
+    /// Writes `line` and returns once the client has read every byte of
+    /// it, so the line is known to have arrived before it leaves the
+    /// queue. The helpers read a byte at a time up to the newline, so the
+    /// flush does not wait on bytes the client will never ask for.
+    pub(super) fn deliver(pipe: &OwnedHandle, line: &[u8]) -> io::Result<()> {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let mut written = 0u32;
+            let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+            // SAFETY: `rest` is valid for `len` bytes; the count out pointer
+            // is a valid local; a null OVERLAPPED selects the blocking form.
+            let ok = unsafe {
+                WriteFile(
+                    pipe.as_raw_handle(),
+                    rest.as_ptr(),
+                    len,
+                    &mut written,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            rest = &rest[written as usize..];
+        }
+        // SAFETY: `pipe` is a live named-pipe server handle.
+        if unsafe { FlushFileBuffers(pipe.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn disconnect(pipe: &OwnedHandle) {
+        // SAFETY: `pipe` is a live named-pipe server handle.
+        unsafe {
+            DisconnectNamedPipe(pipe.as_raw_handle());
+        }
+    }
+
+    /// Opens the pipe as a client once, so a thread blocked in
+    /// `ConnectNamedPipe` returns. Failure means nothing was listening,
+    /// in which case the thread is not blocked there.
+    pub(super) fn wake(name: &[u16]) {
+        // SAFETY: `name` is NUL terminated; the null attributes and
+        // template are the documented defaults.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_NONE,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            // SAFETY: the handle was just returned by CreateFileW and is
+            // closed exactly once.
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
     }
 }
 
@@ -1764,6 +2336,42 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         /// `v=[<printed>] rc=<helper rc>` is how every value test reports.
         fn capture(helper_call: &str) -> String {
             format!("v=\"$({helper_call})\"; rc=$?; echo \"v=[$v] rc=$rc\"")
+        }
+
+        /// Git Bash cannot open `\\.\pipe\<name>` as spelled; the helper
+        /// reads the reply through the msys /proc view of the pipe
+        /// namespace instead, and leaves every other path alone.
+        #[test]
+        fn git_bash_reads_a_windows_named_pipe_through_its_proc_path() {
+            require_tools();
+            let path_after_source = |ostype: &str, reply: &str| -> String {
+                let output = Command::new(bash_program().unwrap())
+                    .arg("-c")
+                    .arg("source \"$PROMPT_UTILS\"; printf '%s' \"$_COYOTE_PROMPT_REPLY_PATH\"")
+                    .env("OSTYPE", ostype)
+                    .env(REPLY_ENV, reply)
+                    .env("PROMPT_UTILS", HELPER)
+                    .env_remove(OUT_FD_ENV)
+                    .stdin(Stdio::null())
+                    .output()
+                    .expect("run bash");
+                assert!(output.status.success(), "{output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            assert_eq!(
+                path_after_source("msys", r"\\.\pipe\coyote-prompt-7-3"),
+                "/proc/sys/Device/NamedPipe/coyote-prompt-7-3"
+            );
+            assert_eq!(
+                path_after_source("cygwin", r"\\.\pipe\coyote-prompt-7-4"),
+                "/proc/sys/Device/NamedPipe/coyote-prompt-7-4"
+            );
+            assert_eq!(
+                path_after_source("msys", "/dev/fd/12"),
+                "/dev/fd/12",
+                "a path that is not a Windows pipe is used as given"
+            );
+            assert_eq!(path_after_source("linux-gnu", "/dev/fd/12"), "/dev/fd/12");
         }
 
         #[test]
