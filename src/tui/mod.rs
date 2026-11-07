@@ -2889,8 +2889,6 @@ fn renew_stream(stream: &mut Option<EventStream>) {
     *stream = Some(EventStream::new());
 }
 
-const STREAM_RENEWED_IN_PLACE: &str = "the event stream is renewed in place";
-
 /// Hands the terminal to `f` in its normal modes and takes it back: the
 /// event stream is restarted around the release so nothing it had in
 /// flight lands on the child or comes back as a keystroke, a Ctrl+C
@@ -2905,7 +2903,12 @@ async fn with_terminal_released<T>(
     renew_stream(stream);
     let released = screen.with_terminal_released(f);
     termination.discard_pending();
-    flush_typeahead(stream.as_mut().expect(STREAM_RENEWED_IN_PLACE)).await;
+    flush_typeahead(
+        stream
+            .as_mut()
+            .expect("the event stream is renewed in place"),
+    )
+    .await;
     released
 }
 
@@ -2926,7 +2929,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let mut frame_failing = false;
     loop {
         let step = tokio::select! {
-            event = stream.as_mut().expect(STREAM_RENEWED_IN_PLACE).next() => Step::Input(event),
+            event = stream.as_mut().expect("the event stream is renewed in place").next() => Step::Input(event),
             msg = rx.recv() => Step::Msg(msg),
             _ = app.frames.next_frame() => Step::Frame,
             done = join(&mut task), if task.is_some() => Step::Work(Box::new(done)),
