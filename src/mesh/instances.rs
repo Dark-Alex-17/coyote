@@ -333,19 +333,19 @@ fn older_path(path: &Path, found: u64) -> PathBuf {
 
 fn older_registry(path: &Path, found: u64) -> String {
     format!(
-        "Mesh instance registry '{}' is version {found}, written by an earlier Coyote; this one writes version {INSTANCES_VERSION}, so it names no session until the next `.mesh on` sets the file aside as '{}' and starts afresh",
+        "Mesh instance registry '{}' is version {found}, written by an earlier Coyote; this one writes version {INSTANCES_VERSION}, so it names no session until the next write (such as `.mesh on`) sets the file aside as '{}' and starts afresh",
         path.display(),
         older_path(path, found).display()
     )
 }
 
 /// Moves a registry an older Coyote wrote to `older_path` (replacing any earlier one), so
-/// the write that found it starts a fresh one. The file is cache: an earlier build's
-/// sessions re-register as each runs `.mesh on`, so this is logged at debug level only.
+/// the write that found it starts a fresh one. The file is cache: sessions re-register as
+/// each runs `.mesh on` under this build, so this is logged at debug level only.
 fn set_aside_older(path: &Path, found: u64) {
     let aside = older_path(path, found);
     debug!(
-        "Mesh instance registry '{}' is version {found}, written by an earlier Coyote; moved to '{}' and started afresh at version {INSTANCES_VERSION}",
+        "Mesh instance registry '{}' is version {found}, written by an earlier Coyote; moving it to '{}' and starting afresh at version {INSTANCES_VERSION}",
         path.display(),
         aside.display()
     );
@@ -800,6 +800,12 @@ mod tests {
         assert!(live(&tmp.path).is_empty());
         assert!(sessions_by_instance(&tmp.path).is_empty());
         assert!(path.exists(), "a read does not move the file");
+        let debugs = crate::testing::debug_snapshot();
+        assert!(
+            debugs.iter().any(|message| message.contains(&path_text)
+                && message.contains("names no session until the next write")),
+            "a read logs why it names no session: {debugs:#?}"
+        );
         let destination = "bb".repeat(16);
         register(&tmp.path, ID_A, row(&destination, "temp"));
 
@@ -824,7 +830,7 @@ mod tests {
         assert!(
             debugs.iter().any(|message| message.contains(&path_text)
                 && message.contains("is version 1, written by an earlier Coyote")
-                && message.contains("moved to")),
+                && message.contains("moving it to")),
             "no debug line names {path_text}; captured: {debugs:#?}"
         );
     }

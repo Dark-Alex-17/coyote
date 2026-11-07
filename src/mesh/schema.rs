@@ -1,8 +1,10 @@
 //! The one versioning discipline every mesh on-disk store follows. Each store carries a
 //! `version` per file or per line; a reader probes it before any other field and refuses
 //! the whole store, never one record, when it is not the version this build writes. The
-//! message builders here are pure so every store's refusal reads the same and the tests
-//! that pin the wording have one place to look.
+//! one exception is the instance registry, which sets a file an older build wrote aside
+//! and starts afresh instead of refusing it. The message builders here are pure so every
+//! store's refusal reads the same and the tests that pin the wording have one place to
+//! look.
 
 use serde::Deserialize;
 use std::path::Path;

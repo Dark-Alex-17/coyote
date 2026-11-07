@@ -2087,6 +2087,12 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
             .is_some_and(|at| at > left_arm),
         "the left marker outranks no route"
     );
+    assert!(
+        render
+            .find("None if facts.own_gone =>")
+            .is_some_and(|at| at < left_arm),
+        "an ended session of yours reads no route even after its farewell"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));

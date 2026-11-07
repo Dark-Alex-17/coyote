@@ -753,7 +753,7 @@ mod tests {
                 destination: destination.clone(),
                 title: Some("news".to_string()),
                 via: PeerVia::Direct,
-                presence: Some("leaving"),
+                presence: Some(crate::mesh::message::PRESENCE_LEAVING),
             },
             MeshEvent::BulletinSent {
                 id: "b-2".to_string(),

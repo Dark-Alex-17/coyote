@@ -1787,6 +1787,17 @@ async fn our_requests_are_decoded_by_the_reference() {
     assert_eq!(heard["path"], json!("/message"), "{heard}");
     assert_eq!(heard["remote_identity"], json!(node_identity));
     let body = &heard["envelope"]["body"];
+    let mut body_keys = keys(body);
+    body_keys.sort_unstable();
+    assert_eq!(
+        body_keys,
+        ["content", "fields", "id", "kind", "ts", "v"],
+        "{heard}"
+    );
+    assert!(
+        body["ts"].as_f64().is_some_and(|ts| ts > 1_700_000_000.0),
+        "{body}"
+    );
     assert_eq!(body["v"], json!(1), "{heard}");
     assert_eq!(body["kind"], json!("bulletin"), "{heard}");
     assert_eq!(body["content"], json!("leaving the mesh"), "{heard}");

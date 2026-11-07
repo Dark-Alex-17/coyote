@@ -355,14 +355,15 @@ impl PeerTable {
     /// Marks the row of `destination_hash` as having said it is leaving the mesh, at
     /// `received_at`: this node's clock when the farewell arrived. A farewell received
     /// before the row's latest announce is ignored, since the instance has announced
-    /// since, and so is one for a destination the table does not know. `true` when the
-    /// row was marked.
+    /// since, and so is one for a destination the table does not know, and a repeat for a
+    /// row already marked, which keeps the time of the first. `true` when the row was
+    /// marked.
     pub(crate) fn mark_left(&self, destination_hash: &str, received_at: SystemTime) -> bool {
         let mut peers = self.inner.lock();
         let Some(record) = peers.get_mut(destination_hash) else {
             return false;
         };
-        if received_at < record.last_seen {
+        if record.left_at.is_some() || received_at < record.last_seen {
             return false;
         }
         record.left_at = Some(received_at);
@@ -835,8 +836,12 @@ mod tests {
 
         let left = t0 + Duration::from_secs(5);
         assert!(table.mark_left("aa", left));
+        assert!(
+            !table.mark_left("aa", left + Duration::from_secs(1)),
+            "a repeated farewell is ignored"
+        );
         let row = table.get("aa").unwrap();
-        assert_eq!(row.left_at, Some(left));
+        assert_eq!(row.left_at, Some(left), "the first farewell's time is kept");
         assert_eq!(row.last_seen, t0, "a farewell is not an announce");
         table.persist_if_dirty().unwrap();
         let reloaded = PeerTable::load(path.clone(), left).unwrap();

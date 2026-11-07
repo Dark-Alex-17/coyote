@@ -4138,11 +4138,12 @@ impl MeshSlot {
     /// First, while the node is still in the slot, every trusted peer it holds a path to
     /// is told it is leaving (`MeshRuntime::send_farewell`), which never takes longer than
     /// `FAREWELL_BUDGET`; `.mesh off`, `.exit session|agent` and the REPL's own exit all
-    /// stop through here, so each says goodbye once.
+    /// stop through here, so each says goodbye once. An envoy reply that goes out during
+    /// that budget reaches the peer after the farewell; the peer files it as usual.
     /// Detaching before the shutdown grace means a reply served during the grace lands as
     /// an ordinary message and its question stays open on disk, which is the price of
-    /// never writing a stopped node's file. An envoy run in flight is cut short first:
-    /// its reply would go out through the node being stopped. `Ok(false)` when nothing
+    /// never writing a stopped node's file. An envoy run in flight is cut short once the
+    /// node is taken: its reply would go out through the node being stopped. `Ok(false)` when nothing
     /// was running. The caller refreshes the session's tool catalog afterwards so the
     /// `mesh__*` tools go with the node.
     pub(crate) async fn stop(&self) -> Result<bool> {
@@ -5968,7 +5969,8 @@ impl PeerSurface for MeshSlot {
     /// `mesh.bulletin.received` with its presence. Its trust, the questions open with it
     /// and the grants it holds are left as they are: the mark is advisory and its next
     /// announce lifts it. A farewell received before that instance's latest announce, or
-    /// from one the table does not hold, changes nothing and fires nothing.
+    /// from one the table does not hold, or a repeat while the mark stands, changes
+    /// nothing and fires nothing.
     fn note_farewell(&self, farewell: Farewell) {
         let Some(runtime) = self.get() else {
             return;
@@ -5979,7 +5981,7 @@ impl PeerSurface for MeshSlot {
             .mark_left(&farewell.source_destination, farewell.received_at)
         {
             debug!(
-                "Mesh farewell {} from instance {dest8} ignored: the peer table holds no row for it, or it has announced since",
+                "Mesh farewell {} from instance {dest8} ignored: the peer table holds no row for it, it has announced since, or it is already marked left",
                 farewell.message_id
             );
             return;
@@ -14755,6 +14757,24 @@ mod tests {
             );
             let row = pair.a.runtime.peers().get(&to_b).expect("the row stays");
             assert!(row.left_at.unwrap() >= row.last_seen);
+            PeerSurface::note_farewell(
+                pair.slot_a.as_ref(),
+                Farewell {
+                    source_identity: identity_b.clone(),
+                    source_destination: to_b.clone(),
+                    message_id: "repeat".to_string(),
+                    received_at: SystemTime::now(),
+                },
+            );
+            assert_eq!(
+                pair.left_at_on_a(),
+                row.left_at,
+                "a repeated farewell keeps the first one's time"
+            );
+            assert!(
+                pair.hooks_a.drain().is_empty(),
+                "a repeated farewell fires nothing"
+            );
 
             pair.b.restart_on(pair.relay.port).await;
             pair.slot_b.install(pair.b.runtime.clone()).unwrap();
@@ -14800,6 +14820,11 @@ mod tests {
                     .is_ok()
             );
             pair.b.runtime.shutdown().await.unwrap();
+            assert_eq!(
+                pair.left_at_on_a(),
+                None,
+                "a node that goes away without stopping through its slot says nothing"
+            );
 
             let started = Instant::now();
             let outcome = pair.a.runtime.send_farewell().await;
