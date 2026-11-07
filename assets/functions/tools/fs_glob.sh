@@ -11,7 +11,11 @@ set -e
 
 # Review lanes ground relative paths in the checkout under review and refuse
 # reads in another clone of the same repository (utils/review-paths.sh).
-_review_lib="$(dirname "${LLM_PROMPT_UTILS_FILE:-${BASH_SOURCE[0]%/*}/../utils/x}")/review-paths.sh"
+if [[ -n "${LLM_PROMPT_UTILS_FILE:-}" ]]; then
+    _review_lib="$(dirname "$LLM_PROMPT_UTILS_FILE")/review-paths.sh"
+else
+    _review_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../utils/review-paths.sh"
+fi
 if [[ -f "$_review_lib" ]]; then
     # shellcheck source=/dev/null
     source "$_review_lib"

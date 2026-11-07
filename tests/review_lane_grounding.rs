@@ -1,44 +1,70 @@
 //! Review lanes read the code under review and report only what the diff
 //! holds. These tests pin the deterministic guards behind that:
 //!
-//! - the read-only fs tools (`assets/functions/tools/fs_*.sh` through
+//! - the read-only tools (`assets/functions/tools/{fs_*,ast_grep}.sh` through
 //!   `assets/functions/utils/review-paths.sh`) resolve a relative path against
-//!   the review checkout and refuse a read inside another clone of the same
-//!   origin repository, while other repositories stay readable;
+//!   the review checkout and refuse a read of tracked code inside another
+//!   clone of the same origin repository, while other repositories, untracked
+//!   local files and every non-review agent are unaffected; with the default
+//!   `project_dir` of `.` the guard is inert;
 //! - the review agents declare the `review_grounding` variable that turns the
 //!   guard on;
-//! - code-reviewer fails closed when finding verification does not complete:
-//!   unverified findings are listed separately, never as blocking, and the
-//!   review gauntlet reads the lane as an incomplete review;
+//! - code-reviewer never reports an unverified finding as blocking, and the
+//!   review gauntlet reads a verification that failed as a whole as an
+//!   incomplete review;
 //! - code-reviewer's anchor gate drops findings that do not point at a change
 //!   of this diff, and facts.py keeps generated files out of review;
 //! - the synthesis wording keeps prior-art notes as context and anchors
 //!   consumer findings at the changed line.
 //!
-//! The fixture mirrors the failure it guards against: a review checkout, a
+//! The fixtures mirror the failures they guard against: a review checkout, a
 //! stale clone of the same repository in the working directory under the
-//! repository's name, and an unrelated shared library.
+//! repository's name, a worktree of the main clone, and an unrelated shared
+//! library.
 
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::sleep;
+use std::time::Duration;
+
+const TOOLS: [&str; 6] = [
+    "fs_read.sh",
+    "fs_cat.sh",
+    "fs_grep.sh",
+    "fs_glob.sh",
+    "fs_ls.sh",
+    "ast_grep.sh",
+];
 
 fn manifest() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The first bash on PATH outside System32, where Windows ships the WSL
-/// launcher (not a shell).
+fn tool_path(tool: &str) -> PathBuf {
+    manifest().join("assets/functions/tools").join(tool)
+}
+
+/// The first bash on PATH outside System32. The one Windows puts there is
+/// the WSL launcher, which is not a shell: it prints a banner about missing
+/// distributions and exits 1.
 fn bash_program() -> Option<PathBuf> {
-    which::which_all("bash").ok()?.find(|p| {
-        !p.to_string_lossy()
-            .to_ascii_lowercase()
-            .replace('\\', "/")
-            .contains("/windows/system32/")
-    })
+    which::which_all("bash")
+        .ok()?
+        .find(|path| is_outside_system32(path))
+}
+
+/// Twin of `is_outside_system32` in src/testing.rs; change both together.
+/// Splits on both separators because `Path::components` leaves a Windows
+/// path whole on unix, where this is unit-tested.
+fn is_outside_system32(path: &Path) -> bool {
+    !path
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case("system32"))
 }
 
 fn tools_available() -> bool {
@@ -57,17 +83,21 @@ impl Drop for TempDir {
     }
 }
 
+/// Unique per call: tests run in parallel threads of one process, so the pid
+/// alone (or a clock) would hand two of them the same directory.
 fn temp_dir(label: &str) -> TempDir {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!("coyote-grounding-{label}-{unique}"));
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let dir = env::temp_dir().join(format!(
+        "coyote-grounding-{label}-{}-{n}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     TempDir(dir)
 }
 
-fn git(dir: &Path, args: &[&str]) {
+fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -80,6 +110,8 @@ fn git(dir: &Path, args: &[&str]) {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            "-c",
+            "core.autocrlf=false",
         ])
         .args(args)
         .output()
@@ -90,6 +122,7 @@ fn git(dir: &Path, args: &[&str]) {
         dir.display(),
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, text: &str) {
@@ -97,9 +130,14 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+fn s(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 /// `root/review` (the checkout under review, origin in scp form), `root/billing`
 /// (a stale clone of the same repository, origin in https form) and
-/// `root/shared-lib` (another repository).
+/// `root/shared-lib` (another repository). `root` is named by the caller, so
+/// a root holding a space or a quote is exercised too.
 struct Clones {
     _dir: TempDir,
     root: PathBuf,
@@ -108,9 +146,9 @@ struct Clones {
     other: PathBuf,
 }
 
-fn clones() -> Clones {
+fn clones_in(root_name: &str) -> Clones {
     let dir = temp_dir("clones");
-    let root = dir.0.clone();
+    let root = dir.0.join(root_name);
     let seed = root.join("seed");
     fs::create_dir_all(&seed).unwrap();
     git(&seed, &["init", "-q"]);
@@ -120,33 +158,15 @@ fn clones() -> Clones {
     let review = root.join("review");
     let shadow = root.join("billing");
     for clone in [&review, &shadow] {
-        git(
-            &root,
-            &[
-                "clone",
-                "-q",
-                seed.to_str().unwrap(),
-                clone.to_str().unwrap(),
-            ],
-        );
+        git(&root, &["clone", "-q", &s(&seed), &s(clone)]);
     }
     git(
         &review,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            "git@github.com:Org/Billing.git",
-        ],
+        &["remote", "set-url", "origin", "git@github.com:Org/Billing.git"],
     );
     git(
         &shadow,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            "https://github.com/org/billing/",
-        ],
+        &["remote", "set-url", "origin", "https://github.com/org/billing/"],
     );
     write(&shadow.join("internal/plan.go"), "package plan // STALE\n");
     let other = root.join("shared-lib");
@@ -154,12 +174,7 @@ fn clones() -> Clones {
     git(&other, &["init", "-q"]);
     git(
         &other,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:org/shared-lib.git",
-        ],
+        &["remote", "add", "origin", "git@github.com:org/shared-lib.git"],
     );
     write(&other.join("caller.go"), "package lib // CALLER\n");
     Clones {
@@ -171,144 +186,258 @@ fn clones() -> Clones {
     }
 }
 
-/// Runs one fs tool the way the engine does for an agent: `main` with the
-/// `argc_*` options set, cwd = `cwd`, the agent variables in the env and the
-/// tool output collected from `$LLM_OUTPUT`.
-fn run_tool(
-    tool: &str,
+fn clones() -> Clones {
+    clones_in("root")
+}
+
+/// How a tool is run: the agent variables, and whether LLM_PROMPT_UTILS_FILE
+/// points at a utils dir the way the engine's run-tool shim sets it.
+#[derive(Default, Clone)]
+struct Run<'a> {
+    vars: Vec<(&'a str, String)>,
+    utils_file: Option<PathBuf>,
+}
+
+fn review_run(review: &Path) -> Run<'static> {
+    Run {
+        vars: vec![
+            ("LLM_AGENT_VAR_PROJECT_DIR", s(review)),
+            ("LLM_AGENT_VAR_REVIEW_GROUNDING", "1".to_string()),
+        ],
+        utils_file: None,
+    }
+}
+
+/// Runs one tool the way the engine does for an agent: `main` with the
+/// `argc_*` options in the environment, cwd = `cwd`, the agent variables in
+/// the env and the tool output collected from `$LLM_OUTPUT`.
+fn run_script_tool(
+    script: &Path,
     cwd: &Path,
     args: &[(&str, &str)],
-    vars: &[(&str, &str)],
+    run: &Run,
     cache: &Path,
 ) -> String {
-    let script = manifest().join("assets/functions/tools").join(tool);
-    let output = cwd.join(format!(".out-{tool}"));
-    let _ = fs::remove_file(&output);
-    let mut snippet = format!("source '{}'", script.display());
-    for (k, v) in args {
-        snippet.push_str(&format!("; argc_{k}='{v}'"));
-    }
-    snippet.push_str("; main");
+    let scratch = temp_dir("out");
+    let output = scratch.0.join("llm-output");
     let mut cmd = Command::new(bash_program().unwrap());
     cmd.arg("-c")
-        .arg(snippet)
+        .arg("source \"$TOOL_UNDER_TEST\"; main")
         .current_dir(cwd)
+        .env("TOOL_UNDER_TEST", script)
         .env("LLM_OUTPUT", &output)
         .env("COYOTE_REVIEW_ORIGIN_CACHE", cache)
         .env_remove("LLM_PROMPT_UTILS_FILE")
         .env_remove("LLM_AGENT_VAR_PROJECT_DIR")
         .env_remove("LLM_AGENT_VAR_REVIEW_GROUNDING");
-    for (k, v) in vars {
+    for (k, v) in args {
+        cmd.env(format!("argc_{k}"), v);
+    }
+    for (k, v) in &run.vars {
         cmd.env(k, v);
+    }
+    if let Some(utils) = &run.utils_file {
+        cmd.env("LLM_PROMPT_UTILS_FILE", utils);
     }
     let out = cmd.output().unwrap();
     let text = fs::read_to_string(&output).unwrap_or_default();
-    let _ = fs::remove_file(&output);
-    format!("{text}{}", String::from_utf8_lossy(&out.stderr))
+    format!(
+        "{text}{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
-fn review_vars(review: &Path) -> Vec<(&'static str, String)> {
-    vec![
-        (
-            "LLM_AGENT_VAR_PROJECT_DIR",
-            review.to_string_lossy().into_owned(),
-        ),
-        ("LLM_AGENT_VAR_REVIEW_GROUNDING", "1".to_string()),
-    ]
+fn run_tool(tool: &str, cwd: &Path, args: &[(&str, &str)], run: &Run, cache: &Path) -> String {
+    run_script_tool(&tool_path(tool), cwd, args, run, cache)
 }
 
-fn as_refs<'a>(vars: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
-    vars.iter().map(|(k, v)| (*k, v.as_str())).collect()
+fn assert_refused(out: &str, checkout_path_tail: &str, label: &str) {
+    assert!(
+        out.contains("Refused:") && out.contains("another clone of the repository under review"),
+        "{label}: must refuse: {out}"
+    );
+    let named = out
+        .lines()
+        .find_map(|l| l.strip_prefix("It may not match the code being reviewed. Read the review checkout instead: "))
+        .unwrap_or_else(|| panic!("{label}: no checkout path named: {out}"));
+    assert!(
+        named.replace('\\', "/").ends_with(checkout_path_tail),
+        "{label}: must name {checkout_path_tail}: {out}"
+    );
 }
 
 /// The #1001 shape: the engine's cwd holds a stale clone under the repo name
 /// and the reviewer passes a relative path. Every read tool resolves it in the
-/// review checkout.
+/// review checkout, whatever characters the checkout's path holds.
 #[test]
 fn relative_paths_resolve_against_the_review_checkout() {
     if !tools_available() {
         return;
     }
-    let c = clones();
-    let cache = c.root.join("cache");
-    let vars = review_vars(&c.review);
-    let vars = as_refs(&vars);
-    for tool in ["fs_cat.sh", "fs_read.sh"] {
+    for root_name in ["root", "root with space", "root's quote"] {
+        let c = clones_in(root_name);
+        let cache = c.root.join("cache");
+        let run = review_run(&c.review);
+        for tool in ["fs_cat.sh", "fs_read.sh"] {
+            let out = run_tool(tool, &c.root, &[("path", "internal/plan.go")], &run, &cache);
+            assert!(out.contains("// HEAD"), "{root_name} {tool}: {out}");
+            assert!(!out.contains("STALE"), "{root_name} {tool} read the stale clone: {out}");
+        }
+        let out = run_tool("fs_grep.sh", &c.root, &[("pattern", "package plan")], &run, &cache);
+        assert!(
+            out.contains("// HEAD") && !out.contains("STALE"),
+            "{root_name}: fs_grep with no path must search the checkout: {out}"
+        );
+        let out = run_tool("fs_glob.sh", &c.root, &[("pattern", "*.go")], &run, &cache);
+        assert!(
+            out.contains("review/internal/plan.go") && !out.contains("billing/"),
+            "{root_name}: fs_glob with no path must search the checkout: {out}"
+        );
+        let out = run_tool("fs_ls.sh", &c.root, &[("path", "internal")], &run, &cache);
+        assert!(out.contains("plan.go"), "{root_name}: {out}");
+
         let out = run_tool(
-            tool,
+            "fs_read.sh",
             &c.root,
-            &[("path", "internal/plan.go")],
-            &vars,
+            &[("path", "billing/internal/plan.go")],
+            &run,
             &cache,
         );
+        assert!(!out.contains("STALE"), "{root_name}: {out}");
         assert!(
-            out.contains("// HEAD"),
-            "{tool} must read the checkout: {out}"
+            out.contains("did you mean") && out.contains("internal/plan.go"),
+            "{root_name}: the miss must name the checkout file it most likely means: {out}"
         );
-        assert!(!out.contains("STALE"), "{tool} read the stale clone: {out}");
     }
-    let out = run_tool(
-        "fs_grep.sh",
-        &c.root,
-        &[("pattern", "package plan")],
-        &vars,
-        &cache,
-    );
-    assert!(
-        out.contains("// HEAD") && !out.contains("STALE"),
-        "fs_grep with no path must search the checkout, not the cwd: {out}"
-    );
-    let out = run_tool("fs_glob.sh", &c.root, &[("pattern", "*.go")], &vars, &cache);
-    assert!(
-        out.contains("review/internal/plan.go") && !out.contains("billing/"),
-        "fs_glob with no path must search the checkout: {out}"
-    );
-    let out = run_tool("fs_ls.sh", &c.root, &[("path", "internal")], &vars, &cache);
-    assert!(
-        out.contains("plan.go"),
-        "fs_ls must list the checkout: {out}"
-    );
-
-    let out = run_tool(
-        "fs_read.sh",
-        &c.root,
-        &[("path", "billing/internal/plan.go")],
-        &vars,
-        &cache,
-    );
-    assert!(
-        !out.contains("STALE"),
-        "a repo-name-prefixed relative path must not reach the stale clone: {out}"
-    );
-    assert!(
-        out.contains("did you mean") && out.contains("internal/plan.go"),
-        "the miss must name the checkout file it most likely means: {out}"
-    );
 }
 
-/// Without the review variable the tools keep their old cwd semantics, so
-/// non-review agents are untouched.
+/// The engine's run-tool shim exports LLM_PROMPT_UTILS_FILE; the tools find
+/// the guard next to it.
 #[test]
-fn tools_outside_a_review_lane_keep_cwd_semantics() {
+fn tools_find_the_guard_through_the_engine_utils_file() {
+    if !tools_available() {
+        return;
+    }
+    let c = clones();
+    let mut run = review_run(&c.review);
+    run.utils_file = Some(manifest().join("assets/functions/utils/prompt-utils.sh"));
+    let out = run_tool(
+        "fs_cat.sh",
+        &c.root,
+        &[("path", "internal/plan.go")],
+        &run,
+        &c.root.join("cache"),
+    );
+    assert!(out.contains("// HEAD"), "{out}");
+}
+
+/// A tool installed without the guard refuses in a review lane and reads
+/// normally everywhere else.
+#[test]
+fn a_missing_guard_refuses_only_in_a_review_lane() {
+    if !tools_available() {
+        return;
+    }
+    let c = clones();
+    let lone = temp_dir("lone-tool");
+    let tools = lone.0.join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    let script = tools.join("fs_cat.sh");
+    fs::copy(tool_path("fs_cat.sh"), &script).unwrap();
+    let target = c.review.join("internal/plan.go");
+    let target = s(&target);
+    let cache = c.root.join("cache");
+    let out = run_script_tool(&script, &c.root, &[("path", &target)], &review_run(&c.review), &cache);
+    assert!(
+        out.contains("Refused: the review path guard") && out.contains("is not installed"),
+        "{out}"
+    );
+    let out = run_script_tool(&script, &c.root, &[("path", &target)], &Run::default(), &cache);
+    assert!(out.contains("// HEAD"), "{out}");
+}
+
+/// A tool with the guard block and its call lines removed: the tool as it was
+/// before review grounding existed.
+fn ungrounded_copy(tool: &str, dir: &Path) -> PathBuf {
+    let text = fs::read_to_string(tool_path(tool)).unwrap();
+    let start = text.find("# Review lanes ground relative paths").unwrap();
+    let end_marker = "        REVIEW_GROUNDED_PATH=\"$1\"\n    }\nfi\n";
+    let end = text[start..].find(end_marker).unwrap() + start + end_marker.len();
+    let mut stripped = format!("{}{}", &text[..start], &text[end..]);
+    stripped = stripped
+        .lines()
+        .filter(|l| !l.contains("review_ground_path \"") && !l.contains("=\"$REVIEW_GROUNDED_PATH\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let path = dir.join(tool);
+    fs::write(&path, stripped).unwrap();
+    path
+}
+
+/// Every non-review agent (no grounding variable) gets byte-identical output
+/// from all six tools, project_dir set or not.
+#[test]
+fn non_review_agents_get_byte_identical_tool_output() {
     if !tools_available() {
         return;
     }
     let c = clones();
     let cache = c.root.join("cache");
-    let project = c.review.to_string_lossy().into_owned();
-    let out = run_tool(
-        "fs_cat.sh",
-        &c.root,
-        &[("path", "billing/internal/plan.go")],
-        &[("LLM_AGENT_VAR_PROJECT_DIR", project.as_str())],
-        &cache,
-    );
-    assert!(out.contains("STALE"), "{out}");
+    let baselines = temp_dir("baseline");
+    let shadow_file = c.shadow.join("internal/plan.go");
+    let shadow_file = s(&shadow_file);
+    let shadow_dir = s(&c.shadow);
+    let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("fs_read.sh", vec![("path", "billing/internal/plan.go")]),
+        ("fs_read.sh", vec![("path", &*shadow_file)]),
+        ("fs_cat.sh", vec![("path", "billing/internal/plan.go")]),
+        ("fs_cat.sh", vec![("path", "missing.go")]),
+        ("fs_grep.sh", vec![("pattern", "package")]),
+        ("fs_grep.sh", vec![("pattern", "STALE"), ("path", &*shadow_dir)]),
+        ("fs_glob.sh", vec![("pattern", "*.go")]),
+        ("fs_ls.sh", vec![("path", "billing")]),
+        ("ast_grep.sh", vec![("pattern", "package $X"), ("path", &*shadow_dir)]),
+    ];
+    let project = Run {
+        vars: vec![("LLM_AGENT_VAR_PROJECT_DIR", s(&c.review))],
+        utils_file: None,
+    };
+    for (tool, args) in &cases {
+        let baseline = ungrounded_copy(tool, &baselines.0);
+        for run in [Run::default(), project.clone()] {
+            let expected = run_script_tool(&baseline, &c.root, args, &run, &cache);
+            let actual = run_tool(tool, &c.root, args, &run, &cache);
+            assert_eq!(actual, expected, "{tool} {args:?}");
+        }
+    }
 }
 
-/// A read that lands in another clone of the reviewed repository is refused
-/// with the review checkout's path, whether it is absolute or relative, a
-/// file or a directory, present or missing.
+/// The guard block is the same text in every tool, so no tool drifts.
+#[test]
+fn the_guard_block_is_identical_in_every_tool() {
+    let block = |tool: &str| {
+        let text = fs::read_to_string(tool_path(tool)).unwrap();
+        let start = text.find("# Review lanes ground relative paths").unwrap();
+        let end_marker = "        REVIEW_GROUNDED_PATH=\"$1\"\n    }\nfi\n";
+        let end = text[start..].find(end_marker).unwrap() + start + end_marker.len();
+        text[start..end].to_string()
+    };
+    let first = block(TOOLS[0]);
+    for tool in TOOLS {
+        assert_eq!(block(tool), first, "{tool}");
+        assert!(
+            fs::read_to_string(tool_path(tool))
+                .unwrap()
+                .contains("review_ground_path \""),
+            "{tool} must ground its path argument"
+        );
+    }
+}
+
+/// A read that lands on tracked code in another clone of the reviewed
+/// repository is refused, naming the same file in the review checkout,
+/// whether it is absolute or relative, a file or a directory.
 #[test]
 fn reads_in_a_same_origin_clone_are_redirected_to_the_checkout() {
     if !tools_available() {
@@ -316,129 +445,209 @@ fn reads_in_a_same_origin_clone_are_redirected_to_the_checkout() {
     }
     let c = clones();
     let cache = c.root.join("cache");
-    let vars = review_vars(&c.review);
-    let vars = as_refs(&vars);
+    let run = review_run(&c.review);
     let shadow_file = c.shadow.join("internal/plan.go");
-    let shadow_file = shadow_file.to_string_lossy();
-    let shadow_dir = c.shadow.to_string_lossy();
-    let missing = c.shadow.join("internal/gone.go");
-    let missing = missing.to_string_lossy();
-    for (tool, args) in [
-        ("fs_cat.sh", vec![("path", &*shadow_file)]),
-        ("fs_read.sh", vec![("path", &*shadow_file)]),
-        ("fs_read.sh", vec![("path", "../billing/internal/plan.go")]),
-        ("fs_cat.sh", vec![("path", &*missing)]),
-        ("fs_ls.sh", vec![("path", &*shadow_dir)]),
+    let shadow_file = s(&shadow_file);
+    let shadow_dir = s(&c.shadow);
+    let shadow_sub = s(&c.shadow.join("internal"));
+    for (tool, args, tail) in [
+        ("fs_cat.sh", vec![("path", &*shadow_file)], "review/internal/plan.go"),
+        ("fs_read.sh", vec![("path", &*shadow_file)], "review/internal/plan.go"),
         (
-            "fs_grep.sh",
-            vec![("pattern", "STALE"), ("path", &*shadow_dir)],
+            "fs_read.sh",
+            vec![("path", "../billing/internal/plan.go")],
+            "review/internal/plan.go",
         ),
-        (
-            "fs_glob.sh",
-            vec![("pattern", "*.go"), ("path", &*shadow_dir)],
-        ),
+        ("fs_ls.sh", vec![("path", &*shadow_dir)], "review"),
+        ("fs_grep.sh", vec![("pattern", "STALE"), ("path", &*shadow_sub)], "review/internal"),
+        ("fs_glob.sh", vec![("pattern", "*.go"), ("path", &*shadow_dir)], "review"),
+        ("ast_grep.sh", vec![("pattern", "package $X"), ("path", &*shadow_sub)], "review/internal"),
     ] {
-        let out = run_tool(tool, &c.root, &args, &vars, &cache);
-        assert!(
-            out.contains("Refused:")
-                && out.contains("another clone of the repository under review"),
-            "{tool} {args:?} must refuse the shadow clone: {out}"
-        );
-        assert!(
-            out.contains("Read the review checkout instead:") && out.contains("/review"),
-            "{tool} {args:?} must name the review checkout: {out}"
-        );
+        let out = run_tool(tool, &c.root, &args, &run, &cache);
+        assert_refused(&out, tail, &format!("{tool} {args:?}"));
         assert!(!out.contains("package plan // STALE"), "{tool}: {out}");
     }
-    let out = run_tool(
-        "fs_cat.sh",
-        &c.root,
-        &[("path", &*shadow_file)],
-        &vars,
-        &cache,
-    );
-    assert!(
-        out.contains("review/internal/plan.go"),
-        "the refusal must point at the same file in the checkout: {out}"
-    );
 }
 
 /// Owner rule: reviewers still read callers and shared libraries in other
-/// repositories, and the review checkout itself by absolute path.
+/// repositories, files outside any repository, the review checkout itself by
+/// absolute path, and untracked local files of a same-origin clone.
 #[test]
-fn reads_in_other_repositories_still_succeed() {
+fn reads_in_other_repositories_and_untracked_files_still_succeed() {
     if !tools_available() {
         return;
     }
     let c = clones();
     let cache = c.root.join("cache");
-    let vars = review_vars(&c.review);
-    let vars = as_refs(&vars);
-    let caller = c.other.join("caller.go");
-    let out = run_tool(
-        "fs_cat.sh",
-        &c.root,
-        &[("path", &caller.to_string_lossy())],
-        &vars,
-        &cache,
-    );
+    let run = review_run(&c.review);
+    let caller = s(&c.other.join("caller.go"));
+    let out = run_tool("fs_cat.sh", &c.root, &[("path", &caller)], &run, &cache);
     assert!(out.contains("// CALLER"), "{out}");
-    let out = run_tool(
-        "fs_grep.sh",
-        &c.root,
-        &[("pattern", "CALLER"), ("path", &c.other.to_string_lossy())],
-        &vars,
-        &cache,
-    );
+    let other = s(&c.other);
+    let out = run_tool("fs_grep.sh", &c.root, &[("pattern", "CALLER"), ("path", &other)], &run, &cache);
     assert!(out.contains("// CALLER"), "{out}");
-    let own = c.review.join("internal/plan.go");
-    let out = run_tool(
-        "fs_read.sh",
-        &c.root,
-        &[("path", &own.to_string_lossy())],
-        &vars,
-        &cache,
-    );
+    let own = s(&c.review.join("internal/plan.go"));
+    let out = run_tool("fs_read.sh", &c.root, &[("path", &own)], &run, &cache);
     assert!(out.contains("// HEAD"), "{out}");
     let outside = c.root.join("notes.txt");
     write(&outside, "NOT A REPO\n");
-    let out = run_tool(
-        "fs_cat.sh",
-        &c.root,
-        &[("path", &outside.to_string_lossy())],
-        &vars,
-        &cache,
-    );
+    let out = run_tool("fs_cat.sh", &c.root, &[("path", &s(&outside))], &run, &cache);
     assert!(out.contains("NOT A REPO"), "{out}");
+    let local = c.shadow.join("plans/x.md");
+    write(&local, "LOCAL PLAN\n");
+    let out = run_tool("fs_cat.sh", &c.root, &[("path", &s(&local))], &run, &cache);
+    assert!(
+        out.contains("LOCAL PLAN"),
+        "an untracked file only the other clone has stays readable: {out}"
+    );
 }
 
-/// The origin lookup is cached per checkout root, and a cache directory the
-/// user does not own is ignored rather than trusted.
+/// A main clone and a worktree of it (same origin, shared config), the way a
+/// task worktree sits next to the checkout coyote was started in.
+struct Worktree {
+    _dir: TempDir,
+    main: PathBuf,
+    worktree: PathBuf,
+}
+
+fn worktree() -> Worktree {
+    let dir = temp_dir("worktree");
+    let main = dir.0.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    git(
+        &main,
+        &["remote", "add", "origin", "git@github.com:org/coyote.git"],
+    );
+    write(&main.join("src/lib.rs"), "// MAIN\n");
+    write(&main.join("src/gone.rs"), "// GONE IN THE WORKTREE\n");
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-qm", "base"]);
+    let worktree = dir.0.join("task-1");
+    git(&main, &["worktree", "add", "-q", &s(&worktree), "-b", "task"]);
+    write(&worktree.join("src/lib.rs"), "// TASK\n");
+    fs::remove_file(worktree.join("src/gone.rs")).unwrap();
+    write(&main.join("plans/x.md"), "LOCAL PLAN\n");
+    let exclude = main.join(".git/info/exclude");
+    let mut text = fs::read_to_string(&exclude).unwrap_or_default();
+    text.push_str("plans/\n");
+    fs::write(&exclude, text).unwrap();
+    Worktree {
+        _dir: dir,
+        main,
+        worktree,
+    }
+}
+
+/// The default project_dir (`.`, or none at all) names no checkout, so the
+/// guard is inert even when the cwd is a same-origin clone of the reviewed
+/// repository: reads behave exactly as without the guard.
 #[test]
-fn origin_lookups_are_cached_per_checkout_root() {
+fn the_default_project_dir_leaves_reads_untouched() {
+    if !tools_available() {
+        return;
+    }
+    let w = worktree();
+    let cache = w.main.join("../cache");
+    let task_file = s(&w.worktree.join("src/lib.rs"));
+    for project_dir in [None, Some("."), Some("./")] {
+        let mut run = Run {
+            vars: vec![("LLM_AGENT_VAR_REVIEW_GROUNDING", "1".to_string())],
+            utils_file: None,
+        };
+        if let Some(p) = project_dir {
+            run.vars.push(("LLM_AGENT_VAR_PROJECT_DIR", p.to_string()));
+        }
+        let out = run_tool("fs_cat.sh", &w.main, &[("path", "src/lib.rs")], &run, &cache);
+        assert_eq!(out.trim(), "// MAIN", "{project_dir:?}: {out}");
+        let out = run_tool("fs_cat.sh", &w.main, &[("path", &task_file)], &run, &cache);
+        assert_eq!(out.trim(), "// TASK", "{project_dir:?}: {out}");
+    }
+    // An inherited project_dir that repeats the cwd's checkout says nothing
+    // about which checkout is under review: inert too.
+    let run = review_run(&w.main);
+    let out = run_tool("fs_cat.sh", &w.main, &[("path", &task_file)], &run, &cache);
+    assert_eq!(out.trim(), "// TASK", "{out}");
+}
+
+/// project_dir names the task worktree and coyote runs in the main clone: the
+/// worktree reads normally, the main clone's tracked code is redirected to the
+/// worktree, and only to a path that exists there.
+#[test]
+fn a_worktree_review_from_the_main_clone_is_grounded() {
+    if !tools_available() {
+        return;
+    }
+    let w = worktree();
+    let cache = w.main.join("../cache");
+    let run = review_run(&w.worktree);
+    let out = run_tool("fs_cat.sh", &w.main, &[("path", "src/lib.rs")], &run, &cache);
+    assert_eq!(out.trim(), "// TASK", "{out}");
+    let task_file = s(&w.worktree.join("src/lib.rs"));
+    let out = run_tool("fs_read.sh", &w.main, &[("path", &task_file)], &run, &cache);
+    assert!(out.contains("1: // TASK"), "{out}");
+    let main_file = s(&w.main.join("src/lib.rs"));
+    let out = run_tool("fs_cat.sh", &w.main, &[("path", &main_file)], &run, &cache);
+    assert_refused(&out, "task-1/src/lib.rs", "main clone file with a counterpart");
+    let gone = s(&w.main.join("src/gone.rs"));
+    let out = run_tool("fs_cat.sh", &w.main, &[("path", &gone)], &run, &cache);
+    assert_refused(&out, "task-1", "tracked file the worktree deleted");
+    assert!(!out.contains("GONE IN THE WORKTREE"), "{out}");
+    let plan = s(&w.main.join("plans/x.md"));
+    let out = run_tool("fs_cat.sh", &w.main, &[("path", &plan)], &run, &cache);
+    assert_eq!(out.trim(), "LOCAL PLAN", "an excluded local file stays readable: {out}");
+}
+
+/// The origin lookup is cached per checkout root under a hashed key and
+/// refreshed when the repository config changes.
+#[test]
+fn origin_lookups_are_cached_and_refreshed_with_the_config() {
     if !tools_available() {
         return;
     }
     let c = clones();
     let cache = c.root.join("cache");
-    let vars = review_vars(&c.review);
-    let vars = as_refs(&vars);
-    let shadow_file = c.shadow.join("internal/plan.go");
-    run_tool(
-        "fs_cat.sh",
-        &c.root,
-        &[("path", &shadow_file.to_string_lossy())],
-        &vars,
-        &cache,
-    );
-    let entries: Vec<String> = fs::read_dir(&cache)
-        .unwrap()
-        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
-        .collect();
-    assert_eq!(entries.len(), 2, "one entry per checkout root: {entries:?}");
+    let run = review_run(&c.review);
+    let shadow_file = s(&c.shadow.join("internal/plan.go"));
+    let out = run_tool("fs_cat.sh", &c.root, &[("path", &shadow_file)], &run, &cache);
+    assert!(out.contains("Refused:"), "{out}");
+    let entries = || -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    fs::read_to_string(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let first = entries();
+    assert_eq!(first.len(), 2, "one entry per checkout root: {first:?}");
     assert!(
-        entries.iter().all(|e| e == "github.com/org/billing"),
-        "scp and https origins normalize to one form: {entries:?}"
+        first
+            .iter()
+            .all(|(k, v)| k.len() == 40 && k.chars().all(|c| c.is_ascii_hexdigit()) && v == "github.com/org/billing"),
+        "hashed keys; scp and https origins normalize to one form: {first:?}"
+    );
+    // A coarse mtime clock must still see the config as newer.
+    sleep(Duration::from_millis(1100));
+    git(
+        &c.shadow,
+        &["remote", "set-url", "origin", "git@github.com:org/other.git"],
+    );
+    let out = run_tool("fs_cat.sh", &c.root, &[("path", &shadow_file)], &run, &cache);
+    assert!(
+        out.contains("// STALE"),
+        "a clone whose origin changed is no longer the reviewed repository: {out}"
+    );
+    assert!(
+        entries().iter().any(|(_, v)| v == "github.com/org/other"),
+        "{:?}",
+        entries()
     );
 }
 
@@ -464,20 +673,6 @@ fn review_agents_declare_review_grounding_on_by_default() {
             .find(|v| v["name"].as_str() == Some("review_grounding"))
             .unwrap_or_else(|| panic!("{rel}: no review_grounding variable"));
         assert_eq!(var["default"].as_str(), Some("1"), "{rel}");
-    }
-    for tool in [
-        "fs_read.sh",
-        "fs_cat.sh",
-        "fs_grep.sh",
-        "fs_glob.sh",
-        "fs_ls.sh",
-    ] {
-        let text =
-            fs::read_to_string(manifest().join("assets/functions/tools").join(tool)).unwrap();
-        assert!(
-            text.contains("review_ground_path \""),
-            "{tool} must ground its path argument"
-        );
     }
 }
 
@@ -1005,14 +1200,13 @@ fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
             "https://github.com/docker/billing",
         ],
     );
-    let vars = review_vars(&pr.repo);
-    let vars = as_refs(&vars);
+    let run = review_run(&pr.repo);
     let cache = pr.root.join("cache");
     let out = run_tool(
         "fs_read.sh",
         &pr.root,
         &[("path", "billing/internal/plan.go")],
-        &vars,
+        &run,
         &cache,
     );
     assert!(
@@ -1024,7 +1218,7 @@ fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
         "fs_read.sh",
         &pr.root,
         &[("path", &stale.to_string_lossy())],
-        &vars,
+        &run,
         &cache,
     );
     assert!(
@@ -1035,7 +1229,7 @@ fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
         "fs_read.sh",
         &pr.root,
         &[("path", "internal/plan.go")],
-        &vars,
+        &run,
         &cache,
     );
     assert!(

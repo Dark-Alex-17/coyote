@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 
 # Path grounding for the read-only fs tools (fs_read, fs_cat, fs_grep,
-# fs_glob, fs_ls) when they run inside a review lane.
+# fs_glob, fs_ls, ast_grep) when they run inside a review lane.
 #
 # A review lane declares the `review_grounding` agent variable (default '1'),
 # so the tools see LLM_AGENT_VAR_REVIEW_GROUNDING=1 next to
-# LLM_AGENT_VAR_PROJECT_DIR, the checkout under review. Outside a review lane,
-# or when project_dir does not name a git checkout, every path passes through
-# unchanged.
+# LLM_AGENT_VAR_PROJECT_DIR, the checkout under review. The guard is inert,
+# and every path passes through unchanged, when:
+#   - the variable is not '1' (every non-review agent);
+#   - project_dir is empty or the literal default `.`: the caller named no
+#     checkout, so the working directory is not known to be the one under
+#     review;
+#   - project_dir is not inside a git checkout;
+#   - project_dir is inside the same checkout as the working directory:
+#     relative reads already land in it, and an inherited project_dir that
+#     merely repeats the working directory says nothing about which checkout
+#     is under review.
 #
-# Inside a review lane two rules apply, and only these two:
-#   1. A relative path resolves against the review checkout's project dir,
-#      never against the process working directory.
+# Otherwise two rules apply, and only these two:
+#   1. A relative path resolves against project_dir, never against the
+#      process working directory.
 #   2. A path inside a DIFFERENT checkout whose `origin` remote is the same
-#      repository as the review checkout (a stale local clone, another
-#      worktree) is refused with a message naming the review checkout.
+#      repository (a stale local clone, another worktree) is refused, naming
+#      the review checkout, when the same file exists in the review checkout
+#      or is tracked in that other clone. Untracked files only that clone has
+#      (local notes, excluded plans) stay readable.
 # Reads anywhere else, other repositories included, are unaffected.
 #
 # Usage:  review_ground_path "$path" || return 0; path="$REVIEW_GROUNDED_PATH"
@@ -22,16 +32,40 @@
 # written to $LLM_OUTPUT=/dev/stdout is never captured as the path). On refusal
 # the message is appended to $LLM_OUTPUT and the function returns 1.
 
+# Windows drive paths (C:\x, C:/x) become MSYS paths (/c/x) so every
+# comparison below works on one form.
+_review_posix() {
+    local path="$1"
+    if [[ "${OS:-}" == "Windows_NT" && "$path" =~ ^[A-Za-z]:[\\/] ]] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$path"
+        return 0
+    fi
+    printf '%s' "$path"
+}
+
+_review_expand_home() {
+    local path="$1"
+    case "$path" in
+        \~) path="$HOME" ;;
+        \~/*) path="$HOME/${path#\~/}" ;;
+    esac
+    printf '%s' "$path"
+}
+
 # Prints the normalized origin URL of the checkout at $1, or nothing. The
-# lookup is cached per checkout root, so repeated reads stay cheap.
+# lookup is cached per checkout root and refreshed when the repository's
+# config file is newer than the cached entry.
 _review_origin_of() {
-    local root="$1" cache_dir key url
+    local root="$1" cache_dir key url common config
     cache_dir="${COYOTE_REVIEW_ORIGIN_CACHE:-${TMPDIR:-/tmp}/coyote-review-origins-$(id -u)}"
-    key="${root//\//%}"
+    key=$(printf '%s' "$root" | git hash-object --stdin 2>/dev/null) || key=""
     [[ -d "$cache_dir" ]] || mkdir -m 700 "$cache_dir" 2>/dev/null || true
-    # A cache directory someone else owns could forge an origin match.
-    [[ -O "$cache_dir" ]] || cache_dir=""
-    if [[ -n "$cache_dir" && -f "$cache_dir/$key" ]]; then
+    # Only a cache directory this user owns is used.
+    [[ -n "$key" && -O "$cache_dir" ]] || cache_dir=""
+    common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || common=""
+    [[ -z "$common" || "$common" == /* || "$common" =~ ^[A-Za-z]: ]] || common="$root/$common"
+    config="$common/config"
+    if [[ -n "$cache_dir" && -f "$cache_dir/$key" && ! "$config" -nt "$cache_dir/$key" ]]; then
         cat "$cache_dir/$key"
         return 0
     fi
@@ -73,6 +107,7 @@ _review_checkout_root() {
     done
     top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
     [[ -n "$top" ]] || return 1
+    top=$(_review_posix "$top")
     (cd "$top" 2>/dev/null && pwd -P)
 }
 
@@ -108,49 +143,49 @@ review_ground_path() {
     local path="$1"
     REVIEW_GROUNDED_PATH="$path"
     local project_dir="${LLM_AGENT_VAR_PROJECT_DIR:-}"
-    if [[ "${LLM_AGENT_VAR_REVIEW_GROUNDING:-}" != "1" || -z "$project_dir" ]]; then
-        REVIEW_GROUNDED_PATH="$path"
+    if [[ "${LLM_AGENT_VAR_REVIEW_GROUNDING:-}" != "1" || -z "$project_dir" || "$project_dir" == "." || "$project_dir" == "./" ]]; then
         return 0
     fi
-    local base review_root
-    base=$(cd "$project_dir" 2>/dev/null && pwd -P) || {
-        REVIEW_GROUNDED_PATH="$path"
-        return 0
-    }
-    review_root=$(_review_checkout_root "$base") || {
-        REVIEW_GROUNDED_PATH="$path"
-        return 0
-    }
+    project_dir=$(_review_posix "$(_review_expand_home "$project_dir")")
+    local base review_root cwd_root
+    base=$(cd "$project_dir" 2>/dev/null && pwd -P) || return 0
+    review_root=$(_review_checkout_root "$base") || return 0
+    cwd_root=$(_review_checkout_root "$(pwd -P)") || cwd_root=""
+    [[ "$cwd_root" != "$review_root" ]] || return 0
 
+    path=$(_review_posix "$(_review_expand_home "$path")")
     case "$path" in
-        /* | "~"*) ;;
-        "" | .) path="$base" ;;
+        /* | [A-Za-z]:[\\/]*) ;;
+        "" | . | ./) path="$base" ;;
         *)
             local rel_in="${path#./}"
             path="$base/$rel_in"
             _review_missing_hint "$base" "$rel_in"
             ;;
     esac
+    REVIEW_GROUNDED_PATH="$path"
 
     local target_root
-    target_root=$(_review_checkout_root "$path") || {
-        REVIEW_GROUNDED_PATH="$path"
-        return 0
-    }
-    if [[ "$target_root" != "$review_root" ]]; then
-        local review_origin
-        review_origin=$(_review_origin_of "$review_root")
-        if [[ -n "$review_origin" && "$(_review_origin_of "$target_root")" == "$review_origin" ]]; then
-            local rel
-            rel=$(_review_physical "$path")
-            rel="${rel#"$target_root"}"
-            rel="${rel#/}"
-            {
-                echo "Refused: $path is in $target_root, another clone of the repository under review ($review_origin)."
-                echo "It may not match the code being reviewed. Read the review checkout instead: $review_root${rel:+/$rel}"
-            } >> "$LLM_OUTPUT"
-            return 1
-        fi
+    target_root=$(_review_checkout_root "$path") || return 0
+    [[ "$target_root" != "$review_root" ]] || return 0
+    local review_origin
+    review_origin=$(_review_origin_of "$review_root")
+    [[ -n "$review_origin" && "$(_review_origin_of "$target_root")" == "$review_origin" ]] || return 0
+
+    local rel counterpart
+    rel=$(_review_physical "$path")
+    rel="${rel#"$target_root"}"
+    rel="${rel#/}"
+    counterpart="$review_root${rel:+/$rel}"
+    if [[ ! -e "$counterpart" ]]; then
+        # Not in the review checkout: refuse only what the other clone tracks
+        # (stale code), never its untracked local files.
+        [[ -n "$rel" && -n "$(git -C "$target_root" ls-files -- "$rel" 2>/dev/null | head -n 1)" ]] || return 0
+        counterpart="$review_root"
     fi
-    REVIEW_GROUNDED_PATH="$path"
+    {
+        echo "Refused: $path is in $target_root, another clone of the repository under review ($review_origin)."
+        echo "It may not match the code being reviewed. Read the review checkout instead: $counterpart"
+    } >> "$LLM_OUTPUT"
+    return 1
 }
