@@ -1499,7 +1499,7 @@ def compose_delegation(state):
 
 # A sisyphus-next end node opens its output with its sentinel on a line of its own; REDIRECT ends the run before any
 # work lands (a plan-shaped brief). A sentinel quoted mid-line in a successful report is prose, never a verdict.
-FAILURE_SENTINEL_RE = re.compile(r"(?m)^\s*SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\b")
+FAILURE_SENTINEL_RE = re.compile(r"(?m)^\s*SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT|HANDOFF)\b")
 DISCUSSION_SENTINEL_RE = re.compile(r"(?m)^\s*SISYPHUS_AWAITING_DISCUSSION\b")
 DISCUSSION_DATA_RE = re.compile(r"(?m)^Discussion data: (\{.*\})[ \t]*$")
 LEDGER_SECTION_RE = re.compile(r"(?im)^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions)\s*:")
