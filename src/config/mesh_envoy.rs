@@ -7825,6 +7825,15 @@ mod tests {
             self.b.restart_on(self.relay.port).await;
             self.app_b.mesh.install(self.b.runtime.clone()).unwrap();
             TransportRelay::heard_from(&mut relay_announces, &self.to_b).await;
+            // B's stop said goodbye to A, which tries nothing over a link to B until it
+            // has filed B's next announce.
+            let peers_a = self.a.runtime.peers();
+            wait_until("A to file B's announce and lift its farewell", || {
+                peers_a
+                    .get(&self.to_b)
+                    .is_some_and(|row| row.left_at.is_none())
+            })
+            .await;
             assert!(
                 self.b
                     .runtime

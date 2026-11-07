@@ -6725,6 +6725,17 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
 /// is checked on every run.
 #[test]
 fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
+    let back = string_literals(&fn_body("src/mesh/node.rs", "return_line"));
+    for needle in [
+        "from {}",
+        " is back; your question {from} is still open",
+        " is back; your {n} questions, the oldest {from}, are still open",
+    ] {
+        assert!(
+            back.iter().any(|literal| literal == needle),
+            "return_line no longer prints {needle:?}: {back:?}"
+        );
+    }
     let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
     assert_eq!(
         outbound,
@@ -6813,7 +6824,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let entry_literals = string_literals(&fn_body("src/repl/mesh.rs", "pending_entry"));
     for needle in [
         "{marker}-> ",
-        " {age} . {} . id ",
+        " {age} . {}{left} . id ",
+        " . peer left {}",
         " {} {age}{expires} . id ",
         " . expires in {}",
         "  {number}. ",
@@ -7008,6 +7020,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "`<dest8> (<dest8>)`".to_string(),
         "`<name> (<dest8>) asked <age> . expires in <span> . id <id8>`".to_string(),
         "`-> <name> (<dest8>) <age> . <state> . id <id8>`".to_string(),
+        "`. peer left <age>`".to_string(),
+        "`[mesh:reply] <name> is back; your question from <age> is still open`".to_string(),
+        "`your <n> questions, the oldest from <age>, are still open`".to_string(),
         "`envoy asks: <what the envoy wanted decided>`".to_string(),
         "any 8 or more of an id's first characters".to_string(),
         "plain under `NO_COLOR`".to_string(),
@@ -7084,6 +7099,51 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             );
         }
     }
+}
+
+/// What a sender is told when a propagation node holds a message or request for a peer
+/// that had gone reads on the wiki in the words the source prints: `.mesh message`,
+/// `.mesh request`, and the `departed` object of the `mesh__*` tools.
+#[test]
+fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
+    let source = read(repo_root().join("src/mesh/message.rs"));
+    let find = |head: &str| {
+        source
+            .lines()
+            .find(|line| line.contains(&format!("\"{head}")))
+            .and_then(|line| string_literals(line).pop())
+            .unwrap_or_else(|| panic!("src/mesh/message.rs has no literal starting {head:?}"))
+    };
+    let held = find("; held at the propagation node");
+    let end = find("'s sessions when one syncs");
+    assert_eq!(held, "; held at the propagation node, delivered to any of ");
+    assert_eq!(end, "'s sessions when one syncs");
+    let status = string_literals(&method_body("src/mesh/message.rs", "status"));
+    let no_route =
+        " has no route (its last link failed and it has not announced since; last heard {})";
+    assert_eq!(status, [" left {}", no_route], "Departure::status moved");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for needle in [
+        format!("`Sent <id8> to <dest8>: <name> left 2h ago{held}<name>{end}.`"),
+        format!("`<name>{}`", no_route.replace("{}", "<age>")),
+        format!(
+            "`request <id8> to <dest8>: pending; <dest8> left 2h ago{held}<dest8>{end} (the decision arrives as an idle line; .mesh inbox lists it)`"
+        ),
+    ] {
+        assert!(
+            commands.contains(&needle),
+            "Mesh-Commands.md does not quote {needle}"
+        );
+    }
+    let mesh = flat(&read(wiki.join("Mesh.md")));
+    let tools = format!("`<hash> left 2h ago{held}<hash>{end}`");
+    assert!(mesh.contains(&tools), "Mesh.md does not quote {tools}");
+    assert!(
+        mesh.contains("`departed`: `state` (`left` or `no_route`), `left_secs_ago` for `left`"),
+        "Mesh.md does not describe the departed object"
+    );
 }
 
 /// The Commands page's `.mesh dismiss` section quotes what the verb prints as the code
