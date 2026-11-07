@@ -19,18 +19,20 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
-    CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
+    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP,
+    CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
     DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, GH_CALL_SECS, OWNER_POLL_MAX, OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
-    STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, frontmatter, read_file, render_question,
+    STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, ledger, load_state, match_option,
-    note_script_error, now_iso, option, raise_escalation, read_artifact, run_dir_for, snapshot,
+    note_script_error, now_iso, option, read_artifact, run_dir_for, snapshot,
     tail, truthy, var, write_artifact,
 )
+from _lib import raise_escalation as _raise_escalation  # noqa: E402
 
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 
@@ -357,6 +359,139 @@ def assess_fault(state):
 # route_intent targets that start work; only these spend a picked-up handoff
 WORK_STARTS = ("next_subtask", "plan_subtasks", "architecture_review", "run_step")
 
+# The sizing verdict's options: plan-shaped work at the top level is asked about, never refused.
+SIZING_ARCHITECT = "Hand it to the architect"
+SIZING_HERE = f"Do it here anyway (up to {SUBTASK_MAX} subtasks)"
+SIZING_NARROW = "Narrow the scope"
+SIZING_NARROW_PREFIX = "Narrow the scope to: "
+
+
+def _one_line(text, n=200):
+    return tail(" ".join(str(text or "").split()), n)
+
+
+def _sizing_verdict(state, u, reason, planned=None):
+    """Ask a top-level run's user what to do with plan-shaped work, the verdict and its reason stated.
+
+    `planned` is the in-run planner's breakdown when it could not fit the work into SUBTASK_MAX subtasks; doing it
+    here is then not offered again. Past CLARIFY_MAX verdicts in one run the work is redirected as before.
+    """
+    rounds = as_int(state.get("sizing_rounds"))
+    reason = _one_line(reason) or f"more than {SUBTASK_MAX} subtasks, cross-PR sequencing, or batch/protected semantics"
+    if rounds >= CLARIFY_MAX:
+        u["redirect_reason"] = (f"Still plan-shaped after {rounds} sizing verdicts ({reason}): this wants an "
+                                "architect run.")
+        ledger(state, u, f"sizing: {u['redirect_reason']}")
+        u["_next"] = "end_redirect"
+        return u
+    estimate = as_int(state.get("subtask_estimate"))
+    breakdown = [_one_line(b) for b in (planned or as_list(state.get("proposed_breakdown"))) if _one_line(b)]
+    u.update({"sizing_rounds": rounds + 1, "sizing_reason": reason, "proposed_breakdown": breakdown})
+    if planned is not None:
+        question = (f"Sizing verdict: the in-run planner could not fit this work into {SUBTASK_MAX} subtasks "
+                    f"({reason}). It wants a sealed plan. How should it go ahead?")
+    else:
+        question = (f"Sizing verdict: plan-shaped ({reason}). One run takes at most {SUBTASK_MAX} in-run subtasks "
+                    "in one PR; larger work wants a sealed plan. How should it go ahead?")
+    evidence = [f"Intent: {_one_line(state.get('intent_statement'), 400) or '(none stated)'}",
+                f"Estimated subtasks: {estimate or len(breakdown) or 'not estimated'}"]
+    if breakdown:
+        evidence += ["Proposed breakdown:"] + [f"- {b}" for b in breakdown]
+    opts = [option(SIZING_ARCHITECT, True, "writes a ready architect handoff that a bare go-ahead in architect-next "
+                                           "picks up")]
+    if planned is None:
+        opts.append(option(SIZING_HERE, evidence=f"plans at most {SUBTASK_MAX} sealed subtasks in this run"))
+    opts.append(option(SIZING_NARROW, evidence="asks for the narrower scope, then sizes it again"))
+    ledger(state, u, f"sizing: verdict {rounds + 1}/{CLARIFY_MAX}: plan-shaped ({reason}); asking")
+    return raise_escalation(state, u, escalation(
+        "sizing_verdict", question, opts, evidence="\n".join(evidence), hard_trigger=True, tier3_ok=False,
+        data={"planned": planned is not None}))
+
+
+def _handoff_title(state):
+    brief = str(state.get("brief") or "")
+    m = re.search(r"(?m)^#+\s+(.+)$", brief)
+    first = m.group(1) if m else next((l for l in brief.splitlines() if l.strip()), "")
+    return _one_line(first, 100).strip("\"' ") or "Plan-shaped work handed over by sisyphus-next"
+
+
+def _write_architect_handoff(state, u):
+    """Write the brief and the assess findings as a ready `vehicle: architect` engineer handoff.
+
+    Returns (path, "") when written, else ("", the reason for the redirect); the text then goes to the run dir.
+    """
+    project = os.path.realpath(state.get("git_root") or state.get("project_dir") or ".")
+    title = _handoff_title(state)
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60].strip("-") or "handoff"
+    folder = os.path.join(project, "plans", "engineer-handoffs")
+    breakdown = [b for b in as_list(u.get("proposed_breakdown", state.get("proposed_breakdown"))) if str(b).strip()]
+    estimate = as_int(state.get("subtask_estimate"))
+    reason = u.get("sizing_reason") or state.get("sizing_reason") or ""
+    lines = ["---", "status: ready", "vehicle: architect", f"project: {project}", f"created: {now_iso()}",
+             f"title: {title}", "---", "", f"# {title}", "",
+             f"Handed over by sisyphus-next run {state.get('run_id') or '(unknown)'}: its sizing verdict was "
+             f"plan-shaped ({reason}). This is a design-doc seed; the architect owns the decomposition.", "",
+             "## Brief (verbatim)", "", str(state.get("brief") or "").strip() or "(empty)", ""]
+    if str(state.get("clarifications") or "").strip():
+        lines += ["## Clarifications (verbatim)", "", str(state["clarifications"]).strip(), ""]
+    lines += ["## Intent", "", _one_line(state.get("intent_statement"), 1000) or "(none stated)", "",
+              "## Sizing verdict", "", "- Verdict: plan-shaped", f"- Reason: {reason or '(none stated)'}",
+              f"- Estimated subtasks: {estimate or len(breakdown) or 'not estimated'}", "",
+              "## Proposed breakdown", ""]
+    lines += [f"- {b}" for b in breakdown] or ["(none proposed)"]
+    lines += ["", "## Acceptance criteria (verbatim)", "", str(state.get("spec_text") or "").strip() or "(none stated)"]
+    text = "\n".join(lines) + "\n"
+    names = (f"{slug}.md", f"{slug}-{state.get('run_id') or 'run'}.md")
+    why = ""
+    try:
+        # a symlinked plans/ or engineer-handoffs/ committed in the repo must not carry the write outside it
+        if _inside(os.path.realpath(folder), project):
+            os.makedirs(folder, exist_ok=True)
+        if not _inside(os.path.realpath(folder), project):
+            why = f"{folder} resolves outside the project ({os.path.realpath(folder)})"
+        else:
+            for name in names:
+                path = os.path.join(folder, name)
+                try:
+                    with open(path, "x", encoding="utf-8", newline="\n") as f:
+                        f.write(text)
+                    return path, ""
+                except FileExistsError:
+                    continue
+            why = f"both names taken under {folder} ({' and '.join(names)})"
+    except OSError as e:
+        why = f"{folder} could not be written ({e})"
+    ledger(state, u, f"sizing: the architect handoff was not written: {why}")
+    kept = os.path.join(state.get("run_dir") or "", "architect-handoff.md")
+    try:
+        write_artifact(state.get("run_dir") or "", "architect-handoff.md", text)
+    except OSError as e:
+        ledger(state, u, f"sizing: the run-dir copy of the architect handoff could not be written either: {e}")
+        return "", f"the handoff was not written ({why}), and its run-dir copy failed too ({e})."
+    return "", f"the handoff was not written ({why}), so its text is at {kept}."
+
+
+def _inside(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:  # another drive on Windows
+        return False
+
+
+def _sizing_pick(answer, options):
+    """The sizing option a reply names exactly (its label, its number or its whole text), or None."""
+    reply = (answer or "").strip()
+    m = re.match(r"(?i)^option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", reply)
+    return _exact_option(m.group(1) if m else reply, options)
+
+
+def _narrow_scope(state, u, scope):
+    """Size the narrowed scope again: it becomes the brief, the original request kept below it as context."""
+    u.update({"sizing_reason": "", "subtask_estimate": 0, "proposed_breakdown": [], "sizing_note": ""})
+    text = (f"{scope.strip()}\n\nThe user narrowed a plan-shaped request to the scope above; size and do only that. "
+            f"The original request, as context only:\n\n{str(state.get('brief') or '').strip()}\n")
+    _adopt_brief(state, u, text, "the narrowed scope after a plan-shaped sizing verdict")
+
 
 def route_intent(state):
     u = {}
@@ -421,9 +556,13 @@ def _route_intent(state, u):
         u["_next"] = "end_redirect"
     elif intent == "plan_execution":
         u["_next"] = "run_step"
+    elif sizing == "plan_shaped" and truthy(state.get("top_level")):
+        return _sizing_verdict(state, u, state.get("sizing_reason"))
     elif sizing == "plan_shaped":
-        u["redirect_reason"] = ("Plan-shaped work (more than 3 subtasks, cross-PR sequencing, or batch/protected "
-                                "semantics): this wants an architect run. The chat lane can draft the design-doc skeleton.")
+        why = _one_line(state.get("sizing_reason"))
+        u["redirect_reason"] = (f"Plan-shaped work (more than {SUBTASK_MAX} subtasks, cross-PR sequencing, or "
+                                f"batch/protected semantics{': ' + why if why else ''}): this wants an architect run. "
+                                "The chat lane can draft the design-doc skeleton.")
         u["_next"] = "end_redirect"
     elif sizing == "compound":
         u["_next"] = "plan_subtasks"
@@ -482,6 +621,10 @@ def record_subtasks(state):
     subtasks = [s for s in as_list(state.get("subtasks")) if isinstance(s, dict)]
     if not subtasks or len(subtasks) > SUBTASK_MAX:
         why = state.get("plan_shaped_reason") or f"{len(subtasks)} subtasks (bound: {SUBTASK_MAX})"
+        if truthy(state.get("top_level")):
+            # never silently dropped or trimmed: the user picks the architect or a narrower scope
+            ledger(state, u, f"subtasks: {len(subtasks)} planned, bound {SUBTASK_MAX}: {_one_line(why)}; asking")
+            return _sizing_verdict(state, u, why, planned=[s.get("title") or s.get("outcome") or "" for s in subtasks])
         u["redirect_reason"] = f"Plan-shaped by A11: {why}. This wants an architect run."
         u["_next"] = "end_redirect"
         return u
@@ -646,6 +789,60 @@ def design_gate(state):
 
 
 # ====================================================================== 2.3
+# escalation kinds whose fixed options have an approval node of their own, never a multiple-choice prompt
+OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm", "review_incomplete")
+
+
+def normalize_choices(state, u, esc):
+    """`esc` as a multiple-choice escalation, or None when it keeps the typed prompt.
+
+    Askable: a kind without its own approval node whose options, once texts that differ only in case collapse to one
+    (the recommended copy kept), number CHOICE_OPTIONS_MIN to CHOICE_OPTIONS_MAX with at least one recommended. Several
+    recommended keep the first; the recommended option moves first. Nothing is trimmed: a kind with more options, or
+    with no recommended one, keeps today's typed prompt and its options as they were.
+    """
+    if esc.get("kind") in OWN_PROMPT_KINDS:
+        return None
+    opts = [{"text": str(o.get("text")).strip(), "recommended": truthy(o.get("recommended")),
+             "evidence": str(o.get("evidence") or "").strip()}
+            for o in as_list(esc.get("options")) if isinstance(o, dict) and str(o.get("text") or "").strip()]
+    distinct = {}
+    for o in opts:
+        key = o["text"].casefold()
+        if key not in distinct or (o["recommended"] and not distinct[key]["recommended"]):
+            distinct[key] = o
+    picked = list(distinct.values())
+    recommended = [i for i, o in enumerate(picked) if o["recommended"]]
+    if not recommended or not CHOICE_OPTIONS_MIN <= len(picked) <= CHOICE_OPTIONS_MAX:
+        return None
+    asked = tail(esc.get("question", ""), 120)
+    if len(picked) < len(opts):
+        ledger(state, u, f"choice: {len(opts) - len(picked)} duplicate option(s) dropped on {asked!r}")
+    if len(recommended) > 1:
+        for i in recommended[1:]:
+            picked[i]["recommended"] = False
+        ledger(state, u, f"choice: {len(recommended)} recommended options on {asked!r}; kept the first: "
+                         f"{picked[recommended[0]]['text']}")
+    picked.insert(0, picked.pop(recommended[0]))
+    return {**esc, "options": picked,
+            "data": {**as_dict(esc.get("data")), "multiple_choice": True, "recommended_count": len(recommended)}}
+
+
+def raise_escalation(state, u, esc):
+    """Raise `esc`; one normalize_choices can ask as a multiple choice goes to the ask_choice_N prompts."""
+    return _raise_escalation(state, u, normalize_choices(state, u, esc) or esc)
+
+
+def _choice_pick(text, options):
+    """The option text a reply names ("Option 2", "2", or the option's text), or None.
+
+    Only the label's own "(recommended)" and trailing punctuation may follow the reference: "Option 2, but only for
+    reads" qualifies the pick, so it is interpreted and recorded in full.
+    """
+    m = re.match(r"(?i)^\s*option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", text or "")
+    return match_option(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
+
+
 def escalate_gate(state):
     u = {}
     esc = as_dict(state.get("escalation"))
@@ -673,6 +870,10 @@ def ladder_route(state):
     harvest_anomalies(state, u, "ladder_judge")
     esc = as_dict(state.get("escalation"))
     res = state.get("ladder_resolution") or "escalate"
+    if res == "recommended" and as_int(as_dict(esc.get("data")).get("recommended_count")) > 1:
+        # the escalation named several recommended options before normalization kept one: no clear recommendation
+        ledger(state, u, f"ladder: {esc.get('kind')} carried several recommended options; escalating")
+        res = "escalate"
     if res in ("ruling", "recommended"):
         choice = match_option(state.get("ladder_choice") or "", esc.get("options") or [])
         if choice is None and res == "recommended":
@@ -717,10 +918,13 @@ def consult_route(state):
 
 
 _TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "handoff_confirm": "confirm_handoff",
-                     "draft_confirm": "confirm_draft"}
+                     "draft_confirm": "confirm_draft",
+                     "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
 
 
 def _terminal_prompt(esc):
+    if as_dict(esc.get("data")).get("multiple_choice"):
+        return _TERMINAL_PROMPTS.get(f"choice_{len(esc.get('options') or [])}", "ask_user")
     return _TERMINAL_PROMPTS.get(esc.get("kind"), "ask_user")
 
 
@@ -782,13 +986,18 @@ def parse_answer(state):
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
     kind = esc.get("kind", "")
+    picker = truthy(as_dict(esc.get("data")).get("multiple_choice"))
     if kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
     elif kind in ("handoff_confirm", "handoff_path") and _typed_path(text, state):
         choice = text
     else:
-        choice = match_option(text, options)
+        # at a multiple-choice prompt a qualified pick ("Option 2, but ...") names no option and is interpreted
+        choice = _choice_pick(text, options) if picker else match_option(text, options)
+        if choice is None and kind in STOP_AWARE_KINDS and re.sub(r"[\W_]+$", "", text.lower()) in STOP_REPLIES:
+            # a whole-reply stop goes straight to apply_answer, which stops; it is never interpreted or re-asked
+            choice = text
         if choice is None and text and not truthy(state.get("reply_interpreted")):
             # the first typed reply that names no option is interpreted once, never re-asked blind
             u["reply_accepts"] = _accepts_text(kind)
@@ -802,7 +1011,13 @@ def parse_answer(state):
                                  f"free text stands after {REASK_MAX} tries).\n\n" + state.get("ask_question", ""))
             u["_next"] = _terminal_prompt(esc)
             return u
-        choice = text
+        if not text and options and picker and not esc.get("hard_trigger"):
+            # a hard trigger is the user's call: an empty reply never picks its recommended option
+            choice = options[0].get("text", "")
+            ledger(state, u, f"choice: {kind}: empty reply after {REASK_MAX} re-asks -> the recommended option: "
+                             f"{tail(choice, 200)}")
+        else:
+            choice = text
     u.update({"last_answer": choice, "last_answer_text": text, "parked": "", "reply_interpreted": False})
     ledger(state, u, f"decision: {kind}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
@@ -819,6 +1034,7 @@ ACCEPTED_INSTRUCTIONS = {
     "scope_breach": ("rescope",),
     "handoff_confirm": ("path",),
     "handoff_path": ("path",),
+    "sizing_verdict": ("narrow",),
 }
 INSTRUCTION_HELP = {
     "answer": "answer the question in the user's own words; value: the answer",
@@ -827,13 +1043,14 @@ INSTRUCTION_HELP = {
     "recipe": "supply what the probe needs to run (recipe, fixture, mock); value: what to provide",
     "rescope": "proceed with the task's scope re-declared as described; value: the new scope",
     "path": "use the handoff file at a path; value: the path",
+    "narrow": "do a narrower part of the work in this run, sized again first; value: the narrower scope",
 }
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
 # the owner's own words verbatim.
 INSTRUCTION_ANSWERS = {"answer": "{}", "design": "Use this approach instead: {}",
                        "amendment": "Continue; treat the criterion as amended: {}", "recipe": "Supply it: {}",
-                       "rescope": "Proceed: scope re-declared to include: {}"}
-FREE_FORM_SHAPES = ("answer", "design", "amendment", "recipe", "rescope")
+                       "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}"}
+FREE_FORM_SHAPES = ("answer", "design", "amendment", "recipe", "rescope", "narrow")
 
 
 def _accepts_text(kind):
@@ -927,7 +1144,8 @@ def _discussion_message(d, delegated=False):
     """
     lines = ["SISYPHUS_AWAITING_DISCUSSION", f"A {d['kind']} question is open for discussion:", d["question"]]
     if d["options"]:
-        lines += ["", "Options:"] + [f"  {o['label']}: {o['text']}" + (" (recommended)" if o["recommended"] else "")
+        lines += ["", "Options:"] + [f"  {o['label']}: {o['text']}"
+                                    + (" (recommended)" if o["recommended"] and "(recommended)" not in o["label"] else "")
                                     for o in d["options"]]
     lines += ["", f"Your reply: {d['reply']}", "", d["resume"], "", f"Sisyphus run id: {d['run_id']}"]
     if delegated:
@@ -967,9 +1185,11 @@ def choice_park(state):
     parks[key] = count + 1
     run_id = state.get("run_id") or ""
     data = as_dict(esc.get("data"))
+    picker = truthy(data.get("multiple_choice"))
     u["discussion"] = {
         "run_id": run_id, "kind": kind, "question": data.get("asked") or esc.get("question", ""),
-        "options": [{"label": str(i), "text": o.get("text", ""), "recommended": truthy(o.get("recommended")),
+        "options": [{"label": choice_label(i - 1) if picker else str(i), "text": o.get("text", ""),
+                     "recommended": truthy(o.get("recommended")),
                      "evidence": o.get("evidence", "")} for i, o in enumerate(esc.get("options") or [], 1)],
         "reply": (state.get("last_answer_text") or "").strip(), "task": tail(state.get("current_task") or "", 600),
         "resume": ('Discuss it here. When it is settled, say "continue" to be asked this question again, or '
@@ -1031,6 +1251,10 @@ def _answered(state, choices, default=None):
 
 
 STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and report", "stop and report")
+# the kinds whose apply_answer branch reads a whole-reply stop; only these take a bare "abort" without interpreting it
+STOP_AWARE_KINDS = ("clarify", "handoff_confirm", "handoff_path", "sizing_verdict", "sizing_narrow", "oracle_fault",
+                    "engine_fault", "plan_defect", "review_incomplete", "strikeout", "lane_stuck", "review_exhausted",
+                    "scope_breach", "pr_review_owner_judgment")
 
 
 def _whole_reply_stop(answer, options=(), stop_options=None):
@@ -1113,6 +1337,57 @@ def apply_answer(state):
         u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {answer}\n"
         u["assess_faulted"] = False
         u["_next"] = "assess"
+    elif kind in ("sizing_verdict", "sizing_narrow") and stop:
+        u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
+        u["_next"] = "end_aborted"
+    elif kind == "sizing_verdict":
+        # only an exact option or the narrow instruction counts: "don't hand it to the architect" picks nothing
+        picked = _sizing_pick(answer, options)
+        narrowed = answer.strip()[len(SIZING_NARROW_PREFIX):].strip() \
+            if answer.strip().startswith(SIZING_NARROW_PREFIX) else ""
+        if picked == SIZING_ARCHITECT and not truthy(state.get("top_level")):
+            u["redirect_reason"] = ("Plan-shaped work for the architect; a delegated run writes no handoff, its "
+                                    "parent owns the planning.")
+            ledger(state, u, "sizing: the architect option in a delegated run -> end_redirect, nothing written")
+            u["_next"] = "end_redirect"
+        elif picked == SIZING_ARCHITECT:
+            path, why = _write_architect_handoff(state, u)
+            if path:
+                _consume_handoff(state, u)
+                u["architect_handoff"] = path
+                u["handoff_report"] = (
+                    f"Wrote the architect handoff {path} (status: ready, vehicle: architect). Start an architect-next "
+                    "run in this project: a bare \"go ahead\" picks the handoff up and asks you to confirm it as the "
+                    "design doc; naming the path works too.")
+                ledger(state, u, f"sizing: handed to the architect: {path}")
+                u["_next"] = "end_handoff"
+            else:
+                u["redirect_reason"] = f"Plan-shaped work for the architect; {why}"
+                u["_next"] = "end_redirect"
+        elif picked == SIZING_HERE:
+            u["sizing_note"] = (f"The user chose to do this work here despite a plan-shaped sizing verdict "
+                                f"({state.get('sizing_reason') or 'no reason recorded'}). Fit it into at most "
+                                f"{SUBTASK_MAX} sealed subtasks; return an empty list with plan_shaped_reason only "
+                                "when it cannot fit at all.")
+            _consume_handoff(state, u)
+            ledger(state, u, f"sizing: doing plan-shaped work here in at most {SUBTASK_MAX} subtasks (user's choice)")
+            u["_next"] = "plan_subtasks"
+        elif narrowed:
+            _narrow_scope(state, u, narrowed)
+        elif picked == SIZING_NARROW:
+            raise_escalation(state, u, escalation(
+                "sizing_narrow", "Which narrower part of the work should this run do? Describe the scope; it is sized "
+                                 "again before any work starts.", [], hard_trigger=True, tier3_ok=False))
+        else:
+            u["redirect_reason"] = (f"Plan-shaped work ({state.get('sizing_reason') or 'no reason recorded'}); the "
+                                    f"reply {tail(answer, 120)!r} picked none of the sizing options, so nothing was "
+                                    "started: this wants an architect run.")
+            u["_next"] = "end_redirect"
+    elif kind == "sizing_narrow" and answer.strip():
+        _narrow_scope(state, u, answer)
+    elif kind == "sizing_narrow":
+        u["redirect_reason"] = "Plan-shaped work and no narrower scope was given: this wants an architect run."
+        u["_next"] = "end_redirect"
     elif kind == "design_choice":
         u["_next"] = "compose_brief"
     elif kind == "oracle_fault":
@@ -1358,7 +1633,7 @@ def scope_check(state):
                 owners = {f: [t for t, paths in roster.items() if any(_in_scope(f, p) for p in paths)] for f in outside}
                 breach = "; ".join(f"{f} (owned by {', '.join(o) or 'nobody declared'})" for f, o in owners.items())
                 u["scope_breach"] = breach
-                u["escalation"] = escalation(
+                esc = escalation(
                     "scope_breach",
                     f"Scope breach: correct implementation needs files outside this task's declared scope: {breach}. "
                     "Nothing was edited. How should the parent resolve it?",
@@ -1367,6 +1642,7 @@ def scope_check(state):
                      option("Proceed: scope re-declared to include these files"),
                      option("Abort this task")],
                     hard_trigger=True)
+                u["escalation"] = normalize_choices(state, u, esc) or esc
                 u["ask_question"] = __import__("_lib").render_question(u["escalation"])
                 u["_next"] = "send_breach_notice"
                 return u

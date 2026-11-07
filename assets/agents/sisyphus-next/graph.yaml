@@ -71,7 +71,7 @@ variables:
 settings:
   # Engine backstop only: every cycle carries its own named bound in a script. Worst legitimate visit count of the most-visited node
   # (run_gauntlet: 1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
-  # per subtask, x3 subtasks = 18); user-driven review retries ride the headroom.
+  # per subtask, x6 subtasks (SUBTASK_MAX) = 36); user-driven review retries ride the headroom.
   max_loop_iterations: 100
   log_state_snapshots: true
   validate_before_run: true
@@ -154,6 +154,9 @@ initial_state:
   # --- assess ---
   intent: ''
   sizing: ''
+  sizing_reason: ''
+  subtask_estimate: 0
+  proposed_breakdown: []
   assess_faulted: false
   intent_statement: ''
   clarifying_questions: []
@@ -180,6 +183,11 @@ initial_state:
   subtask_index: 0
   current_task: ''
   task_number: 0
+  # --- sizing verdict (plan-shaped work asked, not refused) ---
+  sizing_rounds: 0
+  sizing_note: ''
+  architect_handoff: ''
+  handoff_report: ''
   # --- research ---
   explore_slices: []
   librarian_questions: []
@@ -523,11 +531,19 @@ nodes:
         plan_authoring   "write the plan", "draft steps" for a plan repo
 
       Size an implementation (sizing): simple = one coherent change (one PR);
-      compound = a small ordered breakdown of at most 3 subtasks, each sealable
-      with executable acceptance criteria; plan_shaped = more than 3 subtasks,
-      cross-PR sequencing, or batch/protected semantics - that wants an architect
-      run. Unsure defaults UP (compound over simple; plan_shaped over compound),
-      never silently ambitious.
+      compound = an ordered breakdown of at most 6 subtasks in one PR, each
+      sealable with executable acceptance criteria; plan_shaped = more than 6
+      subtasks, cross-PR sequencing, or batch/protected semantics - that wants an
+      architect run, and a top-level run asks the user with your verdict. Unsure
+      between simple and compound: compound. Unsure between compound and
+      plan_shaped: compound; plan_shaped only when the evidence shows it. Never
+      silently ambitious.
+
+      State the sizing verdict for every implementation: sizing_reason is ONE line
+      naming the evidence (for example "about 9 subtasks across 3 modules, needs a
+      sealed plan"), subtask_estimate the estimated number of subtasks, and
+      proposed_breakdown one short line per estimated subtask (compound and
+      plan_shaped only; [] otherwise).
 
       Oracle triggers (needs_oracle=true, oracle_question set): "how should I",
       "what's wrong with / why does X keep", technology or pattern choices, how
@@ -607,6 +623,11 @@ nodes:
         sizing:
           type: string
           enum: [simple, compound, plan_shaped, n/a]
+        sizing_reason: { type: string }
+        subtask_estimate: { type: integer }
+        proposed_breakdown:
+          type: array
+          items: { type: string }
         clarifying_questions:
           type: array
           items:
@@ -670,22 +691,28 @@ nodes:
   route_intent:
     id: route_intent
     type: script
-    description: The Phase 0 table as edges (design doc 2.1); clarification bound B1.
+    description: >-
+      The Phase 0 table as edges (design doc 2.1); clarification bound B1. Plan-shaped
+      work raises the hard-trigger sizing_verdict escalation in a top-level run (hand
+      it to the architect, do it here in up to 6 subtasks, or narrow the scope) and
+      ends in end_redirect in a delegated run.
     script: scripts/route_intent.py
     fallback: end_failure
 
   plan_subtasks:
     id: plan_subtasks
     type: llm
-    description: A11 - compound work becomes at most 3 sealed in-run subtasks.
+    description: A11 - compound work becomes at most 6 sealed in-run subtasks.
     instructions: |
       You break a compound implementation request into an ORDERED list of at
-      most 3 subtasks. Each subtask must be sealed to the delegation standard: a
+      most 6 subtasks. Each subtask must be sealed to the delegation standard: a
       concrete outcome, the constraints it inherits, and EXECUTABLE acceptance
       criteria (commands or observable checks). If the work genuinely needs more
-      than 3 subtasks, cross-PR sequencing, or batch/protected semantics, return
+      than 6 subtasks, cross-PR sequencing, or batch/protected semantics, return
       an empty list and say why in plan_shaped_reason - that is plan-shaped work
       for the architect, by definition. Never invent a shadow plan format.
+      When a sizing note is present, the user chose to do plan-shaped work here:
+      fit it into at most 6 subtasks if that is at all possible.
     prompt: |
       ## Request
       {{brief}}
@@ -695,6 +722,9 @@ nodes:
 
       ## Intent statement
       {{intent_statement}}
+
+      ## Sizing note (empty unless the user chose to do plan-shaped work here)
+      {{sizing_note}}
     tools: []
     timeout: 600
     output_schema:
@@ -725,7 +755,11 @@ nodes:
   record_subtasks:
     id: record_subtasks
     type: script
-    description: Validate the A11 bound (B2, at most 3) and write tasklog.md.
+    description: >-
+      Validate the A11 bound (B2, at most 6) and write tasklog.md; a plan over the
+      bound (or none) raises the sizing_verdict escalation in a top-level run (hand it
+      to the architect or narrow the scope), never trimmed, and ends in end_redirect
+      in a delegated run.
     script: scripts/record_subtasks.py
     fallback: end_failure
 
@@ -1212,13 +1246,88 @@ nodes:
       last_answer: '{{choice}}'
       last_answer_text: '{{choice}}'
 
+  ask_choice_2:
+    id: ask_choice_2
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with two options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label, the recommended one first. The engine's own "Other (custom)"
+      choice goes to parse_answer, which sends typed text that names no option to
+      interpret_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  ask_choice_3:
+    id: ask_choice_3
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with three options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label, the recommended one first. The engine's own "Other (custom)"
+      choice goes to parse_answer, which sends typed text that names no option to
+      interpret_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+      - 'Option 3'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+      'Option 3': parse_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  ask_choice_4:
+    id: ask_choice_4
+    type: approval
+    description: >-
+      Terminal prompt for a multiple-choice escalation with four options, picked by
+      _terminal_prompt from the option count; ask_question lists each option's text
+      under its label, the recommended one first. The engine's own "Other (custom)"
+      choice goes to parse_answer, which sends typed text that names no option to
+      interpret_reply.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Option 1 (recommended)'
+      - 'Option 2'
+      - 'Option 3'
+      - 'Option 4'
+    routes:
+      'Option 1 (recommended)': parse_answer
+      'Option 2': parse_answer
+      'Option 3': parse_answer
+      'Option 4': parse_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
   parse_answer:
     id: parse_answer
     type: script
     description: >-
-      Number or text -> option; the first typed reply that names no option goes to
-      interpret_reply; after that, unparseable re-asks (B14) then the free text
-      stands; clears the parked marker; ledgers the decision.
+      Number or text -> option (at a multiple-choice prompt, an option label, number
+      or text with nothing but punctuation after it); the first typed reply that
+      names no option goes to interpret_reply; after that, unparseable re-asks (B14)
+      then the free text stands, except that an empty reply to a multiple-choice
+      prompt takes the recommended option; clears the parked marker; ledgers the
+      decision.
     script: scripts/parse_answer.py
     fallback: end_failure
 
@@ -1232,7 +1341,7 @@ nodes:
       A user was asked a question with fixed options and typed their own text
       instead of picking one. Decide what the text is:
       - option: the text means one of the offered options. Set reply_option to
-        that option's exact text.
+        that option's exact text (never its "Option N" label).
       - instruction: the text asks for something this question accepts (listed
         under "Accepted instructions"). Set reply_instruction to that shape's
         name and reply_value to its value, taken from the user's words.
@@ -2235,6 +2344,15 @@ nodes:
     output: |
       SISYPHUS_REDIRECT
       {{redirect_reason}}
+
+      Sisyphus run id: {{run_id}}
+
+  end_handoff:
+    id: end_handoff
+    type: end
+    output: |
+      SISYPHUS_HANDOFF
+      {{handoff_report}}
 
       Sisyphus run id: {{run_id}}
 

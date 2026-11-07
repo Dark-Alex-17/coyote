@@ -21,9 +21,11 @@ import sys
 # ---------------------------------------------------------------- constants
 STRIKE_LIMIT = 3          # Phase 7 3-strike rule; also the family bound (B1, B7, B10, B14)
 RERUN_ONCE = 1            # adversary/security/probe/debris/debt/obs re-run-once family
-SUBTASK_MAX = 3           # A11
+SUBTASK_MAX = 6           # A11: in-run subtasks one run takes on; more is the architect's, asked (sizing verdict)
 CLARIFY_MAX = STRIKE_LIMIT
 REASK_MAX = STRIKE_LIMIT
+CHOICE_OPTIONS_MIN = 2    # a multiple-choice escalation offers 2-4 options, one recommended (architect-next's bounds)
+CHOICE_OPTIONS_MAX = 4
 OWNER_POLL_MAX = 2        # ask_owner tool budget: wait 30 / poll 25 minutes
 OWNER_WAIT_MINUTES = 30
 OWNER_POLL_MINUTES = 25
@@ -343,7 +345,15 @@ def render_question(esc):
     if esc.get("evidence"):
         lines += ["", "Evidence:", esc["evidence"].strip()]
     opts = esc.get("options") or []
-    if opts:
+    if opts and as_dict(esc.get("data")).get("multiple_choice"):
+        lines.append("")
+        for i, o in enumerate(opts):
+            lines.append(f"{choice_label(i)}: {o.get('text', '')}")
+            if o.get("evidence"):
+                lines.append(f"    Evidence: {o['evidence']}")
+        lines += ["", 'Pick an option, or choose "Other (custom)" to type your own answer or to start a discussion '
+                      "about this question."]
+    elif opts:
         lines += ["", "Options:"]
         for i, o in enumerate(opts, 1):
             mark = " (recommended)" if o.get("recommended") else ""
@@ -351,6 +361,11 @@ def render_question(esc):
             lines.append(f"  {i}) {o.get('text', '')}{mark}{ev}")
         lines += ["", "Reply with a number or free text."]
     return "\n".join(lines).strip()
+
+
+def choice_label(index):
+    """The static approval-node label of a multiple-choice option; the recommended one is always first."""
+    return "Option 1 (recommended)" if index == 0 else f"Option {index + 1}"
 
 
 def raise_escalation(state, updates, esc):

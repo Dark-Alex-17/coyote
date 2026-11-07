@@ -55,7 +55,11 @@ whose `vehicle` is `architect` (a seed with no `vehicle` key counts as
 oriented on it.
 
 Attached to `sisyphus-next`, the engineer writes a task handoff there with
-`vehicle: sisyphus` when the user describes task-sized work. A top-level
+`vehicle: sisyphus` when the user describes task-sized work, and gives the
+run's sizing verdict wording: sisyphus for up to about 6 in-run subtasks,
+otherwise the architect. A top-level run that sizes work plan-shaped can itself
+write a ready `vehicle: architect` seed there when the user chooses to hand it
+to the architect. A top-level
 sisyphus-next run whose message is a bare go-ahead ("go ahead", "do it")
 offers the newest ready `vehicle: sisyphus` handoff for its project, and marks
 the one it uses `status: consumed` once the run has started work on it; with no

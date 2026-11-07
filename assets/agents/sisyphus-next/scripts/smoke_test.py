@@ -190,13 +190,18 @@ check("A10: anomalies harvested into anomalies_log and reset", u["anomalies_log"
 # ---------------------------------------------------------------- subtasks (B2/B3)
 subs = [{"title": f"s{i}", "outcome": f"o{i}", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX)]
 u = gates.record_subtasks(base_state(subtasks=subs))
-check("record_subtasks: <=3 recorded", u["_next"] == "next_subtask" and os.path.exists(os.path.join(base_state()["run_dir"], "tasklog.md")))
-u = gates.record_subtasks(base_state(subtasks=subs + [{"title": "s4", "outcome": "o", "acceptance_criteria": []}]))
-check("record_subtasks: B2 >3 -> end_redirect (plan-shaped)", u["_next"] == "end_redirect")
-u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="cross-PR"))
-check("record_subtasks: empty -> end_redirect with reason", u["_next"] == "end_redirect" and "cross-PR" in u["redirect_reason"])
+check("record_subtasks: up to SUBTASK_MAX recorded", u["_next"] == "next_subtask" and os.path.exists(os.path.join(base_state()["run_dir"], "tasklog.md")))
+u = gates.record_subtasks(base_state(subtasks=subs + [{"title": "s7", "outcome": "o", "acceptance_criteria": []}], top_level=False))
+check("record_subtasks: B2 more than SUBTASK_MAX in a delegated run -> end_redirect (plan-shaped)", u["_next"] == "end_redirect")
+u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="cross-PR", top_level=False))
+check("record_subtasks: empty in a delegated run -> end_redirect with reason", u["_next"] == "end_redirect" and "cross-PR" in u["redirect_reason"])
+u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="needs cross-PR sequencing", top_level=True))
+check("record_subtasks: empty at the top level -> sizing_verdict [architect, narrow] with the reason in the question",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "sizing_verdict"
+      and [o["text"] for o in u["escalation"]["options"]] == [gates.SIZING_ARCHITECT, gates.SIZING_NARROW]
+      and "needs cross-PR sequencing" in u["escalation"]["question"])
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=0, intent="implementation"))
-check("next_subtask: first -> plan_research, counters reset", u["_next"] == "plan_research" and u["fix_strikes"] == 0 and u["task_number"] == 1 and "Subtask 1/3" in u["current_task"])
+check("next_subtask: first -> plan_research, counters reset", u["_next"] == "plan_research" and u["fix_strikes"] == 0 and u["task_number"] == 1 and f"Subtask 1/{SUBTASK_MAX}" in u["current_task"])
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=SUBTASK_MAX))
 check("next_subtask: B3 exhausted -> final_report", u["_next"] == "final_report")
 u = gates.next_subtask(base_state(subtasks=subs[:1], subtask_index=0, intent="trivial"))
@@ -436,7 +441,7 @@ check("handoff pickup: a typed path to a vehicle-architect handoff is the brief 
       u["_next"] == "next_subtask" and "Add a /health route." in s2["brief"] and fm(arch)["status"] == "ready"
       and any("not a vehicle: sisyphus handoff" in d for d in s3["decisions"]))
 for intent, sizing, nxt in (("plan_authoring", "n/a", "end_redirect"), ("ambiguous", "n/a", "escalate_gate"),
-                            ("exploration", "n/a", "research_answer"), ("implementation", "plan_shaped", "end_redirect")):
+                            ("exploration", "n/a", "research_answer"), ("implementation", "plan_shaped", "escalate_gate")):
     s3, u = chain({**hs, "handoff_path": new, "intent": intent, "sizing": sizing}, "route_intent")
     check(f"handoff pickup: route_intent -> {nxt} ({intent}/{sizing}) starts no work -> handoff left ready, ledgered",
           u["_next"] == nxt and fm(new)["status"] == "ready" and any("left ready" in d for d in s3["decisions"]))
@@ -568,6 +573,230 @@ check("apply_answer: strikeout / lane_stuck replies that mention abort are no ab
           for k in ("strikeout", "lane_stuck") for t in ("one more round, not abort", "not abort, one more round"))
       and gates.apply_answer(base_state(escalation=escalation("lane_stuck", "q", so), last_answer="Abort and report"))["_next"] == "end_aborted"
       and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="whatever"))["_next"] == "end_aborted")
+
+# ---------------------------------------------------------------- multiple-choice prompts
+mc_opts = [option("Proceed without the oracle"), option("Retry the consult", True, "one retry is in bounds"),
+           option("Abort this task")]
+u = gates.raise_escalation(base_state(), {}, escalation("oracle_fault", "The consult failed. How to proceed?", mc_opts))
+mce = u["escalation"]
+check("choice: 2-4 options with one recommended -> multiple choice, the recommended option first, ask_choice_N",
+      mce["data"]["multiple_choice"] is True
+      and [o["text"] for o in mce["options"]] == ["Retry the consult", "Proceed without the oracle", "Abort this task"]
+      and gates.ask_dispatch(base_state(escalation=mce))["_next"] == "ask_choice_3"
+      and "Option 1 (recommended): Retry the consult" in u["ask_question"]
+      and "    Evidence: one retry is in bounds" in u["ask_question"] and "Option 3: Abort this task" in u["ask_question"]
+      and '"Other (custom)"' in u["ask_question"])
+s2, u = chain(base_state(escalation=mce, last_answer="Option 2", last_answer_text="Option 2", oracle_retries=0),
+              "parse_answer", "apply_answer")
+check("choice: a pick ('Option 2') -> that option's text through apply_answer",
+      s2["last_answer"] == "Proceed without the oracle" and u["_next"] == "design_gate")
+check("choice: 'Option 1 (recommended)', a number and the option text are picks too",
+      all(gates.parse_answer(base_state(escalation=mce, last_answer_text=t))["last_answer"] == "Retry the consult"
+          for t in ("Option 1 (recommended)", "1", "Retry the consult.")))
+u = gates.parse_answer(base_state(escalation=mce, last_answer_text="Option 2, but only after lunch"))
+check("choice: a qualified pick ('Option 2, but ...') names no option -> interpret_reply, the reply kept in full",
+      u["_next"] == "interpret_reply" and "last_answer" not in u)
+s2, u = chain(base_state(escalation=mce, last_answer_text="Option 2, but only after lunch", reply_verdict="unclear",
+                         reply_clarify="Proceed now or later?"), "interpret_route")
+check("choice: an unclear Other reply keeps the multiple-choice prompt for its one clarifying question",
+      u["_next"] == "ask_dispatch" and gates.ask_dispatch(s2)["_next"] == "ask_choice_3"
+      and "Option 1 (recommended): Retry the consult" in s2["ask_question"])
+dup = gates.raise_escalation(base_state(), {}, escalation(
+    "design_choice", "Which cache?", [option("Keep the cache"), option("keep the CACHE", True), option("Drop it")]))
+check("choice: options that differ only in case collapse to one, the recommended copy kept, ledgered -> ask_choice_2",
+      [o["text"] for o in dup["escalation"]["options"]] == ["keep the CACHE", "Drop it"]
+      and gates.ask_dispatch(base_state(escalation=dup["escalation"]))["_next"] == "ask_choice_2"
+      and any("1 duplicate option(s) dropped" in d for d in dup["decisions"]))
+u = gates.parse_answer(base_state(escalation=mce, last_answer_text="", reask_rounds=0))
+check("choice: an empty reply within the re-asks -> asked again at the same multiple-choice prompt",
+      u["_next"] == "ask_choice_3" and u["reask_rounds"] == 1)
+u = gates.parse_answer(base_state(escalation=mce, last_answer_text="", reask_rounds=REASK_MAX))
+check("choice: an empty picker reply after the re-asks takes the recommended option, ledgered",
+      u["_next"] == "apply_answer" and u["last_answer"] == "Retry the consult"
+      and any("empty reply after" in d and "the recommended option" in d for d in u["decisions"]))
+u = gates.parse_answer(base_state(escalation=esc, last_answer_text="", reask_rounds=REASK_MAX))
+check("choice: an empty typed-prompt reply after the re-asks stays empty (no recommended option taken)",
+      u["last_answer"] == "")
+u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "Which module?", "options": [
+    {"text": "auth"}, {"text": "billing", "recommended": True, "evidence": "the issue names billing"}]}]))
+check("choice: clarify's LLM-written options -> multiple choice, recommended first, stop_options kept",
+      u["escalation"]["kind"] == "clarify" and [o["text"] for o in u["escalation"]["options"]] == ["billing", "auth"]
+      and u["escalation"]["data"]["stop_options"] == [] and gates.ask_dispatch(base_state(escalation=u["escalation"]))["_next"] == "ask_choice_2")
+s2, u = chain(base_state(escalation=u["escalation"], last_answer_text="Option 2"), "parse_answer", "apply_answer")
+check("choice: a clarify pick re-runs assess with the picked text", u["_next"] == "assess" and "A: auth" in s2["clarifications"])
+u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "Which?", "options": [
+    {"text": "a"}, {"text": "b"}]}]))
+check("choice: options with none recommended keep the typed prompt (ask_user), order kept",
+      "multiple_choice" not in u["escalation"]["data"] and [o["text"] for o in u["escalation"]["options"]] == ["a", "b"]
+      and gates.ask_dispatch(base_state(escalation=u["escalation"]))["_next"] == "ask_user")
+five = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("o1"), option("o2", True)] + [option(f"o{i}") for i in range(3, 6)]))
+one = gates.raise_escalation(base_state(), {}, escalation("handoff_path", "q", [option("Abort the run", True)]))
+check("choice: more than 4 or fewer than 2 options keep the typed prompt (ask_user), nothing trimmed",
+      gates.ask_dispatch(base_state(escalation=five["escalation"]))["_next"] == "ask_user" and len(five["escalation"]["options"]) == 5
+      and "multiple_choice" not in five["escalation"]["data"]
+      and gates.ask_dispatch(base_state(escalation=one["escalation"]))["_next"] == "ask_user")
+own = [gates.raise_escalation(base_state(), {}, escalation(k, "q", [option("A", True), option("B")]))["escalation"]
+       for k in ("handoff_confirm", "draft_confirm", "review_incomplete")]
+check("choice: handoff_confirm, draft_confirm and review_incomplete keep their own approval nodes",
+      [gates.ask_dispatch(base_state(escalation=e))["_next"] for e in own]
+      == ["confirm_handoff", "confirm_draft", "ask_review_incomplete"]
+      and not any(e["data"].get("multiple_choice") for e in own))
+u = gates.scope_check(base_state(roster_scope={"TASK-001": ["src/a/"], "TASK-002": ["src/b/"]}, own_scope=["src/a/"],
+                                 expected_files=["src/b/x.py"], delegated=True, parallel_mode=True, coder_brief={}))
+check("choice: the scope_breach escalation set outside raise_escalation is a multiple choice too",
+      u.get("_next") == "send_breach_notice" and u["escalation"]["data"].get("multiple_choice") is True
+      and u["escalation"]["options"][0]["text"].startswith("Serialize") and "Option 1 (recommended)" in u["ask_question"])
+
+# ---------------------------------------------------------------- sizing verdict: plan-shaped work is asked, not refused
+check("sizing: SUBTASK_MAX is 6 and the do-it-here option names it",
+      SUBTASK_MAX == 6 and gates.SIZING_HERE == "Do it here anyway (up to 6 subtasks)")
+SREPO = os.path.join(TMP, "srepo")
+os.makedirs(SREPO)
+subprocess.run(["git", "-C", SREPO, "init", "-q"], check=True, capture_output=True)
+sz = dict(project_dir=SREPO, git_root=SREPO, top_level=True, delegated=False, intent="implementation", sizing="plan_shaped",
+          sizing_reason="about 9 subtasks across 3 modules, needs a sealed plan", subtask_estimate=9,
+          proposed_breakdown=["parser", "planner", "executor"], intent_statement="Add a query engine",
+          brief="# Query engine\n\nBuild a query engine.", spec_text="- `qe run` returns rows", run_id="sz1")
+ss, u = chain(base_state(**sz), "route_intent")
+e = ss["escalation"]
+check("sizing: a top-level plan_shaped run raises a hard-trigger sizing_verdict stating the reason, with three options",
+      u["_next"] == "escalate_gate" and e["kind"] == "sizing_verdict" and e["hard_trigger"] and not e["tier3_ok"]
+      and "about 9 subtasks across 3 modules" in e["question"]
+      and [o["text"] for o in e["options"]] == [gates.SIZING_ARCHITECT, gates.SIZING_HERE, gates.SIZING_NARROW]
+      and e["options"][0]["recommended"] and "Estimated subtasks: 9" in e["evidence"] and "- parser" in e["evidence"])
+check("sizing: the verdict escalates even under escalation_policy=autonomous, asked at ask_choice_3",
+      gates.escalate_gate({**ss, "escalation_policy": "autonomous"})["_next"] == "ask_dispatch"
+      and gates.ask_dispatch(ss)["_next"] == "ask_choice_3"
+      and "Option 1 (recommended): Hand it to the architect" in ss["ask_question"])
+u = gates.route_intent(base_state(**{**sz, "top_level": False, "delegated": True}))
+check("sizing: a delegated plan_shaped run keeps SISYPHUS_REDIRECT (end_redirect), never asks",
+      u["_next"] == "end_redirect" and "escalation" not in u and "more than 6 subtasks" in u["redirect_reason"]
+      and "about 9 subtasks" in u["redirect_reason"])
+s2, u = chain({**ss, "last_answer": "Option 1 (recommended)", "last_answer_text": "Option 1 (recommended)"},
+              "parse_answer", "apply_answer")
+hp = s2.get("architect_handoff", "")
+check("sizing: 'Hand it to the architect' writes a ready handoff and ends at end_handoff naming it and the go-ahead",
+      u["_next"] == "end_handoff"
+      and hp == os.path.join(os.path.realpath(SREPO), "plans", "engineer-handoffs", "query-engine.md")
+      and hp in s2["handoff_report"] and 'a bare "go ahead" picks the handoff up' in s2["handoff_report"])
+hfm, hbody = _lib.frontmatter(open(hp).read()) if hp else ({}, "")
+check("sizing: the handoff frontmatter and body carry the brief and the assess findings",
+      hfm.get("status") == "ready" and hfm.get("vehicle") == "architect" and hfm.get("project") == os.path.realpath(SREPO)
+      and hfm.get("title") == "Query engine" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", hfm.get("created", ""))
+      and all(t in hbody for t in ("Build a query engine.", "Add a query engine",
+                                    "- Reason: about 9 subtasks across 3 modules", "- Estimated subtasks: 9",
+                                    "- parser\n- planner\n- executor", "- `qe run` returns rows")))
+ARCH_SCRIPTS = os.path.join(HERE, "..", "..", "architect-next", "scripts")
+_seed_probe = ("import json, os, sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]); import gates; "
+               "u = {'code_repo_path': sys.argv[2], 'plans_root': os.path.join(sys.argv[2], 'plans'), "
+               "'git_root': sys.argv[2]}; p = gates._find_seed(u); "
+               "print(json.dumps([p, gates._seed_question(p) if p else '']))")
+_r = subprocess.run([sys.executable, "-c", _seed_probe, ARCH_SCRIPTS, SREPO], capture_output=True, text=True, timeout=120,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+_seed = json.loads(_r.stdout.strip().splitlines()[-1]) if _r.returncode == 0 and _r.stdout.strip() else ["", _r.stderr[-300:]]
+check("sizing: architect-next's own _find_seed picks the written handoff up as its ready seed",
+      os.path.realpath(_seed[0] or "/nonexistent") == os.path.realpath(hp or "/x") and "'Query engine'" in _seed[1], _seed[1])
+s3, u = chain({**ss, "last_answer": gates.SIZING_ARCHITECT, "run_id": "sz2"}, "apply_answer")
+check("sizing: a second handoff with the same title gets the run id in its name, the first left alone",
+      s3["architect_handoff"].endswith("query-engine-sz2.md") and _lib.frontmatter(open(hp).read())[0].get("status") == "ready")
+BADREPO = os.path.join(TMP, "badrepo")
+os.makedirs(BADREPO)
+open(os.path.join(BADREPO, "plans"), "w").write("not a dir\n")
+s3, u = chain({**ss, "project_dir": BADREPO, "git_root": BADREPO, "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: an unwritable handoff dir -> end_redirect naming the copy in the run dir, ledgered",
+      u["_next"] == "end_redirect" and "architect-handoff.md" in s3["redirect_reason"]
+      and os.path.isfile(os.path.join(ss["run_dir"], "architect-handoff.md"))
+      and any("could not be written" in d for d in s3["decisions"]))
+s2, u = chain({**ss, "last_answer": "Option 2", "last_answer_text": "Option 2"}, "parse_answer", "apply_answer")
+check("sizing: 'Do it here anyway' -> plan_subtasks, told to fit at most 6 subtasks",
+      u["_next"] == "plan_subtasks" and "at most 6" in s2["sizing_note"] and s2["last_answer"] == gates.SIZING_HERE)
+seven = [{"title": f"t{i}", "outcome": "o", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX + 1)]
+s3, u = chain({**s2, "subtasks": seven}, "record_subtasks")
+e3 = s3["escalation"]
+check("record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, never trimmed",
+      e3["kind"] == "sizing_verdict" and [o["text"] for o in e3["options"]] == [gates.SIZING_ARCHITECT, gates.SIZING_NARROW]
+      and e3["data"]["planned"] is True and "- t6" in e3["evidence"] and "subtask_index" not in u
+      and gates.ask_dispatch(s3)["_next"] == "ask_choice_2")
+u = gates.apply_answer({**s3, "last_answer": gates.SIZING_HERE})
+check("record_subtasks: a typed do-it-here after the planner overflowed is no pick -> end_redirect, nothing started",
+      u["_next"] == "end_redirect")
+s2, u = chain({**ss, "last_answer": "Option 3", "last_answer_text": "Option 3"}, "parse_answer", "apply_answer")
+check("sizing: 'Narrow the scope' asks for the narrower scope as free text (ask_user)",
+      s2["escalation"]["kind"] == "sizing_narrow" and gates.ask_dispatch(s2)["_next"] == "ask_user")
+s3, u = chain({**s2, "last_answer_text": "only the parser"}, "parse_answer", "apply_answer")
+check("sizing: the narrowed scope becomes the brief and assess runs again, the old verdict cleared",
+      u["_next"] == "assess" and s3["brief"].startswith("only the parser") and "Build a query engine." in s3["brief"]
+      and s3["sizing_reason"] == "" and s3["proposed_breakdown"] == [])
+s2, u = chain({**ss, "last_answer_text": "just do the parser for now", "reply_verdict": "instruction",
+               "reply_instruction": "narrow", "reply_value": "the parser"}, "interpret_route", "apply_answer")
+check("sizing: an Other reply that narrows the scope -> interpret_reply's narrow instruction, assess on the owner's words",
+      u["_next"] == "assess" and s2["brief"].startswith("just do the parser for now"))
+check("sizing: a whole-reply abort ends the run; the verdict re-asks at most CLARIFY_MAX times, then redirects",
+      gates.apply_answer({**ss, "last_answer": "abort"})["_next"] == "end_aborted"
+      and gates.route_intent(base_state(**sz, sizing_rounds=CLARIFY_MAX))["_next"] == "end_redirect")
+SDIR = os.path.join(SREPO, "plans", "engineer-handoffs")
+_before = sorted(os.listdir(SDIR))
+s2, u = chain({**ss, "last_answer": "don't hand it to the architect, do it here", "run_id": "sz3"}, "apply_answer")
+check("sizing: only an exact option counts - a negated reply naming the architect picks none -> end_redirect, nothing written",
+      u["_next"] == "end_redirect" and "picked none of the sizing options" in s2["redirect_reason"]
+      and sorted(os.listdir(SDIR)) == _before and not s2.get("architect_handoff"))
+s2, u = chain({**ss, "last_answer_text": "", "last_answer": "", "reask_rounds": REASK_MAX, "run_id": "sz3"},
+              "parse_answer", "apply_answer")
+check("sizing: an empty reply after the re-asks never picks the hard-trigger recommendation -> end_redirect, no file",
+      u["_next"] == "end_redirect" and s2["last_answer"] == "" and sorted(os.listdir(SDIR)) == _before
+      and not any("the recommended option" in d for d in s2["decisions"]))
+s2, u = chain({**ss, "top_level": False, "last_answer": gates.SIZING_ARCHITECT, "run_id": "sz3"}, "apply_answer")
+check("sizing: the architect option in a delegated run writes no handoff -> end_redirect, ledgered",
+      u["_next"] == "end_redirect" and sorted(os.listdir(SDIR)) == _before
+      and any("delegated run -> end_redirect, nothing written" in d for d in s2["decisions"]))
+s2, u = chain({**ss, "last_answer": gates.SIZING_ARCHITECT, "run_id": "sz2"}, "apply_answer")
+check("sizing: both handoff names taken -> end_redirect saying so, ledgered, the run-dir copy kept",
+      u["_next"] == "end_redirect" and "both names taken" in s2["redirect_reason"]
+      and any("both names taken" in d for d in s2["decisions"]) and sorted(os.listdir(SDIR)) == _before)
+keep = handoff("keep-ready.md")
+s2, u = chain({**ss, "project_dir": BADREPO, "git_root": BADREPO, "handoff_path": keep,
+               "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: a picked-up sisyphus handoff stays ready when the architect handoff was not written",
+      u["_next"] == "end_redirect" and fm(keep)["status"] == "ready")
+RDIR = os.path.join(TMP, "rdir-blocked")
+os.makedirs(os.path.join(RDIR, "architect-handoff.md"))
+s2, u = chain({**ss, "project_dir": BADREPO, "git_root": BADREPO, "run_dir": RDIR,
+               "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: a failing run-dir fallback is ledgered and named in the redirect, never a crash",
+      u["_next"] == "end_redirect" and "run-dir copy failed too" in s2["redirect_reason"]
+      and any("run-dir copy of the architect handoff could not be written" in d for d in s2["decisions"]))
+SYMREPO, OUTSIDE = os.path.join(TMP, "symrepo"), os.path.join(TMP, "outside-handoffs")
+os.makedirs(os.path.join(SYMREPO, "plans"))
+os.makedirs(OUTSIDE)
+os.symlink(OUTSIDE, os.path.join(SYMREPO, "plans", "engineer-handoffs"))
+s2, u = chain({**ss, "project_dir": SYMREPO, "git_root": SYMREPO, "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+check("sizing: a symlinked engineer-handoffs dir outside the project is refused -> run-dir copy, end_redirect, ledgered",
+      u["_next"] == "end_redirect" and os.listdir(OUTSIDE) == [] and "resolves outside the project" in s2["redirect_reason"]
+      and any("resolves outside the project" in d for d in s2["decisions"]))
+TREPO = os.path.join(TMP, "trepo")
+os.makedirs(TREPO)
+s2, u = chain({**ss, "project_dir": TREPO, "git_root": TREPO, "brief": "# ../../../tmp/evil: x/y\\z \"q\"\nsecond line\n\nbody",
+               "last_answer": gates.SIZING_ARCHITECT}, "apply_answer")
+_hp = s2.get("architect_handoff", "")
+check("sizing: a hostile, path-like title lands under plans/engineer-handoffs with a sanitized name and a one-line title",
+      u["_next"] == "end_handoff" and os.path.dirname(_hp) == os.path.join(os.path.realpath(TREPO), "plans", "engineer-handoffs")
+      and re.fullmatch(r"[a-z0-9-]+\.md", os.path.basename(_hp)) is not None
+      and "\n" not in _lib.frontmatter(open(_hp).read())[0].get("title", "\n") and not os.path.exists(os.path.join(TMP, "evil")))
+two = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("A", True), option("B", True)]))
+check("ladder: an escalation that carried several recommended options is escalated, never auto-picked",
+      two["escalation"]["data"]["recommended_count"] == 2
+      and gates.ladder_route(base_state(escalation=two["escalation"], ladder_resolution="recommended", ladder_choice="A"))["_next"]
+      == "ask_dispatch")
+pdc = gates.raise_escalation(base_state(), {}, pd)["escalation"]
+s2, u = chain(base_state(escalation=pdc, last_answer_text="abort", last_answer="abort"), "parse_answer", "apply_answer")
+check("choice: a whole-reply abort at a multiple-choice prompt goes straight to apply_answer and stops",
+      pdc["data"]["multiple_choice"] and u["_next"] == "end_blocked" and s2["last_answer"] == "abort"
+      and gates.parse_answer(base_state(escalation=dup["escalation"], last_answer_text="abort"))["_next"] == "interpret_reply")
+s2, u = chain(base_state(escalation=mce, last_answer_text="why retry?"), "choice_park")
+check("choice: a parked multiple-choice question carries the Option N labels, the recommended one marked once",
+      [o["label"] for o in s2["discussion"]["options"]] == ["Option 1 (recommended)", "Option 2", "Option 3"]
+      and "Option 1 (recommended): Retry the consult\n" in s2["discussion_message"]
+      and "(recommended) (recommended)" not in s2["discussion_message"])
 oj = escalation("pr_review_owner_judgment", "q", [option("Fix them as the reviewer asks"), option("Skip them and keep watching"),
                                                   option("Stop watching and report")],
                 data={"judgment": [{"id": "c1", "kind": "comment", "url": "u", "body": "b", "question": "q"}], "noaction": []})
@@ -1089,7 +1318,7 @@ check("pr_tracking ci: pr_gate with pending review items -> the normal publish t
 _esc = gates.ci_apply(base_state(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))["escalation"]
 check("pr_tracking ci: ci_apply exhausted keeps its question and options",
       _esc["question"] == f"CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?"
-      and [o["text"] for o in _esc["options"]] == ["Resume with one more coder fix round", "Leave the PR in draft and report"])
+      and [o["text"] for o in _esc["options"]] == ["Leave the PR in draft and report", "Resume with one more coder fix round"])
 _esc = gates.ci_apply(base_state(ci_verdict="infra"))["escalation"]
 check("pr_tracking ci: ci_apply infra keeps its question",
       _esc["question"] == "CI failed for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or leave in draft?")
@@ -1209,8 +1438,8 @@ check("pr_tracking review: pr_review_resolve on a head mismatch -> push_unconfir
       u.get("escalation", {}).get("kind") == "pr_review_push_unconfirmed" and not os.path.exists(_RESOLVED)
       and not os.path.exists(_REPLIED)
       and f"review-watch: PR #7 push not confirmed (remote 0000000000000000000000000000000000000000, local {_HEAD})" in u["decisions"]
-      and [o["text"] for o in u["escalation"]["options"]] == ["Retry the push check", "Stop watching and report"]
-      and u["escalation"]["options"][1]["recommended"] and "pr_review_pending" not in u)
+      and [o["text"] for o in u["escalation"]["options"]] == ["Stop watching and report", "Retry the push check"]
+      and u["escalation"]["options"][0]["recommended"] and "pr_review_pending" not in u)
 os.environ["SISYPHUS_GH_HEAD_CMD"] = "exit 1"
 u = gates.pr_review_resolve(rs(pr_review_pending=_round["pr_review_pending"], pr_review_rounds=1))
 check("pr_tracking review: pr_review_resolve on a failed head read -> push_unconfirmed, nothing replied or resolved",
@@ -1310,15 +1539,15 @@ u = gates.ci_apply(rs(ci_verdict="unsure"))
 check("pr_tracking review: CI unsure after the flip -> ci_unsure, review text, stop: ci_unsure",
       u["escalation"]["kind"] == "ci_unsure"
       and u["escalation"]["question"] == "Review watch stopped: CI diagnosis is unsure (unsure defaults up, never to a re-run). How to proceed?"
-      and [o["text"] for o in u["escalation"]["options"]] == ["Re-run the failing checks once", "Resume with a coder fix round", "Stop watching and report"]
-      and u["escalation"]["options"][2]["recommended"] and "review-watch: PR #7 stop: ci_unsure" in u["decisions"])
+      and [o["text"] for o in u["escalation"]["options"]] == ["Stop watching and report", "Re-run the failing checks once", "Resume with a coder fix round"]
+      and u["escalation"]["options"][0]["recommended"] and "review-watch: PR #7 stop: ci_unsure" in u["decisions"])
 for _st in ("timeout", "poll_error"):
     u = gates.ci_route(rs(ci_status=_st))
     check(f"pr_tracking review: ci_route {_st} after the flip -> ci_exhausted, review text, stop: ci_{_st}",
           u["escalation"]["kind"] == "ci_exhausted"
           and u["escalation"]["question"] == f"Review watch stopped: CI watch ended without a verdict ({_st}). Keep waiting, or stop watching?"
-          and [o["text"] for o in u["escalation"]["options"]] == ["Keep waiting (re-run the watch)", "Stop watching and report"]
-          and u["escalation"]["options"][1]["recommended"] and f"review-watch: PR #7 stop: ci_{_st}" in u["decisions"])
+          and [o["text"] for o in u["escalation"]["options"]] == ["Stop watching and report", "Keep waiting (re-run the watch)"]
+          and u["escalation"]["options"][0]["recommended"] and f"review-watch: PR #7 stop: ci_{_st}" in u["decisions"])
 u = gates.ci_route(base_state(ci_status="timeout"))
 check("pr_tracking ci: ci_route timeout keeps the draft text",
       u["escalation"]["question"] == "CI watch ended without a verdict (timeout). Keep waiting, or leave the PR in draft and report?")
@@ -1755,9 +1984,11 @@ for _label, _kind, _stop in _watch_stops:
           _stop["_next"] == "escalate_gate" and _stop["escalation"]["kind"] == _kind
           and _stop["escalation"]["hard_trigger"] is True
           and gates.escalate_gate(rs(**_esc_state))["_next"] == "ask_dispatch")
-    check(f"pr_tracking review: {_label} reaches ask_user from a subagent and from the top level",
-          gates.ask_dispatch(rs(**{**_esc_state, "top_level": False, "owner_away": True}))["_next"] == "ask_user"
-          and gates.ask_dispatch(rs(**{**_esc_state, "top_level": True, "owner_away": True}))["_next"] == "ask_user")
+    _prompt = gates._terminal_prompt(_stop["escalation"])
+    check(f"pr_tracking review: {_label} reaches its terminal prompt from a subagent and from the top level",
+          _prompt in ("ask_user", "ask_choice_2", "ask_choice_3", "ask_choice_4")
+          and gates.ask_dispatch(rs(**{**_esc_state, "top_level": False, "owner_away": True}))["_next"] == _prompt
+          and gates.ask_dispatch(rs(**{**_esc_state, "top_level": True, "owner_away": True}))["_next"] == _prompt)
 check("pr_tracking review: upstream has no remote owner channel, so the top-level owner prompt is the terminal ask_user",
       _lib.OWNER_REMOTE_INPUT is False and gates.OWNER_REMOTE_INPUT is False)
 u = gates.ci_apply(base_state(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))

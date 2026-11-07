@@ -1035,11 +1035,12 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
 /// relayed to the owner instead of the oracle, the relay parked at once
 /// whatever the policy, the child's exact parent-resume form, the delegation
 /// kind restored after the resumed child returns, the sentinel read only at the
-/// start of a line, the opening-lines heuristic anchored the same way, a
-/// retried wave member delegated into its own worktree, and the review cadence
-/// defaulted on a wave fix-round item from an older snapshot.
+/// start of a line, `SISYPHUS_HANDOFF` among the no-work sentinels, the
+/// opening-lines heuristic anchored the same way, a retried wave member
+/// delegated into its own worktree, and the review cadence defaulted on a wave
+/// fix-round item from an older snapshot.
 #[test]
-#[ignore = "eight smoke battery runs take about a minute; run with -- --ignored"]
+#[ignore = "nine smoke battery runs take about a minute; run with -- --ignored"]
 fn relay_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
@@ -1081,10 +1082,17 @@ fn relay_smoke_rows_go_red_under_the_recorded_sabotages() {
             (
                 "sentinel-anchored",
                 "FAILURE_SENTINEL_RE = \
-                 re.compile(r\"(?m)^\\s*SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\\b\")\n",
-                "FAILURE_SENTINEL_RE = re.compile(r\"SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT)\")\n",
+                 re.compile(r\"(?m)^\\s*SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT|HANDOFF)\\b\")\n",
+                "FAILURE_SENTINEL_RE = re.compile(r\"SISYPHUS_(FAILED|BLOCKED|ABORTED|REDIRECT|HANDOFF)\")\n",
                 "route_delegate: a successful report that quotes SISYPHUS_REDIRECT mid-line and says \
                  'could not complete' in prose -> verify_gate",
+            ),
+            (
+                "sentinel-handoff",
+                "|REDIRECT|HANDOFF)",
+                "|REDIRECT)",
+                "route_delegate: sisyphus-next SISYPHUS_HANDOFF on its own line (no work landed) -> \
+                 oracle_diagnose",
             ),
             (
                 "head-anchored",
@@ -1112,6 +1120,49 @@ fn relay_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
         ],
     );
+}
+
+/// Every sisyphus-next end node that lands no work opens with a `SISYPHUS_*`
+/// sentinel line, and `FAILURE_SENTINEL_RE` must name each of them, so a
+/// delegated child that ends that way goes to the oracle diagnosis instead of
+/// the conformance gate. `SISYPHUS_AWAITING_DISCUSSION` is the relay's own
+/// sentinel and is left out.
+#[test]
+fn failure_sentinel_names_every_sisyphus_next_no_work_end() {
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let line = gates
+        .lines()
+        .find(|l| l.starts_with("FAILURE_SENTINEL_RE = "))
+        .expect("gates.py defines FAILURE_SENTINEL_RE");
+    let text = fs::read_to_string(agents_dir().join("sisyphus-next/graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let mut named = BTreeSet::new();
+    for (_, node) in doc["nodes"].as_mapping().unwrap() {
+        if node["type"].as_str() != Some("end") {
+            continue;
+        }
+        let first = node["output"]
+            .as_str()
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("");
+        if let Some(word) = first.trim().strip_prefix("SISYPHUS_")
+            && word != "AWAITING_DISCUSSION"
+        {
+            named.insert(word.to_string());
+        }
+    }
+    assert!(
+        named.contains("HANDOFF"),
+        "sisyphus-next has no SISYPHUS_HANDOFF end: {named:?}"
+    );
+    for word in &named {
+        assert!(
+            line.contains(&format!("|{word}")) || line.contains(&format!("({word}|")),
+            "FAILURE_SENTINEL_RE does not name SISYPHUS_{word}: {line}"
+        );
+    }
 }
 
 /// One `(label, guard, sabotaged guard, smoke row)` per guard: the guard must

@@ -23697,6 +23697,9 @@ mod tests {
                         unreachable(&[
                             "apply_answer",
                             "architecture_review",
+                            "ask_choice_2",
+                            "ask_choice_3",
+                            "ask_choice_4",
                             "ask_dispatch",
                             "ask_owner_poll",
                             "ask_owner_route",
@@ -23735,6 +23738,7 @@ mod tests {
                             "end_blocked",
                             "end_complete",
                             "end_discussion",
+                            "end_handoff",
                             "end_redirect",
                             "escalate_gate",
                             "explore_fanout_solo",
