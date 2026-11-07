@@ -3,7 +3,7 @@ use super::*;
 use std::{
     collections::HashMap,
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -81,14 +81,26 @@ pub fn detect_shell() -> Shell {
 
 /// Runs `cmd` on the inherited descriptors and returns its exit code. The
 /// shell passthrough and `-e` come through here, so under the TUI, where
-/// the child would inherit a raw tty and the capture pipe, it refuses.
+/// the child would otherwise inherit a raw tty and the capture pipe, it
+/// runs with the terminal lent to it.
 pub fn run_command<T: AsRef<OsStr>>(
     cmd: &str,
     args: &[T],
     envs: Option<HashMap<String, String>>,
 ) -> Result<i32> {
     if crate::tui::active() {
-        bail!("Shell passthrough is not available in the TUI yet"); // TASK-315
+        let cmd = cmd.to_string();
+        let args: Vec<OsString> = args.iter().map(|arg| arg.as_ref().to_owned()).collect();
+        return crate::tui::lend_terminal(move |tty| {
+            let status = Command::new(&cmd)
+                .args(&args)
+                .envs(envs.unwrap_or_default())
+                .stdin(Stdio::inherit())
+                .stdout(tty.stdio()?)
+                .stderr(tty.stdio()?)
+                .status()?;
+            Ok(exit_code(status))
+        })?;
     }
     wait_for_status(cmd, args, envs, Stdio::inherit())
 }
@@ -268,29 +280,33 @@ pub async fn run_loader_command(
     }
 }
 
-/// Whether an editor can take the terminal right now. Callers that write
-/// a file for the editor to open check this first, so a refusal leaves
-/// nothing behind.
-pub fn ensure_editor_available() -> Result<()> {
-    if crate::tui::active() {
-        bail!("Editing files is not available in the TUI yet"); // TASK-315
-    }
-    Ok(())
-}
-
 /// Whether an inquire prompt can take the terminal right now. Every REPL
 /// command that still asks on the raw tty checks this before it builds
 /// the prompt, so under the full-screen UI the refusal lands in the
 /// transcript instead of a question nobody can see.
 pub fn ensure_prompts_available() -> Result<()> {
     if crate::tui::active() {
-        bail!("Interactive prompts are not available in the TUI yet"); // TASK-315
+        bail!("Interactive prompts are not available in the TUI yet"); // TASK-388
     }
     Ok(())
 }
 
+/// Opens `path` in `editor` and waits for it; under the TUI the editor
+/// gets the terminal lent to it.
 pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
-    ensure_editor_available()?;
+    if crate::tui::active() {
+        let editor = editor.to_string();
+        let path = path.to_path_buf();
+        return crate::tui::lend_terminal(move |tty| {
+            Command::new(&editor)
+                .arg(&path)
+                .stdin(Stdio::inherit())
+                .stdout(tty.stdio()?)
+                .stderr(tty.stdio()?)
+                .status()?;
+            Ok(())
+        })?;
+    }
     let mut child = Command::new(editor).arg(path).spawn()?;
     child.wait()?;
     Ok(())

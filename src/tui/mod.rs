@@ -20,7 +20,7 @@ use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::utils::{AbortSignal, create_abort_signal};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use cells::{
     AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
 };
@@ -39,10 +39,11 @@ use redirect::FdRedirect;
 pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
 use serde_json::Value;
-use sink::{AgentOutcome, TuiPrompter, TuiSink, UiMsg, unattended_answer};
+use sink::{AgentOutcome, LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -57,6 +58,87 @@ pub(crate) static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn active() -> bool {
     TUI_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// The loop's inbox while `run` owns the terminal, for work elsewhere in
+/// the process that needs the terminal in its normal modes.
+static LENDER: Mutex<Option<UnboundedSender<UiMsg>>> = Mutex::new(None);
+
+/// A duplicate of the terminal taken before the screen was entered.
+/// During a turn fds 1 and 2 are pointed at the capture pipe for the
+/// whole process, so a child that should write to the terminal is given
+/// this one explicitly. `None` when the duplicate could not be taken.
+#[cfg(unix)]
+static TTY_OUT: OnceLock<Option<std::os::fd::OwnedFd>> = OnceLock::new();
+
+fn set_lender(tx: Option<UnboundedSender<UiMsg>>) {
+    *LENDER.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = tx;
+}
+
+fn lender() -> Option<UnboundedSender<UiMsg>> {
+    LENDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+#[cfg(unix)]
+fn remember_tty() {
+    use std::os::fd::AsFd;
+    TTY_OUT.get_or_init(|| match std::io::stdout().as_fd().try_clone_to_owned() {
+        Ok(fd) => Some(fd),
+        Err(err) => {
+            warn!("Children lent the terminal will inherit the turn's output capture: {err}");
+            None
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn remember_tty() {}
+
+/// What a job lent the terminal spawns its child on.
+pub(crate) struct TtyHandles {
+    _private: (),
+}
+
+impl TtyHandles {
+    /// A handle on the terminal for a child's stdout or stderr: the saved
+    /// terminal descriptor where there is one, the inherited descriptor
+    /// otherwise.
+    pub(crate) fn stdio(&self) -> std::io::Result<Stdio> {
+        #[cfg(unix)]
+        if let Some(Some(tty)) = TTY_OUT.get() {
+            return tty.try_clone().map(Stdio::from);
+        }
+        Ok(Stdio::inherit())
+    }
+}
+
+const NOT_LENDING: &str = "the TUI is not lending its terminal";
+
+/// Runs `job` with the terminal released to it (alternate screen left,
+/// line discipline cooked), the way Ctrl+O hands it to the editor, and
+/// blocks until the loop has taken the screen back. For the shell
+/// passthrough and the file editors, which run on a work thread while
+/// the UI owns the terminal; fails when no UI is lending it.
+pub(crate) fn lend_terminal<T: Send + 'static>(
+    job: impl FnOnce(&TtyHandles) -> T + Send + 'static,
+) -> Result<T> {
+    let Some(tx) = lender() else {
+        bail!(NOT_LENDING);
+    };
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let job = LendJob(Box::new(move |tty: &TtyHandles| {
+        // The asker gave up waiting; the result has nowhere to go.
+        let _ = reply_tx.send(job(tty));
+    }));
+    if tx.send(UiMsg::LendTerminal(job)).is_err() {
+        bail!(NOT_LENDING);
+    }
+    reply_rx
+        .recv()
+        .map_err(|_| anyhow!("the TUI went away before the lent terminal came back"))
 }
 
 /// Test-only harness hook: when set to `1`, `run` panics right after
@@ -100,6 +182,11 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 /// terminal is tall enough.
 const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
+const SELECT_HINT: &str = "Up/Down = move  Enter = choose  1-9 = choose by number  Esc = cancel";
+const CHECKBOX_HINT: &str = "Space = tick  Up/Down = move  Enter = answer  Esc = cancel";
+/// The last row of a select: the REPL's prompter appends the same entry,
+/// and choosing it opens a free-text field in the list's place.
+const CUSTOM_CHOICE_ROW: &str = "Other (custom)";
 /// The confirm legend while part of the question is off screen: nothing
 /// clipped may be approved, so the approving keys are not offered. Esc
 /// leads so a narrow wrap never splits it from its meaning.
@@ -149,7 +236,8 @@ fn confirm_hint(default: bool, tool: bool) -> String {
 struct ActiveGuard;
 
 impl ActiveGuard {
-    fn set() -> Self {
+    fn set(lender: UnboundedSender<UiMsg>) -> Self {
+        set_lender(Some(lender));
         TUI_ACTIVE.store(true, Ordering::SeqCst);
         Self
     }
@@ -158,6 +246,7 @@ impl ActiveGuard {
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         TUI_ACTIVE.store(false, Ordering::SeqCst);
+        set_lender(None);
     }
 }
 
@@ -354,15 +443,32 @@ struct TurnStatus {
 struct PendingPrompt {
     req: PromptRequest,
     reply: mpsc::Sender<PromptAnswer>,
+    /// The text field of an input or password, or of a select whose
+    /// custom row was chosen.
     field: Option<TextArea<'static>>,
+    /// The row under the marker of a select or checkbox.
+    cursor: usize,
+    /// One flag per option of a checkbox, in the options' order.
+    checked: Vec<bool>,
 }
 
 impl PendingPrompt {
+    fn new(req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) -> Self {
+        let field = matches!(req.action, PromptAction::Input | PromptAction::Password)
+            .then(|| new_field(req.action == PromptAction::Password));
+        let checked = vec![false; req.options.len()];
+        Self {
+            req,
+            reply,
+            field,
+            cursor: 0,
+            checked,
+        }
+    }
+
     fn kind(&self) -> ModalKind {
-        if self.field.is_some() {
-            ModalKind::Input
-        } else {
-            ModalKind::Confirm {
+        match self.req.action {
+            PromptAction::Confirm => ModalKind::Confirm {
                 default: self
                     .req
                     .default
@@ -370,17 +476,136 @@ impl PendingPrompt {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true),
                 tool: self.req.tool.is_some(),
-            }
+            },
+            PromptAction::Input => ModalKind::Input,
+            PromptAction::Password => ModalKind::Password,
+            PromptAction::Select => ModalKind::Select {
+                custom_field_open: self.field.is_some(),
+            },
+            PromptAction::Checkbox => ModalKind::Checkbox,
         }
     }
 
-    /// The legend under the modal; a confirm whose question is clipped
-    /// offers only Esc.
-    fn hint(&self, clipped: bool) -> String {
+    /// Whether the answer is a non-empty id of the tool call or job that
+    /// asked, so a report that the call ended can take the question down.
+    fn asked_by_call(&self, call_id: &str) -> bool {
+        !call_id.is_empty() && self.req.call_id.as_deref() == Some(call_id)
+    }
+
+    fn asked_by_job(&self, job_id: &str) -> bool {
+        !job_id.is_empty() && self.req.job_id.as_deref() == Some(job_id)
+    }
+
+    /// The rows of a list modal: the options, plus the custom row of a
+    /// select.
+    fn list_len(&self) -> usize {
         match self.kind() {
-            ModalKind::Input => INPUT_HINT.to_string(),
-            ModalKind::Confirm { .. } if clipped => CLIPPED_HINT.to_string(),
+            ModalKind::Select {
+                custom_field_open: false,
+            } => self.req.options.len() + 1,
+            ModalKind::Checkbox => self.req.options.len(),
+            _ => 0,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        let len = self.list_len();
+        if len == 0 {
+            return;
+        }
+        let last = len - 1;
+        self.cursor = if delta < 0 {
+            self.cursor.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.cursor.saturating_add(delta as usize).min(last)
+        };
+    }
+
+    fn toggle_cursor(&mut self) {
+        if let Some(flag) = self.checked.get_mut(self.cursor) {
+            *flag = !*flag;
+        }
+    }
+
+    /// What Enter on a list answers: the select's row (or `None` for the
+    /// custom row, which opens the field instead) or the ticked options.
+    fn choice(&self) -> Option<PromptAnswer> {
+        match self.kind() {
+            ModalKind::Select {
+                custom_field_open: false,
+            } => self
+                .req
+                .options
+                .get(self.cursor)
+                .cloned()
+                .map(PromptAnswer::Selected),
+            ModalKind::Checkbox => Some(PromptAnswer::Checked(
+                self.req
+                    .options
+                    .iter()
+                    .zip(&self.checked)
+                    .filter(|(_, ticked)| **ticked)
+                    .map(|(option, _)| option.clone())
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn open_custom_field(&mut self) {
+        self.field = Some(new_field(false));
+    }
+
+    /// What the field holds as an answer, by the kind that opened it: a
+    /// select's custom text is a selection, the others are text.
+    fn field_answer(&self) -> PromptAnswer {
+        let text = self
+            .field
+            .as_ref()
+            .map(|field| field.lines().join(" "))
+            .unwrap_or_default();
+        match self.req.action {
+            PromptAction::Select => PromptAnswer::Selected(text),
+            _ => PromptAnswer::Text(text),
+        }
+    }
+
+    /// Who is asking: the tool, else the agent, else nobody in particular.
+    fn origin_line(&self) -> Option<String> {
+        if let Some(tool) = &self.req.tool {
+            return Some(format!("tool: {tool}"));
+        }
+        self.req
+            .origin
+            .agent_id
+            .as_ref()
+            .map(|agent| format!("agent: {agent}"))
+    }
+
+    /// Rows the origin takes under the question. A confirm's middle row
+    /// already carries it.
+    fn origin_rows(&self) -> u16 {
+        match self.kind() {
+            ModalKind::Confirm { .. } => 0,
+            _ => u16::from(self.origin_line().is_some()),
+        }
+    }
+
+    /// The legend under the modal; a question that is clipped offers
+    /// only Esc.
+    fn hint(&self, clipped: bool) -> String {
+        if clipped {
+            return CLIPPED_HINT.to_string();
+        }
+        match self.kind() {
             ModalKind::Confirm { default, tool } => confirm_hint(default, tool),
+            ModalKind::Input
+            | ModalKind::Password
+            | ModalKind::Select {
+                custom_field_open: true,
+            } => INPUT_HINT.to_string(),
+            ModalKind::Select { .. } => SELECT_HINT.to_string(),
+            ModalKind::Checkbox => CHECKBOX_HINT.to_string(),
         }
     }
 
@@ -411,11 +636,23 @@ impl PendingPrompt {
     }
 
     /// Rows the question may take on a frame `height` tall: the status
-    /// row, the footer, the modal's middle row and its hint are fixed, and
-    /// `TRANSCRIPT_MIN_ROWS` stay with the transcript.
+    /// row, the footer, the modal's origin, middle and hint rows are
+    /// fixed, and `TRANSCRIPT_MIN_ROWS` stay with the transcript.
     fn question_cap(&self, width: u16, height: u16) -> u16 {
-        let fixed = 3 + TRANSCRIPT_MIN_ROWS + self.hint_rows(width);
+        let fixed = 2
+            + TRANSCRIPT_MIN_ROWS
+            + self.hint_rows(width)
+            + self.origin_rows()
+            + self.middle_rows(width, height);
         height.saturating_sub(fixed).max(1)
+    }
+
+    /// Rows of the field, the confirm's tool line, or the list; a list
+    /// longer than the frame allows (one question row, the fixed rows and
+    /// the transcript's minimum kept) scrolls inside what it gets.
+    fn middle_rows(&self, width: u16, height: u16) -> u16 {
+        let fixed = 3 + TRANSCRIPT_MIN_ROWS + self.hint_rows(width) + self.origin_rows();
+        row_count(self.list_len()).clamp(1, height.saturating_sub(fixed).max(1))
     }
 
     fn question_rows(&self, width: u16, height: u16) -> u16 {
@@ -433,21 +670,64 @@ impl PendingPrompt {
         row_count(self.question_lines(width).len()) <= rows
     }
 
-    /// Rows of the whole modal: question, field or tool row, hint.
+    /// Rows of the whole modal: question, origin, field or list, hint.
     fn rows(&self, width: u16, height: u16) -> u16 {
-        self.question_rows(width, height) + 1 + self.hint_rows(width)
+        self.question_rows(width, height)
+            + self.origin_rows()
+            + self.middle_rows(width, height)
+            + self.hint_rows(width)
     }
 
-    /// The question, middle and legend rows inside the modal's `area`.
-    /// A frame too short for the layout squeezes the question first;
-    /// what it actually received is what answerability is judged on.
-    fn areas(&self, area: Rect) -> [Rect; 3] {
+    /// The question, origin, middle and legend rows inside the modal's
+    /// `area` on a frame `frame` tall. A frame too short for the layout
+    /// squeezes the question first; what it actually received is what
+    /// answerability is judged on.
+    fn areas(&self, area: Rect, frame: Rect) -> [Rect; 4] {
         Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(self.origin_rows()),
+            Constraint::Length(self.middle_rows(area.width, frame.height)),
             Constraint::Length(self.hint_rows(area.width)),
         ])
         .areas(area)
+    }
+
+    /// The list's rows as drawn, windowed around the cursor when it is
+    /// taller than `visible`.
+    fn list_lines(&self, visible: usize) -> Vec<Line<'static>> {
+        let checkbox = self.kind() == ModalKind::Checkbox;
+        let rows: Vec<String> = self
+            .req
+            .options
+            .iter()
+            .map(|option| render::plain_text(option).replace('\n', " "))
+            .chain((!checkbox).then(|| CUSTOM_CHOICE_ROW.to_string()))
+            .collect();
+        let first = if self.cursor < visible {
+            0
+        } else {
+            self.cursor + 1 - visible
+        };
+        rows.into_iter()
+            .enumerate()
+            .skip(first)
+            .take(visible)
+            .map(|(index, text)| {
+                let marker = if index == self.cursor { ">" } else { " " };
+                let line = if checkbox {
+                    let tick = if self.checked[index] { "x" } else { " " };
+                    format!("{marker} [{tick}] {text}")
+                } else {
+                    format!("{marker} {text}")
+                };
+                let style = if index == self.cursor {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+                Line::from(Span::styled(line, style))
+            })
+            .collect()
     }
 }
 
@@ -521,6 +801,15 @@ fn new_textarea() -> TextArea<'static> {
     textarea
 }
 
+/// A modal's one-line field; a password's shows a `*` per character.
+fn new_field(masked: bool) -> TextArea<'static> {
+    let mut field = new_textarea();
+    if masked {
+        field.set_mask_char('*');
+    }
+    field
+}
+
 /// An empty composer with its placeholder; the modal's input field is a
 /// bare `new_textarea`.
 fn new_composer() -> TextArea<'static> {
@@ -536,6 +825,9 @@ pub(crate) struct App {
     todo: TodoPanel,
     composer: TextArea<'static>,
     prompts: VecDeque<PendingPrompt>,
+    /// Work waiting for the terminal to be released to it; the loop runs
+    /// each after the step that queued it.
+    lend_requests: Vec<LendJob>,
     turn: Option<TurnStatus>,
     /// The teardown task owns the context: nothing new can be submitted,
     /// interrupted or quit until it reports back.
@@ -572,6 +864,7 @@ impl App {
             todo: TodoPanel::default(),
             composer: new_composer(),
             prompts: VecDeque::new(),
+            lend_requests: Vec::new(),
             turn: None,
             exiting: false,
             exit_first_cell: 0,
@@ -873,13 +1166,47 @@ impl App {
                 None
             }
             Action::SubmitModalInput => {
-                let text = self
-                    .prompts
-                    .front()
-                    .and_then(|p| p.field.as_ref())
-                    .map(|field| field.lines().join(" "))
-                    .unwrap_or_default();
-                self.answer_front(PromptAnswer::Text(text));
+                if let Some(answer) = self.prompts.front().map(PendingPrompt::field_answer) {
+                    self.answer_front(answer);
+                }
+                None
+            }
+            Action::SubmitModalChoice => {
+                if let Some(prompt) = self.prompts.front_mut() {
+                    match prompt.choice() {
+                        Some(answer) => self.answer_front(answer),
+                        // The select's cursor is on the custom row: the
+                        // field opens with a fresh gate, so the Enter that
+                        // opened it cannot also send an empty answer.
+                        None => {
+                            prompt.open_custom_field();
+                            self.last_keystroke = Some(self.clock.now());
+                        }
+                    }
+                }
+                None
+            }
+            Action::ModalMove(delta) => {
+                if let Some(prompt) = self.prompts.front_mut() {
+                    prompt.move_cursor(delta);
+                }
+                None
+            }
+            Action::ModalToggle => {
+                if let Some(prompt) = self.prompts.front_mut() {
+                    prompt.toggle_cursor();
+                }
+                None
+            }
+            Action::ModalJump(index) => {
+                if let Some(prompt) = self.prompts.front_mut()
+                    && index < prompt.req.options.len()
+                {
+                    prompt.cursor = index;
+                    if let Some(answer) = prompt.choice() {
+                        self.answer_front(answer);
+                    }
+                }
                 None
             }
             Action::ModalInput(key) => {
@@ -996,7 +1323,10 @@ impl App {
                 ok,
                 error,
                 duration_ms,
-            } => self.tool_finished(&call_id, ok, error, duration_ms),
+            } => {
+                self.tool_finished(&call_id, ok, error, duration_ms);
+                self.dismiss_prompts(|prompt| prompt.asked_by_call(&call_id));
+            }
             UiMsg::JobStarted { job_id, tool } => self.start_row(
                 Cell::Job {
                     job_id,
@@ -1007,15 +1337,21 @@ impl App {
                 },
                 "job__start",
             ),
-            UiMsg::JobFinished { job_id, ok, error } => self.set_job_status(
-                &job_id,
-                if ok {
-                    JobStatus::Done
-                } else {
-                    JobStatus::Failed(error.unwrap_or_default())
-                },
-            ),
-            UiMsg::JobCancelled { job_id } => self.set_job_status(&job_id, JobStatus::Cancelled),
+            UiMsg::JobFinished { job_id, ok, error } => {
+                self.set_job_status(
+                    &job_id,
+                    if ok {
+                        JobStatus::Done
+                    } else {
+                        JobStatus::Failed(error.unwrap_or_default())
+                    },
+                );
+                self.dismiss_prompts(|prompt| prompt.asked_by_job(&job_id));
+            }
+            UiMsg::JobCancelled { job_id } => {
+                self.set_job_status(&job_id, JobStatus::Cancelled);
+                self.dismiss_prompts(|prompt| prompt.asked_by_job(&job_id));
+            }
             UiMsg::AgentStarted { agent_id, name } => self.start_row(
                 Cell::Agent {
                     agent_id,
@@ -1058,8 +1394,13 @@ impl App {
                 }
             }
             UiMsg::Prompt { req, reply } => self.enqueue_prompt(*req, reply),
+            UiMsg::LendTerminal(job) => self.lend_requests.push(job),
         }
         self.schedule_frame();
+    }
+
+    fn take_lend_requests(&mut self) -> Vec<LendJob> {
+        std::mem::take(&mut self.lend_requests)
     }
 
     /// The tool row a hook's call id names: the row with that id, or,
@@ -1235,21 +1576,6 @@ impl App {
     }
 
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
-        let field = match req.action {
-            PromptAction::Confirm => None,
-            PromptAction::Input => Some(new_textarea()),
-            PromptAction::Select | PromptAction::Checkbox | PromptAction::Password => {
-                self.transcript.push(Cell::notice(
-                    NoticeKind::ToolWarning,
-                    format!(
-                        "Prompt kind {} is not available in the TUI yet",
-                        req.action.name()
-                    ),
-                ));
-                let _ = reply.send(PromptAnswer::Cancelled); // TASK-315
-                return;
-            }
-        };
         if self.prompts.is_empty() {
             self.question_area = None;
             // The idle gate counts from the moment the modal appears, not
@@ -1258,7 +1584,26 @@ impl App {
             // queued prompt is re-armed the same way when the front answers.
             self.last_keystroke = Some(self.clock.now());
         }
-        self.prompts.push_back(PendingPrompt { req, reply, field });
+        self.prompts.push_back(PendingPrompt::new(req, reply));
+    }
+
+    /// Cancels every question, queued or up, whose asker has ended: the
+    /// tool was killed or the job finished under it, so nobody is left
+    /// to take the answer. The front's successor gets a fresh gate.
+    fn dismiss_prompts(&mut self, asked_by: impl Fn(&PendingPrompt) -> bool) {
+        let front_dismissed = self.prompts.front().is_some_and(&asked_by);
+        self.prompts.retain(|prompt| {
+            if asked_by(prompt) {
+                let _ = prompt.reply.send(PromptAnswer::Cancelled);
+                false
+            } else {
+                true
+            }
+        });
+        if front_dismissed {
+            self.last_keystroke = Some(self.clock.now());
+            self.question_area = None;
+        }
     }
 
     /// Late command output arrives one pipe read at a time; consecutive
@@ -1496,7 +1841,7 @@ impl App {
 
         self.question_area = match self.prompts.front() {
             Some(prompt) => {
-                let [question, ..] = prompt.areas(bottom.intersection(area));
+                let [question, ..] = prompt.areas(bottom.intersection(area), area);
                 frame.render_widget(PromptModal(prompt), bottom);
                 Some(question)
             }
@@ -1560,10 +1905,10 @@ impl Widget for FooterBar {
     }
 }
 
-/// A prompt drawn where the composer was: question, origin, hint. A
-/// question taller than its rows is cut with a marker counting the hidden
-/// lines and a legend offering only Esc; the cap grows with the terminal,
-/// so enlarging it shows them.
+/// A prompt drawn where the composer was: question, origin, the field or
+/// list, hint. A question taller than its rows is cut with a marker
+/// counting the hidden lines and a legend offering only Esc; the cap
+/// grows with the terminal, so enlarging it shows them.
 struct PromptModal<'a>(&'a PendingPrompt);
 
 impl Widget for PromptModal<'_> {
@@ -1572,8 +1917,7 @@ impl Widget for PromptModal<'_> {
         if area.is_empty() {
             return;
         }
-        let [question, middle, hint] = self.0.areas(area);
-        let req = &self.0.req;
+        let [question, origin, middle, hint] = self.0.areas(area, *buf.area());
         let mut lines = self.0.question_lines(area.width);
         let visible = usize::from(question.height);
         let clipped = lines.len() > visible;
@@ -1587,13 +1931,20 @@ impl Widget for PromptModal<'_> {
             )));
         }
         Paragraph::new(lines).render(question, buf);
-        match &self.0.field {
-            Some(field) => field.render(middle, buf),
-            None => {
-                if let Some(tool) = &req.tool {
-                    Paragraph::new(Line::from(Span::styled(format!("tool: {tool}"), DIM)))
-                        .render(middle, buf);
-                }
+        // A confirm's origin sits in its middle row; every other kind
+        // has a row of its own for it above the field or list.
+        let origin_row = match self.0.kind() {
+            ModalKind::Confirm { .. } => middle,
+            _ => origin,
+        };
+        if let Some(line) = self.0.origin_line() {
+            Paragraph::new(Line::from(Span::styled(line, DIM))).render(origin_row, buf);
+        }
+        match (&self.0.field, self.0.kind()) {
+            (Some(field), _) => field.render(middle, buf),
+            (None, ModalKind::Confirm { .. }) => {}
+            (None, _) => {
+                Paragraph::new(self.0.list_lines(usize::from(middle.height))).render(middle, buf);
             }
         }
         Paragraph::new(self.0.hint_lines(area.width, clipped)).render(hint, buf);
@@ -1903,8 +2254,8 @@ pub fn ensure_tty() -> Result<()> {
 
 pub async fn run(mut ctx: RequestContext) -> Result<()> {
     ensure_tty()?;
-    let _active = ActiveGuard::set();
     let (tx, rx) = unbounded_channel();
+    let _active = ActiveGuard::set(tx.clone());
     let auto_cancel = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(TuiSink::new(tx.clone()));
     ctx.ui = Arc::clone(&sink) as Arc<dyn crate::turn::UiSink>;
@@ -1918,6 +2269,8 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         FooterInfo::from_ctx(&ctx),
     )?;
 
+    // Fd 1 is still the terminal here; a turn's capture takes it over.
+    remember_tty();
     let mut screen = Screen::enter()?;
     // Armed only once the terminal is ours. Entering blocks on the
     // keyboard-enhancement probe, which spins on a tty whose master has
@@ -2060,6 +2413,24 @@ fn quit_abort(abort: &AbortSignal, turn_running: bool) {
     }
 }
 
+/// Hands the terminal to `f` in its normal modes and takes it back: the
+/// event stream is restarted around the release so nothing it had in
+/// flight lands on the child or comes back as a keystroke, a Ctrl+C
+/// meant for the child is forgotten, and what the terminal queued
+/// meanwhile is dropped.
+async fn with_terminal_released<T>(
+    screen: &mut Screen,
+    stream: &mut EventStream,
+    termination: &mut Termination,
+    f: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    *stream = EventStream::new();
+    let released = screen.with_terminal_released(f);
+    termination.discard_pending();
+    flush_typeahead(stream).await;
+    released
+}
+
 async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let Shell {
         app,
@@ -2149,16 +2520,14 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::Suspend) => {
                         #[cfg(unix)]
                         {
-                            *stream = EventStream::new();
-                            let released = screen.with_terminal_released(|| {
+                            let released = with_terminal_released(screen, stream, termination, || {
                                 // SAFETY: raise takes a signal number and no pointers.
                                 unsafe { libc::raise(libc::SIGTSTP) };
-                            });
-                            termination.discard_pending();
+                            })
+                            .await;
                             if let Err(err) = released {
                                 warn!("Failed to re-enter the alternate screen: {err}");
                             }
-                            flush_typeahead(stream).await;
                             app.schedule_frame();
                         }
                     }
@@ -2166,10 +2535,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         let text = app.composer_text();
                         match app.config.editor() {
                             Ok(editor) => {
-                                *stream = EventStream::new();
-                                let edited = screen
-                                    .with_terminal_released(|| edit_in_editor(&editor, &text));
-                                termination.discard_pending();
+                                let edited = with_terminal_released(screen, stream, termination, || {
+                                    edit_in_editor(&editor, &text)
+                                })
+                                .await;
                                 match edited {
                                     Ok(Ok(edited)) => app.set_composer_text(&edited),
                                     Ok(Err(err)) => app.handle_msg(UiMsg::Notice {
@@ -2180,7 +2549,6 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                                         warn!("Failed to re-enter the alternate screen: {err}")
                                     }
                                 }
-                                flush_typeahead(stream).await;
                             }
                             Err(err) => app.handle_msg(UiMsg::Notice {
                                 kind: NoticeKind::ToolWarning,
@@ -2258,6 +2626,16 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     };
                 }
             },
+        }
+        for LendJob(job) in app.take_lend_requests() {
+            let released = with_terminal_released(screen, stream, termination, || {
+                job(&TtyHandles { _private: () })
+            })
+            .await;
+            if let Err(err) = released {
+                warn!("Failed to re-enter the alternate screen: {err}");
+            }
+            app.schedule_frame();
         }
         if quit_requested
             && task.is_none()
@@ -3078,20 +3456,235 @@ mod tests {
         assert_eq!(harness.app.composer_text(), "draft");
     }
 
+    fn list_request(action: PromptAction, tool: Option<&str>) -> PromptRequest {
+        PromptRequest {
+            options: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
+            tool: tool.map(str::to_string),
+            ..PromptRequest::new(action, "Pick one q9d-s", Origin::detached())
+        }
+    }
+
+    /// A select lists its options under the question with the custom row
+    /// last; the arrows move the marker without the gate and Enter, once
+    /// idle, sends the marked option's text.
     #[test]
-    fn unsupported_prompt_kinds_are_cancelled_at_once() {
+    fn a_select_modal_moves_its_marker_and_sends_the_row() {
         let mut harness = Harness::standalone(80, 24);
-        let req = PromptRequest::new(PromptAction::Select, "Pick one", Origin::detached());
-        let asker = ask_on_a_thread(&mut harness, req);
-        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, Some("ask")));
+        assert_eq!(harness.press(KeyCode::Down), None);
+        let frame = harness.draw();
+        assert_welcome_snapshot("select_modal_80x24", &frame);
+        assert!(frame.contains("tool: ask"), "{frame}");
+        assert!(frame.contains(CUSTOM_CHOICE_ROW), "{frame}");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Selected("beta".to_string())
+        );
         assert!(harness.app.prompts.is_empty());
-        assert!(matches!(
-            harness.app.transcript.cells().last(),
-            Some(Cell::Notice {
-                kind: NoticeKind::ToolWarning,
-                ..
+    }
+
+    /// A digit chooses the select's row outright; one past the options
+    /// does nothing, so a stray key cannot answer with the custom row.
+    #[test]
+    fn a_select_digit_chooses_the_row_outright() {
+        let mut harness = Harness::standalone(80, 24);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, None));
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('4')), None);
+        assert!(!asker.is_finished());
+        assert_eq!(harness.press(KeyCode::Char('3')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Selected("gamma".to_string())
+        );
+    }
+
+    /// Enter on the custom row swaps the list for a text field, and the
+    /// field opens with a fresh gate: the Enter that typed the text
+    /// cannot send it until the gap passes. What is sent is a selection,
+    /// so the asker reads it like any other row.
+    #[test]
+    fn the_custom_row_of_a_select_opens_a_field_whose_text_is_the_selection() {
+        let mut harness = Harness::standalone(80, 24);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, None));
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('k')), None);
+        for _ in 0..5 {
+            assert_eq!(harness.press(KeyCode::Down), None);
+        }
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            harness.app.key_context().modal,
+            Some(ModalKind::Select {
+                custom_field_open: true
             })
-        ));
+        );
+        harness.type_text("delta");
+        let frame = harness.draw();
+        assert_welcome_snapshot("select_custom_field_80x24", &frame);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Selected("delta".to_string())
+        );
+    }
+
+    /// A checkbox ticks rows with Space, ungated, and Enter sends the
+    /// ticked options in the list's order.
+    #[test]
+    fn a_checkbox_modal_ticks_rows_and_sends_them_in_order() {
+        let mut harness = Harness::standalone(80, 24);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Checkbox, None));
+        assert_eq!(harness.press(KeyCode::Down), None);
+        assert_eq!(harness.press(KeyCode::Down), None);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert_eq!(harness.press(KeyCode::Up), None);
+        assert_eq!(harness.press(KeyCode::Up), None);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        let frame = harness.draw();
+        assert_welcome_snapshot("checkbox_modal_80x24", &frame);
+        assert!(frame.contains("[x] alpha"), "{frame}");
+        assert!(frame.contains("[ ] beta"), "{frame}");
+        assert!(!frame.contains(CUSTOM_CHOICE_ROW), "{frame}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Checked(["alpha", "gamma"].map(str::to_string).to_vec())
+        );
+    }
+
+    /// A password's field shows a mask per character and sends the text
+    /// behind it.
+    #[test]
+    fn a_password_modal_masks_its_field() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest::new(PromptAction::Password, "Token:", Origin::detached());
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.type_text("hunter2");
+        let frame = harness.draw();
+        assert_welcome_snapshot("password_modal_80x24", &frame);
+        assert!(!frame.contains("hunter2"), "{frame}");
+        assert!(frame.contains("*******"), "{frame}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Text("hunter2".to_string())
+        );
+    }
+
+    /// A list taller than the rows it gets scrolls to keep the marker in
+    /// view; the question keeps at least its one row.
+    #[test]
+    fn a_long_select_windows_its_rows_around_the_marker() {
+        let mut harness = Harness::standalone(60, 14);
+        let req = PromptRequest {
+            options: (1..=20).map(|n| format!("option {n:02}")).collect(),
+            ..PromptRequest::new(PromptAction::Select, "Pick one q9d-s", Origin::detached())
+        };
+        let _asker = ask_on_a_thread(&mut harness, req);
+        let top = harness.draw();
+        assert!(top.contains("> option 01"), "{top}");
+        assert!(!top.contains("option 20"), "{top}");
+        for _ in 0..19 {
+            assert_eq!(harness.press(KeyCode::Down), None);
+        }
+        let bottom = harness.draw();
+        assert!(bottom.contains("> option 20"), "{bottom}");
+        assert!(!bottom.contains("option 01"), "{bottom}");
+        assert!(bottom.contains("Pick one q9d-s"), "{bottom}");
+    }
+
+    /// A question whose asker ends is taken down with a cancel: the tool
+    /// call or job that asked is matched by its id, an empty id matches
+    /// nothing, a queued question goes the same way as the front, and
+    /// the front's successor gets a fresh gate.
+    #[test]
+    fn a_prompt_is_cancelled_when_its_asker_ends() {
+        fn asked_by(call_id: Option<&str>, job_id: Option<&str>) -> PromptRequest {
+            PromptRequest {
+                call_id: call_id.map(str::to_string),
+                job_id: job_id.map(str::to_string),
+                ..list_request(PromptAction::Select, None)
+            }
+        }
+        fn tool_finished(call_id: &str) -> UiMsg {
+            UiMsg::ToolFinished {
+                call_id: call_id.to_string(),
+                ok: true,
+                error: None,
+                duration_ms: None,
+            }
+        }
+        fn job_finished(job_id: &str) -> UiMsg {
+            UiMsg::JobFinished {
+                job_id: job_id.to_string(),
+                ok: false,
+                error: Some("boom".to_string()),
+            }
+        }
+        fn job_cancelled(job_id: &str) -> UiMsg {
+            UiMsg::JobCancelled {
+                job_id: job_id.to_string(),
+            }
+        }
+        let cases = [
+            (asked_by(Some("call-1"), None), tool_finished("call-1"), true),
+            (asked_by(Some("call-1"), None), tool_finished("call-2"), false),
+            (asked_by(Some("call-1"), None), job_finished("call-1"), false),
+            (asked_by(None, Some("job-1")), job_finished("job-1"), true),
+            (asked_by(None, Some("job-1")), job_cancelled("job-1"), true),
+            (asked_by(None, Some("job-1")), job_finished("job-2"), false),
+            (asked_by(None, Some("job-1")), tool_finished("job-1"), false),
+            (asked_by(None, None), tool_finished(""), false),
+            (asked_by(None, None), job_finished(""), false),
+        ];
+        for (req, msg, dismissed) in cases {
+            let mut harness = Harness::standalone(80, 24);
+            let label = format!("{:?}/{:?} on {msg:?}", req.call_id, req.job_id);
+            let asker = ask_on_a_thread(&mut harness, req);
+            harness.app.handle_msg(msg);
+            assert_eq!(harness.app.prompts.is_empty(), dismissed, "{label}");
+            if dismissed {
+                assert_eq!(
+                    asker.join().unwrap().unwrap(),
+                    PromptAnswer::Cancelled,
+                    "{label}"
+                );
+            } else {
+                assert!(!asker.is_finished(), "{label}");
+                harness.app.abandon_prompts();
+            }
+        }
+
+        let mut harness = Harness::standalone(80, 24);
+        let front = ask_on_a_thread(&mut harness, asked_by(Some("call-1"), None));
+        let queued = ask_on_a_thread(&mut harness, asked_by(None, Some("job-1")));
+        let third = ask_on_a_thread(&mut harness, asked_by(None, Some("job-2")));
+        harness.app.handle_msg(job_finished("job-2"));
+        assert_eq!(harness.app.prompts.len(), 2);
+        assert_eq!(third.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        assert!(!front.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.app.handle_msg(tool_finished("call-1"));
+        assert_eq!(front.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        assert_eq!(harness.app.prompts.len(), 1);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!queued.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            queued.join().unwrap().unwrap(),
+            PromptAnswer::Selected("alpha".to_string())
+        );
     }
 
     /// With nobody left to answer, every yes/no question is refused
@@ -5271,16 +5864,13 @@ mod tests {
         let mut todo = TodoPanel::default();
         todo.set("ship it".to_string(), todo_items());
         let (reply, _answers) = mpsc::channel();
-        let confirm = PendingPrompt {
-            req: confirm_request(Some("fs_write")),
-            reply: reply.clone(),
-            field: None,
-        };
-        let input = PendingPrompt {
-            req: PromptRequest::new(PromptAction::Input, "Name?", Origin::detached()),
-            reply,
-            field: Some(new_textarea()),
-        };
+        let confirm = PendingPrompt::new(confirm_request(Some("fs_write")), reply.clone());
+        let input = PendingPrompt::new(
+            PromptRequest::new(PromptAction::Input, "Name?", Origin::detached()),
+            reply.clone(),
+        );
+        let select = PendingPrompt::new(list_request(PromptAction::Select, Some("ask")), reply.clone());
+        let checkbox = PendingPrompt::new(list_request(PromptAction::Checkbox, None), reply);
         let mut widgets: Vec<(&str, Draw<'_>)> = vec![
             (
                 "transcript (welcome)",
@@ -5333,6 +5923,14 @@ mod tests {
             (
                 "input modal",
                 Box::new(|area, buf| PromptModal(&input).render(area, buf)),
+            ),
+            (
+                "select modal",
+                Box::new(|area, buf| PromptModal(&select).render(area, buf)),
+            ),
+            (
+                "checkbox modal",
+                Box::new(|area, buf| PromptModal(&checkbox).render(area, buf)),
             ),
             (
                 "todo panel",
@@ -5759,8 +6357,7 @@ mod tests {
                     .filter_map(|needle| body.find(needle))
                     .min();
                 readers.push(KeyboardReader {
-                    gated: body.contains("crate::tui::active()")
-                        || body.contains("ensure_editor_available()"),
+                    gated: body.contains("crate::tui::active()"),
                     prompt_gated: gate_at
                         .is_some_and(|gate| first_builder.is_none_or(|builder| gate < builder)),
                     file,
@@ -5772,10 +6369,9 @@ mod tests {
     }
 
     /// Every direct keyboard reader outside this module either checks the
-    /// TUI flag (itself, or through `ensure_editor_available`) or is
-    /// listed here with the reason it stays REPL-only, so a new reader
-    /// cannot appear without a decision about the TUI. A `PROMPT_GATED`
-    /// row is only honoured when the fn body really calls
+    /// TUI flag or is listed here with the reason it stays REPL-only, so
+    /// a new reader cannot appear without a decision about the TUI. A
+    /// `PROMPT_GATED` row is only honoured when the fn body really calls
     /// `ensure_prompts_available()`, and a body that does cannot hide
     /// under another reason.
     #[test]
@@ -5787,8 +6383,8 @@ mod tests {
         const REPL_PROMPTER: &str =
             "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
         const VIA_GATE: &str = "calls read_single_key, which refuses under the TUI";
-        const VIA_EDIT_GATE: &str = "calls edit_file, which refuses under the TUI";
-        const VIA_RUN_GATE: &str = "calls run_command, which refuses under the TUI";
+        const VIA_EDIT_GATE: &str = "calls edit_file, which lends the terminal under the TUI";
+        const VIA_RUN_GATE: &str = "calls run_command, which lends the terminal under the TUI";
         const REPL_PAINTER: &str =
             "polled by the spinner and the REPL stream painter, both replaced under the TUI";
         const NULL_STDIN: &str = "a unit test; the child it waits on has stdin at /dev/null";
@@ -6017,35 +6613,77 @@ mod tests {
         );
     }
 
-    /// `.edit` on a file is refused the same way: no editor is spawned
-    /// onto the capture pipe (the name given is not a program at all).
+    /// Registers a lender on its own thread that runs every job it is
+    /// sent, the way the loop does with the screen released, and counts
+    /// them; unregistered when the guard drops.
+    fn test_lender() -> (LenderGuard, Arc<std::sync::atomic::AtomicUsize>) {
+        let (tx, mut rx) = unbounded_channel();
+        let lent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&lent);
+        std::thread::spawn(move || {
+            while let Some(msg) = rx.blocking_recv() {
+                if let UiMsg::LendTerminal(LendJob(job)) = msg {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    job(&TtyHandles { _private: () });
+                }
+            }
+        });
+        set_lender(Some(tx));
+        (LenderGuard, lent)
+    }
+
+    struct LenderGuard;
+
+    impl Drop for LenderGuard {
+        fn drop(&mut self) {
+            set_lender(None);
+        }
+    }
+
+    /// With the UI flag up but no loop lending the terminal (the flag
+    /// outlives the loop during teardown), `.edit` on a file fails
+    /// outright: no editor is spawned onto the capture pipe (the name
+    /// given is not a program at all).
     #[test]
     #[serial]
-    fn edit_file_refuses_under_the_tui_without_spawning_an_editor() {
+    fn edit_file_without_a_lender_fails_without_spawning_an_editor() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let err = crate::utils::edit_file(
             "definitely-not-an-editor-x7x",
             std::path::Path::new("/dev/null"),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("not available in the TUI"),
-            "{err}"
-        );
+        assert_eq!(err.to_string(), NOT_LENDING);
     }
 
-    /// `!cmd` is refused the same way: no shell is spawned onto the raw
-    /// tty and the capture pipe (the name given is not a program at all).
+    /// `!cmd` fails the same way without a lender.
     #[test]
     #[serial]
-    fn run_command_refuses_under_the_tui_without_spawning_a_child() {
+    fn run_command_without_a_lender_fails_without_spawning_a_child() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let err = crate::utils::run_command("definitely-not-a-shell-x7x", &["-c", "true"], None)
             .unwrap_err();
-        assert!(
-            err.to_string().contains("not available in the TUI"),
-            "{err}"
-        );
+        assert_eq!(err.to_string(), NOT_LENDING);
+    }
+
+    /// With a lender registered, `!cmd` and `.edit` run their child
+    /// through it: the child runs (its exit code comes back, the file it
+    /// was given is touched) and the lender saw the job.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+        let (_lender, lent) = test_lender();
+        let code = crate::utils::run_command("sh", &["-c", "exit 7"], None).unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(lent.load(Ordering::SeqCst), 1);
+
+        let path = crate::utils::temp_file("-lent-editor-", ".txt");
+        crate::utils::edit_file("touch", &path).unwrap();
+        assert!(path.is_file(), "{}", path.display());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(lent.load(Ordering::SeqCst), 2);
     }
 
     /// A document loader that writes to its output file still runs under
@@ -6107,23 +6745,11 @@ mod tests {
             ),
             (
                 "src/utils/command.rs",
-                "bail!(\"Shell passthrough is not available in the TUI yet\")",
-            ),
-            (
-                "src/utils/command.rs",
-                "bail!(\"Editing files is not available in the TUI yet\")",
-            ),
-            (
-                "src/utils/command.rs",
                 "bail!(\"Interactive prompts are not available in the TUI yet\")",
             ),
             (
                 "src/utils/input.rs",
                 "bail!(\"Keyboard prompts are not available in the TUI yet; unanswered: {question}\")",
-            ),
-            (
-                "src/tui/mod.rs",
-                "let _ = reply.send(PromptAnswer::Cancelled);",
             ),
             ("src/tui/redirect.rs", "String::new()"),
             (

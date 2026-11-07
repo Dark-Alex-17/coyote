@@ -15,6 +15,13 @@ pub(crate) enum ModalKind {
         tool: bool,
     },
     Input,
+    /// One row per option plus an "Other (custom)" row; choosing that
+    /// row opens a text field in the list's place.
+    Select {
+        custom_field_open: bool,
+    },
+    Checkbox,
+    Password,
 }
 
 /// What the key table needs to know about the app.
@@ -26,9 +33,11 @@ pub(crate) struct KeyContext {
     /// Whether a second has passed since the last key pressed (accepted
     /// or ignored, outside a modal or under one) or since the previous
     /// answer: the
-    /// condition for a bare hotkey or Enter to count as an answer to a
-    /// confirm, so a modal that appears mid-sentence cannot be answered by
-    /// the keystroke already in flight.
+    /// condition for a bare hotkey or Enter to count as an answer to any
+    /// modal, so a modal that appears mid-sentence cannot be answered by
+    /// the keystroke already in flight. Keys that only move a list's
+    /// cursor or type into a field are not gated; the letter and digit
+    /// shortcuts of a list are, like a confirm's hotkeys.
     pub(crate) idle_ok: bool,
     /// Whether the whole question is on screen. A question taller than
     /// its pane is clipped with a marker, and nothing clipped may be
@@ -62,6 +71,14 @@ pub(crate) enum Action {
     AnswerYesForSession,
     /// Send the modal's text field as the answer.
     SubmitModalInput,
+    /// Send the list modal's current row (select) or ticked rows (checkbox).
+    SubmitModalChoice,
+    /// Move the list modal's cursor by this many rows, down when positive.
+    ModalMove(i32),
+    /// Tick or untick the checkbox row under the cursor.
+    ModalToggle,
+    /// Choose the select row at this index outright.
+    ModalJump(usize),
     ModalInput(KeyEvent),
     ComposerInput(KeyEvent),
     ToggleTodo,
@@ -113,15 +130,48 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
                 _ => Action::Nothing,
             }
         }
-        Some(ModalKind::Input) => match code {
+        Some(
+            ModalKind::Input
+            | ModalKind::Password
+            | ModalKind::Select {
+                custom_field_open: true,
+            },
+        ) => match code {
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
             KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
             // The field is one line, so the composer's newline chords have
-            // nothing to insert: Enter submits however it is held.
+            // nothing to insert: Enter submits however it is held, once
+            // the typing-idle gate has passed; a gated Enter is swallowed
+            // rather than typed.
+            KeyCode::Enter if !(ctx.idle_ok && ctx.question_fully_shown) => Action::Nothing,
             KeyCode::Enter => Action::SubmitModalInput,
             KeyCode::Char('j') if ctrl => Action::Nothing,
             _ => Action::ModalInput(key),
         },
+        Some(
+            ModalKind::Select {
+                custom_field_open: false,
+            }
+            | ModalKind::Checkbox,
+        ) => {
+            let answerable = ctx.idle_ok && ctx.question_fully_shown;
+            let checkbox = ctx.modal == Some(ModalKind::Checkbox);
+            match code {
+                KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
+                KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
+                KeyCode::Up => Action::ModalMove(-1),
+                KeyCode::Down => Action::ModalMove(1),
+                KeyCode::Char(' ') if checkbox => Action::ModalToggle,
+                _ if !answerable => Action::Nothing,
+                KeyCode::Enter => Action::SubmitModalChoice,
+                KeyCode::Char('k') if !ctrl => Action::ModalMove(-1),
+                KeyCode::Char('j') if !ctrl => Action::ModalMove(1),
+                KeyCode::Char(digit @ '1'..='9') if !ctrl && !checkbox => {
+                    Action::ModalJump(usize::from(digit as u8 - b'1'))
+                }
+                _ => Action::Nothing,
+            }
+        }
         None => match code {
             KeyCode::Char('c') if ctrl => {
                 if ctx.turn_running {
@@ -588,6 +638,120 @@ mod tests {
             map_key(plain(KeyCode::Esc), &modal),
             Action::Answer(PromptAnswer::Cancelled)
         );
+    }
+
+    /// Enter on a field modal is an answer, so it waits out the typing
+    /// gap the way a confirm's hotkeys do; a gated Enter is swallowed,
+    /// not typed into the field. Letters are typed whatever the gate
+    /// says, and Esc cancels through it.
+    #[test]
+    fn field_modal_enter_needs_the_typing_idle_gap() {
+        let typed = plain(KeyCode::Char('s'));
+        for kind in [
+            ModalKind::Input,
+            ModalKind::Password,
+            ModalKind::Select {
+                custom_field_open: true,
+            },
+        ] {
+            let modal = KeyContext {
+                modal: Some(kind),
+                ..IDLE
+            };
+            let busy_typing = KeyContext {
+                idle_ok: false,
+                ..modal
+            };
+            let clipped = KeyContext {
+                question_fully_shown: false,
+                ..modal
+            };
+            let cases = [
+                (plain(KeyCode::Enter), modal, Action::SubmitModalInput),
+                (plain(KeyCode::Enter), busy_typing, Action::Nothing),
+                (plain(KeyCode::Enter), clipped, Action::Nothing),
+                (typed, busy_typing, Action::ModalInput(typed)),
+                (
+                    plain(KeyCode::Esc),
+                    busy_typing,
+                    Action::Answer(PromptAnswer::Cancelled),
+                ),
+                (ctrl('c'), busy_typing, Action::Answer(PromptAnswer::Cancelled)),
+            ];
+            for (key, ctx, expected) in cases {
+                assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+            }
+        }
+    }
+
+    /// The list modals: the arrows move without the gate, Space ticks a
+    /// checkbox row without it; Enter, the `j`/`k` letters and a select's
+    /// digits wait for it. A checkbox has no digit shortcuts (a digit
+    /// would have to both move and answer), and a select has no Space.
+    #[test]
+    fn list_modal_keys() {
+        let select = KeyContext {
+            modal: Some(ModalKind::Select {
+                custom_field_open: false,
+            }),
+            ..IDLE
+        };
+        let select_busy = KeyContext {
+            idle_ok: false,
+            ..select
+        };
+        let select_clipped = KeyContext {
+            question_fully_shown: false,
+            ..select
+        };
+        let checkbox = KeyContext {
+            modal: Some(ModalKind::Checkbox),
+            ..IDLE
+        };
+        let checkbox_busy = KeyContext {
+            idle_ok: false,
+            ..checkbox
+        };
+        let cases = [
+            (plain(KeyCode::Up), select, Action::ModalMove(-1)),
+            (plain(KeyCode::Down), select, Action::ModalMove(1)),
+            (plain(KeyCode::Up), select_busy, Action::ModalMove(-1)),
+            (plain(KeyCode::Down), checkbox_busy, Action::ModalMove(1)),
+            (plain(KeyCode::Char('k')), select, Action::ModalMove(-1)),
+            (plain(KeyCode::Char('j')), select, Action::ModalMove(1)),
+            (plain(KeyCode::Char('k')), select_busy, Action::Nothing),
+            (plain(KeyCode::Char('j')), checkbox_busy, Action::Nothing),
+            (plain(KeyCode::Char('1')), select, Action::ModalJump(0)),
+            (plain(KeyCode::Char('9')), select, Action::ModalJump(8)),
+            (plain(KeyCode::Char('0')), select, Action::Nothing),
+            (plain(KeyCode::Char('2')), select_busy, Action::Nothing),
+            (plain(KeyCode::Char('2')), select_clipped, Action::Nothing),
+            (plain(KeyCode::Char('2')), checkbox, Action::Nothing),
+            (plain(KeyCode::Char(' ')), checkbox, Action::ModalToggle),
+            (plain(KeyCode::Char(' ')), checkbox_busy, Action::ModalToggle),
+            (plain(KeyCode::Char(' ')), select, Action::Nothing),
+            (plain(KeyCode::Enter), select, Action::SubmitModalChoice),
+            (plain(KeyCode::Enter), checkbox, Action::SubmitModalChoice),
+            (plain(KeyCode::Enter), select_busy, Action::Nothing),
+            (plain(KeyCode::Enter), select_clipped, Action::Nothing),
+            (plain(KeyCode::Enter), checkbox_busy, Action::Nothing),
+            (plain(KeyCode::Char('x')), select, Action::Nothing),
+            (
+                plain(KeyCode::Esc),
+                select_busy,
+                Action::Answer(PromptAnswer::Cancelled),
+            ),
+            (
+                ctrl('c'),
+                checkbox_busy,
+                Action::Answer(PromptAnswer::Cancelled),
+            ),
+            (ctrl('z'), select, Action::Suspend),
+            (plain(KeyCode::PageUp), checkbox, Action::ScrollPage(-1)),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
     }
 
     /// The table stays pure: no terminal writes and no std I/O in this file.

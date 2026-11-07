@@ -57,8 +57,8 @@ use crate::turn::{StdoutSink, UiSink};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    ensure_editor_available, ensure_prompts_available, estimate_token_length, fuzzy_filter,
-    get_env_name, list_file_names, now, render_prompt, temp_file,
+    ensure_prompts_available, estimate_token_length, fuzzy_filter, get_env_name,
+    list_file_names, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -4181,7 +4181,6 @@ impl RequestContext {
             Some(session) => (session.name().to_string(), session.scope()),
             None => bail!("No session"),
         };
-        ensure_editor_available()?;
         let session_path = self.session_file_for(&name, scope);
         self.save_session(Some(&name), None)?;
         let editor = app.editor()?;
@@ -4208,7 +4207,6 @@ impl RequestContext {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
         };
-        ensure_editor_available()?;
         let config_path = paths::agent_config_file(agent_name);
         let graph_path = paths::agent_graph_file(agent_name);
         let target_path = if !config_path.exists() && graph_path.exists() {
@@ -6883,7 +6881,6 @@ impl RequestContext {
     }
 
     fn upsert_role(&self, app: &AppConfig, name: &str) -> Result<()> {
-        ensure_editor_available()?;
         let role_path = paths::role_file(name);
         ensure_parent_exists(&role_path)?;
         let editor = app.editor()?;
@@ -6896,7 +6893,6 @@ impl RequestContext {
 
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
         paths::validate_skill_name(name)?;
-        ensure_editor_available()?;
         let path = paths::skill_file(name);
         ensure_parent_exists(&path)?;
         let is_new = !path.exists();
@@ -7464,7 +7460,6 @@ impl RequestContext {
         }
 
         let document_paths = rag.document_paths();
-        ensure_editor_available()?;
         let temp_file = temp_file(&format!("-rag-{}", rag.name()), ".txt");
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await

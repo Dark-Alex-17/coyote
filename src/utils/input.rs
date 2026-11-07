@@ -21,7 +21,7 @@ pub fn read_single_key(valid_chars: &[char], default: char, prompt: &str) -> Res
         if truncated {
             question.push_str("...");
         }
-        bail!("Keyboard prompts are not available in the TUI yet; unanswered: {question}"); // TASK-315
+        bail!("Keyboard prompts are not available in the TUI yet; unanswered: {question}"); // TASK-388
     }
     print!("{prompt}");
     stdout().flush()?;

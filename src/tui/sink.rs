@@ -83,6 +83,20 @@ pub(crate) enum UiMsg {
         req: Box<PromptRequest>,
         reply: std::sync::mpsc::Sender<PromptAnswer>,
     },
+    /// Work that needs the terminal in its normal modes (a shell
+    /// passthrough, an editor on a file): the loop releases the screen,
+    /// runs it, and takes the screen back.
+    LendTerminal(LendJob),
+}
+
+/// The job behind [`UiMsg::LendTerminal`]; its result travels back to
+/// the asker inside the closure.
+pub(crate) struct LendJob(pub(crate) Box<dyn FnOnce(&super::TtyHandles) + Send>);
+
+impl fmt::Debug for LendJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LendJob")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
