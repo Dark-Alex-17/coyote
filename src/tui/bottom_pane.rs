@@ -341,13 +341,30 @@ pub(super) struct RewindState {
 
 impl RewindState {
     /// None when no cell opened an exchange, so there is nothing to go
-    /// back to.
-    pub(super) fn from_cells(cells: &[Cell], prefix: CommandPrefix) -> Option<Self> {
+    /// back to. A macro's row is skipped, since its one cell stands for
+    /// as many exchanges as the macro ran; the flag says whether any was.
+    pub(super) fn from_cells(
+        cells: &[Cell],
+        prefix: CommandPrefix,
+        macros: &[(String, String)],
+    ) -> (Option<Self>, bool) {
+        let is_macro = |cell: &Cell| {
+            matches!(cell, Cell::Command { name, .. }
+                if super::command_word(name, prefix)
+                    .and_then(|word| word.strip_prefix('.').map(str::to_string))
+                    .is_some_and(|word| macros.iter().any(|(name, _)| *name == word)))
+        };
+        let mut skipped_macros = false;
         let rows: Vec<RewindRow> = cells
             .iter()
             .enumerate()
             .rev()
             .filter(|(_, cell)| super::opens_exchange(cell, prefix))
+            .filter(|(_, cell)| {
+                let skip = is_macro(cell);
+                skipped_macros |= skip;
+                !skip
+            })
             .map(|(opener, cell)| {
                 let text = match cell {
                     Cell::User { text, .. } => text.as_str(),
@@ -360,7 +377,10 @@ impl RewindState {
                 }
             })
             .collect();
-        (!rows.is_empty()).then_some(Self { rows, highlight: 0 })
+        (
+            (!rows.is_empty()).then_some(Self { rows, highlight: 0 }),
+            skipped_macros,
+        )
     }
 
     pub(super) fn move_highlight(&mut self, delta: i32) {
@@ -905,8 +925,13 @@ mod tests {
             opened(Cell::command(".regenerate")),
             opened(Cell::user("third")),
         ];
-        assert!(RewindState::from_cells(&cells[1..3], CommandPrefix::Dot).is_none());
-        let mut rewind = RewindState::from_cells(&cells, CommandPrefix::Dot).unwrap();
+        assert_eq!(
+            RewindState::from_cells(&cells[1..3], CommandPrefix::Dot, &[]),
+            (None, false)
+        );
+        let (rewind, skipped) = RewindState::from_cells(&cells, CommandPrefix::Dot, &[]);
+        assert!(!skipped);
+        let mut rewind = rewind.unwrap();
         let titles: Vec<(usize, &str)> = rewind
             .rows
             .iter()
@@ -950,13 +975,33 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_row_is_skipped_and_reported() {
+        let macros = [("deploy".to_string(), "ship it".to_string())];
+        let cells = [
+            opened(Cell::user("first")),
+            Cell::assistant("answer".to_string(), true),
+            opened(Cell::command(".deploy prod")),
+            Cell::assistant("done".to_string(), true),
+            opened(Cell::user("third")),
+        ];
+        let (rewind, skipped) = RewindState::from_cells(&cells, CommandPrefix::Dot, &macros);
+        assert!(skipped);
+        let openers: Vec<usize> = rewind.unwrap().rows.iter().map(|row| row.opener).collect();
+        assert_eq!(openers, [4, 0]);
+        let (rewind, skipped) = RewindState::from_cells(&cells[2..4], CommandPrefix::Dot, &macros);
+        assert!(rewind.is_none());
+        assert!(skipped);
+    }
+
+    #[test]
     fn band_rows_stay_within_the_cap_with_their_header() {
         let names: Vec<String> = (0..20).map(|i| format!("entry {i}")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let search = SearchState::new(&history(&names));
         assert_eq!(search.band_rows(), BAND_MAX_ROWS);
         let cells: Vec<Cell> = names.iter().map(|name| opened(Cell::user(name))).collect();
-        let rewind = RewindState::from_cells(&cells, CommandPrefix::Dot).unwrap();
+        let (rewind, _) = RewindState::from_cells(&cells, CommandPrefix::Dot, &[]);
+        let rewind = rewind.unwrap();
         assert_eq!(rewind.band_rows(), BAND_MAX_ROWS);
         assert_eq!(View::Composer.band_rows(), 0);
         assert_eq!(View::Rewind(rewind).band_rows(), BAND_MAX_ROWS);

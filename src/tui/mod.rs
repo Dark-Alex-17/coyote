@@ -1327,10 +1327,21 @@ impl App {
             .last_esc
             .is_some_and(|at| now.duration_since(at) <= REWIND_ESC_GAP);
         self.last_esc = (!second).then_some(now);
-        if second
-            && let Some(rewind) =
-                RewindState::from_cells(self.transcript.cells(), self.config.command_prefix)
-        {
+        if !second {
+            return;
+        }
+        let (rewind, skipped_macros) = RewindState::from_cells(
+            self.transcript.cells(),
+            self.config.command_prefix,
+            &self.macros,
+        );
+        if skipped_macros {
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                "Rewind skips macro turns".to_string(),
+            );
+        }
+        if let Some(rewind) = rewind {
             self.view = View::Rewind(rewind);
         }
     }
