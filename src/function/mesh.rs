@@ -989,6 +989,8 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
             match outcome {
                 Ok(card) => {
                     peers[index]["status"] = card_value(&card, &records[index].destination_hash);
+                    // The link that served the card lifted any failed-link mark.
+                    peers[index]["reachable"] = json!(true);
                 }
                 Err(err) => {
                     peers[index]["status_error"] = json!(err.to_string());

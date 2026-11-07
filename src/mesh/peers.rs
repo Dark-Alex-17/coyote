@@ -292,6 +292,7 @@ impl PeerTable {
                 .map(|record| record.destination_hash.clone())
                 .expect("a table over its cap is not empty");
             peers.remove(&oldest);
+            self.link_failed.lock().remove(&oldest);
         }
         self.dirty.store(true, Ordering::Release);
         change
