@@ -162,11 +162,21 @@ fn clones_in(root_name: &str) -> Clones {
     }
     git(
         &review,
-        &["remote", "set-url", "origin", "git@github.com:Org/Billing.git"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Org/Billing.git",
+        ],
     );
     git(
         &shadow,
-        &["remote", "set-url", "origin", "https://github.com/org/billing/"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/org/billing/",
+        ],
     );
     write(&shadow.join("internal/plan.go"), "package plan // STALE\n");
     let other = root.join("shared-lib");
@@ -174,7 +184,12 @@ fn clones_in(root_name: &str) -> Clones {
     git(&other, &["init", "-q"]);
     git(
         &other,
-        &["remote", "add", "origin", "git@github.com:org/shared-lib.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:org/shared-lib.git",
+        ],
     );
     write(&other.join("caller.go"), "package lib // CALLER\n");
     Clones {
@@ -259,7 +274,11 @@ fn assert_refused(out: &str, checkout_path_tail: &str, label: &str) {
     );
     let named = out
         .lines()
-        .find_map(|l| l.strip_prefix("It may not match the code being reviewed. Read the review checkout instead: "))
+        .find_map(|l| {
+            l.strip_prefix(
+                "It may not match the code being reviewed. Read the review checkout instead: ",
+            )
+        })
         .unwrap_or_else(|| panic!("{label}: no checkout path named: {out}"));
     assert!(
         named.replace('\\', "/").ends_with(checkout_path_tail),
@@ -282,9 +301,18 @@ fn relative_paths_resolve_against_the_review_checkout() {
         for tool in ["fs_cat.sh", "fs_read.sh"] {
             let out = run_tool(tool, &c.root, &[("path", "internal/plan.go")], &run, &cache);
             assert!(out.contains("// HEAD"), "{root_name} {tool}: {out}");
-            assert!(!out.contains("STALE"), "{root_name} {tool} read the stale clone: {out}");
+            assert!(
+                !out.contains("STALE"),
+                "{root_name} {tool} read the stale clone: {out}"
+            );
         }
-        let out = run_tool("fs_grep.sh", &c.root, &[("pattern", "package plan")], &run, &cache);
+        let out = run_tool(
+            "fs_grep.sh",
+            &c.root,
+            &[("pattern", "package plan")],
+            &run,
+            &cache,
+        );
         assert!(
             out.contains("// HEAD") && !out.contains("STALE"),
             "{root_name}: fs_grep with no path must search the checkout: {out}"
@@ -348,12 +376,24 @@ fn a_missing_guard_refuses_only_in_a_review_lane() {
     let target = c.review.join("internal/plan.go");
     let target = s(&target);
     let cache = c.root.join("cache");
-    let out = run_script_tool(&script, &c.root, &[("path", &target)], &review_run(&c.review), &cache);
+    let out = run_script_tool(
+        &script,
+        &c.root,
+        &[("path", &target)],
+        &review_run(&c.review),
+        &cache,
+    );
     assert!(
         out.contains("Refused: the review path guard") && out.contains("is not installed"),
         "{out}"
     );
-    let out = run_script_tool(&script, &c.root, &[("path", &target)], &Run::default(), &cache);
+    let out = run_script_tool(
+        &script,
+        &c.root,
+        &[("path", &target)],
+        &Run::default(),
+        &cache,
+    );
     assert!(out.contains("// HEAD"), "{out}");
 }
 
@@ -367,7 +407,9 @@ fn ungrounded_copy(tool: &str, dir: &Path) -> PathBuf {
     let mut stripped = format!("{}{}", &text[..start], &text[end..]);
     stripped = stripped
         .lines()
-        .filter(|l| !l.contains("review_ground_path \"") && !l.contains("=\"$REVIEW_GROUNDED_PATH\""))
+        .filter(|l| {
+            !l.contains("review_ground_path \"") && !l.contains("=\"$REVIEW_GROUNDED_PATH\"")
+        })
         .map(|l| format!("{l}\n"))
         .collect();
     let path = dir.join(tool);
@@ -394,10 +436,16 @@ fn non_review_agents_get_byte_identical_tool_output() {
         ("fs_cat.sh", vec![("path", "billing/internal/plan.go")]),
         ("fs_cat.sh", vec![("path", "missing.go")]),
         ("fs_grep.sh", vec![("pattern", "package")]),
-        ("fs_grep.sh", vec![("pattern", "STALE"), ("path", &*shadow_dir)]),
+        (
+            "fs_grep.sh",
+            vec![("pattern", "STALE"), ("path", &*shadow_dir)],
+        ),
         ("fs_glob.sh", vec![("pattern", "*.go")]),
         ("fs_ls.sh", vec![("path", "billing")]),
-        ("ast_grep.sh", vec![("pattern", "package $X"), ("path", &*shadow_dir)]),
+        (
+            "ast_grep.sh",
+            vec![("pattern", "package $X"), ("path", &*shadow_dir)],
+        ),
     ];
     let project = Run {
         vars: vec![("LLM_AGENT_VAR_PROJECT_DIR", s(&c.review))],
@@ -451,17 +499,37 @@ fn reads_in_a_same_origin_clone_are_redirected_to_the_checkout() {
     let shadow_dir = s(&c.shadow);
     let shadow_sub = s(&c.shadow.join("internal"));
     for (tool, args, tail) in [
-        ("fs_cat.sh", vec![("path", &*shadow_file)], "review/internal/plan.go"),
-        ("fs_read.sh", vec![("path", &*shadow_file)], "review/internal/plan.go"),
+        (
+            "fs_cat.sh",
+            vec![("path", &*shadow_file)],
+            "review/internal/plan.go",
+        ),
+        (
+            "fs_read.sh",
+            vec![("path", &*shadow_file)],
+            "review/internal/plan.go",
+        ),
         (
             "fs_read.sh",
             vec![("path", "../billing/internal/plan.go")],
             "review/internal/plan.go",
         ),
         ("fs_ls.sh", vec![("path", &*shadow_dir)], "review"),
-        ("fs_grep.sh", vec![("pattern", "STALE"), ("path", &*shadow_sub)], "review/internal"),
-        ("fs_glob.sh", vec![("pattern", "*.go"), ("path", &*shadow_dir)], "review"),
-        ("ast_grep.sh", vec![("pattern", "package $X"), ("path", &*shadow_sub)], "review/internal"),
+        (
+            "fs_grep.sh",
+            vec![("pattern", "STALE"), ("path", &*shadow_sub)],
+            "review/internal",
+        ),
+        (
+            "fs_glob.sh",
+            vec![("pattern", "*.go"), ("path", &*shadow_dir)],
+            "review",
+        ),
+        (
+            "ast_grep.sh",
+            vec![("pattern", "package $X"), ("path", &*shadow_sub)],
+            "review/internal",
+        ),
     ] {
         let out = run_tool(tool, &c.root, &args, &run, &cache);
         assert_refused(&out, tail, &format!("{tool} {args:?}"));
@@ -484,14 +552,26 @@ fn reads_in_other_repositories_and_untracked_files_still_succeed() {
     let out = run_tool("fs_cat.sh", &c.root, &[("path", &caller)], &run, &cache);
     assert!(out.contains("// CALLER"), "{out}");
     let other = s(&c.other);
-    let out = run_tool("fs_grep.sh", &c.root, &[("pattern", "CALLER"), ("path", &other)], &run, &cache);
+    let out = run_tool(
+        "fs_grep.sh",
+        &c.root,
+        &[("pattern", "CALLER"), ("path", &other)],
+        &run,
+        &cache,
+    );
     assert!(out.contains("// CALLER"), "{out}");
     let own = s(&c.review.join("internal/plan.go"));
     let out = run_tool("fs_read.sh", &c.root, &[("path", &own)], &run, &cache);
     assert!(out.contains("// HEAD"), "{out}");
     let outside = c.root.join("notes.txt");
     write(&outside, "NOT A REPO\n");
-    let out = run_tool("fs_cat.sh", &c.root, &[("path", &s(&outside))], &run, &cache);
+    let out = run_tool(
+        "fs_cat.sh",
+        &c.root,
+        &[("path", &s(&outside))],
+        &run,
+        &cache,
+    );
     assert!(out.contains("NOT A REPO"), "{out}");
     let local = c.shadow.join("plans/x.md");
     write(&local, "LOCAL PLAN\n");
@@ -524,7 +604,10 @@ fn worktree() -> Worktree {
     git(&main, &["add", "."]);
     git(&main, &["commit", "-qm", "base"]);
     let worktree = dir.0.join("task-1");
-    git(&main, &["worktree", "add", "-q", &s(&worktree), "-b", "task"]);
+    git(
+        &main,
+        &["worktree", "add", "-q", &s(&worktree), "-b", "task"],
+    );
     write(&worktree.join("src/lib.rs"), "// TASK\n");
     fs::remove_file(worktree.join("src/gone.rs")).unwrap();
     write(&main.join("plans/x.md"), "LOCAL PLAN\n");
@@ -558,7 +641,13 @@ fn the_default_project_dir_leaves_reads_untouched() {
         if let Some(p) = project_dir {
             run.vars.push(("LLM_AGENT_VAR_PROJECT_DIR", p.to_string()));
         }
-        let out = run_tool("fs_cat.sh", &w.main, &[("path", "src/lib.rs")], &run, &cache);
+        let out = run_tool(
+            "fs_cat.sh",
+            &w.main,
+            &[("path", "src/lib.rs")],
+            &run,
+            &cache,
+        );
         assert_eq!(out.trim(), "// MAIN", "{project_dir:?}: {out}");
         let out = run_tool("fs_cat.sh", &w.main, &[("path", &task_file)], &run, &cache);
         assert_eq!(out.trim(), "// TASK", "{project_dir:?}: {out}");
@@ -581,21 +670,35 @@ fn a_worktree_review_from_the_main_clone_is_grounded() {
     let w = worktree();
     let cache = w.main.join("../cache");
     let run = review_run(&w.worktree);
-    let out = run_tool("fs_cat.sh", &w.main, &[("path", "src/lib.rs")], &run, &cache);
+    let out = run_tool(
+        "fs_cat.sh",
+        &w.main,
+        &[("path", "src/lib.rs")],
+        &run,
+        &cache,
+    );
     assert_eq!(out.trim(), "// TASK", "{out}");
     let task_file = s(&w.worktree.join("src/lib.rs"));
     let out = run_tool("fs_read.sh", &w.main, &[("path", &task_file)], &run, &cache);
     assert!(out.contains("1: // TASK"), "{out}");
     let main_file = s(&w.main.join("src/lib.rs"));
     let out = run_tool("fs_cat.sh", &w.main, &[("path", &main_file)], &run, &cache);
-    assert_refused(&out, "task-1/src/lib.rs", "main clone file with a counterpart");
+    assert_refused(
+        &out,
+        "task-1/src/lib.rs",
+        "main clone file with a counterpart",
+    );
     let gone = s(&w.main.join("src/gone.rs"));
     let out = run_tool("fs_cat.sh", &w.main, &[("path", &gone)], &run, &cache);
     assert_refused(&out, "task-1", "tracked file the worktree deleted");
     assert!(!out.contains("GONE IN THE WORKTREE"), "{out}");
     let plan = s(&w.main.join("plans/x.md"));
     let out = run_tool("fs_cat.sh", &w.main, &[("path", &plan)], &run, &cache);
-    assert_eq!(out.trim(), "LOCAL PLAN", "an excluded local file stays readable: {out}");
+    assert_eq!(
+        out.trim(),
+        "LOCAL PLAN",
+        "an excluded local file stays readable: {out}"
+    );
 }
 
 /// The origin lookup is cached per checkout root under a hashed key and
@@ -609,7 +712,13 @@ fn origin_lookups_are_cached_and_refreshed_with_the_config() {
     let cache = c.root.join("cache");
     let run = review_run(&c.review);
     let shadow_file = s(&c.shadow.join("internal/plan.go"));
-    let out = run_tool("fs_cat.sh", &c.root, &[("path", &shadow_file)], &run, &cache);
+    let out = run_tool(
+        "fs_cat.sh",
+        &c.root,
+        &[("path", &shadow_file)],
+        &run,
+        &cache,
+    );
     assert!(out.contains("Refused:"), "{out}");
     let entries = || -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = fs::read_dir(&cache)
@@ -628,18 +737,29 @@ fn origin_lookups_are_cached_and_refreshed_with_the_config() {
     let first = entries();
     assert_eq!(first.len(), 2, "one entry per checkout root: {first:?}");
     assert!(
-        first
-            .iter()
-            .all(|(k, v)| k.len() == 40 && k.chars().all(|c| c.is_ascii_hexdigit()) && v == "github.com/org/billing"),
+        first.iter().all(|(k, v)| k.len() == 40
+            && k.chars().all(|c| c.is_ascii_hexdigit())
+            && v == "github.com/org/billing"),
         "hashed keys; scp and https origins normalize to one form: {first:?}"
     );
     // A coarse mtime clock must still see the config as newer.
     sleep(Duration::from_millis(1100));
     git(
         &c.shadow,
-        &["remote", "set-url", "origin", "git@github.com:org/other.git"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:org/other.git",
+        ],
     );
-    let out = run_tool("fs_cat.sh", &c.root, &[("path", &shadow_file)], &run, &cache);
+    let out = run_tool(
+        "fs_cat.sh",
+        &c.root,
+        &[("path", &shadow_file)],
+        &run,
+        &cache,
+    );
     assert!(
         out.contains("// STALE"),
         "a clone whose origin changed is no longer the reviewed repository: {out}"
@@ -824,7 +944,8 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
     let whole = "review incomplete: finding verification failed, 2 finding(s) unverified";
     let incomplete_line = "\nGAUNTLET_REVIEW_INCOMPLETE: code-review";
     let degraded_row = "| code-review | BLOCKED | PIPELINE-FAULT (degraded lane) |";
-    let attention_row = "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴; 2 unverified finding(s) |";
+    let attention_row =
+        "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴; 2 unverified finding(s) |";
     for (label, verifier_output, reason, gauntlet_verdict, machine, row) in [
         (
             "per-finding faults",
@@ -872,8 +993,14 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
             verdict["reason"].as_str().unwrap().starts_with(reason),
             "{label}: {verdict}"
         );
-        assert_eq!(gauntlet["gauntlet_verdict"], gauntlet_verdict, "{label}: {gauntlet}");
-        assert_eq!(gauntlet["gauntlet_incomplete_line"], machine, "{label}: {gauntlet}");
+        assert_eq!(
+            gauntlet["gauntlet_verdict"], gauntlet_verdict,
+            "{label}: {gauntlet}"
+        );
+        assert_eq!(
+            gauntlet["gauntlet_incomplete_line"], machine,
+            "{label}: {gauntlet}"
+        );
         assert_eq!(code_review_row(&gauntlet), row, "{label}: {gauntlet}");
         let text = gauntlet["gauntlet_report"].as_str().unwrap();
         if gauntlet_verdict == "PASS" {
@@ -1212,13 +1339,15 @@ fn anchor_gate_faults_and_drops_reach_the_verdict() {
     );
     assert!(report.contains("found 0 critical"), "{report}");
     assert!(
-        gauntlet["gauntlet_report"]
-            .as_str()
-            .unwrap()
-            .contains("- code-review: 1 critical finding(s) could not be anchored; listed for a human"),
+        gauntlet["gauntlet_report"].as_str().unwrap().contains(
+            "- code-review: 1 critical finding(s) could not be anchored; listed for a human"
+        ),
         "{gauntlet}"
     );
-    assert_eq!(code_review_row(&gauntlet), "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |");
+    assert_eq!(
+        code_review_row(&gauntlet),
+        "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |"
+    );
 }
 
 /// The #1001 round end to end: a stale clone of the same repository sits in
@@ -1355,8 +1484,13 @@ fn synthesis_and_reviewer_wording_is_in_place() {
     }
     let security = read("security-reviewer/instructions.md");
     assert!(security.contains("**Read the checkout under review.**"));
-    let gate = fs::read_to_string(manifest().join("assets/agents/code-reviewer/scripts/anchor_gate.py")).unwrap();
-    assert!(gate.contains("\nADJACENT = 3\n"), "the adjacency the wording names");
+    let gate =
+        fs::read_to_string(manifest().join("assets/agents/code-reviewer/scripts/anchor_gate.py"))
+            .unwrap();
+    assert!(
+        gate.contains("\nADJACENT = 3\n"),
+        "the adjacency the wording names"
+    );
     assert!(gate.contains("not within {ADJACENT} lines of a change"));
     assert!(graph.contains("within 3 lines of a changed hunk"));
     let readme = read("code-reviewer/README.md");
@@ -1416,7 +1550,10 @@ fn anchor_gate_reads_renames_and_awkward_paths() {
         .map(|f| f.as_str().unwrap())
         .collect();
     for path in ["src/new_name.go", "src/with space.go", "src/na\u{ef}ve.go"] {
-        assert!(changed.contains(&path), "{path} must be a verbatim changed path: {changed:?}");
+        assert!(
+            changed.contains(&path),
+            "{path} must be a verbatim changed path: {changed:?}"
+        );
     }
     let mut findings = vec![
         finding("rename", "🔴 CRITICAL", "src/new_name.go", "10"),
@@ -1424,7 +1561,12 @@ fn anchor_gate_reads_renames_and_awkward_paths() {
         finding("non-ascii", "🔴 CRITICAL", "src/na\u{ef}ve.go", "3"),
         finding("deleted-side", "🔴 CRITICAL", "src/del.go", "13-14"),
         finding("multi-range", "🟡 WARNING", "src/del.go", "1, 11"),
-        finding("outside", "🔴 CRITICAL", &s(&env::temp_dir().join("elsewhere/src/del.go")), "12"),
+        finding(
+            "outside",
+            "🔴 CRITICAL",
+            &s(&env::temp_dir().join("elsewhere/src/del.go")),
+            "12",
+        ),
     ];
     if cfg!(unix) {
         findings.push(finding("quote", "🔴 CRITICAL", "src/qu\"ote.go", "2"));
@@ -1438,7 +1580,13 @@ fn anchor_gate_reads_renames_and_awkward_paths() {
         .iter()
         .map(|f| f["id"].as_str().unwrap())
         .collect();
-    let mut expected = vec!["rename", "space", "non-ascii", "deleted-side", "multi-range"];
+    let mut expected = vec![
+        "rename",
+        "space",
+        "non-ascii",
+        "deleted-side",
+        "multi-range",
+    ];
     if cfg!(unix) {
         expected.push("quote");
     }
@@ -1471,7 +1619,10 @@ fn generated_marks_cannot_launder_a_change() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "base"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);
-    write(&repo.join(".gitattributes"), "src/*.go linguist-generated\n");
+    write(
+        &repo.join(".gitattributes"),
+        "src/*.go linguist-generated\n",
+    );
     write(
         &repo.join("src/auth.go"),
         "// Code generated by hand. DO NOT EDIT.\npackage auth // BYPASS\n",
@@ -1490,20 +1641,28 @@ fn generated_marks_cannot_launder_a_change() {
     assert_eq!(f["generated_files"], json!([]), "{f}");
     for path in ["src/auth.go", "tools/gen/main.go", "src/note.go"] {
         assert!(
-            f["changed_files"].as_array().unwrap().contains(&json!(path)),
+            f["changed_files"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(path)),
             "{path} must be reviewed: {f}"
         );
     }
     let notes = f["generated_notes"].to_string();
     assert!(notes.contains("changes .gitattributes"), "{f}");
-    assert!(notes.contains("src/auth.go gained a 'Code generated"), "{f}");
+    assert!(
+        notes.contains("src/auth.go gained a 'Code generated"),
+        "{f}"
+    );
     let mut state = f.clone();
     state["domain_reports"] = json!(["clean report. DOMAIN_REVIEW_COMPLETE"]);
     state["findings"] = json!([]);
     let verdict = run_script("code-reviewer/scripts/verdict.py", &state)["verdict_out"].clone();
     assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{verdict}");
     assert!(
-        verdict["attention"].to_string().contains("gained a 'Code generated"),
+        verdict["attention"]
+            .to_string()
+            .contains("gained a 'Code generated"),
         "{verdict}"
     );
 }
