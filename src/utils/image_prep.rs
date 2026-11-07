@@ -18,8 +18,18 @@ pub const MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
 pub const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 pub const MAX_REQUEST_IMAGES: usize = 20;
 pub const MAX_REQUEST_IMAGE_BASE64_BYTES: usize = 20 * 1024 * 1024;
+pub const REQUEST_IMAGE_LOW_WATERMARK_COUNT: usize = 10;
+pub const REQUEST_IMAGE_LOW_WATERMARK_BYTES: usize = 10 * 1024 * 1024;
+const _: () = assert!(
+    REQUEST_IMAGE_LOW_WATERMARK_COUNT < MAX_REQUEST_IMAGES
+        && REQUEST_IMAGE_LOW_WATERMARK_BYTES < MAX_REQUEST_IMAGE_BASE64_BYTES
+);
 pub const SUPPORTED_IMAGE_FORMATS_NOTE: &str =
     "only PNG, JPEG, WebP and GIF images can be attached";
+/// Marks where an attached image sits in a message's text, one per image in
+/// attachment order. Typed text, retrieved context and preambles have it
+/// stripped, so only the REPL can place an image.
+pub const IMAGE_SLOT: char = '\u{FFFC}';
 
 const SUPPORTED_IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 6] = [
@@ -46,6 +56,51 @@ impl PreparedImage {
     pub fn to_data_url(&self) -> String {
         format!("data:{};base64,{}", self.mime_type, self.base64_data)
     }
+}
+
+/// How many of the oldest history images a request carrying `count` images
+/// must drop. Drops come in whole blocks of the gap between the high and low
+/// watermarks, so the cut only moves when the high limit is crossed again and
+/// the cached prompt prefix stays the same from one turn to the next.
+pub fn history_images_to_drop(count: usize) -> usize {
+    overflow_in_blocks(count, MAX_REQUEST_IMAGES, REQUEST_IMAGE_LOW_WATERMARK_COUNT)
+}
+
+/// The byte counterpart of `history_images_to_drop`: the oldest history
+/// images whose base64 payloads add up to at least this many bytes go.
+pub fn history_image_bytes_to_drop(bytes: usize) -> usize {
+    overflow_in_blocks(
+        bytes,
+        MAX_REQUEST_IMAGE_BASE64_BYTES,
+        REQUEST_IMAGE_LOW_WATERMARK_BYTES,
+    )
+}
+
+fn overflow_in_blocks(total: usize, high: usize, low: usize) -> usize {
+    let block = high - low;
+    total.saturating_sub(high).div_ceil(block) * block
+}
+
+/// The placeholder the user sees for the `number`th image (1-based).
+pub fn image_marker(number: usize) -> String {
+    format!("[Image #{number}]")
+}
+
+pub fn strip_image_slots(text: &str) -> String {
+    text.replace(IMAGE_SLOT, "")
+}
+
+/// Shows each `IMAGE_SLOT` as the `image_marker` of its image. Slots past
+/// `image_count` have no image behind them and are dropped.
+pub fn render_image_slots(text: &str, image_count: usize) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    for (index, piece) in text.split(IMAGE_SLOT).enumerate() {
+        if index > 0 && index <= image_count {
+            rendered.push_str(&image_marker(index));
+        }
+        rendered.push_str(piece);
+    }
+    rendered
 }
 
 pub fn is_supported_image_path(path: &str) -> bool {
@@ -331,12 +386,52 @@ mod tests {
     }
 
     #[test]
+    fn image_slots_render_as_numbered_markers_or_strip() {
+        let text = format!("{IMAGE_SLOT} a {IMAGE_SLOT}b{IMAGE_SLOT}");
+
+        assert_eq!(
+            render_image_slots(&text, 3),
+            "[Image #1] a [Image #2]b[Image #3]"
+        );
+        assert_eq!(strip_image_slots(&text), " a b");
+        assert_eq!(render_image_slots("no slots", 0), "no slots");
+    }
+
+    #[test]
+    fn image_slots_past_the_image_count_are_dropped() {
+        let text = format!("{IMAGE_SLOT} a {IMAGE_SLOT}b{IMAGE_SLOT}");
+
+        assert_eq!(render_image_slots(&text, 1), "[Image #1] a b");
+        assert_eq!(render_image_slots(&text, 0), " a b");
+    }
+
+    #[test]
     fn is_supported_image_path_ignores_case() {
         assert!(is_supported_image_path("photo.png"));
         assert!(is_supported_image_path("PHOTO.JPG"));
         assert!(is_supported_image_path("dir with space/a.WebP"));
         assert!(!is_supported_image_path("image.svg"));
         assert!(!is_supported_image_path("png"));
+    }
+
+    #[test]
+    fn history_images_drop_in_blocks_of_the_watermark_gap() {
+        let dropped: Vec<_> = [0, 20, 21, 25, 30, 31, 40, 41]
+            .into_iter()
+            .map(history_images_to_drop)
+            .collect();
+
+        assert_eq!(dropped, [0, 0, 10, 10, 10, 20, 20, 30]);
+    }
+
+    #[test]
+    fn history_image_bytes_drop_in_blocks_of_the_watermark_gap() {
+        let mb = 1024 * 1024;
+
+        assert_eq!(history_image_bytes_to_drop(20 * mb), 0);
+        assert_eq!(history_image_bytes_to_drop(20 * mb + 1), 10 * mb);
+        assert_eq!(history_image_bytes_to_drop(30 * mb), 10 * mb);
+        assert_eq!(history_image_bytes_to_drop(30 * mb + 1), 20 * mb);
     }
 
     #[test]

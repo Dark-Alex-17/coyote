@@ -1048,4 +1048,15 @@ mod tests {
         let err = result.expect_err("the image must be refused");
         assert!(err.to_string().contains("does not accept images"), "{err}");
     }
+
+    #[tokio::test]
+    async fn create_input_strips_a_typed_image_slot() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+
+        let input = create_input(&ctx, Some("a\u{FFFC}b".into()), &[], create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(input.text(), "ab");
+    }
 }

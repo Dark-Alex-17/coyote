@@ -798,6 +798,61 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn interleaved_user_parts_keep_their_order() {
+        let body = claude_build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("claude", "claude-test"),
+            false,
+        )
+        .unwrap();
+
+        let image = |media_type: &str, data: &str| {
+            json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media_type, "data": data },
+            })
+        };
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                { "type": "text", "text": "before" },
+                image("image/png", "QQ=="),
+                { "type": "text", "text": "after" },
+                image("image/jpeg", "Qg=="),
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn interleaved_user_parts_keep_their_order_with_prompt_cache() {
+        let body = claude_build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("claude", "claude-test"),
+            true,
+        )
+        .unwrap();
+
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        let kinds: Vec<_> = content.iter().map(|block| block["type"].clone()).collect();
+        assert_eq!(kinds, vec!["text", "image", "text", "image"], "body: {body}");
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(content[1]["source"]["data"], "QQ==");
+        assert_eq!(content[2]["text"], "after");
+        assert_eq!(content[3]["source"]["data"], "Qg==");
+        let marked: Vec<_> = content
+            .iter()
+            .map(|block| block.get("cache_control").is_some())
+            .collect();
+        assert_eq!(marked, vec![false, false, false, true], "body: {body}");
+        assert_eq!(
+            content[3]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "body: {body}"
+        );
+    }
+
     fn build_body_with(
         tool_results: Vec<ToolResult>,
         text: &str,

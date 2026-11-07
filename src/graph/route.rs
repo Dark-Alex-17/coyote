@@ -122,7 +122,10 @@ fn recent_messages(messages: &[Message]) -> String {
             };
             match &m.content {
                 MessageContent::ToolCalls(_) => None,
-                content => Some(format!("{speaker}: {}", content.to_text())),
+                content => Some(format!(
+                    "{speaker}: {}",
+                    content.to_text_with_image_placeholders()
+                )),
             }
         })
         .collect();
@@ -703,7 +706,10 @@ mod tests {
         assert_eq!(outcome.unwrap(), Branch::Run);
         let text = seen[0].text();
         let recent = recent_section(&text);
-        assert_eq!(recent, "user: q1\nassistant: r1\nuser: q2\nassistant: r2");
+        assert_eq!(
+            recent,
+            "user: q1\nassistant: r1\nuser: q2 [image]\nassistant: r2"
+        );
         assert!(!text.contains("SYSTEM-PROMPT-LINE"), "{text}");
         assert!(!text.contains("TOOL-OUTPUT"), "{text}");
         assert!(!text.contains("calling a tool"), "{text}");

@@ -5371,15 +5371,29 @@ mod tests {
         tool_timeout: Option<u64>,
         abort: Option<AbortSignal>,
     ) -> Option<ScriptRunOutput> {
-        let probe = temp_file("-attachments-probe-", "");
+        assert_temp_files_removed_with_probe(
+            &temp_file("-attachments-probe-", ""),
+            body,
+            tool_timeout,
+            abort,
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_temp_files_removed_with_probe(
+        probe: &Path,
+        body: &str,
+        tool_timeout: Option<u64>,
+        abort: Option<AbortSignal>,
+    ) -> Option<ScriptRunOutput> {
         let script = format!(
             "echo /x/a.png >> \"$LLM_ATTACHMENTS\"; echo partial >> \"$LLM_OUTPUT\"; \
              printf '%s\\n%s\\n' \"$LLM_ATTACHMENTS\" \"$LLM_OUTPUT\" > \"$PROBE\"; {body}"
         );
         let envs = HashMap::from([("PROBE".to_string(), probe.display().to_string())]);
         let run = run_bash_tool(&script, envs, tool_timeout, abort)?;
-        let recorded = fs::read_to_string(&probe).unwrap();
-        fs::remove_file(&probe).unwrap();
+        let recorded = fs::read_to_string(probe).unwrap();
+        fs::remove_file(probe).unwrap();
         let recorded: Vec<&str> = recorded.lines().collect();
         assert_eq!(recorded.len(), 2, "{recorded:?}");
         assert!(recorded[0].contains("-attachments-"), "{recorded:?}");
@@ -5533,11 +5547,18 @@ mod tests {
     fn run_llm_function_drops_attachments_and_temp_files_on_abort() {
         let abort = create_abort_signal();
         let trigger = abort.clone();
+        let probe = temp_file("-attachments-probe-", "");
+        let watched = probe.clone();
+        // Abort only once the script has recorded its paths, however slow the host is.
         let aborter = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(500));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !watched.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            thread::sleep(Duration::from_millis(50));
             trigger.set_ctrlc();
         });
-        let run = assert_temp_files_removed("sleep 5", None, Some(abort));
+        let run = assert_temp_files_removed_with_probe(&probe, "sleep 30", None, Some(abort));
         aborter.join().unwrap();
         let Some(run) = run else {
             return;

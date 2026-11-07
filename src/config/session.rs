@@ -1603,7 +1603,7 @@ impl Session {
         } else {
             if self.messages.is_empty() {
                 if self.name == TEMP_SESSION_NAME && self.save_session == Some(true) {
-                    let raw_input = input.raw();
+                    let raw_input = input.raw_without_image_slots();
                     let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
                     self.autoname = Some(AutoName::new_from_chat_history(chat_history));
                 }
@@ -4206,6 +4206,39 @@ last_run:
         let session = Session::default();
 
         assert!(!session.need_autoname());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slotted_exchange_shows_its_marker_and_names_the_session_without_a_slot() {
+        let guard = crate::testing::TestConfigDirGuard::new("session-slot");
+        let image = guard.path.join("shot.png");
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let input = Input::from_files_with_image_slots(
+            &ctx,
+            &format!("see {} now", crate::utils::IMAGE_SLOT),
+            vec![image.to_string_lossy().to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+        let mut session = Session {
+            name: TEMP_SESSION_NAME.to_string(),
+            save_session: Some(true),
+            ..Default::default()
+        };
+
+        session.add_message(&input, "a pixel").unwrap();
+
+        let history = session.chat_history_for_autonaming().unwrap();
+        assert!(!history.contains(crate::utils::IMAGE_SLOT), "{history}");
+        assert!(history.contains("see  now"), "{history}");
+        let rendered = rendered_lines(&session).join("\n");
+        assert!(!rendered.contains(crate::utils::IMAGE_SLOT), "{rendered}");
+        assert!(rendered.contains("-- see [Image #1] now"), "{rendered}");
     }
 
     #[test]

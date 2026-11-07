@@ -284,7 +284,7 @@ right_prompt: null               # If null, uses the built-in default:
                                  #   total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens (session cumulative)
                                  #   last_cost, total_cost (USD, formatted like 0.0142; set only when nonzero and every billed token type has a price)
                                  # Image variable (REPL only):
-                                 #   images (number of pending pasted images)
+                                 #   images (number of images queued for the next message)
 
 # ---- Miscellaneous ----
 user_agent: null                 # Set User-Agent HTTP header, use `auto` for coyote/<current-version>

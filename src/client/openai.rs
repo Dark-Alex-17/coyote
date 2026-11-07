@@ -1057,6 +1057,42 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
 
+    #[test]
+    fn chat_interleaved_user_parts_keep_their_order() {
+        let body = openai_build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("openai", "gpt-test"),
+        );
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                { "type": "text", "text": "before" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,QQ==" } },
+                { "type": "text", "text": "after" },
+                { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,Qg==" } },
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn responses_interleaved_user_parts_keep_their_order() {
+        let body =
+            openai_build_responses_body(interleaved_user_data(), &Model::new("openai", "gpt-test"));
+
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([
+                { "type": "input_text", "text": "before" },
+                { "type": "input_image", "image_url": "data:image/png;base64,QQ==" },
+                { "type": "input_text", "text": "after" },
+                { "type": "input_image", "image_url": "data:image/jpeg;base64,Qg==" },
+            ]),
+            "body: {body}"
+        );
+    }
+
     fn build_body(sequence: bool) -> Value {
         let data = ChatCompletionsData {
             messages: vec![

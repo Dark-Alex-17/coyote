@@ -646,6 +646,26 @@ mod tests {
         assert_eq!(contents.len(), 1, "body: {body}");
     }
 
+    #[test]
+    fn gemini_interleaved_user_parts_keep_their_order() {
+        let body = gemini_build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("vertexai", "gemini-test"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["contents"][0]["parts"],
+            json!([
+                { "text": "before" },
+                { "inline_data": { "mime_type": "image/png", "data": "QQ==" } },
+                { "text": "after" },
+                { "inline_data": { "mime_type": "image/jpeg", "data": "Qg==" } },
+            ]),
+            "body: {body}"
+        );
+    }
+
     fn gemini_body_for(tool_results: Vec<ToolResult>) -> Value {
         let data = ChatCompletionsData {
             messages: vec![

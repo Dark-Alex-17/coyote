@@ -894,6 +894,49 @@ mod tests {
     use super::*;
     use crate::function::{FunctionDeclaration, ImageAttachment, ToolCall, ToolResult};
 
+    #[test]
+    fn interleaved_user_parts_keep_their_order() {
+        let body = build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("bedrock", "test"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                { "text": "before" },
+                { "image": { "format": "png", "source": { "bytes": "QQ==" } } },
+                { "text": "after" },
+                { "image": { "format": "jpeg", "source": { "bytes": "Qg==" } } },
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn interleaved_user_parts_keep_their_order_with_prompt_cache() {
+        let body = build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("bedrock", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                { "text": "before" },
+                { "image": { "format": "png", "source": { "bytes": "QQ==" } } },
+                { "text": "after" },
+                { "image": { "format": "jpeg", "source": { "bytes": "Qg==" } } },
+                { "cachePoint": { "type": "default" } },
+            ]),
+            "body: {body}"
+        );
+    }
+
     fn tool_result(output: Value) -> ToolResult {
         ToolResult {
             call: ToolCall::new(

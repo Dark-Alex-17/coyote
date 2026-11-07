@@ -620,6 +620,9 @@ pub struct RequestContext {
     pub auto_continue_paused: Option<String>,
     pub pending_prefill: Option<String>,
     pub pending_images: Vec<String>,
+    /// Images pasted into the line being edited; `[Image #N]` in that line
+    /// refers to entry N - 1.
+    pub pasted_images: Vec<String>,
 
     pub session_abort: Option<AbortSignal>,
 
@@ -697,6 +700,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: None,
             task_abort: None,
             top_level_agent_id: None,
@@ -785,6 +789,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: None,
             task_abort: None,
             top_level_agent_id: None,
@@ -908,6 +913,7 @@ impl RequestContext {
             auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
             pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: self.session_abort.clone(),
             task_abort: self.task_abort.clone(),
             // Branches never own the top-level `agent.*` bracket; only the
@@ -979,6 +985,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: None,
             task_abort: None,
             top_level_agent_id: None,
@@ -9642,7 +9649,7 @@ mod tests {
 
         let rendered = render_summarization_chunk(&[SummaryUnit::Message(&message)]);
 
-        assert_eq!(rendered, "USER: what is in this picture?\n\n[image]");
+        assert_eq!(rendered, "USER: what is in this picture? [image]");
     }
 
     /// Measured tokens cover the rendered content only; the `USER: ` label is

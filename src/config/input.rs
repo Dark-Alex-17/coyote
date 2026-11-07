@@ -5,7 +5,10 @@ use crate::client::{
     MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
 };
 use crate::function::ToolResult;
-use crate::utils::{AbortSignal, UserInterrupt, is_loader_protocol, sha256};
+use crate::utils::{
+    AbortSignal, IMAGE_SLOT, UserInterrupt, is_loader_protocol, render_image_slots, sha256,
+    strip_image_slots,
+};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
@@ -46,7 +49,10 @@ pub struct Input {
 }
 
 impl Input {
+    /// Text from anywhere but the REPL image route has its `IMAGE_SLOT`s
+    /// stripped, so a typed or loaded one cannot place an image.
     pub fn from_str(ctx: &RequestContext, text: &str, role: Option<Role>) -> Result<Self> {
+        let text = strip_image_slots(text);
         let (role, with_session, with_agent) = resolve_role(ctx, role)?;
         let long_lived = is_long_lived(ctx, with_session);
         let captured = capture_input_config(ctx, &role);
@@ -56,8 +62,8 @@ impl Input {
             session: captured.session,
             rag: captured.rag,
             functions: captured.functions,
-            text: text.to_string(),
-            raw: (text.to_string(), vec![]),
+            text: text.clone(),
+            raw: (text, vec![]),
             patched_text: None,
             request_preamble: None,
             last_reply: None,
@@ -84,6 +90,7 @@ impl Input {
         role: Role,
         functions: Option<Vec<FunctionDeclaration>>,
     ) -> Result<Self> {
+        let text = strip_image_slots(text);
         let with_session = ctx.session.is_some();
         Ok(Self {
             app_config: Arc::clone(&ctx.app.config),
@@ -91,8 +98,8 @@ impl Input {
             session: ctx.session.clone(),
             rag: ctx.rag.clone(),
             functions,
-            text: text.to_string(),
-            raw: (text.to_string(), vec![]),
+            text: text.clone(),
+            raw: (text, vec![]),
             patched_text: None,
             request_preamble: None,
             last_reply: None,
@@ -123,14 +130,15 @@ impl Input {
     /// functions are not declared either: auxiliary one-shots whose reply
     /// is read as data must not be able to call anything.
     pub fn detached_with_role(ctx: &RequestContext, text: &str, role: Role) -> Self {
+        let text = strip_image_slots(text);
         Self {
             app_config: Arc::clone(&ctx.app.config),
             stream_enabled: ctx.app.config.stream,
             session: None,
             rag: None,
             functions: None,
-            text: text.to_string(),
-            raw: (text.to_string(), vec![]),
+            text: text.clone(),
+            raw: (text, vec![]),
             patched_text: None,
             request_preamble: None,
             last_reply: None,
@@ -148,6 +156,26 @@ impl Input {
     }
 
     pub async fn from_files(
+        ctx: &RequestContext,
+        raw_text: &str,
+        paths: Vec<String>,
+        role: Option<Role>,
+    ) -> Result<Self> {
+        Self::load_files(ctx, &strip_image_slots(raw_text), paths, role).await
+    }
+
+    /// `from_files` keeping the `IMAGE_SLOT`s in `raw_text`. Only the REPL
+    /// image route, which places every slot itself, may call it.
+    pub(crate) async fn from_files_with_image_slots(
+        ctx: &RequestContext,
+        raw_text: &str,
+        paths: Vec<String>,
+        role: Option<Role>,
+    ) -> Result<Self> {
+        Self::load_files(ctx, raw_text, paths, role).await
+    }
+
+    async fn load_files(
         ctx: &RequestContext,
         raw_text: &str,
         paths: Vec<String>,
@@ -178,7 +206,7 @@ impl Input {
                     last_reply = Some(v.clone());
                 }
                 if let Some(v) = last_reply.clone() {
-                    texts.push(format!("\n{v}"));
+                    texts.push(format!("\n{}", strip_image_slots(&v)));
                 }
             }
             if last_reply.is_none() && documents.is_empty() && medias.is_empty() {
@@ -187,6 +215,8 @@ impl Input {
         }
         let documents_len = documents.len();
         for (kind, path, contents) in documents {
+            let path = strip_image_slots(&path);
+            let contents = strip_image_slots(&contents);
             if documents_len == 1 && raw_text.is_empty() {
                 texts.push(format!("\n{contents}"));
             } else {
@@ -239,7 +269,7 @@ impl Input {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.medias.is_empty()
+        strip_image_slots(&self.text).is_empty() && self.medias.is_empty()
     }
 
     pub fn data_urls(&self) -> HashMap<String, String> {
@@ -264,6 +294,12 @@ impl Input {
         }
     }
 
+    /// Whether the user's text says anything a retrieval query could use;
+    /// a message of only images does not.
+    fn has_search_text(&self) -> bool {
+        !strip_image_slots(&self.text).trim().is_empty()
+    }
+
     pub fn bare_text(&self) -> &str {
         &self.text
     }
@@ -283,10 +319,16 @@ impl Input {
     }
 
     pub fn set_request_preamble(&mut self, text: impl Into<String>) {
-        self.request_preamble = Some(text.into());
+        self.request_preamble = Some(strip_image_slots(&text.into()));
     }
 
+    /// Copies the request-only state of `source`. Its text comes along with
+    /// its medias, since the `IMAGE_SLOT`s in it place those images and this
+    /// input's own constructor stripped them.
     pub(crate) fn carry_patch_from(&mut self, source: &Input) {
+        if !source.medias.is_empty() {
+            self.text = source.text.clone();
+        }
         self.patched_text = source.patched_text.clone();
         self.rag_name = source.rag_name.clone();
         self.raw = source.raw.clone();
@@ -315,7 +357,6 @@ impl Input {
         self.patched_text = Some(text.to_string());
     }
 
-    #[cfg(test)]
     pub fn medias(&self) -> &[String] {
         &self.medias
     }
@@ -326,7 +367,7 @@ impl Input {
     }
 
     pub fn set_text(&mut self, text: String) {
-        self.text = text;
+        self.text = strip_image_slots(&text);
     }
 
     pub fn stream(&self) -> bool {
@@ -367,7 +408,7 @@ impl Input {
     }
 
     pub async fn use_embeddings(&mut self, abort_signal: AbortSignal) -> Result<()> {
-        if self.text.is_empty() {
+        if !self.has_search_text() {
             return Ok(());
         }
         if let Some(rag) = &self.rag {
@@ -552,8 +593,7 @@ impl Input {
     }
 
     pub fn summary(&self) -> String {
-        let text: String = self
-            .text
+        let text: String = render_image_slots(&self.text, self.medias.len())
             .trim()
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
@@ -576,8 +616,17 @@ impl Input {
     }
 
     pub fn raw(&self) -> String {
+        self.raw_with(render_image_slots)
+    }
+
+    /// `raw` with the image positions dropped rather than shown.
+    pub fn raw_without_image_slots(&self) -> String {
+        self.raw_with(|text, _| strip_image_slots(text))
+    }
+
+    fn raw_with(&self, show_slots: fn(&str, usize) -> String) -> String {
         let (text, files) = &self.raw;
-        let mut segments = files.to_vec();
+        let mut segments: Vec<String> = files.iter().map(|f| strip_image_slots(f)).collect();
         if !segments.is_empty() {
             segments.insert(0, ".file".into());
         }
@@ -585,13 +634,13 @@ impl Input {
             if !segments.is_empty() {
                 segments.push("--".into());
             }
-            segments.push(text.clone());
+            segments.push(show_slots(text, self.medias.len()));
         }
         segments.join(" ")
     }
 
     pub fn render(&self) -> String {
-        let text = self.text();
+        let text = render_image_slots(&self.text(), self.medias.len());
         if self.medias.is_empty() {
             return text;
         }
@@ -609,24 +658,44 @@ impl Input {
         format!(".file {}{}", files.join(" "), tail_text)
     }
 
+    /// Splits the text at each `IMAGE_SLOT`, the i-th slot taking the i-th
+    /// image. Slots beyond the images are dropped; images without a slot
+    /// follow the text, as `.file` has always sent them.
     pub fn message_content(&self) -> MessageContent {
         let text = self.text_with_preamble();
         if self.medias.is_empty() {
-            MessageContent::Text(text)
-        } else {
-            let mut list: Vec<MessageContentPart> = self
-                .medias
-                .iter()
-                .cloned()
-                .map(|url| MessageContentPart::ImageUrl {
-                    image_url: ImageUrl { url },
-                })
-                .collect();
-            if !self.text.is_empty() || self.request_preamble.is_some() {
-                list.insert(0, MessageContentPart::Text { text });
-            }
-            MessageContent::Array(list)
+            return MessageContent::Text(strip_image_slots(&text));
         }
+        let image_part = |url: &String| MessageContentPart::ImageUrl {
+            image_url: ImageUrl { url: url.clone() },
+        };
+        let mut medias = self.medias.iter();
+        let mut parts = Vec::new();
+        let mut pending = String::new();
+        for (index, piece) in text.split(IMAGE_SLOT).enumerate() {
+            if index > 0
+                && let Some(url) = medias.next()
+            {
+                push_trimmed_text(&mut parts, &pending);
+                pending.clear();
+                parts.push(image_part(url));
+            }
+            pending.push_str(piece);
+        }
+        if !parts.is_empty() {
+            push_trimmed_text(&mut parts, &pending);
+        } else if !self.text.is_empty() || self.request_preamble.is_some() {
+            parts.push(MessageContentPart::Text { text: pending });
+        }
+        parts.extend(medias.map(image_part));
+        MessageContent::Array(parts)
+    }
+}
+
+fn push_trimmed_text(parts: &mut Vec<MessageContentPart>, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        parts.push(MessageContentPart::Text { text: text.into() });
     }
 }
 
@@ -829,31 +898,83 @@ fn data_url_base64_len(url: &str) -> usize {
 const IMAGES_UNSUPPORTED_REASON: &str = "the current model does not accept images";
 const IMAGES_OVER_BUDGET_REASON: &str = "older image dropped to stay within the request size limit";
 
-/// Running image totals for one outgoing request. Once an image is refused
-/// every older one is refused too, so the kept images are always the newest.
+/// The number of oldest history images still to refuse, consumed as history
+/// images are visited oldest first.
 struct ImageBudget {
-    open: bool,
-    count: usize,
-    bytes: usize,
+    to_drop: usize,
 }
 
 impl ImageBudget {
-    fn admit(&mut self, size: usize) -> bool {
-        self.open = self.open
-            && self.count < MAX_REQUEST_IMAGES
-            && self.bytes + size <= MAX_REQUEST_IMAGE_BASE64_BYTES;
-        if self.open {
-            self.count += 1;
-            self.bytes += size;
+    fn admit(&mut self) -> bool {
+        if self.to_drop == 0 {
+            return true;
         }
-        self.open
+        self.to_drop -= 1;
+        false
     }
 }
 
+/// Base64 sizes of the images a message carries, in the order they are sent.
+fn image_sizes(message: &Message) -> Vec<usize> {
+    match &message.content {
+        MessageContent::Array(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                MessageContentPart::ImageUrl { image_url } => {
+                    Some(data_url_base64_len(&image_url.url))
+                }
+                MessageContentPart::Text { .. } => None,
+            })
+            .collect(),
+        MessageContent::ToolCalls(tool_calls) => tool_calls
+            .tool_results
+            .iter()
+            .flat_map(|result| &result.attachments)
+            .map(|attachment| attachment.data.len())
+            .collect(),
+        MessageContent::Text(_) => vec![],
+    }
+}
+
+/// Counts every image in the request, the current message's included, and
+/// picks how many of the oldest history images go. The cut depends only on
+/// the totals, so the same history always yields the same request.
+fn oldest_history_images_to_drop(messages: &[Message], current_user: Option<usize>) -> usize {
+    let mut history = Vec::new();
+    let mut count = 0;
+    let mut bytes = 0;
+    for (idx, message) in messages.iter().enumerate() {
+        let sizes = image_sizes(message);
+        count += sizes.len();
+        bytes += sizes.iter().sum::<usize>();
+        let is_history_image_message = Some(idx) != current_user
+            && (message.role == MessageRole::User
+                || matches!(message.content, MessageContent::ToolCalls(_)));
+        if is_history_image_message {
+            history.extend(sizes);
+        }
+    }
+
+    let count_to_drop = history_images_to_drop(count);
+    let bytes_to_drop = history_image_bytes_to_drop(bytes);
+    let mut dropped = 0;
+    let mut dropped_bytes = 0;
+    for size in history {
+        if dropped >= count_to_drop && dropped_bytes >= bytes_to_drop {
+            break;
+        }
+        dropped += 1;
+        dropped_bytes += size;
+    }
+    dropped
+}
+
 /// Keeps history images within what the model and the per-request limits
-/// accept, replacing each dropped image with a short note. It rewrites only
-/// the outgoing copy and never fails: an error here would be written into
-/// the session as a failed turn. The current user message's images are never
+/// accept, replacing each dropped image with a short note. Over a limit, the
+/// oldest images go in blocks (see `history_images_to_drop`) so the prompt
+/// prefix providers cache does not shift on every turn. It rewrites only the
+/// outgoing copy and never fails: an error here would be written into the
+/// session as a failed turn. The current user message's images are never
 /// dropped; `guard_medias` has already checked them on their own.
 fn limit_outgoing_images(messages: &mut [Message], model: &Model, current_user: Option<usize>) {
     let vision = model.supports_vision();
@@ -863,38 +984,24 @@ fn limit_outgoing_images(messages: &mut [Message], model: &Model, current_user: 
         IMAGES_UNSUPPORTED_REASON
     };
     let mut budget = ImageBudget {
-        open: vision,
-        count: 0,
-        bytes: 0,
+        to_drop: if vision {
+            oldest_history_images_to_drop(messages, current_user)
+        } else {
+            usize::MAX
+        },
     };
-    if let Some(MessageContent::Array(parts)) = current_user.map(|idx| &messages[idx].content) {
-        for part in parts {
-            if let MessageContentPart::ImageUrl { image_url } = part {
-                budget.count += 1;
-                budget.bytes += data_url_base64_len(&image_url.url);
-            }
-        }
-    }
 
-    for (idx, message) in messages.iter_mut().enumerate().rev() {
+    for (idx, message) in messages.iter_mut().enumerate() {
         if Some(idx) == current_user {
             continue;
         }
         match &mut message.content {
             MessageContent::Array(parts) if message.role == MessageRole::User => {
-                let mut dropped = 0;
-                let mut kept = Vec::with_capacity(parts.len());
-                for part in parts.drain(..).rev() {
-                    if let MessageContentPart::ImageUrl { image_url } = &part
-                        && !budget.admit(data_url_base64_len(&image_url.url))
-                    {
-                        dropped += 1;
-                        continue;
-                    }
-                    kept.push(part);
-                }
-                kept.reverse();
-                *parts = kept;
+                let total = parts.len();
+                parts.retain(|part| {
+                    !matches!(part, MessageContentPart::ImageUrl { .. }) || budget.admit()
+                });
+                let dropped = total - parts.len();
                 if dropped > 0 {
                     parts.push(MessageContentPart::Text {
                         text: format!("[{dropped} image(s) omitted: {reason}]"),
@@ -902,16 +1009,10 @@ fn limit_outgoing_images(messages: &mut [Message], model: &Model, current_user: 
                 }
             }
             MessageContent::ToolCalls(tool_calls) => {
-                for result in tool_calls.tool_results.iter_mut().rev() {
+                for result in tool_calls.tool_results.iter_mut() {
                     let total = result.attachments.len();
-                    let mut kept: Vec<_> = std::mem::take(&mut result.attachments)
-                        .into_iter()
-                        .rev()
-                        .filter(|attachment| budget.admit(attachment.data.len()))
-                        .collect();
-                    kept.reverse();
-                    let dropped = total - kept.len();
-                    result.attachments = kept;
+                    result.attachments.retain(|_| budget.admit());
+                    let dropped = total - result.attachments.len();
                     if dropped > 0 {
                         result.output = json!({
                             "result": result.output.take(),
@@ -1413,6 +1514,33 @@ mod tests {
     }
 
     #[test]
+    fn from_files_strips_image_slots_from_loaded_documents() {
+        let dir = env::temp_dir().join(format!(
+            "coyote-input-slot-test-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let file_path = dir.join("doc.txt");
+        fs::write(&file_path, format!("before{IMAGE_SLOT}after")).unwrap();
+
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![file_path.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap();
+
+        assert!(input.text().contains("beforeafter"));
+        assert!(!input.text().contains(IMAGE_SLOT));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn from_files_loads_multiple_files() {
         let dir = env::temp_dir().join(format!(
             "coyote-input-test-multi-{}",
@@ -1866,6 +1994,252 @@ mod tests {
         format!("data:image/png;base64,{}", "A".repeat(base64_len))
     }
 
+    /// Text parts as their text and image parts as `image:<url>`.
+    fn part_list(content: MessageContent) -> Vec<String> {
+        let MessageContent::Array(parts) = content else {
+            panic!("expected a part list: {content:?}");
+        };
+        parts
+            .into_iter()
+            .map(|part| match part {
+                MessageContentPart::Text { text } => text,
+                MessageContentPart::ImageUrl { image_url } => format!("image:{}", image_url.url),
+            })
+            .collect()
+    }
+
+    fn input_with_text_and_images(text: &str, medias: Vec<String>) -> Input {
+        let mut input = input_with_images(true, medias);
+        input.text = text.into();
+        input
+    }
+
+    #[test]
+    fn message_content_places_each_image_at_its_slot() {
+        let (one, two) = (png_data_url(1), png_data_url(2));
+        let input = input_with_text_and_images(
+            &format!("Something here {IMAGE_SLOT} Something else {IMAGE_SLOT}"),
+            vec![one.clone(), two.clone()],
+        );
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "Something here".to_string(),
+                format!("image:{one}"),
+                "Something else".to_string(),
+                format!("image:{two}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_content_appends_images_without_a_slot() {
+        let (one, two) = (png_data_url(1), png_data_url(2));
+        let input = input_with_text_and_images(
+            &format!("see {IMAGE_SLOT} then"),
+            vec![one.clone(), two.clone()],
+        );
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "see".to_string(),
+                format!("image:{one}"),
+                "then".to_string(),
+                format!("image:{two}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_content_drops_slots_beyond_the_images() {
+        let one = png_data_url(1);
+        let input = input_with_text_and_images(
+            &format!("{IMAGE_SLOT} a{IMAGE_SLOT} here"),
+            vec![one.clone()],
+        );
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![format!("image:{one}"), "a here".to_string()]
+        );
+    }
+
+    #[test]
+    fn message_content_keeps_typed_markers_as_text() {
+        let one = png_data_url(1);
+        let input =
+            input_with_text_and_images(&format!("[Image #1] a {IMAGE_SLOT} b"), vec![one.clone()]);
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "[Image #1] a".to_string(),
+                format!("image:{one}"),
+                "b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn message_content_with_only_slots_has_no_text_parts() {
+        let one = png_data_url(1);
+        let input = input_with_text_and_images(&format!(" {IMAGE_SLOT} "), vec![one.clone()]);
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![format!("image:{one}")]
+        );
+    }
+
+    #[test]
+    fn message_content_without_images_drops_stray_slots() {
+        let input = input_with_text_and_images(&format!("a{IMAGE_SLOT}b"), vec![]);
+
+        assert!(matches!(input.message_content(), MessageContent::Text(text) if text == "ab"));
+    }
+
+    #[test]
+    fn preamble_and_retrieved_text_cannot_move_the_users_image() {
+        let one = png_data_url(1);
+        let mut input =
+            input_with_text_and_images(&format!("look {IMAGE_SLOT} here"), vec![one.clone()]);
+        input.set_request_preamble(format!("run said [Image #1] and {IMAGE_SLOT}"));
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "run said [Image #1] and\n\nlook".to_string(),
+                format!("image:{one}"),
+                "here".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn display_shows_each_slot_as_its_marker() {
+        let one = png_data_url(1);
+        let mut input =
+            input_with_text_and_images(&format!("see {IMAGE_SLOT} now"), vec![one.clone()]);
+        input.raw = (format!("see {IMAGE_SLOT} now"), vec!["/a.png".into()]);
+
+        assert_eq!(input.summary(), "see [Image #1] now");
+        assert_eq!(input.raw(), ".file /a.png -- see [Image #1] now");
+        assert_eq!(input.raw_without_image_slots(), ".file /a.png -- see  now");
+        assert!(
+            input.render().ends_with(" -- see [Image #1] now"),
+            "{}",
+            input.render()
+        );
+    }
+
+    #[test]
+    fn display_drops_slots_past_the_images() {
+        let one = png_data_url(1);
+        let text = format!("see {IMAGE_SLOT} and {IMAGE_SLOT} now");
+        let mut input = input_with_text_and_images(&text, vec![one.clone()]);
+        input.raw = (text, vec![]);
+
+        assert_eq!(input.summary(), "see [Image #1] and  now");
+        assert_eq!(input.raw(), "see [Image #1] and  now");
+        assert!(
+            input.render().ends_with(" -- see [Image #1] and  now"),
+            "{}",
+            input.render()
+        );
+    }
+
+    #[test]
+    fn image_only_text_has_nothing_to_search() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "", None).unwrap();
+        input.text = format!("{IMAGE_SLOT} {IMAGE_SLOT}");
+        assert!(!input.has_search_text());
+        input.text = format!("{IMAGE_SLOT} what is this?");
+        assert!(input.has_search_text());
+    }
+
+    #[test]
+    fn typed_image_slots_are_stripped_at_every_constructor() {
+        let ctx = create_test_ctx();
+        let typed = format!("a{IMAGE_SLOT}b");
+
+        let from_str = Input::from_str(&ctx, &typed, None).unwrap();
+        let attached = Input::attached_with_role(&ctx, &typed, Role::new("", ""), None).unwrap();
+        let detached = Input::detached_with_role(&ctx, &typed, Role::new("", ""));
+        let from_files = run_async(Input::from_files(&ctx, &typed, vec![], None)).unwrap();
+
+        for input in [from_str, attached, detached, from_files] {
+            assert_eq!(input.text(), "ab");
+            assert_eq!(input.raw(), "ab");
+        }
+    }
+
+    #[test]
+    fn set_text_strips_image_slots() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "before", None).unwrap();
+
+        input.set_text(format!("a{IMAGE_SLOT}b"));
+
+        assert_eq!(input.text(), "ab");
+    }
+
+    #[test]
+    fn only_the_image_route_constructor_keeps_slots() {
+        let ctx = create_test_ctx();
+        let text = format!("a{IMAGE_SLOT}b");
+
+        let input = run_async(Input::from_files_with_image_slots(
+            &ctx,
+            &text,
+            vec![],
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(input.text(), text);
+    }
+
+    #[test]
+    fn a_lone_typed_slot_is_empty_input() {
+        let input = Input::from_str(&create_test_ctx(), &IMAGE_SLOT.to_string(), None).unwrap();
+
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn file_images_still_follow_the_text() {
+        let dir = env::temp_dir().join(format!(
+            "coyote-input-test-file-image-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let shot = dir.join("a.png");
+        image::DynamicImage::new_rgba8(2, 2)
+            .save_with_format(&shot, image::ImageFormat::Png)
+            .unwrap();
+        let ctx = create_test_ctx();
+
+        let input = run_async(Input::from_files(
+            &ctx,
+            "hi",
+            vec![shot.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap();
+
+        let parts = part_list(input.message_content());
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "hi");
+        assert!(parts[1].starts_with("image:data:image/png"), "{parts:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn guard_images_allows_text_only_on_non_vision_model() {
         input_with_images(false, vec![]).guard_images().unwrap();
@@ -2022,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_outgoing_images_keeps_the_newest_twenty() {
+    fn limit_outgoing_images_drops_the_oldest_ten_of_twenty_five() {
         let mut messages = vec![
             user_images(3, 8),
             tool_message(tool_images("b", &[4], 8)),
@@ -2039,45 +2413,136 @@ mod tests {
             last_text_part(&messages[0]),
             format!("[3 image(s) omitted: {OVER_BUDGET_NOTE}]")
         );
-        let partial = &tool_results(&messages[1])[0];
-        let kept: Vec<_> = partial
-            .attachments
-            .iter()
-            .map(|a| a.source.as_str())
-            .collect();
-        assert_eq!(kept, ["b-0-2", "b-0-3"]);
+        let emptied = &tool_results(&messages[1])[0];
+        assert!(emptied.attachments.is_empty());
         assert_eq!(
-            partial.output,
+            emptied.output,
             json!({
                 "result": "read",
-                "images_omitted": format!("2 image(s) from this tool were omitted: {OVER_BUDGET_NOTE}"),
+                "images_omitted": format!("4 image(s) from this tool were omitted: {OVER_BUDGET_NOTE}"),
             })
         );
-        assert_eq!(as_json(&messages[2..]), as_json(&stored[2..]));
+        assert_eq!(image_count(&messages[2]), 5);
         assert_eq!(
-            messages.iter().map(image_count).sum::<usize>(),
-            MAX_REQUEST_IMAGES
+            last_text_part(&messages[2]),
+            format!("[3 image(s) omitted: {OVER_BUDGET_NOTE}]")
+        );
+        assert_eq!(as_json(&messages[3..]), as_json(&stored[3..]));
+        assert_eq!(messages.iter().map(image_count).sum::<usize>(), 15);
+    }
+
+    /// `n` user turns carrying one image each, then a text-only current turn.
+    fn image_turns(n: usize, base64_len: usize) -> Vec<Message> {
+        let mut messages: Vec<_> = (0..n)
+            .map(|i| {
+                Message::new(
+                    MessageRole::User,
+                    MessageContent::Array(vec![
+                        MessageContentPart::Text {
+                            text: format!("turn {i}"),
+                        },
+                        image_part(base64_len),
+                    ]),
+                )
+            })
+            .collect();
+        messages.push(text_message("and now?"));
+        messages
+    }
+
+    fn dropped_turns(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .take_while(|message| {
+                matches!(&message.content, MessageContent::Array(_)) && image_count(message) == 0
+            })
+            .count()
+    }
+
+    #[test]
+    fn limit_outgoing_images_drops_the_oldest_in_blocks_of_ten() {
+        for (n, expected_dropped) in [(20, 0), (21, 10), (25, 10), (30, 10), (31, 20)] {
+            let mut messages = image_turns(n, 8);
+
+            limit_outgoing_images(&mut messages, &model_with_vision(true), Some(n));
+
+            assert_eq!(dropped_turns(&messages), expected_dropped, "n = {n}");
+            assert_eq!(
+                messages.iter().map(image_count).sum::<usize>(),
+                n - expected_dropped,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_outgoing_images_keeps_the_prefix_stable_as_images_are_added() {
+        let mut fewer = image_turns(21, 8);
+        let mut more = image_turns(22, 8);
+
+        limit_outgoing_images(&mut fewer, &model_with_vision(true), Some(21));
+        limit_outgoing_images(&mut more, &model_with_vision(true), Some(22));
+
+        assert_eq!(image_count(&fewer[10]), 1);
+        assert_eq!(
+            serde_json::to_string(&fewer[..11]).unwrap(),
+            serde_json::to_string(&more[..11]).unwrap()
         );
     }
 
     #[test]
-    fn limit_outgoing_images_drops_the_oldest_image_over_the_byte_budget() {
-        let eight_mb = 8 * 1024 * 1024;
+    fn limit_outgoing_images_drops_the_oldest_in_byte_blocks() {
+        let two_mb = 2 * 1024 * 1024;
+        for (n, expected_dropped) in [(10, 0), (11, 5), (15, 5), (16, 10)] {
+            let mut messages = image_turns(n, two_mb);
+
+            limit_outgoing_images(&mut messages, &model_with_vision(true), Some(n));
+
+            assert_eq!(dropped_turns(&messages), expected_dropped, "n = {n}");
+            assert_eq!(
+                messages.iter().map(image_count).sum::<usize>(),
+                n - expected_dropped,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_outgoing_images_counts_interleaved_parts_in_order() {
+        let interleaved = Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![
+                image_part(8),
+                MessageContentPart::Text {
+                    text: "between".into(),
+                },
+                image_part(8),
+                image_part(8),
+            ]),
+        );
         let mut messages = vec![
-            user_images(1, eight_mb),
-            tool_message(tool_images("b", &[1, 1], eight_mb)),
+            user_images(9, 8),
+            interleaved,
+            user_images(9, 8),
             text_message("and now?"),
         ];
-        let stored = messages.clone();
 
-        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(2));
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(3));
 
         assert_eq!(image_count(&messages[0]), 0);
-        assert_eq!(
-            last_text_part(&messages[0]),
-            format!("[1 image(s) omitted: {OVER_BUDGET_NOTE}]")
-        );
-        assert_eq!(as_json(&messages[1..]), as_json(&stored[1..]));
+        let MessageContent::Array(parts) = &messages[1].content else {
+            panic!("{:?}", messages[1].content);
+        };
+        let shape: Vec<_> = parts
+            .iter()
+            .map(|part| match part {
+                MessageContentPart::Text { text } => text.as_str(),
+                MessageContentPart::ImageUrl { .. } => "image",
+            })
+            .collect();
+        let note = format!("[1 image(s) omitted: {OVER_BUDGET_NOTE}]");
+        assert_eq!(shape, ["between", "image", "image", note.as_str()]);
+        assert_eq!(image_count(&messages[2]), 9);
     }
 
     #[test]
@@ -2138,6 +2603,18 @@ mod tests {
 
         assert_eq!(image_count(&messages[0]), 0);
         assert_eq!(image_count(&messages[1]), MAX_REQUEST_IMAGES);
+    }
+
+    #[test]
+    fn limit_outgoing_images_keeps_the_current_message_images_when_history_overflows() {
+        let mut messages = image_turns(25, 8);
+        messages.pop();
+        messages.push(user_images(5, 8));
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(25));
+
+        assert_eq!(dropped_turns(&messages), 10);
+        assert_eq!(image_count(&messages[25]), 5);
     }
 
     #[test]

@@ -42,7 +42,7 @@ sync_models_ttl_hours: 24        # Hours before the synced model catalog is cons
 #   total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens (session cumulative)
 #   last_cost, total_cost (USD, formatted like 0.0142; set only when nonzero and every billed token type has a price)
 # Image variable (REPL only):
-#   images (number of pending pasted images)
+#   images (number of images queued for the next message)
 left_prompt:
   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.yellow}{?images  [{images} img]}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:

@@ -942,10 +942,7 @@ impl Rag {
         let text = if embeddings.is_empty() {
             text.to_string()
         } else {
-            rag_template
-                .replace("__CONTEXT__", &embeddings)
-                .replace("__SOURCES__", &sources)
-                .replace("__INPUT__", text)
+            fill_rag_template(rag_template, &embeddings, &sources, text)
         };
         self.set_last_sources(&ids);
         Ok(text)
@@ -1241,6 +1238,7 @@ impl Rag {
         top_k: usize,
         rerank_model: Option<&str>,
     ) -> Result<Vec<(DocumentId, String)>> {
+        let query = &search_query(query);
         let keyword_leg = async {
             if self.provider.has_native_keyword_search() {
                 self.provider
@@ -2233,6 +2231,36 @@ fn merge_vector_results(mut results: Vec<(DocumentId, f32)>) -> Vec<(DocumentId,
         .into_iter()
         .filter(|(id, _)| seen.insert(*id))
         .collect()
+}
+
+/// The text a search runs on: the typed words without their image positions.
+fn search_query(text: &str) -> String {
+    strip_image_slots(text)
+}
+
+/// Retrieved documents and the template lose any `IMAGE_SLOT`, so only the
+/// user's own text can place an image. The template is filled in one pass,
+/// so a placeholder inside a retrieved document stays literal text.
+fn fill_rag_template(template: &str, context: &str, sources: &str, input: &str) -> String {
+    let fills = [
+        ("__CONTEXT__", strip_image_slots(context)),
+        ("__SOURCES__", strip_image_slots(sources)),
+        ("__INPUT__", input.to_string()),
+    ];
+    let template = strip_image_slots(template);
+    let mut filled = String::with_capacity(template.len());
+    let mut rest = template.as_str();
+    while let Some((at, placeholder, value)) = fills
+        .iter()
+        .filter_map(|(placeholder, value)| Some((rest.find(placeholder)?, placeholder, value)))
+        .min_by_key(|(at, ..)| *at)
+    {
+        filled.push_str(&rest[..at]);
+        filled.push_str(value);
+        rest = &rest[at + placeholder.len()..];
+    }
+    filled.push_str(rest);
+    filled
 }
 
 fn reciprocal_rank_fusion(
@@ -4045,6 +4073,26 @@ mod tests {
         assert!(RAG_TEMPLATE.contains("__CONTEXT__"));
         assert!(RAG_TEMPLATE.contains("__SOURCES__"));
         assert!(RAG_TEMPLATE.contains("__INPUT__"));
+    }
+
+    #[test]
+    fn retrieved_context_cannot_place_an_image() {
+        let context = format!("doc __INPUT__ text says [Image #1] and {IMAGE_SLOT} here");
+        let input = format!("look {IMAGE_SLOT} now");
+
+        let filled = fill_rag_template(RAG_TEMPLATE, &context, "src", &input);
+
+        assert_eq!(filled.matches(IMAGE_SLOT).count(), 1);
+        let context_at = filled
+            .find("doc __INPUT__ text says [Image #1] and  here")
+            .unwrap();
+        assert!(filled.find(IMAGE_SLOT).unwrap() > context_at);
+        assert!(filled.contains(&input));
+    }
+
+    #[test]
+    fn search_query_drops_the_image_slots() {
+        assert_eq!(search_query(&format!("foo{IMAGE_SLOT}bar")), "foobar");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use super::{
 };
 use crate::config::paths;
 use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
-use crate::utils::AbortSignal;
+use crate::utils::{AbortSignal, render_image_slots, strip_image_slots};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use log::info;
@@ -36,10 +36,11 @@ pub async fn run_active_agent_graph(
     input: &Input,
     abort_signal: AbortSignal,
 ) -> Result<ChildGraphRun> {
+    let (seed_prompt, record_prompt) = graph_prompts(input);
     run_seeded_graph(
         ctx,
-        &input.text(),
-        input.bare_text(),
+        &seed_prompt,
+        &record_prompt,
         false,
         input.session(&ctx.session).is_some(),
         abort_signal,
@@ -124,6 +125,18 @@ async fn run_seeded_graph(
     Ok(ChildGraphRun { result, last_run })
 }
 
+/// The prompts a graph run takes from `input`: the seed for
+/// `initial_prompt` (its patched text) and the record (its bare typed
+/// text). Graph state holds text only, so each image position shows as its
+/// `[Image #k]` marker.
+fn graph_prompts(input: &Input) -> (String, String) {
+    let images = input.medias().len();
+    (
+        render_image_slots(&input.text(), images),
+        render_image_slots(input.bare_text(), images),
+    )
+}
+
 /// The record a finished run leaves behind, or `None` when there is
 /// nothing to store it on. A child always records: its caller seats it on
 /// its own session. A REPL turn or a one-shot run records only when its
@@ -138,8 +151,14 @@ pub fn last_run_for(
     child: bool,
     has_session: bool,
 ) -> Option<LastRun> {
-    (child || (has_session && (expose.is_some() || !carry.is_empty())))
-        .then(|| LastRun::capture(result, prompt, expose.unwrap_or(&[]), carry))
+    (child || (has_session && (expose.is_some() || !carry.is_empty()))).then(|| {
+        LastRun::capture(
+            result,
+            &strip_image_slots(prompt),
+            expose.unwrap_or(&[]),
+            carry,
+        )
+    })
 }
 
 pub enum GraphTurn {
@@ -176,6 +195,7 @@ pub async fn run_graph_turn(
         .load_from_file(&graph_path)
         .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
 
+    let (seed_prompt, record_prompt) = graph_prompts(input);
     let block = match (&graph.session, ctx.session.is_some()) {
         (Some(block), true) => block.clone(),
         (block, _) => {
@@ -190,7 +210,7 @@ pub async fn run_graph_turn(
             let carried = carried_for(ctx, &graph.carry);
             seed_initial_state(
                 &mut graph.initial_state,
-                &input.text(),
+                &seed_prompt,
                 None,
                 &previous_turns,
                 &carried,
@@ -202,7 +222,7 @@ pub async fn run_graph_turn(
                 expose.as_deref(),
                 &carry,
                 &result,
-                input.bare_text(),
+                &record_prompt,
                 false,
                 input.session(&ctx.session).is_some(),
             );
@@ -214,7 +234,7 @@ pub async fn run_graph_turn(
     };
     let branch = match forced {
         Some(branch) => branch,
-        None => route::classify(ctx, &graph, &block, input.bare_text(), &abort, runner).await?,
+        None => route::classify(ctx, &graph, &block, &record_prompt, &abort, runner).await?,
     };
     ctx.set_last_graph_branch(branch, forced.is_some());
     println!("{}", route::routing_line(branch));
@@ -224,7 +244,7 @@ pub async fn run_graph_turn(
             let carried = carried_for(ctx, &graph.carry);
             seed_initial_state(
                 &mut graph.initial_state,
-                &input.text(),
+                &seed_prompt,
                 None,
                 &previous_turns,
                 &carried,
@@ -235,7 +255,7 @@ pub async fn run_graph_turn(
                 Some(&block.expose),
                 &carry,
                 &result,
-                input.bare_text(),
+                &record_prompt,
                 false,
                 input.session(&ctx.session).is_some(),
             );
@@ -398,7 +418,7 @@ pub fn carried_for(ctx: &RequestContext, carry: &[String]) -> IndexMap<String, V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{Model, ModelData};
+    use crate::client::{MessageContent, MessageContentPart, Model, ModelData};
     use crate::config::{AppState, LastMessage, Role, RoleLike, WorkingMode};
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
@@ -1180,6 +1200,160 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().last_run().is_none());
     }
 
+    /// An input from the REPL image route, its one image placed mid-text.
+    async fn input_with_an_image_slot(ctx: &RequestContext, agent: &str) -> Input {
+        let image = paths::agent_data_dir(agent).join("shot.png");
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
+        Input::from_files_with_image_slots(
+            ctx,
+            &format!("see {} now", crate::utils::IMAGE_SLOT),
+            vec![image.to_string_lossy().to_string()],
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_shows_image_slots_as_markers() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot_slot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "see [Image #1] now");
+        assert_eq!(run.last_run.unwrap().prompt, "see [Image #1] now");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_shows_image_slots_as_markers() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("turn_slot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let mut route_prompts: Vec<String> = Vec::new();
+        let mut runner = completion_runner(|input, _ctx, _abort| {
+            route_prompts.push(input.text());
+            boxed_completion(async { Ok((r#"{"decision":"run"}"#.to_string(), vec![])) })
+        });
+        let turn = run_graph_turn(&mut ctx, &input, create_abort_signal(), None, &mut runner)
+            .await
+            .unwrap();
+
+        assert!(
+            !route_prompts[0].contains(crate::utils::IMAGE_SLOT),
+            "{}",
+            route_prompts[0]
+        );
+        assert!(
+            route_prompts[0].contains("see [Image #1] now"),
+            "{}",
+            route_prompts[0]
+        );
+        let GraphTurn::Run { output, last_run } = turn else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "see [Image #1] now");
+        assert_eq!(last_run.unwrap().prompt, "see [Image #1] now");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_without_a_session_shows_image_slots_as_markers() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("turn_slot_no_session");
+        write_graph_agent(&name, "");
+        let mut ctx = ctx_with_agent(&name).await;
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+
+        assert!(roles.is_empty());
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "see [Image #1] now");
+    }
+
+    fn assert_the_image_sits_between_the_words(attached: &Input) {
+        let MessageContent::Array(parts) = attached.message_content() else {
+            panic!("expected parts");
+        };
+        let shape: Vec<String> = parts
+            .iter()
+            .map(|part| match part {
+                MessageContentPart::Text { text } => format!("text:{text}"),
+                MessageContentPart::ImageUrl { .. } => "image".to_string(),
+            })
+            .collect();
+        assert_eq!(shape, ["text:see", "image", "text:now"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_chat_branch_keeps_the_image_positions() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("chat_slot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+        let GraphTurn::Chat(attached) = turn.unwrap() else {
+            panic!("expected a chat");
+        };
+        assert_the_image_sits_between_the_words(&attached);
+        assert_eq!(attached.render(), input.render());
+        assert_eq!(attached.raw(), input.raw());
+        assert_eq!(attached.summary(), input.summary());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_delegated_chat_keeps_the_image_positions() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("delegating_slot");
+        let chat_agent = unique("chat_agent_slot");
+        let chat_agent_dir = paths::agent_data_dir(&chat_agent);
+        create_dir_all(&chat_agent_dir).unwrap();
+        write(
+            chat_agent_dir.join("config.yaml"),
+            format!("name: {chat_agent}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        write_graph_agent(
+            &name,
+            &format!("session:\n  chat:\n    agent: {chat_agent}\n"),
+        );
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+        ctx.leave_delegate_turn();
+
+        let GraphTurn::Chat(attached) = turn.unwrap() else {
+            panic!("expected a chat");
+        };
+        assert_the_image_sits_between_the_words(&attached);
+        assert_eq!(attached.render(), input.render());
+    }
+
     /// Without an engaged session a one-shot run has nowhere to be
     /// recorded, block graph or not.
     #[tokio::test]
@@ -1780,6 +1954,16 @@ mod tests {
             assert!(run.exposed.is_empty());
             assert!(run.carried.is_empty());
         }
+    }
+
+    #[test]
+    fn last_run_for_records_no_image_slot() {
+        let result = run_that_said("x");
+        let prompt = format!("see [Image #1] {}", crate::utils::IMAGE_SLOT);
+
+        let run = last_run_for(None, &[], &result, &prompt, true, false).unwrap();
+
+        assert_eq!(run.prompt, "see [Image #1] ");
     }
 
     #[test]
