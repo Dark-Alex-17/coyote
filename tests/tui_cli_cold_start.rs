@@ -42,12 +42,13 @@ fn fresh_config_dir(scenario: &str) -> PathBuf {
 }
 
 /// A dry-run config that never asks to save a session, so every exit path
-/// is prompt-free. Paths land in single-quoted YAML scalars.
+/// is prompt-free.
 fn write_dry_run_config(dir: &Path) {
     write_config(dir, "save_session: false\n");
 }
 
 /// The same config with `extra` top-level YAML appended by the caller.
+/// Paths land in single-quoted YAML scalars.
 fn write_config(dir: &Path, extra: &str) {
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();

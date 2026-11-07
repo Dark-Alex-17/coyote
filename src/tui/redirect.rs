@@ -664,4 +664,36 @@ mod windows_tests {
         let captured = guard.finish();
         assert!(captured.contains("child-marker-x7x"), "{captured}");
     }
+
+    /// The process's std handles as `GetStdHandle` reports them.
+    fn std_handles() -> (isize, isize) {
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        // SAFETY: GetStdHandle takes no pointers and only reads process state.
+        unsafe {
+            (
+                GetStdHandle(STD_OUTPUT_HANDLE) as isize,
+                GetStdHandle(STD_ERROR_HANDLE) as isize,
+            )
+        }
+    }
+
+    /// Whichever way the guard ends, the std handles are the ones the
+    /// process had before `begin`; while it lives they are the pipe.
+    #[test]
+    #[serial]
+    fn the_std_handles_are_put_back_after_finish_and_after_drop() {
+        let before = std_handles();
+
+        let guard = FdRedirect::begin(|_| {}).unwrap();
+        assert_ne!(std_handles(), before);
+        guard.finish();
+        assert_eq!(std_handles(), before);
+
+        let guard = FdRedirect::begin(|_| {}).unwrap();
+        assert_ne!(std_handles(), before);
+        drop(guard);
+        assert_eq!(std_handles(), before);
+    }
 }

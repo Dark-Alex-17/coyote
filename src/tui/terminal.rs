@@ -855,7 +855,10 @@ impl Screen {
             #[cfg(unix)]
             PANIC_FD.swap(-1, Ordering::SeqCst);
             #[cfg(windows)]
-            CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
+            {
+                CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
+                SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+            }
             return Err(err.into());
         }
         Ok(Self {
@@ -950,7 +953,10 @@ impl Drop for Screen {
         #[cfg(unix)]
         PANIC_FD.swap(-1, Ordering::SeqCst);
         #[cfg(windows)]
-        CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
+        {
+            CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
+            SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        }
     }
 }
 
@@ -958,15 +964,40 @@ impl Drop for Screen {
 mod tests {
     use super::*;
     use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
-    use ratatui::layout::{Position, Rect, Size};
+    #[cfg(unix)]
+    use ratatui::layout::Rect;
+    use ratatui::layout::{Position, Size};
     use ratatui::widgets::Paragraph;
+    #[cfg(unix)]
     use ratatui::{TerminalOptions, Viewport};
     use serial_test::serial;
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
 
+    // crossterm decides once per process whether its commands emit escape
+    // bytes or call the console API, from `TERM` and whether enabling
+    // escape processing on stdout works; a runner without a console would
+    // fail the second check and route the alternate-screen command away
+    // from the pipe the tests below read. `TERM` set to anything but
+    // "dumb" settles it before the cache is filled.
+    //
+    // `unsafe` is ctor's required acknowledgment that this runs before
+    // main; the body is sound pre-main because no other thread exists.
+    #[cfg(windows)]
+    #[ctor::ctor(unsafe)]
+    fn force_ansi_terminal() {
+        if std::env::var_os("TERM").is_none() {
+            // SAFETY: no other thread exists before main, so nothing can be
+            // reading the environment concurrently.
+            unsafe { std::env::set_var("TERM", "xterm-256color") };
+        }
+    }
+
+    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 
+    #[cfg(unix)]
     impl Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
@@ -978,6 +1009,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl SharedBuf {
         fn take(&self) -> String {
             String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().unwrap())).into_owned()
@@ -986,6 +1018,7 @@ mod tests {
 
     /// A terminal writing into `buf`; the fixed viewport keeps ratatui
     /// from asking the (absent) terminal for its size.
+    #[cfg(unix)]
     fn buffer_terminal(buf: &SharedBuf) -> Terminal<ScreenBackend<SharedBuf>> {
         Terminal::with_options(
             RowTrackingBackend::new(CrosstermBackend::new(buf.clone())),
@@ -997,12 +1030,14 @@ mod tests {
     }
 
     /// A writer that fails its `n`th write and records the rest.
+    #[cfg(unix)]
     struct FailingWriter {
         out: Vec<u8>,
         writes: usize,
         fail_at: usize,
     }
 
+    #[cfg(unix)]
     impl Write for FailingWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.writes += 1;
@@ -1020,6 +1055,7 @@ mod tests {
 
     /// The enter steps that only write to the terminal: raw mode is left
     /// out because it would switch the test runner's own tty.
+    #[cfg(unix)]
     fn writing_enter_steps() -> Vec<TerminalStep> {
         enter_sequence(false)
             .into_iter()
@@ -1079,6 +1115,7 @@ mod tests {
     /// A step failing midway hands back what came on before it: the
     /// alternate screen entered by the first write is left again, the
     /// flag is down, and nothing is pushed.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn a_failing_enter_step_unwinds_the_steps_already_applied() {
@@ -1106,6 +1143,7 @@ mod tests {
     /// `leave` undoes an `enter` once: the full mirror on the first call
     /// (pop, then the modes, then the cursor shown inside the alternate
     /// screen before it is left), nothing on the second.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn leave_restores_once_and_is_silent_afterwards() {
@@ -1129,6 +1167,7 @@ mod tests {
     /// A frame drawn after something else restored the terminal first
     /// re-enters it and repaints from scratch; once back, drawing is just
     /// drawing.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn a_draw_after_a_foreign_leave_reenters_and_repaints_once() {
@@ -1149,6 +1188,7 @@ mod tests {
     /// The repaint helper never asks the terminal anything: a buffer that
     /// cannot answer a cursor-position query gets the clear and the next
     /// frame paints every cell, including the ones unchanged since before.
+    #[cfg(unix)]
     #[test]
     fn repaint_from_scratch_clears_and_repaints_every_cell_without_a_query() {
         let out = SharedBuf::default();
@@ -1175,6 +1215,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_frame_is_bracketed_by_a_synchronized_update() {
         let out = SharedBuf::default();
@@ -1532,5 +1573,41 @@ mod tests {
         assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
 
         CONSOLE_HANDLE.store(0, Ordering::SeqCst);
+    }
+
+    /// With nothing recorded the restore touches no console; once a
+    /// snapshot is taken it puts that mode back, extended flags included.
+    /// A runner without a console input buffer cannot take the snapshot,
+    /// so the second half is skipped there.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn the_input_mode_restore_is_a_no_op_until_a_snapshot_round_trips() {
+        use std::os::windows::io::AsRawHandle;
+
+        SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        restore_input_mode_from_static().unwrap();
+        assert_eq!(
+            SAVED_INPUT_MODE.load(Ordering::SeqCst),
+            NO_SAVED_INPUT_MODE,
+            "the sentinel survives a restore"
+        );
+
+        let Ok(input) = console::open_input() else {
+            eprintln!("skipping: no console input buffer");
+            return;
+        };
+        let before = console::mode(input.as_raw_handle()).unwrap();
+        let saved = snapshot_input_mode().expect("the open input buffer answers GetConsoleMode");
+        assert_eq!(saved, before);
+        assert_eq!(SAVED_INPUT_MODE.load(Ordering::SeqCst), u64::from(saved));
+
+        restore_input_mode_from_static().unwrap();
+        assert_eq!(
+            console::mode(input.as_raw_handle()).unwrap(),
+            restored_input_mode(saved)
+        );
+
+        SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
     }
 }
