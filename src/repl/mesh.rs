@@ -31,7 +31,7 @@ use crate::mesh::message::{
 use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
     Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
-    PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingState, access_not_a_question,
+    PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingRecord, PendingState, access_not_a_question,
     question_not_an_access_request,
 };
 use crate::mesh::shares::{
@@ -49,10 +49,10 @@ use crate::mesh::trust::{
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
     AddressName, AlreadyClosed, DialAdvice, DialFailure, FetchError, FetchReport,
-    HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED, InterfaceState, InterfaceStatus,
-    LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
-    MeshRuntime, NameTarget, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL,
-    PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
+    HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED, InstanceSession, InterfaceState,
+    InterfaceStatus, LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON,
+    MeshPaths, MeshRuntime, NameTarget, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER,
+    PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
     canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
     loopback_endpoint, owner_label, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
     short, span_text,
@@ -1128,11 +1128,11 @@ fn walk_staged(root: &Path, bound: usize) -> std::io::Result<StagedWalk> {
 /// Expired escalations are swept first, so their `[mesh:message]` lines are pushed
 /// once and no row that just expired renders.
 fn pending(ctx: &RequestContext) -> Result<()> {
-    live(ctx)?;
+    let runtime = live(ctx)?;
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
     let names = ctx.app.mesh.address_names();
-    let asked: Vec<QuestionRow> = ctx
+    let mut asked: Vec<QuestionRow> = ctx
         .app
         .mesh
         .correlations()
@@ -1140,7 +1140,7 @@ fn pending(ctx: &RequestContext) -> Result<()> {
         .iter()
         .map(|correlation| {
             QuestionRow::outbound(
-                correlation,
+                &correlation.record,
                 name_at(
                     ctx,
                     &names,
@@ -1150,6 +1150,19 @@ fn pending(ctx: &RequestContext) -> Result<()> {
             )
         })
         .collect();
+    asked.extend(
+        runtime
+            .other_sessions_asked(now)
+            .iter()
+            .map(|(ask, asker)| {
+                let record = &ask.record;
+                QuestionRow::other_session(
+                    record,
+                    name_at(ctx, &names, &record.peer_destination, &record.peer_identity),
+                    asker.as_ref(),
+                )
+            }),
+    );
     let inbound = match ctx.app.mesh.inbound_store() {
         Some(store) => store.list(now)?,
         None => Vec::new(),
@@ -1232,11 +1245,11 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 &correlation.record.peer_identity,
             );
             (
-                QuestionRow::outbound(&correlation, name),
+                QuestionRow::outbound(&correlation.record, name),
                 Answering::OwnQuestion(Box::new(correlation)),
             )
         }
-        _ => return Err(no_open_question(id)),
+        _ => return Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_question(id))),
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     out_path_text(
@@ -1670,7 +1683,7 @@ fn open_escalated_question(
         Some(record) if record.kind == InboundKind::Access => Err(access_not_a_question(id)),
         Some(record) => Ok(record),
         None if ctx.app.mesh.correlations().get(id).is_some() => Err(asked_by_this_node(id)),
-        None => Err(no_open_question(id)),
+        None => Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_question(id))),
     }
 }
 
@@ -7229,8 +7242,9 @@ mod name_addressing_tests {
 
 /// The full id of the entry `token` names among those `.mesh pending` lists: the
 /// unexpired questions and access requests peers sent, then the questions this node
-/// asked. A store that cannot be read contributes nothing rather than failing the verb,
-/// which reads it again itself.
+/// asked, then those the other sessions on this cache dir asked, which the verbs then
+/// refuse by name. A store that cannot be read contributes nothing rather than failing
+/// the verb, which reads it again itself.
 fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<String> {
     let inbound = ctx
         .app
@@ -7239,6 +7253,12 @@ fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<Stri
         .and_then(|store| store.list(now).ok())
         .unwrap_or_default();
     let outbound = ctx.app.mesh.correlations().list();
+    let others = ctx
+        .app
+        .mesh
+        .get()
+        .map(|runtime| runtime.other_sessions_asked(now))
+        .unwrap_or_default();
     resolve_pending_id(
         token,
         inbound
@@ -7249,8 +7269,25 @@ fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<Stri
                     .into_iter()
                     .map(|correlation| (correlation.record.id, None)),
             )
+            .chain(others.into_iter().map(|(ask, _)| (ask.record.id, None)))
             .collect(),
     )
+}
+
+/// The refusal for `id` when another session on this cache dir asked it, naming that
+/// session and the command to run there; `None` when none did.
+fn asked_elsewhere(ctx: &RequestContext, id: &str, now: SystemTime) -> Option<anyhow::Error> {
+    let runtime = ctx.app.mesh.get()?;
+    runtime
+        .other_sessions_asked(now)
+        .into_iter()
+        .find(|(ask, _)| ask.record.id == id)
+        .map(|(_, asker)| {
+            anyhow!(
+                "Question {id} was {}, not this session, and only the session that asked it can collect the reply or follow up: run `.mesh answer {id} \"<text>\"` in that session.",
+                asked_by(asker.as_ref())
+            )
+        })
 }
 
 fn change_text(change: TrustChange) -> &'static str {
@@ -8592,6 +8629,18 @@ fn own_session_name(session: &str) -> String {
     format!("(you: {session})")
 }
 
+/// Who asked a question another session on this cache dir is waiting on: the running
+/// session by name, an ended one marked gone, or no name once its registry row is gone.
+fn asked_by(asker: Option<&InstanceSession>) -> String {
+    match asker {
+        Some(InstanceSession::Running(session)) => {
+            format!("asked by {}", own_session_name(session))
+        }
+        Some(InstanceSession::Gone(session)) => format!("asked by (you, gone: {session})"),
+        None => "asked by another session".to_string(),
+    }
+}
+
 /// How `.mesh peers` and `.mesh pending` name a peer you labelled: the label, then the
 /// name the peer announces, if any, in parentheses.
 fn labelled_name(label: &str, display_name: Option<&str>) -> String {
@@ -9639,8 +9688,23 @@ struct QuestionRow {
 }
 
 impl QuestionRow {
-    fn outbound(correlation: &Correlation, name: String) -> Self {
-        let record = &correlation.record;
+    /// A question another session on this cache dir asked: its row reads as one this
+    /// node asked, with a line naming that session, since only it can collect the reply
+    /// or follow up.
+    fn other_session(
+        record: &PendingRecord,
+        name: String,
+        asker: Option<&InstanceSession>,
+    ) -> Self {
+        let mut row = Self::outbound(record, name);
+        row.extra.push((
+            "",
+            format!("{} . collect it from that session", asked_by(asker)),
+        ));
+        row
+    }
+
+    fn outbound(record: &PendingRecord, name: String) -> Self {
         let state = match record.state {
             PendingState::Open => "open",
             PendingState::Escalated => "escalated: the peer's human has been asked",
@@ -13842,7 +13906,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     }
 
     fn asked_row(id: &str, state: PendingState) -> QuestionRow {
-        QuestionRow::outbound(&correlation(id, state), "bob".to_string())
+        QuestionRow::outbound(&correlation(id, state).record, "bob".to_string())
     }
 
     fn escalated_row(id: &str, envoy_question: &str) -> QuestionRow {
@@ -18480,6 +18544,106 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
                         assert!(out.contains("(you: temp)"), "{out}");
                         assert!(!out.contains("Laptop"), "{out}");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        assert!(temp_slot.stop().await.unwrap());
+                        relay_handle.abort();
+                    });
+                }
+
+                /// `a`'s `.mesh pending` lists the questions every other session on the
+                /// cache dir asked under `Asked by this node`, each naming the session
+                /// that asked it (running, ended, or no longer in the registry) and
+                /// saying to collect it there; `.mesh answer` on one is refused with
+                /// the same name and the command to run in that session, and nothing
+                /// is sent or opened in `a`.
+                #[test]
+                #[serial]
+                fn other_sessions_asks_are_listed_by_session_and_only_their_session_answers() {
+                    use crate::mesh::pending::{
+                        PENDING_RECORD_VERSION, PendingRecord, PendingStore,
+                    };
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-other-session-asks");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let tmp = TempDir::new("repl-mesh-other-session-asks");
+                        let a = start_as("a", &tmp, addr.port()).await;
+                        let temp = start_as("temp", &tmp, addr.port()).await;
+                        let temp_slot = Arc::new(MeshSlot::default());
+                        temp_slot.install(temp.clone()).unwrap();
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(a.clone()).unwrap();
+                        let now = SystemTime::now();
+                        let peer = hex_lower(&[0x5e; 16]);
+                        let record = |id: &str| PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: id.to_string(),
+                            peer_destination: peer.clone(),
+                            peer_identity: hex_lower(&[0x6f; 16]),
+                            thread: id.to_string(),
+                            question: format!("Question {id}?"),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + Duration::from_secs(30)),
+                            state: PendingState::Open,
+                            reply: None,
+                        };
+                        temp_slot
+                            .correlations()
+                            .open(record("q-temp-0001"))
+                            .unwrap();
+                        let gone_id = hex_lower(&[0x0d; 16]);
+                        let lost_id = hex_lower(&[0x0e; 16]);
+                        for (instance_id, id) in
+                            [(&gone_id, "q-gone-0001"), (&lost_id, "q-lost-0001")]
+                        {
+                            PendingStore::new(a.cache_dir(), instance_id)
+                                .upsert(record(id), now)
+                                .unwrap();
+                        }
+                        let registry = a.cache_dir().join("mesh").join("instances.json");
+                        let mut file: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+                        let mut gone_row = file["instances"][a.current_instance_id()].clone();
+                        gone_row["session"] = serde_json::json!("old");
+                        gone_row["destination"] = serde_json::json!(hex_lower(&[0x0f; 16]));
+                        gone_row["process"]["pid"] = serde_json::json!(u32::MAX);
+                        file["instances"][gone_id.as_str()] = gone_row;
+                        std::fs::write(&registry, serde_json::to_vec(&file).unwrap()).unwrap();
+
+                        let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+
+                        assert!(out.contains("Asked by this node (3)"), "{out}");
+                        for line in [
+                            "asked by (you: temp) . collect it from that session",
+                            "asked by (you, gone: old) . collect it from that session",
+                            "asked by another session . collect it from that session",
+                        ] {
+                            assert!(out.contains(line), "no {line:?} in {out}");
+                        }
+                        for id in ["q-temp-0", "q-gone-0", "q-lost-0"] {
+                            assert!(out.contains(&format!(". id {id}")), "no {id} in {out}");
+                        }
+
+                        let refused = out_of(&mut ctx, ".mesh answer q-temp-0001 \"main\"")
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert_eq!(
+                            refused,
+                            "Question q-temp-0001 was asked by (you: temp), not this session, and only the session that asked it can collect the reply or follow up: run `.mesh answer q-temp-0001 \"<text>\"` in that session."
+                        );
+                        let by_prefix = out_of(&mut ctx, ".mesh answer q-lost-0 \"main\"")
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert!(
+                            by_prefix.starts_with("Question q-lost-0001 was asked by another session, not this session"),
+                            "{by_prefix}"
+                        );
+                        assert!(ctx.app.mesh.correlations().list().is_empty());
+                        assert!(temp_slot.correlations().is_open("q-temp-0001"));
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         assert!(temp_slot.stop().await.unwrap());

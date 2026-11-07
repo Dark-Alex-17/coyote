@@ -23,7 +23,7 @@ use crate::mesh::grants::GrantStore;
 use crate::mesh::identity::IdentityLock;
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::inbox::InboxStaging;
-use crate::mesh::instances::{self, InstanceRow};
+use crate::mesh::instances::{self, InstanceRow, InstanceSession};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
     KnockFallback, KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia,
@@ -43,8 +43,8 @@ use crate::mesh::peers::{
     PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
-    Correlations, InboundKind, InboundRecord, InboundStore, PendingRecord, PendingStore,
-    access_not_a_question,
+    Correlations, InboundKind, InboundRecord, InboundStore, OtherSessionAsk, PendingRecord,
+    PendingStore, access_not_a_question, other_sessions_asked,
 };
 use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
@@ -77,7 +77,7 @@ use crate::render::{QuotingError, error_notice};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use parking_lot::RwLock;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::request::RequestAllow;
@@ -719,10 +719,10 @@ pub(crate) struct MeshRuntime {
     /// re-points it at the fork's store on a re-key.
     envoy_memory: ArcSwapOption<EnvoySessions>,
     envoy_memory_config: EnvoyMemoryConfig,
-    /// The threads this instance has sent or received, which the tools accept as a
-    /// thread to continue. Bound to the instance the node currently serves, like the
-    /// grants: `rebind_sent_threads` re-points it at the fork's file on a re-key.
-    sent_threads: ArcSwap<SentThreads>,
+    /// The threads any session on this cache dir has sent or received, which the tools
+    /// accept as a thread to continue. One list per config dir, so a fork keeps it
+    /// across a re-key.
+    sent_threads: Arc<SentThreads>,
     memory: PeerMemory,
     /// Every configured interface with what it is doing, in config order.
     interface_states: RwLock<Vec<InterfaceStatus>>,
@@ -824,7 +824,7 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
-        let sent_threads = SentThreads::open(&paths.cache_dir, &instance_id)?;
+        let sent_threads = SentThreads::open(&paths.cache_dir)?;
         let envoy_memory =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
         if let Some(store) = &envoy_memory {
@@ -1013,7 +1013,7 @@ impl MeshRuntime {
             serving,
             envoy_memory: ArcSwapOption::new(envoy_memory),
             envoy_memory_config: config.envoy_memory.clone(),
-            sent_threads: ArcSwap::from_pointee(sent_threads),
+            sent_threads: Arc::new(sent_threads),
             memory: PeerMemory::default(),
             interface_states: RwLock::new(states),
             watched_interfaces: watched,
@@ -1117,6 +1117,23 @@ impl MeshRuntime {
         instances::live(&self.cache_dir)
             .into_iter()
             .map(|(destination, row)| (destination, row.session))
+            .collect()
+    }
+
+    /// The questions the other sessions on this cache dir asked and still wait on or
+    /// have yet to collect, newest first, each with what the instance registry says of
+    /// the session that asked it (`None` once its row is gone).
+    pub(crate) fn other_sessions_asked(
+        &self,
+        now: SystemTime,
+    ) -> Vec<(OtherSessionAsk, Option<InstanceSession>)> {
+        let sessions = instances::sessions_by_instance(&self.cache_dir);
+        other_sessions_asked(&self.cache_dir, &self.current_instance_id(), now)
+            .into_iter()
+            .map(|ask| {
+                let session = sessions.get(&ask.instance_id).cloned();
+                (ask, session)
+            })
             .collect()
     }
 
@@ -1230,20 +1247,7 @@ impl MeshRuntime {
     }
 
     pub(crate) fn sent_threads(&self) -> Arc<SentThreads> {
-        self.sent_threads.load_full()
-    }
-
-    /// Opens the sent-threads list of `instance_id` and records into it, handing back
-    /// the list it displaces so a re-key that fails can put it back. A fork starts from
-    /// its own file, so it continues only the threads it sends or receives itself.
-    pub(crate) fn rebind_sent_threads(&self, instance_id: &str) -> Result<Arc<SentThreads>> {
-        let threads = SentThreads::open(&self.cache_dir, instance_id)?;
-        Ok(self.sent_threads.swap(Arc::new(threads)))
-    }
-
-    /// Records into `threads` again: the infallible half of `rebind_sent_threads`.
-    pub(crate) fn restore_sent_threads(&self, threads: Arc<SentThreads>) {
-        self.sent_threads.store(threads);
+        Arc::clone(&self.sent_threads)
     }
 
     /// The share root's serving state: the local size limit, the grant store and the
@@ -4089,19 +4093,19 @@ impl MeshSlot {
     }
 
     /// Re-keys the running node for a forked session and binds the pending questions,
-    /// the grants, the sent-threads list and the envoy's memory to the fork's own files,
-    /// since a fork asks its own questions, answers its own access requests and
-    /// remembers its own peer threads, and must not collect, hand out or read the
-    /// original's; a no-op while the mesh is off. The fork's files are adopted before
-    /// the node re-keys so a reply or fetch the fork's destination serves at once finds
-    /// them, and a re-key that fails puts the original's back, since the original is
-    /// what stays served.
+    /// the grants and the envoy's memory to the fork's own files, since a fork asks its
+    /// own questions, answers its own access requests and remembers its own peer
+    /// threads, and must not collect, hand out or read the original's; a no-op while the
+    /// mesh is off. The sent-threads list is one per config dir and is left as it is, so
+    /// the fork may continue every thread the original could. The fork's files are
+    /// adopted before the node re-keys so a reply or fetch the fork's destination serves
+    /// at once finds them, and a re-key that fails puts the original's back, since the
+    /// original is what stays served.
     /// Questions peers escalated before the fork are copied into the fork's inbound file
     /// so `.mesh answer` still finds them after the switch. A fork pending file this
     /// Coyote cannot read is logged and the fork starts with no questions pending, as
     /// `install` does: the node must not be reported as failed for a cache file. A fork
-    /// grants or sent-threads file that cannot be opened refuses the re-key, as it would
-    /// refuse `start`.
+    /// grants file that cannot be opened refuses the re-key, as it would refuse `start`.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let Some(runtime) = self.get() else {
             return Ok(());
@@ -4143,25 +4147,11 @@ impl MeshSlot {
             .context(
                 "The fork's grant store could not be opened, so the node still serves the original instance",
             );
-        let rebound = grants_rebound.and_then(|displaced_grants| {
-            match runtime.rebind_sent_threads(&rekey.fork_instance_id) {
-                Ok(displaced_threads) => Ok((displaced_grants, displaced_threads)),
-                Err(err) => {
-                    runtime.serving().restore_grants(displaced_grants);
-                    Err(err.context(
-                        "The fork's sent-threads list could not be opened, so the node still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again.",
-                    ))
-                }
-            }
-        });
-        let (rekeyed, displaced) = match rebound {
-            Ok((displaced_grants, displaced_threads)) => {
+        let (rekeyed, displaced) = match grants_rebound {
+            Ok(displaced_grants) => {
                 let displaced_envoy_memory = runtime.rebind_envoy_memory(&rekey.fork_instance_id);
                 let rekeyed = runtime.rekey(rekey).await;
-                (
-                    rekeyed,
-                    Some((displaced_grants, displaced_threads, displaced_envoy_memory)),
-                )
+                (rekeyed, Some((displaced_grants, displaced_envoy_memory)))
             }
             Err(err) => (Err(err), None),
         };
@@ -4175,9 +4165,8 @@ impl MeshSlot {
                 &instance_id,
             )));
             // The original's stores were never closed, so putting them back cannot fail.
-            if let Some((original_grants, original_threads, original_envoy_memory)) = displaced {
+            if let Some((original_grants, original_envoy_memory)) = displaced {
                 runtime.serving().restore_grants(original_grants);
-                runtime.restore_sent_threads(original_threads);
                 runtime.restore_envoy_memory(original_envoy_memory);
             }
         }
@@ -4530,33 +4519,33 @@ impl MeshSlot {
         self.inbound.lock().clone()
     }
 
-    /// The threads the running instance has sent or received; `None` while the mesh is
-    /// off.
+    /// The threads any session on this cache dir has sent or received; `None` while the
+    /// mesh is off.
     pub(crate) fn sent_threads(&self) -> Option<Arc<SentThreads>> {
         self.get().map(|runtime| runtime.sent_threads())
     }
 
-    /// Records `thread` as one this instance sent or opened, so the tools accept it as a
-    /// thread to continue.
+    /// Records `thread` as one this identity sent or opened, so the tools of every
+    /// session on this cache dir accept it as a thread to continue.
     pub(crate) fn remember_sent_thread(&self, thread: &str) {
         self.remember_thread(|store| store.record_sent(thread));
     }
 
-    /// Records `thread` as one a peer sent, so the tools accept it as a thread to
-    /// continue.
+    /// Records `thread` as one a peer sent, so the tools of every session on this cache
+    /// dir accept it as a thread to continue.
     pub(crate) fn remember_received_thread(&self, thread: &str) {
         self.remember_thread(|store| store.record_received(thread));
     }
 
     /// A failed write is only logged: the send or delivery it follows has already
-    /// happened, and the list in memory still holds the thread.
+    /// happened.
     fn remember_thread(&self, record: impl FnOnce(&SentThreads) -> Result<()>) {
         let Some(store) = self.sent_threads() else {
             return;
         };
         if let Err(err) = record(&store) {
             warn!(
-                "Mesh sent-threads list could not be written, so the thread just sent or received can be continued only until the node stops. Check the permissions and free space of the mesh cache directory; the error says which file: {}",
+                "Mesh sent-threads list could not be written, so mesh__send and mesh__ask will refuse the thread just sent or received as one to continue; omit thread to start a new conversation instead. Check the permissions and free space of the mesh cache directory; the error says which file: {}",
                 redact_hashes(&format!("{err:#}"))
             );
         }
@@ -19884,127 +19873,34 @@ mod tests {
         started.relay_handle.abort();
     }
 
-    /// A fork sent-threads list at a version this build does not write refuses the
-    /// re-key: the error says the node stays the original and what to do, the original's
-    /// grants are served again and the original's list still answers the tools.
+    /// A re-key leaves the sent-threads list alone: it is one per config dir, so the
+    /// fork continues the original's threads and what the fork sends is in the same file.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_newer_fork_sent_threads_file_refuses_the_rekey_and_keeps_the_original() {
-        use crate::mesh::shares::PeerRef;
-
-        let started = started_runtime("node-rekey-sent-threads-newer").await;
-        let cache_dir = started.runtime.cache_dir().to_path_buf();
-        let original_id = started.runtime.current_instance_id();
-        let fork_id = fresh_instance_id();
-        let slot = Arc::new(MeshSlot::default());
-        slot.install(started.runtime.clone()).unwrap();
-        slot.remember_sent_thread("m-original");
-        let original_path = slot.sent_threads().unwrap().path().to_path_buf();
-        let now = SystemTime::now();
-        let peer_destination = hex_lower(&[0x3f; 16]);
-        let peer = PeerRef {
-            identity: "ignored-by-grants",
-            destination: &peer_destination,
-        };
-        GrantStore::new(&cache_dir, &original_id)
-            .grant(
-                "0123456789abcdef",
-                &peer_destination,
-                &["docs/original.md".into()],
-                None,
-                now,
-            )
-            .unwrap();
-        let fork_path = SentThreads::open(&cache_dir, &fork_id)
-            .unwrap()
-            .path()
-            .to_path_buf();
-        let newer = br#"{"version": 2, "sent": ["m-fork"], "received": []}"#;
-        std::fs::create_dir_all(fork_path.parent().unwrap()).unwrap();
-        std::fs::write(&fork_path, newer).unwrap();
-
-        let err = slot
-            .rekey(ForkRekey {
-                original_instance_id: Some(original_id.clone()),
-                fork_instance_id: fork_id.clone(),
-            })
-            .await
-            .unwrap_err();
-        let chain = format!("{err:#}");
-
-        assert!(
-            chain.contains(
-                "The fork's sent-threads list could not be opened, so the node still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again."
-            ),
-            "{chain}"
-        );
-        assert!(chain.contains(&fork_path.display().to_string()), "{chain}");
-        assert_eq!(started.runtime.current_instance_id(), original_id);
-        assert!(
-            started
-                .runtime
-                .serving()
-                .grants()
-                .is_granted(&peer, "docs/original.md", now)
-                .unwrap(),
-            "the original's grants are served again"
-        );
-        let threads = slot.sent_threads().unwrap();
-        assert_eq!(threads.path(), original_path);
-        assert!(threads.contains("m-original"));
-        assert!(!threads.contains("m-fork"));
-        assert_eq!(
-            std::fs::read(&fork_path).unwrap(),
-            newer,
-            "the refused file is left as it was"
-        );
-        assert!(slot.stop().await.unwrap());
-        started.relay_handle.abort();
-    }
-
-    /// After a re-key the tools read the fork's own sent-threads list: a thread in the
-    /// fork's file is known, one the original sent is not, and a new send records into
-    /// the fork's file.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rekey_rebinds_the_sent_threads_list_to_the_fork_instance() {
+    async fn a_fork_shares_the_sent_threads_list_across_the_rekey() {
         let started = started_runtime("node-rekey-sent-threads").await;
         let cache_dir = started.runtime.cache_dir().to_path_buf();
         let original_id = started.runtime.current_instance_id();
-        let fork_id = fresh_instance_id();
         let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
         slot.remember_sent_thread("m-original");
-        let fork_path = SentThreads::open(&cache_dir, &fork_id)
-            .unwrap()
-            .path()
-            .to_path_buf();
-        std::fs::create_dir_all(fork_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &fork_path,
-            br#"{"version": 1, "sent": ["m-fork"], "received": ["t-fork"]}"#,
-        )
-        .unwrap();
+        let path = slot.sent_threads().unwrap().path().to_path_buf();
 
         slot.rekey(ForkRekey {
-            original_instance_id: Some(original_id.clone()),
-            fork_instance_id: fork_id.clone(),
+            original_instance_id: Some(original_id),
+            fork_instance_id: fresh_instance_id(),
         })
         .await
         .unwrap();
 
         let threads = slot.sent_threads().unwrap();
-        assert_eq!(threads.path(), fork_path);
-        assert!(threads.contains("m-fork"));
-        assert!(threads.contains("t-fork"));
-        assert!(
-            !threads.contains("m-original"),
-            "a fork continues only its own threads"
-        );
-        slot.remember_sent_thread("m-new");
+        assert_eq!(threads.path(), path);
+        assert_eq!(path, cache_dir.join("mesh").join("sent-threads.json"));
+        assert!(threads.contains("m-original"));
+        slot.remember_sent_thread("m-fork");
         let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fork_path).unwrap()).unwrap();
-        assert_eq!(written["sent"], serde_json::json!(["m-fork", "m-new"]));
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["sent"], serde_json::json!(["m-original", "m-fork"]));
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

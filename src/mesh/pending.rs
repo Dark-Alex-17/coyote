@@ -134,7 +134,6 @@ impl PendingStore {
     }
 
     /// Newest first, with expired questions left out; the file is not touched.
-    #[cfg(test)]
     pub(crate) fn list(&self, now: SystemTime) -> Result<Vec<PendingRecord>> {
         let mut records = self.read_all()?;
         records.retain(|record| !is_expired(record, now));
@@ -261,6 +260,67 @@ impl PendingStore {
     fn write_all(&self, records: &[PendingRecord]) -> Result<()> {
         write_jsonl(&self.path, records, PENDING_NAMES)
     }
+}
+
+/// A question another session on this cache dir asked, with the instance it asked from.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OtherSessionAsk {
+    pub instance_id: String,
+    pub record: PendingRecord,
+}
+
+/// The questions every session on `cache_dir` other than `own_instance_id` asked and
+/// still has something to do with (awaiting a reply, or answered with the reply waiting
+/// to be collected), newest first. Each `pending-<instance_id>.jsonl` is read as it
+/// stands and never written: only the session that asked collects or prunes its own.
+/// A store that cannot be read contributes nothing; its own session reports it.
+pub(crate) fn other_sessions_asked(
+    cache_dir: &Path,
+    own_instance_id: &str,
+    now: SystemTime,
+) -> Vec<OtherSessionAsk> {
+    let Ok(entries) = fs::read_dir(mesh_cache_dir(cache_dir)) else {
+        return Vec::new();
+    };
+    let mut asks: Vec<OtherSessionAsk> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(instance_id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("pending-"))
+            .and_then(|rest| rest.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        if instance_id == own_instance_id || instance_id.is_empty() {
+            continue;
+        }
+        match PendingStore::new(cache_dir, instance_id).list(now) {
+            Ok(records) => asks.extend(
+                records
+                    .into_iter()
+                    .filter(|record| {
+                        record.state != PendingState::Answered || record.reply.is_some()
+                    })
+                    .map(|record| OtherSessionAsk {
+                        instance_id: instance_id.to_string(),
+                        record,
+                    }),
+            ),
+            Err(err) => log::debug!(
+                "Questions asked from instance {} are left out of `.mesh pending`: {}",
+                short(instance_id),
+                redact_hashes(&format!("{err:#}"))
+            ),
+        }
+    }
+    asks.sort_by(|a, b| {
+        b.record
+            .sent_at
+            .cmp(&a.record.sent_at)
+            .then_with(|| a.record.id.cmp(&b.record.id))
+    });
+    asks
 }
 
 fn is_expired(record: &PendingRecord, now: SystemTime) -> bool {

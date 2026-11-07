@@ -99,6 +99,36 @@ pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {
     }
 }
 
+/// What the registry says of the session that runs, or ran, an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstanceSession {
+    /// Its process is still running, under this session name.
+    Running(String),
+    /// Its row is still filed but its process has gone.
+    Gone(String),
+}
+
+/// Every row the registry holds, live or not yet dropped, by instance id, each with
+/// whether its process still runs. A registry that cannot be read names none; `live`
+/// warns about it.
+pub(crate) fn sessions_by_instance(cache_dir: &Path) -> HashMap<String, InstanceSession> {
+    let Ok(rows) = read_rows(&registry_path(cache_dir)) else {
+        return HashMap::new();
+    };
+    let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
+    let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);
+    rows.into_iter()
+        .map(|(instance_id, row)| {
+            let session = if alive.contains(&row.process) {
+                InstanceSession::Running(row.session)
+            } else {
+                InstanceSession::Gone(row.session)
+            };
+            (instance_id, session)
+        })
+        .collect()
+}
+
 /// Applies `change` to the live rows under the registry's lock and writes the result,
 /// which drops every row whose process has gone. A failure is only warned about.
 fn update(cache_dir: &Path, change: impl FnOnce(&mut BTreeMap<String, InstanceRow>)) {
@@ -161,6 +191,15 @@ enum RegistryRead {
 /// refresh; a missing file has none. A row stamped without a start time stays while its
 /// pid is in use, since it cannot be told from the process that filed it.
 fn read_live_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, RegistryRead> {
+    let mut rows = read_rows(path)?;
+    let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
+    let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);
+    rows.retain(|_, row| alive.contains(&row.process));
+    Ok(rows)
+}
+
+/// Every row at `path`, whether its process runs or not; a missing file has none.
+fn read_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, RegistryRead> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -171,11 +210,7 @@ fn read_live_rows(path: &Path) -> Result<BTreeMap<String, InstanceRow>, Registry
             });
         }
     };
-    let mut rows = parse_instances(&bytes)?.instances;
-    let stamps: Vec<ProcessStamp> = rows.values().map(|row| row.process).collect();
-    let alive = ProcessStamp::alive_or_start_unknown_set(&stamps);
-    rows.retain(|_, row| alive.contains(&row.process));
-    Ok(rows)
+    Ok(parse_instances(&bytes)?.instances)
 }
 
 /// Reads the version alone first so a file from another layout is refused by its version
@@ -326,6 +361,39 @@ mod tests {
         let instances = written(&tmp).instances;
         assert!(!instances.contains_key(ID_B), "{:?}", instances.keys());
         assert!(instances.contains_key(ID_A));
+    }
+
+    #[test]
+    fn sessions_by_instance_names_every_filed_row_and_whether_it_still_runs() {
+        let tmp = TempDir::new("instances-sessions");
+        assert!(sessions_by_instance(&tmp.path).is_empty());
+        let dead = InstanceRow {
+            process: ProcessStamp {
+                pid: DEAD_PID,
+                start: 0,
+            },
+            ..row(&"dd".repeat(16), "gone")
+        };
+        let file = InstancesFile {
+            version: INSTANCES_VERSION,
+            instances: BTreeMap::from([
+                (ID_A.to_string(), row(&"aa".repeat(16), "a")),
+                (ID_B.to_string(), dead),
+            ]),
+        };
+        write_raw(&tmp, &serde_json::to_vec(&file).unwrap());
+
+        let sessions = sessions_by_instance(&tmp.path);
+
+        assert_eq!(
+            sessions.get(ID_A),
+            Some(&InstanceSession::Running("a".to_string()))
+        );
+        assert_eq!(
+            sessions.get(ID_B),
+            Some(&InstanceSession::Gone("gone".to_string()))
+        );
+        assert_eq!(sessions.len(), 2);
     }
 
     mod instances_stamp_tests {

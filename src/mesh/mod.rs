@@ -42,6 +42,7 @@ pub(crate) mod trust;
 pub(crate) mod wire_path;
 
 pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT};
+pub(crate) use instances::InstanceSession;
 #[cfg(test)]
 pub(crate) use node::MESH_PROGRESS_MIN_INTERVAL;
 #[cfg(test)]
@@ -1500,6 +1501,13 @@ pub(crate) mod test_support {
         /// reach the recorder instead of knocking.
         pub(crate) fn trust(&self, destination_hex: &str, identity_hex: &str) {
             *self.list.lock() = TrustList::default().destination(destination_hex, identity_hex);
+            self.regate();
+        }
+
+        /// Trusts every instance of `identity_hex`, as a peer that trusts all of a
+        /// person's sessions does.
+        pub(crate) fn trust_identity(&self, identity_hex: &str) {
+            *self.list.lock() = TrustList::default().identity(identity_hex, true);
             self.regate();
         }
 

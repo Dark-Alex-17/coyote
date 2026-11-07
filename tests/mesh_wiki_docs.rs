@@ -7566,6 +7566,48 @@ fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() 
     );
 }
 
+/// `.mesh pending` lists the questions the other sessions on the cache dir asked, each
+/// with a line naming the session that asked it and saying to collect it there. The
+/// renderer's words for the three cases and the Commands page's must agree.
+#[test]
+fn the_pending_section_names_the_session_another_sessions_question_came_from() {
+    let asked_by = string_literals(&fn_body("src/repl/mesh.rs", "asked_by"));
+    for needle in [
+        "asked by {}",
+        "asked by (you, gone: {session})",
+        "asked by another session",
+    ] {
+        assert!(
+            asked_by.iter().any(|literal| literal == needle),
+            "asked_by no longer prints {needle:?}: {asked_by:?}"
+        );
+    }
+    let other = string_literals(&method_body("src/repl/mesh.rs", "other_session"));
+    assert!(
+        other
+            .iter()
+            .any(|literal| literal == "{} . collect it from that session"),
+        "QuestionRow::other_session no longer says to collect it from that session: {other:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let pending = section("Mesh-Commands.md", &page, "### `.mesh pending`");
+    let prose = flat(&pending);
+    for needle in [
+        "asked by (you: temp) . collect it from that session",
+        "`asked by (you: <session>)`",
+        "`asked by (you, gone: <session>)`",
+        "`asked by another session`",
+        "`collect it from that session`",
+    ] {
+        assert!(
+            prose.contains(needle),
+            "the `.mesh pending` section does not show {needle:?}:\n{prose}"
+        );
+    }
+}
+
 /// The value of the one `const NAME: &str = "...";` line in `path`.
 fn const_str(path: &str, name: &str) -> String {
     let source = read(repo_root().join(path));
