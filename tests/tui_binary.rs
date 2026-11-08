@@ -3882,6 +3882,11 @@ fn dot_role_for_a_new_role_asks_in_the_modal_and_opens_the_editor_on_y() {
         edited.contains("new-role-xk3"),
         "the editor was not handed the new role's file: {edited:?}\n{since}"
     );
+    let role_files = new_files_named(&dir, &[], "new-role-xk3");
+    assert!(
+        role_files.iter().any(|path| path.is_file()),
+        "`y` opened the editor but wrote no role file (new files: {role_files:?}):\n{since}"
+    );
 
     pty.send(b".info\r").unwrap();
     pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
