@@ -14,8 +14,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
+pub(crate) const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 const YES_FOR_SESSION: &str = "Yes for this session";
+/// The published answer of a prompt a run with no human refused.
+pub(crate) const NEEDS_HUMAN_MARKER: &str = "<needs_human>";
 
 /// Whether a human can answer a prompt in this run. A headless run and the
 /// ACP server have none; every other run has a terminal.
@@ -113,6 +115,11 @@ impl PromptAnswer {
             PromptAnswer::Selected(choice) => choice.clone(),
             PromptAnswer::Checked(choices) => json!(choices).to_string(),
             PromptAnswer::Text(_) if action == PromptAction::Password => "<redacted>".to_string(),
+            // Only the headless prompter answers a confirm with text: its
+            // `needs_human` JSON, which the bus reports like a refusal.
+            PromptAnswer::Text(_) if action == PromptAction::Confirm => {
+                NEEDS_HUMAN_MARKER.to_string()
+            }
             PromptAnswer::Text(text) => text.clone(),
             PromptAnswer::Cancelled => "<cancelled>".to_string(),
         }
@@ -149,6 +156,11 @@ impl PromptAnswer {
     fn mismatch(self, expected: PromptAction) -> anyhow::Error {
         match self {
             PromptAnswer::Cancelled => anyhow!("Operation was canceled by the user"),
+            // Only the headless prompter answers a confirm with text (its
+            // `needs_human` JSON), so the refusal is what the caller sees.
+            PromptAnswer::Text(_) if expected == PromptAction::Confirm => {
+                NeedsHuman::Prompt(expected).into()
+            }
             _ => anyhow!("Unexpected answer to the {} prompt", expected.name()),
         }
     }
@@ -214,7 +226,8 @@ pub fn new_prompt_id() -> String {
 
 /// Asks through `prompter` and publishes the prompt as requested and as
 /// answered, so a prompter stays a renderer and the bus stays the observer.
-/// A prompter failure still closes the pair, with `<error>` as the answer.
+/// A prompter failure still closes the pair, with `<error>` as the answer,
+/// or `<needs_human>` when a run with no human refused the prompt.
 pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> {
     let id = req.id.clone();
     let action = req.action;
@@ -222,9 +235,14 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
     let answer = match prompter.prompt(req) {
         Ok(answer) => answer,
         Err(err) => {
+            let answer = if NeedsHuman::caused(&err) {
+                NEEDS_HUMAN_MARKER
+            } else {
+                "<error>"
+            };
             bus().publish(Event::PromptAnswered {
                 id,
-                answer: "<error>".to_string(),
+                answer: answer.to_string(),
                 auto: false,
             });
             return Err(err);
@@ -323,13 +341,64 @@ impl Prompter for InquirePrompter {
     }
 }
 
-/// Answers for a run with no human: the reply is the structured
-/// `needs_human` JSON the model is expected to act on, carried as text.
-/// Only `handle_user_tool` knows how to read that text; every other Input
-/// consumer must gate on [`human_present`] or it will take the JSON as the
-/// human's answer.
+/// Answers for a run with no human. A confirm is answered with the
+/// structured `needs_human` JSON the model is expected to act on, carried
+/// as text; only `handle_user_tool` knows how to read it, and every other
+/// confirm consumer rejects it as the wrong shape. Every other kind is
+/// refused with [`NeedsHuman`], because a text-shaped answer would be
+/// taken as the human's: a role would be saved under the JSON, or an MCP
+/// server would receive it as an argument.
 #[derive(Debug, Default)]
 pub struct HeadlessPrompter;
+
+/// The refusal a run with no human gives a prompt whose answer would
+/// otherwise be read as text, or an action that would have to ask one.
+#[derive(Debug)]
+pub(crate) enum NeedsHuman {
+    Prompt(PromptAction),
+    /// A `kind` named `name` would have been created behind a prompt;
+    /// the gate refuses before any prompter is reached.
+    Creating {
+        kind: &'static str,
+        name: String,
+    },
+}
+
+const NO_HUMAN_ATTACHED: &str =
+    "and none is attached to this run; run it without --headless or --acp-server";
+
+impl NeedsHuman {
+    pub(crate) fn for_creating(kind: &'static str, name: &str) -> Self {
+        Self::Creating {
+            kind,
+            name: name.to_string(),
+        }
+    }
+
+    /// Whether `err` is, or wraps through `context`, this refusal.
+    pub(crate) fn caused(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.downcast_ref::<NeedsHuman>().is_some())
+    }
+}
+
+impl fmt::Display for NeedsHuman {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prompt(action) => write!(
+                f,
+                "The {} prompt needs a human {NO_HUMAN_ATTACHED}",
+                action.name()
+            ),
+            Self::Creating { kind, name } => write!(
+                f,
+                "Creating {kind} '{name}' needs a human to answer the prompt {NO_HUMAN_ATTACHED}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NeedsHuman {}
 
 /// The JSON a headless run hands back in place of a human answer.
 pub(crate) fn headless_reply(req: &PromptRequest) -> Value {
@@ -344,7 +413,10 @@ pub(crate) fn headless_reply(req: &PromptRequest) -> Value {
 
 impl Prompter for HeadlessPrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
-        Ok(PromptAnswer::Text(headless_reply(&req).to_string()))
+        match req.action {
+            PromptAction::Confirm => Ok(PromptAnswer::Text(headless_reply(&req).to_string())),
+            action => Err(NeedsHuman::Prompt(action).into()),
+        }
     }
 
     #[cfg(test)]
@@ -541,9 +613,9 @@ mod tests {
         );
     }
 
-    /// The only `Password` pin: no `user__*` tool raises one, so the
-    /// variant stays exercised here alone until the vault prompts route
-    /// through the prompter.
+    /// No `user__*` tool raises a `Password` prompt; the variant reaches
+    /// the prompter from the wire protocol and is pinned here as well as
+    /// by the TUI's masked modal.
     #[test]
     #[serial]
     fn ask_returns_a_password_but_publishes_it_redacted() {
@@ -618,11 +690,61 @@ mod tests {
     }
 
     #[test]
-    fn headless_prompter_carries_the_reply_as_text() {
-        let req = request(PromptAction::Select, None);
+    fn headless_prompter_carries_the_confirm_reply_as_text() {
+        let req = request(PromptAction::Confirm, None);
         let expected = headless_reply(&req).to_string();
         let answer = HeadlessPrompter.prompt(req).unwrap();
         assert_eq!(answer, PromptAnswer::Text(expected));
+    }
+
+    #[test]
+    fn headless_prompter_refuses_every_text_shaped_kind() {
+        for (action, name) in [
+            (PromptAction::Input, "input"),
+            (PromptAction::Password, "password"),
+            (PromptAction::Select, "select"),
+            (PromptAction::Checkbox, "checkbox"),
+        ] {
+            let err = HeadlessPrompter.prompt(request(action, None)).unwrap_err();
+            let refusal = err
+                .downcast_ref::<NeedsHuman>()
+                .unwrap_or_else(|| panic!("{name}: {err}"));
+            assert!(
+                matches!(refusal, NeedsHuman::Prompt(refused) if *refused == action),
+                "{name}: {refusal:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "The {name} prompt needs a human and none is attached to this run; \
+                     run it without --headless or --acp-server"
+                )
+            );
+        }
+    }
+
+    /// The creation gate's refusal shares its tail with the prompt
+    /// refusals, so the two never drift apart.
+    #[test]
+    fn a_creation_refusal_names_the_thing_and_the_missing_human() {
+        let err: anyhow::Error = NeedsHuman::for_creating("role", "coder").into();
+        assert!(NeedsHuman::caused(&err));
+        assert_eq!(
+            err.to_string(),
+            "Creating role 'coder' needs a human to answer the prompt and none is attached to \
+             this run; run it without --headless or --acp-server"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_recognised_under_added_context() {
+        use anyhow::Context;
+        let err = HeadlessPrompter
+            .prompt(request(PromptAction::Select, None))
+            .context("while asking for a role name")
+            .unwrap_err();
+        assert!(NeedsHuman::caused(&err));
+        assert!(!NeedsHuman::caused(&anyhow!("no tty here")));
     }
 
     #[test]
@@ -630,6 +752,7 @@ mod tests {
         let text = PromptAnswer::Text("hunter2".to_string());
         assert_eq!(text.summary(PromptAction::Password), "<redacted>");
         assert_eq!(text.summary(PromptAction::Input), "hunter2");
+        assert_eq!(text.summary(PromptAction::Confirm), "<needs_human>");
         assert_eq!(
             PromptAnswer::Confirmed(true).summary(PromptAction::Confirm),
             "yes"
@@ -676,10 +799,14 @@ mod tests {
 
     #[test]
     fn accessors_reject_a_mismatch_and_a_cancel() {
-        let err = PromptAnswer::Text("t".to_string())
+        let err = PromptAnswer::Selected("t".to_string())
             .into_confirmed()
             .unwrap_err();
         assert_eq!(err.to_string(), "Unexpected answer to the confirm prompt");
+        let err = PromptAnswer::Text("t".to_string())
+            .into_confirmed()
+            .unwrap_err();
+        assert!(err.is::<NeedsHuman>(), "{err}");
         let err = PromptAnswer::Confirmed(true).into_selected().unwrap_err();
         assert_eq!(err.to_string(), "Unexpected answer to the select prompt");
         let err = PromptAnswer::Confirmed(true).into_checked().unwrap_err();

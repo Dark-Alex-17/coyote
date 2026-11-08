@@ -3,11 +3,17 @@
 //! spawned work task that runs the same REPL command path the line editor
 //! would, and everything the turn says comes back through `UiMsg`s. The
 //! transcript is redrawn from its sources on every frame, so a resize is
-//! just another frame.
+//! just another frame. A `!cmd` passthrough or an editor borrows the
+//! terminal: the loop leaves the screen and runs the job synchronously on
+//! its own thread, so nothing is drawn until the job returns.
 
+mod bottom_pane;
 mod cells;
+mod composer;
 mod events;
+mod history;
 mod keys;
+mod queued;
 mod redirect;
 mod render;
 mod sink;
@@ -19,15 +25,26 @@ use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
+use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{AbortSignal, create_abort_signal};
-use anyhow::{Result, bail};
-use cells::{
-    AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
+use anyhow::{Result, anyhow, bail};
+use bottom_pane::{
+    PaletteSnapshot, PaletteState, PaletteView, RewindState, RewindTarget, RewindView, SearchState,
+    SearchView, View,
 };
-use crossterm::event::{EventStream, KeyEvent, MouseButton, MouseEventKind};
+use cells::{
+    AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, RewindBarrier, ToolStatus,
+    append_output,
+};
+use composer::{Composer, field_background};
+use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
-use keys::{Action, KeyContext, ModalKind};
+use history::ComposerHistory;
+use keys::{Action, KeyContext, ModalKind, PopupKind, ViMode};
+use queued::{
+    QueuedLine, QueuedPreview, carry_over, reconcile_queue, remove_sent, take_user_messages,
+};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -39,12 +56,16 @@ use redirect::FdRedirect;
 pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
 use serde_json::Value;
-use sink::{AgentOutcome, TuiPrompter, TuiSink, UiMsg, unattended_answer};
+use sink::{AgentOutcome, LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use terminal::Screen;
 use todo::TodoPanel;
@@ -57,6 +78,133 @@ pub(crate) static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn active() -> bool {
     TUI_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// The loop's inbox while `run` owns the terminal, for work elsewhere in
+/// the process that needs the terminal in its normal modes, and the
+/// thread the loop runs on: a lend from that thread would wait on itself.
+static LENDER: Mutex<Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)>> = Mutex::new(None);
+
+/// A duplicate of the terminal taken before the screen was entered.
+/// During a turn fds 1 and 2 are pointed at the capture pipe for the
+/// whole process, so a child that should write to the terminal is given
+/// this one explicitly. `None` when the duplicate could not be taken.
+#[cfg(unix)]
+static TTY_OUT: OnceLock<Option<std::os::fd::OwnedFd>> = OnceLock::new();
+
+fn set_lender(tx: Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)>) {
+    *LENDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = tx;
+}
+
+fn lender() -> Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)> {
+    LENDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Takes the terminal duplicate for `TtyHandles::stdio`. Returns the
+/// reason when it could not be taken, for the transcript as well as the
+/// log: lent children then write into the turn's capture instead.
+#[cfg(unix)]
+fn remember_tty() -> Option<String> {
+    let mut degraded = None;
+    TTY_OUT.get_or_init(|| match dup_tty_out() {
+        Ok(fd) => Some(fd),
+        Err(err) => {
+            let reason =
+                format!("Children lent the terminal will inherit the turn's output capture: {err}");
+            warn!("{reason}");
+            degraded = Some(reason);
+            None
+        }
+    });
+    degraded
+}
+
+/// Duplicates fd 1 close-on-exec: the copy is for the loop to hand out
+/// through `TtyHandles::stdio`, never for a child to inherit on its own.
+#[cfg(unix)]
+fn dup_tty_out() -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC takes no pointers; the result is checked.
+    let fd = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just created by fcntl and nothing else owns it.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn remember_tty() -> Option<String> {
+    None
+}
+
+/// What a job lent the terminal spawns its child on.
+pub(crate) struct TtyHandles {
+    _private: (),
+}
+
+impl TtyHandles {
+    /// A handle on the terminal for a child's stdout or stderr: the saved
+    /// terminal descriptor where there is one, the inherited descriptor
+    /// otherwise.
+    pub(crate) fn stdio(&self) -> std::io::Result<Stdio> {
+        #[cfg(unix)]
+        if let Some(Some(tty)) = TTY_OUT.get() {
+            return tty.try_clone().map(Stdio::from);
+        }
+        Ok(Stdio::inherit())
+    }
+}
+
+const NOT_LENDING: &str = "the TUI is not lending its terminal";
+
+/// Fails the way `lend_terminal` would, without a job. For callers that
+/// write a file before opening the editor on it and must not leave that
+/// file behind when the lend cannot happen.
+pub(crate) fn ensure_terminal_lendable() -> Result<()> {
+    if active() && lender().is_none() {
+        bail!(NOT_LENDING);
+    }
+    Ok(())
+}
+
+/// Puts a notice in the transcript from anywhere in the process, the
+/// loop's own thread included. False when no UI is running to show it.
+pub(crate) fn notice(kind: NoticeKind, text: String) -> bool {
+    lender().is_some_and(|(tx, _)| tx.send(UiMsg::Notice { kind, text }).is_ok())
+}
+
+/// Runs `job` with the terminal released to it (alternate screen left,
+/// line discipline cooked), the way Ctrl+O hands it to the editor, and
+/// blocks until the loop has taken the screen back. For the shell
+/// passthrough and the file editors, which run on a work thread while
+/// the UI owns the terminal; fails when no UI is lending it, and on the
+/// loop thread itself, where the wait would never end.
+pub(crate) fn lend_terminal<T: Send + 'static>(
+    job: impl FnOnce(&TtyHandles) -> T + Send + 'static,
+) -> Result<T> {
+    let Some((tx, loop_thread)) = lender() else {
+        bail!(NOT_LENDING);
+    };
+    if std::thread::current().id() == loop_thread {
+        bail!("lend_terminal on the loop thread would wait on itself");
+    }
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let job = LendJob(Box::new(move |tty: &TtyHandles| {
+        // The asker gave up waiting; the result has nowhere to go.
+        let _ = reply_tx.send(job(tty));
+    }));
+    if tx.send(UiMsg::LendTerminal(job)).is_err() {
+        bail!(NOT_LENDING);
+    }
+    reply_rx
+        .recv()
+        .map_err(|_| anyhow!("the TUI went away before the lent terminal came back"))
 }
 
 /// Test-only harness hook: when set to `1`, `run` panics right after
@@ -83,6 +231,8 @@ const PANIC_AT_EXIT_ENV: &str = "COYOTE_TUI_PANIC_AT_EXIT";
 /// counts as a modal answer, so a keystroke meant for the composer never
 /// confirms a prompt that appeared under it.
 const HOTKEY_IDLE: Duration = Duration::from_secs(1);
+/// How close two idle Escs must come to open the rewind picker.
+const REWIND_ESC_GAP: Duration = Duration::from_secs(1);
 /// How long the UI waits on the exit work. The work itself waits
 /// `EXIT_CANCEL_WAIT` on background tasks before it saves the session and
 /// runs the finished hook, so the wait on it has to outlast that or a
@@ -92,19 +242,21 @@ const TOOL_OUTPUT_TAIL: usize = 20;
 /// Most text one cell of late command output holds; a leftover child that
 /// keeps writing sees its oldest lines dropped rather than the transcript grow.
 const LATE_OUTPUT_LIMIT: usize = 64 * 1024;
-const COMPOSER_MIN_ROWS: u16 = 3;
-const COMPOSER_MAX_ROWS: u16 = 8;
 /// Transcript rows a modal's question may not take from the frame, so the
 /// narration being approved stays in view above it. A question that still
 /// does not fit is clipped with a marker and cannot be approved until the
 /// terminal is tall enough.
 const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
+const SELECT_HINT: &str = "Up/Down = move  Enter = choose  Esc = cancel";
+const CHECKBOX_HINT: &str = "Space = tick  Up/Down = move  Enter = answer  Esc = cancel";
+/// The last row of a select, the entry the REPL's prompter appends too;
+/// choosing it opens a free-text field in the list's place.
+const CUSTOM_CHOICE_ROW: &str = crate::prompt::CUSTOM_MULTI_CHOICE_ANSWER_OPTION;
 /// The confirm legend while part of the question is off screen: nothing
 /// clipped may be approved, so the approving keys are not offered. Esc
 /// leads so a narrow wrap never splits it from its meaning.
 const CLIPPED_HINT: &str = "Esc = cancel  enlarge the terminal to answer";
-const COMPOSER_PLACEHOLDER: &str = "Type a prompt or a .command; Enter sends";
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
 /// How long `flush_typeahead` waits for one more queued event, and how
@@ -149,7 +301,8 @@ fn confirm_hint(default: bool, tool: bool) -> String {
 struct ActiveGuard;
 
 impl ActiveGuard {
-    fn set() -> Self {
+    fn set(lender: UnboundedSender<UiMsg>) -> Self {
+        set_lender(Some((lender, std::thread::current().id())));
         TUI_ACTIVE.store(true, Ordering::SeqCst);
         Self
     }
@@ -158,6 +311,7 @@ impl ActiveGuard {
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         TUI_ACTIVE.store(false, Ordering::SeqCst);
+        set_lender(None);
     }
 }
 
@@ -354,15 +508,32 @@ struct TurnStatus {
 struct PendingPrompt {
     req: PromptRequest,
     reply: mpsc::Sender<PromptAnswer>,
+    /// The text field of an input or password, or of a select whose
+    /// custom row was chosen.
     field: Option<TextArea<'static>>,
+    /// The row under the marker of a select or checkbox.
+    cursor: usize,
+    /// One flag per option of a checkbox, in the options' order.
+    checked: Vec<bool>,
 }
 
 impl PendingPrompt {
+    fn new(req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) -> Self {
+        let field = matches!(req.action, PromptAction::Input | PromptAction::Password)
+            .then(|| new_field(req.action == PromptAction::Password));
+        let checked = vec![false; req.options.len()];
+        Self {
+            req,
+            reply,
+            field,
+            cursor: 0,
+            checked,
+        }
+    }
+
     fn kind(&self) -> ModalKind {
-        if self.field.is_some() {
-            ModalKind::Input
-        } else {
-            ModalKind::Confirm {
+        match self.req.action {
+            PromptAction::Confirm => ModalKind::Confirm {
                 default: self
                     .req
                     .default
@@ -370,17 +541,140 @@ impl PendingPrompt {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true),
                 tool: self.req.tool.is_some(),
-            }
+            },
+            PromptAction::Input => ModalKind::Input,
+            PromptAction::Password => ModalKind::Password,
+            PromptAction::Select => ModalKind::Select {
+                custom_field_open: self.field.is_some(),
+            },
+            PromptAction::Checkbox => ModalKind::Checkbox,
         }
     }
 
-    /// The legend under the modal; a confirm whose question is clipped
-    /// offers only Esc.
-    fn hint(&self, clipped: bool) -> String {
+    /// Whether the answer is a non-empty id of the tool call or job that
+    /// asked, so a report that the call ended can take the question down.
+    fn asked_by_call(&self, call_id: &str) -> bool {
+        !call_id.is_empty() && self.req.call_id.as_deref() == Some(call_id)
+    }
+
+    fn asked_by_job(&self, job_id: &str) -> bool {
+        !job_id.is_empty() && self.req.job_id.as_deref() == Some(job_id)
+    }
+
+    fn asked_by_agent(&self, agent_id: &str) -> bool {
+        !agent_id.is_empty() && self.req.origin.agent_id.as_deref() == Some(agent_id)
+    }
+
+    /// The rows of a list modal: the options, plus the custom row of a
+    /// select.
+    fn list_len(&self) -> usize {
         match self.kind() {
-            ModalKind::Input => INPUT_HINT.to_string(),
-            ModalKind::Confirm { .. } if clipped => CLIPPED_HINT.to_string(),
+            ModalKind::Select {
+                custom_field_open: false,
+            } => self.req.options.len() + 1,
+            ModalKind::Checkbox => self.req.options.len(),
+            _ => 0,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        let len = self.list_len();
+        if len == 0 {
+            return;
+        }
+        let last = len - 1;
+        self.cursor = if delta < 0 {
+            self.cursor.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.cursor.saturating_add(delta as usize).min(last)
+        };
+    }
+
+    fn toggle_cursor(&mut self) {
+        if let Some(flag) = self.checked.get_mut(self.cursor) {
+            *flag = !*flag;
+        }
+    }
+
+    /// What Enter on a list answers: the select's row (or `None` for the
+    /// custom row, which opens the field instead) or the ticked options.
+    fn choice(&self) -> Option<PromptAnswer> {
+        match self.kind() {
+            ModalKind::Select {
+                custom_field_open: false,
+            } => self
+                .req
+                .options
+                .get(self.cursor)
+                .cloned()
+                .map(PromptAnswer::Selected),
+            ModalKind::Checkbox => Some(PromptAnswer::Checked(
+                self.req
+                    .options
+                    .iter()
+                    .zip(&self.checked)
+                    .filter(|(_, ticked)| **ticked)
+                    .map(|(option, _)| option.clone())
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn open_custom_field(&mut self) {
+        self.field = Some(new_field(false));
+    }
+
+    /// What the field holds as an answer, by the kind that opened it: a
+    /// select's custom text is a selection, the others are text.
+    fn field_answer(&self) -> PromptAnswer {
+        let text = self
+            .field
+            .as_ref()
+            .map(|field| field.lines().join(" "))
+            .unwrap_or_default();
+        match self.req.action {
+            PromptAction::Select => PromptAnswer::Selected(text),
+            _ => PromptAnswer::Text(text),
+        }
+    }
+
+    /// Who is asking: the tool, else the agent, else nobody in particular.
+    fn origin_line(&self) -> Option<String> {
+        if let Some(tool) = &self.req.tool {
+            return Some(format!("tool: {tool}"));
+        }
+        self.req
+            .origin
+            .agent_id
+            .as_ref()
+            .map(|agent| format!("agent: {agent}"))
+    }
+
+    /// Rows the origin takes under the question. A confirm's middle row
+    /// already carries it.
+    fn origin_rows(&self) -> u16 {
+        match self.kind() {
+            ModalKind::Confirm { .. } => 0,
+            _ => u16::from(self.origin_line().is_some()),
+        }
+    }
+
+    /// The legend under the modal; a question that is clipped offers
+    /// only Esc.
+    fn hint(&self, clipped: bool) -> String {
+        if clipped {
+            return CLIPPED_HINT.to_string();
+        }
+        match self.kind() {
             ModalKind::Confirm { default, tool } => confirm_hint(default, tool),
+            ModalKind::Input
+            | ModalKind::Password
+            | ModalKind::Select {
+                custom_field_open: true,
+            } => INPUT_HINT.to_string(),
+            ModalKind::Select { .. } => SELECT_HINT.to_string(),
+            ModalKind::Checkbox => CHECKBOX_HINT.to_string(),
         }
     }
 
@@ -411,11 +705,23 @@ impl PendingPrompt {
     }
 
     /// Rows the question may take on a frame `height` tall: the status
-    /// row, the footer, the modal's middle row and its hint are fixed, and
-    /// `TRANSCRIPT_MIN_ROWS` stay with the transcript.
+    /// row, the footer, the modal's origin, middle and hint rows are
+    /// fixed, and `TRANSCRIPT_MIN_ROWS` stay with the transcript.
     fn question_cap(&self, width: u16, height: u16) -> u16 {
-        let fixed = 3 + TRANSCRIPT_MIN_ROWS + self.hint_rows(width);
+        let fixed = 2
+            + TRANSCRIPT_MIN_ROWS
+            + self.hint_rows(width)
+            + self.origin_rows()
+            + self.middle_rows(width, height);
         height.saturating_sub(fixed).max(1)
+    }
+
+    /// Rows of the field, the confirm's tool line, or the list; a list
+    /// longer than the frame allows (one question row, the fixed rows and
+    /// the transcript's minimum kept) scrolls inside what it gets.
+    fn middle_rows(&self, width: u16, height: u16) -> u16 {
+        let fixed = 3 + TRANSCRIPT_MIN_ROWS + self.hint_rows(width) + self.origin_rows();
+        row_count(self.list_len()).clamp(1, height.saturating_sub(fixed).max(1))
     }
 
     fn question_rows(&self, width: u16, height: u16) -> u16 {
@@ -433,21 +739,64 @@ impl PendingPrompt {
         row_count(self.question_lines(width).len()) <= rows
     }
 
-    /// Rows of the whole modal: question, field or tool row, hint.
+    /// Rows of the whole modal: question, origin, field or list, hint.
     fn rows(&self, width: u16, height: u16) -> u16 {
-        self.question_rows(width, height) + 1 + self.hint_rows(width)
+        self.question_rows(width, height)
+            + self.origin_rows()
+            + self.middle_rows(width, height)
+            + self.hint_rows(width)
     }
 
-    /// The question, middle and legend rows inside the modal's `area`.
-    /// A frame too short for the layout squeezes the question first;
-    /// what it actually received is what answerability is judged on.
-    fn areas(&self, area: Rect) -> [Rect; 3] {
+    /// The question, origin, middle and legend rows inside the modal's
+    /// `area` on a frame `frame` tall. A frame too short for the layout
+    /// squeezes the question first; what it actually received is what
+    /// answerability is judged on.
+    fn areas(&self, area: Rect, frame: Rect) -> [Rect; 4] {
         Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(self.origin_rows()),
+            Constraint::Length(self.middle_rows(area.width, frame.height)),
             Constraint::Length(self.hint_rows(area.width)),
         ])
         .areas(area)
+    }
+
+    /// The list's rows as drawn, windowed around the cursor when it is
+    /// taller than `visible`.
+    fn list_lines(&self, visible: usize) -> Vec<Line<'static>> {
+        let checkbox = self.kind() == ModalKind::Checkbox;
+        let rows: Vec<String> = self
+            .req
+            .options
+            .iter()
+            .map(|option| render::plain_text(option).replace('\n', " "))
+            .chain((!checkbox).then(|| CUSTOM_CHOICE_ROW.to_string()))
+            .collect();
+        let first = if self.cursor < visible {
+            0
+        } else {
+            self.cursor + 1 - visible
+        };
+        rows.into_iter()
+            .enumerate()
+            .skip(first)
+            .take(visible)
+            .map(|(index, text)| {
+                let marker = if index == self.cursor { ">" } else { " " };
+                let line = if checkbox {
+                    let tick = if self.checked[index] { "x" } else { " " };
+                    format!("{marker} [{tick}] {text}")
+                } else {
+                    format!("{marker} {text}")
+                };
+                let style = if index == self.cursor {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+                Line::from(Span::styled(line, style))
+            })
+            .collect()
     }
 }
 
@@ -504,15 +853,60 @@ fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix
         .rposition(|cell| opens_exchange(cell, prefix))
 }
 
+/// What stops the rewind picker at a command line, under the macros
+/// enabled when it ran: a macro (`.<name>` or `.macro <name>`, not the
+/// enable/disable toggles) stands for exchanges the transcript never
+/// counted; `.session`, `.agent <name>`, `.fork`, `.undo`, `.edit
+/// session` and the session and agent forms of `.exit`, `.empty` and
+/// `.compress` leave the context holding history the transcript never
+/// showed. A bare `.agent` only prints its usage, and `.macro <name>`
+/// for a name the list had not got, with the model never asked, created
+/// the macro in the editor rather than running one.
+fn rewind_barrier(
+    line: &str,
+    prefix: crate::config::CommandPrefix,
+    macros: &[(String, String)],
+    asked_model: bool,
+) -> Option<RewindBarrier> {
+    let line = prefix.normalize(line.trim())?;
+    let mut words = line.split_whitespace();
+    let known = |word: &str| macros.iter().any(|(name, _)| name == word);
+    match (words.next()?, words.next()) {
+        (".macro", Some(first)) => (!matches!(first, "enable" | "disable")
+            && (asked_model || known(first)))
+        .then_some(RewindBarrier::Macro),
+        (".session" | ".fork" | ".undo", _) | (".agent", Some(_)) => Some(RewindBarrier::Session),
+        (".exit", Some("session" | "agent"))
+        | (".empty" | ".compress" | ".edit", Some("session")) => Some(RewindBarrier::Session),
+        (word, _) => word
+            .strip_prefix('.')
+            .filter(|word| known(word))
+            .map(|_| RewindBarrier::Macro),
+    }
+}
+
 /// Something the loop, not the app, has to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Submit(String),
+    /// A prompt typed during a turn; the loop offers it to the running
+    /// turn's model.
+    Queue(String),
+    /// A held line taken back into the composer: the loop withdraws the
+    /// prompt from the running turn and offers the draft it displaced,
+    /// each `None` when it was a command the turn never saw.
+    Unqueue {
+        held: Option<String>,
+        draft: Option<String>,
+    },
     Interrupt,
     Quit,
     Suspend,
     OpenEditor,
     Redraw,
+    /// Take the chosen exchanges out of the session and the transcript
+    /// and give the oldest one's prompt back to the composer.
+    Rewind(RewindTarget),
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -521,21 +915,27 @@ fn new_textarea() -> TextArea<'static> {
     textarea
 }
 
-/// An empty composer with its placeholder; the modal's input field is a
-/// bare `new_textarea`.
-fn new_composer() -> TextArea<'static> {
-    let mut composer = new_textarea();
-    composer.set_placeholder_text(COMPOSER_PLACEHOLDER);
-    composer.set_placeholder_style(DIM);
-    composer
+/// A modal's one-line field; a password's shows a `*` per character.
+fn new_field(masked: bool) -> TextArea<'static> {
+    let mut field = new_textarea();
+    if masked {
+        field.set_mask_char('*');
+    }
+    field
 }
 
 /// Everything drawn, and the rules for changing it.
 pub(crate) struct App {
     transcript: Transcript,
     todo: TodoPanel,
-    composer: TextArea<'static>,
+    composer: Composer,
+    /// Lines entered while a turn ran, oldest first; the loop submits
+    /// what the model did not get, one per turn, once it ends.
+    queued: Vec<QueuedLine>,
     prompts: VecDeque<PendingPrompt>,
+    /// Work waiting for the terminal to be released to it; the loop runs
+    /// each after the step that queued it.
+    lend_requests: Vec<LendJob>,
     turn: Option<TurnStatus>,
     /// The teardown task owns the context: nothing new can be submitted,
     /// interrupted or quit until it reports back.
@@ -546,6 +946,10 @@ pub(crate) struct App {
     footer: FooterInfo,
     usage: String,
     last_keystroke: Option<Instant>,
+    /// When the front prompt became the front; what Enter on a text
+    /// field is settled against, so typing the answer does not postpone
+    /// sending it.
+    front_since: Option<Instant>,
     /// The area of the last frame drawn; what a modal's question cap and
     /// its clipped state are judged against between frames.
     frame_area: Option<Rect>,
@@ -555,8 +959,50 @@ pub(crate) struct App {
     clock: Arc<dyn Clock>,
     frames: FrameScheduler,
     renderer: Renderer,
+    /// The enabled macros as (name, description), refreshed with the
+    /// context since a turn can enable or shadow one: the typed-command
+    /// highlight accepts them as known and the palette lists them.
+    macros: Vec<(String, String)>,
+    view: View,
+    /// What the palette lists while the context is away on a turn.
+    palette_snapshot: PaletteSnapshot,
+    /// Set by every edit of the composer; the next `refresh_palette`
+    /// rebuilds the palette's rows and clears it. A palette closed by
+    /// Esc stays closed until the draft changes again.
+    palette_dirty: bool,
+    history: ComposerHistory,
+    /// Where submitted lines are recorded, None when the config keeps
+    /// no shell history; the history then lasts the run.
+    history_file: Option<PathBuf>,
+    /// None under emacs bindings.
+    vi_mode: Option<ViMode>,
+    /// A `d` pressed in normal mode, waiting for the second.
+    vi_pending_d: bool,
+    /// When the last idle Esc was pressed; a second one within
+    /// `REWIND_ESC_GAP` opens the rewind picker.
+    last_esc: Option<Instant>,
     config: Arc<AppConfig>,
     prompt_memory: Arc<PromptMemory>,
+}
+
+fn history_file(config: &AppConfig, session: Option<&str>) -> Option<PathBuf> {
+    config
+        .save_shell_history
+        .then(|| crate::config::paths::repl_history_file_for(session))
+}
+
+fn load_history(path: Option<&Path>) -> ComposerHistory {
+    let Some(path) = path else {
+        return ComposerHistory::default();
+    };
+    ComposerHistory::load(path).unwrap_or_else(|err| {
+        warn!("Failed to read the history at {}: {err}", path.display());
+        ComposerHistory::default()
+    })
+}
+
+fn vi_mode(config: &AppConfig) -> Option<ViMode> {
+    (config.keybindings == "vi").then_some(ViMode::Insert)
 }
 
 impl App {
@@ -566,23 +1012,38 @@ impl App {
         prompt_memory: Arc<PromptMemory>,
         footer: FooterInfo,
     ) -> Result<Self> {
-        let renderer = Renderer::new(config.render_options()?)?;
+        let options = config.render_options()?;
+        let background = field_background(&config, &options);
+        let renderer = Renderer::new(options)?;
+        let history_file = history_file(&config, footer.session.as_deref());
         Ok(Self {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
-            composer: new_composer(),
+            composer: Composer::new(background, config.command_prefix),
+            queued: Vec::new(),
             prompts: VecDeque::new(),
+            lend_requests: Vec::new(),
             turn: None,
             exiting: false,
             exit_first_cell: 0,
             footer,
             usage: String::new(),
             last_keystroke: None,
+            front_since: None,
             frame_area: None,
             question_area: None,
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
+            macros: Vec::new(),
+            view: View::Composer,
+            palette_snapshot: PaletteSnapshot::EMPTY,
+            palette_dirty: false,
+            history: load_history(history_file.as_deref()),
+            history_file,
+            vi_mode: vi_mode(&config),
+            vi_pending_d: false,
+            last_esc: None,
             config,
             prompt_memory,
         })
@@ -592,18 +1053,21 @@ impl App {
         self.frames.schedule_frame();
     }
 
+    #[cfg(test)]
+    fn set_no_color(&mut self, no_color: bool) {
+        self.renderer.no_color = no_color;
+    }
+
     pub(crate) fn composer_text(&self) -> String {
-        self.composer.lines().join("\n")
+        self.composer.text()
     }
 
     pub(crate) fn set_composer_text(&mut self, text: &str) {
-        let mut composer = TextArea::new(text.split('\n').map(str::to_string).collect());
-        composer.set_cursor_line_style(Style::new());
-        composer.set_placeholder_text(COMPOSER_PLACEHOLDER);
-        composer.set_placeholder_style(DIM);
-        composer.move_cursor(ratatui_textarea::CursorMove::Bottom);
-        composer.move_cursor(ratatui_textarea::CursorMove::End);
-        self.composer = composer;
+        self.composer.set_text(text);
+        // Text put there by anything but the walk ends the walk: the next
+        // Up starts from the newest entry again.
+        self.history.reset();
+        self.palette_dirty = true;
         self.schedule_frame();
     }
 
@@ -611,12 +1075,38 @@ impl App {
     /// called whenever the context is back in the UI's hands.
     pub(crate) fn sync_from_ctx(&mut self, ctx: &mut RequestContext) {
         self.footer = FooterInfo::from_ctx(ctx);
+        self.macros = ctx
+            .visible_macro_completions()
+            .into_iter()
+            .map(|(name, description)| (name, description.unwrap_or_default()))
+            .collect();
+        self.palette_snapshot = PaletteSnapshot::from_ctx(ctx);
         if !Arc::ptr_eq(&self.config, &ctx.app.config) {
-            match ctx.app.config.render_options().and_then(Renderer::new) {
-                Ok(renderer) => self.renderer = renderer,
+            let config = &ctx.app.config;
+            match config.render_options().and_then(|options| {
+                let background = field_background(config, &options);
+                Renderer::new(options).map(|renderer| (renderer, background))
+            }) {
+                Ok((mut renderer, background)) => {
+                    renderer.no_color = self.renderer.no_color;
+                    self.renderer = renderer;
+                    self.composer.set_background(background);
+                }
                 Err(err) => warn!("Keeping the previous render options: {err}"),
             }
+            self.composer.set_command_prefix(config.command_prefix);
             self.config = Arc::clone(&ctx.app.config);
+            self.vi_mode = match (vi_mode(&self.config), self.vi_mode) {
+                (Some(_), Some(current)) => Some(current),
+                (wanted, _) => wanted,
+            };
+        }
+        // A new session, or history switched on or off, means another
+        // file; the entries of the run so far go with the old one.
+        let file = history_file(&self.config, self.footer.session.as_deref());
+        if file != self.history_file {
+            self.history_file = file;
+            self.history = load_history(self.history_file.as_deref());
         }
         if let Some(text) = ctx.pending_prefill.take() {
             self.set_composer_text(&text);
@@ -667,6 +1157,7 @@ impl App {
                 name,
                 output,
                 opened,
+                rewind_barrier: barrier,
                 cache,
             }) = self.transcript.cell_mut(index)
             else {
@@ -674,6 +1165,12 @@ impl App {
             };
             *output = outcome.captured.clone();
             *opened = turn.requested;
+            // A command that failed before asking the model changed
+            // nothing the picker has to stop at; a macro that failed at a
+            // later step already recorded the exchanges before it.
+            *barrier = (outcome.error.is_none() || turn.requested)
+                .then(|| rewind_barrier(name, prefix, &self.macros, turn.requested))
+                .flatten();
             *cache = LineCache::default();
             // `.undo` took the last exchange out of the context; the
             // transcript drops it too, back to the cell that opened it,
@@ -748,9 +1245,13 @@ impl App {
     }
 
     fn key_context(&self) -> KeyContext {
+        let now = self.clock.now();
         let idle_ok = self
             .last_keystroke
-            .is_none_or(|at| self.clock.now().duration_since(at) >= HOTKEY_IDLE);
+            .is_none_or(|at| now.duration_since(at) >= HOTKEY_IDLE);
+        let field_settled = self
+            .front_since
+            .is_some_and(|at| now.duration_since(at) >= HOTKEY_IDLE);
         // The cap says what the frame should allow; the rows the last
         // draw actually gave the question say what it got. A frame too
         // short for the layout squeezes the question below its cap.
@@ -766,11 +1267,221 @@ impl App {
         KeyContext {
             turn_running: self.turn.is_some() || self.exiting,
             composer_empty: self.composer.is_empty(),
+            single_line: self.composer.lines().len() <= 1,
             modal: self.prompts.front().map(PendingPrompt::kind),
             idle_ok,
+            field_settled,
             question_fully_shown,
             scrolled: self.transcript.scrolled(),
             focused: self.transcript.focused(),
+            popup: match self.view {
+                View::Composer => None,
+                View::Palette(_) => Some(PopupKind::Palette),
+                View::HistorySearch(_) => Some(PopupKind::HistorySearch),
+                View::Rewind(_) => Some(PopupKind::Rewind),
+            },
+            vi: self.vi_mode,
+        }
+    }
+
+    /// The composer's line when it is a single line opening with a
+    /// sigil the configured prefix accepts, a leading `:::` fence token
+    /// skipped: the line the palette is for.
+    fn command_line(&self) -> Option<&str> {
+        let [line] = self.composer.lines() else {
+            return None;
+        };
+        let unfenced = line.trim_start();
+        let unfenced = match unfenced.strip_prefix(":::") {
+            Some(rest) if rest.starts_with(' ') => rest.trim_start(),
+            _ => unfenced,
+        };
+        let first = unfenced.chars().next()?;
+        self.config
+            .command_prefix
+            .accepts(first)
+            .then_some(line.as_str())
+    }
+
+    /// Opens, refreshes or closes the palette after an edit of the
+    /// composer; an edit under another band closes that band. With the
+    /// context in hand the rows include arguments and macros; mid-turn
+    /// they are the commands the snapshot allows.
+    pub(crate) fn refresh_palette(&mut self, ctx: Option<&RequestContext>) {
+        if !self.palette_dirty {
+            return;
+        }
+        self.palette_dirty = false;
+        let palette = match self.command_line() {
+            Some(line) if self.prompts.is_empty() => PaletteState::build(
+                line,
+                self.config.command_prefix,
+                self.palette_snapshot,
+                &self.macros,
+                ctx,
+            ),
+            _ => None,
+        };
+        self.view = match palette {
+            Some(palette) => View::Palette(palette),
+            None => View::Composer,
+        };
+        self.schedule_frame();
+    }
+
+    fn close_view(&mut self) {
+        self.view = View::Composer;
+        self.palette_dirty = false;
+    }
+
+    /// Puts a history entry in the composer. Walking the history is not
+    /// an edit: the palette stays closed so the next Up or Down keeps
+    /// walking, and it reopens with the first real edit.
+    fn recall_history_entry(&mut self, text: &str) {
+        self.composer.set_text(text);
+        self.close_view();
+        self.schedule_frame();
+    }
+
+    fn record_history(&mut self, line: &str) {
+        self.history.push(line);
+        if let Some(path) = &self.history_file
+            && let Err(err) = history::append(path, line)
+        {
+            warn!("Failed to write the history at {}: {err}", path.display());
+        }
+    }
+
+    /// Takes the trimmed draft out of the composer and into the history;
+    /// None when there is nothing but whitespace.
+    fn take_composer_line(&mut self) -> Option<String> {
+        let text = self.composer_text();
+        if text.trim().is_empty() {
+            return None;
+        }
+        self.composer.clear();
+        self.palette_dirty = true;
+        self.transcript.clear_focus();
+        // The next line is typed, so the vi layer starts it in insert.
+        self.vi_mode = self.vi_mode.map(|_| ViMode::Insert);
+        let line = text.trim().to_string();
+        self.record_history(&line);
+        Some(line)
+    }
+
+    fn submit_composer(&mut self) -> Option<Command> {
+        self.take_composer_line().map(Command::Submit)
+    }
+
+    fn queue_composer(&mut self) -> Option<Command> {
+        if self.exiting {
+            return None;
+        }
+        self.hold_composer_line().map(Command::Queue)
+    }
+
+    /// Holds the draft for the running turn. A prompt is returned for the
+    /// loop, which offers it to the model; a command only waits.
+    fn hold_composer_line(&mut self) -> Option<String> {
+        let line = self.take_composer_line()?;
+        let command = is_command(&line, self.config.command_prefix);
+        self.queued.push(QueuedLine {
+            text: line.clone(),
+            command,
+        });
+        (!command).then_some(line)
+    }
+
+    /// Takes the newest held line back into the composer. A draft under
+    /// it is not lost: it joins the end of the queue, so the two trade
+    /// places.
+    fn edit_queued(&mut self) -> Option<Command> {
+        let line = self.queued.pop()?;
+        let draft = self.hold_composer_line();
+        self.set_composer_text(&line.text);
+        let held = (!line.command).then_some(line.text);
+        if held.is_none() && draft.is_none() {
+            return None;
+        }
+        Some(Command::Unqueue { held, draft })
+    }
+
+    /// An interrupt, or the quit that follows one, is for everything the
+    /// user lined up, not just the turn that is running.
+    fn drop_queued(&mut self) {
+        let dropped = self.queued.len();
+        if dropped > 0 {
+            self.queued.clear();
+            self.push_notice(
+                NoticeKind::Interrupted,
+                format!("Dropped {dropped} queued line(s)"),
+            );
+        }
+    }
+
+    /// A second idle Esc within the gap opens the rewind picker, when
+    /// the transcript holds an exchange to go back to.
+    fn idle_esc(&mut self) {
+        let now = self.clock.now();
+        let second = self
+            .last_esc
+            .is_some_and(|at| now.duration_since(at) <= REWIND_ESC_GAP);
+        self.last_esc = (!second).then_some(now);
+        if !second {
+            return;
+        }
+        let (rewind, barrier) =
+            RewindState::from_cells(self.transcript.cells(), self.config.command_prefix);
+        if let Some(barrier) = barrier {
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                format!("Rewind stops at the last {}", barrier.kind_name()),
+            );
+        }
+        if let Some(rewind) = rewind {
+            self.view = View::Rewind(rewind);
+        }
+    }
+
+    /// Takes the band's highlighted row: the palette's into the typed
+    /// token, the search's into the composer, the rewind picker's to
+    /// the loop. The palette with no highlight lets the Enter do what
+    /// it does without a band: submit when idle, queue during a turn.
+    fn accept_popup(&mut self) -> Option<Command> {
+        match &self.view {
+            View::HistorySearch(search) => {
+                let chosen = search.highlighted().map(str::to_string);
+                match chosen {
+                    Some(text) => self.recall_history_entry(&text),
+                    None => self.close_view(),
+                }
+                self.history.reset();
+                None
+            }
+            View::Rewind(rewind) => {
+                let chosen = rewind.chosen().map(Command::Rewind);
+                self.close_view();
+                chosen
+            }
+            View::Palette(palette) => {
+                if palette.highlighted().is_none() {
+                    return if self.turn.is_some() || self.exiting {
+                        self.queue_composer()
+                    } else {
+                        self.submit_composer()
+                    };
+                }
+                // The band may outlive the line it was built on (an
+                // editor's result, a rewind's prefill); a range the line
+                // no longer has names nothing, so the band just closes.
+                let accepted = self.command_line().and_then(|line| palette.accept(line));
+                self.close_view();
+                if let Some(text) = accepted {
+                    self.set_composer_text(&text);
+                }
+                None
+            }
+            View::Composer => None,
         }
     }
 
@@ -793,7 +1504,8 @@ impl App {
                         }
                     }
                     None => {
-                        self.composer.insert_str(text);
+                        self.composer.insert_str(&text);
+                        self.palette_dirty = true;
                     }
                 }
                 self.schedule_frame();
@@ -832,19 +1544,20 @@ impl App {
         if self.prompts.is_empty() || action == Action::Nothing {
             self.last_keystroke = Some(self.clock.now());
         }
+        // The two-key sequences only count consecutive presses.
+        if action != Action::IdleEsc {
+            self.last_esc = None;
+        }
+        if action != Action::ViDeleteLine {
+            self.vi_pending_d = false;
+        }
         let command = match action {
-            Action::Submit => {
-                let text = self.composer_text();
-                if text.trim().is_empty() {
-                    None
-                } else {
-                    self.composer = new_composer();
-                    self.transcript.clear_focus();
-                    Some(Command::Submit(text.trim().to_string()))
-                }
-            }
+            Action::Submit => self.submit_composer(),
+            Action::QueueInput => self.queue_composer(),
+            Action::EditQueued => self.edit_queued(),
             Action::InsertNewline => {
                 self.composer.insert_newline();
+                self.palette_dirty = true;
                 None
             }
             Action::ClearComposer => {
@@ -853,9 +1566,17 @@ impl App {
             }
             Action::Interrupt => {
                 self.transcript.clear_focus();
+                self.drop_queued();
                 (!self.exiting).then_some(Command::Interrupt)
             }
-            Action::Quit => (!self.exiting).then_some(Command::Quit),
+            Action::IdleEsc => {
+                self.idle_esc();
+                None
+            }
+            Action::Quit => {
+                self.drop_queued();
+                (!self.exiting).then_some(Command::Quit)
+            }
             Action::Suspend => Some(Command::Suspend),
             Action::OpenEditor => Some(Command::OpenEditor),
             Action::ScheduleFrame => Some(Command::Redraw),
@@ -873,13 +1594,49 @@ impl App {
                 None
             }
             Action::SubmitModalInput => {
-                let text = self
-                    .prompts
-                    .front()
-                    .and_then(|p| p.field.as_ref())
-                    .map(|field| field.lines().join(" "))
-                    .unwrap_or_default();
-                self.answer_front(PromptAnswer::Text(text));
+                if let Some(answer) = self.prompts.front().map(PendingPrompt::field_answer) {
+                    self.answer_front(answer);
+                }
+                None
+            }
+            Action::SubmitModalChoice => {
+                if let Some(prompt) = self.prompts.front_mut() {
+                    match prompt.choice() {
+                        Some(answer) => self.answer_front(answer),
+                        // The select's cursor is on the custom row: the
+                        // field opens with a fresh gate, so the Enter that
+                        // opened it cannot also send an empty answer.
+                        None => {
+                            prompt.open_custom_field();
+                            let now = self.clock.now();
+                            self.last_keystroke = Some(now);
+                            self.front_since = Some(now);
+                        }
+                    }
+                }
+                None
+            }
+            Action::ModalMove(delta) => {
+                if let Some(prompt) = self.prompts.front_mut() {
+                    prompt.move_cursor(delta);
+                }
+                None
+            }
+            Action::ModalToggle => {
+                if let Some(prompt) = self.prompts.front_mut() {
+                    prompt.toggle_cursor();
+                }
+                None
+            }
+            Action::ModalJump(index) => {
+                if let Some(prompt) = self.prompts.front_mut()
+                    && index < prompt.req.options.len()
+                {
+                    prompt.cursor = index;
+                    if let Some(answer) = prompt.choice() {
+                        self.answer_front(answer);
+                    }
+                }
                 None
             }
             Action::ModalInput(key) => {
@@ -890,7 +1647,83 @@ impl App {
                 None
             }
             Action::ComposerInput(key) => {
-                self.composer.input(key);
+                // Tab on a command line asks for the palette rather than
+                // indenting the command.
+                if key.code != KeyCode::Tab || self.command_line().is_none() {
+                    self.composer.input(key);
+                }
+                self.palette_dirty = true;
+                None
+            }
+            Action::HistoryPrev => {
+                let draft = self.composer_text();
+                if let Some(entry) = self.history.prev(&draft).map(str::to_string) {
+                    self.recall_history_entry(&entry);
+                }
+                None
+            }
+            Action::HistoryNext => {
+                if let Some(text) = self.history.next() {
+                    self.recall_history_entry(&text);
+                }
+                None
+            }
+            Action::OpenHistorySearch => {
+                self.view = View::HistorySearch(SearchState::new(&self.history));
+                None
+            }
+            Action::PaletteMove(delta) => {
+                match &mut self.view {
+                    View::Composer => {}
+                    View::Palette(palette) => palette.move_highlight(delta),
+                    View::HistorySearch(search) => search.move_highlight(delta),
+                    View::Rewind(rewind) => rewind.move_highlight(delta),
+                }
+                None
+            }
+            Action::PaletteAccept => self.accept_popup(),
+            Action::ClosePopup => {
+                self.close_view();
+                None
+            }
+            Action::PopupChar(c) => {
+                if let View::HistorySearch(search) = &mut self.view {
+                    search.push_char(c, &self.history);
+                }
+                None
+            }
+            Action::PopupBackspace => {
+                if let View::HistorySearch(search) = &mut self.view {
+                    search.pop_char(&self.history);
+                }
+                None
+            }
+            Action::ViNormal => {
+                self.vi_mode = Some(ViMode::Normal);
+                None
+            }
+            Action::ViInsert { append } => {
+                if let Some(motion) = append {
+                    self.composer.move_cursor_to_append(motion);
+                }
+                self.vi_mode = Some(ViMode::Insert);
+                None
+            }
+            Action::ViMotion(motion) => {
+                self.composer.move_cursor(motion);
+                None
+            }
+            Action::ViDeleteChar => {
+                self.composer.delete_next_char();
+                self.palette_dirty = true;
+                None
+            }
+            Action::ViDeleteLine => {
+                if self.vi_pending_d {
+                    self.composer.delete_line();
+                    self.palette_dirty = true;
+                }
+                self.vi_pending_d = !self.vi_pending_d;
                 None
             }
             Action::ToggleTodo => {
@@ -936,12 +1769,19 @@ impl App {
             // The asker gave up waiting (its turn was interrupted); the
             // answer has nowhere to go.
             let _ = prompt.reply.send(answer);
-            // The next queued question gets a fresh idle gate: a held or
-            // repeated hotkey must not answer it on the first prompt's
-            // momentum.
-            self.last_keystroke = Some(self.clock.now());
-            self.question_area = None;
+            self.arm_front_gates();
         }
+    }
+
+    /// Starts the modal gates over for whatever prompt is now at the
+    /// front: a held or repeated key must not answer it on the previous
+    /// prompt's momentum, and a user idle for a second who taps a key as
+    /// the modal comes up has not seen it yet.
+    fn arm_front_gates(&mut self) {
+        let now = self.clock.now();
+        self.last_keystroke = Some(now);
+        self.front_since = (!self.prompts.is_empty()).then_some(now);
+        self.question_area = None;
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
@@ -996,7 +1836,10 @@ impl App {
                 ok,
                 error,
                 duration_ms,
-            } => self.tool_finished(&call_id, ok, error, duration_ms),
+            } => {
+                self.tool_finished(&call_id, ok, error, duration_ms);
+                self.dismiss_prompts(|prompt| prompt.asked_by_call(&call_id));
+            }
             UiMsg::JobStarted { job_id, tool } => self.start_row(
                 Cell::Job {
                     job_id,
@@ -1007,15 +1850,21 @@ impl App {
                 },
                 "job__start",
             ),
-            UiMsg::JobFinished { job_id, ok, error } => self.set_job_status(
-                &job_id,
-                if ok {
-                    JobStatus::Done
-                } else {
-                    JobStatus::Failed(error.unwrap_or_default())
-                },
-            ),
-            UiMsg::JobCancelled { job_id } => self.set_job_status(&job_id, JobStatus::Cancelled),
+            UiMsg::JobFinished { job_id, ok, error } => {
+                self.set_job_status(
+                    &job_id,
+                    if ok {
+                        JobStatus::Done
+                    } else {
+                        JobStatus::Failed(error.unwrap_or_default())
+                    },
+                );
+                self.dismiss_prompts(|prompt| prompt.asked_by_job(&job_id));
+            }
+            UiMsg::JobCancelled { job_id } => {
+                self.set_job_status(&job_id, JobStatus::Cancelled);
+                self.dismiss_prompts(|prompt| prompt.asked_by_job(&job_id));
+            }
             UiMsg::AgentStarted { agent_id, name } => self.start_row(
                 Cell::Agent {
                     agent_id,
@@ -1033,8 +1882,16 @@ impl App {
                     AgentOutcome::Interrupted => AgentStatus::Interrupted,
                 };
                 self.set_agent_status(&agent_id, status);
+                self.dismiss_prompts(|prompt| prompt.asked_by_agent(&agent_id));
             }
             UiMsg::TodoUpdated(items) => self.todo.set_items(items),
+            UiMsg::QueuedInputSent(text) => {
+                // The cell is committed whether or not a held line matched:
+                // the model received the text either way, and the strip may
+                // already have let it go (an interrupt's drop, a swap).
+                remove_sent(&mut self.queued, &text);
+                self.transcript.push(Cell::user_mid_turn(plain_text(&text)))
+            }
             UiMsg::Busy(message) => {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.busy = message;
@@ -1058,8 +1915,13 @@ impl App {
                 }
             }
             UiMsg::Prompt { req, reply } => self.enqueue_prompt(*req, reply),
+            UiMsg::LendTerminal(job) => self.lend_requests.push(job),
         }
         self.schedule_frame();
+    }
+
+    fn take_lend_requests(&mut self) -> Vec<LendJob> {
+        std::mem::take(&mut self.lend_requests)
     }
 
     /// The tool row a hook's call id names: the row with that id, or,
@@ -1235,30 +2097,30 @@ impl App {
     }
 
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
-        let field = match req.action {
-            PromptAction::Confirm => None,
-            PromptAction::Input => Some(new_textarea()),
-            PromptAction::Select | PromptAction::Checkbox | PromptAction::Password => {
-                self.transcript.push(Cell::notice(
-                    NoticeKind::ToolWarning,
-                    format!(
-                        "Prompt kind {} is not available in the TUI yet",
-                        req.action.name()
-                    ),
-                ));
-                let _ = reply.send(PromptAnswer::Cancelled); // TASK-315
-                return;
-            }
-        };
-        if self.prompts.is_empty() {
-            self.question_area = None;
-            // The idle gate counts from the moment the modal appears, not
-            // from the user's last key: a user idle for a second who taps a
-            // hotkey as the modal comes up has not seen it yet. The next
-            // queued prompt is re-armed the same way when the front answers.
-            self.last_keystroke = Some(self.clock.now());
+        self.close_view();
+        let becomes_front = self.prompts.is_empty();
+        self.prompts.push_back(PendingPrompt::new(req, reply));
+        if becomes_front {
+            self.arm_front_gates();
         }
-        self.prompts.push_back(PendingPrompt { req, reply, field });
+    }
+
+    /// Cancels every question, queued or up, whose asker has ended: the
+    /// tool was killed or the job finished under it, so nobody is left
+    /// to take the answer. The front's successor gets a fresh gate.
+    fn dismiss_prompts(&mut self, asked_by: impl Fn(&PendingPrompt) -> bool) {
+        let front_dismissed = self.prompts.front().is_some_and(&asked_by);
+        self.prompts.retain(|prompt| {
+            if asked_by(prompt) {
+                let _ = prompt.reply.send(PromptAnswer::Cancelled);
+                false
+            } else {
+                true
+            }
+        });
+        if front_dismissed {
+            self.arm_front_gates();
+        }
     }
 
     /// Late command output arrives one pipe read at a time; consecutive
@@ -1456,10 +2318,23 @@ impl App {
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
         match self.prompts.front() {
             Some(prompt) => prompt.rows(area.width, area.height),
-            None => u16::try_from(self.composer.lines().len())
-                .unwrap_or(COMPOSER_MAX_ROWS)
-                .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS),
+            None => self.composer.rows() + self.band_rows(area),
         }
+    }
+
+    /// The rows the band above the composer takes from the transcript:
+    /// what the view asks for, or the queued-lines preview when no view
+    /// is open, within what the frame can give once the composer, the
+    /// status and footer rows and the transcript's minimum have theirs.
+    fn band_rows(&self, area: Rect) -> u16 {
+        let room = area
+            .height
+            .saturating_sub(self.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
+        let wanted = match self.view {
+            View::Composer => queued::preview_rows(&self.queued),
+            _ => self.view.band_rows(),
+        };
+        wanted.min(room)
     }
 
     /// One frame from state; `frame.area()` is the only size consulted.
@@ -1496,12 +2371,33 @@ impl App {
 
         self.question_area = match self.prompts.front() {
             Some(prompt) => {
-                let [question, ..] = prompt.areas(bottom.intersection(area));
+                let [question, ..] = prompt.areas(bottom.intersection(area), area);
                 frame.render_widget(PromptModal(prompt), bottom);
                 Some(question)
             }
             None => {
-                frame.render_widget(&self.composer, bottom);
+                let [band, field] = Layout::vertical([
+                    Constraint::Length(self.band_rows(area)),
+                    Constraint::Min(0),
+                ])
+                .areas(bottom);
+                match &self.view {
+                    View::Composer => frame.render_widget(QueuedPreview(&self.queued), band),
+                    View::Palette(palette) => frame.render_widget(PaletteView(palette), band),
+                    View::HistorySearch(search) => frame.render_widget(SearchView(search), band),
+                    View::Rewind(rewind) => frame.render_widget(RewindView(rewind), band),
+                }
+                let macro_names: Vec<&str> =
+                    self.macros.iter().map(|(name, _)| name.as_str()).collect();
+                frame.render_widget(
+                    self.composer.view(
+                        self.config.command_prefix,
+                        &macro_names,
+                        self.renderer.no_color,
+                        self.vi_mode == Some(ViMode::Normal),
+                    ),
+                    field,
+                );
                 None
             }
         };
@@ -1560,10 +2456,10 @@ impl Widget for FooterBar {
     }
 }
 
-/// A prompt drawn where the composer was: question, origin, hint. A
-/// question taller than its rows is cut with a marker counting the hidden
-/// lines and a legend offering only Esc; the cap grows with the terminal,
-/// so enlarging it shows them.
+/// A prompt drawn where the composer was: question, origin, the field or
+/// list, hint. A question taller than its rows is cut with a marker
+/// counting the hidden lines and a legend offering only Esc; the cap
+/// grows with the terminal, so enlarging it shows them.
 struct PromptModal<'a>(&'a PendingPrompt);
 
 impl Widget for PromptModal<'_> {
@@ -1572,8 +2468,7 @@ impl Widget for PromptModal<'_> {
         if area.is_empty() {
             return;
         }
-        let [question, middle, hint] = self.0.areas(area);
-        let req = &self.0.req;
+        let [question, origin, middle, hint] = self.0.areas(area, *buf.area());
         let mut lines = self.0.question_lines(area.width);
         let visible = usize::from(question.height);
         let clipped = lines.len() > visible;
@@ -1587,13 +2482,20 @@ impl Widget for PromptModal<'_> {
             )));
         }
         Paragraph::new(lines).render(question, buf);
-        match &self.0.field {
-            Some(field) => field.render(middle, buf),
-            None => {
-                if let Some(tool) = &req.tool {
-                    Paragraph::new(Line::from(Span::styled(format!("tool: {tool}"), DIM)))
-                        .render(middle, buf);
-                }
+        // A confirm's origin sits in its middle row; every other kind
+        // has a row of its own for it above the field or list.
+        let origin_row = match self.0.kind() {
+            ModalKind::Confirm { .. } => middle,
+            _ => origin,
+        };
+        if let Some(line) = self.0.origin_line() {
+            Paragraph::new(Line::from(Span::styled(line, DIM))).render(origin_row, buf);
+        }
+        match (&self.0.field, self.0.kind()) {
+            (Some(field), _) => field.render(middle, buf),
+            (None, ModalKind::Confirm { .. }) => {}
+            (None, _) => {
+                Paragraph::new(self.0.list_lines(usize::from(middle.height))).render(middle, buf);
             }
         }
         Paragraph::new(self.0.hint_lines(area.width, clipped)).render(hint, buf);
@@ -1604,6 +2506,9 @@ enum Task {
     Turn {
         handle: JoinHandle<(RequestContext, TurnOutcome)>,
         command: bool,
+        /// The context's notification queue, kept while the context is
+        /// away: how a line typed mid-turn reaches the model.
+        queue: Arc<NotificationQueue>,
     },
     Exit(JoinHandle<(RequestContext, Result<()>, String)>),
 }
@@ -1617,6 +2522,25 @@ async fn join(task: &mut Option<Task>) -> Done {
     match task.as_mut().expect("polled only while a task runs") {
         Task::Turn { handle, .. } => Done::Turn(handle.await),
         Task::Exit(handle) => Done::Exit(handle.await),
+    }
+}
+
+/// Sends `line` off with the context as a turn.
+fn start_turn(
+    app: &mut App,
+    ctx: RequestContext,
+    abort: &AbortSignal,
+    tx: &UnboundedSender<UiMsg>,
+    line: String,
+) -> Task {
+    abort.reset();
+    let command = is_command(&line, ctx.app.config.command_prefix);
+    app.begin_turn(&line, command);
+    let queue = Arc::clone(&ctx.notification_queue);
+    Task::Turn {
+        handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),
+        command,
+        queue,
     }
 }
 
@@ -1733,7 +2657,9 @@ impl Unfinished {
 struct Shell<'a> {
     app: &'a mut App,
     screen: &'a mut Screen,
-    stream: EventStream,
+    /// Always `Some` outside `renew_stream`; the option exists so the old
+    /// stream can be dropped before its replacement is built.
+    stream: Option<EventStream>,
     termination: Termination,
     rx: UnboundedReceiver<UiMsg>,
     tx: UnboundedSender<UiMsg>,
@@ -1844,12 +2770,15 @@ fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> 
 /// and whatever the editor left in it are removed on every path.
 fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     let dir = crate::utils::temp_file("-tui-edit-", "");
-    let mut dir_options = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let dir_options = {
         use std::os::unix::fs::DirBuilderExt;
-        dir_options.mode(0o700);
-    }
+        let mut options = std::fs::DirBuilder::new();
+        options.mode(0o700);
+        options
+    };
+    #[cfg(not(unix))]
+    let dir_options = std::fs::DirBuilder::new();
     dir_options.create(&dir)?;
     let path = dir.join("buffer.md");
     let mut options = std::fs::OpenOptions::new();
@@ -1870,7 +2799,9 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     let status = std::process::Command::new(editor).arg(&path).status();
     let edited = std::fs::read_to_string(&path);
     let _ = std::fs::remove_dir_all(&dir);
-    if !status?.success() {
+    let status = status?;
+    crate::utils::report_editor_exit(status);
+    if !status.success() {
         return Ok(text.to_string());
     }
     Ok(edited?.trim_end_matches('\n').to_string())
@@ -1903,8 +2834,8 @@ pub fn ensure_tty() -> Result<()> {
 
 pub async fn run(mut ctx: RequestContext) -> Result<()> {
     ensure_tty()?;
-    let _active = ActiveGuard::set();
     let (tx, rx) = unbounded_channel();
+    let _active = ActiveGuard::set(tx.clone());
     let auto_cancel = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(TuiSink::new(tx.clone()));
     ctx.ui = Arc::clone(&sink) as Arc<dyn crate::turn::UiSink>;
@@ -1917,7 +2848,15 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         Arc::clone(&ctx.prompt_memory),
         FooterInfo::from_ctx(&ctx),
     )?;
+    // The first frame reads the context the way every later idle return
+    // does: the palette's command set in particular, which is otherwise
+    // the bare one until the first command hands the context back.
+    app.sync_from_ctx(&mut ctx);
 
+    // Fd 1 is still the terminal here; a turn's capture takes it over.
+    if let Some(reason) = remember_tty() {
+        app.push_notice(NoticeKind::ToolWarning, reason);
+    }
     let mut screen = Screen::enter()?;
     // Armed only once the terminal is ours. Entering blocks on the
     // keyboard-enhancement probe, which spins on a tty whose master has
@@ -1935,7 +2874,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     let mut shell = Shell {
         app: &mut app,
         screen: &mut screen,
-        stream: EventStream::new(),
+        stream: Some(EventStream::new()),
         termination,
         rx,
         tx,
@@ -2060,6 +2999,97 @@ fn quit_abort(abort: &AbortSignal, turn_running: bool) {
     }
 }
 
+/// Takes the user's lines off the running turn's queue. The strip was
+/// cleared with the interrupt or the quit; the copies on the queue must
+/// go too, or the next tool round would still hand them to the model
+/// and a quit's final tool result could carry them.
+fn purge_turn_queue(task: &Option<Task>) {
+    if let Some(Task::Turn { queue, .. }) = task {
+        take_user_messages(queue);
+    }
+}
+
+/// Takes the `pops` newest exchanges out of the session, stopping at
+/// the first that cannot be undone: how many came out, and what stopped
+/// it short.
+fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> (usize, Option<anyhow::Error>) {
+    for popped in 0..pops {
+        if let Err(err) = ctx.undo_last_exchange() {
+            return (popped, Some(err));
+        }
+    }
+    (pops, None)
+}
+
+/// Takes the chosen exchanges out of the session and the transcript and
+/// gives the oldest one's prompt back to the composer. Every offered row
+/// sits above the newest macro turn, so each one is a single exchange
+/// and popping one per row keeps the session and the transcript in
+/// step; the transcript goes back only as far as the session did, and a
+/// stop short of the choice is said. Without a session there is nothing
+/// to pop and the transcript is the whole of the rewind. The composer
+/// gets the row's own text, not the session's prefill: a command row
+/// holds the command, which the session never did.
+fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
+    let chosen = target.rows.len();
+    let (cut, stopped) = if ctx.session.is_some() {
+        rewind_exchanges(ctx, chosen)
+    } else {
+        (chosen, None)
+    };
+    app.sync_from_ctx(ctx);
+    if let Some(row) = cut
+        .checked_sub(1)
+        .and_then(|oldest| target.rows.get(oldest))
+    {
+        app.transcript.truncate(row.opener);
+        app.set_composer_text(&row.title);
+    }
+    app.refresh_palette(Some(ctx));
+    // The notice is a transcript cell, so it goes in after the cut or
+    // the cut would take it with the exchanges.
+    if let Some(err) = stopped {
+        app.handle_msg(UiMsg::Notice {
+            kind: NoticeKind::ToolWarning,
+            text: format!("Rewind stopped: {err}"),
+        });
+    }
+}
+
+/// Replaces the event stream, dropping the old one first. Constructing a
+/// crossterm stream takes the shared reader lock, and the old stream's
+/// pending poll holds that lock until the stream is dropped (dropping it
+/// sets its shutdown flag and wakes the poll). During a turn the run loop
+/// always has a poll in flight, so building the new stream before
+/// dropping the old one would wait on the lock until the next keystroke.
+fn renew_stream(stream: &mut Option<EventStream>) {
+    drop(stream.take());
+    *stream = Some(EventStream::new());
+}
+
+/// Hands the terminal to `f` in its normal modes and takes it back: the
+/// event stream is restarted around the release so nothing it had in
+/// flight lands on the child or comes back as a keystroke, a Ctrl+C
+/// meant for the child is forgotten, and what the terminal queued
+/// meanwhile is dropped.
+async fn with_terminal_released<T>(
+    screen: &mut Screen,
+    stream: &mut Option<EventStream>,
+    termination: &mut Termination,
+    f: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    renew_stream(stream);
+    let released = screen.with_terminal_released(f);
+    termination.discard_pending();
+    flush_typeahead(
+        stream
+            .as_mut()
+            .expect("the event stream is renewed in place"),
+    )
+    .await;
+    released
+}
+
 async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let Shell {
         app,
@@ -2077,7 +3107,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let mut frame_failing = false;
     loop {
         let step = tokio::select! {
-            event = stream.next() => Step::Input(event),
+            event = stream.as_mut().expect("the event stream is renewed in place").next() => Step::Input(event),
             msg = rx.recv() => Step::Msg(msg),
             _ = app.frames.next_frame() => Step::Frame,
             done = join(&mut task), if task.is_some() => Step::Work(Box::new(done)),
@@ -2091,6 +3121,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 auto_cancel.store(true, Ordering::SeqCst);
                 app.begin_exit();
                 app.abandon_prompts();
+                purge_turn_queue(&task);
                 return match task.take() {
                     Some(Task::Turn { handle, .. }) => {
                         abort.set_ctrlc();
@@ -2126,13 +3157,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 match command {
                     Some(Command::Submit(line)) => {
                         if let Some(ctx) = ctx.take() {
-                            abort.reset();
-                            let command = is_command(&line, ctx.app.config.command_prefix);
-                            app.begin_turn(&line, command);
-                            task = Some(Task::Turn {
-                                handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),
-                                command,
-                            });
+                            task = Some(start_turn(app, ctx, abort, tx, line));
                         } else {
                             // Submit is not mapped while a task holds the
                             // context; should that ever change, the draft
@@ -2141,24 +3166,47 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             app.set_composer_text(&line);
                         }
                     }
-                    Some(Command::Interrupt) => abort.set_ctrlc(),
+                    Some(Command::Queue(text)) => {
+                        if let Some(Task::Turn { queue, .. }) = &task {
+                            queued::queue_user_message(queue, &text);
+                        }
+                    }
+                    Some(Command::Unqueue { held, draft }) => {
+                        if let Some(Task::Turn { queue, .. }) = &task {
+                            if let Some(text) = held
+                                && !queued::unqueue_user_message(queue, &text)
+                            {
+                                app.handle_msg(UiMsg::Notice {
+                                    kind: NoticeKind::ToolWarning,
+                                    text: "already sent to the model".to_string(),
+                                });
+                            }
+                            if let Some(text) = draft {
+                                queued::queue_user_message(queue, &text);
+                            }
+                        }
+                    }
+                    Some(Command::Interrupt) => {
+                        abort.set_ctrlc();
+                        purge_turn_queue(&task);
+                    }
                     Some(Command::Quit) => {
                         quit_requested = true;
                         quit_abort(abort, task.is_some());
+                        purge_turn_queue(&task);
                     }
                     Some(Command::Suspend) => {
                         #[cfg(unix)]
                         {
-                            *stream = EventStream::new();
-                            let released = screen.with_terminal_released(|| {
-                                // SAFETY: raise takes a signal number and no pointers.
-                                unsafe { libc::raise(libc::SIGTSTP) };
-                            });
-                            termination.discard_pending();
+                            let released =
+                                with_terminal_released(screen, stream, termination, || {
+                                    // SAFETY: raise takes a signal number and no pointers.
+                                    unsafe { libc::raise(libc::SIGTSTP) };
+                                })
+                                .await;
                             if let Err(err) = released {
                                 warn!("Failed to re-enter the alternate screen: {err}");
                             }
-                            flush_typeahead(stream).await;
                             app.schedule_frame();
                         }
                     }
@@ -2166,10 +3214,11 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         let text = app.composer_text();
                         match app.config.editor() {
                             Ok(editor) => {
-                                *stream = EventStream::new();
-                                let edited = screen
-                                    .with_terminal_released(|| edit_in_editor(&editor, &text));
-                                termination.discard_pending();
+                                let edited =
+                                    with_terminal_released(screen, stream, termination, || {
+                                        edit_in_editor(&editor, &text)
+                                    })
+                                    .await;
                                 match edited {
                                     Ok(Ok(edited)) => app.set_composer_text(&edited),
                                     Ok(Err(err)) => app.handle_msg(UiMsg::Notice {
@@ -2180,7 +3229,6 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                                         warn!("Failed to re-enter the alternate screen: {err}")
                                     }
                                 }
-                                flush_typeahead(stream).await;
                             }
                             Err(err) => app.handle_msg(UiMsg::Notice {
                                 kind: NoticeKind::ToolWarning,
@@ -2195,8 +3243,17 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         }
                         app.schedule_frame();
                     }
+                    Some(Command::Rewind(target)) => {
+                        if let Some(ctx) = ctx.as_mut() {
+                            apply_rewind(app, ctx, target);
+                        }
+                    }
                     None => {}
                 }
+                // After the dispatch, not before: an editor's result or a
+                // rewind's prefill replaces the composer, and the band
+                // must not keep a token range from the line it had.
+                app.refresh_palette(ctx.as_ref());
             }
             Step::Msg(Some(msg)) => app.handle_msg(msg),
             Step::Msg(None) => {}
@@ -2216,7 +3273,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             }
             Step::Work(done) => match *done {
                 Done::Turn(joined) => {
-                    let Some(Task::Turn { command, .. }) = task.take() else {
+                    let Some(Task::Turn { command, queue, .. }) = task.take() else {
                         continue;
                     };
                     match joined {
@@ -2230,10 +3287,28 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             }
                             app.end_turn(command, &outcome);
                             app.sync_from_ctx(&mut returned);
+                            app.refresh_palette(Some(&returned));
                             if outcome.exit {
                                 quit_requested = true;
                             }
-                            ctx = Some(returned);
+                            reconcile_queue(&mut app.queued, &take_user_messages(&queue));
+                            // An `.exit` that ran from the queue ends the
+                            // session for the lines behind it as well.
+                            if quit_requested {
+                                app.drop_queued();
+                            }
+                            if quit_requested || app.queued.is_empty() {
+                                ctx = Some(returned);
+                            } else {
+                                // What the model did not get runs as turns
+                                // of its own, the rest offered to each of
+                                // them in turn, on the returned context's
+                                // queue: an agent switch during the turn
+                                // left the finished turn's behind.
+                                let next = app.queued.remove(0);
+                                carry_over(&returned.notification_queue, &app.queued);
+                                task = Some(start_turn(app, returned, abort, tx, next.text));
+                            }
                         }
                         Err(err) => {
                             let late = app.turn_late_output();
@@ -2259,6 +3334,16 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 }
             },
         }
+        for LendJob(job) in app.take_lend_requests() {
+            let released = with_terminal_released(screen, stream, termination, || {
+                job(&TtyHandles { _private: () })
+            })
+            .await;
+            if let Err(err) = released {
+                warn!("Failed to re-enter the alternate screen: {err}");
+            }
+            app.schedule_frame();
+        }
         if quit_requested
             && task.is_none()
             && let Some(ctx) = ctx.take()
@@ -2273,7 +3358,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
 mod tests {
     use super::*;
     use crate::client::{ClientConfig, Model};
-    use crate::config::{AppState, Session, SessionScope, WorkingMode};
+    use crate::config::{AppState, Input, Session, SessionScope, WorkingMode};
     use crate::events::{Event, Origin};
     use crate::prompt::Prompter;
     use crate::testing::TestConfigDirGuard;
@@ -2287,6 +3372,7 @@ mod tests {
     fn plain_config() -> Arc<AppConfig> {
         Arc::new(AppConfig {
             highlight: false,
+            save_shell_history: false,
             ..Default::default()
         })
     }
@@ -2296,6 +3382,7 @@ mod tests {
         app.config = Arc::new(AppConfig {
             dry_run: true,
             highlight: false,
+            save_shell_history: false,
             clients: vec![ClientConfig::default()],
             memory: Some(false),
             workspace_instructions: Some(false),
@@ -2365,7 +3452,19 @@ mod tests {
         }
 
         fn press(&mut self, code: KeyCode) -> Option<Command> {
-            self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            self.press_with_ctx(code, None)
+        }
+
+        /// A key followed by the palette refresh the loop runs after
+        /// every input, with the context in hand when `ctx` is given.
+        fn press_with_ctx(
+            &mut self,
+            code: KeyCode,
+            ctx: Option<&RequestContext>,
+        ) -> Option<Command> {
+            let command = self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            self.app.refresh_palette(ctx);
+            command
         }
 
         fn type_text(&mut self, text: &str) {
@@ -2398,18 +3497,48 @@ mod tests {
         }
     }
 
+    /// How long a test waits for an asker's answer before it is declared
+    /// stuck; the alternative is a test that never ends.
+    const ASKER_WAIT: Duration = Duration::from_secs(5);
+
+    /// A prompt asked on its own thread; `join` is bounded by
+    /// `ASKER_WAIT`.
+    struct Asker {
+        answer: mpsc::Receiver<Result<PromptAnswer>>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Asker {
+        fn is_finished(&self) -> bool {
+            self.thread.is_finished()
+        }
+
+        fn join(self) -> std::thread::Result<Result<PromptAnswer>> {
+            match self.answer.recv_timeout(ASKER_WAIT) {
+                Ok(answer) => self.thread.join().map(|()| answer),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the asker got no answer within {ASKER_WAIT:?}")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(self
+                    .thread
+                    .join()
+                    .expect_err("a thread that sent no answer panicked")),
+            }
+        }
+    }
+
     /// Asks through the prompter on its own thread, the way a tool would,
     /// and delivers the request to the app.
-    fn ask_on_a_thread(
-        harness: &mut Harness,
-        req: PromptRequest,
-    ) -> std::thread::JoinHandle<Result<PromptAnswer>> {
+    fn ask_on_a_thread(harness: &mut Harness, req: PromptRequest) -> Asker {
         let (tx, mut rx) = unbounded_channel();
         let prompter = TuiPrompter::new(tx, Arc::new(AtomicBool::new(false)));
-        let asker = std::thread::spawn(move || prompter.prompt(req));
+        let (answer_tx, answer) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = answer_tx.send(prompter.prompt(req));
+        });
         let msg = rx.blocking_recv().expect("the prompter sends the request");
         harness.app.handle_msg(msg);
-        asker
+        Asker { answer, thread }
     }
 
     fn duplicated_adjacent_rows(rendered: &str) -> usize {
@@ -2432,9 +3561,15 @@ mod tests {
         );
     }
 
+    /// How long a `run_async` body may take before the test is declared
+    /// stuck; a turn that waits on a reply that never comes would
+    /// otherwise hang the whole binary.
+    const RUN_ASYNC_WAIT: Duration = Duration::from_secs(60);
+
     /// Drives a turn on a runtime whose workers have the stack headroom
     /// `run_repl_command` needs in debug builds; a default 2 MiB worker
-    /// overflows and aborts the whole test binary.
+    /// overflows and aborts the whole test binary. The body is bounded
+    /// by `RUN_ASYNC_WAIT`.
     fn run_async<F>(f: F) -> F::Output
     where
         F: Future + Send,
@@ -2451,7 +3586,13 @@ mod tests {
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(f)
+                        .block_on(async {
+                            tokio::time::timeout(RUN_ASYNC_WAIT, f)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    panic!("the async test body did not finish within {RUN_ASYNC_WAIT:?}")
+                                })
+                        })
                 })
                 .unwrap()
                 .join()
@@ -2929,6 +4070,108 @@ mod tests {
         assert_eq!(harness.app.composer_text(), "draft");
     }
 
+    /// The gate holds for every modal kind and its answer key: the key
+    /// pressed before the question arrives is typing, the key one
+    /// millisecond short of the idle second is dropped (and re-arms a
+    /// hotkey's gate), and the key at the full second answers. A fresh
+    /// modal answered exactly at the second pins the boundary itself;
+    /// for the input field, characters typed inside that second do not
+    /// move it.
+    #[test]
+    fn checklist_8_typeahead_and_idle_gate_guard_the_modal() {
+        type GateCase = (
+            &'static str,
+            fn() -> PromptRequest,
+            &'static str,
+            KeyCode,
+            PromptAnswer,
+        );
+        let input_request = || PromptRequest::new(PromptAction::Input, "Name?", Origin::detached());
+        let cases: [GateCase; 3] = [
+            (
+                "confirm",
+                || confirm_request(None),
+                "",
+                KeyCode::Char('y'),
+                PromptAnswer::Confirmed(true),
+            ),
+            (
+                "input",
+                input_request,
+                "ab",
+                KeyCode::Enter,
+                PromptAnswer::Text("ab".to_string()),
+            ),
+            (
+                "select",
+                || list_request(PromptAction::Select, None),
+                "",
+                KeyCode::Char('1'),
+                PromptAnswer::Selected("alpha".to_string()),
+            ),
+        ];
+        for (kind, request, typed, key, expected) in cases {
+            let mut harness = Harness::standalone(80, 24);
+            harness.clock.advance(10 * HOTKEY_IDLE);
+            assert_eq!(harness.press(key), None, "{kind}");
+            let asker = ask_on_a_thread(&mut harness, request());
+            harness.type_text(typed);
+            assert_eq!(
+                harness.app.prompts.len(),
+                1,
+                "{kind}: the early key answered"
+            );
+            assert!(!asker.is_finished(), "{kind}");
+            harness
+                .clock
+                .advance(HOTKEY_IDLE - Duration::from_millis(1));
+            assert_eq!(harness.press(key), None);
+            assert_eq!(
+                harness.app.prompts.len(),
+                1,
+                "{kind}: answered a millisecond early"
+            );
+            assert!(!asker.is_finished(), "{kind}");
+            harness.clock.advance(HOTKEY_IDLE);
+            assert_eq!(harness.press(key), None);
+            assert_eq!(asker.join().unwrap().unwrap(), expected, "{kind}");
+
+            let mut harness = Harness::standalone(80, 24);
+            harness.clock.advance(10 * HOTKEY_IDLE);
+            let asker = ask_on_a_thread(&mut harness, request());
+            harness.type_text(typed);
+            harness.clock.advance(HOTKEY_IDLE);
+            assert_eq!(harness.press(key), None);
+            assert_eq!(
+                asker.join().unwrap().unwrap(),
+                expected,
+                "{kind}: the full second did not answer"
+            );
+        }
+
+        // A checkbox's Space is held to the same gate: typed ahead it
+        // ticks nothing and re-arms, after the idle second it ticks.
+        let mut harness = Harness::standalone(80, 24);
+        harness.clock.advance(10 * HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Checkbox, None));
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert!(harness.draw().contains("[ ] alpha"));
+        harness
+            .clock
+            .advance(HOTKEY_IDLE - Duration::from_millis(1));
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert!(harness.draw().contains("[ ] alpha"));
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert!(harness.draw().contains("[x] alpha"));
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Checked(vec!["alpha".to_string()])
+        );
+    }
+
     /// Answering one question re-arms the idle gate for the next queued
     /// one: a `y` held down or pressed twice answers only the first.
     #[test]
@@ -3015,9 +4258,10 @@ mod tests {
         );
     }
 
-    /// Enter tapped while the turn runs maps to nothing, but it is still
-    /// a keystroke for the idle gate: a confirm appearing right after one
-    /// is not answered by the next tap of the same key.
+    /// Enter tapped on an empty composer while the turn runs holds
+    /// nothing, but it is still a keystroke for the idle gate: a confirm
+    /// appearing right after one is not answered by the next tap of the
+    /// same key.
     #[test]
     fn enter_ignored_during_a_turn_still_arms_the_idle_gate_for_a_fresh_confirm() {
         let mut harness = Harness::standalone(80, 24);
@@ -3045,6 +4289,362 @@ mod tests {
         );
     }
 
+    /// A prompt entered during a turn is held and handed to the loop,
+    /// whose step puts it on the turn's queue and announces it; a command
+    /// is only held. Alt+Up takes the newest back, newest first.
+    #[test]
+    #[serial]
+    fn lines_entered_during_a_turn_are_queued_and_prompts_reach_the_model() {
+        let sink = crate::events::RecordingSink::install();
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("hello q9d-q");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("hello q9d-q".to_string()))
+        );
+        assert_eq!(harness.app.composer_text(), "");
+        let frame = harness.draw();
+        assert!(frame.contains("pending: 1"), "{frame}");
+        assert!(frame.contains("hello q9d-q"), "{frame}");
+
+        let queue = NotificationQueue::new();
+        queued::queue_user_message(&queue, "hello q9d-q");
+        assert_eq!(
+            sink.drain(),
+            vec![Event::QueuedInput {
+                text: "hello q9d-q".to_string()
+            }]
+        );
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            &drained[0],
+            crate::supervisor::notification::SystemNotification::UserMessage { text }
+                if text == "hello q9d-q"
+        ));
+
+        harness.type_text(".info");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            harness.app.queued,
+            vec![
+                QueuedLine {
+                    text: "hello q9d-q".to_string(),
+                    command: false
+                },
+                QueuedLine {
+                    text: ".info".to_string(),
+                    command: true
+                },
+            ]
+        );
+        assert!(sink.drain().is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("pending: 2"), "{frame}");
+
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(harness.app.handle_key(alt_up), None);
+        assert_eq!(harness.app.composer_text(), ".info");
+        // The second Alt+Up finds `.info` as the draft and holds it again.
+        assert_eq!(
+            harness.app.handle_key(alt_up),
+            Some(Command::Unqueue {
+                held: Some("hello q9d-q".to_string()),
+                draft: None,
+            })
+        );
+        assert_eq!(harness.app.composer_text(), "hello q9d-q");
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: ".info".to_string(),
+                command: true
+            }]
+        );
+        assert!(harness.draw().contains("pending: 1"));
+    }
+
+    /// Alt+Up over a draft trades places with it: the held line comes
+    /// out, the draft goes to the end of the queue, and the loop is told
+    /// to withdraw the one and offer the other.
+    #[test]
+    fn editing_a_queued_line_keeps_the_draft_on_the_queue() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("a");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("a".to_string()))
+        );
+        harness.type_text("d");
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(
+            harness.app.handle_key(alt_up),
+            Some(Command::Unqueue {
+                held: Some("a".to_string()),
+                draft: Some("d".to_string()),
+            })
+        );
+        assert_eq!(harness.app.composer_text(), "a");
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: "d".to_string(),
+                command: false
+            }]
+        );
+    }
+
+    /// The strip follows the model: a line it was handed leaves the queue
+    /// the moment the cell is committed, so the count is right and Alt+Up
+    /// cannot pull a sent line back into the composer.
+    #[test]
+    fn a_line_sent_mid_turn_leaves_the_queue_at_once() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        for text in ["a", "b"] {
+            harness.type_text(text);
+            assert_eq!(
+                harness.press(KeyCode::Enter),
+                Some(Command::Queue(text.to_string()))
+            );
+        }
+        assert!(harness.draw().contains("pending: 2"));
+        harness
+            .app
+            .handle_msg(UiMsg::QueuedInputSent("a".to_string()));
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: "b".to_string(),
+                command: false
+            }]
+        );
+        let frame = harness.draw();
+        assert!(frame.contains("pending: 1"), "{frame}");
+        assert!(frame.contains("> a (sent mid-turn)"), "{frame}");
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(
+            harness.app.handle_key(alt_up),
+            Some(Command::Unqueue {
+                held: Some("b".to_string()),
+                draft: None,
+            })
+        );
+        assert_eq!(harness.app.composer_text(), "b");
+        assert!(harness.app.queued.is_empty());
+    }
+
+    /// The moment the model is handed a queued line, the transcript gets
+    /// a cell for it where it was read, scrubbed like a typed line.
+    #[test]
+    fn a_line_sent_mid_turn_is_committed_as_a_scrubbed_cell() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness
+            .app
+            .handle_msg(UiMsg::QueuedInputSent("\x1b[31mred\x1b[0m".to_string()));
+        assert!(matches!(
+            harness.app.transcript.cells(),
+            [
+                Cell::User {
+                    mid_turn: false,
+                    ..
+                },
+                Cell::User {
+                    text,
+                    mid_turn: true,
+                    opened: false,
+                    ..
+                }
+            ] if text == "red"
+        ));
+    }
+
+    /// A user line, a reply, the line sent mid-turn, the next reply. The
+    /// mid-turn cell carries its marker in the text itself and is drawn
+    /// dim, so it reads as sent-by-the-queue with or without colour.
+    fn mid_turn_transcript(harness: &mut Harness) -> String {
+        harness.app.begin_turn("explain", false);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("first reply".to_string()));
+        harness
+            .app
+            .handle_msg(UiMsg::QueuedInputSent("follow-up k4e-m".to_string()));
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("second reply".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.draw()
+    }
+
+    #[test]
+    fn the_mid_turn_cell_is_dim_with_a_marker() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(false);
+        let frame = mid_turn_transcript(&mut harness);
+        insta::assert_snapshot!("mid_turn_cell_80x24", &frame);
+        let row = screen_row(&harness, "> follow-up k4e-m (sent mid-turn)");
+        let buffer = harness.terminal.backend().buffer();
+        assert!(buffer[(0, row)].modifier.contains(Modifier::DIM), "{frame}");
+        assert!(
+            !buffer[(0, row)].modifier.contains(Modifier::BOLD),
+            "{frame}"
+        );
+        let typed = screen_row(&harness, "> explain");
+        assert!(
+            buffer[(0, typed)].modifier.contains(Modifier::BOLD),
+            "{frame}"
+        );
+        assert!(
+            !buffer[(0, typed)].modifier.contains(Modifier::DIM),
+            "{frame}"
+        );
+        let placeholder = &buffer[(1, COMPOSER_TEXT_ROW)];
+        assert_eq!(placeholder.symbol(), "T", "{frame}");
+        assert!(placeholder.modifier.contains(Modifier::DIM), "{frame}");
+        assert_eq!(placeholder.bg, Color::Indexed(236), "{frame}");
+    }
+
+    #[test]
+    fn the_mid_turn_marker_survives_no_color() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(true);
+        let frame = mid_turn_transcript(&mut harness);
+        insta::assert_snapshot!("mid_turn_cell_nocolor_80x24", &frame);
+        assert!(frame.contains("(sent mid-turn)"), "{frame}");
+        let row = screen_row(&harness, "> follow-up k4e-m (sent mid-turn)");
+        let buffer = harness.terminal.backend().buffer();
+        assert!(buffer[(0, row)].modifier.contains(Modifier::DIM), "{frame}");
+        let placeholder = &buffer[(1, COMPOSER_TEXT_ROW)];
+        assert_eq!(placeholder.symbol(), "T", "{frame}");
+        assert!(placeholder.modifier.contains(Modifier::DIM), "{frame}");
+        assert_eq!(placeholder.bg, Color::Reset, "{frame}");
+    }
+
+    /// Esc during a turn drops what was lined up behind it and says so.
+    /// The second held line went in through the palette, which the queue
+    /// closes: the Esc that follows reaches the turn, not a band.
+    #[test]
+    fn an_interrupt_drops_the_queued_lines_with_a_notice() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("later");
+        harness.press(KeyCode::Enter);
+        harness.type_text(".info");
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(harness.app.queued.len(), 2);
+        assert!(harness.app.composer.is_empty());
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.vi_mode, None);
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(harness.app.queued.is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("Dropped 2 queued line(s)"), "{frame}");
+        assert!(!frame.contains("pending:"), "{frame}");
+    }
+
+    /// Ctrl+D during a turn quits, and what was lined up behind the turn
+    /// goes the same way as on an interrupt, with the same notice.
+    #[test]
+    fn a_quit_drops_the_queued_lines_with_a_notice() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("later");
+        harness.press(KeyCode::Enter);
+        assert_eq!(harness.app.queued.len(), 1);
+        let quit = harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(quit, Some(Command::Quit));
+        assert!(harness.app.queued.is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("Dropped 1 queued line(s)"), "{frame}");
+    }
+
+    /// The loop's half of the drop: the user's lines come off the queue
+    /// the running turn reads, a task's notification stays for the exit
+    /// work, and no task at all is nothing to purge.
+    #[tokio::test]
+    async fn purging_the_turn_queue_takes_only_the_users_lines() {
+        let queue = Arc::new(NotificationQueue::new());
+        queued::queue_user_message(&queue, "later");
+        queue.push(crate::supervisor::notification::job_notification(
+            "job-1", "tool", true,
+        ));
+        let task = Some(Task::Turn {
+            handle: tokio::spawn(std::future::pending()),
+            command: false,
+            queue: Arc::clone(&queue),
+        });
+        purge_turn_queue(&task);
+        purge_turn_queue(&None);
+        let left = queue.drain();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id(), Some("job-1"));
+    }
+
+    /// A line queued after the interrupt, before the turn actually ends,
+    /// survives the reconcile even when the dropped one is still on the
+    /// queue the turn hands back.
+    #[test]
+    fn a_line_queued_after_an_interrupt_survives_the_reconcile() {
+        let mut harness = Harness::standalone(80, 24);
+        let queue = NotificationQueue::new();
+        harness.app.begin_turn("explain", false);
+        harness.type_text("a");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("a".to_string()))
+        );
+        queued::queue_user_message(&queue, "a");
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(harness.app.queued.is_empty());
+        harness.type_text("b");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("b".to_string()))
+        );
+        queued::queue_user_message(&queue, "b");
+
+        reconcile_queue(&mut harness.app.queued, &take_user_messages(&queue));
+        let texts: Vec<&str> = harness.app.queued.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["b"]);
+    }
+
+    /// The lines left over at the end of a turn go on the queue of the
+    /// context that came back, the one the next turn clones. A `.agent`
+    /// turn hands back a context with a fresh queue, and what the end of
+    /// the turn put on the old one would never be taken again.
+    #[test]
+    fn leftover_lines_are_carried_on_the_returned_contexts_queue() {
+        let mut harness = Harness::standalone(80, 24);
+        let mut ctx = chat_ctx();
+        let finished = Arc::clone(&ctx.notification_queue);
+        harness.app.begin_turn(".agent helper", true);
+        harness.type_text("first q9d-a");
+        harness.press(KeyCode::Enter);
+        harness.type_text("second q9d-b");
+        harness.press(KeyCode::Enter);
+        carry_over(&finished, &harness.app.queued);
+        ctx.notification_queue = Arc::new(NotificationQueue::new());
+        harness.app.end_turn(true, &TurnOutcome::default());
+
+        reconcile_queue(&mut harness.app.queued, &take_user_messages(&finished));
+        assert_eq!(harness.app.queued.len(), 2);
+        let next = harness.app.queued.remove(0);
+        assert_eq!(next.text, "first q9d-a");
+        carry_over(&ctx.notification_queue, &harness.app.queued);
+        assert_eq!(
+            take_user_messages(&ctx.notification_queue),
+            ["second q9d-b"]
+        );
+        assert!(take_user_messages(&finished).is_empty());
+    }
+
     #[test]
     fn yes_for_this_session_answers_and_is_remembered_for_the_tool() {
         let mut harness = Harness::standalone(80, 24);
@@ -3061,6 +4661,10 @@ mod tests {
         assert_eq!(harness.app.prompt_memory.auto_answer(&req), Some(true));
     }
 
+    /// Enter on the field settles from the modal's appearance: the
+    /// answer is typed, so typing must not push the send out. Enter a
+    /// millisecond short of the second is dropped, more typing right
+    /// after does not re-arm it, and Enter at the second sends.
     #[test]
     fn an_input_modal_types_into_its_own_field_and_sends_it() {
         let mut harness = Harness::standalone(80, 24);
@@ -3071,27 +4675,290 @@ mod tests {
         let frame = harness.draw();
         assert_welcome_snapshot("input_modal_80x24", &frame);
         assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness
+            .clock
+            .advance(HOTKEY_IDLE - Duration::from_millis(1));
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness.type_text(" two");
+        harness.clock.advance(Duration::from_millis(1));
+        assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
-            PromptAnswer::Text("notes".to_string())
+            PromptAnswer::Text("notes two".to_string())
         );
         assert_eq!(harness.app.composer_text(), "draft");
     }
 
+    fn list_request(action: PromptAction, tool: Option<&str>) -> PromptRequest {
+        PromptRequest {
+            options: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
+            tool: tool.map(str::to_string),
+            ..PromptRequest::new(action, "Pick one q9d-s", Origin::detached())
+        }
+    }
+
+    /// A select lists its options under the question with the custom row
+    /// last; the arrows move the marker without the gate and Enter, once
+    /// idle, sends the marked option's text.
     #[test]
-    fn unsupported_prompt_kinds_are_cancelled_at_once() {
+    fn a_select_modal_moves_its_marker_and_sends_the_row() {
         let mut harness = Harness::standalone(80, 24);
-        let req = PromptRequest::new(PromptAction::Select, "Pick one", Origin::detached());
-        let asker = ask_on_a_thread(&mut harness, req);
-        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        let asker = ask_on_a_thread(
+            &mut harness,
+            list_request(PromptAction::Select, Some("ask")),
+        );
+        assert_eq!(harness.press(KeyCode::Down), None);
+        let frame = harness.draw();
+        assert_welcome_snapshot("select_modal_80x24", &frame);
+        assert!(frame.contains("tool: ask"), "{frame}");
+        assert!(frame.contains(CUSTOM_CHOICE_ROW), "{frame}");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Selected("beta".to_string())
+        );
         assert!(harness.app.prompts.is_empty());
-        assert!(matches!(
-            harness.app.transcript.cells().last(),
-            Some(Cell::Notice {
-                kind: NoticeKind::ToolWarning,
-                ..
+    }
+
+    /// A digit chooses the select's row outright; one past the options
+    /// does nothing, so a stray key cannot answer with the custom row.
+    #[test]
+    fn a_select_digit_chooses_the_row_outright() {
+        let mut harness = Harness::standalone(80, 24);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, None));
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('4')), None);
+        assert!(!asker.is_finished());
+        assert_eq!(harness.press(KeyCode::Char('3')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Selected("gamma".to_string())
+        );
+    }
+
+    /// Enter on the custom row swaps the list for a text field, and the
+    /// field opens with a fresh gate: the Enter that typed the text
+    /// cannot send it until the gap passes. What is sent is a selection,
+    /// so the asker reads it like any other row.
+    #[test]
+    fn the_custom_row_of_a_select_opens_a_field_whose_text_is_the_selection() {
+        let mut harness = Harness::standalone(80, 24);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, None));
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('k')), None);
+        for _ in 0..5 {
+            assert_eq!(harness.press(KeyCode::Down), None);
+        }
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            harness.app.key_context().modal,
+            Some(ModalKind::Select {
+                custom_field_open: true
             })
-        ));
+        );
+        harness.type_text("delta");
+        let frame = harness.draw();
+        assert_welcome_snapshot("select_custom_field_80x24", &frame);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Selected("delta".to_string())
+        );
+    }
+
+    /// A checkbox ticks rows with Space and Enter sends the ticked
+    /// options in the list's order.
+    #[test]
+    fn a_checkbox_modal_ticks_rows_and_sends_them_in_order() {
+        let mut harness = Harness::standalone(80, 24);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Checkbox, None));
+        assert_eq!(harness.press(KeyCode::Down), None);
+        assert_eq!(harness.press(KeyCode::Down), None);
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert_eq!(harness.press(KeyCode::Up), None);
+        assert_eq!(harness.press(KeyCode::Up), None);
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        let frame = harness.draw();
+        assert_welcome_snapshot("checkbox_modal_80x24", &frame);
+        assert!(frame.contains("[x] alpha"), "{frame}");
+        assert!(frame.contains("[ ] beta"), "{frame}");
+        assert!(!frame.contains(CUSTOM_CHOICE_ROW), "{frame}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Checked(["alpha", "gamma"].map(str::to_string).to_vec())
+        );
+    }
+
+    /// A password's field shows a mask per character and sends the text
+    /// behind it.
+    #[test]
+    fn a_password_modal_masks_its_field() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest::new(PromptAction::Password, "Token:", Origin::detached());
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.type_text("hunter2");
+        let frame = harness.draw();
+        assert_welcome_snapshot("password_modal_80x24", &frame);
+        assert!(!frame.contains("hunter2"), "{frame}");
+        assert!(frame.contains("*******"), "{frame}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Text("hunter2".to_string())
+        );
+    }
+
+    /// A list taller than the rows it gets scrolls to keep the marker in
+    /// view; the question keeps at least its one row.
+    #[test]
+    fn a_long_select_windows_its_rows_around_the_marker() {
+        let mut harness = Harness::standalone(60, 14);
+        let req = PromptRequest {
+            options: (1..=20).map(|n| format!("option {n:02}")).collect(),
+            ..PromptRequest::new(PromptAction::Select, "Pick one q9d-s", Origin::detached())
+        };
+        let _asker = ask_on_a_thread(&mut harness, req);
+        let top = harness.draw();
+        assert!(top.contains("> option 01"), "{top}");
+        assert!(!top.contains("option 20"), "{top}");
+        for _ in 0..19 {
+            assert_eq!(harness.press(KeyCode::Down), None);
+        }
+        let bottom = harness.draw();
+        assert!(bottom.contains("> option 20"), "{bottom}");
+        assert!(!bottom.contains("option 01"), "{bottom}");
+        assert!(bottom.contains("Pick one q9d-s"), "{bottom}");
+    }
+
+    /// A question whose asker ends is taken down with a cancel: the tool
+    /// call, job or agent that asked is matched by its id, an empty id
+    /// matches nothing, a queued question goes the same way as the front,
+    /// and the front's successor gets a fresh gate.
+    #[test]
+    fn a_prompt_is_cancelled_when_its_asker_ends() {
+        fn asked_by(call_id: Option<&str>, job_id: Option<&str>) -> PromptRequest {
+            PromptRequest {
+                call_id: call_id.map(str::to_string),
+                job_id: job_id.map(str::to_string),
+                ..list_request(PromptAction::Select, None)
+            }
+        }
+        fn asked_by_agent(agent_id: &str) -> PromptRequest {
+            let mut req = asked_by(None, None);
+            req.origin.agent_id = Some(agent_id.to_string());
+            req
+        }
+        fn tool_finished(call_id: &str) -> UiMsg {
+            UiMsg::ToolFinished {
+                call_id: call_id.to_string(),
+                ok: true,
+                error: None,
+                duration_ms: None,
+            }
+        }
+        fn job_finished(job_id: &str) -> UiMsg {
+            UiMsg::JobFinished {
+                job_id: job_id.to_string(),
+                ok: false,
+                error: Some("boom".to_string()),
+            }
+        }
+        fn job_cancelled(job_id: &str) -> UiMsg {
+            UiMsg::JobCancelled {
+                job_id: job_id.to_string(),
+            }
+        }
+        fn agent_finished(agent_id: &str) -> UiMsg {
+            UiMsg::AgentFinished {
+                agent_id: agent_id.to_string(),
+                outcome: AgentOutcome::Interrupted,
+            }
+        }
+        let cases = [
+            (
+                asked_by(Some("call-1"), None),
+                tool_finished("call-1"),
+                true,
+            ),
+            (
+                asked_by(Some("call-1"), None),
+                tool_finished("call-2"),
+                false,
+            ),
+            (
+                asked_by(Some("call-1"), None),
+                job_finished("call-1"),
+                false,
+            ),
+            (asked_by(None, Some("job-1")), job_finished("job-1"), true),
+            (asked_by(None, Some("job-1")), job_cancelled("job-1"), true),
+            (asked_by(None, Some("job-1")), job_finished("job-2"), false),
+            (asked_by(None, Some("job-1")), tool_finished("job-1"), false),
+            (asked_by_agent("agent-1"), agent_finished("agent-1"), true),
+            (asked_by_agent("agent-1"), agent_finished("agent-2"), false),
+            (
+                asked_by(None, Some("job-1")),
+                agent_finished("job-1"),
+                false,
+            ),
+            (asked_by(None, None), tool_finished(""), false),
+            (asked_by(None, None), job_finished(""), false),
+            (asked_by(None, None), agent_finished(""), false),
+        ];
+        for (req, msg, dismissed) in cases {
+            let mut harness = Harness::standalone(80, 24);
+            let label = format!(
+                "{:?}/{:?}/{:?} on {msg:?}",
+                req.call_id, req.job_id, req.origin.agent_id
+            );
+            let asker = ask_on_a_thread(&mut harness, req);
+            harness.app.handle_msg(msg);
+            assert_eq!(harness.app.prompts.is_empty(), dismissed, "{label}");
+            if dismissed {
+                assert_eq!(
+                    asker.join().unwrap().unwrap(),
+                    PromptAnswer::Cancelled,
+                    "{label}"
+                );
+            } else {
+                assert!(!asker.is_finished(), "{label}");
+                harness.app.abandon_prompts();
+            }
+        }
+
+        let mut harness = Harness::standalone(80, 24);
+        let front = ask_on_a_thread(&mut harness, asked_by(Some("call-1"), None));
+        let queued = ask_on_a_thread(&mut harness, asked_by(None, Some("job-1")));
+        let third = ask_on_a_thread(&mut harness, asked_by(None, Some("job-2")));
+        harness.app.handle_msg(job_finished("job-2"));
+        assert_eq!(harness.app.prompts.len(), 2);
+        assert_eq!(third.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        assert!(!front.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.app.handle_msg(tool_finished("call-1"));
+        assert_eq!(front.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        assert_eq!(harness.app.prompts.len(), 1);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(!queued.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            queued.join().unwrap().unwrap(),
+            PromptAnswer::Selected("alpha".to_string())
+        );
     }
 
     /// With nobody left to answer, every yes/no question is refused
@@ -4137,6 +6004,24 @@ mod tests {
             let style = chrome_style(dim, no_color);
             assert_eq!(style.fg, None);
             assert!(style.add_modifier.contains(Modifier::DIM));
+        }
+    }
+
+    /// The transcript's cells take the colour decision from the same
+    /// switch the composer does, so one flip covers the whole frame.
+    #[test]
+    fn a_drawn_error_cell_follows_the_no_color_switch() {
+        for (no_color, fg) in [(false, Color::Red), (true, Color::Reset)] {
+            let mut harness = Harness::standalone(60, 12);
+            harness.app.set_no_color(no_color);
+            harness.app.transcript.push(Cell::Error {
+                text: "broken q8c".to_string(),
+                cache: LineCache::default(),
+            });
+            let frame = harness.draw();
+            let row = screen_row(&harness, "broken q8c");
+            let buffer = harness.terminal.backend().buffer();
+            assert_eq!(buffer[(0, row)].fg, fg, "{no_color}: {frame}");
         }
     }
 
@@ -5203,9 +7088,12 @@ mod tests {
             "{frame}"
         );
         assert!(!frame.contains("late line 2"), "the view moved:\n{frame}");
+        // The chip sits on the transcript's last row; everything above it
+        // must be the held view, unchanged.
+        let above_chip = usize::from(row);
         assert_eq!(
-            frame.lines().take(18).collect::<Vec<_>>(),
-            held.lines().take(18).collect::<Vec<_>>(),
+            frame.lines().take(above_chip).collect::<Vec<_>>(),
+            held.lines().take(above_chip).collect::<Vec<_>>(),
             "the view slid under the new cells:\n{frame}"
         );
 
@@ -5271,16 +7159,28 @@ mod tests {
         let mut todo = TodoPanel::default();
         todo.set("ship it".to_string(), todo_items());
         let (reply, _answers) = mpsc::channel();
-        let confirm = PendingPrompt {
-            req: confirm_request(Some("fs_write")),
-            reply: reply.clone(),
-            field: None,
-        };
-        let input = PendingPrompt {
-            req: PromptRequest::new(PromptAction::Input, "Name?", Origin::detached()),
-            reply,
-            field: Some(new_textarea()),
-        };
+        let confirm = PendingPrompt::new(confirm_request(Some("fs_write")), reply.clone());
+        let input = PendingPrompt::new(
+            PromptRequest::new(PromptAction::Input, "Name?", Origin::detached()),
+            reply.clone(),
+        );
+        let select = PendingPrompt::new(
+            list_request(PromptAction::Select, Some("ask")),
+            reply.clone(),
+        );
+        let checkbox = PendingPrompt::new(list_request(PromptAction::Checkbox, None), reply);
+        let dot = crate::config::CommandPrefix::Dot;
+        let palette = PaletteState::build(".in", dot, PaletteSnapshot::EMPTY, &[], None)
+            .expect("`.in` lists commands");
+        let mut history = ComposerHistory::default();
+        history.push("one");
+        let search = SearchState::new(&history);
+        let (rewind, _) = RewindState::from_cells(plain.app.transcript.cells(), dot);
+        let rewind = rewind.expect("the exchange is a rewind row");
+        let queued = vec![QueuedLine {
+            text: "later".to_string(),
+            command: false,
+        }];
         let mut widgets: Vec<(&str, Draw<'_>)> = vec![
             (
                 "transcript (welcome)",
@@ -5335,8 +7235,32 @@ mod tests {
                 Box::new(|area, buf| PromptModal(&input).render(area, buf)),
             ),
             (
+                "select modal",
+                Box::new(|area, buf| PromptModal(&select).render(area, buf)),
+            ),
+            (
+                "checkbox modal",
+                Box::new(|area, buf| PromptModal(&checkbox).render(area, buf)),
+            ),
+            (
                 "todo panel",
                 Box::new(|area, buf| (&todo).render(area, buf)),
+            ),
+            (
+                "palette band",
+                Box::new(|area, buf| PaletteView(&palette).render(area, buf)),
+            ),
+            (
+                "search band",
+                Box::new(|area, buf| SearchView(&search).render(area, buf)),
+            ),
+            (
+                "rewind band",
+                Box::new(|area, buf| RewindView(&rewind).render(area, buf)),
+            ),
+            (
+                "queued preview",
+                Box::new(|area, buf| QueuedPreview(&queued).render(area, buf)),
             ),
         ];
         let screen = Rect::new(0, 0, 10, 3);
@@ -5430,6 +7354,1152 @@ mod tests {
         assert!(!harness.app.transcript.scrolled());
         harness.type_text("d");
         assert_eq!(harness.app.composer_text(), "abcd");
+    }
+
+    /// Where the composer lands at 80x24 with a one-line draft: the rule
+    /// above its three text rows, with the footer under them.
+    const COMPOSER_RULE_ROW: u16 = 19;
+    const COMPOSER_TEXT_ROW: u16 = 20;
+
+    fn composer_cell(harness: &Harness, x: u16) -> (Color, bool) {
+        let cell = &harness.terminal.backend().buffer()[(x, COMPOSER_TEXT_ROW)];
+        (cell.fg, cell.modifier.contains(Modifier::BOLD))
+    }
+
+    /// The symbols of the last drawn frame's row `y`, unquoted.
+    fn row_text(harness: &Harness, y: u16) -> String {
+        let buffer = harness.terminal.backend().buffer();
+        (0..buffer.area().width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
+        let mut harness = Harness::standalone(80, 24);
+        // The test process's stdout is a pipe, which `NO_COLOR` reads as a
+        // colourless terminal.
+        harness.app.set_no_color(false);
+        harness.type_text(".info tools");
+        let frame = harness.draw();
+        assert_welcome_snapshot("composer_command_80x24", &frame);
+        let buffer = harness.terminal.backend().buffer();
+        assert_eq!(
+            buffer[(0, COMPOSER_RULE_ROW)].symbol(),
+            ratatui::symbols::line::HORIZONTAL
+        );
+        assert!(
+            buffer[(0, COMPOSER_RULE_ROW)]
+                .modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            (0..11).all(|x| composer_cell(&harness, x) == (Color::Green, true)),
+            "{frame}"
+        );
+        assert_eq!(composer_cell(&harness, 11), (Color::Reset, false));
+        assert_eq!(buffer[(0, COMPOSER_TEXT_ROW)].bg, Color::Indexed(236));
+        assert_eq!(buffer[(79, COMPOSER_TEXT_ROW + 2)].bg, Color::Indexed(236));
+    }
+
+    #[test]
+    fn no_color_keeps_the_command_bold_without_colour_or_surface() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(true);
+        harness.type_text(".info tools");
+        let frame = harness.draw();
+        assert_welcome_snapshot("composer_command_no_color_80x24", &frame);
+        assert!(
+            (0..11).all(|x| composer_cell(&harness, x) == (Color::Reset, true)),
+            "{frame}"
+        );
+        let buffer = harness.terminal.backend().buffer();
+        assert!((0..80).all(|x| buffer[(x, COMPOSER_TEXT_ROW)].bg == Color::Reset));
+    }
+
+    /// The textarea draws its cursor as a reversed cell; after the draft
+    /// it has to sit on the field's text rows, not on the rule.
+    #[test]
+    fn the_cursor_sits_inside_the_field_under_the_rule() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        harness.render();
+        let buffer = harness.terminal.backend().buffer();
+        let cursor = buffer
+            .area
+            .positions()
+            .find(|position| buffer[*position].modifier.contains(Modifier::REVERSED))
+            .expect("the composer draws its cursor");
+        assert_eq!((cursor.x, cursor.y), (5, COMPOSER_TEXT_ROW));
+    }
+
+    fn palette(harness: &Harness) -> Option<&PaletteState> {
+        match &harness.app.view {
+            View::Palette(palette) => Some(palette),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_typed_sigil_opens_the_palette_with_no_highlight() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".");
+        let palette = palette(&harness).expect("the palette opens on a sigil");
+        assert_eq!(palette.highlight, None);
+        assert!(palette.rows.iter().any(|row| row.value == ".help "));
+        assert_eq!(palette.token_range, 0..1);
+        harness.type_text("in");
+        let frame = harness.draw();
+        assert_welcome_snapshot("palette_open_80x24", &frame);
+        assert!(frame.contains(".info"), "{frame}");
+        assert!(frame.contains("Show system info"), "{frame}");
+    }
+
+    /// Seeded from the context, the first `.` lists what the context
+    /// allows, the rows the REPL completer gives: the tool and skill
+    /// commands a bare state hides, and not the `.agent` a bare state
+    /// alone offers.
+    #[test]
+    fn the_palette_seeded_from_the_context_lists_what_the_context_allows() {
+        let mut ctx = chat_ctx();
+        assert!(ctx.app.config.function_calling_support);
+        assert!(ctx.resolved_skills_enabled());
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.press_with_ctx(KeyCode::Char('.'), Some(&ctx));
+        let rows: Vec<&str> = palette(&harness)
+            .expect("the palette opens on a sigil")
+            .rows
+            .iter()
+            .map(|row| row.value.trim_end())
+            .collect();
+        for present in [".info tools", ".skill load", ".tool enable"] {
+            assert!(rows.contains(&present), "{present} missing from {rows:?}");
+        }
+        assert!(!rows.contains(&".agent"), "{rows:?}");
+    }
+
+    #[test]
+    fn enter_with_no_highlight_submits_the_line() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit(".in".to_string()))
+        );
+        assert!(palette(&harness).is_none());
+        assert!(harness.app.composer.is_empty());
+    }
+
+    /// Mid-turn the same Enter holds the line instead; a command waits
+    /// without reaching the loop.
+    #[test]
+    fn enter_with_the_palette_open_and_no_highlight_queues_the_command_mid_turn() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text(".info");
+        assert_eq!(
+            palette(&harness).map(|palette| palette.highlight),
+            Some(None)
+        );
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: ".info".to_string(),
+                command: true
+            }]
+        );
+        assert!(palette(&harness).is_none());
+        assert!(harness.app.composer.is_empty());
+    }
+
+    #[test]
+    fn tab_highlights_the_first_row_and_enter_takes_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".inf");
+        assert!(harness.press(KeyCode::Tab).is_none());
+        let open = palette(&harness).expect("still open");
+        assert_eq!(open.highlight, Some(0));
+        let first = open.rows[0].value.clone();
+        assert!(
+            first.starts_with(".in") && first.ends_with(' '),
+            "{first:?}"
+        );
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert_eq!(harness.app.composer_text(), first);
+        assert!(palette(&harness).is_none_or(|open| open.token_range.start > 0));
+        harness.type_text("x");
+        assert_eq!(harness.app.composer_text(), format!("{first}x"));
+    }
+
+    #[test]
+    fn up_from_the_first_row_clears_the_highlight() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".");
+        harness.press(KeyCode::Down);
+        harness.press(KeyCode::Down);
+        assert_eq!(palette(&harness).unwrap().highlight, Some(1));
+        harness.press(KeyCode::BackTab);
+        assert_eq!(palette(&harness).unwrap().highlight, Some(0));
+        harness.press(KeyCode::Up);
+        assert_eq!(palette(&harness).unwrap().highlight, None);
+    }
+
+    #[test]
+    fn esc_closes_the_palette_without_interrupting_or_losing_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hello", false);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), ".in");
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        harness.type_text("f");
+        assert!(palette(&harness).is_some(), "an edit reopens it");
+    }
+
+    #[test]
+    fn tab_reopens_a_closed_palette_on_a_command_line() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        harness.press(KeyCode::Esc);
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Tab);
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.app.composer_text(), ".in");
+    }
+
+    /// A fence opened in front of the command still gets the palette,
+    /// with the token to replace behind the fence.
+    #[test]
+    fn a_fenced_command_line_opens_the_palette_behind_the_fence() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("::: .in");
+        let palette = palette(&harness).expect("the fenced line opens the palette");
+        assert!(palette.rows.iter().any(|row| row.value == ".info "));
+        assert_eq!(palette.token_range, 4..7);
+    }
+
+    #[test]
+    fn a_space_after_a_full_command_keeps_the_palette_only_for_arguments() {
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        for c in ".help".chars() {
+            harness.press_with_ctx(KeyCode::Char(c), Some(&ctx));
+        }
+        assert!(palette(&harness).is_some());
+        harness.press_with_ctx(KeyCode::Char(' '), Some(&ctx));
+        assert!(palette(&harness).is_none());
+
+        harness.app.set_composer_text(".set");
+        harness.app.refresh_palette(Some(&ctx));
+        harness.press_with_ctx(KeyCode::Char(' '), Some(&ctx));
+        let palette = palette(&harness).expect("the settable keys are rows");
+        assert!(palette.rows.iter().all(|row| !row.value.starts_with('.')));
+        // Argument values keep the completer's trailing space, so the
+        // accepted token ends ready for the next one.
+        assert!(
+            palette.rows.iter().any(|row| row.value == "highlight "),
+            "{:?}",
+            palette.rows
+        );
+        assert_eq!(palette.token_range, 5..5);
+        harness.press_with_ctx(KeyCode::Tab, Some(&ctx));
+        let first = palette_first_value(&harness);
+        harness.press_with_ctx(KeyCode::Enter, Some(&ctx));
+        assert_eq!(harness.app.composer_text(), format!(".set {first}"));
+    }
+
+    fn palette_first_value(harness: &Harness) -> String {
+        palette(harness).unwrap().rows[0].value.clone()
+    }
+
+    #[test]
+    fn mid_turn_the_palette_lists_commands_from_the_snapshot_only() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hello", false);
+        harness.type_text(".set ");
+        assert!(palette(&harness).is_none());
+        harness.app.set_composer_text(".h");
+        harness.app.refresh_palette(None);
+        let palette = palette(&harness).expect("commands need no context");
+        assert!(palette.rows.iter().any(|row| row.value == ".help "));
+    }
+
+    #[test]
+    fn a_prompt_arriving_closes_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hello", false);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        assert!(palette(&harness).is_none());
+        assert!(matches!(
+            harness.app.key_context().modal,
+            Some(ModalKind::Confirm { .. })
+        ));
+        harness.press(KeyCode::Esc);
+        assert!(matches!(asker.join().unwrap(), Ok(PromptAnswer::Cancelled)));
+    }
+
+    #[test]
+    fn a_second_line_closes_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        harness.app.refresh_palette(None);
+        assert!(palette(&harness).is_none());
+    }
+
+    /// The composer can change under an open band without a key (an
+    /// editor's result, a rewind's prefill). Enter on the highlight then
+    /// closes the band and leaves the draft as it is: the band's token
+    /// range belongs to a line that is gone.
+    #[test]
+    fn enter_on_a_palette_left_behind_by_an_edit_closes_it_and_keeps_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".in");
+        harness.press(KeyCode::Tab);
+        assert!(palette(&harness).is_some_and(|open| open.highlighted().is_some()));
+        harness.app.set_composer_text(".i");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(harness.app.handle_key(enter), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), ".i");
+
+        harness.type_text("n");
+        harness.press(KeyCode::Tab);
+        assert!(palette(&harness).is_some_and(|open| open.highlighted().is_some()));
+        harness.app.set_composer_text("x");
+        assert_eq!(harness.app.handle_key(enter), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "x");
+    }
+
+    #[test]
+    fn the_palette_band_sits_above_the_rule_and_keeps_the_transcript_minimum() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text(".");
+        harness.render();
+        let rows = harness.app.band_rows(Rect::new(0, 0, 80, 24));
+        assert_eq!(rows, bottom_pane::BAND_MAX_ROWS);
+        let frame = harness.terminal.backend().to_string();
+        assert!(row_text(&harness, COMPOSER_RULE_ROW).contains(ratatui::symbols::line::HORIZONTAL));
+        assert!(
+            row_text(&harness, COMPOSER_RULE_ROW - 1).contains("(+"),
+            "{frame}"
+        );
+        assert!(
+            row_text(&harness, COMPOSER_RULE_ROW - rows).starts_with('.'),
+            "{frame}"
+        );
+        assert_eq!(
+            row_text(&harness, COMPOSER_RULE_ROW - rows - 1).trim(),
+            "",
+            "the status row sits between the transcript and the band\n{frame}"
+        );
+
+        harness.resize(80, 12);
+        harness.render();
+        let room = 12 - (harness.app.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
+        assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 12)), room);
+        let frame = harness.terminal.backend().to_string();
+        let band_top = 12 - 1 - harness.app.composer.rows() - room;
+        assert!(row_text(&harness, band_top).starts_with('.'), "{frame}");
+        assert!(
+            row_text(&harness, band_top + room - 1).contains("(+"),
+            "the hidden count is the band's last row\n{frame}"
+        );
+        assert!(
+            row_text(&harness, band_top + room).contains(ratatui::symbols::line::HORIZONTAL),
+            "the rule follows the band\n{frame}"
+        );
+    }
+
+    fn submit(harness: &mut Harness, line: &str) {
+        harness.type_text(line);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit(line.to_string()))
+        );
+    }
+
+    #[test]
+    fn up_and_down_on_a_single_line_walk_the_history_around_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        assert!(harness.app.history_file.is_none(), "tests keep no file");
+        submit(&mut harness, "first");
+        submit(&mut harness, "second");
+        harness.type_text("draft");
+        assert!(harness.press(KeyCode::Up).is_none());
+        assert_eq!(harness.app.composer_text(), "second");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "first");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "first", "the oldest holds");
+        harness.press(KeyCode::Down);
+        assert_eq!(harness.app.composer_text(), "second");
+        harness.press(KeyCode::Down);
+        assert_eq!(harness.app.composer_text(), "draft");
+        harness.press(KeyCode::Down);
+        assert_eq!(harness.app.composer_text(), "draft");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("draft".to_string()))
+        );
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "draft");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "second");
+    }
+
+    /// A recalled command line is not an edit: the palette stays shut so
+    /// Up keeps walking instead of moving a highlight, and the first real
+    /// edit brings the palette back.
+    #[test]
+    fn walking_the_history_does_not_reopen_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        for line in [".info", "plain", ".help"] {
+            harness.app.history.push(line);
+        }
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".info");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Backspace);
+        assert_eq!(harness.app.composer_text(), ".inf");
+        assert!(palette(&harness).is_some());
+    }
+
+    /// A command line recalled through the Ctrl+R search is a history
+    /// walk too: no palette over it, and the next Up walks on.
+    #[test]
+    fn recalling_from_the_search_does_not_reopen_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        for line in [".info", "plain", ".help"] {
+            harness.app.history.push(line);
+        }
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        harness.type_text(".he");
+        assert_eq!(search(&harness).unwrap().matches, [".help"]);
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert_eq!(harness.app.composer_text(), ".help");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
+    }
+
+    /// Clearing the composer mid-walk, or recalling an entry through the
+    /// search mid-walk, ends the walk: the next Up starts from the newest
+    /// entry rather than carrying on from where the walk was.
+    #[test]
+    fn clearing_or_searching_ends_the_history_walk() {
+        let mut harness = Harness::standalone(80, 24);
+        for line in [".info", "plain", ".help"] {
+            harness.app.history.push(line);
+        }
+        harness.press(KeyCode::Up);
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
+        harness.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert!(harness.app.composer.is_empty());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        harness.type_text(".in");
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert_eq!(harness.app.composer_text(), ".info");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+    }
+
+    #[test]
+    fn the_arrows_of_a_multi_line_draft_stay_with_the_cursor() {
+        let mut harness = Harness::standalone(80, 24);
+        submit(&mut harness, "old line");
+        harness.type_text("one");
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        harness.type_text("two");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "one\ntwo");
+        harness.type_text("!");
+        assert_eq!(harness.app.composer_text(), "one!\ntwo");
+    }
+
+    #[test]
+    fn a_submitted_line_is_recorded_in_the_history_file_when_one_is_kept() {
+        let dir = std::env::temp_dir().join(format!(
+            "coyote-tui-history-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("history");
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.history_file = Some(path.clone());
+        submit(&mut harness, "hello");
+        submit(&mut harness, ".info");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n.info\n");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let saving = AppConfig {
+            save_shell_history: true,
+            ..Default::default()
+        };
+        assert!(history_file(&saving, None).is_some_and(|p| p.ends_with("default")));
+        assert!(history_file(&saving, Some("a/b")).is_some_and(|p| p.ends_with("session_a_b")));
+        assert_eq!(history_file(&plain_config(), Some("a")), None);
+    }
+
+    fn search(harness: &Harness) -> Option<&SearchState> {
+        match &harness.app.view {
+            View::HistorySearch(search) => Some(search),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn ctrl_r_opens_the_search_band_whose_filter_narrows_and_enter_recalls() {
+        let mut harness = Harness::standalone(80, 24);
+        submit(&mut harness, "git status");
+        submit(&mut harness, "cargo test");
+        submit(&mut harness, "git log");
+        assert!(harness.app.handle_key(ctrl(KeyCode::Char('r'))).is_none());
+        let open = search(&harness).expect("the band opens");
+        assert_eq!(open.matches, ["git log", "cargo test", "git status"]);
+        harness.type_text("git");
+        let open = search(&harness).unwrap();
+        assert_eq!(open.filter, "git");
+        assert_eq!(open.matches, ["git log", "git status"]);
+        assert_eq!(harness.app.composer_text(), "", "typing goes to the filter");
+        let frame = harness.draw();
+        assert!(frame.contains("history: git"), "{frame}");
+        assert!(!frame.contains("cargo test"), "{frame}");
+        harness.press(KeyCode::Down);
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert!(search(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "git status");
+
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        harness.type_text("x");
+        harness.press(KeyCode::Backspace);
+        assert_eq!(search(&harness).unwrap().filter, "");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(search(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "git status");
+    }
+
+    #[test]
+    fn the_search_band_with_no_matches_closes_on_enter_leaving_the_draft() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        assert!(search(&harness).unwrap().matches.is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("(no matches)"), "{frame}");
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert!(search(&harness).is_none());
+        assert_eq!(harness.app.composer_text(), "draft");
+    }
+
+    fn vi_harness() -> Harness {
+        let footer = FooterInfo {
+            model: "openai:test-model".to_string(),
+            ..FooterInfo::default()
+        };
+        let config = Arc::new(AppConfig {
+            keybindings: "vi".to_string(),
+            ..(*plain_config()).clone()
+        });
+        Harness::new(80, 24, config, footer)
+    }
+
+    #[test]
+    fn emacs_bindings_have_no_vi_mode() {
+        let mut harness = Harness::standalone(80, 24);
+        assert_eq!(harness.app.vi_mode, None);
+        harness.type_text("text");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(harness.app.vi_mode, None);
+        assert!(!harness.draw().contains(composer::NORMAL_TAG));
+    }
+
+    #[test]
+    fn vi_esc_enters_normal_mode_where_the_letters_move_delete_and_return_to_insert() {
+        let mut harness = vi_harness();
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        harness.type_text("one two");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Normal));
+        assert!(harness.draw().contains(composer::NORMAL_TAG));
+        harness.type_text("0x");
+        assert_eq!(harness.app.composer_text(), "ne two");
+        harness.type_text("$hx");
+        assert_eq!(harness.app.composer_text(), "ne to");
+        harness.type_text("0wx");
+        assert_eq!(harness.app.composer_text(), "ne o");
+        harness.type_text("$bx");
+        assert_eq!(harness.app.composer_text(), "e o");
+        harness.type_text("qz");
+        assert_eq!(
+            harness.app.composer_text(),
+            "e o",
+            "unbound letters are swallowed"
+        );
+        harness.type_text("dd");
+        assert_eq!(harness.app.composer_text(), "");
+        harness.type_text("i");
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        harness.type_text("abc");
+        assert_eq!(harness.app.composer_text(), "abc");
+        assert!(!harness.draw().contains(composer::NORMAL_TAG));
+        harness.press(KeyCode::Esc);
+        harness.type_text("Ad");
+        assert_eq!(harness.app.composer_text(), "abcd");
+        harness.press(KeyCode::Esc);
+        harness.type_text("0aX");
+        assert_eq!(harness.app.composer_text(), "aXbcd");
+        harness.press(KeyCode::Esc);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("aXbcd".to_string()))
+        );
+        assert_eq!(
+            harness.app.vi_mode,
+            Some(ViMode::Insert),
+            "a sent line starts the next in insert"
+        );
+    }
+
+    #[test]
+    fn a_lone_d_is_forgotten_by_the_next_key_and_j_k_move_between_lines() {
+        let mut harness = vi_harness();
+        harness.type_text("top");
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        harness.type_text("bottom");
+        harness.press(KeyCode::Esc);
+        harness.type_text("hdxd");
+        assert_eq!(harness.app.composer_text(), "top\nbotto");
+        harness.type_text("k0dd");
+        assert_eq!(harness.app.composer_text(), "botto");
+        harness.type_text("jdd");
+        assert_eq!(harness.app.composer_text(), "");
+    }
+
+    #[test]
+    fn vi_esc_still_interrupts_a_turn_and_closes_a_popup_first() {
+        let mut harness = vi_harness();
+        harness.app.begin_turn("hello", false);
+        harness.type_text("draft");
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.app.set_composer_text(".in");
+        harness.app.refresh_palette(None);
+        assert!(palette(&harness).is_some());
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(palette(&harness).is_none());
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Insert));
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Normal));
+    }
+
+    #[test]
+    fn rewind_exchanges_pops_the_newest_exchanges_and_counts_how_far_it_got() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        for prompt in ["first", "second", "third"] {
+            let input = Input::from_str(&ctx, prompt, None).unwrap();
+            session.add_message(&input, "reply").unwrap();
+        }
+        ctx.session = Some(session);
+        let (popped, stopped) = rewind_exchanges(&mut ctx, 2);
+        assert_eq!(popped, 2);
+        assert!(stopped.is_none());
+        let session = ctx.session.as_ref().unwrap();
+        let prompts: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role.is_user())
+            .filter_map(|m| m.content.as_text())
+            .collect();
+        assert_eq!(prompts, ["first"]);
+        assert_eq!(ctx.pending_prefill.as_deref(), Some("second"));
+
+        let (popped, stopped) = rewind_exchanges(&mut ctx, 3);
+        assert_eq!(popped, 1);
+        let err = stopped.expect("the second pop finds nothing");
+        assert!(err.to_string().contains("Nothing to undo"), "{err}");
+        assert!(!ctx.session.as_ref().unwrap().has_user_messages());
+        assert_eq!(ctx.pending_prefill.as_deref(), Some("first"));
+
+        ctx.session = None;
+        let (popped, stopped) = rewind_exchanges(&mut ctx, 1);
+        assert_eq!(popped, 0);
+        let err = stopped.expect("no session to pop from");
+        assert!(err.to_string().contains("No session"), "{err}");
+    }
+
+    fn rewind(harness: &Harness) -> Option<&RewindState> {
+        match &harness.app.view {
+            View::Rewind(rewind) => Some(rewind),
+            _ => None,
+        }
+    }
+
+    fn three_exchanges(harness: &mut Harness) {
+        for question in ["first question", "second\nwith detail", "third question"] {
+            harness.app.begin_turn(question, false);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+            harness.app.end_turn(false, &TurnOutcome::default());
+        }
+    }
+
+    #[test]
+    fn esc_esc_on_an_empty_idle_composer_opens_the_rewind_picker_newest_first() {
+        let mut harness = Harness::standalone(80, 24);
+        three_exchanges(&mut harness);
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(rewind(&harness).is_none(), "one Esc is not enough");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        let picker = rewind(&harness).expect("the second Esc opens it");
+        let titles: Vec<(usize, &str)> = picker
+            .rows
+            .iter()
+            .map(|row| (row.opener, row.title.as_str()))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                (4, "third question"),
+                (2, "second\nwith detail"),
+                (0, "first question"),
+            ]
+        );
+        assert_eq!(picker.highlight, 0);
+        let frame = harness.draw();
+        assert_welcome_snapshot("rewind_picker_80x24", &frame);
+        assert!(frame.contains("third question"), "{frame}");
+        assert!(frame.contains("+1 line"), "{frame}");
+        harness.press(KeyCode::Down);
+        let Some(Command::Rewind(target)) = harness.press(KeyCode::Enter) else {
+            panic!("the second row rewinds two exchanges");
+        };
+        let rows: Vec<(usize, &str)> = target
+            .rows
+            .iter()
+            .map(|row| (row.opener, row.title.as_str()))
+            .collect();
+        assert_eq!(rows, [(4, "third question"), (2, "second\nwith detail")]);
+        assert!(rewind(&harness).is_none());
+    }
+
+    #[test]
+    fn esc_esc_does_not_open_the_picker_when_anything_outranks_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "nothing to rewind to");
+
+        three_exchanges(&mut harness);
+        harness.type_text("typed");
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "a draft");
+        harness.app.set_composer_text("");
+
+        harness.press(KeyCode::Esc);
+        harness
+            .clock
+            .advance(REWIND_ESC_GAP + Duration::from_millis(1));
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "too far apart");
+        harness
+            .clock
+            .advance(REWIND_ESC_GAP + Duration::from_millis(1));
+
+        harness.app.begin_turn("running", false);
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        assert!(rewind(&harness).is_none(), "a turn");
+        harness.app.end_turn(false, &TurnOutcome::default());
+
+        harness.type_text(".in");
+        assert!(palette(&harness).is_some());
+        harness.press(KeyCode::Esc);
+        harness.app.set_composer_text("");
+        harness.press(KeyCode::Esc);
+        assert!(
+            rewind(&harness).is_none(),
+            "closing the palette is not an idle Esc"
+        );
+
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        harness.press(KeyCode::Esc);
+        assert!(matches!(asker.join().unwrap(), Ok(PromptAnswer::Cancelled)));
+        harness.press(KeyCode::Esc);
+        assert!(
+            rewind(&harness).is_none(),
+            "cancelling a modal is not an idle Esc"
+        );
+
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_some(), "two idle Escs in a row open it");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(rewind(&harness).is_none(), "Esc closes it");
+        assert_eq!(harness.app.composer_text(), "");
+    }
+
+    #[test]
+    fn under_vi_the_picker_opens_from_normal_mode() {
+        let mut harness = vi_harness();
+        three_exchanges(&mut harness);
+        harness.press(KeyCode::Esc);
+        assert_eq!(harness.app.vi_mode, Some(ViMode::Normal));
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none(), "the first Esc only left insert");
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_some());
+        harness.press(KeyCode::Enter);
+        assert!(rewind(&harness).is_none());
+    }
+
+    /// Opens the picker on an idle composer and takes the row `down`
+    /// steps below the newest.
+    fn choose_rewind(harness: &mut Harness, down: usize) -> RewindTarget {
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        for _ in 0..down {
+            harness.press(KeyCode::Down);
+        }
+        match harness.press(KeyCode::Enter) {
+            Some(Command::Rewind(target)) => target,
+            other => panic!("the row did not rewind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rewind_command_pops_the_session_and_truncates_the_transcript() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        for prompt in ["first question", "second\nwith detail", "third question"] {
+            let input = Input::from_str(&ctx, prompt, None).unwrap();
+            session.add_message(&input, "an answer").unwrap();
+        }
+        ctx.session = Some(session);
+        let mut harness = Harness::for_ctx(&ctx);
+        three_exchanges(&mut harness);
+        assert_eq!(harness.app.transcript.len(), 6);
+        let target = choose_rewind(&mut harness, 1);
+        apply_rewind(&mut harness.app, &mut ctx, target);
+        assert_eq!(harness.app.transcript.len(), 2);
+        assert_eq!(harness.app.composer_text(), "second\nwith detail");
+        assert_eq!(ctx.pending_prefill, None);
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .filter(|m| m.role.is_user())
+                .count(),
+            1
+        );
+        assert!(!harness.draw().contains("Rewind stopped"));
+    }
+
+    /// A dry run keeps no session, so the prefill cannot come from a pop:
+    /// the chosen row's own text is what the composer gets, and the
+    /// transcript goes back to it all the same.
+    #[test]
+    fn a_rewind_without_a_session_still_truncates_and_prefills_the_chosen_prompt() {
+        let mut ctx = chat_ctx();
+        assert!(ctx.session.is_none());
+        let mut harness = Harness::for_ctx(&ctx);
+        three_exchanges(&mut harness);
+        let target = choose_rewind(&mut harness, 1);
+        apply_rewind(&mut harness.app, &mut ctx, target);
+        assert_eq!(harness.app.transcript.len(), 2);
+        assert_eq!(harness.app.composer_text(), "second\nwith detail");
+        assert!(!harness.draw().contains("Rewind stopped"));
+    }
+
+    /// A session shorter than the transcript is popped as far as it goes
+    /// and the transcript cut back only that far, with a notice.
+    #[test]
+    fn a_rewind_the_session_cannot_finish_stops_where_the_session_did() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        let input = Input::from_str(&ctx, "third question", None).unwrap();
+        session.add_message(&input, "an answer").unwrap();
+        ctx.session = Some(session);
+        let mut harness = Harness::for_ctx(&ctx);
+        three_exchanges(&mut harness);
+        let target = choose_rewind(&mut harness, 1);
+        apply_rewind(&mut harness.app, &mut ctx, target);
+        assert_eq!(
+            harness.app.transcript.len(),
+            5,
+            "two exchanges stay and the notice follows them"
+        );
+        assert_eq!(harness.app.composer_text(), "third question");
+        assert!(!ctx.session.as_ref().unwrap().has_user_messages());
+        let frame = harness.draw();
+        assert!(frame.contains("Rewind stopped: Nothing to undo"), "{frame}");
+    }
+
+    /// A macro's one transcript row stands for every exchange it ran, so
+    /// the picker offers only the rows above it: popping one exchange per
+    /// offered row leaves the session holding exactly what the transcript
+    /// still shows.
+    #[test]
+    fn a_rewind_above_a_macro_row_pops_one_exchange_per_offered_row() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        for prompt in [
+            "first question",
+            "macro step one",
+            "macro step two",
+            "third question",
+        ] {
+            let input = Input::from_str(&ctx, prompt, None).unwrap();
+            session.add_message(&input, "an answer").unwrap();
+        }
+        ctx.session = Some(session);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.macros = vec![("deploy".to_string(), "ship it".to_string())];
+        for (line, command) in [
+            ("first question", false),
+            (".deploy prod", true),
+            ("third question", false),
+        ] {
+            harness.app.begin_turn(line, command);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+            harness.app.end_turn(command, &TurnOutcome::default());
+        }
+        assert_eq!(harness.app.transcript.len(), 6);
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        let picker = rewind(&harness).expect("the newest row is offered");
+        assert_eq!(
+            picker.rows.len(),
+            1,
+            "nothing at or below the macro is offered"
+        );
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Rewind stops at the last macro turn"),
+            "{frame}"
+        );
+        let target = match harness.press(KeyCode::Enter) {
+            Some(Command::Rewind(target)) => target,
+            other => panic!("the row did not rewind: {other:?}"),
+        };
+        apply_rewind(&mut harness.app, &mut ctx, target);
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(&cells[2], Cell::Command { name, .. } if name == ".deploy prod"));
+        assert!(
+            !cells
+                .iter()
+                .any(|cell| matches!(cell, Cell::User { text, .. } if text == "third question"))
+        );
+        assert_eq!(harness.app.composer_text(), "third question");
+        let session = ctx.session.as_ref().unwrap();
+        let prompts: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role.is_user())
+            .filter_map(|m| m.content.as_text())
+            .collect();
+        assert_eq!(
+            prompts,
+            ["first question", "macro step one", "macro step two"],
+            "the macro's exchanges stay in the session as its row stays in the transcript"
+        );
+        assert!(!harness.draw().contains("Rewind stopped"));
+    }
+
+    #[test]
+    fn a_rewind_barrier_is_read_from_the_command_word_and_the_enabled_macros() {
+        let deploy = [("deploy".to_string(), "ship it".to_string())];
+        let dot = crate::config::CommandPrefix::Dot;
+        let barrier =
+            |line: &str, macros: &[(String, String)]| rewind_barrier(line, dot, macros, false);
+        assert_eq!(barrier(".deploy prod", &deploy), Some(RewindBarrier::Macro));
+        assert_eq!(barrier(".deploy prod", &[]), None);
+        assert_eq!(
+            barrier(".macro deploy", &deploy),
+            Some(RewindBarrier::Macro)
+        );
+        // `.macro <unknown>` that never asked the model created the
+        // macro; one that did ran a macro the list had not got.
+        assert_eq!(barrier(".macro deploy", &[]), None);
+        assert_eq!(
+            rewind_barrier(".macro deploy", dot, &[], true),
+            Some(RewindBarrier::Macro)
+        );
+        assert_eq!(barrier(".macro enable deploy", &deploy), None);
+        assert_eq!(barrier(".macro disable deploy", &deploy), None);
+        assert_eq!(barrier(".macro", &deploy), None);
+        assert_eq!(barrier(".session other", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".agent coder", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".agent", &[]), None);
+        assert_eq!(barrier(".exit session", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".empty session", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".edit session", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".edit role", &[]), None);
+        assert_eq!(barrier(".exit role", &[]), None);
+        assert_eq!(barrier(".info", &[]), None);
+        assert_eq!(barrier("plain words", &deploy), None);
+        assert_eq!(
+            rewind_barrier(
+                "/session other",
+                crate::config::CommandPrefix::Slash,
+                &[],
+                false
+            ),
+            Some(RewindBarrier::Session)
+        );
+    }
+
+    /// The barrier is committed with the cell: disabling the macro
+    /// afterwards does not let the picker count past the turn it ran,
+    /// and a session swap, which opened no exchange, stops it the same
+    /// way with its own notice.
+    #[test]
+    fn the_picker_stops_at_a_barrier_committed_before_the_macros_changed() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.macros = vec![("deploy".to_string(), "ship it".to_string())];
+        for (line, command) in [
+            ("first question", false),
+            (".deploy prod", true),
+            ("third question", false),
+        ] {
+            harness.app.begin_turn(line, command);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+            harness.app.end_turn(command, &TurnOutcome::default());
+        }
+        harness.app.macros.clear();
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert_eq!(rewind(&harness).map(|picker| picker.rows.len()), Some(1));
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Rewind stops at the last macro turn"),
+            "{frame}"
+        );
+        harness.press(KeyCode::Esc);
+
+        harness.app.begin_turn(".session other", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        harness.app.begin_turn("fourth question", false);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        let picker = rewind(&harness).expect("the row above the swap is offered");
+        assert_eq!(
+            picker
+                .rows
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["fourth question"]
+        );
+        assert!(matches!(
+            harness.app.transcript.cells().last(),
+            Some(Cell::Notice { text, .. }) if text == "Rewind stops at the last session command"
+        ));
+    }
+
+    /// A session command that failed left the context as it was, so its
+    /// cell carries no barrier and the picker counts past it.
+    #[test]
+    fn a_failed_session_command_is_not_a_barrier() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".session nosuch", true);
+        harness.app.end_turn(
+            true,
+            &TurnOutcome {
+                error: Some("session not found".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        assert!(matches!(
+            &harness.app.transcript.cells()[3],
+            Cell::Command {
+                name,
+                rewind_barrier: None,
+                ..
+            } if name == ".session nosuch"
+        ));
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert_eq!(rewind(&harness).map(|picker| picker.rows.len()), Some(1));
+    }
+
+    /// A macro that failed at a later step already recorded the exchanges
+    /// before it, so its cell is a barrier like a macro that finished.
+    #[test]
+    fn a_macro_that_asked_the_model_is_a_barrier_even_when_it_failed_later() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.macros = vec![("deploy".to_string(), "ship it".to_string())];
+        exchange(&mut harness);
+        harness.app.begin_turn(".deploy prod", true);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("step one done".to_string()));
+        harness.app.end_turn(
+            true,
+            &TurnOutcome {
+                error: Some("step two failed".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        assert!(matches!(
+            &harness.app.transcript.cells()[3],
+            Cell::Command {
+                name,
+                rewind_barrier: Some(RewindBarrier::Macro),
+                ..
+            } if name == ".deploy prod"
+        ));
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none());
+        assert!(matches!(
+            harness.app.transcript.cells().last(),
+            Some(Cell::Notice { text, .. }) if text == "Rewind stops at the last macro turn"
+        ));
     }
 
     #[test]
@@ -5759,8 +8829,7 @@ mod tests {
                     .filter_map(|needle| body.find(needle))
                     .min();
                 readers.push(KeyboardReader {
-                    gated: body.contains("crate::tui::active()")
-                        || body.contains("ensure_editor_available()"),
+                    gated: body.contains("crate::tui::active()"),
                     prompt_gated: gate_at
                         .is_some_and(|gate| first_builder.is_none_or(|builder| gate < builder)),
                     file,
@@ -5772,10 +8841,9 @@ mod tests {
     }
 
     /// Every direct keyboard reader outside this module either checks the
-    /// TUI flag (itself, or through `ensure_editor_available`) or is
-    /// listed here with the reason it stays REPL-only, so a new reader
-    /// cannot appear without a decision about the TUI. A `PROMPT_GATED`
-    /// row is only honoured when the fn body really calls
+    /// TUI flag or is listed here with the reason it stays REPL-only, so
+    /// a new reader cannot appear without a decision about the TUI. A
+    /// `PROMPT_GATED` row is only honoured when the fn body really calls
     /// `ensure_prompts_available()`, and a body that does cannot hide
     /// under another reason.
     #[test]
@@ -5787,8 +8855,8 @@ mod tests {
         const REPL_PROMPTER: &str =
             "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
         const VIA_GATE: &str = "calls read_single_key, which refuses under the TUI";
-        const VIA_EDIT_GATE: &str = "calls edit_file, which refuses under the TUI";
-        const VIA_RUN_GATE: &str = "calls run_command, which refuses under the TUI";
+        const VIA_EDIT_GATE: &str = "calls edit_file, which lends the terminal under the TUI";
+        const VIA_RUN_GATE: &str = "calls run_command, which lends the terminal under the TUI";
         const REPL_PAINTER: &str =
             "polled by the spinner and the REPL stream painter, both replaced under the TUI";
         const NULL_STDIN: &str = "a unit test; the child it waits on has stdin at /dev/null";
@@ -5839,9 +8907,32 @@ mod tests {
                 "edit_mcp_config",
                 VIA_EDIT_GATE,
             ),
-            ("src/config/request_context.rs", "new_macro", PROMPT_GATED),
-            ("src/config/request_context.rs", "new_role", PROMPT_GATED),
-            ("src/config/request_context.rs", "save_role", PROMPT_GATED),
+            (
+                "src/config/request_context.rs",
+                "edit_session",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_agent_config",
+                VIA_EDIT_GATE,
+            ),
+            ("src/config/request_context.rs", "new_macro", VIA_EDIT_GATE),
+            (
+                "src/config/request_context.rs",
+                "upsert_role",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "upsert_skill",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_rag_docs",
+                VIA_EDIT_GATE,
+            ),
             ("src/config/update.rs", "run_self_update", PROMPT_GATED),
             ("src/main.rs", "shell_execute", CLI_ONLY),
             ("src/main.rs", "resolve_oauth_client", PROMPT_GATED),
@@ -5862,11 +8953,6 @@ mod tests {
             (
                 "src/rag/mod.rs",
                 "resolve_or_create_api_key_secret",
-                PROMPT_GATED,
-            ),
-            (
-                "src/repl/mod.rs",
-                "run_repl_command_with_prefix",
                 PROMPT_GATED,
             ),
             ("src/repl/mod.rs", "handle_shell_passthrough", VIA_RUN_GATE),
@@ -6017,35 +9103,100 @@ mod tests {
         );
     }
 
-    /// `.edit` on a file is refused the same way: no editor is spawned
-    /// onto the capture pipe (the name given is not a program at all).
+    /// Registers a lender on its own thread that runs every job it is
+    /// sent, the way the loop does with the screen released, and counts
+    /// them; unregistered when the guard drops.
+    #[cfg(unix)]
+    fn test_lender() -> (LenderGuard, Arc<std::sync::atomic::AtomicUsize>) {
+        let (tx, mut rx) = unbounded_channel();
+        let lent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&lent);
+        let lender = std::thread::spawn(move || {
+            while let Some(msg) = rx.blocking_recv() {
+                if let UiMsg::LendTerminal(LendJob(job)) = msg {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    job(&TtyHandles { _private: () });
+                }
+            }
+        });
+        set_lender(Some((tx, lender.thread().id())));
+        (LenderGuard, lent)
+    }
+
+    #[cfg(unix)]
+    struct LenderGuard;
+
+    #[cfg(unix)]
+    impl Drop for LenderGuard {
+        fn drop(&mut self) {
+            set_lender(None);
+        }
+    }
+
+    /// The loop's copy of the terminal is close-on-exec: a tool child
+    /// spawned during a turn must not inherit a second handle on the tty
+    /// next to the capture pipe it was given.
+    #[cfg(unix)]
+    #[test]
+    fn the_lent_tty_fd_is_cloexec() {
+        use std::os::fd::AsRawFd;
+        let fd = match dup_tty_out() {
+            Ok(fd) => fd,
+            // fd 1 is closed in this process; there is nothing to pin.
+            Err(err) if err.raw_os_error() == Some(libc::EBADF) => return,
+            Err(err) => panic!("dup of fd 1 failed: {err}"),
+        };
+        // SAFETY: fcntl with F_GETFD takes no pointers.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1, "{}", std::io::Error::last_os_error());
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
+    /// With the UI flag up but no loop lending the terminal (the flag
+    /// outlives the loop during teardown), `.edit` on a file fails
+    /// outright: no editor is spawned onto the capture pipe (the name
+    /// given is not a program at all).
     #[test]
     #[serial]
-    fn edit_file_refuses_under_the_tui_without_spawning_an_editor() {
+    fn edit_file_without_a_lender_fails_without_spawning_an_editor() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let err = crate::utils::edit_file(
             "definitely-not-an-editor-x7x",
             std::path::Path::new("/dev/null"),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("not available in the TUI"),
-            "{err}"
-        );
+        assert_eq!(err.to_string(), NOT_LENDING);
     }
 
-    /// `!cmd` is refused the same way: no shell is spawned onto the raw
-    /// tty and the capture pipe (the name given is not a program at all).
+    /// `!cmd` fails the same way without a lender.
     #[test]
     #[serial]
-    fn run_command_refuses_under_the_tui_without_spawning_a_child() {
+    fn run_command_without_a_lender_fails_without_spawning_a_child() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let err = crate::utils::run_command("definitely-not-a-shell-x7x", &["-c", "true"], None)
             .unwrap_err();
-        assert!(
-            err.to_string().contains("not available in the TUI"),
-            "{err}"
-        );
+        assert_eq!(err.to_string(), NOT_LENDING);
+    }
+
+    /// With a lender registered, `!cmd` and `.edit` run their child
+    /// through it: the child runs (its exit code comes back, the file it
+    /// was given is touched) and the lender saw the job.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+        let (_lender, lent) = test_lender();
+        let code = crate::utils::run_command("sh", &["-c", "exit 7"], None).unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(lent.load(Ordering::SeqCst), 1);
+
+        let path = crate::utils::temp_file("-lent-editor-", ".txt");
+        crate::utils::edit_file("touch", &path).unwrap();
+        let touched = path.is_file();
+        let _ = std::fs::remove_file(&path);
+        assert!(touched, "{}", path.display());
+        assert_eq!(lent.load(Ordering::SeqCst), 2);
     }
 
     /// A document loader that writes to its output file still runs under
@@ -6063,10 +9214,9 @@ mod tests {
             "txt",
             "sh -c \"cat $1 - > $2\"",
         )
-        .await
-        .unwrap();
-        std::fs::remove_file(&source).unwrap();
-        assert_eq!(loaded, "loaded under the tui x7x\n");
+        .await;
+        let _ = std::fs::remove_file(&source);
+        assert_eq!(loaded.unwrap(), "loaded under the tui x7x\n");
     }
 
     /// A task id in the source names the owner of a debt marker and
@@ -6107,14 +9257,6 @@ mod tests {
             ),
             (
                 "src/utils/command.rs",
-                "bail!(\"Shell passthrough is not available in the TUI yet\")",
-            ),
-            (
-                "src/utils/command.rs",
-                "bail!(\"Editing files is not available in the TUI yet\")",
-            ),
-            (
-                "src/utils/command.rs",
                 "bail!(\"Interactive prompts are not available in the TUI yet\")",
             ),
             (
@@ -6122,10 +9264,23 @@ mod tests {
                 "bail!(\"Keyboard prompts are not available in the TUI yet; unanswered: {question}\")",
             ),
             (
-                "src/tui/mod.rs",
-                "let _ = reply.send(PromptAnswer::Cancelled);",
+                "src/config/agent.rs",
+                "eprintln!(\"The agent has documents attached; starting without RAG\");",
+            ),
+            (
+                "src/config/install_remote.rs",
+                "return Ok(ObsoleteAction::Keep);",
+            ),
+            (
+                "src/config/install_remote.rs",
+                "conflict::rerun_hint() // TASK-388",
+            ),
+            (
+                "src/config/install_remote.rs",
+                "Ok((Vec::new(), missing.to_vec()))",
             ),
             ("src/tui/redirect.rs", "String::new()"),
+            ("src/tui/bottom_pane.rs", "\".uninstall\", \".update\"];"),
             (
                 "tests/tui_binary.rs",
                 "the transcript is not yet printed on the normal screen when the UI leaves",
@@ -6284,6 +9439,19 @@ mod tests {
         assert!(
             enter < stream,
             "the event stream took stdin before the probe"
+        );
+    }
+
+    /// Two event streams alive at once both read stdin, so the one being
+    /// replaced must be dropped before its successor is created.
+    #[test]
+    fn renew_stream_drops_the_old_stream_before_opening_the_new_one() {
+        let renew = fn_body(include_str!("mod.rs"), "fn renew_stream(");
+        let dropped = renew.find("drop(stream.take())").unwrap();
+        let opened = renew.find("EventStream::new()").unwrap();
+        assert!(
+            dropped < opened,
+            "the new event stream was opened while the old one still held stdin"
         );
     }
 }

@@ -29,7 +29,7 @@ use crate::mcp::{
 };
 use crate::parsers::{bash, python, typescript};
 use crate::prompt::{PromptMemory, Prompter};
-use crate::supervisor::notification::USER_MESSAGE_EVENT;
+use crate::supervisor::notification::{SystemNotification, USER_MESSAGE_EVENT};
 use crate::turn::UiSink;
 use agents::AGENT_FUNCTION_PREFIX;
 use anyhow::{Context, Result, anyhow, bail};
@@ -439,7 +439,8 @@ fn normalize_tool_result(result: Value) -> Value {
 /// Drains this context's own notification queue and drops task events whose
 /// handle is no longer registered with the supervisor (already collected or
 /// cancelled), so the model is never pointed at a dead id. User messages
-/// name no task and always pass through.
+/// name no task and always pass through; each one is announced on the bus
+/// as sent before the caller puts it in front of the model.
 fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
     let events = ctx.notification_queue.drain();
     if events.is_empty() {
@@ -451,11 +452,17 @@ fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
         sup.as_ref()
             .is_some_and(|sup| sup.has_job(id) || sup.has_agent(id))
     };
-    events
+    let live: Vec<SystemNotification> = events
         .into_iter()
         .filter(|event| event.id().is_none_or(task_is_live))
-        .map(|event| event.to_value())
-        .collect()
+        .collect();
+    drop(sup);
+    for event in &live {
+        if let SystemNotification::UserMessage { text } = event {
+            events::bus().publish(Event::QueuedInputSent { text: text.clone() });
+        }
+    }
+    live.into_iter().map(|event| event.to_value()).collect()
 }
 
 /// Single-pass merge of both system channels onto the last tool result of a
@@ -3416,6 +3423,45 @@ mod tests {
         assert_eq!(
             live,
             vec![json!({"event": "user_message", "text": "user-msg-probe-x7x"})]
+        );
+    }
+
+    /// Each user message leaving the queue is announced once, in queue
+    /// order; task events are not, whatever their fate.
+    #[test]
+    #[serial]
+    fn drain_live_notifications_announces_each_sent_user_message_in_order() {
+        let recording = crate::events::RecordingSink::install();
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "sent-probe-k4e-a".into(),
+            });
+        ctx.notification_queue
+            .push(job_notification("job_gone", "execute_command", true));
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "sent-probe-k4e-b".into(),
+            });
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 2);
+        let sent: Vec<Event> = recording
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::QueuedInputSent { text } if text.contains("sent-probe-k4e")))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                Event::QueuedInputSent {
+                    text: "sent-probe-k4e-a".into()
+                },
+                Event::QueuedInputSent {
+                    text: "sent-probe-k4e-b".into()
+                },
+            ]
         );
     }
 

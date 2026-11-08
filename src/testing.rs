@@ -305,6 +305,84 @@ impl Drop for CacheDirGuard {
     }
 }
 
+/// A fresh directory under the temp dir for a test's scratch files,
+/// removed on drop, including on panic, so no outcome leaves them behind.
+pub(crate) struct ScratchDirGuard {
+    pub(crate) path: PathBuf,
+}
+
+impl ScratchDirGuard {
+    pub(crate) fn new(label: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("coyote-scratch-{label}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A fragment only one test's files carry under the shared
+/// `env::temp_dir()`. Entries named with it are removed when the guard is
+/// made (a run killed mid-test must not fail the next one) and when it is
+/// dropped; everything else in the directory, including what tests
+/// running alongside write there, is left alone.
+pub(crate) struct TempNeedleGuard {
+    needle: String,
+}
+
+impl TempNeedleGuard {
+    pub(crate) fn new(needle: &str) -> Self {
+        assert!(
+            needle.len() >= 12,
+            "a temp needle of {} bytes could match another test's files: {needle:?}",
+            needle.len()
+        );
+        let guard = Self {
+            needle: needle.to_string(),
+        };
+        guard.remove_leftovers();
+        guard
+    }
+
+    /// The entries under the temp dir whose file name carries the needle.
+    pub(crate) fn leftovers(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(&self.needle))
+            })
+            .collect()
+    }
+
+    fn remove_leftovers(&self) {
+        for path in self.leftovers() {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+}
+
+impl Drop for TempNeedleGuard {
+    fn drop(&mut self) {
+        self.remove_leftovers();
+    }
+}
+
 /// The first bash on PATH outside System32, for tests that drive the shipped
 /// shell scripts. The one Windows puts in System32 is the WSL launcher, not
 /// a shell: it prints a banner about missing distributions and exits 1, and
@@ -421,7 +499,7 @@ pub(crate) fn read_all(reader: &mut File) -> String {
 }
 
 mod tests {
-    use super::{TestConfigDirGuard, is_outside_system32};
+    use super::{ScratchDirGuard, TempNeedleGuard, TestConfigDirGuard, is_outside_system32};
     use crate::utils;
     use serial_test::serial;
     use std::path::Path;
@@ -463,5 +541,62 @@ mod tests {
             !cache_root.exists(),
             "the temp cache dir is removed on drop"
         );
+    }
+
+    /// The scratch dir exists, with what the test put in it, while the
+    /// guard lives and is gone once it is dropped.
+    #[test]
+    fn scratch_dir_guard_removes_its_dir_on_drop() {
+        let path = {
+            let guard = ScratchDirGuard::new("scratch-guard-unit");
+            std::fs::write(guard.path.join("inner.txt"), "kept until drop").unwrap();
+            assert!(guard.path.is_dir());
+            guard.path.clone()
+        };
+        assert!(!path.exists(), "the scratch dir is removed on drop");
+    }
+
+    /// The guard's sweeps, on creation and on drop, remove only entries
+    /// whose name carries the needle; a neighbour without it stays.
+    #[test]
+    fn temp_needle_guard_sweeps_needle_hits_only() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let needle = format!("needle-guard-unit-{unique}");
+        let temp = std::env::temp_dir();
+        let hit_file = temp.join(format!("{needle}-file"));
+        let hit_dir = temp.join(format!("{needle}-dir"));
+        let bystander = temp.join(format!("bystander-{unique}"));
+        std::fs::write(&hit_file, "").unwrap();
+        std::fs::create_dir_all(hit_dir.join("inner")).unwrap();
+        std::fs::write(&bystander, "").unwrap();
+
+        let guard = TempNeedleGuard::new(&needle);
+        assert!(!hit_file.exists(), "a leftover file survived the sweep");
+        assert!(!hit_dir.exists(), "a leftover directory survived the sweep");
+        assert!(bystander.exists(), "a file without the needle was removed");
+
+        std::fs::write(&hit_file, "").unwrap();
+        assert_eq!(guard.leftovers(), vec![hit_file.clone()]);
+        drop(guard);
+        assert!(
+            !hit_file.exists(),
+            "a file made under the guard survived its drop"
+        );
+        assert!(
+            bystander.exists(),
+            "the drop removed a file without the needle"
+        );
+        let _ = std::fs::remove_file(&bystander);
+    }
+
+    /// A needle shorter than twelve bytes could match another test's
+    /// files, so the guard refuses it.
+    #[test]
+    #[should_panic(expected = "could match another test's files")]
+    fn temp_needle_guard_refuses_a_short_needle() {
+        let _guard = TempNeedleGuard::new("short-x7x");
     }
 }

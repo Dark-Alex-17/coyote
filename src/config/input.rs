@@ -683,6 +683,146 @@ fn resolve_paths(
     ))
 }
 
+/// Runs a backtick document command and returns what it wrote, stderr
+/// folded in and an error message standing in for output it could not
+/// produce. Under the full-screen UI the only stdin is the raw tty the
+/// event stream owns, so the command gets none, and the wait is a poll
+/// the turn's abort can interrupt: dropping the future kills the child.
+async fn run_document_command(cmd: &str) -> String {
+    if !crate::tui::active() {
+        return duct::cmd(&SHELL.cmd, [SHELL.arg.as_str(), cmd])
+            .stderr_to_stdout()
+            .unchecked()
+            .read()
+            .unwrap_or_else(|err| err.to_string());
+    }
+    match run_document_command_under_tui(cmd).await {
+        Ok(text) => text,
+        Err(err) => err.to_string(),
+    }
+}
+
+/// The output pipe is ours rather than duct's: duct reaps the shell the
+/// moment it exits, and a reaped pid may be reused, so from then on no
+/// group could safely be signalled. Here the shell is reaped only once
+/// it has exited AND the pipe has hit EOF; until both hold it stays a
+/// zombie, and its pid, which is also its group id, is the drop's to
+/// signal.
+async fn run_document_command_under_tui(cmd: &str) -> std::io::Result<String> {
+    let (mut reader, writer) = std::io::pipe()?;
+    let child = {
+        let mut command = std::process::Command::new(&SHELL.cmd);
+        command
+            .args([SHELL.arg.as_str(), cmd])
+            .stdin(std::process::Stdio::null())
+            .stdout(writer.try_clone()?)
+            .stderr(writer);
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        // The command keeps its copies of the write end until it drops
+        // here; after that only the processes hold the pipe open.
+        command.spawn()?
+    };
+    let mut child = KillOnDrop(Some(child));
+    let output = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    while !(child.exited()? && output.is_finished()) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    child.reap()?;
+    let bytes = output.await.map_err(std::io::Error::other)??;
+    Ok(String::from_utf8_lossy(&bytes)
+        .trim_end_matches(['\n', '\r'])
+        .to_string())
+}
+
+/// A document command that does not outlive the future waiting on it.
+/// On unix the shell leads its own process group and the drop signals
+/// the whole group, so the kill also reaches whatever the shell spawned;
+/// killing the shell alone would leave those orphans holding the output
+/// pipe. The shell inside is never reaped while the guard is armed, so
+/// an exited shell is a zombie whose pid cannot be reused, and the drop
+/// signals the group named by that pid unconditionally. The one escape
+/// is a grandchild that left the group with setsid: it is neither
+/// signalled nor waited on. The drop blocks its thread, a tokio worker
+/// when a turn is aborted, until the just-killed shell is reaped; the
+/// wait has no bound, but a SIGKILLed shell is reapable at once.
+struct KillOnDrop(Option<std::process::Child>);
+
+impl KillOnDrop {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0
+            .as_mut()
+            .expect("the child is only taken by reap or drop")
+    }
+
+    /// Whether the shell has exited. On unix this peeks without reaping,
+    /// so the shell stays a zombie and its pid stays ours.
+    fn exited(&mut self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            Ok(exited_unreaped(self.child().id() as libc::pid_t))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(self.child().try_wait()?.is_some())
+        }
+    }
+
+    /// Reaps a shell that has exited and whose pipe has closed, and
+    /// disarms the guard: its pid may now belong to another process, so
+    /// nothing is signalled later.
+    fn reap(mut self) -> std::io::Result<()> {
+        let mut child = self.0.take().expect("reap runs once");
+        child.wait().map(drop)
+    }
+}
+
+/// Whether our child `pid` has exited and is still waiting to be reaped.
+/// A pid that is no child of ours any more counts as exited.
+#[cfg(unix)]
+fn exited_unreaped(pid: libc::pid_t) -> bool {
+    // SAFETY: all-zero bytes are a valid `siginfo_t`, and `waitid` only
+    // writes into it; with WNOHANG a pid that has not exited leaves
+    // `si_pid` at zero.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        // SAFETY: `info` is a live, writable `siginfo_t`.
+        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, options) } == 0 {
+            // SAFETY: `si_pid` is valid for a child-state report.
+            return unsafe { info.si_pid() } != 0;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return true;
+        }
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            // SAFETY: killpg has no memory-safety preconditions. Nothing
+            // has reaped the shell yet, so it is running or a zombie and
+            // its pid, which is also its group id, cannot have been
+            // reused: the group signalled is the one it leads, however
+            // long ago it exited.
+            let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        // Only the shell is waited on. A grandchild that left the group
+        // with setsid survives the signal, closes the pipe in its own
+        // time, and nothing waits on it.
+        let _ = child.wait();
+    }
+}
+
 async fn load_documents(
     loaders: &HashMap<String, String>,
     local_paths: Vec<String>,
@@ -699,11 +839,7 @@ async fn load_documents(
     let mut data_urls = HashMap::new();
 
     for cmd in external_cmds {
-        let output = duct::cmd(&SHELL.cmd, &[&SHELL.arg, &cmd])
-            .stderr_to_stdout()
-            .unchecked()
-            .read()
-            .unwrap_or_else(|err| err.to_string());
+        let output = run_document_command(&cmd).await;
         files.push(("CMD", cmd, output));
     }
 
@@ -1317,6 +1453,192 @@ mod tests {
         ))
         .unwrap();
         assert!(input.text().contains("hello from cmd"));
+    }
+
+    #[cfg(unix)]
+    mod tui_document_commands {
+        use super::*;
+        use crate::testing::AtomicFlagGuard;
+        use serial_test::serial;
+
+        /// Under the full-screen UI a document command that reads stdin gets
+        /// none, so `cat -` returns at once with nothing instead of waiting on
+        /// a tty the event stream owns.
+        #[test]
+        #[serial]
+        fn a_document_command_under_the_tui_reads_no_stdin() {
+            let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+            let started = std::time::Instant::now();
+
+            let output = run_async(run_document_command("cat -; echo done-k2m"));
+
+            assert_eq!(output, "done-k2m");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+
+        /// Runs `script` as a document command under the TUI and drops the
+        /// future as soon as `ready` reads a pid out of `pid_file`.
+        /// Returns that pid and how long the drop took. The script is
+        /// written beside the pid file and `exec`ed into `sh`, so its `$$`
+        /// and `$!` do not depend on whatever `$SHELL` the command line
+        /// uses and `$$` is the group leader's pid.
+        fn drop_document_command_once_pid_written(
+            script: &str,
+            pid_file: &std::path::Path,
+            ready: impl Fn(&str) -> Option<i32>,
+        ) -> (i32, std::time::Duration) {
+            let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+            let script_file = pid_file.with_extension("sh");
+            fs::write(&script_file, script).unwrap();
+            let command = format!("exec sh '{}'", script_file.display());
+            let mut dropped_at = None;
+            let pid = run_async(async {
+                let command = run_document_command(&command);
+                tokio::pin!(command);
+                loop {
+                    tokio::select! {
+                        output = &mut command => panic!("the command finished early: {output}"),
+                        () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                            if let Some(pid) = fs::read_to_string(pid_file)
+                                .ok()
+                                .and_then(|text| ready(&text))
+                            {
+                                dropped_at = Some(std::time::Instant::now());
+                                break pid;
+                            }
+                        }
+                    }
+                }
+            });
+            (pid, dropped_at.unwrap().elapsed())
+        }
+
+        fn whole_pid(text: &str) -> Option<i32> {
+            text.trim().parse().ok()
+        }
+
+        /// A reaped pid answers ESRCH to a null signal; a zombie or a
+        /// still-running process answers 0.
+        fn process_alive(pid: i32) -> bool {
+            // SAFETY: a null signal only checks the pid.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        /// Fails unless `pid` is gone within `deadline`; a pid still alive
+        /// at the deadline is killed on the way out so the failed test
+        /// leaves nothing behind. A reaped pid answers ESRCH to a null
+        /// signal; a zombie or a still-running process answers 0.
+        fn assert_process_gone(pid: i32, deadline: std::time::Duration, what: &str) {
+            let deadline = std::time::Instant::now() + deadline;
+            while process_alive(pid) {
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: kill takes a pid and a signal number and touches no memory.
+                    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                    panic!("{what} (pid {pid}) outlived its future");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        /// Dropping the future that waits on a document command under the
+        /// TUI, which is what an aborted turn does, kills the command instead
+        /// of leaving it to finish on its own.
+        #[test]
+        #[serial]
+        fn dropping_a_document_command_under_the_tui_kills_it() {
+            let dir = env::temp_dir().join(format!(
+                "coyote-input-test-kill-{}",
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            create_dir_all(&dir).unwrap();
+            let pid_file = dir.join("pid");
+            let script = format!("echo $$ > '{}'; sleep 30", pid_file.display());
+            let (pid, _) = drop_document_command_once_pid_written(&script, &pid_file, whole_pid);
+            assert_process_gone(
+                pid,
+                std::time::Duration::from_secs(5),
+                "the document command",
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// A piped or backgrounded document command leaves the real work in a
+        /// grandchild of the shell. The drop kills the whole process group
+        /// and comes back promptly rather than waiting on the orphan.
+        #[test]
+        #[serial]
+        fn dropping_a_document_command_kills_its_grandchildren_too() {
+            let dir = env::temp_dir().join(format!(
+                "coyote-input-test-killpg-{}",
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            create_dir_all(&dir).unwrap();
+            let pid_file = dir.join("pid");
+            let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+            let (grandchild, drop_took) =
+                drop_document_command_once_pid_written(&script, &pid_file, whole_pid);
+            assert!(
+                drop_took < std::time::Duration::from_secs(2),
+                "dropping the command took {drop_took:?}"
+            );
+            assert_process_gone(
+                grandchild,
+                std::time::Duration::from_secs(2),
+                "the grandchild of the document command",
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// A shell that backgrounds its work and exits without waiting on
+        /// it leaves the grandchild alone in the group. The exited shell
+        /// stays a zombie, so its pid still names the group when the drop
+        /// signals it: the grandchild dies with it, and the drop comes
+        /// back promptly rather than waiting on the pipe it held.
+        #[test]
+        #[serial]
+        fn dropping_a_document_command_whose_shell_already_exited_kills_the_orphan_still_in_the_group()
+         {
+            let dir = env::temp_dir().join(format!(
+                "coyote-input-test-orphan-{}",
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            create_dir_all(&dir).unwrap();
+            let pid_file = dir.join("pid");
+            let script = format!("sleep 30 & echo $$ $! > '{}'", pid_file.display());
+            // The drop waits for the shell to have exited while its pid is
+            // still held: a running shell would take the grandchild with
+            // it for the ordinary reason.
+            let (grandchild, drop_took) =
+                drop_document_command_once_pid_written(&script, &pid_file, |text| {
+                    let (shell, grandchild) = text.trim().split_once(' ')?;
+                    let shell: i32 = shell.parse().ok()?;
+                    (process_alive(shell) && exited_unreaped(shell))
+                        .then(|| grandchild.parse().ok())?
+                });
+            assert!(
+                drop_took < std::time::Duration::from_secs(2),
+                "dropping the command took {drop_took:?}"
+            );
+            assert_process_gone(
+                grandchild,
+                std::time::Duration::from_secs(2),
+                "the orphaned grandchild of the document command",
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

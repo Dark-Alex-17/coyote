@@ -561,7 +561,7 @@ fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<O
     // matches the non-interactive answer rather than refusing after
     // apply_plan has already written the update.
     if !*IS_STDOUT_TERMINAL || crate::tui::active() {
-        return Ok(ObsoleteAction::Keep);
+        return Ok(ObsoleteAction::Keep); // TASK-388
     }
 
     // The branch above already keeps under the UI; defence in depth.
@@ -978,7 +978,7 @@ fn resolve_uninstall_action(
     // Under the full-screen UI the menu cannot be shown; the file is kept
     // like the non-interactive answer rather than refused mid-uninstall.
     if assume_yes || !*IS_STDOUT_TERMINAL || crate::tui::active() {
-        return Ok(ObsoleteAction::Keep);
+        return Ok(ObsoleteAction::Keep); // TASK-388
     }
 
     if let Some(action) = *sticky {
@@ -2221,7 +2221,7 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
         bail!(
             "MCP server '{name}' already exists locally. Refusing to merge non-interactively. \
              {}, with --install-force (installs), or with --yes (updates).",
-            conflict::rerun_hint()
+            conflict::rerun_hint() // TASK-388
         );
     }
     // The refusal above already covers the UI; defence in depth.
@@ -2333,7 +2333,7 @@ fn partition_missing_secrets(missing: &[String]) -> Result<(Vec<String>, Vec<Str
         );
         return prompt_for_each_secret(missing);
     }
-    Ok((Vec::new(), missing.to_vec()))
+    Ok((Vec::new(), missing.to_vec())) // TASK-388
 }
 
 fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {

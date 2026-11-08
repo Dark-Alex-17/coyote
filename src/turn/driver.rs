@@ -630,9 +630,13 @@ mod tests {
     use crate::client::{call_chat_completions, call_chat_completions_streaming};
     use crate::config::{AppState, WorkingMode};
     use crate::events::{Event, RecordingSink};
+    use crate::function::{ToolCall, eval_tool_calls};
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
+    use crate::supervisor::notification::SystemNotification;
     use crate::utils::create_abort_signal;
+    use serde_json::json;
     use serial_test::serial;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn silent_ctx() -> RequestContext {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
@@ -768,5 +772,178 @@ mod tests {
             .filter(|event| matches!(event, Event::TextDelta(text) if text == reply))
             .collect();
         assert_eq!(deltas, vec![Event::TextDelta(reply.to_string())]);
+    }
+
+    /// A line the user queued mid-turn rides on the last tool result of
+    /// the round that follows it, so the model reads it before its next
+    /// step.
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_user_message_reaches_the_model_at_the_next_tool_round() {
+        let mut ctx = silent_ctx();
+        let probe = "queued-probe-x7x";
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: probe.to_string(),
+            });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut runner = completion_runner(move |input, ctx, _abort| {
+            match seen.fetch_add(1, Ordering::SeqCst) + 1 {
+                1 => boxed_completion(async move {
+                    let call = ToolCall::new(
+                        "unknown_tool".to_string(),
+                        json!({}),
+                        Some("id-1".to_string()),
+                    );
+                    let results = eval_tool_calls(ctx, vec![call]).await?;
+                    Ok((String::new(), results))
+                }),
+                _ => {
+                    let results = &input
+                        .tool_calls()
+                        .as_ref()
+                        .expect("the second call carries the first round's results")
+                        .tool_results;
+                    let notifications = &results.last().unwrap().output["system_notifications"];
+                    assert_eq!(notifications[0]["event"], "user_message");
+                    assert_eq!(notifications[0]["text"], probe);
+                    boxed_completion(async { Ok(("done".to_string(), vec![])) })
+                }
+            }
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive(&mut ctx, TurnMode::Repl, "hi", &mut runner),
+        )
+        .await
+        .expect("the two-round turn did not finish within 5s");
+
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The sent event marks the line joining the next request's history,
+    /// not that request succeeding: when the request then fails, the
+    /// event has fired exactly once and the merged tool result the turn
+    /// keeps for a retry still carries the line.
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_user_message_is_announced_once_even_when_the_next_request_fails() {
+        let mut ctx = silent_ctx();
+        let probe = "queued-failed-probe-x7x";
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: probe.to_string(),
+            });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut runner = completion_runner(move |_input, ctx, _abort| {
+            match seen.fetch_add(1, Ordering::SeqCst) + 1 {
+                1 => boxed_completion(async move {
+                    let call = ToolCall::new(
+                        "unknown_tool".to_string(),
+                        json!({}),
+                        Some("id-1".to_string()),
+                    );
+                    let results = eval_tool_calls(ctx, vec![call]).await?;
+                    Ok((String::new(), results))
+                }),
+                _ => boxed_completion(async { Err(anyhow::anyhow!("the request failed")) }),
+            }
+        });
+        let sink = RecordingSink::install();
+
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut driver = TurnDriver {
+            runner: &mut runner,
+            mode: TurnMode::Repl,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            driver.run_turn(&mut ctx, create_abort_signal(), input, false, None),
+        )
+        .await
+        .expect("the failing turn did not finish within 5s");
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let sent: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::QueuedInputSent { text } if text == probe))
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let kept = ctx
+            .last_message
+            .as_ref()
+            .expect("the failed request's input is kept for a retry");
+        let results = &kept
+            .input
+            .tool_calls()
+            .as_ref()
+            .expect("the kept input carries the tool round")
+            .tool_results;
+        let notifications = &results.last().unwrap().output["system_notifications"];
+        assert_eq!(notifications[0]["text"], probe);
+    }
+
+    /// An interrupt that lands during the tool round the line was merged
+    /// into ends the turn there: the event has fired once and the
+    /// committed tool result still carries the line for the next request.
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_user_message_survives_an_interrupt_after_it_was_merged() {
+        let mut ctx = silent_ctx();
+        let probe = "queued-interrupted-probe-x7x";
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: probe.to_string(),
+            });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut runner = completion_runner(move |_input, ctx, abort| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            boxed_completion(async move {
+                let call = ToolCall::new(
+                    "unknown_tool".to_string(),
+                    json!({}),
+                    Some("id-1".to_string()),
+                );
+                let results = eval_tool_calls(ctx, vec![call]).await?;
+                abort.set_ctrlc();
+                Ok((String::new(), results))
+            })
+        });
+        let sink = RecordingSink::install();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive(&mut ctx, TurnMode::Repl, "hi", &mut runner),
+        )
+        .await
+        .expect("the interrupted turn did not finish within 5s");
+
+        assert_eq!(outcome, TurnOutcome::Interrupted);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let sent: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::QueuedInputSent { text } if text == probe))
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let kept = ctx
+            .last_message
+            .as_ref()
+            .expect("the interrupted round is committed");
+        let results = &kept
+            .input
+            .tool_calls()
+            .as_ref()
+            .expect("the committed input carries the tool round")
+            .tool_results;
+        let notifications = &results.last().unwrap().output["system_notifications"];
+        assert_eq!(notifications[0]["text"], probe);
     }
 }

@@ -2,7 +2,6 @@
 source: src/tui/mod.rs
 expression: frame
 ---
-"                                        "
 "┌──────────────────────────────────────┐"
 "│ coyote X.Y.Z │"
 "│ model: openai:test-model             │"
@@ -18,6 +17,7 @@ expression: frame
 "└──────────────────────────────────────┘"
 "                                        "
 "                                        "
+"────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"
 "                                        "
 "                                        "

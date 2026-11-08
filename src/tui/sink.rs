@@ -79,10 +79,27 @@ pub(crate) enum UiMsg {
         outcome: AgentOutcome,
     },
     TodoUpdated(Vec<TodoItem>),
+    /// A queued line the model has just been handed; the transcript
+    /// records it where it was read.
+    QueuedInputSent(String),
     Prompt {
         req: Box<PromptRequest>,
         reply: std::sync::mpsc::Sender<PromptAnswer>,
     },
+    /// Work that needs the terminal in its normal modes (a shell
+    /// passthrough, an editor on a file): the loop releases the screen,
+    /// runs it, and takes the screen back.
+    LendTerminal(LendJob),
+}
+
+/// The job behind [`UiMsg::LendTerminal`]; its result travels back to
+/// the asker inside the closure.
+pub(crate) struct LendJob(pub(crate) Box<dyn FnOnce(&super::TtyHandles) + Send>);
+
+impl fmt::Debug for LendJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LendJob")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +321,7 @@ impl EventSink for TuiSink {
                 },
             }),
             Event::TodoUpdated { items } => self.send(UiMsg::TodoUpdated(items.clone())),
+            Event::QueuedInputSent { text } => self.send(UiMsg::QueuedInputSent(text.clone())),
             _ => {}
         }
     }
@@ -596,5 +614,20 @@ mod tests {
             items: items.clone(),
         });
         assert!(matches!(rx.try_recv(), Ok(UiMsg::TodoUpdated(got)) if got == items));
+    }
+
+    /// Queueing a line is the composer's own doing and already on screen;
+    /// only the line's hand-over to the model is forwarded.
+    #[test]
+    fn a_sent_queued_line_reaches_the_transcript_but_a_queued_one_does_not() {
+        let (sink, mut rx) = sink();
+        sink.on_event(&Event::QueuedInput {
+            text: "later".to_string(),
+        });
+        sink.on_event(&Event::QueuedInputSent {
+            text: "later".to_string(),
+        });
+        assert!(matches!(rx.try_recv(), Ok(UiMsg::QueuedInputSent(text)) if text == "later"));
+        assert!(rx.try_recv().is_err());
     }
 }

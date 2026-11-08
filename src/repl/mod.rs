@@ -3,8 +3,9 @@ mod highlighter;
 mod prompt;
 mod replay;
 
-use self::completer::ReplCompleter;
-use self::highlighter::ReplHighlighter;
+pub(crate) use self::completer::{ReplCompleter, command_candidates, macro_candidates, split_line};
+pub(crate) use self::highlighter::{CommandSpan, classify_command};
+use self::highlighter::{MacroNames, ReplHighlighter};
 use self::prompt::ReplPrompt;
 
 use crate::client::{
@@ -20,6 +21,7 @@ use crate::config::{AssetCategory, paths};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
+use crate::prompt::PromptAction;
 use crate::render::render_error;
 use crate::supervisor::Supervisor;
 use crate::turn::driver::{
@@ -28,8 +30,7 @@ use crate::turn::driver::{
 use crate::turn::{TurnDriver, TurnMode};
 use crate::utils::{
     AbortSignal, SHELL, UserInterrupt, abortable_run_with_spinner, create_abort_signal,
-    dimmed_text, drain_stale_tty_input, ensure_prompts_available, resync_cursor_queries,
-    run_command, set_text, temp_file,
+    dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -38,7 +39,6 @@ use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
 use indoc::indoc;
-use inquire::Text;
 use log::warn;
 use parking_lot::RwLock;
 use reedline::CursorConfig;
@@ -463,13 +463,15 @@ pub struct Repl {
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
+    macro_names: MacroNames,
 }
 
 impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
         let ctx = Arc::new(RwLock::new(ctx));
-        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
+        let macro_names = MacroNames::default();
+        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), macro_names.clone())?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
 
@@ -478,6 +480,7 @@ impl Repl {
             editor,
             prompt,
             abort_signal,
+            macro_names,
         })
     }
 
@@ -549,6 +552,7 @@ impl Repl {
             }
             // Drain stale ESC[6n replies so reedline anchors the prompt on the real row.
             resync_cursor_queries();
+            self.macro_names.refresh(&self.ctx.read());
             let sig = self.editor.read_line(&self.prompt);
             match sig {
                 Ok(Signal::Success(line)) => {
@@ -616,9 +620,13 @@ impl Repl {
         exit_result
     }
 
-    fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
+    fn create_editor(
+        ctx: Arc<RwLock<RequestContext>>,
+        app: &AppConfig,
+        macro_names: MacroNames,
+    ) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
-        let highlighter = ReplHighlighter::new(Arc::clone(&ctx));
+        let highlighter = ReplHighlighter::new(Arc::clone(&ctx), macro_names);
         let menu = Self::create_menu();
         let edit_mode = Self::create_edit_mode(app);
         let cursor_config = CursorConfig {
@@ -722,6 +730,14 @@ impl ReplCommand {
 
     fn is_valid(&self, flags: StateFlags) -> bool {
         self.state.assert(flags)
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) fn description(&self) -> &'static str {
+        self.description
     }
 }
 
@@ -965,17 +981,7 @@ pub async fn run_repl_command_with_prefix(
                             .arguments
                             .unwrap_or_default();
                         let (mut arguments, missing) = resolve_prompt_args(&declared, provided);
-                        if !missing.is_empty() {
-                            ensure_prompts_available()?;
-                        }
-                        for key in missing {
-                            let value = Text::new(&prompt_arg_inquire_label(server, name, &key))
-                                .prompt()
-                                .with_context(|| {
-                                    format!("Failed to read prompt argument '{key}'")
-                                })?;
-                            arguments.insert(key, value);
-                        }
+                        arguments.extend(prompt_missing_args(ctx, server, name, missing)?);
                         let result = ctx
                             .tool_scope
                             .mcp_runtime
@@ -2107,7 +2113,7 @@ fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Opt
 /// The text inside a `::: ... :::` multi-line fence, or the line itself
 /// when it has none. Every surface classifies a submitted line through
 /// this, so a fenced command runs and is shown as a command everywhere.
-fn unfence(line: &str) -> &str {
+pub(crate) fn unfence(line: &str) -> &str {
     match MULTILINE_RE.captures(line) {
         Ok(Some(captures)) => captures.get(1).map_or(line, |text| text.as_str()),
         _ => line,
@@ -2177,6 +2183,31 @@ fn prompt_arg_inquire_label(server: &str, prompt: &str, arg: &str) -> String {
         sanitize_display_text(server),
         sanitize_display_text(arg)
     )
+}
+
+/// Asks for each required argument the `.prompt` call left out, one
+/// Input question per key in the order the prompt declares them.
+fn prompt_missing_args(
+    ctx: &RequestContext,
+    server: &str,
+    prompt: &str,
+    missing: Vec<String>,
+) -> Result<Vec<(String, String)>> {
+    missing
+        .into_iter()
+        .map(|key| {
+            let value = ctx
+                .prompt(ctx.prompt_request(
+                    PromptAction::Input,
+                    prompt_arg_inquire_label(server, prompt, &key),
+                    Vec::new(),
+                    None,
+                ))?
+                .into_text()
+                .with_context(|| format!("Failed to read prompt argument '{key}'"))?;
+            Ok((key, value))
+        })
+        .collect()
 }
 
 pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
@@ -2266,6 +2297,7 @@ mod tests {
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::prompt::{PromptAnswer, ScriptedPrompter};
     use crate::turn::driver::{
         auto_compress_session, compress_for_error_retry, compression_failure_notice,
         dim_notice_color, interrupted_turn_notice, maybe_auto_compress, pause_banner_text,
@@ -7979,6 +8011,78 @@ local_hello() {\n\
         );
     }
 
+    /// The arguments a `.prompt` call leaves out are asked for through
+    /// the context's prompter, one Input question per key in declaration
+    /// order; a cancel on any of them ends the call with the key named.
+    #[test]
+    fn missing_prompt_args_are_asked_through_the_prompter() {
+        let mut ctx = repl_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Text("notes.txt".to_string()),
+            PromptAnswer::Text("terse".to_string()),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        let filled = prompt_missing_args(
+            &ctx,
+            "srv",
+            "summarize",
+            vec!["path".to_string(), "style".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            filled,
+            vec![
+                ("path".to_string(), "notes.txt".to_string()),
+                ("style".to_string(), "terse".to_string()),
+            ]
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|req| req.action == PromptAction::Input));
+        assert_eq!(
+            requests[0].question,
+            "Prompt 'summarize' on 'srv' requires 'path':"
+        );
+        assert_eq!(
+            requests[1].question,
+            "Prompt 'summarize' on 'srv' requires 'style':"
+        );
+        assert!(
+            prompt_missing_args(&ctx, "srv", "summarize", Vec::new())
+                .unwrap()
+                .is_empty()
+        );
+
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err =
+            prompt_missing_args(&ctx, "srv", "summarize", vec!["path".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "Failed to read prompt argument 'path'");
+        assert_eq!(
+            err.root_cause().to_string(),
+            "Operation was canceled by the user"
+        );
+    }
+
+    /// With no human to fill them in, the missing arguments end the call
+    /// before anything reaches the server.
+    #[test]
+    fn missing_prompt_args_with_no_human_end_the_call() {
+        let mut ctx = repl_ctx();
+        ctx.prompter = Arc::new(crate::prompt::HeadlessPrompter);
+
+        let err =
+            prompt_missing_args(&ctx, "srv", "summarize", vec!["path".to_string()]).unwrap_err();
+
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "The input prompt needs a human and none is attached to this run; \
+             run it without --headless or --acp-server"
+        );
+    }
+
     #[test]
     fn parse_repl_install_routes_categories_to_builtins() {
         assert_eq!(
@@ -9371,7 +9475,9 @@ local_hello() {\n\
     }
 
     #[test]
+    #[serial]
     fn exit_session_with_nothing_attached_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
         run_async(async {
             let mut ctx = repl_ctx();
             assert!(ctx.session.is_none());
@@ -9390,7 +9496,9 @@ local_hello() {\n\
     }
 
     #[test]
+    #[serial]
     fn exit_session_with_a_session_attached_cancels_background_work() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
         run_async(async {
             let mut ctx = repl_ctx();
             let mut session = Session::default();

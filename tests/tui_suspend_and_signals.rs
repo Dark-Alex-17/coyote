@@ -99,6 +99,10 @@ fn write_dry_run_config_with(dir: &Path, extra: &str) {
 /// The fake-LLM config, prompt-free on every exit path; `extra` is
 /// appended as top-level YAML.
 fn write_fake_llm_config(dir: &Path, fake: &FakeLlm, extra: &str) {
+    write_fake_llm_config_saving(dir, fake, extra, false);
+}
+
+fn write_fake_llm_config_saving(dir: &Path, fake: &FakeLlm, extra: &str, save_session: bool) {
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
     fs::write(
@@ -107,7 +111,7 @@ fn write_fake_llm_config(dir: &Path, fake: &FakeLlm, extra: &str) {
             "model: fake:fake-model\n\
              function_calling_support: true\n\
              stream: true\n\
-             save_session: false\n\
+             save_session: {save_session}\n\
              vault_password_file: '{vault_pass}'\n\
              clients:\n\
              \x20 - type: openai-compatible\n\
@@ -448,17 +452,19 @@ fn assert_repainted_after(
 
 // ---------------------------------------------------------------------
 // Enter on a draft while the context is away (a tool is running). The
-// draft is not lost and the running turn is not disturbed.
+// draft is queued and rides into the next tool round.
 // ---------------------------------------------------------------------
 
-/// Keys are handled while a work task sleeps; a submit while the context
-/// is away restores the draft rather than losing it, and never ends the
-/// turn or the process. Whichever way the UI holds the draft (back in the
-/// composer, or sent as the next prompt once the turn is over), the text
-/// reaches the model exactly once and the UI stays live throughout.
+/// Keys are handled while a work task sleeps; Enter while the context is
+/// away queues the line (the strip above the field shows `pending: 1`
+/// and the text) and never ends the turn or the process. Once the tool
+/// is released the driver hands the queued line to the model at the
+/// tool-round boundary, so the fake serves exactly two requests, the
+/// second carrying the draft, the strip is gone and the composer is
+/// empty.
 #[test]
 #[serial]
-fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
+fn enter_on_a_draft_while_a_tool_sleeps_queues_it_and_the_model_gets_it_next_round() {
     let dir = fresh_config_dir("enter-mid-tool");
     let _guard = TempDirGuard(dir.clone());
     let marker = dir.join("tool");
@@ -468,7 +474,6 @@ fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
             arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
         },
         Reply::Text("fixture done r12-a".to_string()),
-        Reply::Text("draft reply r12-b".to_string()),
     ]);
     write_fake_llm_config(&dir, &fake, "");
     write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
@@ -490,6 +495,11 @@ fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
         !mid.contains("exit=") && find(pty.raw(), LEAVE_ALT, typed_at).is_none(),
         "Enter on a draft while a tool ran ended the UI (a panic or a quit):\n{after_enter}"
     );
+    let queued = squeezed(&mid);
+    assert!(
+        queued.contains("pending:1") && queued.contains("draft-r12-d"),
+        "Enter on a draft while a tool ran did not queue it:\n{mid}"
+    );
     assert_eq!(
         fake.served(),
         1,
@@ -508,36 +518,38 @@ fn enter_on_a_draft_while_a_tool_sleeps_loses_nothing_and_disturbs_nothing() {
         "the reply after the tool",
     );
     pty.read_for(Duration::from_millis(800));
+    assert_eq!(
+        fake.served(),
+        2,
+        "the queued line did not ride into the tool round as a notification"
+    );
+    let bodies = fake.bodies();
+    assert!(
+        bodies[1].contains("draft-r12-d"),
+        "the queued line is missing from the model's second request:\n{}",
+        bodies[1]
+    );
 
-    // Either the draft is back in the composer (Ctrl+L repaints the whole
-    // screen, so it is visible from here on) or it already went out as
-    // the next prompt; in both cases it must not be gone.
+    // Ctrl+L repaints the whole screen, so what follows is the current
+    // frame alone: no strip, the mid-turn cell in the transcript, and no
+    // draft left in the field.
     let repaint_at = pty.raw().len();
     pty.send(b"\x0c").unwrap();
     pty.read_for(Duration::from_millis(600));
     let repainted = since(&pty, repaint_at);
-    let in_composer = squeezed(&repainted).contains("draft-r12-d");
-    if in_composer {
-        pty.send(b"\r").unwrap();
-    } else {
-        assert!(
-            fake.served() >= 2 && squeezed(&since(&pty, typed_at)).contains("draft-r12-d"),
-            "the draft typed while the tool ran was lost: it is neither in the composer nor \
-             in the transcript (model calls served: {}):\n{repainted}",
-            fake.served()
-        );
-    }
-    let transcript = wait_for_squeezed_after(
-        &mut pty,
-        "draft reply r12-b",
-        typed_at,
-        "the reply to the draft",
+    assert!(
+        !repainted.contains("pending:"),
+        "the queue strip outlived the turn:\n{repainted}"
+    );
+    let frame = squeezed(&repainted);
+    assert!(
+        frame.contains(">draft-r12-d(sentmid-turn)"),
+        "the transcript has no mid-turn cell for the line the model read:\n{repainted}"
     );
     assert_eq!(
-        fake.served(),
-        3,
-        "the draft reached the model {} times instead of once:\n{transcript}",
-        fake.served().saturating_sub(2)
+        frame.matches("draft-r12-d").count(),
+        1,
+        "the queued line is still in the composer after it went to the model:\n{repainted}"
     );
 
     pty.send(b"\x04").unwrap();
@@ -922,6 +934,107 @@ fn sigterm_during_a_slow_file_loader_kills_it_and_leaves_the_tty_cooked() {
         !squeezed(&transcript).contains("neverreachedr12-n"),
         "the model's reply landed after the signal:\n{transcript}"
     );
+}
+
+/// A line queued while a tool sleeps, then SIGTERM: the exit takes the
+/// line off the turn's queue before the turn is told to stop, so the
+/// tool result the interrupt closes cannot hand it to the model and the
+/// session the exit autosaves (one is open, under `save_session: true`)
+/// does not carry it either. The process still leaves cleanly.
+#[test]
+#[serial]
+fn sigterm_with_a_queued_line_does_not_hand_it_to_the_model() {
+    let dir = fresh_config_dir("sigterm-queued");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_sleep".to_string(),
+            arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+        },
+        Reply::Text("never reached r12-q".to_string()),
+    ]);
+    write_fake_llm_config_saving(&dir, &fake, "", true);
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&transcript);
+    let session_at = pty.raw().len();
+    pty.send(b".session sigq-r12\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "sigq-r12 . agents",
+        session_at,
+        "the footer's session token",
+    );
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"call the sleep tool\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-started"),
+        "the sleep tool's start marker",
+    );
+    pty.read_for(Duration::from_millis(300));
+    let typed_at = pty.raw().len();
+    pty.send(b"queued-r12-q\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "pending: 1",
+        typed_at,
+        "the queue strip after Enter on a draft",
+    );
+    // A full repaint: the incremental frame can carry a torn cell diff
+    // of the strip's text, so the queued line is read from a fresh one.
+    let repaint_at = pty.raw().len();
+    pty.resize(24, 81).unwrap();
+    pty.read_for(Duration::from_millis(600));
+    let mid = squeezed(&since(&pty, repaint_at));
+    assert!(
+        mid.contains("queued-r12-q"),
+        "Enter on a draft while a tool ran did not queue it:\n{mid}"
+    );
+    let started = Instant::now();
+    // SAFETY: kill takes a pid and a signal number and touches no memory.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let took = started.elapsed();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(count(pty.raw(), LEAVE_ALT), 1, "{transcript}");
+    assert!(
+        took < Duration::from_secs(8),
+        "the exit waited the tool out instead of aborting it: {took:?}"
+    );
+    assert!(
+        fake.bodies()
+            .iter()
+            .all(|body| !body.contains("queued-r12-q")),
+        "the queued line reached the model through the signal exit:\n{:?}",
+        fake.bodies()
+    );
+    let saved: Vec<(PathBuf, String)> = fs::read_dir(dir.join("sessions"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            (path, text)
+        })
+        .collect();
+    assert!(
+        !saved.is_empty(),
+        "the signal exit saved no session under {}:\n{transcript}",
+        dir.join("sessions").display()
+    );
+    for (path, saved) in saved {
+        assert!(
+            !saved.contains("queued-r12-q"),
+            "the queued line was saved with the session {}:\n{saved}",
+            path.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

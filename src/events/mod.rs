@@ -124,8 +124,16 @@ pub enum Event {
         answer: String,
         auto: bool,
     },
-    #[allow(dead_code)] // TASK-315
     QueuedInput {
+        text: String,
+    },
+    /// A queued line left the queue for the model. It fires when the line
+    /// is merged onto a tool result, which is when it enters the next
+    /// request's history and before that request is sent. Merged results
+    /// stay in the history across a retry, so a request that then fails or
+    /// is interrupted still carries the text the next time one goes out;
+    /// the event therefore fires once per line, never again on retry.
+    QueuedInputSent {
         text: String,
     },
 }

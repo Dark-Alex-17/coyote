@@ -45,8 +45,8 @@ use crate::mcp::{
     is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::prompt::{
-    HeadlessPrompter, InquirePrompter, PromptAction, PromptAnswer, PromptMemory, PromptRequest,
-    Prompter, human_present,
+    HeadlessPrompter, InquirePrompter, NeedsHuman, PromptAction, PromptAnswer, PromptMemory,
+    PromptRequest, Prompter, human_present,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -57,8 +57,8 @@ use crate::turn::{StdoutSink, UiSink};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    ensure_editor_available, ensure_prompts_available, estimate_token_length, fuzzy_filter,
-    get_env_name, list_file_names, now, render_prompt, temp_file,
+    ensure_prompts_available, estimate_token_length, fuzzy_filter, get_env_name, list_file_names,
+    now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -77,7 +77,6 @@ use gman::providers::SupportedProvider;
 use hooks::{McpServerHooks, RagSyncHooks};
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{Confirm, Text, validator::Validation};
 use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
@@ -4127,12 +4126,22 @@ impl RequestContext {
 
     pub fn new_role(&self, app: &AppConfig, name: &str) -> Result<()> {
         if self.macro_flag {
+            // A macro step never opens an editor; with no human on the run
+            // the refusal says who is missing rather than a bare `No role`.
+            if !human_present() {
+                return Err(NeedsHuman::for_creating("role", name).into());
+            }
             bail!("No role");
         }
-        ensure_prompts_available()?;
-        let ans = Confirm::new("Create a new role?")
-            .with_default(true)
-            .prompt()?;
+        crate::tui::ensure_terminal_lendable()?;
+        let ans = self
+            .prompt(self.prompt_request(
+                PromptAction::Confirm,
+                "Create a new role?",
+                Vec::new(),
+                Some(serde_json::json!(true)),
+            ))?
+            .into_confirmed()?;
         if ans {
             self.upsert_role(app, name)?;
         } else {
@@ -4155,19 +4164,22 @@ impl RequestContext {
             None => bail!("No role"),
         };
         if role_name == TEMP_ROLE_NAME {
-            ensure_prompts_available()?;
-            role_name = Text::new("Role name:")
-                .with_validator(|input: &str| {
-                    let input = input.trim();
-                    if input.is_empty() {
-                        Ok(Validation::Invalid("This name is required".into()))
-                    } else if input == TEMP_ROLE_NAME {
-                        Ok(Validation::Invalid("This name is reserved".into()))
-                    } else {
-                        Ok(Validation::Valid)
-                    }
-                })
-                .prompt()?;
+            let mut question = "Role name:".to_string();
+            role_name = loop {
+                let input = self
+                    .prompt(self.prompt_request(PromptAction::Input, &question, Vec::new(), None))?
+                    .into_text()?;
+                let input = input.trim();
+                if input.is_empty() {
+                    question = "Role name (required):".to_string();
+                    continue;
+                }
+                if input == TEMP_ROLE_NAME {
+                    question = format!("Role name ('{TEMP_ROLE_NAME}' is reserved):");
+                    continue;
+                }
+                break input.to_string();
+            };
         }
         let role_path = paths::role_file(&role_name);
         if let Some(role) = self.role.as_mut() {
@@ -4181,7 +4193,7 @@ impl RequestContext {
             Some(session) => (session.name().to_string(), session.scope()),
             None => bail!("No session"),
         };
-        ensure_editor_available()?;
+        crate::tui::ensure_terminal_lendable()?;
         let session_path = self.session_file_for(&name, scope);
         self.save_session(Some(&name), None)?;
         let editor = app.editor()?;
@@ -4208,7 +4220,7 @@ impl RequestContext {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
         };
-        ensure_editor_available()?;
+        crate::tui::ensure_terminal_lendable()?;
         let config_path = paths::agent_config_file(agent_name);
         let graph_path = paths::agent_graph_file(agent_name);
         let target_path = if !config_path.exists() && graph_path.exists() {
@@ -4241,12 +4253,20 @@ impl RequestContext {
             bail!("'{name}' is a reserved macro name");
         }
         if self.macro_flag {
+            if !human_present() {
+                return Err(NeedsHuman::for_creating("macro", name).into());
+            }
             bail!("No macro");
         }
-        ensure_prompts_available()?;
-        let ans = Confirm::new("Create a new macro?")
-            .with_default(true)
-            .prompt()?;
+        crate::tui::ensure_terminal_lendable()?;
+        let ans = self
+            .prompt(self.prompt_request(
+                PromptAction::Confirm,
+                "Create a new macro?",
+                Vec::new(),
+                Some(serde_json::json!(true)),
+            ))?
+            .into_confirmed()?;
         if ans {
             let macro_path = paths::macro_file(name);
             ensure_parent_exists(&macro_path)?;
@@ -6883,7 +6903,7 @@ impl RequestContext {
     }
 
     fn upsert_role(&self, app: &AppConfig, name: &str) -> Result<()> {
-        ensure_editor_available()?;
+        crate::tui::ensure_terminal_lendable()?;
         let role_path = paths::role_file(name);
         ensure_parent_exists(&role_path)?;
         let editor = app.editor()?;
@@ -6896,7 +6916,7 @@ impl RequestContext {
 
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
         paths::validate_skill_name(name)?;
-        ensure_editor_available()?;
+        crate::tui::ensure_terminal_lendable()?;
         let path = paths::skill_file(name);
         ensure_parent_exists(&path)?;
         let is_new = !path.exists();
@@ -7464,7 +7484,7 @@ impl RequestContext {
         }
 
         let document_paths = rag.document_paths();
-        ensure_editor_available()?;
+        crate::tui::ensure_terminal_lendable()?;
         let temp_file = temp_file(&format!("-rag-{}", rag.name()), ".txt");
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await
@@ -8197,7 +8217,7 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
-    use crate::testing::{AtomicFlagGuard, install_log_collector, warn_snapshot};
+    use crate::testing::{AtomicFlagGuard, TempNeedleGuard, install_log_collector, warn_snapshot};
     use crate::turn::SilentSink;
     use crate::utils;
     use crate::utils::get_env_name;
@@ -11839,27 +11859,24 @@ mod tests {
         assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
     }
 
-    /// `.skill <name>` under the full-screen UI is refused before the
-    /// scaffold is written: no editor can open it there, and a refusal
-    /// that left the file behind would turn the next `.skill` into an
-    /// edit of an empty template.
+    /// `.skill <name>` under the full-screen UI needs the terminal lent
+    /// to the editor; with nobody lending it the command fails before the
+    /// scaffold is written, since a scaffold left behind would turn the
+    /// next `.skill` into an edit of an empty template.
     #[test]
     #[serial]
-    fn upsert_skill_under_the_tui_refuses_before_scaffolding_the_file() {
+    fn upsert_skill_under_the_tui_without_a_lender_fails_before_scaffolding_the_file() {
         let _guard = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let err = ctx
             .upsert_skill(&ctx.app.config, "tui-refused-skill")
             .unwrap_err();
-        assert!(
-            err.to_string().contains("not available in the TUI"),
-            "{err}"
-        );
+        assert_no_lender_under_the_tui(err);
         let path = paths::skill_file("tui-refused-skill");
         assert!(
             !path.exists(),
-            "the refusal left a scaffold at {}",
+            "the failed lend left a scaffold at {}",
             path.display()
         );
     }
@@ -11877,7 +11894,10 @@ mod tests {
         write(&rag_path, "driver: yaml\n").unwrap();
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
-        assert_refused_under_the_tui(err);
+        assert!(
+            err.to_string().contains("not available in the TUI"),
+            "{err}"
+        );
         assert!(
             rag_path.exists(),
             "the refusal removed {}",
@@ -11886,19 +11906,20 @@ mod tests {
         assert!(ctx.rag.is_none());
     }
 
-    fn assert_refused_under_the_tui(err: anyhow::Error) {
+    fn assert_no_lender_under_the_tui(err: anyhow::Error) {
         assert!(
-            err.to_string().contains("not available in the TUI"),
+            err.to_string()
+                .contains("the TUI is not lending its terminal"),
             "{err}"
         );
     }
 
     /// `.edit session` saves the session before opening it; under the
-    /// full-screen UI the refusal comes first, so the file is never
-    /// written.
+    /// full-screen UI with nobody lending the terminal the failure comes
+    /// first, so the file is never written.
     #[test]
     #[serial]
-    fn edit_session_under_the_tui_refuses_before_saving_the_session() {
+    fn edit_session_under_the_tui_without_a_lender_fails_before_saving_the_session() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
@@ -11907,20 +11928,20 @@ mod tests {
         ctx.session = Some(session);
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let app = ctx.app.config.clone();
-        assert_refused_under_the_tui(ctx.edit_session(&app).unwrap_err());
+        assert_no_lender_under_the_tui(ctx.edit_session(&app).unwrap_err());
         assert!(
             !path.exists(),
-            "the refusal saved the session to {}",
+            "the failed lend saved the session to {}",
             path.display()
         );
     }
 
     /// `.edit agent-config` writes a stub config when the agent has none;
-    /// a stub left behind by a refusal would redirect every later edit of
-    /// a graph-only agent to it.
+    /// a stub left behind by a failed lend would redirect every later edit
+    /// of a graph-only agent to it.
     #[test]
     #[serial]
-    fn edit_agent_config_under_the_tui_refuses_before_writing_the_stub() {
+    fn edit_agent_config_under_the_tui_without_a_lender_fails_before_writing_the_stub() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -11929,23 +11950,26 @@ mod tests {
         }));
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let app = ctx.app.config.clone();
-        assert_refused_under_the_tui(ctx.edit_agent_config(&app).unwrap_err());
+        assert_no_lender_under_the_tui(ctx.edit_agent_config(&app).unwrap_err());
         let path = paths::agent_config_file("tui-refused-agent");
         assert!(
             !path.exists(),
-            "the refusal left a stub config at {}",
+            "the failed lend left a stub config at {}",
             path.display()
         );
     }
 
     /// `.edit rag-docs` hands the document list to the editor through a
-    /// temp file; the refusal comes before that file is created.
+    /// temp file; with nobody lending the terminal the failure comes
+    /// before that file is created. The leak check looks for the file's
+    /// own name in the shared temp dir, nothing another test wrote.
     #[test]
     #[serial]
-    fn edit_rag_docs_under_the_tui_refuses_before_writing_the_temp_file() {
+    fn edit_rag_docs_under_the_tui_without_a_lender_fails_before_writing_the_temp_file() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let name = "tui-refused-kb";
+        let temp = TempNeedleGuard::new(&format!("-rag-{name}"));
         let rag_path = ctx.rag_file(name);
         ensure_parent_exists(&rag_path).unwrap();
         write(
@@ -11960,79 +11984,231 @@ mod tests {
         })));
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let err = run_async(ctx.edit_rag_docs(utils::create_abort_signal())).unwrap_err();
-        assert_refused_under_the_tui(err);
-        let needle = format!("-rag-{name}");
-        let leftovers: Vec<PathBuf> = read_dir(env::temp_dir())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.to_string_lossy().contains(&needle))
-            .collect();
+        assert_no_lender_under_the_tui(err);
+        let leftovers = temp.leftovers();
         assert!(
             leftovers.is_empty(),
-            "the refusal left the editor's temp file behind: {leftovers:?}"
+            "the failed lend left the editor's temp file behind: {leftovers:?}"
         );
     }
 
-    /// `.role new` and `.macro new` create their parent directory before
-    /// the editor opens; the refusal leaves neither the directory nor the
-    /// file behind.
+    /// `.role <new>` and `.macro new` open the editor on a file under the
+    /// roles or macros dir; with nobody lending the terminal the failure
+    /// comes before anything is written, so a failed lend leaves no
+    /// half-made role or macro behind.
     #[test]
     #[serial]
-    fn upsert_role_and_new_macro_under_the_tui_refuse_before_creating_anything() {
+    fn upsert_role_and_new_macro_without_a_lender_fails_before_creating_anything() {
         let _guard = TestConfigDirGuard::new();
-        let ctx = create_test_ctx();
-        let role_path = paths::role_file("tui-refused-role");
-        let macro_path = paths::macro_file("tui-refused-macro");
-        for path in [&role_path, &macro_path] {
-            assert!(
-                !path.parent().unwrap().exists(),
-                "{} exists before the refusal",
-                path.parent().unwrap().display()
-            );
-        }
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
-        assert_refused_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
-        assert_refused_under_the_tui(ctx.new_macro(&app, "tui-refused-macro").unwrap_err());
-        for path in [&role_path, &macro_path] {
+        let prompter = Arc::new(ScriptedPrompter::new(Vec::new()));
+        ctx.prompter = prompter.clone();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        assert_no_lender_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
+        assert_no_lender_under_the_tui(ctx.new_role(&app, "tui-refused-role").unwrap_err());
+        assert_no_lender_under_the_tui(ctx.new_macro(&app, "tui-refused-macro").unwrap_err());
+        assert!(
+            prompter.requests().is_empty(),
+            "the refused lend still asked: {:?}",
+            prompter.requests()
+        );
+
+        for dir in [paths::roles_dir(), paths::macros_dir()] {
+            let written: Vec<PathBuf> = read_dir(&dir)
+                .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+                .unwrap_or_default();
             assert!(
-                !path.exists() && !path.parent().unwrap().exists(),
-                "the refusal created {} or its directory",
-                path.display()
+                written.is_empty(),
+                "the failed lend wrote under {}: {written:?}",
+                dir.display()
             );
         }
     }
 
-    /// `.role <new>` asks `Create a new role?` and `.save role` on a temp
-    /// role asks for its name, both on the raw tty; under the full-screen
-    /// UI each is refused before the question is built and no role file
-    /// appears.
+    /// `.macro new` asks `Create a new macro?` through the prompter; a
+    /// `no` leaves neither the file nor its directory behind.
     #[test]
     #[serial]
-    fn new_role_and_save_role_under_the_tui_refuse_before_asking() {
+    fn new_macro_declined_through_the_prompter_creates_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let macro_path = paths::macro_file("declined-macro");
+        assert!(!macro_path.parent().unwrap().exists());
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+
+        let err = ctx.new_macro(&app, "declined-macro").unwrap_err();
+
+        assert_eq!(err.to_string(), "No macro");
+        assert!(
+            !macro_path.exists() && !macro_path.parent().unwrap().exists(),
+            "the declined macro created {} or its directory",
+            macro_path.display()
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Create a new macro?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(true)));
+    }
+
+    /// `.role <new>` asks `Create a new role?` through the prompter, with
+    /// yes as the default; a `no` is `No role`, a cancel is the
+    /// prompter's cancel error, and neither leaves a role file. The yes
+    /// path opens the configured editor, a process-wide choice a unit
+    /// test cannot stub, so it is not driven here.
+    #[test]
+    #[serial]
+    fn new_role_asks_through_the_prompter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+
+        let err = ctx.new_role(&app, "declined-role").unwrap_err();
+
+        assert_eq!(err.to_string(), "No role");
+        assert!(!paths::role_file("declined-role").exists());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Create a new role?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(true)));
+
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err = ctx.new_role(&app, "cancelled-role").unwrap_err();
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+        assert!(!paths::role_file("cancelled-role").exists());
+    }
+
+    /// `.save role` on the temp role asks for a name through the prompter
+    /// and asks again after an empty or the reserved one, with the reason
+    /// in the question; the role is saved under the first usable answer,
+    /// trimmed.
+    #[test]
+    #[serial]
+    fn save_role_re_asks_until_the_name_is_usable() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         ctx.use_temp_role(&app, "a temporary role").unwrap();
-        let roles_dir = paths::role_file("tui-refused-new-role")
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        assert!(
-            !roles_dir.exists(),
-            "{} exists before the refusal",
-            roles_dir.display()
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
+            PromptAnswer::Text(TEMP_ROLE_NAME.to_string()),
+            PromptAnswer::Text(" mine ".to_string()),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        ctx.save_role(None).unwrap();
+
+        assert!(paths::role_file("mine").exists());
+        assert!(!paths::role_file(TEMP_ROLE_NAME).exists());
+        assert_eq!(ctx.role.as_ref().unwrap().name(), "mine");
+        let requests = prompter.requests();
+        assert!(requests.iter().all(|req| req.action == PromptAction::Input));
+        let questions: Vec<&str> = requests.iter().map(|req| req.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            [
+                "Role name:",
+                "Role name (required):",
+                "Role name ('temp' is reserved):",
+            ]
         );
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
-        let err = ctx.new_role(&app, "tui-refused-new-role").unwrap_err();
-        assert_refused_under_the_tui(err);
+
+        ctx.use_temp_role(&app, "another temporary role").unwrap();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
         let err = ctx.save_role(None).unwrap_err();
-        assert_refused_under_the_tui(err);
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+    }
+
+    /// With no human to name it, saving the temp role fails instead of
+    /// writing a role under whatever the headless prompter answered.
+    #[test]
+    #[serial]
+    fn save_role_with_no_human_writes_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.use_temp_role(&app, "a temporary role").unwrap();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+
+        let err = ctx.save_role(None).unwrap_err();
+
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        let roles = paths::roles_dir();
+        let written: Vec<_> = fs::read_dir(&roles)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(written.is_empty(), "{written:?}");
+        assert_eq!(ctx.role.as_ref().unwrap().name(), TEMP_ROLE_NAME);
+    }
+
+    /// With no human to confirm, `.role <new>` and `.macro new` fail on
+    /// the headless prompter's refusal, by name, and open no editor and
+    /// write nothing, not even the macros directory.
+    #[test]
+    #[serial]
+    fn new_role_and_new_macro_with_no_human_create_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+
+        let err = ctx.new_role(&app, "headless-role").unwrap_err();
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
         assert!(
-            !roles_dir.exists(),
-            "the refusal created {}",
-            roles_dir.display()
+            err.to_string().contains("confirm prompt needs a human"),
+            "{err}"
         );
+        assert!(!paths::role_file("headless-role").exists());
+
+        let err = ctx.new_macro(&app, "headless-macro").unwrap_err();
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        assert!(!paths::macros_dir().exists());
+    }
+
+    /// A macro step reaches the creation gate before any prompter. With
+    /// no human on the run the refusal names what would have been created
+    /// and who is missing; an interactive macro keeps its terse refusal.
+    #[test]
+    #[serial]
+    fn a_macro_step_creating_a_role_or_macro_names_the_missing_human_when_headless() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.macro_flag = true;
+        {
+            let _headless = AtomicFlagGuard::set(&utils::HEADLESS, true);
+            let err = ctx.new_role(&app, "gate-role").unwrap_err();
+            assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Creating role 'gate-role' needs a human to answer the prompt and none is \
+                 attached to this run; run it without --headless or --acp-server"
+            );
+            let err = ctx.new_macro(&app, "gate-macro").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Creating macro 'gate-macro' needs a human to answer the prompt and none is \
+                 attached to this run; run it without --headless or --acp-server"
+            );
+        }
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        assert_eq!(
+            ctx.new_role(&app, "gate-role").unwrap_err().to_string(),
+            "No role"
+        );
+        assert_eq!(
+            ctx.new_macro(&app, "gate-macro").unwrap_err().to_string(),
+            "No macro"
+        );
+        assert!(!paths::role_file("gate-role").exists());
+        assert!(!paths::macros_dir().exists());
     }
 
     /// A seeded child hands out the very signal `agent__cancel` sets; the

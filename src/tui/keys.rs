@@ -15,6 +15,44 @@ pub(crate) enum ModalKind {
         tool: bool,
     },
     Input,
+    /// One row per option plus an "Other (custom)" row; choosing that
+    /// row opens a text field in the list's place.
+    Select {
+        custom_field_open: bool,
+    },
+    Checkbox,
+    Password,
+}
+
+/// What is open over the composer, if anything; the list keys and Esc
+/// go to it before anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PopupKind {
+    /// Typing goes on into the composer under it.
+    Palette,
+    /// Typing goes into the band's filter line.
+    HistorySearch,
+    Rewind,
+}
+
+/// The vi layer's mode; the composer under emacs bindings has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViMode {
+    Insert,
+    Normal,
+}
+
+/// A normal-mode cursor motion, named after the key that asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViMotion {
+    Back,
+    Down,
+    Up,
+    Forward,
+    WordForward,
+    WordBack,
+    Head,
+    End,
 }
 
 /// What the key table needs to know about the app.
@@ -22,14 +60,25 @@ pub(crate) enum ModalKind {
 pub(crate) struct KeyContext {
     pub(crate) turn_running: bool,
     pub(crate) composer_empty: bool,
+    /// Whether the composer holds one line (an empty one counts): only
+    /// then do the plain arrows walk the history instead of the draft.
+    pub(crate) single_line: bool,
     pub(crate) modal: Option<ModalKind>,
     /// Whether a second has passed since the last key pressed (accepted
     /// or ignored, outside a modal or under one) or since the previous
-    /// answer: the
-    /// condition for a bare hotkey or Enter to count as an answer to a
-    /// confirm, so a modal that appears mid-sentence cannot be answered by
-    /// the keystroke already in flight.
+    /// answer: the condition for a bare hotkey, or Enter on a list or
+    /// confirm, to count as an answer, so a modal that appears
+    /// mid-sentence cannot be answered by the keystroke already in
+    /// flight. Keys that only move a list's cursor or type into a field
+    /// are not gated; the letter and digit shortcuts of a list are, like
+    /// a confirm's hotkeys.
     pub(crate) idle_ok: bool,
+    /// Whether the front modal has been up for a second, counted from
+    /// its appearance, the previous answer or its custom field opening
+    /// and not from the last key: the condition for Enter to send a text
+    /// field. Typing the answer is expected under a field, so it must
+    /// not postpone sending it the way it postpones a hotkey.
+    pub(crate) field_settled: bool,
     /// Whether the whole question is on screen. A question taller than
     /// its pane is clipped with a marker, and nothing clipped may be
     /// approved: only Esc and Ctrl+C answer until the terminal is tall
@@ -42,16 +91,26 @@ pub(crate) struct KeyContext {
     /// Whether a transcript row holds the focus; an Enter on an empty
     /// composer goes to it, and so does Esc while no turn is running.
     pub(crate) focused: bool,
+    pub(crate) popup: Option<PopupKind>,
+    pub(crate) vi: Option<ViMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     /// Send the composer text as the next line.
     Submit,
+    /// Hold the composer text for the running turn: a prompt reaches the
+    /// model at its next tool round, a command waits for the turn to end.
+    QueueInput,
+    /// Take the newest held line back into the composer.
+    EditQueued,
     InsertNewline,
     ClearComposer,
     /// Soft-interrupt the running turn.
     Interrupt,
+    /// An Esc with nothing to cancel on an empty composer; two of them
+    /// close together open the rewind picker.
+    IdleEsc,
     Quit,
     Suspend,
     OpenEditor,
@@ -62,8 +121,40 @@ pub(crate) enum Action {
     AnswerYesForSession,
     /// Send the modal's text field as the answer.
     SubmitModalInput,
+    /// Send the list modal's current row (select) or ticked rows (checkbox).
+    SubmitModalChoice,
+    /// Move the list modal's cursor by this many rows, down when positive.
+    ModalMove(i32),
+    /// Tick or untick the checkbox row under the cursor.
+    ModalToggle,
+    /// Choose the select row at this index outright.
+    ModalJump(usize),
     ModalInput(KeyEvent),
     ComposerInput(KeyEvent),
+    /// Show the next older history entry in the composer.
+    HistoryPrev,
+    /// Show the next newer history entry, or the draft past the newest.
+    HistoryNext,
+    OpenHistorySearch,
+    /// Move the popup's highlight by this many rows, down when positive.
+    PaletteMove(i32),
+    /// Take the popup's highlighted row into the composer; with no row
+    /// highlighted the Enter goes on to submit.
+    PaletteAccept,
+    ClosePopup,
+    /// Type into the popup's filter line.
+    PopupChar(char),
+    PopupBackspace,
+    ViNormal,
+    /// Enter insert mode, after the motion if one is given.
+    ViInsert {
+        append: Option<ViMotion>,
+    },
+    ViMotion(ViMotion),
+    /// Delete the character under the cursor.
+    ViDeleteChar,
+    /// The `d` of `dd`: the second press deletes the cursor's line.
+    ViDeleteLine,
     ToggleTodo,
     /// Move the transcript view by this many lines, down when positive.
     ScrollLines(i32),
@@ -81,6 +172,7 @@ pub(crate) enum Action {
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     // A chord's letter is matched case-folded once here: with the kitty
     // protocol Ctrl+Shift+C arrives as an uppercase `C`.
     let code = lowercase(key.code);
@@ -113,16 +205,52 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
                 _ => Action::Nothing,
             }
         }
-        Some(ModalKind::Input) => match code {
+        Some(
+            ModalKind::Input
+            | ModalKind::Password
+            | ModalKind::Select {
+                custom_field_open: true,
+            },
+        ) => match code {
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
             KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
             // The field is one line, so the composer's newline chords have
-            // nothing to insert: Enter submits however it is held.
+            // nothing to insert: Enter submits however it is held, once
+            // the modal has settled; a gated Enter is swallowed rather
+            // than typed.
+            KeyCode::Enter if !(ctx.field_settled && ctx.question_fully_shown) => Action::Nothing,
             KeyCode::Enter => Action::SubmitModalInput,
             KeyCode::Char('j') if ctrl => Action::Nothing,
             _ => Action::ModalInput(key),
         },
+        Some(
+            ModalKind::Select {
+                custom_field_open: false,
+            }
+            | ModalKind::Checkbox,
+        ) => {
+            let answerable = ctx.idle_ok && ctx.question_fully_shown;
+            let checkbox = ctx.modal == Some(ModalKind::Checkbox);
+            match code {
+                KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
+                KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
+                KeyCode::Up => Action::ModalMove(-1),
+                KeyCode::Down => Action::ModalMove(1),
+                _ if !answerable => Action::Nothing,
+                KeyCode::Char(' ') if checkbox => Action::ModalToggle,
+                KeyCode::Enter => Action::SubmitModalChoice,
+                KeyCode::Char('k') if !ctrl => Action::ModalMove(-1),
+                KeyCode::Char('j') if !ctrl => Action::ModalMove(1),
+                KeyCode::Char(digit @ '1'..='9') if !ctrl && !checkbox => {
+                    Action::ModalJump(usize::from(digit as u8 - b'1'))
+                }
+                _ => Action::Nothing,
+            }
+        }
         None => match code {
+            // A band is the innermost thing open, so the quit chords
+            // close it first, as Esc does.
+            KeyCode::Char('c' | 'd') if ctrl && ctx.popup.is_some() => Action::ClosePopup,
             KeyCode::Char('c') if ctrl => {
                 if ctx.turn_running {
                     Action::Interrupt
@@ -137,7 +265,33 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
             KeyCode::Up if ctrl => Action::FocusPrev,
             KeyCode::Down if ctrl => Action::FocusNext,
-            // A draft keeps the letter: `G` mid-sentence is typing.
+            KeyCode::Up if alt => Action::EditQueued,
+            KeyCode::Esc if ctx.popup.is_some() => Action::ClosePopup,
+            KeyCode::Up if ctx.popup.is_some() => Action::PaletteMove(-1),
+            KeyCode::Down if ctx.popup.is_some() => Action::PaletteMove(1),
+            KeyCode::Tab if ctx.popup.is_some() => Action::PaletteMove(1),
+            KeyCode::BackTab if ctx.popup.is_some() => Action::PaletteMove(-1),
+            // The bands that are not the palette have no draft under
+            // them to take a newline: Enter accepts however it is held.
+            KeyCode::Enter
+                if matches!(
+                    ctx.popup,
+                    Some(PopupKind::HistorySearch | PopupKind::Rewind)
+                ) =>
+            {
+                Action::PaletteAccept
+            }
+            KeyCode::Char(_) if !ctrl && ctx.popup == Some(PopupKind::HistorySearch) => {
+                match key.code {
+                    KeyCode::Char(typed) => Action::PopupChar(typed),
+                    _ => Action::Nothing,
+                }
+            }
+            KeyCode::Backspace if ctx.popup == Some(PopupKind::HistorySearch) => {
+                Action::PopupBackspace
+            }
+            // A draft keeps the letter: `G` mid-sentence is typing, and a
+            // band that takes letters above gets it as a filter character.
             KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
                 Action::ScrollToBottom
             }
@@ -145,10 +299,13 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             // goes with it.
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
             KeyCode::Esc if ctx.focused => Action::ClearFocus,
+            KeyCode::Esc if ctx.vi == Some(ViMode::Insert) => Action::ViNormal,
+            KeyCode::Esc if ctx.composer_empty => Action::IdleEsc,
             KeyCode::Esc => Action::Nothing,
             // The editor would inherit fds 1 and 2 on the turn's capture pipe.
             KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
+            KeyCode::Char('r') if ctrl => Action::OpenHistorySearch,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
             KeyCode::Enter
                 if key
@@ -157,11 +314,40 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             {
                 Action::InsertNewline
             }
+            KeyCode::Enter if ctx.popup.is_some() => Action::PaletteAccept,
             KeyCode::Enter if ctx.focused && ctx.composer_empty => Action::ToggleFocused,
-            KeyCode::Enter if ctx.turn_running => Action::Nothing,
+            KeyCode::Enter if ctx.turn_running => Action::QueueInput,
             KeyCode::Enter => Action::Submit,
+            KeyCode::Up if ctx.single_line && key.modifiers.is_empty() => Action::HistoryPrev,
+            KeyCode::Down if ctx.single_line && key.modifiers.is_empty() => Action::HistoryNext,
+            KeyCode::Char(_) if !ctrl && ctx.vi == Some(ViMode::Normal) => vi_normal(key.code),
             _ => Action::ComposerInput(key),
         },
+    }
+}
+
+/// Normal mode's letters, matched with their case: `a` and `A` differ.
+/// A letter with no binding is swallowed, not typed.
+fn vi_normal(code: KeyCode) -> Action {
+    match code {
+        KeyCode::Char('h') => Action::ViMotion(ViMotion::Back),
+        KeyCode::Char('j') => Action::ViMotion(ViMotion::Down),
+        KeyCode::Char('k') => Action::ViMotion(ViMotion::Up),
+        KeyCode::Char('l') => Action::ViMotion(ViMotion::Forward),
+        KeyCode::Char('w') => Action::ViMotion(ViMotion::WordForward),
+        KeyCode::Char('b') => Action::ViMotion(ViMotion::WordBack),
+        KeyCode::Char('0') => Action::ViMotion(ViMotion::Head),
+        KeyCode::Char('$') => Action::ViMotion(ViMotion::End),
+        KeyCode::Char('x') => Action::ViDeleteChar,
+        KeyCode::Char('d') => Action::ViDeleteLine,
+        KeyCode::Char('i') => Action::ViInsert { append: None },
+        KeyCode::Char('a') => Action::ViInsert {
+            append: Some(ViMotion::Forward),
+        },
+        KeyCode::Char('A') => Action::ViInsert {
+            append: Some(ViMotion::End),
+        },
+        _ => Action::Nothing,
     }
 }
 
@@ -192,11 +378,15 @@ mod tests {
     const IDLE: KeyContext = KeyContext {
         turn_running: false,
         composer_empty: true,
+        single_line: true,
         modal: None,
         idle_ok: true,
+        field_settled: true,
         question_fully_shown: true,
         scrolled: false,
         focused: false,
+        popup: None,
+        vi: None,
     };
 
     #[test]
@@ -209,6 +399,19 @@ mod tests {
             turn_running: true,
             ..IDLE
         };
+        let running_vi_insert = KeyContext {
+            vi: Some(ViMode::Insert),
+            ..running
+        };
+        let running_with = |popup: PopupKind| KeyContext {
+            popup: Some(popup),
+            ..running
+        };
+        let under = |modal: ModalKind| KeyContext {
+            modal: Some(modal),
+            ..running
+        };
+        let cancelled = Action::Answer(PromptAnswer::Cancelled);
         let cases = [
             (ctrl('c'), IDLE, Action::Quit),
             (ctrl('c'), typing, Action::ClearComposer),
@@ -216,8 +419,58 @@ mod tests {
             (ctrl('d'), IDLE, Action::Quit),
             (ctrl('d'), typing, Action::ComposerInput(ctrl('d'))),
             (ctrl('d'), running, Action::Quit),
-            (plain(KeyCode::Esc), IDLE, Action::Nothing),
+            (plain(KeyCode::Esc), IDLE, Action::IdleEsc),
+            (plain(KeyCode::Esc), typing, Action::Nothing),
             (plain(KeyCode::Esc), running, Action::Interrupt),
+            (plain(KeyCode::Esc), running_vi_insert, Action::Interrupt),
+            (
+                plain(KeyCode::Esc),
+                running_with(PopupKind::Palette),
+                Action::ClosePopup,
+            ),
+            (
+                plain(KeyCode::Esc),
+                running_with(PopupKind::Rewind),
+                Action::ClosePopup,
+            ),
+            (
+                plain(KeyCode::Esc),
+                running_with(PopupKind::HistorySearch),
+                Action::ClosePopup,
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Confirm {
+                    default: true,
+                    tool: true,
+                }),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Input),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Select {
+                    custom_field_open: false,
+                }),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Select {
+                    custom_field_open: true,
+                }),
+                cancelled.clone(),
+            ),
+            (
+                plain(KeyCode::Esc),
+                under(ModalKind::Checkbox),
+                cancelled.clone(),
+            ),
+            (plain(KeyCode::Esc), under(ModalKind::Password), cancelled),
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
@@ -254,7 +507,7 @@ mod tests {
         };
         let cases = [
             (plain(KeyCode::Enter), IDLE, Action::Submit),
-            (plain(KeyCode::Enter), running, Action::Nothing),
+            (plain(KeyCode::Enter), running, Action::QueueInput),
             (
                 press(KeyCode::Enter, KeyModifiers::SHIFT),
                 IDLE,
@@ -279,12 +532,341 @@ mod tests {
         assert_eq!(map_key(typed, &running), Action::ComposerInput(typed));
     }
 
+    /// Enter during a turn holds the line; a modal or a popup up at the
+    /// time keeps Enter for itself. Alt+Up takes a held line back whether
+    /// or not a turn runs.
+    #[test]
+    fn queued_input_keys() {
+        let running = KeyContext {
+            turn_running: true,
+            composer_empty: false,
+            ..IDLE
+        };
+        let alt_up = press(KeyCode::Up, KeyModifiers::ALT);
+        let cases = [
+            (plain(KeyCode::Enter), running, Action::QueueInput),
+            (alt_up, IDLE, Action::EditQueued),
+            (alt_up, running, Action::EditQueued),
+            (
+                plain(KeyCode::Enter),
+                KeyContext {
+                    popup: Some(PopupKind::Palette),
+                    ..running
+                },
+                Action::PaletteAccept,
+            ),
+            (
+                plain(KeyCode::Enter),
+                KeyContext {
+                    modal: Some(ModalKind::Confirm {
+                        default: false,
+                        tool: false,
+                    }),
+                    ..running
+                },
+                Action::Answer(PromptAnswer::Confirmed(false)),
+            ),
+            (
+                plain(KeyCode::Enter),
+                KeyContext {
+                    modal: Some(ModalKind::Input),
+                    ..running
+                },
+                Action::SubmitModalInput,
+            ),
+            (plain(KeyCode::Up), running, Action::HistoryPrev),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// With the palette open the list keys and Esc go to it, whatever
+    /// the turn or the focus is doing, and the quit chords close it
+    /// before they can quit or interrupt; typing still reaches the
+    /// composer and the view keys still move the transcript.
+    #[test]
+    fn popup_keys() {
+        let popup = KeyContext {
+            popup: Some(PopupKind::Palette),
+            composer_empty: false,
+            ..IDLE
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..popup
+        };
+        let focused = KeyContext {
+            focused: true,
+            ..popup
+        };
+        let cases = [
+            (plain(KeyCode::Esc), popup, Action::ClosePopup),
+            (plain(KeyCode::Esc), running, Action::ClosePopup),
+            (plain(KeyCode::Esc), focused, Action::ClosePopup),
+            (ctrl('c'), popup, Action::ClosePopup),
+            (ctrl('c'), running, Action::ClosePopup),
+            (ctrl('d'), popup, Action::ClosePopup),
+            (plain(KeyCode::Up), popup, Action::PaletteMove(-1)),
+            (plain(KeyCode::Down), popup, Action::PaletteMove(1)),
+            (plain(KeyCode::Tab), popup, Action::PaletteMove(1)),
+            (plain(KeyCode::BackTab), popup, Action::PaletteMove(-1)),
+            (plain(KeyCode::Enter), popup, Action::PaletteAccept),
+            (plain(KeyCode::Enter), running, Action::PaletteAccept),
+            (
+                press(KeyCode::Enter, KeyModifiers::SHIFT),
+                popup,
+                Action::InsertNewline,
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::SHIFT),
+                popup,
+                Action::ScrollLines(-1),
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::CONTROL),
+                popup,
+                Action::FocusPrev,
+            ),
+            (
+                plain(KeyCode::Tab),
+                IDLE,
+                Action::ComposerInput(plain(KeyCode::Tab)),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+        let typed = plain(KeyCode::Char('x'));
+        assert_eq!(map_key(typed, &popup), Action::ComposerInput(typed));
+    }
+
+    /// The plain arrows walk the history only on a one-line composer;
+    /// a multi-line draft keeps them for its own cursor, and a modifier
+    /// (Alt+Up edits the queue) keeps them too.
+    #[test]
+    fn single_line_arrows_walk_the_history() {
+        let multi_line = KeyContext {
+            single_line: false,
+            composer_empty: false,
+            ..IDLE
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..IDLE
+        };
+        let typing = KeyContext {
+            composer_empty: false,
+            ..IDLE
+        };
+        let cases = [
+            (plain(KeyCode::Up), IDLE, Action::HistoryPrev),
+            (plain(KeyCode::Down), IDLE, Action::HistoryNext),
+            (plain(KeyCode::Up), typing, Action::HistoryPrev),
+            (plain(KeyCode::Up), running, Action::HistoryPrev),
+            (
+                plain(KeyCode::Up),
+                multi_line,
+                Action::ComposerInput(plain(KeyCode::Up)),
+            ),
+            (
+                plain(KeyCode::Down),
+                multi_line,
+                Action::ComposerInput(plain(KeyCode::Down)),
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::ALT),
+                IDLE,
+                Action::EditQueued,
+            ),
+            (ctrl('r'), IDLE, Action::OpenHistorySearch),
+            (ctrl('r'), running, Action::OpenHistorySearch),
+            (ctrl('r'), multi_line, Action::OpenHistorySearch),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// With the search band open the letters and Backspace edit its
+    /// filter and Enter takes the highlighted entry however it is held;
+    /// the rewind picker types into the composer instead.
+    #[test]
+    fn history_search_and_rewind_popup_keys() {
+        let search = KeyContext {
+            popup: Some(PopupKind::HistorySearch),
+            ..IDLE
+        };
+        let scrolled_search = KeyContext {
+            scrolled: true,
+            ..search
+        };
+        let rewind = KeyContext {
+            popup: Some(PopupKind::Rewind),
+            ..IDLE
+        };
+        let shifted_g = press(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        let cases = [
+            (plain(KeyCode::Char('g')), search, Action::PopupChar('g')),
+            (shifted_g, search, Action::PopupChar('G')),
+            (shifted_g, scrolled_search, Action::PopupChar('G')),
+            (plain(KeyCode::Char(' ')), search, Action::PopupChar(' ')),
+            (plain(KeyCode::Backspace), search, Action::PopupBackspace),
+            (plain(KeyCode::Enter), search, Action::PaletteAccept),
+            (
+                press(KeyCode::Enter, KeyModifiers::SHIFT),
+                search,
+                Action::PaletteAccept,
+            ),
+            (plain(KeyCode::Up), search, Action::PaletteMove(-1)),
+            (plain(KeyCode::Down), search, Action::PaletteMove(1)),
+            (plain(KeyCode::Esc), search, Action::ClosePopup),
+            (ctrl('r'), search, Action::OpenHistorySearch),
+            (ctrl('c'), search, Action::ClosePopup),
+            (ctrl('d'), search, Action::ClosePopup),
+            (plain(KeyCode::Enter), rewind, Action::PaletteAccept),
+            (plain(KeyCode::Up), rewind, Action::PaletteMove(-1)),
+            (plain(KeyCode::Down), rewind, Action::PaletteMove(1)),
+            (plain(KeyCode::Esc), rewind, Action::ClosePopup),
+            (ctrl('c'), rewind, Action::ClosePopup),
+            (
+                plain(KeyCode::Char('g')),
+                rewind,
+                Action::ComposerInput(plain(KeyCode::Char('g'))),
+            ),
+            (
+                plain(KeyCode::Backspace),
+                rewind,
+                Action::ComposerInput(plain(KeyCode::Backspace)),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// Insert mode is the emacs table but for Esc, which enters normal
+    /// mode when nothing outranks it: a popup, a focused row and a
+    /// running turn each still take the Esc first.
+    #[test]
+    fn vi_insert_keys() {
+        let insert = KeyContext {
+            vi: Some(ViMode::Insert),
+            composer_empty: false,
+            ..IDLE
+        };
+        let empty = KeyContext {
+            composer_empty: true,
+            ..insert
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..insert
+        };
+        let focused = KeyContext {
+            focused: true,
+            ..insert
+        };
+        let popup = KeyContext {
+            popup: Some(PopupKind::Palette),
+            ..insert
+        };
+        let typed = plain(KeyCode::Char('x'));
+        let cases = [
+            (plain(KeyCode::Esc), insert, Action::ViNormal),
+            (plain(KeyCode::Esc), empty, Action::ViNormal),
+            (plain(KeyCode::Esc), running, Action::Interrupt),
+            (plain(KeyCode::Esc), focused, Action::ClearFocus),
+            (plain(KeyCode::Esc), popup, Action::ClosePopup),
+            (typed, insert, Action::ComposerInput(typed)),
+            (
+                plain(KeyCode::Char('j')),
+                insert,
+                Action::ComposerInput(plain(KeyCode::Char('j'))),
+            ),
+            (plain(KeyCode::Enter), insert, Action::Submit),
+            (plain(KeyCode::Up), insert, Action::HistoryPrev),
+            (ctrl('c'), insert, Action::ClearComposer),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// Normal mode's letters move, delete and re-enter insert; the rest
+    /// are swallowed. Enter submits as in insert, Esc keeps the usual
+    /// meanings, and the chords stay the chords.
+    #[test]
+    fn vi_normal_keys() {
+        let normal = KeyContext {
+            vi: Some(ViMode::Normal),
+            composer_empty: false,
+            ..IDLE
+        };
+        let empty = KeyContext {
+            composer_empty: true,
+            ..normal
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..normal
+        };
+        let letter = |c: char| plain(KeyCode::Char(c));
+        let cases = [
+            (letter('h'), normal, Action::ViMotion(ViMotion::Back)),
+            (letter('j'), normal, Action::ViMotion(ViMotion::Down)),
+            (letter('k'), normal, Action::ViMotion(ViMotion::Up)),
+            (letter('l'), normal, Action::ViMotion(ViMotion::Forward)),
+            (letter('w'), normal, Action::ViMotion(ViMotion::WordForward)),
+            (letter('b'), normal, Action::ViMotion(ViMotion::WordBack)),
+            (letter('0'), normal, Action::ViMotion(ViMotion::Head)),
+            (letter('$'), normal, Action::ViMotion(ViMotion::End)),
+            (letter('x'), normal, Action::ViDeleteChar),
+            (letter('d'), normal, Action::ViDeleteLine),
+            (letter('i'), normal, Action::ViInsert { append: None }),
+            (
+                letter('a'),
+                normal,
+                Action::ViInsert {
+                    append: Some(ViMotion::Forward),
+                },
+            ),
+            (
+                press(KeyCode::Char('A'), KeyModifiers::SHIFT),
+                normal,
+                Action::ViInsert {
+                    append: Some(ViMotion::End),
+                },
+            ),
+            (letter('q'), normal, Action::Nothing),
+            (letter('H'), normal, Action::Nothing),
+            (plain(KeyCode::Enter), normal, Action::Submit),
+            (plain(KeyCode::Enter), running, Action::QueueInput),
+            (plain(KeyCode::Esc), normal, Action::Nothing),
+            (plain(KeyCode::Esc), empty, Action::IdleEsc),
+            (plain(KeyCode::Esc), running, Action::Interrupt),
+            (ctrl('c'), normal, Action::ClearComposer),
+            (ctrl('j'), normal, Action::InsertNewline),
+            (ctrl('r'), normal, Action::OpenHistorySearch),
+            (plain(KeyCode::Up), normal, Action::HistoryPrev),
+            (
+                plain(KeyCode::Backspace),
+                normal,
+                Action::ComposerInput(plain(KeyCode::Backspace)),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
     /// The transcript's keys: F2, the page and Shift+arrow scrolls and
     /// the Ctrl+arrow focus walk work whatever the turn is doing; End
     /// goes to the view only while it is scrolled, Shift+G only while
     /// it is scrolled and the composer is empty; Enter goes to a
     /// focused row while the composer is empty, Esc while no turn runs.
-    /// The plain arrows and Tab stay the composer's.
+    /// The plain arrows of a multi-line draft and Tab stay the
+    /// composer's.
     #[test]
     fn transcript_keys() {
         let running = KeyContext {
@@ -310,6 +892,15 @@ mod tests {
         let focused_typing = KeyContext {
             composer_empty: false,
             ..focused
+        };
+        let focused_multi_line = KeyContext {
+            single_line: false,
+            ..focused_typing
+        };
+        let scrolled_multi_line = KeyContext {
+            single_line: false,
+            composer_empty: false,
+            ..scrolled
         };
         let shift = |code: KeyCode| press(code, KeyModifiers::SHIFT);
         let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
@@ -351,12 +942,12 @@ mod tests {
             (shift(KeyCode::Enter), focused, Action::InsertNewline),
             (
                 plain(KeyCode::Up),
-                focused,
+                focused_multi_line,
                 Action::ComposerInput(plain(KeyCode::Up)),
             ),
             (
                 plain(KeyCode::Down),
-                scrolled,
+                scrolled_multi_line,
                 Action::ComposerInput(plain(KeyCode::Down)),
             ),
             (
@@ -367,7 +958,7 @@ mod tests {
             (
                 press(KeyCode::Up, KeyModifiers::ALT),
                 focused,
-                Action::ComposerInput(press(KeyCode::Up, KeyModifiers::ALT)),
+                Action::EditQueued,
             ),
         ];
         for (key, ctx, expected) in cases {
@@ -588,6 +1179,131 @@ mod tests {
             map_key(plain(KeyCode::Esc), &modal),
             Action::Answer(PromptAnswer::Cancelled)
         );
+    }
+
+    /// Enter on a field modal is an answer, so it waits for the modal to
+    /// settle; unlike a confirm's hotkeys it does not wait out the typing
+    /// gap, since typing is how the field is answered. A gated Enter is
+    /// swallowed, not typed into the field. Letters are typed whatever
+    /// the gates say, and Esc cancels through them.
+    #[test]
+    fn field_modal_enter_needs_the_modal_settled_not_the_typing_gap() {
+        let typed = plain(KeyCode::Char('s'));
+        for kind in [
+            ModalKind::Input,
+            ModalKind::Password,
+            ModalKind::Select {
+                custom_field_open: true,
+            },
+        ] {
+            let modal = KeyContext {
+                modal: Some(kind),
+                ..IDLE
+            };
+            let unsettled = KeyContext {
+                field_settled: false,
+                ..modal
+            };
+            let busy_typing = KeyContext {
+                idle_ok: false,
+                ..modal
+            };
+            let clipped = KeyContext {
+                question_fully_shown: false,
+                ..modal
+            };
+            let cases = [
+                (plain(KeyCode::Enter), modal, Action::SubmitModalInput),
+                (plain(KeyCode::Enter), busy_typing, Action::SubmitModalInput),
+                (plain(KeyCode::Enter), unsettled, Action::Nothing),
+                (plain(KeyCode::Enter), clipped, Action::Nothing),
+                (typed, unsettled, Action::ModalInput(typed)),
+                (
+                    plain(KeyCode::Esc),
+                    unsettled,
+                    Action::Answer(PromptAnswer::Cancelled),
+                ),
+                (
+                    ctrl('c'),
+                    unsettled,
+                    Action::Answer(PromptAnswer::Cancelled),
+                ),
+            ];
+            for (key, ctx, expected) in cases {
+                assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+            }
+        }
+    }
+
+    /// The list modals: the arrows move without the gate; Enter, Space on
+    /// a checkbox, the `j`/`k` letters and a select's digits wait for it,
+    /// so a typed-ahead space cannot tick a row the user never saw. A
+    /// checkbox has no digit shortcuts (a digit would have to both move
+    /// and answer), and a select has no Space.
+    #[test]
+    fn list_modal_keys() {
+        let select = KeyContext {
+            modal: Some(ModalKind::Select {
+                custom_field_open: false,
+            }),
+            ..IDLE
+        };
+        let select_busy = KeyContext {
+            idle_ok: false,
+            ..select
+        };
+        let select_clipped = KeyContext {
+            question_fully_shown: false,
+            ..select
+        };
+        let checkbox = KeyContext {
+            modal: Some(ModalKind::Checkbox),
+            ..IDLE
+        };
+        let checkbox_busy = KeyContext {
+            idle_ok: false,
+            ..checkbox
+        };
+        let cases = [
+            (plain(KeyCode::Up), select, Action::ModalMove(-1)),
+            (plain(KeyCode::Down), select, Action::ModalMove(1)),
+            (plain(KeyCode::Up), select_busy, Action::ModalMove(-1)),
+            (plain(KeyCode::Down), checkbox_busy, Action::ModalMove(1)),
+            (plain(KeyCode::Char('k')), select, Action::ModalMove(-1)),
+            (plain(KeyCode::Char('j')), select, Action::ModalMove(1)),
+            (plain(KeyCode::Char('k')), select_busy, Action::Nothing),
+            (plain(KeyCode::Char('j')), checkbox_busy, Action::Nothing),
+            (plain(KeyCode::Char('1')), select, Action::ModalJump(0)),
+            (plain(KeyCode::Char('9')), select, Action::ModalJump(8)),
+            (plain(KeyCode::Char('0')), select, Action::Nothing),
+            (plain(KeyCode::Char('2')), select_busy, Action::Nothing),
+            (plain(KeyCode::Char('2')), select_clipped, Action::Nothing),
+            (plain(KeyCode::Char('2')), checkbox, Action::Nothing),
+            (plain(KeyCode::Char(' ')), checkbox, Action::ModalToggle),
+            (plain(KeyCode::Char(' ')), checkbox_busy, Action::Nothing),
+            (plain(KeyCode::Char(' ')), select, Action::Nothing),
+            (plain(KeyCode::Enter), select, Action::SubmitModalChoice),
+            (plain(KeyCode::Enter), checkbox, Action::SubmitModalChoice),
+            (plain(KeyCode::Enter), select_busy, Action::Nothing),
+            (plain(KeyCode::Enter), select_clipped, Action::Nothing),
+            (plain(KeyCode::Enter), checkbox_busy, Action::Nothing),
+            (plain(KeyCode::Char('x')), select, Action::Nothing),
+            (
+                plain(KeyCode::Esc),
+                select_busy,
+                Action::Answer(PromptAnswer::Cancelled),
+            ),
+            (
+                ctrl('c'),
+                checkbox_busy,
+                Action::Answer(PromptAnswer::Cancelled),
+            ),
+            (ctrl('z'), select, Action::Suspend),
+            (plain(KeyCode::PageUp), checkbox, Action::ScrollPage(-1)),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
     }
 
     /// The table stays pure: no terminal writes and no std I/O in this file.

@@ -85,6 +85,29 @@ impl FoldedCall {
     }
 }
 
+/// Why the rewind picker cannot count exchanges past a command cell.
+/// Decided when the command's turn is committed, from the command word
+/// and the macros enabled at that moment, so a macro disabled later
+/// still stops the picker at the turn it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewindBarrier {
+    /// A macro: its one cell stands for as many exchanges as it ran.
+    Macro,
+    /// A verb that swapped or rewrote the session's history behind the
+    /// transcript (`.session`, `.agent`, `.exit session`, ...).
+    Session,
+}
+
+impl RewindBarrier {
+    /// What the picker's notice says it stopped at.
+    pub(crate) fn kind_name(self) -> &'static str {
+        match self {
+            RewindBarrier::Macro => "macro turn",
+            RewindBarrier::Session => "session command",
+        }
+    }
+}
+
 /// One entry of the transcript, kept as source so any width can render it.
 pub(super) enum Cell {
     User {
@@ -94,6 +117,14 @@ pub(super) enum Cell {
         /// back; `.undo` takes that exchange and this cell with it. A
         /// turn that failed before the request recorded nothing.
         opened: bool,
+        /// A line queued while a turn ran and handed to the model on a
+        /// tool result of that turn. It opens no exchange of its own (the
+        /// running turn's holds it), so it is never a rewind row.
+        /// The cell is committed when the line joins the next request's
+        /// history, not when that request succeeds: the history keeps the
+        /// line through a failed or interrupted request, so the cell is
+        /// still the record of what the model receives.
+        mid_turn: bool,
         cache: LineCache,
     },
     Assistant {
@@ -116,6 +147,7 @@ pub(super) enum Cell {
         output: String,
         /// As `User::opened`.
         opened: bool,
+        rewind_barrier: Option<RewindBarrier>,
         cache: LineCache,
     },
     /// Dim lines: tool output that belongs to no tool row, such as a
@@ -246,6 +278,16 @@ impl Cell {
         Self::User {
             text: text.to_string(),
             opened: false,
+            mid_turn: false,
+            cache: LineCache::default(),
+        }
+    }
+
+    pub(super) fn user_mid_turn(text: String) -> Self {
+        Self::User {
+            text,
+            opened: false,
+            mid_turn: true,
             cache: LineCache::default(),
         }
     }
@@ -271,6 +313,7 @@ impl Cell {
             name: name.to_string(),
             output: String::new(),
             opened: false,
+            rewind_barrier: None,
             cache: LineCache::default(),
         }
     }
@@ -347,14 +390,22 @@ impl Cell {
     }
 
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
-        let no_color = *crate::utils::NO_COLOR;
+        let no_color = renderer.no_color;
         match self {
-            Cell::User { text, cache, .. } => cache.get(width, || {
+            Cell::User {
+                text,
+                mid_turn: false,
+                cache,
+                ..
+            } => cache.get(width, || {
                 render::plain_lines(
                     &format!("> {text}"),
                     width,
                     Style::new().add_modifier(Modifier::BOLD),
                 )
+            }),
+            Cell::User { text, cache, .. } => cache.get(width, || {
+                render::plain_lines(&format!("> {text} (sent mid-turn)"), width, DIM)
             }),
             Cell::Assistant {
                 source,

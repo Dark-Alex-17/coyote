@@ -1,0 +1,28 @@
+---
+source: src/tui/mod.rs
+expression: frame
+---
+"> first question                                                                "
+"                                                                                "
+"an answer                                                                       "
+"                                                                                "
+"> second                                                                        "
+"with detail                                                                     "
+"                                                                                "
+"an answer                                                                       "
+"                                                                                "
+"> third question                                                                "
+"                                                                                "
+"an answer                                                                       "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"Rewind to (Enter = choose  Esc = close)                                         "
+"third question                                                                  "
+"second          +1 line                                                         "
+"first question                                                                  "
+"────────────────────────────────────────────────────────────────────────────────"
+" Type a prompt or a .command; Enter sends                                       "
+"                                                                                "
+"                                                                                "
+"openai:test-model . no session . agents 0 . jobs 0                              "

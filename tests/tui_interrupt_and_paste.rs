@@ -514,6 +514,9 @@ fn an_idle_quit_after_an_esc_interrupted_turn_still_asks_to_save_the_session() {
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE)
         .expect("`y` on the save modal did not ask for a session name");
+    // The name field gates Enter until the modal has settled after its
+    // appearance; typing itself does not postpone it.
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"esc-session-k4e\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");

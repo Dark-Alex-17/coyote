@@ -18,7 +18,6 @@ pub enum SystemNotification {
     },
     /// Text the user typed while a turn was running, handed to the model at
     /// the next tool-round boundary.
-    #[allow(dead_code)] // TASK-315
     UserMessage { text: String },
 }
 
@@ -111,6 +110,36 @@ impl NotificationQueue {
 
     pub fn drain(&self) -> Vec<SystemNotification> {
         std::mem::take(&mut *self.pending.lock())
+    }
+
+    /// Removes and returns, in order, the entries `take` accepts; the rest
+    /// stay in place. One lock, so a concurrent drain sees either the whole
+    /// queue or the kept remainder, never a half-moved one.
+    pub fn take_where(
+        &self,
+        mut take: impl FnMut(&SystemNotification) -> bool,
+    ) -> Vec<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let mut taken = Vec::new();
+        let mut index = 0;
+        while index < pending.len() {
+            if take(&pending[index]) {
+                taken.push(pending.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        taken
+    }
+
+    /// Removes and returns the newest entry `matches` accepts, if any.
+    pub fn take_last_where(
+        &self,
+        matches: impl FnMut(&SystemNotification) -> bool,
+    ) -> Option<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let index = pending.iter().rposition(matches)?;
+        Some(pending.remove(index))
     }
 }
 
@@ -216,5 +245,43 @@ mod tests {
     fn drain_on_empty_queue_is_a_noop() {
         let queue = NotificationQueue::default();
         assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn take_where_removes_the_accepted_entries_and_keeps_the_rest_in_order() {
+        let queue = NotificationQueue::new();
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(SystemNotification::UserMessage { text: "b".into() });
+        queue.push(job_notification("job_2", "execute_command", false));
+
+        let taken = queue.take_where(|n| matches!(n, SystemNotification::UserMessage { .. }));
+
+        let texts: Vec<Value> = taken.iter().map(|n| n.to_value()["text"].clone()).collect();
+        assert_eq!(texts, [json!("a"), json!("b")]);
+        let left = queue.drain();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0].id(), Some("job_1"));
+        assert_eq!(left[1].id(), Some("job_2"));
+    }
+
+    #[test]
+    fn take_last_where_removes_only_the_newest_match() {
+        let queue = NotificationQueue::new();
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+
+        let taken = queue.take_last_where(|n| matches!(n, SystemNotification::UserMessage { .. }));
+
+        assert_eq!(
+            taken.map(|n| n.to_value()["text"].clone()),
+            Some(json!("a"))
+        );
+        let left = queue.drain();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0].id(), None);
+        assert_eq!(left[1].id(), Some("job_1"));
+        assert!(queue.take_last_where(|_| true).is_none());
     }
 }
