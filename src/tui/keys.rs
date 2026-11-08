@@ -248,6 +248,9 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             }
         }
         None => match code {
+            // A band is the innermost thing open, so the quit chords
+            // close it first, as Esc does.
+            KeyCode::Char('c' | 'd') if ctrl && ctx.popup.is_some() => Action::ClosePopup,
             KeyCode::Char('c') if ctrl => {
                 if ctx.turn_running {
                     Action::Interrupt
@@ -579,8 +582,9 @@ mod tests {
     }
 
     /// With the palette open the list keys and Esc go to it, whatever
-    /// the turn or the focus is doing; typing still reaches the composer
-    /// and the view keys still move the transcript.
+    /// the turn or the focus is doing, and the quit chords close it
+    /// before they can quit or interrupt; typing still reaches the
+    /// composer and the view keys still move the transcript.
     #[test]
     fn popup_keys() {
         let popup = KeyContext {
@@ -600,6 +604,9 @@ mod tests {
             (plain(KeyCode::Esc), popup, Action::ClosePopup),
             (plain(KeyCode::Esc), running, Action::ClosePopup),
             (plain(KeyCode::Esc), focused, Action::ClosePopup),
+            (ctrl('c'), popup, Action::ClosePopup),
+            (ctrl('c'), running, Action::ClosePopup),
+            (ctrl('d'), popup, Action::ClosePopup),
             (plain(KeyCode::Up), popup, Action::PaletteMove(-1)),
             (plain(KeyCode::Down), popup, Action::PaletteMove(1)),
             (plain(KeyCode::Tab), popup, Action::PaletteMove(1)),
@@ -715,11 +722,13 @@ mod tests {
             (plain(KeyCode::Down), search, Action::PaletteMove(1)),
             (plain(KeyCode::Esc), search, Action::ClosePopup),
             (ctrl('r'), search, Action::OpenHistorySearch),
-            (ctrl('c'), search, Action::Quit),
+            (ctrl('c'), search, Action::ClosePopup),
+            (ctrl('d'), search, Action::ClosePopup),
             (plain(KeyCode::Enter), rewind, Action::PaletteAccept),
             (plain(KeyCode::Up), rewind, Action::PaletteMove(-1)),
             (plain(KeyCode::Down), rewind, Action::PaletteMove(1)),
             (plain(KeyCode::Esc), rewind, Action::ClosePopup),
+            (ctrl('c'), rewind, Action::ClosePopup),
             (
                 plain(KeyCode::Char('g')),
                 rewind,

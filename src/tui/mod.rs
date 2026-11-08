@@ -831,9 +831,9 @@ fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix
 /// What stops the rewind picker at a command line, under the macros
 /// enabled when it ran: a macro (`.<name>` or `.macro <name>`, not the
 /// enable/disable toggles) stands for exchanges the transcript never
-/// counted; `.session`, `.agent`, `.fork`, `.undo` and the session and
-/// agent forms of `.exit`, `.empty` and `.compress` leave the context
-/// holding history the transcript never showed.
+/// counted; `.session`, `.agent`, `.fork`, `.undo`, `.edit session` and
+/// the session and agent forms of `.exit`, `.empty` and `.compress` leave
+/// the context holding history the transcript never showed.
 fn rewind_barrier(
     line: &str,
     prefix: crate::config::CommandPrefix,
@@ -846,9 +846,8 @@ fn rewind_barrier(
             (!matches!(first, "enable" | "disable")).then_some(RewindBarrier::Macro)
         }
         (".session" | ".agent" | ".fork" | ".undo", _) => Some(RewindBarrier::Session),
-        (".exit", Some("session" | "agent")) | (".empty" | ".compress", Some("session")) => {
-            Some(RewindBarrier::Session)
-        }
+        (".exit", Some("session" | "agent"))
+        | (".empty" | ".compress" | ".edit", Some("session")) => Some(RewindBarrier::Session),
         (word, _) => word
             .strip_prefix('.')
             .filter(|word| macros.iter().any(|(name, _)| name == word))
@@ -1136,7 +1135,13 @@ impl App {
             };
             *output = outcome.captured.clone();
             *opened = turn.requested;
-            *barrier = rewind_barrier(name, prefix, &self.macros);
+            // A command that failed changed nothing the picker has to
+            // stop at.
+            *barrier = outcome
+                .error
+                .is_none()
+                .then(|| rewind_barrier(name, prefix, &self.macros))
+                .flatten();
             *cache = LineCache::default();
             // `.undo` took the last exchange out of the context; the
             // transcript drops it too, back to the cell that opened it,
@@ -8208,6 +8213,11 @@ mod tests {
             rewind_barrier(".empty session", dot, &[]),
             Some(RewindBarrier::Session)
         );
+        assert_eq!(
+            rewind_barrier(".edit session", dot, &[]),
+            Some(RewindBarrier::Session)
+        );
+        assert_eq!(rewind_barrier(".edit role", dot, &[]), None);
         assert_eq!(rewind_barrier(".exit role", dot, &[]), None);
         assert_eq!(rewind_barrier(".info", dot, &[]), None);
         assert_eq!(rewind_barrier("plain words", dot, &deploy), None);
@@ -8269,6 +8279,33 @@ mod tests {
             harness.app.transcript.cells().last(),
             Some(Cell::Notice { text, .. }) if text == "Rewind stops at the last session command"
         ));
+    }
+
+    /// A session command that failed left the context as it was, so its
+    /// cell carries no barrier and the picker counts past it.
+    #[test]
+    fn a_failed_session_command_is_not_a_barrier() {
+        let mut harness = Harness::standalone(80, 24);
+        exchange(&mut harness);
+        harness.app.begin_turn(".session nosuch", true);
+        harness.app.end_turn(
+            true,
+            &TurnOutcome {
+                error: Some("session not found".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        assert!(matches!(
+            &harness.app.transcript.cells()[3],
+            Cell::Command {
+                name,
+                rewind_barrier: None,
+                ..
+            } if name == ".session nosuch"
+        ));
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert_eq!(rewind(&harness).map(|picker| picker.rows.len()), Some(1));
     }
 
     #[test]

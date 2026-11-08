@@ -447,6 +447,9 @@ fn the_cold_start_palette_lists_the_tool_verbs_under_either_prefix() {
         let [enable, disable] = rows.map(|row| row.split_whitespace().collect::<String>());
         squeezed_positions(&frame, [enable.as_str(), disable.as_str()]);
 
+        // Ctrl+C closes the band first; the second one clears the draft.
+        pty.send(b"\x03").unwrap();
+        pty.read_for(HOTKEY_GAP);
         pty.send(b"\x03").unwrap();
         pty.read_for(HOTKEY_GAP);
         pty.send(b"\x04").unwrap();
