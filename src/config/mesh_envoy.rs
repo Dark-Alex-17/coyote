@@ -468,10 +468,9 @@ impl EnvoyRunner {
     }
 
     pub(crate) fn attach(self: &Arc<Self>) {
-        self.app
-            .load()
-            .mesh
-            .set_envoy(Arc::clone(self) as Arc<dyn EnvoySink>);
+        let app = self.app.load();
+        app.mesh.watch_releases();
+        app.mesh.set_envoy(Arc::clone(self) as Arc<dyn EnvoySink>);
     }
 
     pub(crate) fn detach(&self) {
@@ -4518,11 +4517,12 @@ mod tests {
     /// admitted and handed to the envoy; the forty-nine behind it are refused
     /// `Throttled` before any acknowledgement, since a run of the sender's is in
     /// flight, and nothing is filed or counted. By store-and-forward the nine asks still
-    /// under the hourly count of ten are refused by the envoy for the run in flight and
-    /// the rest are over the hourly limit; every one is filed in the inbox without an
-    /// envoy run and the peer is owed one typed reply per reason for the hour. The envoy
-    /// runs exactly one, the REPL hears one refusal line per reason, and another
-    /// identity is untouched.
+    /// under the hourly count of ten meet the run in flight: eight are parked behind it
+    /// and the ninth, past the per-sender bound, is filed; the rest are over the hourly
+    /// limit and filed too, and the peer is owed one typed reply per reason for the
+    /// hour. Until the run in flight ends the envoy runs exactly one, the REPL hears one
+    /// refusal line per reason, and another identity is untouched; then the parked
+    /// eight run one after another.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_flood_from_one_identity_is_bounded_on_both_inbound_paths() {
@@ -4611,13 +4611,13 @@ mod tests {
         }
         assert_eq!(
             app.mesh.peer_inbox().len(),
-            50,
-            "every refused propagated ask is filed"
+            42,
+            "every refused propagated ask is filed: one past the parked eight, forty-one over the limit"
         );
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(
             idle.texts().len(),
-            lines_before + 51,
+            lines_before + 43,
             "one inbox line per filed ask and the hour's first rate_limited line: {:?}",
             idle.texts()
         );
@@ -4640,16 +4640,449 @@ mod tests {
             Reply::Value(_)
         ));
 
-        gate.add_permits(2);
-        wait_until("both admitted asks to be answered", || {
-            runs.load(Ordering::SeqCst) == 2 && idle.count("envoy replied: ok") == 2
-        })
+        gate.add_permits(10);
+        wait_until(
+            "the admitted asks and the parked eight to be answered",
+            || runs.load(Ordering::SeqCst) == 10 && idle.count("envoy replied: ok") == 10,
+        )
         .await;
         runner.stop().await;
         assert_eq!(
             app.mesh.peer_inbox().len(),
-            54,
-            "fifty filed propagated asks and two exchanges"
+            62,
+            "forty-two filed propagated asks and ten exchanges"
+        );
+        source.remove_dir();
+    }
+
+    /// A trusted sender whose held messages reach the slot the way a propagation-node
+    /// sync hands them over: one after another, in the order fetched.
+    struct HeldSender {
+        origin: OriginName,
+        hex: String,
+        trust: Arc<crate::mesh::trust::TrustStore>,
+        _trust_dir: TempDir,
+    }
+
+    impl HeldSender {
+        fn new(tag: &str) -> Self {
+            let origin = OriginName([6u8; NAME_HASH_LEN]);
+            let identity = PrivateIdentity::new_from_rand(OsRng);
+            let hex = identity.address_hash().to_hex_string();
+            let destination =
+                destination_address(&origin.0, identity.address_hash()).to_hex_string();
+            let (trust, _trust_dir) = TrustList::default()
+                .destination(&destination, &hex)
+                .open(tag);
+            Self {
+                origin,
+                hex,
+                trust,
+                _trust_dir,
+            }
+        }
+
+        /// Hands every body over as one sync does and returns their message ids.
+        fn sync(&self, app: &AppState, bodies: &[&str]) -> Vec<String> {
+            let routing = PeerRouting {
+                trust: &self.trust,
+                surface: Some(Arc::clone(&app.mesh) as Arc<dyn PeerSurface>),
+                inner: &NullSink,
+            };
+            bodies
+                .iter()
+                .map(|body| {
+                    let out = OutboundPeer::new(PeerKind::Message, body, None, None, None).unwrap();
+                    routing.deliver(propagated(&out, &self.origin, &self.hex));
+                    out.id.clone()
+                })
+                .collect()
+        }
+    }
+
+    /// Records the peer text of each run, then parks on `gate` until the test adds a
+    /// permit.
+    fn recording_parked_drive(gate: &Arc<Semaphore>, seen: &Arc<Mutex<Vec<String>>>) -> EnvoyDrive {
+        let gate = Arc::clone(gate);
+        let seen = Arc::clone(seen);
+        drive_of(move |_, input, _| {
+            let gate = Arc::clone(&gate);
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().push(input.text());
+                gate.acquire().await.unwrap().forget();
+                Ok("ok".into())
+            }
+        })
+    }
+
+    /// Which of `bodies` each recorded run carried, in run order.
+    fn runs_of(seen: &Mutex<Vec<String>>, bodies: &[&str]) -> Vec<String> {
+        seen.lock()
+            .iter()
+            .map(|text| {
+                let mut carried = bodies.iter().filter(|body| text.contains(**body));
+                let body = carried.next().expect("every run carries one known body");
+                assert!(carried.next().is_none(), "{text}");
+                (*body).to_string()
+            })
+            .collect()
+    }
+
+    /// The routed value of every `mesh.message.received` fire, by message id, in order.
+    fn routed_fires(hooks: &crate::mesh::events::RecordingHookSink) -> Vec<(String, String)> {
+        use crate::hooks::HookEvent;
+        use crate::mesh::events::env_value;
+        hooks
+            .snapshot()
+            .into_iter()
+            .filter(|(event, _)| *event == HookEvent::MeshMessageReceived)
+            .map(|(_, envs)| {
+                (
+                    env_value(&envs, "COYOTE_MESH_MESSAGE_ID")
+                        .unwrap()
+                        .to_string(),
+                    env_value(&envs, "COYOTE_MESH_ROUTED").unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// One sync brings three held messages from one sender while the envoy may run one
+    /// of that sender's at a time: the first runs at once, the other two wait for it and
+    /// then run in the order they were fetched. None is refused, so the sender is owed
+    /// no throttle reply and nothing is filed but the exchanges; each message's received
+    /// hook fires once, routed to the envoy, as it is handed over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn held_messages_from_one_sender_in_one_sync_run_one_after_another() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-held-order");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let hooks = crate::mesh::events::RecordingHookSink::attach(&app.mesh.hooks());
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 1,
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner =
+            EnvoyRunner::start_with(Arc::clone(&app), recording_parked_drive(&gate, &seen));
+        runner.attach();
+        let sender = HeldSender::new("mesh-envoy-held-order-trust");
+        let bodies = ["held one", "held two", "held three"];
+        let ids = sender.sync(&app, &bodies);
+
+        wait_until("the first held message to run", || seen.lock().len() == 1).await;
+        assert_eq!(app.mesh.peer_inbox().len(), 0, "nothing was filed");
+        assert_eq!(
+            routed_fires(&hooks),
+            [(ids[0].clone(), "envoy".to_string())],
+            "the parked two have not left the queue yet"
+        );
+        for n in 2..=3 {
+            gate.add_permits(1);
+            wait_until("the next held message to run", || seen.lock().len() == n).await;
+        }
+        gate.add_permits(1);
+        wait_until("every held message to be answered", || {
+            idle.count("envoy replied: ok") == 3
+        })
+        .await;
+        assert_eq!(runs_of(&seen, &bodies), bodies);
+        assert_eq!(
+            routed_fires(&hooks),
+            ids.iter()
+                .map(|id| (id.clone(), "envoy".to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(!idle.has("peer_concurrency"), "{:?}", idle.texts());
+        runner.stop().await;
+        assert_eq!(
+            app.mesh.peer_inbox().len(),
+            6,
+            "three exchanges, no refusal"
+        );
+        assert!(
+            app.mesh.limits().claim_peer_reply(
+                &sender.hex,
+                RefusalReason::PeerConcurrency,
+                Instant::now()
+            ),
+            "no throttle reply was spent on the sender"
+        );
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&sender.hex, Instant::now())
+                .unwrap()
+                .in_flight,
+            0
+        );
+        source.remove_dir();
+    }
+
+    /// Messages parked for one sender wait for that sender's runs only: another
+    /// sender's message goes straight to the envoy's queue and runs before the first
+    /// sender's second message, which is handed over only when its first run ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_second_sender_is_not_starved_by_another_senders_parked_messages() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-held-fair");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 1,
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner =
+            EnvoyRunner::start_with(Arc::clone(&app), recording_parked_drive(&gate, &seen));
+        runner.attach();
+        let a = HeldSender::new("mesh-envoy-held-fair-a");
+        let b = HeldSender::new("mesh-envoy-held-fair-b");
+        let bodies = ["from a one", "from a two", "from a three", "from b one"];
+        a.sync(&app, &bodies[..3]);
+        wait_until("a's first message to run", || seen.lock().len() == 1).await;
+        b.sync(&app, &bodies[3..]);
+        gate.add_permits(4);
+        wait_until("all four messages to be answered", || {
+            idle.count("envoy replied: ok") == 4
+        })
+        .await;
+        runner.stop().await;
+        assert_eq!(
+            runs_of(&seen, &bodies),
+            ["from a one", "from b one", "from a two", "from a three"]
+        );
+        assert!(!idle.has("peer_concurrency"), "{:?}", idle.texts());
+        source.remove_dir();
+    }
+
+    /// Stopping the envoy files the messages still parked to the inbox, refused as the
+    /// envoy stopping like the jobs in its own queue; none of them ever runs, and each
+    /// one's received hook fires once, routed to the inbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn stopping_the_envoy_files_parked_messages_to_the_inbox() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-held-stop");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let hooks = crate::mesh::events::RecordingHookSink::attach(&app.mesh.hooks());
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 1,
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner =
+            EnvoyRunner::start_with(Arc::clone(&app), recording_parked_drive(&gate, &seen));
+        runner.attach();
+        let sender = HeldSender::new("mesh-envoy-held-stop-trust");
+        let bodies = ["stop one", "stop two", "stop three"];
+        let ids = sender.sync(&app, &bodies);
+        wait_until("the first held message to run", || seen.lock().len() == 1).await;
+
+        runner.stop().await;
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        let filed: Vec<&str> = envelopes
+            .iter()
+            .map(|envelope| peer_of(envelope).message_id.as_str())
+            .collect();
+        assert!(filed.contains(&ids[1].as_str()), "{filed:?}");
+        assert!(filed.contains(&ids[2].as_str()), "{filed:?}");
+        assert_eq!(
+            runs_of(&seen, &bodies),
+            ["stop one"],
+            "no parked message ran"
+        );
+        let fires = routed_fires(&hooks);
+        for id in &ids[1..] {
+            assert_eq!(
+                fires
+                    .iter()
+                    .filter(|(fired, _)| fired == id)
+                    .map(|(_, routed)| routed.as_str())
+                    .collect::<Vec<_>>(),
+                ["inbox"],
+                "{fires:?}"
+            );
+        }
+        assert!(idle.has("envoy_stopping"), "{:?}", idle.texts());
+        gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen.lock().len(), 1, "nothing was left to run");
+        source.remove_dir();
+    }
+
+    /// At most `ENVOY_QUEUE_MAX` messages wait per sender: with one of its runs in
+    /// flight and eight parked, the next held message from it is filed in the inbox with
+    /// the throttle reply store-and-forward is owed once an hour. The eight still run,
+    /// in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_ninth_parked_message_overflows_to_the_inbox() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-held-overflow");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let hooks = crate::mesh::events::RecordingHookSink::attach(&app.mesh.hooks());
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 1,
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner =
+            EnvoyRunner::start_with(Arc::clone(&app), recording_parked_drive(&gate, &seen));
+        runner.attach();
+        let sender = HeldSender::new("mesh-envoy-held-overflow-trust");
+        let bodies: Vec<String> = (0..=ENVOY_QUEUE_MAX + 1)
+            .map(|n| format!("overflow {n:02}"))
+            .collect();
+        let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        let ids = sender.sync(&app, &bodies);
+        assert_eq!(ids.len(), ENVOY_QUEUE_MAX + 2);
+
+        wait_until("the overflowing message to be filed", || {
+            app.mesh.peer_inbox().len() == 1
+        })
+        .await;
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        assert_eq!(peer_of(&envelopes[0]).message_id, ids[ENVOY_QUEUE_MAX + 1]);
+        assert!(
+            idle.has("further peer_concurrency refusals"),
+            "{:?}",
+            idle.texts()
+        );
+        assert!(
+            !app.mesh.limits().claim_peer_reply(
+                &sender.hex,
+                RefusalReason::PeerConcurrency,
+                Instant::now()
+            ),
+            "the overflow spent the hour's throttle reply"
+        );
+        assert_eq!(
+            routed_fires(&hooks)
+                .into_iter()
+                .filter(|(_, routed)| routed == "inbox")
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [ids[ENVOY_QUEUE_MAX + 1].clone()]
+        );
+
+        gate.add_permits(ENVOY_QUEUE_MAX + 1);
+        wait_until(
+            "the run in flight and the eight parked to be answered",
+            || idle.count("envoy replied: ok") == ENVOY_QUEUE_MAX + 1,
+        )
+        .await;
+        runner.stop().await;
+        assert_eq!(
+            runs_of(&seen, &bodies),
+            bodies[..=ENVOY_QUEUE_MAX]
+                .iter()
+                .map(|body| body.to_string())
+                .collect::<Vec<_>>()
+        );
+        source.remove_dir();
+    }
+
+    /// A parked message is handed over when its sender's run gives its place back; if
+    /// the envoy's shared queue is full then, it takes the refusal path a full queue
+    /// takes on arrival: filed in the inbox with the reason, the throttle reply claimed
+    /// once for the hour, and its received hook routed to the inbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_parked_message_meeting_a_full_shared_queue_is_refused_to_the_inbox() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-held-full");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let hooks = crate::mesh::events::RecordingHookSink::attach(&app.mesh.hooks());
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 1,
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner =
+            EnvoyRunner::start_with(Arc::clone(&app), recording_parked_drive(&gate, &seen));
+        runner.attach();
+        let sender = HeldSender::new("mesh-envoy-held-full-trust");
+        let in_flight = app
+            .mesh
+            .limits()
+            .try_reserve(&sender.hex, Instant::now())
+            .unwrap();
+        let ids = sender.sync(&app, &["waits for a full queue"]);
+        assert_eq!(app.mesh.peer_inbox().len(), 0, "parked, not filed");
+
+        let other = |n: u8| {
+            let mut job = job(PeerKind::Message, &format!("other-{n}"), "other");
+            job.message.source_identity = hex_lower(&[n; 16]);
+            job
+        };
+        assert!(runner.accept(other(0x10)).is_ok());
+        wait_until("the worker to take the first job", || {
+            seen.lock().len() == 1
+        })
+        .await;
+        for n in 1..=ENVOY_QUEUE_MAX {
+            let n = u8::try_from(n).unwrap();
+            assert!(runner.accept(other(0x10 + n)).is_ok());
+        }
+        assert!(!runner.has_room());
+
+        drop(in_flight);
+        wait_until("the parked message to be refused and filed", || {
+            app.mesh.peer_inbox().len() == 1
+        })
+        .await;
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        assert_eq!(peer_of(&envelopes[0]).message_id, ids[0]);
+        assert!(idle.has("envoy_busy"), "{:?}", idle.texts());
+        assert!(
+            !app.mesh.limits().claim_peer_reply(
+                &sender.hex,
+                RefusalReason::EnvoyBusy,
+                Instant::now()
+            ),
+            "the refusal path claimed the hour's reply"
+        );
+        assert_eq!(
+            routed_fires(&hooks),
+            [(ids[0].clone(), "inbox".to_string())]
+        );
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&sender.hex, Instant::now())
+                .unwrap()
+                .in_flight,
+            0,
+            "the refused offer gave its reservation back"
+        );
+        gate.add_permits(ENVOY_QUEUE_MAX + 1);
+        wait_until("the other jobs to be answered", || {
+            idle.count("envoy replied: ok") == ENVOY_QUEUE_MAX + 1
+        })
+        .await;
+        runner.stop().await;
+        assert!(
+            runs_of(&seen, &["other"])
+                .iter()
+                .all(|body| body == "other")
         );
         source.remove_dir();
     }

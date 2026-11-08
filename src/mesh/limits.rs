@@ -295,7 +295,12 @@ impl LimitState {
 pub(crate) struct PeerLimits {
     config: Mutex<PeerLimitConfig>,
     state: Mutex<LimitState>,
+    on_release: Mutex<Option<ReleaseHook>>,
 }
+
+/// Told the sending identity each time one of its runs gives its place back, after
+/// the window is updated and its lock released, so the hook may look at the limits.
+pub(crate) type ReleaseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// One envoy run's place in its sender's concurrency count, given back when dropped, so
 /// every way a job ends releases it exactly once.
@@ -321,7 +326,22 @@ impl PeerLimits {
         Self {
             config: Mutex::new(config),
             state: Mutex::new(LimitState::default()),
+            on_release: Mutex::new(None),
         }
+    }
+
+    /// Installs who hears that a run gave its place back, replacing any earlier hook.
+    pub(crate) fn set_release_hook(&self, hook: ReleaseHook) {
+        *self.on_release.lock() = Some(hook);
+    }
+
+    /// `None` while `identity` has no window; otherwise whether a run would fit under
+    /// its concurrency cap right now. Files no window and counts nothing.
+    pub(crate) fn concurrency_room(&self, identity: &str) -> Option<bool> {
+        let config = self.config();
+        let state = self.state.lock();
+        let window = state.identities.get(identity)?;
+        Some(config.concurrency == 0 || window.in_flight < config.concurrency)
     }
 
     pub(crate) fn configure(&self, config: PeerLimitConfig) {
@@ -396,8 +416,15 @@ impl PeerLimits {
     }
 
     fn release(&self, identity: &str) {
-        if let Some(window) = self.state.lock().identities.get_mut(identity) {
-            window.in_flight = window.in_flight.saturating_sub(1);
+        {
+            let mut state = self.state.lock();
+            if let Some(window) = state.identities.get_mut(identity) {
+                window.in_flight = window.in_flight.saturating_sub(1);
+            }
+        }
+        let hook = self.on_release.lock().clone();
+        if let Some(hook) = hook {
+            hook(identity);
         }
     }
 
@@ -664,6 +691,36 @@ mod tests {
         });
         let refusal = limits.admit_message("a", late).unwrap_err();
         assert_eq!(refusal.retry_after, PEER_WINDOW - Duration::from_secs(10));
+    }
+
+    /// The hook hears the identity once per release, after the window counts the place
+    /// as free, and may read the limits itself: the state lock is no longer held.
+    #[test]
+    fn the_release_hook_runs_after_the_place_is_given_back_and_the_lock_released() {
+        let limits = default_limits();
+        let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+        limits.set_release_hook({
+            let limits = Arc::downgrade(&limits);
+            let heard = Arc::clone(&heard);
+            Arc::new(move |identity: &str| {
+                let room = limits
+                    .upgrade()
+                    .and_then(|limits| limits.concurrency_room(identity));
+                heard.lock().push(format!("{identity} {room:?}"));
+            })
+        });
+        assert_eq!(limits.concurrency_room("a"), None, "no window yet");
+        let first = limits.try_reserve("a", now()).unwrap();
+        assert_eq!(limits.concurrency_room("a"), Some(false));
+        assert!(heard.lock().is_empty());
+        drop(first);
+        assert_eq!(*heard.lock(), ["a Some(true)"]);
+        assert_eq!(
+            limits.concurrency_room("unknown"),
+            None,
+            "a look files no window"
+        );
+        assert!(limits.window_of("unknown", now()).is_none());
     }
 
     #[test]

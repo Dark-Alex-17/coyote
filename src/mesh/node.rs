@@ -3,6 +3,7 @@ use crate::config::mesh_config::{
     MeshInterface,
 };
 use crate::config::mesh_digest::MeshDigestHook;
+use crate::config::mesh_envoy::ENVOY_QUEUE_MAX;
 use crate::config::{ForkRekey, LivePrefix, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
@@ -103,8 +104,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -3841,6 +3842,8 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// A pair the envoy accepted but could not run (the node went off, the run timed out,
 /// was interrupted or failed) stays remembered: the envoy had the body, and the human
 /// already has the fallback line in the inbox, so its repeat is filed and not run again.
+/// A pair parked for its sender's run in flight counts as accepted: refused or filed when
+/// it leaves the queue, it stays remembered the same way.
 #[derive(Default)]
 struct BodyDedup {
     at: BTreeMap<(String, String), SystemTime>,
@@ -3982,6 +3985,14 @@ impl OwnEntryMarks {
 /// `envoy_bodies` is the window of bodies already handed to the envoy, so one that comes
 /// back by store-and-forward after a lost link acknowledgement is filed and not run again.
 ///
+/// `held` parks store-and-forward messages the envoy refused only because their sender
+/// already has `peer_max_concurrent` runs in flight, at most `ENVOY_QUEUE_MAX` per sender
+/// in the order they were fetched, so several held messages from one sender that arrive
+/// in one sync run one after another instead of all but the first being throttled.
+/// `held_count` is how many are parked across every sender. `this` is the slot's own
+/// handle, set the first time it is asked to watch releases: a sender's run giving its
+/// place back schedules the next of its parked messages through it.
+///
 /// `own_entries` marks the inbox entries this node filed itself, written as they are
 /// filed and read by `is_from_self`; `stop` and `rekey` leave it alone, so an entry filed
 /// before a `.mesh off` or a re-key still reads as this node's.
@@ -4014,6 +4025,9 @@ pub(crate) struct MeshSlot {
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
     envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
     envoy_bodies: parking_lot::Mutex<BodyDedup>,
+    held: parking_lot::Mutex<HashMap<String, VecDeque<HeldMessage>>>,
+    held_count: AtomicUsize,
+    this: OnceLock<Weak<MeshSlot>>,
     own_entries: parking_lot::Mutex<OwnEntryMarks>,
     hooks: MeshHooks,
     limits: Arc<PeerLimits>,
@@ -4193,6 +4207,7 @@ impl MeshSlot {
                 if let Some(envoy) = self.envoy.load_full() {
                     envoy.interrupt();
                 }
+                self.file_held(HeldEnd::NodeOff);
                 self.correlations.detach_store();
                 self.inbound.lock().take();
                 let facts = node_facts(&runtime);
@@ -4223,6 +4238,7 @@ impl MeshSlot {
         let Some(runtime) = self.get() else {
             return Ok(());
         };
+        self.file_held(HeldEnd::Rekeyed);
         let now = SystemTime::now();
         // The carry copies only live rows, so an expired one left in the original's
         // file would never be announced once the slot serves the fork's. The sweep and
@@ -4577,6 +4593,7 @@ impl MeshSlot {
 
     pub(crate) fn clear_envoy(&self) {
         self.envoy.store(None);
+        self.file_held(HeldEnd::EnvoyStopping);
     }
 
     /// Installs who runs the `mesh.*` hooks, on this slot's handle and on the installed
@@ -4747,15 +4764,20 @@ impl MeshSlot {
     /// a link and once per identity, per reason, per hour by store-and-forward, and earns
     /// the person at the keyboard one refusal line per reason per hour, so a flood cannot
     /// flood the terminal or the peer's inbox (the inbox summary line still prints per
-    /// message, bounded by the inbox and idle-sink caps). Anything naming a message in
-    /// `in_reply_to` takes the inbox path too, whatever its kind: a peer's envoy replying
-    /// to our envoy's reply would otherwise keep the two talking forever. A body whose
-    /// sending identity and id the envoy already has within `BODY_DEDUP_HORIZON` is filed
-    /// in the inbox instead of being run again: the acknowledgement precedes the run, so
-    /// one lost on a link brings the same body back by store-and-forward. Runs on a
-    /// blocking thread off the server's request path or on the fetch task, so nothing
-    /// here awaits. Whatever the route, the message's thread is recorded as received
-    /// (as `file_peer` records it too), so the tools accept it as one to continue.
+    /// message, bounded by the inbox and idle-sink caps). A store-and-forward message
+    /// refused only because its sender already has `peer_max_concurrent` runs in flight
+    /// is parked instead, and runs when the sender's run ends (see `hand_to_envoy`): a
+    /// sync that brings several held messages from one sender runs them one after
+    /// another, and a parked message's received hook fires when it is run or filed.
+    /// Anything naming a message in `in_reply_to` takes the inbox path too, whatever its
+    /// kind: a peer's envoy replying to our envoy's reply would otherwise keep the two
+    /// talking forever. A body whose sending identity and id the envoy already has within
+    /// `BODY_DEDUP_HORIZON` is filed in the inbox instead of being run again: the
+    /// acknowledgement precedes the run, so one lost on a link brings the same body back
+    /// by store-and-forward. Runs on a blocking thread off the server's request path or
+    /// on the fetch task, so nothing here awaits. Whatever the route, the message's
+    /// thread is recorded as received (as `file_peer` records it too), so the tools
+    /// accept it as one to continue.
     pub(crate) fn deliver_peer(&self, message: PeerMessage) {
         self.deliver_peer_at(message, SystemTime::now());
     }
@@ -4783,21 +4805,24 @@ impl MeshSlot {
                     self.deliver_to_inbox(message, answered);
                     Routed::Inbox
                 } else {
-                    match sink.accept(EnvoyJob {
-                        message: message.clone(),
-                        reservation: None,
-                    }) {
-                        Ok(()) => {
+                    match self.hand_to_envoy(sink.as_ref().as_ref(), message, &received) {
+                        HandOff::Taken => {
                             debug!("Mesh {kind} {id} from {id8} handed to the envoy");
                             Routed::Envoy
                         }
-                        Err(refusal) => {
+                        HandOff::Parked => {
+                            debug!(
+                                "Mesh {kind} {id} from {id8} parked until the sender's run in flight ends"
+                            );
+                            return;
+                        }
+                        HandOff::Refused(message, refusal) => {
                             self.envoy_bodies.lock().forget(&key);
                             debug!(
                                 "Mesh {kind} {id} from {id8} refused by the envoy: {}; delivering it to the inbox",
                                 refusal.reason.as_str()
                             );
-                            self.refuse_for_envoy(message, refusal);
+                            self.refuse_for_envoy(*message, refusal);
                             Routed::Inbox
                         }
                     }
@@ -4805,6 +4830,204 @@ impl MeshSlot {
             }
         };
         self.hooks.fire(received.event(routed));
+    }
+
+    /// Offers `message` to the envoy. A store-and-forward message whose sender is at
+    /// `peer_max_concurrent` (any run in flight counts, direct or held) is parked behind
+    /// that sender's earlier parked messages instead of being refused, and so is one
+    /// arriving while any are parked, so they run in the order they were fetched; past
+    /// `ENVOY_QUEUE_MAX` parked it is refused as before. A message sent directly is
+    /// offered once and refused when there is no room, since its sender is waiting on
+    /// the answer. Parks only once the slot watches releases, since nothing else would
+    /// ever run a parked message.
+    fn hand_to_envoy(
+        &self,
+        sink: &dyn EnvoySink,
+        message: PeerMessage,
+        received: &ReceivedFacts,
+    ) -> HandOff {
+        let offer = |message: PeerMessage| {
+            sink.accept(EnvoyJob {
+                message,
+                reservation: None,
+            })
+        };
+        if message.via != PeerVia::StoreAndForward || self.this.get().is_none() {
+            return match offer(message.clone()) {
+                Ok(()) => HandOff::Taken,
+                Err(refusal) => HandOff::Refused(Box::new(message), refusal),
+            };
+        }
+        let identity = message.source_identity.clone();
+        let mut held = self.held.lock();
+        let waiting = held.get(&identity).map_or(0, VecDeque::len);
+        let refusal = if waiting == 0 {
+            match offer(message.clone()) {
+                Ok(()) => return HandOff::Taken,
+                Err(refusal)
+                    if refusal.reason == RefusalReason::PeerConcurrency
+                        && self.limits.concurrency_room(&identity).is_some() =>
+                {
+                    refusal
+                }
+                Err(refusal) => return HandOff::Refused(Box::new(message), refusal),
+            }
+        } else {
+            PeerRefusal::capacity(RefusalReason::PeerConcurrency)
+        };
+        if waiting >= ENVOY_QUEUE_MAX {
+            return HandOff::Refused(Box::new(message), refusal);
+        }
+        held.entry(identity.clone())
+            .or_default()
+            .push_back(HeldMessage {
+                message,
+                received: received.clone(),
+            });
+        self.held_count.fetch_add(1, Ordering::SeqCst);
+        drop(held);
+        // A run that ended between the refusal and the count above found nothing parked
+        // and scheduled nothing, so the room it left is looked at here.
+        if self.limits.concurrency_room(&identity) != Some(false) {
+            self.schedule_held(identity);
+        }
+        HandOff::Parked
+    }
+
+    /// Lets this slot run parked messages: a sender's run that gives its place back
+    /// schedules the next of that sender's parked messages. Once per slot; until then
+    /// nothing is parked.
+    pub(crate) fn watch_releases(self: &Arc<Self>) {
+        if self.this.set(Arc::downgrade(self)).is_err() {
+            return;
+        }
+        let slot = Arc::downgrade(self);
+        self.limits
+            .set_release_hook(Arc::new(move |identity: &str| {
+                if let Some(slot) = slot.upgrade()
+                    && slot.held_count.load(Ordering::SeqCst) > 0
+                {
+                    slot.schedule_held(identity.to_string());
+                }
+            }));
+    }
+
+    /// Runs `dispatch_held` for `identity` on a blocking thread, never on the caller: a
+    /// release can come from a fetch task, or from a refused offer while `held` is locked.
+    fn schedule_held(&self, identity: String) {
+        let Some(slot) = self.this.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || slot.dispatch_held(&identity));
+            }
+            Err(_) => debug!(
+                "Mesh messages parked for {} wait for the next release: no async runtime to run them on",
+                short(&identity)
+            ),
+        }
+    }
+
+    /// Offers `identity`'s parked messages to the envoy in order until one does not fit
+    /// under the sender's cap, which waits for the next release. One the envoy refuses
+    /// for another reason (its shared queue is full, the sender is over a ceiling) takes
+    /// the inbox path with the typed refusal, as it would have on arrival; with no envoy
+    /// attached any more they are filed as the envoy stopping. The received hook of each
+    /// fires as it leaves.
+    fn dispatch_held(&self, identity: &str) {
+        let mut taken = Vec::new();
+        let mut refused = Vec::new();
+        {
+            let mut held = self.held.lock();
+            let Some(queue) = held.get_mut(identity) else {
+                return;
+            };
+            let before = queue.len();
+            let envoy = self.envoy.load_full();
+            while let Some(next) = queue.front() {
+                let offered = match &envoy {
+                    Some(sink) => sink.accept(EnvoyJob {
+                        message: next.message.clone(),
+                        reservation: None,
+                    }),
+                    None => Err(PeerRefusal::capacity(RefusalReason::EnvoyStopping)),
+                };
+                match offered {
+                    Ok(()) => {
+                        if let Some(next) = queue.pop_front() {
+                            taken.push(next);
+                        }
+                    }
+                    Err(refusal)
+                        if refusal.reason == RefusalReason::PeerConcurrency
+                            && self.limits.concurrency_room(identity).is_some() =>
+                    {
+                        break;
+                    }
+                    Err(refusal) => {
+                        if let Some(next) = queue.pop_front() {
+                            refused.push((next, refusal));
+                        }
+                    }
+                }
+            }
+            let left = before - queue.len();
+            if queue.is_empty() {
+                held.remove(identity);
+            }
+            self.held_count.fetch_sub(left, Ordering::SeqCst);
+        }
+        for next in taken {
+            debug!(
+                "Mesh {} {} from {} handed to the envoy after waiting for the sender's run in flight",
+                next.message.kind,
+                next.message.message_id,
+                short(identity)
+            );
+            self.hooks.fire(next.received.event(Routed::Envoy));
+        }
+        for (next, refusal) in refused {
+            debug!(
+                "Mesh {} {} from {} refused by the envoy after waiting: {}; delivering it to the inbox",
+                next.message.kind,
+                next.message.message_id,
+                short(identity),
+                refusal.reason.as_str()
+            );
+            self.refuse_for_envoy(next.message, refusal);
+            self.hooks.fire(next.received.event(Routed::Inbox));
+        }
+    }
+
+    /// Files every parked message to the inbox: the propagation node already handed
+    /// them over, so they are not left for a run that will not come. A stopping envoy
+    /// refuses them as it refuses its own queued jobs; `.mesh off` and a re-key file them
+    /// with one idle line each, as a job the node went away under.
+    fn file_held(&self, end: HeldEnd) {
+        let parked: Vec<HeldMessage> = {
+            let mut held = self.held.lock();
+            let parked: Vec<HeldMessage> = held.drain().flat_map(|(_, queue)| queue).collect();
+            self.held_count.fetch_sub(parked.len(), Ordering::SeqCst);
+            parked
+        };
+        for next in parked {
+            match end {
+                HeldEnd::EnvoyStopping => self.refuse_for_envoy(
+                    next.message,
+                    PeerRefusal::capacity(RefusalReason::EnvoyStopping),
+                ),
+                HeldEnd::NodeOff => self.record_envoy_fallback(
+                    next.message,
+                    "the node went off before the envoy could run",
+                ),
+                HeldEnd::Rekeyed => self.record_envoy_fallback(
+                    next.message,
+                    "the session forked before the envoy could run",
+                ),
+            }
+            self.hooks.fire(next.received.event(Routed::Inbox));
+        }
     }
 
     /// The envoy refused `original` with a typed reason: it takes the inbox path and the
@@ -5753,6 +5976,7 @@ fn node_facts(runtime: &MeshRuntime) -> NodeFacts {
 
 /// What `mesh.message.received` and `mesh.bulletin.received` say about a message, taken
 /// before it is handed on, since that consumes it. Never its content or fields.
+#[derive(Clone)]
 struct ReceivedFacts {
     kind: PeerKind,
     id: String,
@@ -5798,6 +6022,29 @@ impl ReceivedFacts {
             },
         }
     }
+}
+
+/// A store-and-forward message waiting for its sender's run in flight to end, with what
+/// its received hook will say once it is run or filed.
+struct HeldMessage {
+    message: PeerMessage,
+    received: ReceivedFacts,
+}
+
+/// Where `hand_to_envoy` put a message.
+enum HandOff {
+    Taken,
+    /// Parked behind its sender's runs in flight; its hook fires when it leaves.
+    Parked,
+    Refused(Box<PeerMessage>, PeerRefusal),
+}
+
+/// Why parked messages are filed to the inbox rather than run.
+#[derive(Clone, Copy)]
+enum HeldEnd {
+    EnvoyStopping,
+    NodeOff,
+    Rekeyed,
 }
 
 fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
