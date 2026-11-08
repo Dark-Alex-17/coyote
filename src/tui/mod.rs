@@ -3,7 +3,9 @@
 //! spawned work task that runs the same REPL command path the line editor
 //! would, and everything the turn says comes back through `UiMsg`s. The
 //! transcript is redrawn from its sources on every frame, so a resize is
-//! just another frame.
+//! just another frame. A `!cmd` passthrough or an editor borrows the
+//! terminal: the loop leaves the screen and runs the job synchronously on
+//! its own thread, so nothing is drawn until the job returns.
 
 mod bottom_pane;
 mod cells;

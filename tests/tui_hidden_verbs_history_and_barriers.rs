@@ -950,9 +950,17 @@ fn wait_for_process_gone(pid: i32, limit: Duration) -> bool {
     true
 }
 
-fn kill_leftover(pid: i32) {
-    // SAFETY: kill takes a pid and a signal number and touches no memory.
-    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+/// The sleepers a test forked, killed by pid when it ends however it
+/// ends, so a failed assertion leaves none behind.
+struct Sleepers(Vec<i32>);
+
+impl Drop for Sleepers {
+    fn drop(&mut self) {
+        for &pid in &self.0 {
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
 }
 
 fn write_script(dir: &Path, name: &str, body: &str) -> String {
@@ -968,14 +976,12 @@ fn write_script(dir: &Path, name: &str, body: &str) -> String {
 /// it backgrounds the sleeper and exits, leaving it holding the capture
 /// pipe. Each script records the sleeper's pid, so the checks and the
 /// cleanup touch that process and no other. Esc ends each turn within
-/// ten seconds and the composer takes keys. The waited-on sleeper dies
-/// with its shell's group within two seconds of Esc. The orphaned one
-/// survives: its shell was reaped the moment it exited, and a group
-/// whose leader is gone is not provably ours to signal, so the UI
-/// leaves it alone and this test kills it by pid afterwards.
+/// ten seconds and the composer takes keys. Both sleepers die with the
+/// shell's group within two seconds of Esc: the exited shell is kept a
+/// zombie until then, so its pid still names the group it led.
 #[test]
 #[serial]
-fn a_backtick_document_commands_grandchild_dies_on_esc_while_its_shell_leads_the_group() {
+fn a_backtick_document_commands_grandchild_dies_on_esc_even_after_its_shell_exited() {
     let dir = fresh_config_dir("backtick-grandchild");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir, "");
@@ -1001,22 +1007,17 @@ fn a_backtick_document_commands_grandchild_dies_on_esc_while_its_shell_leads_the
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
     let mut misses: Vec<String> = Vec::new();
-    let mut sleepers = Vec::new();
-    for (script, pid_file, what, dies_on_esc) in [
-        (waits, &waits_pid, "a waited-on grandchild", true),
-        (
-            orphans,
-            &orphans_pid,
-            "a backgrounded, orphaned grandchild",
-            false,
-        ),
+    let mut sleepers = Sleepers(Vec::new());
+    for (script, pid_file, what) in [
+        (waits, &waits_pid, "a waited-on grandchild"),
+        (orphans, &orphans_pid, "a backgrounded, orphaned grandchild"),
     ] {
         let turn_at = pty.raw().len();
         pty.send(format!(".file `sh {script}` -- summarize\r").as_bytes())
             .unwrap();
         // The sleeper must be up before Esc, or the test proves nothing.
         let pid = wait_for_pid_in(&mut pty, pid_file, &format!("{what}: the sleeper's pid"));
-        sleepers.push(pid);
+        sleepers.0.push(pid);
         assert!(
             process_alive(pid),
             "{what}: the sleeper (pid {pid}) is gone before Esc:\n{}",
@@ -1025,18 +1026,9 @@ fn a_backtick_document_commands_grandchild_dies_on_esc_while_its_shell_leads_the
         pty.read_for(Duration::from_millis(800));
         pty.send(b"\x1b").unwrap();
         let esc_at = Instant::now();
-        let gone = wait_for_process_gone(pid, Duration::from_secs(2));
-        if dies_on_esc && !gone {
-            kill_leftover(pid);
+        if !wait_for_process_gone(pid, Duration::from_secs(2)) {
             misses.push(format!(
                 "{what}: the sleeper (pid {pid}) outlived Esc by two seconds:\n{}",
-                since(&pty, turn_at)
-            ));
-        }
-        if !dies_on_esc && gone {
-            misses.push(format!(
-                "{what}: the sleeper (pid {pid}) was signalled though its shell's group was \
-                 no longer ours:\n{}",
                 since(&pty, turn_at)
             ));
         }
@@ -1049,9 +1041,6 @@ fn a_backtick_document_commands_grandchild_dies_on_esc_while_its_shell_leads_the
         }
     }
     quit_and_check(&mut pty);
-    for pid in sleepers {
-        kill_leftover(pid);
-    }
     assert!(
         misses.is_empty(),
         "{} grandchild expectation(s) missed:\n\n{}",
