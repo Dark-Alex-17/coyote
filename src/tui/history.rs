@@ -147,8 +147,10 @@ impl ComposerHistory {
 mod tests {
     use super::*;
     use crate::testing::ScratchDirGuard;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn entries_round_trip_through_the_file_with_newlines_escaped() {
         let dir = ScratchDirGuard::new("history-round-trip");
         // The parent does not exist yet: the first append creates it.
@@ -164,6 +166,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn the_file_is_readable_by_its_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = ScratchDirGuard::new("history-mode");
@@ -175,6 +178,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn a_missing_file_is_an_empty_history() {
         let dir = ScratchDirGuard::new("history-missing");
         let history = ComposerHistory::load(&dir.path.join("history")).unwrap();
@@ -182,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn the_file_keeps_the_newest_thousand_entries() {
         let dir = ScratchDirGuard::new("history-cap");
         let path = dir.path.join("history");

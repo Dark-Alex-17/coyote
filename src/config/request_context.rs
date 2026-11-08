@@ -8209,7 +8209,9 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
-    use crate::testing::{AtomicFlagGuard, TempDirGuard, install_log_collector, warn_snapshot};
+    use crate::testing::{
+        AtomicFlagGuard, TmpdirRedirectGuard, install_log_collector, warn_snapshot,
+    };
     use crate::turn::SilentSink;
     use crate::utils;
     use crate::utils::get_env_name;
@@ -11958,7 +11960,7 @@ mod tests {
     #[test]
     #[serial]
     fn edit_rag_docs_under_the_tui_without_a_lender_fails_before_writing_the_temp_file() {
-        let tmp = TempDirGuard::new("rag-tui-refused");
+        let tmp = TmpdirRedirectGuard::new("rag-tui-refused");
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let name = "tui-refused-kb";

@@ -307,6 +307,9 @@ impl Drop for CacheDirGuard {
 
 /// A fresh directory under the temp dir for a test's scratch files,
 /// removed on drop, including on panic, so no outcome leaves them behind.
+/// It reads `std::env::temp_dir()` at construction, so a test using it
+/// runs `#[serial]` alongside the users of `TmpdirRedirectGuard`, whose
+/// redirected root is removed when that guard drops.
 pub(crate) struct ScratchDirGuard {
     pub(crate) path: PathBuf,
 }
@@ -334,13 +337,13 @@ impl Drop for ScratchDirGuard {
 /// test writes through `env::temp_dir()` lands there and goes with it; a
 /// leak check then reads that directory and not the shared one. Tests
 /// using it must serialize (`#[serial]`); the env vars are process-global.
-pub(crate) struct TempDirGuard {
+pub(crate) struct TmpdirRedirectGuard {
     pub(crate) scratch: ScratchDirGuard,
     _tmpdir: EnvVarGuard,
     _tmp: EnvVarGuard,
 }
 
-impl TempDirGuard {
+impl TmpdirRedirectGuard {
     pub(crate) fn new(label: &str) -> Self {
         let scratch = ScratchDirGuard::new(label);
         let tmpdir = EnvVarGuard::set("TMPDIR", &scratch.path);
