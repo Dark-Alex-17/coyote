@@ -420,6 +420,22 @@ pub fn gemini_build_chat_completions_body(
                             }
                             model_parts.push(part);
                         }
+                        let image_parts: Vec<Value> = tool_results
+                            .iter()
+                            .flat_map(|tool_result| {
+                                tool_result.attachments.iter().flat_map(move |attachment| {
+                                    [
+                                        json!({
+                                            "text": format!(
+                                                "Image output from tool call {}: {}",
+                                                tool_result.call.name, attachment.source
+                                            )
+                                        }),
+                                        json!({ "inline_data": { "mime_type": attachment.mime_type, "data": attachment.data } }),
+                                    ]
+                                })
+                            })
+                            .collect();
                         let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
                             json!({
                                 "functionResponse": {
@@ -435,10 +451,16 @@ pub fn gemini_build_chat_completions_body(
                         if function_parts.is_empty() {
                             vec![]
                         } else {
-                            vec![
+                            let mut turns = vec![
                                 json!({ "role": "model", "parts": model_parts }),
                                 json!({ "role": "function", "parts": function_parts }),
-                            ]
+                            ];
+                            // Gemini rejects image parts inside the function turn, so
+                            // tool images follow it in their own user turn.
+                            if !image_parts.is_empty() {
+                                turns.push(json!({ "role": "user", "parts": image_parts }));
+                            }
+                            turns
                         }
                     }
                 }
@@ -607,6 +629,7 @@ fn strip_model_version(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::function::{ImageAttachment, ToolCall, ToolResult};
 
     #[test]
     fn gemini_empty_tool_results_emits_no_messages() {
@@ -783,5 +806,169 @@ mod tests {
 
             assert!(output.refusal.is_none());
         }
+    }
+
+    #[test]
+    fn gemini_interleaved_user_parts_keep_their_order() {
+        let body = gemini_build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("vertexai", "gemini-test"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["contents"][0]["parts"],
+            json!([
+                { "text": "before" },
+                { "inline_data": { "mime_type": "image/png", "data": "QQ==" } },
+                { "text": "after" },
+                { "inline_data": { "mime_type": "image/jpeg", "data": "Qg==" } },
+            ]),
+            "body: {body}"
+        );
+    }
+
+    fn gemini_body_for(tool_results: Vec<ToolResult>) -> Value {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        text: String::new(),
+                        sequence: false,
+                        round_starts: vec![],
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+            prompt_cache_ttl: None,
+        };
+        gemini_build_chat_completions_body(data, &Model::new("vertexai", "gemini-test")).unwrap()
+    }
+
+    fn fs_read_result(id: &str) -> ToolResult {
+        ToolResult::new(
+            ToolCall::new("fs_read".into(), json!({"path": "x"}), Some(id.into())),
+            json!("ok"),
+        )
+    }
+
+    fn function_response_json() -> Value {
+        json!({
+            "functionResponse": {
+                "name": "fs_read",
+                "response": { "name": "fs_read", "content": "ok" },
+            }
+        })
+    }
+
+    #[test]
+    fn gemini_tool_images_follow_function_responses_in_a_user_turn() {
+        let body = gemini_body_for(vec![
+            fs_read_result("call_A"),
+            fs_read_result("call_B").with_attachments(vec![ImageAttachment {
+                source: "/tmp/b.png".into(),
+                mime_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }]),
+        ]);
+
+        let function_content = &body["contents"][2];
+        assert_eq!(function_content["role"], "function", "body: {body}");
+        assert_eq!(
+            function_content["parts"],
+            json!([function_response_json(), function_response_json()]),
+            "body: {body}"
+        );
+        let image_content = &body["contents"][3];
+        assert_eq!(image_content["role"], "user", "body: {body}");
+        assert_eq!(
+            image_content["parts"],
+            json!([
+                { "text": "Image output from tool call fs_read: /tmp/b.png" },
+                { "inline_data": { "mime_type": "image/png", "data": "aGVsbG8=" } },
+            ]),
+            "body: {body}"
+        );
+        assert_eq!(body["contents"].as_array().unwrap().len(), 4, "body: {body}");
+    }
+
+    #[test]
+    fn gemini_tool_results_without_images_keep_parts() {
+        let body = gemini_body_for(vec![fs_read_result("call_A")]);
+
+        assert_eq!(
+            body["contents"][2]["parts"],
+            json!([function_response_json()]),
+            "body: {body}"
+        );
+        assert_eq!(body["contents"].as_array().unwrap().len(), 3, "body: {body}");
+    }
+
+    #[test]
+    fn gemini_images_omitted_result_has_no_image_parts() {
+        let mut result = fs_read_result("call_A");
+        result.output = json!({ "result": "ok", "images_omitted": "model has no vision" });
+
+        let body = gemini_body_for(vec![result]);
+
+        let parts = body["contents"][2]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "body: {body}");
+        assert!(parts[0].get("functionResponse").is_some(), "body: {body}");
+    }
+
+    #[test]
+    fn claude_route_carries_tool_result_images() {
+        let result = ToolResult::new(
+            ToolCall::new("fs_read".into(), json!({"path": "x"}), Some("toolu_A".into())),
+            json!("ok"),
+        )
+        .with_attachments(vec![ImageAttachment {
+            source: "/tmp/a.png".into(),
+            mime_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }]);
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results: vec![result],
+                        text: String::new(),
+                        sequence: true,
+                        round_starts: vec![],
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+            prompt_cache_ttl: None,
+        };
+
+        let body = claude_build_chat_completions_body(
+            data,
+            &Model::new("vertexai", "claude-test"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["messages"][2]["content"][0]["content"],
+            json!([
+                {"type": "text", "text": "\"ok\""},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
+            ]),
+            "body: {body}"
+        );
     }
 }

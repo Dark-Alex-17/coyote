@@ -885,6 +885,7 @@ fn the_production_path_pins_the_root_to_the_process_cwd() {
             None,
         )
         .unwrap()
+        .output
         .expect("the shim writes to LLM_OUTPUT");
         serde_json::from_str(&output).unwrap()
     };

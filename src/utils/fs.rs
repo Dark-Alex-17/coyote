@@ -25,15 +25,15 @@ fn write_temp_path(path: &Path, seq: u64) -> PathBuf {
 /// than followed. The temp file is fsynced before the rename so a crash after
 /// the rename is journaled cannot leave the target truncated or empty. A stale
 /// temp entry is removed and the open retried once.
-pub(crate) fn write_private_atomic(path: &Path, content: &str) -> io::Result<()> {
+pub(crate) fn write_private_atomic(path: &Path, content: impl AsRef<[u8]>) -> io::Result<()> {
     write_private_atomic_via(
         path,
-        content,
+        content.as_ref(),
         WRITE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
     )
 }
 
-fn write_private_atomic_via(path: &Path, content: &str, seq: u64) -> io::Result<()> {
+fn write_private_atomic_via(path: &Path, content: impl AsRef<[u8]>, seq: u64) -> io::Result<()> {
     let tmp_path = write_temp_path(path, seq);
     let open_tmp = || {
         let mut options = OpenOptions::new();
@@ -54,7 +54,7 @@ fn write_private_atomic_via(path: &Path, content: &str, seq: u64) -> io::Result<
         Err(error) => return Err(error),
     };
     if let Err(error) = tmp_file
-        .write_all(content.as_bytes())
+        .write_all(content.as_ref())
         .and_then(|_| tmp_file.sync_all())
     {
         drop(tmp_file);
@@ -280,6 +280,29 @@ pub(crate) fn copy_dir_all(
     Ok(())
 }
 
+/// Deletes its temp files when dropped, so every exit of the owner
+/// (an early `?` return, a timeout, a cancelled future) cleans them up.
+/// Missing files and removal errors are ignored.
+pub(crate) struct TempFileGuard(Vec<PathBuf>);
+
+impl TempFileGuard {
+    pub(crate) fn new(paths: Vec<PathBuf>) -> Self {
+        Self(paths)
+    }
+
+    pub(crate) fn push(&mut self, path: PathBuf) {
+        self.0.push(path);
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = remove_file(path);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn copy_symlink(link: &Path, target: &Path, _src: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(std::fs::read_link(link)?, target)
@@ -334,6 +357,23 @@ mod tests {
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn temp_file_guard_removes_its_files_and_ignores_missing_ones() {
+        let dir = TempDir::new("guard");
+        let first = dir.0.join("first");
+        let pushed = dir.0.join("pushed");
+        let missing = dir.0.join("missing");
+        fs::write(&first, "a").unwrap();
+        fs::write(&pushed, "b").unwrap();
+
+        let mut guard = TempFileGuard::new(vec![first.clone(), missing]);
+        guard.push(pushed.clone());
+        drop(guard);
+
+        assert!(!first.exists());
+        assert!(!pushed.exists());
     }
 
     #[test]

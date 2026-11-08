@@ -193,6 +193,7 @@ lxmf-wire = "0.14.0"
 # transport's own `rmpv` (`coyote-rns-transport` pins 1.3). Moves together with the
 # transport dependency above.
 rmpv = "1.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dependencies.reqwest]
 version = "0.13.3"
@@ -208,12 +209,13 @@ features = ["parsing", "regex-onig", "plist-load"]
 crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-arboard = { version = "3.3.0", default-features = false, features = [
+arboard = { version = "3.6", default-features = false, features = [
   "wayland-data-control",
+  "image-data",
 ] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
-arboard = { version = "3.3.0", default-features = false }
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

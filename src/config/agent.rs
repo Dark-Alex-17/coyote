@@ -1030,7 +1030,7 @@ impl Agent {
     }
 
     fn run_instructions_fn(&self, tool_timeout: Option<u64>) -> Result<String> {
-        let value = run_llm_function(
+        let run = run_llm_function(
             self.name().to_string(),
             vec!["_instructions".into(), "{}".into()],
             self.variable_envs(),
@@ -1039,7 +1039,7 @@ impl Agent {
             false,
             None,
         )?;
-        match value {
+        match run.output {
             Some(v) => Ok(v),
             _ => bail!("No return value from '_instructions' function"),
         }

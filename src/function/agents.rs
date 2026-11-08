@@ -6356,7 +6356,7 @@ mod tests {
         assert_eq!(repl.matches("record_graph_run(").count(), 1);
 
         let main = include_str!("../main.rs").replace("\r\n", "\n");
-        assert!(!main.contains("\n#[cfg(test)]\nmod tests"));
+        let main = &main[..main.find("\n#[cfg(test)]\nmod tests").unwrap()];
         assert_eq!(main.matches("record_graph_run(").count(), 1);
     }
 

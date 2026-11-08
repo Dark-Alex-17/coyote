@@ -1,6 +1,10 @@
 use super::Model;
 
-use crate::{function::ToolResult, multiline_text, utils::dimmed_text};
+use crate::{
+    function::ToolResult,
+    multiline_text,
+    utils::{dimmed_text, image_marker},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -123,21 +127,36 @@ impl MessageContent {
         match self {
             MessageContent::Text(text) => multiline_text(text),
             MessageContent::Array(list) => {
-                let (mut concatenated_text, mut files) = (String::new(), vec![]);
-                for item in list {
+                // An image with text after it is shown by its marker where
+                // it sits, as `render_image_slots` shows a slot. One after
+                // all the text cannot be told from a `.file` attachment, so
+                // it is only listed.
+                let last_text = list
+                    .iter()
+                    .rposition(|item| matches!(item, MessageContentPart::Text { .. }));
+                let (mut words, mut files) = (vec![], vec![]);
+                for (index, item) in list.iter().enumerate() {
                     match item {
                         MessageContentPart::Text { text } => {
-                            concatenated_text = format!("{concatenated_text} {text}")
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                words.push(text.to_string());
+                            }
                         }
                         MessageContentPart::ImageUrl { image_url } => {
-                            files.push(resolve_url_fn(&image_url.url))
+                            files.push(resolve_url_fn(&image_url.url));
+                            if last_text.is_some_and(|last| index < last) {
+                                words.push(image_marker(files.len()));
+                            }
                         }
                     }
                 }
-                if !concatenated_text.is_empty() {
-                    concatenated_text = format!(" -- {}", multiline_text(&concatenated_text))
-                }
-                format!(".file {}{}", files.join(" "), concatenated_text)
+                let text = if words.is_empty() {
+                    String::new()
+                } else {
+                    format!(" -- {}", multiline_text(&words.join(" ")))
+                };
+                format!(".file {}{}", files.join(" "), text)
             }
             MessageContent::ToolCalls(MessageContentToolCalls {
                 tool_results, text, ..
@@ -172,16 +191,43 @@ impl MessageContent {
         }
     }
 
-    pub fn merge_prompt(&mut self, replace_fn: impl Fn(&str) -> String) {
+    /// Wraps the content in a role `template` at its `placeholder`. Text
+    /// before the placeholder leads the first part and text after it follows
+    /// the last text part, so images stay where the user put them.
+    pub fn merge_prompt(&mut self, template: &str, placeholder: &str) {
         match self {
-            MessageContent::Text(text) => *text = replace_fn(text),
+            MessageContent::Text(text) => *text = template.replace(placeholder, text),
+            MessageContent::Array(list) if list.is_empty() => list.push(MessageContentPart::Text {
+                text: template.replace(placeholder, ""),
+            }),
             MessageContent::Array(list) => {
-                if list.is_empty() {
-                    list.push(MessageContentPart::Text {
-                        text: replace_fn(""),
-                    })
-                } else if let Some(MessageContentPart::Text { text }) = list.get_mut(0) {
-                    *text = replace_fn(text)
+                if let Some(text) = leading_text_before_images(list) {
+                    *text = template.replace(placeholder, text);
+                    return;
+                }
+                let (prefix, suffix) = template.split_once(placeholder).unwrap_or((template, ""));
+                let suffix = suffix.replace(placeholder, "");
+                let suffix = suffix.as_str();
+                let last_text = list.iter_mut().rev().find_map(|item| match item {
+                    MessageContentPart::Text { text } => Some(text),
+                    MessageContentPart::ImageUrl { .. } => None,
+                });
+                match last_text {
+                    Some(text) => text.push_str(suffix),
+                    None if !suffix.is_empty() => list.push(MessageContentPart::Text {
+                        text: suffix.to_string(),
+                    }),
+                    None => {}
+                }
+                match list.first_mut() {
+                    Some(MessageContentPart::Text { text }) => text.insert_str(0, prefix),
+                    _ if !prefix.is_empty() => list.insert(
+                        0,
+                        MessageContentPart::Text {
+                            text: prefix.to_string(),
+                        },
+                    ),
+                    _ => {}
                 }
             }
             MessageContent::ToolCalls(_) => {}
@@ -203,7 +249,25 @@ impl MessageContent {
             MessageContent::ToolCalls(_) => String::new(),
         }
     }
+
+    /// Every part on one line, each image as `IMAGE_PART_TEXT` in place, so
+    /// a text-only reader still sees that an image was there and where.
+    pub fn to_text_with_image_placeholders(&self) -> String {
+        match self {
+            MessageContent::Array(list) => list
+                .iter()
+                .map(|item| match item {
+                    MessageContentPart::Text { text } => text.as_str(),
+                    MessageContentPart::ImageUrl { .. } => IMAGE_PART_TEXT,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            content => content.to_text(),
+        }
+    }
 }
+
+pub const IMAGE_PART_TEXT: &str = "[image]";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -255,6 +319,21 @@ pub struct MessageContentToolCalls {
     /// the whole accumulated history on every request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub round_starts: Vec<usize>,
+}
+
+/// The text of a part list made of one text part followed only by images,
+/// as a `.file` message with typed text is. `None` for any other layout.
+fn leading_text_before_images(list: &mut [MessageContentPart]) -> Option<&mut String> {
+    match list.split_first_mut()? {
+        (MessageContentPart::Text { text }, rest)
+            if rest
+                .iter()
+                .all(|item| matches!(item, MessageContentPart::ImageUrl { .. })) =>
+        {
+            Some(text)
+        }
+        _ => None,
+    }
 }
 
 impl MessageContentToolCalls {
@@ -319,10 +398,73 @@ pub fn extract_system_message(messages: &mut Vec<Message>) -> Option<String> {
     None
 }
 
+/// One user message alternating text and images, `QQ==` before `Qg==`, for
+/// checking that request builders keep the part order.
+#[cfg(test)]
+pub(crate) fn interleaved_user_data() -> super::ChatCompletionsData {
+    let image = |url: &str| MessageContentPart::ImageUrl {
+        image_url: ImageUrl { url: url.into() },
+    };
+    let text = |text: &str| MessageContentPart::Text { text: text.into() };
+    super::ChatCompletionsData {
+        messages: vec![Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![
+                text("before"),
+                image("data:image/png;base64,QQ=="),
+                text("after"),
+                image("data:image/jpeg;base64,Qg=="),
+            ]),
+        )],
+        temperature: None,
+        top_p: None,
+        reasoning_effort: None,
+        functions: None,
+        stream: false,
+        prompt_cache_ttl: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn image(url: &str) -> MessageContentPart {
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl { url: url.into() },
+        }
+    }
+
+    fn text(text: &str) -> MessageContentPart {
+        MessageContentPart::Text { text: text.into() }
+    }
+
+    #[test]
+    fn render_input_marks_images_that_text_follows() {
+        let content = MessageContent::Array(vec![
+            image("/a.png"),
+            text("compare"),
+            image("/b.png"),
+            text("with"),
+            image("/c.png"),
+        ]);
+
+        assert_eq!(
+            content.render_input(|url| url.to_string(), &None),
+            ".file /a.png /b.png /c.png -- [Image #1] compare [Image #2] with"
+        );
+    }
+
+    #[test]
+    fn render_input_keeps_trailing_images_unmarked() {
+        let content = MessageContent::Array(vec![text("hi"), image("/a.png"), image("/b.png")]);
+
+        assert_eq!(
+            content.render_input(|url| url.to_string(), &None),
+            ".file /a.png /b.png -- hi"
+        );
+    }
 
     #[test]
     fn old_session_thinking_blocks_still_deserialize() {

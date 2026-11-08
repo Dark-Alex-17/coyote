@@ -5,19 +5,19 @@ use crate::client::{
     MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
 };
 use crate::function::ToolResult;
-use crate::utils::{AbortSignal, UserInterrupt, base64_encode, is_loader_protocol, sha256};
+use crate::utils::{
+    AbortSignal, IMAGE_SLOT, UserInterrupt, is_loader_protocol, prepare_image_file_blocking,
+    render_image_slots, sha256, strip_image_slots,
+};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    io::Read,
     sync::Arc,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 const SUMMARY_MAX_WIDTH: usize = 80;
 const EXTENDED_PROMPT_CACHE_TTL: &str = "1h";
 
@@ -54,7 +54,10 @@ pub struct Input {
 }
 
 impl Input {
+    /// Text from anywhere but the REPL image route has its `IMAGE_SLOT`s
+    /// stripped, so a typed or loaded one cannot place an image.
     pub fn from_str(ctx: &RequestContext, text: &str, role: Option<Role>) -> Result<Self> {
+        let text = strip_image_slots(text);
         let (role, with_session, with_agent) = resolve_role(ctx, role)?;
         let long_lived = is_long_lived(ctx, with_session);
         let captured = capture_input_config(ctx, &role);
@@ -64,8 +67,8 @@ impl Input {
             session: captured.session,
             rag: captured.rag,
             functions: captured.functions,
-            text: text.to_string(),
-            raw: (text.to_string(), vec![]),
+            text: text.clone(),
+            raw: (text, vec![]),
             patched_text: None,
             request_preamble: None,
             last_reply: None,
@@ -106,6 +109,7 @@ impl Input {
         role: Role,
         functions: Option<Vec<FunctionDeclaration>>,
     ) -> Result<Self> {
+        let text = strip_image_slots(text);
         let with_session = ctx.session.is_some();
         Ok(Self {
             app_config: Arc::clone(&ctx.app.config),
@@ -113,8 +117,8 @@ impl Input {
             session: ctx.session.clone(),
             rag: ctx.rag.clone(),
             functions,
-            text: text.to_string(),
-            raw: (text.to_string(), vec![]),
+            text: text.clone(),
+            raw: (text, vec![]),
             patched_text: None,
             request_preamble: None,
             last_reply: None,
@@ -146,14 +150,15 @@ impl Input {
     /// functions are not declared either: auxiliary one-shots whose reply
     /// is read as data must not be able to call anything.
     pub fn detached_with_role(ctx: &RequestContext, text: &str, role: Role) -> Self {
+        let text = strip_image_slots(text);
         Self {
             app_config: Arc::clone(&ctx.app.config),
             stream_enabled: ctx.app.config.stream,
             session: None,
             rag: None,
             functions: None,
-            text: text.to_string(),
-            raw: (text.to_string(), vec![]),
+            text: text.clone(),
+            raw: (text, vec![]),
             patched_text: None,
             request_preamble: None,
             last_reply: None,
@@ -172,6 +177,26 @@ impl Input {
     }
 
     pub async fn from_files(
+        ctx: &RequestContext,
+        raw_text: &str,
+        paths: Vec<String>,
+        role: Option<Role>,
+    ) -> Result<Self> {
+        Self::load_files(ctx, &strip_image_slots(raw_text), paths, role).await
+    }
+
+    /// `from_files` keeping the `IMAGE_SLOT`s in `raw_text`. Only the REPL
+    /// image route, which places every slot itself, may call it.
+    pub(crate) async fn from_files_with_image_slots(
+        ctx: &RequestContext,
+        raw_text: &str,
+        paths: Vec<String>,
+        role: Option<Role>,
+    ) -> Result<Self> {
+        Self::load_files(ctx, raw_text, paths, role).await
+    }
+
+    async fn load_files(
         ctx: &RequestContext,
         raw_text: &str,
         paths: Vec<String>,
@@ -202,7 +227,7 @@ impl Input {
                     last_reply = Some(v.clone());
                 }
                 if let Some(v) = last_reply.clone() {
-                    texts.push(format!("\n{v}"));
+                    texts.push(format!("\n{}", strip_image_slots(&v)));
                 }
             }
             if last_reply.is_none() && documents.is_empty() && medias.is_empty() {
@@ -211,6 +236,8 @@ impl Input {
         }
         let documents_len = documents.len();
         for (kind, path, contents) in documents {
+            let path = strip_image_slots(&path);
+            let contents = strip_image_slots(&contents);
             if documents_len == 1 && raw_text.is_empty() {
                 texts.push(format!("\n{contents}"));
             } else {
@@ -264,7 +291,7 @@ impl Input {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.medias.is_empty()
+        strip_image_slots(&self.text).is_empty() && self.medias.is_empty()
     }
 
     pub fn data_urls(&self) -> HashMap<String, String> {
@@ -289,6 +316,12 @@ impl Input {
         }
     }
 
+    /// Whether the user's text says anything a retrieval query could use;
+    /// a message of only images does not.
+    fn has_search_text(&self) -> bool {
+        !strip_image_slots(&self.text).trim().is_empty()
+    }
+
     pub fn bare_text(&self) -> &str {
         &self.text
     }
@@ -308,10 +341,16 @@ impl Input {
     }
 
     pub fn set_request_preamble(&mut self, text: impl Into<String>) {
-        self.request_preamble = Some(text.into());
+        self.request_preamble = Some(strip_image_slots(&text.into()));
     }
 
+    /// Copies the request-only state of `source`. Its text comes along with
+    /// its medias, since the `IMAGE_SLOT`s in it place those images and this
+    /// input's own constructor stripped them.
     pub(crate) fn carry_patch_from(&mut self, source: &Input) {
+        if !source.medias.is_empty() {
+            self.text = source.text.clone();
+        }
         self.patched_text = source.patched_text.clone();
         self.rag_name = source.rag_name.clone();
         self.raw = source.raw.clone();
@@ -321,12 +360,26 @@ impl Input {
         self.continue_output = source.continue_output.clone();
     }
 
+    /// Attaches images in the given order, keeping repeats, unlike
+    /// `from_files`, which loads each distinct path once.
+    pub async fn extend_image_medias(&mut self, paths: &[String]) -> Result<()> {
+        for path in paths {
+            let contents = prepare_image_file_blocking(path.into())
+                .await
+                .with_context(|| format!("Unable to read media '{path}'"))?
+                .to_data_url();
+            self.data_urls.insert(sha256(&contents), path.clone());
+            self.medias.push(contents);
+            self.raw.1.push(path.clone());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn set_patched_text(&mut self, text: &str) {
         self.patched_text = Some(text.to_string());
     }
 
-    #[cfg(test)]
     pub fn medias(&self) -> &[String] {
         &self.medias
     }
@@ -337,7 +390,7 @@ impl Input {
     }
 
     pub fn set_text(&mut self, text: String) {
-        self.text = text;
+        self.text = strip_image_slots(&text);
     }
 
     pub fn stream(&self) -> bool {
@@ -378,7 +431,7 @@ impl Input {
     }
 
     pub async fn use_embeddings(&mut self, abort_signal: AbortSignal) -> Result<()> {
-        if self.text.is_empty() {
+        if !self.has_search_text() {
             return Ok(());
         }
         if let Some(rag) = &self.rag {
@@ -442,7 +495,17 @@ impl Input {
         model: &Model,
         stream: bool,
     ) -> Result<ChatCompletionsData> {
+        guard_medias(&self.medias, model)?;
         let mut messages = self.build_messages()?;
+        let current_user = if self.continue_output().is_none() {
+            messages.iter().rposition(|message| {
+                message.role == MessageRole::User
+                    && !matches!(message.content, MessageContent::ToolCalls(_))
+            })
+        } else {
+            None
+        };
+        limit_outgoing_images(&mut messages, model, current_user);
         patch_messages(&mut messages, model);
         model.guard_max_input_tokens(&messages)?;
         let (temperature, top_p) = (self.role().temperature(), self.role().top_p());
@@ -516,6 +579,13 @@ impl Input {
         &self.role
     }
 
+    /// Refuses a message whose images the model cannot take or that exceed
+    /// the per-request limits. Runs before anything is sent so a refusal
+    /// never reaches the session.
+    pub fn guard_images(&self) -> Result<()> {
+        guard_medias(&self.medias, self.role().model())
+    }
+
     pub fn app_config(&self) -> &AppConfig {
         &self.app_config
     }
@@ -557,8 +627,7 @@ impl Input {
     }
 
     pub fn summary(&self) -> String {
-        let text: String = self
-            .text
+        let text: String = render_image_slots(&self.text, self.medias.len())
             .trim()
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
@@ -581,8 +650,17 @@ impl Input {
     }
 
     pub fn raw(&self) -> String {
+        self.raw_with(render_image_slots)
+    }
+
+    /// `raw` with the image positions dropped rather than shown.
+    pub fn raw_without_image_slots(&self) -> String {
+        self.raw_with(|text, _| strip_image_slots(text))
+    }
+
+    fn raw_with(&self, show_slots: fn(&str, usize) -> String) -> String {
         let (text, files) = &self.raw;
-        let mut segments = files.to_vec();
+        let mut segments: Vec<String> = files.iter().map(|f| strip_image_slots(f)).collect();
         if !segments.is_empty() {
             segments.insert(0, ".file".into());
         }
@@ -590,13 +668,13 @@ impl Input {
             if !segments.is_empty() {
                 segments.push("--".into());
             }
-            segments.push(text.clone());
+            segments.push(show_slots(text, self.medias.len()));
         }
         segments.join(" ")
     }
 
     pub fn render(&self) -> String {
-        let text = self.text();
+        let text = render_image_slots(&self.text(), self.medias.len());
         if self.medias.is_empty() {
             return text;
         }
@@ -614,24 +692,44 @@ impl Input {
         format!(".file {}{}", files.join(" "), tail_text)
     }
 
+    /// Splits the text at each `IMAGE_SLOT`, the i-th slot taking the i-th
+    /// image. Slots beyond the images are dropped; images without a slot
+    /// follow the text, as `.file` has always sent them.
     pub fn message_content(&self) -> MessageContent {
         let text = self.text_with_preamble();
         if self.medias.is_empty() {
-            MessageContent::Text(text)
-        } else {
-            let mut list: Vec<MessageContentPart> = self
-                .medias
-                .iter()
-                .cloned()
-                .map(|url| MessageContentPart::ImageUrl {
-                    image_url: ImageUrl { url },
-                })
-                .collect();
-            if !self.text.is_empty() || self.request_preamble.is_some() {
-                list.insert(0, MessageContentPart::Text { text });
-            }
-            MessageContent::Array(list)
+            return MessageContent::Text(strip_image_slots(&text));
         }
+        let image_part = |url: &String| MessageContentPart::ImageUrl {
+            image_url: ImageUrl { url: url.clone() },
+        };
+        let mut medias = self.medias.iter();
+        let mut parts = Vec::new();
+        let mut pending = String::new();
+        for (index, piece) in text.split(IMAGE_SLOT).enumerate() {
+            if index > 0
+                && let Some(url) = medias.next()
+            {
+                push_trimmed_text(&mut parts, &pending);
+                pending.clear();
+                parts.push(image_part(url));
+            }
+            pending.push_str(piece);
+        }
+        if !parts.is_empty() {
+            push_trimmed_text(&mut parts, &pending);
+        } else if !self.text.is_empty() || self.request_preamble.is_some() {
+            parts.push(MessageContentPart::Text { text: pending });
+        }
+        parts.extend(medias.map(image_part));
+        MessageContent::Array(parts)
+    }
+}
+
+fn push_trimmed_text(parts: &mut Vec<MessageContentPart>, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        parts.push(MessageContentPart::Text { text: text.into() });
     }
 }
 
@@ -748,9 +846,11 @@ async fn load_documents(
 
     let local_files = expand_glob_paths(&local_paths, true).await?;
     for file_path in local_files {
-        if is_image(&file_path) {
-            let contents = read_media_to_data_url(&file_path)
-                .with_context(|| format!("Unable to read media '{file_path}'"))?;
+        if is_supported_image_path(&file_path) {
+            let contents = prepare_image_file_blocking(file_path.as_str().into())
+                .await
+                .with_context(|| format!("Unable to read media '{file_path}'"))?
+                .to_data_url();
             data_urls.insert(sha256(&contents), file_path);
             medias.push(contents)
         } else {
@@ -798,29 +898,169 @@ pub fn resolve_data_url(data_urls: &HashMap<String, String>, data_url: String) -
     }
 }
 
-fn is_image(path: &str) -> bool {
-    get_patch_extension(path)
-        .map(|v| IMAGE_EXTS.contains(&v.as_str()))
-        .unwrap_or_default()
+pub fn vision_unsupported_message(model: &Model) -> String {
+    format!(
+        "The model '{}' does not accept images. Switch to a vision-capable model, or set 'supports_vision: true' on this model in your config if it does support them.",
+        model.id()
+    )
 }
 
-fn read_media_to_data_url(image_path: &str) -> Result<String> {
-    let extension = get_patch_extension(image_path).unwrap_or_default();
-    let mime_type = match extension.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        _ => bail!("Unexpected media type"),
+fn guard_medias(medias: &[String], model: &Model) -> Result<()> {
+    if medias.is_empty() {
+        return Ok(());
+    }
+    if !model.supports_vision() {
+        bail!("{}", vision_unsupported_message(model));
+    }
+    let base64_bytes: usize = medias.iter().map(|url| data_url_base64_len(url)).sum();
+    if medias.len() > MAX_REQUEST_IMAGES || base64_bytes > MAX_REQUEST_IMAGE_BASE64_BYTES {
+        const MB: f64 = 1024.0 * 1024.0;
+        bail!(
+            "This message carries {} images ({:.1} MB); the limit is {MAX_REQUEST_IMAGES} images and {} MB per request.",
+            medias.len(),
+            base64_bytes as f64 / MB,
+            MAX_REQUEST_IMAGE_BASE64_BYTES as f64 / MB
+        );
+    }
+    Ok(())
+}
+
+fn data_url_base64_len(url: &str) -> usize {
+    url.split_once(',')
+        .map_or(url.len(), |(_, data)| data.len())
+}
+
+const IMAGES_UNSUPPORTED_REASON: &str = "the current model does not accept images";
+const IMAGES_OVER_BUDGET_REASON: &str = "older image dropped to stay within the request size limit";
+
+/// The number of oldest history images still to refuse, consumed as history
+/// images are visited oldest first.
+struct ImageBudget {
+    to_drop: usize,
+}
+
+impl ImageBudget {
+    fn admit(&mut self) -> bool {
+        if self.to_drop == 0 {
+            return true;
+        }
+        self.to_drop -= 1;
+        false
+    }
+}
+
+/// Base64 sizes of the images a message carries, in the order they are sent.
+fn image_sizes(message: &Message) -> Vec<usize> {
+    match &message.content {
+        MessageContent::Array(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                MessageContentPart::ImageUrl { image_url } => {
+                    Some(data_url_base64_len(&image_url.url))
+                }
+                MessageContentPart::Text { .. } => None,
+            })
+            .collect(),
+        MessageContent::ToolCalls(tool_calls) => tool_calls
+            .tool_results
+            .iter()
+            .flat_map(|result| &result.attachments)
+            .map(|attachment| attachment.data.len())
+            .collect(),
+        MessageContent::Text(_) => vec![],
+    }
+}
+
+/// Counts every image in the request, the current message's included, and
+/// picks how many of the oldest history images go. The cut depends only on
+/// the totals, so the same history always yields the same request.
+fn oldest_history_images_to_drop(messages: &[Message], current_user: Option<usize>) -> usize {
+    let mut history = Vec::new();
+    let mut count = 0;
+    let mut bytes = 0;
+    for (idx, message) in messages.iter().enumerate() {
+        let sizes = image_sizes(message);
+        count += sizes.len();
+        bytes += sizes.iter().sum::<usize>();
+        let is_history_image_message = Some(idx) != current_user
+            && (message.role == MessageRole::User
+                || matches!(message.content, MessageContent::ToolCalls(_)));
+        if is_history_image_message {
+            history.extend(sizes);
+        }
+    }
+
+    let count_to_drop = history_images_to_drop(count);
+    let bytes_to_drop = history_image_bytes_to_drop(bytes);
+    let mut dropped = 0;
+    let mut dropped_bytes = 0;
+    for size in history {
+        if dropped >= count_to_drop && dropped_bytes >= bytes_to_drop {
+            break;
+        }
+        dropped += 1;
+        dropped_bytes += size;
+    }
+    dropped
+}
+
+/// Keeps history images within what the model and the per-request limits
+/// accept, replacing each dropped image with a short note. Over a limit, the
+/// oldest images go in blocks (see `history_images_to_drop`) so the prompt
+/// prefix providers cache does not shift on every turn. It rewrites only the
+/// outgoing copy and never fails: an error here would be written into the
+/// session as a failed turn. The current user message's images are never
+/// dropped; `guard_medias` has already checked them on their own.
+fn limit_outgoing_images(messages: &mut [Message], model: &Model, current_user: Option<usize>) {
+    let vision = model.supports_vision();
+    let reason = if vision {
+        IMAGES_OVER_BUDGET_REASON
+    } else {
+        IMAGES_UNSUPPORTED_REASON
     };
-    let mut file = File::open(image_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let mut budget = ImageBudget {
+        to_drop: if vision {
+            oldest_history_images_to_drop(messages, current_user)
+        } else {
+            usize::MAX
+        },
+    };
 
-    let encoded_image = base64_encode(buffer);
-    let data_url = format!("data:{mime_type};base64,{encoded_image}");
-
-    Ok(data_url)
+    for (idx, message) in messages.iter_mut().enumerate() {
+        if Some(idx) == current_user {
+            continue;
+        }
+        match &mut message.content {
+            MessageContent::Array(parts) if message.role == MessageRole::User => {
+                let total = parts.len();
+                parts.retain(|part| {
+                    !matches!(part, MessageContentPart::ImageUrl { .. }) || budget.admit()
+                });
+                let dropped = total - parts.len();
+                if dropped > 0 {
+                    parts.push(MessageContentPart::Text {
+                        text: format!("[{dropped} image(s) omitted: {reason}]"),
+                    });
+                }
+            }
+            MessageContent::ToolCalls(tool_calls) => {
+                for result in tool_calls.tool_results.iter_mut() {
+                    let total = result.attachments.len();
+                    result.attachments.retain(|_| budget.admit());
+                    let dropped = total - result.attachments.len();
+                    if dropped > 0 {
+                        result.output = json!({
+                            "result": result.output.take(),
+                            "images_omitted": format!(
+                                "{dropped} image(s) from this tool were omitted: {reason}"
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -830,7 +1070,7 @@ mod tests {
     use crate::config::request_context::RequestContext;
     use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
-    use crate::function::ToolCall;
+    use crate::function::{ImageAttachment, ToolCall};
     use serde_json::json;
     use std::fs;
     use std::sync::Arc;
@@ -1278,19 +1518,20 @@ mod tests {
     }
 
     #[test]
-    fn is_image_recognizes_image_extensions() {
-        assert!(is_image("photo.png"));
-        assert!(is_image("photo.jpeg"));
-        assert!(is_image("photo.jpg"));
-        assert!(is_image("photo.webp"));
-        assert!(is_image("photo.gif"));
+    fn is_supported_image_path_recognizes_image_extensions() {
+        assert!(is_supported_image_path("photo.png"));
+        assert!(is_supported_image_path("photo.jpeg"));
+        assert!(is_supported_image_path("photo.jpg"));
+        assert!(is_supported_image_path("photo.webp"));
+        assert!(is_supported_image_path("photo.gif"));
+        assert!(is_supported_image_path("PHOTO.PNG"));
     }
 
     #[test]
-    fn is_image_rejects_non_image_extensions() {
-        assert!(!is_image("file.txt"));
-        assert!(!is_image("file.rs"));
-        assert!(!is_image("file.pdf"));
+    fn is_supported_image_path_rejects_non_image_extensions() {
+        assert!(!is_supported_image_path("file.txt"));
+        assert!(!is_supported_image_path("file.rs"));
+        assert!(!is_supported_image_path("file.pdf"));
     }
 
     #[test]
@@ -1346,6 +1587,33 @@ mod tests {
     }
 
     #[test]
+    fn from_files_strips_image_slots_from_loaded_documents() {
+        let dir = env::temp_dir().join(format!(
+            "coyote-input-slot-test-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let file_path = dir.join("doc.txt");
+        fs::write(&file_path, format!("before{IMAGE_SLOT}after")).unwrap();
+
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![file_path.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap();
+
+        assert!(input.text().contains("beforeafter"));
+        assert!(!input.text().contains(IMAGE_SLOT));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn from_files_loads_multiple_files() {
         let dir = env::temp_dir().join(format!(
             "coyote-input-test-multi-{}",
@@ -1380,6 +1648,32 @@ mod tests {
         let ctx = create_test_ctx();
         let input = run_async(Input::from_files(&ctx, "just text", vec![], None)).unwrap();
         assert_eq!(input.text(), "just text");
+    }
+
+    #[test]
+    fn from_files_rejects_text_file_named_as_image() {
+        let dir = env::temp_dir().join(format!(
+            "coyote-input-test-fake-image-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let file_path = dir.join("x.png");
+        fs::write(&file_path, "not an image").unwrap();
+
+        let ctx = create_test_ctx();
+        let err = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![file_path.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains(&file_path.display().to_string()));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1901,5 +2195,662 @@ mod tests {
         input.carry_patch_from(&source);
 
         assert_eq!(input.continue_output(), Some("partial"));
+    }
+
+    fn model_with_vision(supports_vision: bool) -> Model {
+        let mut data = ModelData::new("eyes");
+        data.supports_vision = supports_vision;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn input_with_images(supports_vision: bool, medias: Vec<String>) -> Input {
+        let mut input = Input::from_str(&create_test_ctx(), "look", None).unwrap();
+        input.set_role_model(model_with_vision(supports_vision));
+        input.medias = medias;
+        input
+    }
+
+    fn png_data_url(base64_len: usize) -> String {
+        format!("data:image/png;base64,{}", "A".repeat(base64_len))
+    }
+
+    /// Text parts as their text and image parts as `image:<url>`.
+    fn part_list(content: MessageContent) -> Vec<String> {
+        let MessageContent::Array(parts) = content else {
+            panic!("expected a part list: {content:?}");
+        };
+        parts
+            .into_iter()
+            .map(|part| match part {
+                MessageContentPart::Text { text } => text,
+                MessageContentPart::ImageUrl { image_url } => format!("image:{}", image_url.url),
+            })
+            .collect()
+    }
+
+    fn input_with_text_and_images(text: &str, medias: Vec<String>) -> Input {
+        let mut input = input_with_images(true, medias);
+        input.text = text.into();
+        input
+    }
+
+    #[test]
+    fn message_content_places_each_image_at_its_slot() {
+        let (one, two) = (png_data_url(1), png_data_url(2));
+        let input = input_with_text_and_images(
+            &format!("Something here {IMAGE_SLOT} Something else {IMAGE_SLOT}"),
+            vec![one.clone(), two.clone()],
+        );
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "Something here".to_string(),
+                format!("image:{one}"),
+                "Something else".to_string(),
+                format!("image:{two}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_content_appends_images_without_a_slot() {
+        let (one, two) = (png_data_url(1), png_data_url(2));
+        let input = input_with_text_and_images(
+            &format!("see {IMAGE_SLOT} then"),
+            vec![one.clone(), two.clone()],
+        );
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "see".to_string(),
+                format!("image:{one}"),
+                "then".to_string(),
+                format!("image:{two}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_content_drops_slots_beyond_the_images() {
+        let one = png_data_url(1);
+        let input = input_with_text_and_images(
+            &format!("{IMAGE_SLOT} a{IMAGE_SLOT} here"),
+            vec![one.clone()],
+        );
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![format!("image:{one}"), "a here".to_string()]
+        );
+    }
+
+    #[test]
+    fn message_content_keeps_typed_markers_as_text() {
+        let one = png_data_url(1);
+        let input =
+            input_with_text_and_images(&format!("[Image #1] a {IMAGE_SLOT} b"), vec![one.clone()]);
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "[Image #1] a".to_string(),
+                format!("image:{one}"),
+                "b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn message_content_with_only_slots_has_no_text_parts() {
+        let one = png_data_url(1);
+        let input = input_with_text_and_images(&format!(" {IMAGE_SLOT} "), vec![one.clone()]);
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![format!("image:{one}")]
+        );
+    }
+
+    #[test]
+    fn message_content_without_images_drops_stray_slots() {
+        let input = input_with_text_and_images(&format!("a{IMAGE_SLOT}b"), vec![]);
+
+        assert!(matches!(input.message_content(), MessageContent::Text(text) if text == "ab"));
+    }
+
+    #[test]
+    fn preamble_and_retrieved_text_cannot_move_the_users_image() {
+        let one = png_data_url(1);
+        let mut input =
+            input_with_text_and_images(&format!("look {IMAGE_SLOT} here"), vec![one.clone()]);
+        input.set_request_preamble(format!("run said [Image #1] and {IMAGE_SLOT}"));
+
+        assert_eq!(
+            part_list(input.message_content()),
+            vec![
+                "run said [Image #1] and\n\nlook".to_string(),
+                format!("image:{one}"),
+                "here".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn display_shows_each_slot_as_its_marker() {
+        let one = png_data_url(1);
+        let mut input =
+            input_with_text_and_images(&format!("see {IMAGE_SLOT} now"), vec![one.clone()]);
+        input.raw = (format!("see {IMAGE_SLOT} now"), vec!["/a.png".into()]);
+
+        assert_eq!(input.summary(), "see [Image #1] now");
+        assert_eq!(input.raw(), ".file /a.png -- see [Image #1] now");
+        assert_eq!(input.raw_without_image_slots(), ".file /a.png -- see  now");
+        assert!(
+            input.render().ends_with(" -- see [Image #1] now"),
+            "{}",
+            input.render()
+        );
+    }
+
+    #[test]
+    fn display_drops_slots_past_the_images() {
+        let one = png_data_url(1);
+        let text = format!("see {IMAGE_SLOT} and {IMAGE_SLOT} now");
+        let mut input = input_with_text_and_images(&text, vec![one.clone()]);
+        input.raw = (text, vec![]);
+
+        assert_eq!(input.summary(), "see [Image #1] and  now");
+        assert_eq!(input.raw(), "see [Image #1] and  now");
+        assert!(
+            input.render().ends_with(" -- see [Image #1] and  now"),
+            "{}",
+            input.render()
+        );
+    }
+
+    #[test]
+    fn image_only_text_has_nothing_to_search() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "", None).unwrap();
+        input.text = format!("{IMAGE_SLOT} {IMAGE_SLOT}");
+        assert!(!input.has_search_text());
+        input.text = format!("{IMAGE_SLOT} what is this?");
+        assert!(input.has_search_text());
+    }
+
+    #[test]
+    fn typed_image_slots_are_stripped_at_every_constructor() {
+        let ctx = create_test_ctx();
+        let typed = format!("a{IMAGE_SLOT}b");
+
+        let from_str = Input::from_str(&ctx, &typed, None).unwrap();
+        let attached = Input::attached_with_role(&ctx, &typed, Role::new("", ""), None).unwrap();
+        let detached = Input::detached_with_role(&ctx, &typed, Role::new("", ""));
+        let from_files = run_async(Input::from_files(&ctx, &typed, vec![], None)).unwrap();
+
+        for input in [from_str, attached, detached, from_files] {
+            assert_eq!(input.text(), "ab");
+            assert_eq!(input.raw(), "ab");
+        }
+    }
+
+    #[test]
+    fn set_text_strips_image_slots() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "before", None).unwrap();
+
+        input.set_text(format!("a{IMAGE_SLOT}b"));
+
+        assert_eq!(input.text(), "ab");
+    }
+
+    #[test]
+    fn only_the_image_route_constructor_keeps_slots() {
+        let ctx = create_test_ctx();
+        let text = format!("a{IMAGE_SLOT}b");
+
+        let input = run_async(Input::from_files_with_image_slots(
+            &ctx,
+            &text,
+            vec![],
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(input.text(), text);
+    }
+
+    #[test]
+    fn a_lone_typed_slot_is_empty_input() {
+        let input = Input::from_str(&create_test_ctx(), &IMAGE_SLOT.to_string(), None).unwrap();
+
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn file_images_still_follow_the_text() {
+        let dir = env::temp_dir().join(format!(
+            "coyote-input-test-file-image-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let shot = dir.join("a.png");
+        image::DynamicImage::new_rgba8(2, 2)
+            .save_with_format(&shot, image::ImageFormat::Png)
+            .unwrap();
+        let ctx = create_test_ctx();
+
+        let input = run_async(Input::from_files(
+            &ctx,
+            "hi",
+            vec![shot.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap();
+
+        let parts = part_list(input.message_content());
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "hi");
+        assert!(parts[1].starts_with("image:data:image/png"), "{parts:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guard_images_allows_text_only_on_non_vision_model() {
+        input_with_images(false, vec![]).guard_images().unwrap();
+    }
+
+    #[test]
+    fn guard_images_refuses_images_on_non_vision_model() {
+        let err = input_with_images(false, vec![png_data_url(8)])
+            .guard_images()
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "The model 'openai:eyes' does not accept images. Switch to a vision-capable model, or set 'supports_vision: true' on this model in your config if it does support them."
+        );
+    }
+
+    #[test]
+    fn guard_images_allows_the_maximum_image_count() {
+        let medias = vec![png_data_url(8); MAX_REQUEST_IMAGES];
+        input_with_images(true, medias).guard_images().unwrap();
+    }
+
+    #[test]
+    fn guard_images_refuses_too_many_images() {
+        let medias = vec![png_data_url(8); MAX_REQUEST_IMAGES + 1];
+        let err = input_with_images(true, medias).guard_images().unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "This message carries 21 images (0.0 MB); the limit is 20 images and 20 MB per request."
+        );
+    }
+
+    #[test]
+    fn guard_images_refuses_oversized_base64_total() {
+        let half = MAX_REQUEST_IMAGE_BASE64_BYTES / 2;
+        let medias = vec![png_data_url(half), png_data_url(half + 1)];
+        let err = input_with_images(true, medias).guard_images().unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "This message carries 2 images (20.0 MB); the limit is 20 images and 20 MB per request."
+        );
+    }
+
+    #[test]
+    fn prepare_completion_data_refuses_images_for_a_non_vision_model() {
+        let input = input_with_images(true, vec![png_data_url(8)]);
+
+        let err = input
+            .prepare_completion_data(&model_with_vision(false), false)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("does not accept images"), "{err}");
+    }
+
+    const OVER_BUDGET_NOTE: &str = "older image dropped to stay within the request size limit";
+
+    fn image_part(base64_len: usize) -> MessageContentPart {
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: png_data_url(base64_len),
+            },
+        }
+    }
+
+    fn user_images(count: usize, base64_len: usize) -> Message {
+        let mut parts = vec![MessageContentPart::Text {
+            text: "see these".into(),
+        }];
+        parts.extend((0..count).map(|_| image_part(base64_len)));
+        Message::new(MessageRole::User, MessageContent::Array(parts))
+    }
+
+    fn attachment(source: &str, base64_len: usize) -> ImageAttachment {
+        ImageAttachment {
+            source: source.into(),
+            mime_type: "image/png".into(),
+            data: "A".repeat(base64_len),
+        }
+    }
+
+    /// One tool result per entry of `per_result`, each carrying that many
+    /// attachments labelled `<label>-<result>-<index>`.
+    fn tool_images(
+        label: &str,
+        per_result: &[usize],
+        base64_len: usize,
+    ) -> MessageContentToolCalls {
+        let results = per_result
+            .iter()
+            .enumerate()
+            .map(|(r, &count)| {
+                ToolResult::new(
+                    ToolCall::new("fs_read".into(), json!({}), Some(format!("{label}-{r}"))),
+                    json!("read"),
+                )
+                .with_attachments(
+                    (0..count)
+                        .map(|i| attachment(&format!("{label}-{r}-{i}"), base64_len))
+                        .collect(),
+                )
+            })
+            .collect();
+        MessageContentToolCalls::new(results, String::new())
+    }
+
+    fn tool_message(tool_calls: MessageContentToolCalls) -> Message {
+        Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(tool_calls),
+        )
+    }
+
+    fn text_message(text: &str) -> Message {
+        Message::new(MessageRole::User, MessageContent::Text(text.into()))
+    }
+
+    fn image_count(message: &Message) -> usize {
+        match &message.content {
+            MessageContent::Array(parts) => parts
+                .iter()
+                .filter(|part| matches!(part, MessageContentPart::ImageUrl { .. }))
+                .count(),
+            MessageContent::ToolCalls(tool_calls) => tool_calls
+                .tool_results
+                .iter()
+                .map(|result| result.attachments.len())
+                .sum(),
+            MessageContent::Text(_) => 0,
+        }
+    }
+
+    fn last_text_part(message: &Message) -> &str {
+        match &message.content {
+            MessageContent::Array(parts) => match parts.last() {
+                Some(MessageContentPart::Text { text }) => text,
+                other => panic!("last part is not text: {other:?}"),
+            },
+            other => panic!("not a part list: {other:?}"),
+        }
+    }
+
+    fn tool_results(message: &Message) -> &[ToolResult] {
+        match &message.content {
+            MessageContent::ToolCalls(tool_calls) => &tool_calls.tool_results,
+            other => panic!("not a tool message: {other:?}"),
+        }
+    }
+
+    fn as_json(messages: &[Message]) -> serde_json::Value {
+        serde_json::to_value(messages).unwrap()
+    }
+
+    #[test]
+    fn limit_outgoing_images_drops_the_oldest_ten_of_twenty_five() {
+        let mut messages = vec![
+            user_images(3, 8),
+            tool_message(tool_images("b", &[4], 8)),
+            user_images(8, 8),
+            tool_message(tool_images("d", &[5, 5], 8)),
+            text_message("and now?"),
+        ];
+        let stored = messages.clone();
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(4));
+
+        assert_eq!(image_count(&messages[0]), 0);
+        assert_eq!(
+            last_text_part(&messages[0]),
+            format!("[3 image(s) omitted: {OVER_BUDGET_NOTE}]")
+        );
+        let emptied = &tool_results(&messages[1])[0];
+        assert!(emptied.attachments.is_empty());
+        assert_eq!(
+            emptied.output,
+            json!({
+                "result": "read",
+                "images_omitted": format!("4 image(s) from this tool were omitted: {OVER_BUDGET_NOTE}"),
+            })
+        );
+        assert_eq!(image_count(&messages[2]), 5);
+        assert_eq!(
+            last_text_part(&messages[2]),
+            format!("[3 image(s) omitted: {OVER_BUDGET_NOTE}]")
+        );
+        assert_eq!(as_json(&messages[3..]), as_json(&stored[3..]));
+        assert_eq!(messages.iter().map(image_count).sum::<usize>(), 15);
+    }
+
+    /// `n` user turns carrying one image each, then a text-only current turn.
+    fn image_turns(n: usize, base64_len: usize) -> Vec<Message> {
+        let mut messages: Vec<_> = (0..n)
+            .map(|i| {
+                Message::new(
+                    MessageRole::User,
+                    MessageContent::Array(vec![
+                        MessageContentPart::Text {
+                            text: format!("turn {i}"),
+                        },
+                        image_part(base64_len),
+                    ]),
+                )
+            })
+            .collect();
+        messages.push(text_message("and now?"));
+        messages
+    }
+
+    fn dropped_turns(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .take_while(|message| {
+                matches!(&message.content, MessageContent::Array(_)) && image_count(message) == 0
+            })
+            .count()
+    }
+
+    #[test]
+    fn limit_outgoing_images_drops_the_oldest_in_blocks_of_ten() {
+        for (n, expected_dropped) in [(20, 0), (21, 10), (25, 10), (30, 10), (31, 20)] {
+            let mut messages = image_turns(n, 8);
+
+            limit_outgoing_images(&mut messages, &model_with_vision(true), Some(n));
+
+            assert_eq!(dropped_turns(&messages), expected_dropped, "n = {n}");
+            assert_eq!(
+                messages.iter().map(image_count).sum::<usize>(),
+                n - expected_dropped,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_outgoing_images_keeps_the_prefix_stable_as_images_are_added() {
+        let mut fewer = image_turns(21, 8);
+        let mut more = image_turns(22, 8);
+
+        limit_outgoing_images(&mut fewer, &model_with_vision(true), Some(21));
+        limit_outgoing_images(&mut more, &model_with_vision(true), Some(22));
+
+        assert_eq!(image_count(&fewer[10]), 1);
+        assert_eq!(
+            serde_json::to_string(&fewer[..11]).unwrap(),
+            serde_json::to_string(&more[..11]).unwrap()
+        );
+    }
+
+    #[test]
+    fn limit_outgoing_images_drops_the_oldest_in_byte_blocks() {
+        let two_mb = 2 * 1024 * 1024;
+        for (n, expected_dropped) in [(10, 0), (11, 5), (15, 5), (16, 10)] {
+            let mut messages = image_turns(n, two_mb);
+
+            limit_outgoing_images(&mut messages, &model_with_vision(true), Some(n));
+
+            assert_eq!(dropped_turns(&messages), expected_dropped, "n = {n}");
+            assert_eq!(
+                messages.iter().map(image_count).sum::<usize>(),
+                n - expected_dropped,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_outgoing_images_counts_interleaved_parts_in_order() {
+        let interleaved = Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![
+                image_part(8),
+                MessageContentPart::Text {
+                    text: "between".into(),
+                },
+                image_part(8),
+                image_part(8),
+            ]),
+        );
+        let mut messages = vec![
+            user_images(9, 8),
+            interleaved,
+            user_images(9, 8),
+            text_message("and now?"),
+        ];
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(3));
+
+        assert_eq!(image_count(&messages[0]), 0);
+        let MessageContent::Array(parts) = &messages[1].content else {
+            panic!("{:?}", messages[1].content);
+        };
+        let shape: Vec<_> = parts
+            .iter()
+            .map(|part| match part {
+                MessageContentPart::Text { text } => text.as_str(),
+                MessageContentPart::ImageUrl { .. } => "image",
+            })
+            .collect();
+        let note = format!("[1 image(s) omitted: {OVER_BUDGET_NOTE}]");
+        assert_eq!(shape, ["between", "image", "image", note.as_str()]);
+        assert_eq!(image_count(&messages[2]), 9);
+    }
+
+    #[test]
+    fn limit_outgoing_images_within_budget_leaves_messages_unchanged() {
+        let mut messages = vec![
+            user_images(2, 64),
+            tool_message(tool_images("b", &[2, 1], 64)),
+            user_images(1, 64),
+        ];
+        let stored = messages.clone();
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(2));
+
+        assert_eq!(as_json(&messages), as_json(&stored));
+    }
+
+    #[test]
+    fn limit_outgoing_images_strips_every_history_image_for_a_non_vision_model() {
+        let image_only = Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![image_part(8), image_part(8)]),
+        );
+        let mut messages = vec![
+            image_only,
+            tool_message(tool_images("b", &[1], 8)),
+            text_message("and now?"),
+        ];
+
+        limit_outgoing_images(&mut messages, &model_with_vision(false), Some(2));
+
+        let MessageContent::Array(parts) = &messages[0].content else {
+            panic!("{:?}", messages[0].content);
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            last_text_part(&messages[0]),
+            "[2 image(s) omitted: the current model does not accept images]"
+        );
+        let result = &tool_results(&messages[1])[0];
+        assert!(result.attachments.is_empty());
+        assert_eq!(
+            result.output,
+            json!({
+                "result": "read",
+                "images_omitted": "1 image(s) from this tool were omitted: the current model does not accept images",
+            })
+        );
+    }
+
+    #[test]
+    fn limit_outgoing_images_never_drops_the_current_message_images() {
+        let mut messages = vec![
+            tool_message(tool_images("b", &[1], 8)),
+            user_images(MAX_REQUEST_IMAGES, 8),
+        ];
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(1));
+
+        assert_eq!(image_count(&messages[0]), 0);
+        assert_eq!(image_count(&messages[1]), MAX_REQUEST_IMAGES);
+    }
+
+    #[test]
+    fn limit_outgoing_images_keeps_the_current_message_images_when_history_overflows() {
+        let mut messages = image_turns(25, 8);
+        messages.pop();
+        messages.push(user_images(5, 8));
+
+        limit_outgoing_images(&mut messages, &model_with_vision(true), Some(25));
+
+        assert_eq!(dropped_turns(&messages), 10);
+        assert_eq!(image_count(&messages[25]), 5);
+    }
+
+    #[test]
+    fn prepare_completion_data_strips_tool_attachments_for_a_non_vision_model() {
+        let mut input = input_with_images(false, vec![]);
+        input.tool_calls = Some(tool_images("b", &[1], 8));
+        let stored = serde_json::to_value(&input.tool_calls).unwrap();
+
+        let data = input
+            .prepare_completion_data(&model_with_vision(false), false)
+            .unwrap();
+
+        let result = &tool_results(data.messages.last().unwrap())[0];
+        assert!(result.attachments.is_empty());
+        assert_eq!(result.output["result"], json!("read"));
+        assert!(result.output["images_omitted"].is_string());
+        assert_eq!(serde_json::to_value(&input.tool_calls).unwrap(), stored);
     }
 }

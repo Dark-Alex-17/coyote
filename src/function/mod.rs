@@ -28,6 +28,7 @@ use crate::mcp::{
 };
 use crate::parsers::{bash, python, typescript};
 use crate::supervisor::notification::{Channel, SystemNotification};
+use crate::utils::fs::TempFileGuard;
 use agents::AGENT_FUNCTION_PREFIX;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future;
@@ -518,29 +519,34 @@ pub async fn eval_tool_calls(
         let futs: Vec<_> = mcp_calls
             .into_iter()
             .map(|(idx, call)| async move {
-                let result = call.eval_mcp(ctx_ref).await;
+                let result = call.eval_mcp_output(ctx_ref).await;
                 (idx, call, result)
             })
             .collect();
         for (idx, call, result) in future::join_all(futs).await {
-            let value = match result {
-                Ok(v) => normalize_tool_result(v),
-                Err(e) => json!({"tool_call_error": format!("{e}")}),
+            let result = match result {
+                Ok(out) => ToolResult::new(call, normalize_tool_result(out.value))
+                    .with_attachments(out.attachments),
+                Err(e) => ToolResult::new(call, json!({"tool_call_error": format!("{e}")})),
             };
-            indexed_results.push((idx, ToolResult::new(call, value)));
+            indexed_results.push((idx, result));
         }
     }
 
     for (idx, call) in sequential_calls {
-        let value = match call.eval(ctx).await {
-            Ok(v) => normalize_tool_result(v),
-            Err(e) => json!({
-                "tool_call_error": format!(
-                    "{e}. This tool is not available or the call failed; use only tools listed in your catalog."
-                )
-            }),
+        let result = match call.eval_output(ctx).await {
+            Ok(out) => ToolResult::new(call, normalize_tool_result(out.value))
+                .with_attachments(out.attachments),
+            Err(e) => ToolResult::new(
+                call,
+                json!({
+                    "tool_call_error": format!(
+                        "{e}. This tool is not available or the call failed; use only tools listed in your catalog."
+                    )
+                }),
+            ),
         };
-        indexed_results.push((idx, ToolResult::new(call, value)));
+        indexed_results.push((idx, result));
     }
 
     indexed_results.sort_unstable_by_key(|(idx, _)| *idx);
@@ -693,6 +699,8 @@ pub struct ToolResult {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thinking: Vec<ThinkingBlock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ImageAttachment>,
 }
 
 impl ToolResult {
@@ -702,7 +710,13 @@ impl ToolResult {
             output,
             text: None,
             thinking: vec![],
+            attachments: vec![],
         }
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<ImageAttachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     pub fn truncate_if_needed(mut self, max_chars: usize) -> Self {
@@ -719,6 +733,44 @@ impl ToolResult {
             ));
         }
         self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ImageAttachment {
+    /// Display label for the image: an absolute path or `mcp:<server>`.
+    pub source: String,
+    pub mime_type: String,
+    /// Base64 payload without the `data:` URL prefix.
+    pub data: String,
+}
+
+impl ImageAttachment {
+    pub fn from_prepared(source: impl Into<String>, image: &PreparedImage) -> Self {
+        Self {
+            source: source.into(),
+            mime_type: image.mime_type.clone(),
+            data: image.base64_data.clone(),
+        }
+    }
+
+    pub fn to_data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime_type, self.data)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    pub value: Value,
+    pub attachments: Vec<ImageAttachment>,
+}
+
+impl From<Value> for ToolOutput {
+    fn from(value: Value) -> Self {
+        Self {
+            value,
+            attachments: vec![],
+        }
     }
 }
 
@@ -1806,7 +1858,12 @@ impl ToolCall {
         }
     }
 
+    #[cfg(test)]
     async fn eval_mcp(&self, ctx: &RequestContext) -> Result<Value> {
+        self.eval_mcp_output(ctx).await.map(|out| out.value)
+    }
+
+    async fn eval_mcp_output(&self, ctx: &RequestContext) -> Result<ToolOutput> {
         if let Some(agent) = ctx.agent.as_ref().filter(|agent| agent.is_builtin()) {
             warn!(
                 "Built-in agent {} asked for MCP tool {}, which it may not call",
@@ -1860,18 +1917,23 @@ impl ToolCall {
                     json!({"tool_call_error": error_msg})
                 })
         } else {
-            Self::invoke_mcp_tool(ctx, cmd_name, &json_data)
+            return Ok(Self::invoke_mcp_tool(ctx, cmd_name, &json_data)
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP tool invocation failed: {e}");
                     emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
-                    json!({"tool_call_error": error_msg})
-                })
+                    ToolOutput::from(json!({"tool_call_error": error_msg}))
+                }));
         };
-        Ok(result)
+        Ok(ToolOutput::from(result))
     }
 
+    #[cfg(test)]
     pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
+        self.eval_output(ctx).await.map(|out| out.value)
+    }
+
+    pub async fn eval_output(&self, ctx: &mut RequestContext) -> Result<ToolOutput> {
         let result = self.eval_inner(ctx).await;
         if let Err(err) = &result {
             // A bail before the tool ran (unknown tool, bad arguments) never
@@ -1891,7 +1953,7 @@ impl ToolCall {
         result
     }
 
-    async fn eval_inner(&self, ctx: &mut RequestContext) -> Result<Value> {
+    async fn eval_inner(&self, ctx: &mut RequestContext) -> Result<ToolOutput> {
         let agent = ctx.agent.clone();
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
@@ -1941,6 +2003,8 @@ impl ToolCall {
         info!("Tool call '{}' started", self.name);
         let tool_started_at = Instant::now();
 
+        let vision = ctx.current_model().supports_vision();
+        let mut attachments: Vec<ImageAttachment> = vec![];
         let output = match cmd_name.as_str() {
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
                 Self::search_mcp_tools(ctx, &cmd_name, &json_data)
@@ -1979,13 +2043,17 @@ impl ToolCall {
                     })
             }
             _ if cmd_name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX) => {
-                Self::invoke_mcp_tool(ctx, &cmd_name, &json_data)
-                    .await
-                    .unwrap_or_else(|e| {
+                match Self::invoke_mcp_tool(ctx, &cmd_name, &json_data).await {
+                    Ok(out) => {
+                        attachments = out.attachments;
+                        out.value
+                    }
+                    Err(e) => {
                         let error_msg = format!("MCP tool invocation failed: {e}");
                         emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                         json!({"tool_call_error": error_msg})
-                    })
+                    }
+                }
             }
             _ if cmd_name.starts_with(TODO_FUNCTION_PREFIX) => {
                 todo::handle_todo_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
@@ -2066,10 +2134,26 @@ impl ToolCall {
                 quiet,
                 ctx.session_abort.clone(),
             ) {
-                Ok(Some(contents)) => serde_json::from_str(&contents)
-                    .ok()
-                    .unwrap_or_else(|| json!({"output": contents})),
-                Ok(None) => Value::Null,
+                Ok(run) => {
+                    let value = match run.output {
+                        Some(contents) => serde_json::from_str(&contents)
+                            .ok()
+                            .unwrap_or_else(|| json!({"output": contents})),
+                        None => Value::Null,
+                    };
+                    if run.attachment_paths.is_empty() && run.dropped_attachments == 0 {
+                        value
+                    } else {
+                        let (images, attached_images, notes) = resolve_script_attachments(
+                            run.attachment_paths,
+                            run.dropped_attachments,
+                            vision,
+                        )
+                        .await;
+                        attachments = images;
+                        merge_attachment_report(value, attached_images, notes)
+                    }
+                }
                 Err(e) => serde_json::from_str(&e.to_string())
                     .ok()
                     .unwrap_or_else(|| json!({"output": e.to_string()})),
@@ -2118,7 +2202,10 @@ impl ToolCall {
             }
         }
 
-        Ok(output)
+        Ok(ToolOutput {
+            value: output,
+            attachments,
+        })
     }
 
     async fn describe_mcp_tool(
@@ -2179,7 +2266,7 @@ impl ToolCall {
         ctx: &RequestContext,
         cmd_name: &str,
         json_data: &Value,
-    ) -> Result<Value> {
+    ) -> Result<ToolOutput> {
         let server = cmd_name.replace(&format!("{MCP_INVOKE_META_FUNCTION_NAME_PREFIX}_"), "");
         let tool = json_data
             .get("tool")
@@ -2191,12 +2278,19 @@ impl ToolCall {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        let attach_images = ctx.current_model().supports_vision();
         let result = ctx
             .tool_scope
             .mcp_runtime
             .invoke(&server, tool, arguments)
             .await?;
-        render_tool_result(serde_json::to_value(result)?, &server)
+        let result = serde_json::to_value(result)?;
+        let (value, attachments) = tokio::task::spawn_blocking(move || {
+            render_tool_result_with_images(result, &server, attach_images)
+        })
+        .await
+        .map_err(|err| anyhow!("Unable to render tool result: {err}"))??;
+        Ok(ToolOutput { value, attachments })
     }
 
     async fn read_mcp_resource(
@@ -2567,13 +2661,27 @@ fn emit_tool_warning(quiet: bool, display: &str, plain: &str) {
 /// base64 blob content is routed through the blob renderer instead of
 /// reaching model context, and oversized structured content is replaced with
 /// a truncation marker. In-bounds results pass through unchanged.
-fn render_tool_result(mut result: Value, server: &str) -> Result<Value> {
+fn render_tool_result(result: Value, server: &str) -> Result<Value> {
+    render_tool_result_with_images(result, server, false).map(|(value, _)| value)
+}
+
+/// Like [`render_tool_result`], but when `attach_images` is set, decodable
+/// `image` items (up to [`MAX_ATTACHMENTS_PER_TOOL_RESULT`]) become
+/// attachments built from their inline bytes only, never from a server-supplied
+/// path or URI. Images that cannot be attached spill as usual.
+fn render_tool_result_with_images(
+    mut result: Value,
+    server: &str,
+    attach_images: bool,
+) -> Result<(Value, Vec<ImageAttachment>)> {
+    let mut attachments = vec![];
     let Some(map) = result.as_object_mut() else {
-        return Ok(result);
+        return Ok((result, attachments));
     };
     if let Some(items) = map.get_mut("content").and_then(Value::as_array_mut) {
         for item in items {
-            render_tool_content_item(item, server)?;
+            let attachments = attach_images.then_some(&mut attachments);
+            render_tool_content_item(item, server, attachments)?;
         }
     }
     let oversized_structured = map
@@ -2594,18 +2702,30 @@ fn render_tool_result(mut result: Value, server: &str) -> Result<Value> {
         );
     }
 
-    Ok(result)
+    Ok((result, attachments))
 }
 
-fn render_tool_content_item(item: &mut Value, server: &str) -> Result<()> {
+fn render_tool_content_item(
+    item: &mut Value,
+    server: &str,
+    attachments: Option<&mut Vec<ImageAttachment>>,
+) -> Result<()> {
     match item.get("type").and_then(Value::as_str) {
         Some("text") => clamp_tool_text(item),
-        Some("image") | Some("audio") => {
+        Some(kind @ ("image" | "audio")) => {
             let mime_type = item
                 .get("mimeType")
                 .and_then(Value::as_str)
                 .map(render::clamp_metadata);
             if let Some(data) = item.get("data").and_then(Value::as_str) {
+                if kind == "image"
+                    && let Some(attachments) = attachments
+                    && attachments.len() < MAX_ATTACHMENTS_PER_TOOL_RESULT
+                    && let Some(placeholder) = attach_inline_image(data, server, attachments)
+                {
+                    *item = placeholder;
+                    return Ok(());
+                }
                 let replacement = render_tool_blob(data, mime_type, None, server)?;
                 *item = replacement;
             }
@@ -2635,6 +2755,29 @@ fn render_tool_content_item(item: &mut Value, server: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Returns the placeholder that replaces the item, or `None` when the bytes
+/// are not a usable image and the item should spill instead.
+fn attach_inline_image(
+    b64: &str,
+    server: &str,
+    attachments: &mut Vec<ImageAttachment>,
+) -> Option<Value> {
+    let bytes = render::decode_base64_bounded(b64).ok()?;
+    let prepared = prepare_image_bytes(&bytes).ok()?;
+    attachments.push(ImageAttachment::from_prepared(
+        format!("mcp:{server}"),
+        &prepared,
+    ));
+    Some(json!({
+        "type": "image",
+        "attached": true,
+        "mime_type": prepared.mime_type,
+        "width": prepared.width,
+        "height": prepared.height,
+        "resized_from": prepared.original_size.map(|(w, h)| json!([w, h])),
+    }))
 }
 
 fn render_tool_blob(
@@ -2766,6 +2909,136 @@ pub(crate) fn builtin_agent_launch(
     )))
 }
 
+pub const MAX_ATTACHMENTS_PER_TOOL_RESULT: usize = 5;
+
+const ATTACHMENTS_FILE_MAX_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Default)]
+pub struct ScriptRunOutput {
+    pub output: Option<String>,
+    /// Paths the script appended to `LLM_ATTACHMENTS`, as written (possibly
+    /// relative), capped at [`MAX_ATTACHMENTS_PER_TOOL_RESULT`].
+    pub attachment_paths: Vec<PathBuf>,
+    pub dropped_attachments: usize,
+}
+
+impl ScriptRunOutput {
+    fn failed(payload: Value) -> Self {
+        Self {
+            output: Some(payload.to_string()),
+            ..Default::default()
+        }
+    }
+}
+
+/// Lines are decoded one at a time so a single non-UTF-8 line cannot hide
+/// the paths around it. Reading stops one path past the cap, so the dropped
+/// count is 1 whenever any path was dropped.
+fn read_attachment_paths(path: &Path) -> (Vec<PathBuf>, usize) {
+    let Ok(file) = File::open(path) else {
+        return (vec![], 0);
+    };
+    let reader = io::BufReader::new(file.take(ATTACHMENTS_FILE_MAX_BYTES));
+    let mut paths = vec![];
+    let mut dropped = 0;
+    for line in io::BufRead::split(reader, b'\n') {
+        let Ok(line) = line else {
+            break;
+        };
+        let line = String::from_utf8_lossy(&line);
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if paths.len() < MAX_ATTACHMENTS_PER_TOOL_RESULT {
+            paths.push(PathBuf::from(line));
+        } else {
+            dropped += 1;
+        }
+    }
+    (paths, dropped)
+}
+
+const NON_VISION_IMAGE_NOTE: &str = "the current model does not accept images; ask the user to describe the image or switch to a vision-capable model";
+
+/// Returns the attachments, one `attached_images` entry per attachment, and
+/// a note for every path that was refused or ignored.
+async fn resolve_script_attachments(
+    paths: Vec<PathBuf>,
+    dropped: usize,
+    vision: bool,
+) -> (Vec<ImageAttachment>, Vec<Value>, Vec<String>) {
+    let mut attachments = vec![];
+    let mut attached_images = vec![];
+    let mut notes = vec![];
+    // Scripts inherit coyote's cwd, so their relative paths resolve the same way.
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
+        .collect();
+    if !vision {
+        notes.extend(
+            paths
+                .iter()
+                .map(|path| format!("{}: {NON_VISION_IMAGE_NOTE}", path.display())),
+        );
+    } else {
+        let prepared = tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let image = prepare_image_file(&path);
+                    (path, image)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        match prepared {
+            Ok(prepared) => {
+                for (path, image) in prepared {
+                    match image {
+                        Ok(image) => {
+                            attachments.push(ImageAttachment::from_prepared(
+                                path.display().to_string(),
+                                &image,
+                            ));
+                            attached_images.push(json!({
+                                "path": path.display().to_string(),
+                                "width": image.width,
+                                "height": image.height,
+                                "resized_from": image.original_size.map(|(w, h)| json!([w, h])),
+                            }));
+                        }
+                        Err(err) => notes.push(format!("{}: {err:#}", path.display())),
+                    }
+                }
+            }
+            Err(err) => notes.push(format!("Unable to prepare image attachments: {err}")),
+        }
+    }
+    if dropped > 0 {
+        notes.push(format!(
+            "{dropped} more image path(s) ignored: at most {MAX_ATTACHMENTS_PER_TOOL_RESULT} images per tool result"
+        ));
+    }
+    (attachments, attached_images, notes)
+}
+
+fn merge_attachment_report(value: Value, attached_images: Vec<Value>, notes: Vec<String>) -> Value {
+    let mut object = match value {
+        Value::Object(object) => object,
+        Value::Null => serde_json::Map::new(),
+        other => serde_json::Map::from_iter([("output".to_string(), other)]),
+    };
+    if !attached_images.is_empty() {
+        object.insert("attached_images".into(), json!(attached_images));
+    }
+    if !notes.is_empty() {
+        object.insert("image_notes".into(), json!(notes));
+    }
+    Value::Object(object)
+}
+
 pub fn run_llm_function(
     cmd_name: String,
     cmd_args: Vec<String>,
@@ -2774,7 +3047,7 @@ pub fn run_llm_function(
     tool_timeout: Option<u64>,
     quiet: bool,
     abort: Option<AbortSignal>,
-) -> Result<Option<String>> {
+) -> Result<ScriptRunOutput> {
     let mut bin_dirs: Vec<PathBuf> = vec![];
     let mut command_name = cmd_name.clone();
     let hermetic = is_builtin_agent(agent_name.as_deref());
@@ -2804,6 +3077,16 @@ pub fn run_llm_function(
 
     let tmp_file = temp_file("-eval-", "");
     envs.insert("LLM_OUTPUT".into(), tmp_file.display().to_string());
+    let attachments_file = temp_file("-attachments-", "");
+    // Command env entries win over the inherited environment, so a script run
+    // from inside another script tool never appends to its parent's file.
+    envs.insert(
+        "LLM_ATTACHMENTS".into(),
+        attachments_file.display().to_string(),
+    );
+    let _temp_files = TempFileGuard::new(vec![tmp_file.clone(), attachments_file.clone()]);
+    #[cfg(windows)]
+    let mut _temp_files = _temp_files;
 
     #[cfg(windows)]
     let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
@@ -2813,6 +3096,7 @@ pub fn run_llm_function(
         let mut args = cmd_args;
         if let Some(json_data) = args.pop() {
             let tool_data_file = temp_file("-tool-data-", ".json");
+            _temp_files.push(tool_data_file.clone());
             fs::write(&tool_data_file, &json_data)?;
             envs.insert(
                 "LLM_TOOL_DATA_FILE".into(),
@@ -2953,7 +3237,7 @@ pub fn run_llm_function(
 
             debug!("Tool call error: {error_json:?}");
 
-            return Ok(Some(error_json.to_string()));
+            return Ok(ScriptRunOutput::failed(error_json));
         }
         if abort.as_ref().is_some_and(|a| a.aborted()) {
             debug!(
@@ -2970,8 +3254,8 @@ pub fn run_llm_function(
                 &format!("⚠️ {tool_error_message} ⚠️"),
                 &tool_error_message,
             );
-            return Ok(Some(
-                json!({"tool_call_error": tool_error_message}).to_string(),
+            return Ok(ScriptRunOutput::failed(
+                json!({"tool_call_error": tool_error_message}),
             ));
         }
         thread::sleep(Duration::from_millis(100));
@@ -3002,18 +3286,23 @@ pub fn run_llm_function(
             error_json["output"] = json!(contents);
         }
         debug!("Tool call error: {error_json:?}");
-        return Ok(Some(error_json.to_string()));
+        return Ok(ScriptRunOutput::failed(error_json));
     }
     let mut output = None;
     if tmp_file.exists() {
         let contents =
-            fs::read_to_string(tmp_file).context("Failed to retrieve tool call output")?;
+            fs::read_to_string(&tmp_file).context("Failed to retrieve tool call output")?;
         if !contents.is_empty() {
             debug!("Tool {command_name} output: {}", contents);
             output = Some(contents);
         }
     };
-    Ok(output)
+    let (attachment_paths, dropped_attachments) = read_attachment_paths(&attachments_file);
+    Ok(ScriptRunOutput {
+        output,
+        attachment_paths,
+        dropped_attachments,
+    })
 }
 
 #[cfg(windows)]
@@ -5058,6 +5347,152 @@ mod tests {
         assert_eq!(resource["text"], "hi");
     }
 
+    fn png_base64(width: u32, height: u32) -> String {
+        let mut bytes = std::io::Cursor::new(vec![]);
+        image::RgbaImage::new(width, height)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        STANDARD.encode(bytes.into_inner())
+    }
+
+    fn image_result(b64: &str, count: usize) -> Value {
+        let items = (0..count)
+            .map(|_| ContentBlock::image(b64.to_string(), "image/png"))
+            .collect();
+        serde_json::to_value(CallToolResult::success(items)).unwrap()
+    }
+
+    #[test]
+    fn render_tool_result_attaches_inline_png_when_attaching() {
+        let b64 = png_base64(3, 2);
+
+        let (value, attachments) =
+            render_tool_result_with_images(image_result(&b64, 1), "srv", true).unwrap();
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].source, "mcp:srv");
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(
+            value["content"][0],
+            json!({
+                "type": "image",
+                "attached": true,
+                "mime_type": "image/png",
+                "width": 3,
+                "height": 2,
+                "resized_from": null,
+            })
+        );
+        assert!(!value.to_string().contains(&b64));
+    }
+
+    #[test]
+    #[serial]
+    fn render_tool_result_without_attaching_matches_job_path() {
+        let _guard = crate::testing::TestConfigDirGuard::new("tool-result-no-attach");
+        let result = image_result(&png_base64(2, 2), 1);
+
+        let (value, attachments) =
+            render_tool_result_with_images(result.clone(), "srv", false).unwrap();
+
+        assert!(attachments.is_empty());
+        assert_eq!(value["content"][0]["spilled"], true);
+        assert_eq!(value, render_tool_result(result, "srv").unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn render_tool_result_job_path_never_attaches_png() {
+        let _guard = crate::testing::TestConfigDirGuard::new("tool-result-job-path");
+        let b64 = png_base64(2, 2);
+
+        let value = render_tool_result(image_result(&b64, 1), "srv").unwrap();
+
+        let item = &value["content"][0];
+        assert_eq!(item["spilled"], true);
+        assert!(item.get("attached").is_none());
+        assert!(!value.to_string().contains(&b64));
+    }
+
+    #[test]
+    #[serial]
+    fn render_tool_result_spills_audio_and_resource_blobs_when_attaching() {
+        let _guard = crate::testing::TestConfigDirGuard::new("tool-result-audio");
+        let b64 = png_base64(2, 2);
+        let result = json!({
+            "content": [
+                {"type": "audio", "data": b64, "mimeType": "audio/wav"},
+                {"type": "resource", "resource": {
+                    "uri": "file:///pic.png", "mimeType": "image/png", "blob": b64,
+                }},
+            ],
+        });
+
+        let (value, attachments) =
+            render_tool_result_with_images(result.clone(), "srv", true).unwrap();
+
+        assert!(attachments.is_empty());
+        assert_eq!(value["content"][0]["spilled"], true);
+        assert_eq!(value["content"][1]["spilled"], true);
+        assert_eq!(value, render_tool_result(result, "srv").unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn render_tool_result_degrades_corrupt_image_data_when_attaching() {
+        let _guard = crate::testing::TestConfigDirGuard::new("tool-result-corrupt");
+        let not_an_image = STANDARD.encode(FIXTURE_BLOB_BYTES);
+        let result = json!({
+            "content": [
+                {"type": "image", "data": "!!!not base64!!!", "mimeType": "image/png"},
+                {"type": "image", "data": not_an_image, "mimeType": "image/png"},
+            ],
+        });
+
+        let (value, attachments) =
+            render_tool_result_with_images(result.clone(), "srv", true).unwrap();
+
+        assert!(attachments.is_empty());
+        let error = value["content"][0]["error"].as_str().unwrap();
+        assert!(error.contains("base64"), "{error}");
+        assert_eq!(value["content"][1]["spilled"], true);
+        assert_eq!(value, render_tool_result(result, "srv").unwrap());
+    }
+
+    #[test]
+    fn render_tool_result_never_attaches_from_path_or_uri() {
+        let item = json!({
+            "type": "image",
+            "mimeType": "image/png",
+            "path": "/etc/passwd",
+            "uri": "file:///etc/passwd",
+        });
+        let result = json!({"content": [item.clone()]});
+
+        let (value, attachments) = render_tool_result_with_images(result, "srv", true).unwrap();
+
+        assert!(attachments.is_empty());
+        assert_eq!(value["content"][0], item);
+    }
+
+    #[test]
+    #[serial]
+    fn render_tool_result_attaches_at_most_the_cap_and_spills_the_rest() {
+        let _guard = crate::testing::TestConfigDirGuard::new("tool-result-cap");
+        let count = MAX_ATTACHMENTS_PER_TOOL_RESULT + 1;
+
+        let (value, attachments) =
+            render_tool_result_with_images(image_result(&png_base64(2, 2), count), "srv", true)
+                .unwrap();
+
+        assert_eq!(attachments.len(), MAX_ATTACHMENTS_PER_TOOL_RESULT);
+        let items = value["content"].as_array().unwrap();
+        for item in &items[..MAX_ATTACHMENTS_PER_TOOL_RESULT] {
+            assert_eq!(item["attached"], true);
+        }
+        assert_eq!(items[MAX_ATTACHMENTS_PER_TOOL_RESULT]["spilled"], true);
+    }
+
     #[test]
     fn render_resource_content_clamps_metadata_strings() {
         let uri = format!("file:///{}", "u".repeat(render::METADATA_MAX_BYTES));
@@ -5105,6 +5540,100 @@ mod tests {
         assert_eq!(output["structuredContent"], json!({"ok": true}));
         assert_eq!(output["isError"], false);
         assert_eq!(call_tool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn image_fixture(b64: &str) -> FixtureServer {
+        FixtureServer {
+            tool_result: Some(CallToolResult::success(vec![ContentBlock::image(
+                b64.to_string(),
+                "image/png",
+            )])),
+            ..Default::default()
+        }
+    }
+
+    fn mcp_ctx(runtime: crate::config::McpRuntime, supports_vision: bool) -> RequestContext {
+        use crate::client::{Model, ModelData};
+
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.mcp_runtime = runtime;
+        let mut data = ModelData::new("eyes");
+        data.supports_vision = supports_vision;
+        ctx.model = Model::from_config("openai", &[data]).remove(0);
+        ctx
+    }
+
+    fn assert_png_attached(output: &ToolOutput, b64: &str) {
+        assert_eq!(output.attachments.len(), 1);
+        assert_eq!(output.attachments[0].source, "mcp:fixture");
+        let item = &output.value["content"][0];
+        assert_eq!(item["type"], "image");
+        assert_eq!(item["attached"], true);
+        assert_eq!(item["mime_type"], "image/png");
+        assert!(!output.value.to_string().contains(b64));
+    }
+
+    #[test]
+    fn eval_mcp_invoke_attaches_png_for_vision_model() {
+        let b64 = png_base64(4, 4);
+        let fixture = image_fixture(&b64);
+
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let ctx = mcp_ctx(runtime, true);
+            call_with_args("mcp_invoke_fixture", json!({"tool": "dup"}))
+                .eval_mcp_output(&ctx)
+                .await
+        })
+        .unwrap();
+
+        assert_png_attached(&output, &b64);
+    }
+
+    #[test]
+    fn eval_mcp_invoke_attaches_png_through_eval_output() {
+        let b64 = png_base64(4, 4);
+        let fixture = image_fixture(&b64);
+
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let mut ctx = mcp_ctx(runtime, true);
+            ctx.tool_scope
+                .functions
+                .append_declaration(FunctionDeclaration {
+                    name: "mcp_invoke_fixture".into(),
+                    description: String::new(),
+                    parameters: Default::default(),
+                    agent: false,
+                });
+            call_with_args("mcp_invoke_fixture", json!({"tool": "dup"}))
+                .eval_output(&mut ctx)
+                .await
+        })
+        .unwrap();
+
+        assert_png_attached(&output, &b64);
+    }
+
+    #[test]
+    #[serial]
+    fn eval_mcp_invoke_spills_png_for_non_vision_model() {
+        let _guard = crate::testing::TestConfigDirGuard::new("mcp-invoke-no-vision");
+        let b64 = png_base64(4, 4);
+        let fixture = image_fixture(&b64);
+
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let ctx = mcp_ctx(runtime, false);
+            call_with_args("mcp_invoke_fixture", json!({"tool": "dup"}))
+                .eval_mcp_output(&ctx)
+                .await
+        })
+        .unwrap();
+
+        assert!(output.attachments.is_empty());
+        assert_eq!(output.value["content"][0]["spilled"], true);
+        assert!(!output.value.to_string().contains(&b64));
     }
 
     #[test]
@@ -5267,6 +5796,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .output
         .expect("nonzero exit must return an error payload");
 
         let json: Value = serde_json::from_str(&result).unwrap();
@@ -5296,6 +5826,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .output
         .expect("nonzero exit must return an error payload");
 
         let json: Value = serde_json::from_str(&result).unwrap();
@@ -5333,12 +5864,532 @@ mod tests {
             Some(abort),
         )
         .unwrap()
+        .output
         .expect("an aborted tool must return an error payload");
         let elapsed = started.elapsed();
 
         assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
         let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["tool_call_error"], "Tool call 'bash' aborted");
+    }
+
+    #[cfg(unix)]
+    fn run_bash_tool(
+        script: &str,
+        envs: HashMap<String, String>,
+        tool_timeout: Option<u64>,
+        abort: Option<AbortSignal>,
+    ) -> Option<ScriptRunOutput> {
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return None;
+        }
+        Some(
+            run_llm_function(
+                "bash".into(),
+                vec!["-c".into(), script.into()],
+                envs,
+                None,
+                tool_timeout,
+                true,
+                abort,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// The script records its `LLM_ATTACHMENTS` and `LLM_OUTPUT` paths in a
+    /// test-owned probe file, so cleanup is checked on exactly those paths
+    /// rather than by listing the shared temp dir.
+    #[cfg(unix)]
+    fn assert_temp_files_removed(
+        body: &str,
+        tool_timeout: Option<u64>,
+        abort: Option<AbortSignal>,
+    ) -> Option<ScriptRunOutput> {
+        assert_temp_files_removed_with_probe(
+            &temp_file("-attachments-probe-", ""),
+            body,
+            tool_timeout,
+            abort,
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_temp_files_removed_with_probe(
+        probe: &Path,
+        body: &str,
+        tool_timeout: Option<u64>,
+        abort: Option<AbortSignal>,
+    ) -> Option<ScriptRunOutput> {
+        let script = format!(
+            "echo /x/a.png >> \"$LLM_ATTACHMENTS\"; echo partial >> \"$LLM_OUTPUT\"; \
+             printf '%s\\n%s\\n' \"$LLM_ATTACHMENTS\" \"$LLM_OUTPUT\" > \"$PROBE\"; {body}"
+        );
+        let envs = HashMap::from([("PROBE".to_string(), probe.display().to_string())]);
+        let run = run_bash_tool(&script, envs, tool_timeout, abort)?;
+        let recorded = fs::read_to_string(probe).unwrap();
+        fs::remove_file(probe).unwrap();
+        let recorded: Vec<&str> = recorded.lines().collect();
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert!(recorded[0].contains("-attachments-"), "{recorded:?}");
+        for path in recorded {
+            assert!(!Path::new(path).exists(), "{path} was left behind");
+        }
+        Some(run)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_collects_attachment_paths() {
+        let Some(run) = run_bash_tool(
+            "printf '/x/a.png\\n\\n   \\n/x/b c.png\\r\\n' >> \"$LLM_ATTACHMENTS\"; printf ok >> \"$LLM_OUTPUT\"",
+            HashMap::new(),
+            None,
+            None,
+        ) else {
+            return;
+        };
+        assert_eq!(run.output.as_deref(), Some("ok"));
+        assert_eq!(
+            run.attachment_paths,
+            vec![PathBuf::from("/x/a.png"), PathBuf::from("/x/b c.png")]
+        );
+        assert_eq!(run.dropped_attachments, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_keeps_paths_around_a_non_utf8_line() {
+        let Some(run) = run_bash_tool(
+            "printf '\\xff\\xfe\\n/x/b.png\\n' >> \"$LLM_ATTACHMENTS\"",
+            HashMap::new(),
+            None,
+            None,
+        ) else {
+            return;
+        };
+        assert_eq!(run.output, None);
+        assert_eq!(run.attachment_paths.len(), 2, "{:?}", run.attachment_paths);
+        assert_eq!(run.attachment_paths[1], PathBuf::from("/x/b.png"));
+    }
+
+    #[test]
+    fn read_attachment_paths_keeps_a_leading_space() {
+        let file = temp_file("-attachments-", ".txt");
+        fs::write(&file, " lead.png\r\n/x/b.png\n").unwrap();
+
+        let (paths, dropped) = read_attachment_paths(&file);
+        let _ = fs::remove_file(&file);
+
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(" lead.png"), PathBuf::from("/x/b.png")]
+        );
+        assert_eq!(dropped, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_caps_attachment_paths() {
+        let Some(run) = run_bash_tool(
+            "for i in 1 2 3 4 5 6; do echo \"/x/$i.png\" >> \"$LLM_ATTACHMENTS\"; done",
+            HashMap::new(),
+            None,
+            None,
+        ) else {
+            return;
+        };
+        let expected: Vec<PathBuf> = (1..=5)
+            .map(|i| PathBuf::from(format!("/x/{i}.png")))
+            .collect();
+        assert_eq!(run.attachment_paths, expected);
+        assert_eq!(run.dropped_attachments, 1);
+    }
+
+    #[test]
+    fn read_attachment_paths_counts_every_ignored_path() {
+        let file = temp_file("-attachments-", ".txt");
+        let lines: String = (1..=10).map(|i| format!("/x/{i}.png\n")).collect();
+        fs::write(&file, lines).unwrap();
+
+        let (paths, dropped) = read_attachment_paths(&file);
+        let _ = fs::remove_file(&file);
+
+        assert_eq!(paths.len(), MAX_ATTACHMENTS_PER_TOOL_RESULT);
+        assert_eq!(dropped, 10 - MAX_ATTACHMENTS_PER_TOOL_RESULT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_without_attachments_reports_none() {
+        let Some(run) = run_bash_tool("printf ok >> \"$LLM_OUTPUT\"", HashMap::new(), None, None)
+        else {
+            return;
+        };
+        assert_eq!(run.output.as_deref(), Some("ok"));
+        assert!(run.attachment_paths.is_empty());
+        assert_eq!(run.dropped_attachments, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_removes_temp_files_after_success() {
+        let Some(run) = assert_temp_files_removed("exit 0", None, None) else {
+            return;
+        };
+        assert_eq!(run.output.as_deref(), Some("partial\n"));
+        assert_eq!(run.attachment_paths, vec![PathBuf::from("/x/a.png")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_drops_attachments_and_temp_files_on_nonzero_exit() {
+        let Some(run) = assert_temp_files_removed("exit 3", None, None) else {
+            return;
+        };
+        let json: Value = serde_json::from_str(run.output.as_deref().unwrap()).unwrap();
+        assert!(
+            json["tool_call_error"]
+                .as_str()
+                .unwrap()
+                .contains("exited with code 3")
+        );
+        assert_eq!(json["output"], "partial\n");
+        assert!(run.attachment_paths.is_empty());
+        assert_eq!(run.dropped_attachments, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_drops_attachments_and_temp_files_on_timeout() {
+        let _timeout_env = crate::testing::EnvVarGuard::unset(get_env_name("tool_timeout"));
+        let Some(run) = assert_temp_files_removed("sleep 5", Some(1), None) else {
+            return;
+        };
+        let json: Value = serde_json::from_str(run.output.as_deref().unwrap()).unwrap();
+        assert!(
+            json["tool_call_error"]
+                .as_str()
+                .unwrap()
+                .contains("timed out")
+        );
+        assert!(run.attachment_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_drops_attachments_and_temp_files_on_abort() {
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        let probe = temp_file("-attachments-probe-", "");
+        let watched = probe.clone();
+        // Abort only once the script has recorded its paths, however slow the host is.
+        let aborter = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !watched.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            thread::sleep(Duration::from_millis(50));
+            trigger.set_ctrlc();
+        });
+        let run = assert_temp_files_removed_with_probe(&probe, "sleep 30", None, Some(abort));
+        aborter.join().unwrap();
+        let Some(run) = run else {
+            return;
+        };
+        let json: Value = serde_json::from_str(run.output.as_deref().unwrap()).unwrap();
+        assert_eq!(json["tool_call_error"], "Tool call 'bash' aborted");
+        assert!(run.attachment_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_overrides_inherited_llm_attachments() {
+        let inherited = temp_file("-attachments-inherited-", "");
+        let _inherited_env = crate::testing::EnvVarGuard::set("LLM_ATTACHMENTS", &inherited);
+        let probe = temp_file("-attachments-probe-", "");
+        let envs = HashMap::from([("PROBE".to_string(), probe.display().to_string())]);
+        let Some(run) = run_bash_tool(
+            "printf '%s' \"$LLM_ATTACHMENTS\" > \"$PROBE\"; echo /x/a.png >> \"$LLM_ATTACHMENTS\"",
+            envs,
+            None,
+            None,
+        ) else {
+            return;
+        };
+        let seen = fs::read_to_string(&probe).unwrap();
+        fs::remove_file(&probe).unwrap();
+        assert_ne!(seen, inherited.display().to_string());
+        assert!(seen.contains("-attachments-"), "{seen}");
+        assert!(
+            !inherited.exists(),
+            "the inherited file must not be written"
+        );
+        assert_eq!(run.attachment_paths, vec![PathBuf::from("/x/a.png")]);
+    }
+
+    fn write_png(path: &Path, width: u32, height: u32) {
+        image::RgbaImage::new(width, height)
+            .save_with_format(path, image::ImageFormat::Png)
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_script_attachments_attaches_valid_images_and_notes_the_rest() {
+        let dir = temp_file("-script-attachments-", "");
+        fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.png");
+        write_png(&small, 3, 2);
+        let wide = dir.join("wide.png");
+        write_png(&wide, MAX_IMAGE_DIMENSION * 2, 10);
+        let missing = dir.join("missing.png");
+        let fake = dir.join("fake.png");
+        fs::write(&fake, "just text").unwrap();
+
+        let (attachments, attached_images, notes) = run_async(resolve_script_attachments(
+            vec![
+                small.clone(),
+                missing.clone(),
+                dir.clone(),
+                fake.clone(),
+                wide.clone(),
+            ],
+            1,
+            true,
+        ));
+
+        let sources: Vec<&str> = attachments.iter().map(|a| a.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec![small.display().to_string(), wide.display().to_string()]
+        );
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(
+            attached_images,
+            vec![
+                json!({"path": small.display().to_string(), "width": 3, "height": 2, "resized_from": null}),
+                json!({
+                    "path": wide.display().to_string(),
+                    "width": MAX_IMAGE_DIMENSION,
+                    "height": 5,
+                    "resized_from": [MAX_IMAGE_DIMENSION * 2, 10],
+                }),
+            ]
+        );
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(notes[0].starts_with(&format!("{}: ", missing.display())));
+        assert!(notes[0].contains("Unable to read"), "{}", notes[0]);
+        assert!(notes[1].starts_with(&format!("{}: ", dir.display())));
+        assert!(notes[1].contains("not a regular file"), "{}", notes[1]);
+        assert!(notes[2].starts_with(&format!("{}: ", fake.display())));
+        assert!(
+            notes[2].contains("Unrecognized image format"),
+            "{}",
+            notes[2]
+        );
+        assert_eq!(
+            notes[3],
+            "1 more image path(s) ignored: at most 5 images per tool result"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_script_attachments_refuses_images_on_non_vision_models() {
+        let relative = PathBuf::from("no-such-dir").join("pic.png");
+        let absolute = env::current_dir().unwrap().join(&relative);
+
+        let (attachments, attached_images, notes) =
+            run_async(resolve_script_attachments(vec![relative], 0, false));
+
+        assert!(attachments.is_empty());
+        assert!(attached_images.is_empty());
+        assert_eq!(
+            notes,
+            vec![format!(
+                "{}: the current model does not accept images; ask the user to describe the image or switch to a vision-capable model",
+                absolute.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn merge_attachment_report_wraps_non_object_values() {
+        let notes = vec!["n".to_string()];
+        assert_eq!(
+            merge_attachment_report(json!("ok"), vec![], notes.clone()),
+            json!({"output": "ok", "image_notes": ["n"]})
+        );
+        assert_eq!(
+            merge_attachment_report(Value::Null, vec![json!({"path": "p"})], vec![]),
+            json!({"attached_images": [{"path": "p"}]})
+        );
+        assert_eq!(
+            merge_attachment_report(json!({"a": 1}), vec![], notes),
+            json!({"a": 1, "image_notes": ["n"]})
+        );
+    }
+
+    /// Declares a script tool named `imgtool` that attaches one real PNG
+    /// through `LLM_ATTACHMENTS`, on a model with or without vision. The
+    /// guards keep the tool's config dir and environment in place.
+    #[cfg(unix)]
+    fn attaching_tool_ctx(
+        supports_vision: bool,
+    ) -> Option<(
+        RequestContext,
+        PathBuf,
+        (
+            crate::testing::TestConfigDirGuard,
+            crate::testing::EnvVarGuard,
+        ),
+    )> {
+        use crate::client::{Model, ModelData};
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+        use std::os::unix::fs::PermissionsExt;
+
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return None;
+        }
+        let guard = TestConfigDirGuard::new("script-attachments");
+        let functions_env = EnvVarGuard::unset(get_env_name("functions_dir"));
+        let bin_dir = paths::functions_bin_dir();
+        fs::create_dir_all(&bin_dir).unwrap();
+        let png = guard.path.join("pic.png");
+        write_png(&png, 4, 4);
+        let tool = bin_dir.join("imgtool");
+        fs::write(
+            &tool,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' '{}' >> \"$LLM_ATTACHMENTS\"\nprintf ok >> \"$LLM_OUTPUT\"\n",
+                png.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut data = ModelData::new("eyes");
+        data.supports_vision = supports_vision;
+        ctx.model = Model::from_config("openai", &[data]).remove(0);
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "imgtool".into(),
+                description: String::new(),
+                parameters: Default::default(),
+                agent: false,
+            });
+        Some((ctx, png, (guard, functions_env)))
+    }
+
+    /// Runs the `imgtool` script tool through `eval_output`.
+    #[cfg(unix)]
+    fn eval_attaching_tool(supports_vision: bool) -> Option<(ToolOutput, PathBuf)> {
+        let (mut ctx, png, _guard) = attaching_tool_ctx(supports_vision)?;
+
+        // A freshly written script can still be open for writing in a forked
+        // child elsewhere in the process, making exec fail with ETXTBSY.
+        let mut attempts = 0;
+        let output = loop {
+            let output =
+                run_async(call_with_args("imgtool", json!({})).eval_output(&mut ctx)).unwrap();
+            let busy = output.value.to_string().contains("Text file busy");
+            if !busy || attempts >= 10 {
+                break output;
+            }
+            attempts += 1;
+            thread::sleep(Duration::from_millis(50));
+        };
+        Some((output, png))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_output_attaches_script_images_on_vision_models() {
+        let Some((output, png)) = eval_attaching_tool(true) else {
+            return;
+        };
+        assert_eq!(
+            output.value,
+            json!({
+                "output": "ok",
+                "attached_images": [
+                    {"path": png.display().to_string(), "width": 4, "height": 4, "resized_from": null}
+                ],
+            })
+        );
+        assert_eq!(output.attachments.len(), 1);
+        assert_eq!(output.attachments[0].source, png.display().to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_output_refuses_script_images_on_non_vision_models() {
+        let Some((output, _png)) = eval_attaching_tool(false) else {
+            return;
+        };
+        assert!(output.attachments.is_empty());
+        assert_eq!(output.value["output"], "ok");
+        assert!(output.value.get("attached_images").is_none());
+        let notes = output.value["image_notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0]
+                .as_str()
+                .unwrap()
+                .contains("does not accept images"),
+            "{notes:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_tool_calls_carries_script_and_mcp_attachments() {
+        let Some((mut ctx, png, _guards)) = attaching_tool_ctx(true) else {
+            return;
+        };
+        let b64 = png_base64(4, 4);
+
+        let results = run_async(async {
+            let (runtime, _server) = fixture_runtime(image_fixture(&b64)).await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            let mut attempts = 0;
+            loop {
+                ctx.tool_scope.tool_tracker = ToolCallTracker::default();
+                let calls = vec![
+                    ToolCall::new("imgtool".into(), json!({}), Some("id-1".into())),
+                    ToolCall::new(
+                        "mcp_invoke_fixture".into(),
+                        json!({"tool": "dup"}),
+                        Some("id-2".into()),
+                    ),
+                ];
+                let results = eval_tool_calls(&mut ctx, calls).await.unwrap();
+                let busy = results[0].output.to_string().contains("Text file busy");
+                if !busy || attempts >= 10 {
+                    break results;
+                }
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].call.name, "imgtool");
+        assert_eq!(results[0].attachments.len(), 1);
+        assert_eq!(results[0].attachments[0].source, png.display().to_string());
+        assert_eq!(results[1].call.name, "mcp_invoke_fixture");
+        assert_eq!(results[1].attachments.len(), 1);
+        assert_eq!(results[1].attachments[0].source, "mcp:fixture");
     }
 
     #[test]
@@ -5900,7 +6951,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert_eq!(output.as_deref(), Some("leaked"), "{agent_name:?}");
+            assert_eq!(output.output.as_deref(), Some("leaked"), "{agent_name:?}");
         }
     }
 
@@ -5970,7 +7021,8 @@ mod tests {
             None,
         )
         .unwrap()
-        .expect("the probe writes to LLM_OUTPUT");
+        .output
+.expect("the probe writes to LLM_OUTPUT");
 
         let lines: Vec<&str> = output.lines().collect();
         assert_eq!(
@@ -6038,6 +7090,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .output
             .expect("the probe writes to LLM_OUTPUT");
             serde_json::from_str::<Value>(&output).unwrap()
         };
@@ -6101,6 +7154,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .output
         .expect("a killed tool reports an error");
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -6176,6 +7230,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .output
         .expect("a killed tool reports an error");
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -6551,6 +7606,98 @@ mod tests {
 
             assert_eq!(truncated.output, json!("aé"));
         }
+    }
+
+    fn attachment(source: &str, data: &str) -> ImageAttachment {
+        ImageAttachment {
+            source: source.into(),
+            mime_type: "image/png".into(),
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn tool_result_without_attachments_serializes_as_before() {
+        let result = ToolResult::new(call("t", Some("id-1")), json!("ok"));
+
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"call":{"name":"t","arguments":{},"id":"id-1"},"output":"ok"}"#
+        );
+    }
+
+    #[test]
+    fn tool_result_from_old_session_yaml_has_no_attachments() {
+        let yaml = "call:\n  name: t\n  arguments: {}\n  id: id-1\noutput: ok\n";
+
+        let result: ToolResult = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(result.output, json!("ok"));
+        assert!(result.attachments.is_empty());
+    }
+
+    #[test]
+    fn tool_result_with_attachment_round_trips() {
+        let result = ToolResult::new(call("t", Some("id-1")), json!("ok"))
+            .with_attachments(vec![attachment("/tmp/a.png", "aGVsbG8=")]);
+
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ToolResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.attachments, result.attachments);
+        assert_eq!(back.output, result.output);
+    }
+
+    #[test]
+    fn truncate_if_needed_keeps_attachments() {
+        let attachments = vec![attachment("/tmp/a.png", &"A".repeat(1_000))];
+        let result = ToolResult::new(call("t", Some("id-1")), json!("a long output"))
+            .with_attachments(attachments.clone());
+
+        let truncated = result.truncate_if_needed(3);
+
+        assert!(
+            truncated
+                .output
+                .as_str()
+                .unwrap()
+                .starts_with("[truncated: tool output exceeded 3 chars]")
+        );
+        assert_eq!(truncated.attachments, attachments);
+    }
+
+    #[test]
+    fn merge_system_channel_keeps_attachments() {
+        let attachments = vec![attachment("mcp:server", "aGVsbG8=")];
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"))
+            .with_attachments(attachments.clone());
+
+        merge_system_channel(
+            &mut result,
+            vec![json!({"escalation_id": "esc_1"})],
+            vec![json!({"id": "job_1"})],
+        );
+
+        assert_eq!(result.output["output"], json!("DONE"));
+        assert_eq!(result.attachments, attachments);
+    }
+
+    #[test]
+    fn image_attachment_from_prepared_builds_data_url() {
+        let prepared = PreparedImage {
+            mime_type: "image/jpeg".into(),
+            base64_data: "/9j/4AAQ".into(),
+            width: 1,
+            height: 1,
+            original_size: None,
+        };
+
+        let attachment = ImageAttachment::from_prepared("/tmp/photo.jpg", &prepared);
+
+        assert_eq!(attachment.source, "/tmp/photo.jpg");
+        assert_eq!(attachment.mime_type, "image/jpeg");
+        assert_eq!(attachment.data, "/9j/4AAQ");
+        assert_eq!(attachment.to_data_url(), "data:image/jpeg;base64,/9j/4AAQ");
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::mcp::{
 };
 use crate::supervisor::notification::job_notification;
 use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
+use crate::utils::fs::TempFileGuard;
 use crate::utils::{
     create_abort_signal, latch_user_interrupt, muted_warning_text, temp_file, wait_abort_signal,
     wait_user_interrupt,
@@ -1136,18 +1137,6 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Deletes the env snapshot's temp files however the job task exits,
-/// including a cancel/abort dropping the future mid-await.
-struct TempFileGuard(Vec<PathBuf>);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 /// A grandchild that inherits the pipes keeps them open past the child's
 /// exit; don't let that hold the job task past its own timeout.
 async fn drain_pump(mut pump: tokio::task::JoinHandle<()>) {
@@ -1164,11 +1153,10 @@ async fn run_process_job(
     state: Arc<Mutex<JobState>>,
     output_buf: Arc<Mutex<RingBuf>>,
 ) -> Result<JobResult> {
-    let mut temp_files = vec![snapshot.output_file.clone()];
+    let mut temp_guard = TempFileGuard::new(vec![snapshot.output_file.clone()]);
     if let Some(tool_data_file) = snapshot.envs.get("LLM_TOOL_DATA_FILE") {
-        temp_files.push(PathBuf::from(tool_data_file));
+        temp_guard.push(PathBuf::from(tool_data_file));
     }
-    let _temp_guard = TempFileGuard(temp_files);
 
     let mut command = tokio::process::Command::new(&snapshot.cmd_name);
     if snapshot.env_clear {
@@ -1177,6 +1165,9 @@ async fn run_process_job(
     command
         .args(&snapshot.cmd_args)
         .envs(&snapshot.envs)
+        // A job started from inside a script tool must not append to that
+        // tool's attachments file; jobs have no attachment channel.
+        .env_remove("LLM_ATTACHMENTS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3006,6 +2997,33 @@ mod tests {
             assert_eq!(result.exit_code, Some(0));
             assert_eq!(result.output, json!({"output": "hi"}));
             assert!(!output_file.exists(), "temp file must be removed");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn run_process_job_does_not_pass_llm_attachments_to_the_child() {
+        let _inherited = crate::testing::EnvVarGuard::set("LLM_ATTACHMENTS", "/parent/attachments");
+        run_async(async {
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot = test_snapshot(
+                "sh",
+                &[
+                    "-c",
+                    "printf '%s' \"${LLM_ATTACHMENTS-unset}\" > \"$LLM_OUTPUT\"",
+                ],
+                0,
+            );
+
+            let result = run_process_job(snapshot, state, output_buf).await.unwrap();
+
+            assert_eq!(result.exit_code, Some(0));
+            assert_eq!(result.output, json!({"output": "unset"}));
         });
     }
 
