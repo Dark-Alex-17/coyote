@@ -654,10 +654,16 @@ fn a_command_prefix_followed_by_more_letters_is_painted_red_not_green() {
             "`{known}` before an argument was not painted green: {name_style:?}\n{frame}"
         );
         // Between the command word and its argument the colour is reset:
-        // the argument is plain, neither red nor green.
+        // the argument is plain, neither red nor green. The terminal only
+        // emits SGR on a change, so an argument painted in the command's
+        // colour would leave no sequence at all; the reset has to be seen.
         let arg_at = find(pty.raw(), b" x", name_at + known.len())
             .unwrap_or_else(|| panic!("the argument of `{with_arg}` was not repainted:\n{frame}"));
         let arg_style = sgr_between(pty.raw(), name_at + known.len(), arg_at + 2);
+        assert!(
+            arg_style.iter().any(|p| p.contains(&39) || p == &[0]),
+            "no reset between `{known}` and its argument: {arg_style:?}\n{frame}"
+        );
         assert!(
             !sets_a_foreground(&arg_style),
             "the argument after `{known}` is painted, not plain: {arg_style:?}\n{frame}"
