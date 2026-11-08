@@ -8078,7 +8078,8 @@ local_hello() {\n\
         assert!(err.is::<crate::prompt::NeedsHuman>(), "{err:?}");
         assert_eq!(
             err.to_string(),
-            "The input prompt needs a human and none is attached to this run"
+            "The input prompt needs a human and none is attached to this run; \
+             run it without --headless or --acp-server"
         );
     }
 

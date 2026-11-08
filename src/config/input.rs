@@ -700,7 +700,7 @@ async fn run_document_command(cmd: &str) -> String {
         std::os::unix::process::CommandExt::process_group(command, 0);
         Ok(())
     });
-    let mut child = match expr.stdin_null().stdout_capture().start() {
+    let child = match expr.stdin_null().stdout_capture().start() {
         Ok(handle) => KillOnDrop(Some(handle)),
         Err(err) => return err.to_string(),
     };
@@ -733,8 +733,8 @@ impl KillOnDrop {
     }
 
     /// For a command that has finished: its pid may already belong to
-    /// another process group, so nothing is killed on drop.
-    fn disarm(&mut self) {
+    /// another process group, so nothing is killed.
+    fn disarm(mut self) {
         self.0 = None;
     }
 }

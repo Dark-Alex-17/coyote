@@ -53,7 +53,7 @@ fn step_highlight(highlight: usize, delta: i32, len: usize) -> usize {
 
 /// A multi-line entry shows its first line, scrubbed of escape
 /// sequences, and how much follows.
-fn first_line(text: &str) -> (String, String) {
+pub(super) fn first_line(text: &str) -> (String, String) {
     let mut lines = text.lines();
     let first = super::render::plain_text(lines.next().unwrap_or_default());
     let rest = lines.count();
@@ -130,14 +130,16 @@ pub(super) struct PaletteState {
 
 impl PaletteState {
     /// The rows for a composer line, or None when the line is not a
-    /// command under `prefix` or nothing matches it. Argument rows and
-    /// macros need the context, so a line typed mid-turn gets command
-    /// rows only. `.prompt` arguments are never offered: listing them
-    /// blocks on an MCP round trip. Once the first token is a command on
-    /// its own and a space follows it, the palette is at the argument
-    /// position: the command rows are not offered again, and the group's
-    /// sub-verbs (`.info tools` after `.info `) come as argument rows.
-    /// Command rows leave out `HIDDEN_UNTIL_ROUTED`; argument rows do not.
+    /// command under `prefix` or nothing matches it. Argument rows need
+    /// the context, so a line typed mid-turn gets command and macro rows
+    /// only. `.prompt` arguments are never offered: listing them
+    /// blocks on an MCP round trip. A leading `:::` token opens a fence
+    /// and is skipped, as the completer skips it. Once the first token
+    /// is a command on its own and a space follows it, the palette is at
+    /// the argument position: the command rows are not offered again,
+    /// and the group's sub-verbs (`.info tools` after `.info `) come as
+    /// argument rows. Command rows leave out `HIDDEN_UNTIL_ROUTED`;
+    /// argument rows do not.
     pub(super) fn build(
         line: &str,
         prefix: CommandPrefix,
@@ -145,7 +147,10 @@ impl PaletteState {
         macros: &[(String, String)],
         ctx: Option<&RequestContext>,
     ) -> Option<Self> {
-        let parts = split_line(line);
+        let mut parts = split_line(line);
+        if parts.first().is_some_and(|(token, _)| *token == ":::") {
+            parts.remove(0);
+        }
         let (typed_cmd, cmd_start) = *parts.first()?;
         let cmd = prefix.normalize(typed_cmd)?;
         let cmd = cmd.as_ref();
@@ -208,19 +213,17 @@ impl PaletteState {
                         description: command.description().to_string(),
                     }),
             );
-            if ctx.is_some() {
-                let macros = macro_candidates(
-                    macros
-                        .iter()
-                        .map(|(name, description)| (name.clone(), description.as_str()))
-                        .collect(),
-                    &command_filter,
-                );
-                rows.extend(macros.into_iter().map(|(name, description)| PaletteRow {
-                    value: format!("{} ", with_sigil(&name)),
-                    description: description.to_string(),
-                }));
-            }
+            let macros = macro_candidates(
+                macros
+                    .iter()
+                    .map(|(name, description)| (name.clone(), description.as_str()))
+                    .collect(),
+                &command_filter,
+            );
+            rows.extend(macros.into_iter().map(|(name, description)| PaletteRow {
+                value: format!("{} ", with_sigil(&name)),
+                description: description.to_string(),
+            }));
         }
 
         let mut seen = HashSet::new();
@@ -767,16 +770,33 @@ mod tests {
     }
 
     #[test]
-    fn mid_turn_rows_come_from_the_snapshot_without_macros() {
+    fn mid_turn_rows_come_from_the_snapshot_and_the_cached_macros() {
         let macros = vec![("mymacro".to_string(), "mine".to_string())];
         let snapshot = PaletteSnapshot::EMPTY;
-        let away = PaletteState::build(".my", CommandPrefix::Dot, snapshot, &macros, None);
-        assert!(away.is_none(), "{away:?}");
-        let ctx = ctx_with(CommandPrefix::Dot, false);
-        let idle = PaletteState::build(".my", CommandPrefix::Dot, snapshot, &macros, Some(&ctx))
-            .expect("the macro is a row");
-        assert_eq!(idle.rows[0].value, ".mymacro ");
-        assert_eq!(idle.rows[0].description, "mine");
+        let away = PaletteState::build(".my", CommandPrefix::Dot, snapshot, &macros, None)
+            .expect("the cached macro is a row");
+        assert_eq!(away.rows[0].value, ".mymacro ");
+        assert_eq!(away.rows[0].description, "mine");
+    }
+
+    /// A fence opened on the command line (`::: .he`) gets the rows the
+    /// bare line gets, and accepting one replaces the token after the
+    /// fence, not the fence.
+    #[test]
+    fn a_leading_fence_token_is_skipped_like_the_completer_does() {
+        let snapshot = PaletteSnapshot::EMPTY;
+        let bare = PaletteState::build(".he", CommandPrefix::Dot, snapshot, &[], None)
+            .expect("the bare line has rows");
+        let fenced = PaletteState::build("::: .he", CommandPrefix::Dot, snapshot, &[], None)
+            .expect("the fenced line has rows");
+        assert!(
+            bare.rows.iter().any(|row| row.value == ".help "),
+            "{bare:?}"
+        );
+        assert_eq!(fenced.rows, bare.rows);
+        assert_eq!(fenced.token_range, 4..7);
+        assert_eq!(bare.token_range, 0..3);
+        assert!(PaletteState::build(":::", CommandPrefix::Dot, snapshot, &[], None).is_none());
     }
 
     #[test]

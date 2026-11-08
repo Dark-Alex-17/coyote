@@ -1251,12 +1251,18 @@ impl App {
     }
 
     /// The composer's line when it is a single line opening with a
-    /// sigil the configured prefix accepts: the line the palette is for.
+    /// sigil the configured prefix accepts, a leading `:::` fence token
+    /// skipped: the line the palette is for.
     fn command_line(&self) -> Option<&str> {
         let [line] = self.composer.lines() else {
             return None;
         };
-        let first = line.trim_start().chars().next()?;
+        let unfenced = line.trim_start();
+        let unfenced = match unfenced.strip_prefix(":::") {
+            Some(rest) if rest.starts_with(' ') => rest.trim_start(),
+            _ => unfenced,
+        };
+        let first = unfenced.chars().next()?;
         self.config
             .command_prefix
             .accepts(first)
@@ -7344,6 +7350,17 @@ mod tests {
         harness.press(KeyCode::Tab);
         assert!(palette(&harness).is_some());
         assert_eq!(harness.app.composer_text(), ".in");
+    }
+
+    /// A fence opened in front of the command still gets the palette,
+    /// with the token to replace behind the fence.
+    #[test]
+    fn a_fenced_command_line_opens_the_palette_behind_the_fence() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("::: .in");
+        let palette = palette(&harness).expect("the fenced line opens the palette");
+        assert!(palette.rows.iter().any(|row| row.value == ".info "));
+        assert_eq!(palette.token_range, 4..7);
     }
 
     #[test]

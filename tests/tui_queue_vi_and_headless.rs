@@ -320,6 +320,19 @@ fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str)
     }
 }
 
+fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
+    let deadline = Instant::now() + PTY_DEADLINE;
+    while !path.exists() {
+        let text = pty.read_for(Duration::from_millis(100));
+        assert!(
+            Instant::now() < deadline,
+            "{what} ({}) never appeared:\n{}",
+            path.display(),
+            text
+        );
+    }
+}
+
 /// The composer takes a command again: `.info` renders its table.
 fn assert_composer_takes_keys(pty: &mut Pty, after: usize, what: &str) {
     pty.send(b".info\r").unwrap();
@@ -866,7 +879,8 @@ fn vi_keybindings_edit_the_composer_in_normal_mode() {
 /// `` .file `cat` `` runs the command with stdin closed: `cat` exits at
 /// once instead of waiting on the tty, the turn ends and the composer
 /// takes keys. `` .file `sleep N` `` is abortable: Esc ends the turn and
-/// no sleeper outlives the session.
+/// the sleeper, which wrote its own pid for the check, does not outlive
+/// the session.
 #[test]
 #[serial]
 fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
@@ -889,7 +903,21 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
     );
 
     let sleep_at = pty.raw().len();
-    pty.send(b".file `sleep 6173` -- summarize\r").unwrap();
+    let sleeper_pid = dir.join("sleeper.pid");
+    pty.send(
+        format!(
+            ".file `echo $$ > '{}'; exec sleep 6173` -- summarize\r",
+            sleeper_pid.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    wait_for_file(&mut pty, &sleeper_pid, "the sleeper's pid");
+    let pid: i32 = fs::read_to_string(&sleeper_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     pty.read_for(Duration::from_millis(1500));
     pty.send(b"\x1b").unwrap();
     let esc_at = Instant::now();
@@ -901,18 +929,15 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
     );
 
     quit_and_check(&mut pty);
-    let leftover = Command::new("pgrep")
-        .args(["-f", "sleep 6173"])
-        .output()
-        .unwrap();
-    let pids = String::from_utf8_lossy(&leftover.stdout);
-    if !pids.trim().is_empty() {
-        let _ = Command::new("pkill").args(["-f", "sleep 6173"]).status();
+    // SAFETY: kill with signal 0 touches no memory; it only checks the pid.
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    if alive {
+        // SAFETY: kill takes a pid and a signal number and touches no memory.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     assert!(
-        pids.trim().is_empty(),
-        "the aborted backtick command outlived the session (pids {})",
-        pids.trim()
+        !alive,
+        "the aborted backtick command outlived the session (pid {pid})"
     );
 }
 

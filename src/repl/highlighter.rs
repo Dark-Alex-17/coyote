@@ -102,20 +102,25 @@ pub(crate) fn classify_command(
     prefix: CommandPrefix,
     extra_known: &[&str],
 ) -> Option<CommandSpan> {
+    // `unfence` hands back a subslice of `line` (or `line` itself), so
+    // the pointer offset places the inner text in `line`'s coordinates;
+    // the word is searched within the inner text only, so a closing
+    // fence glued to the command is not read as part of its name.
     let inner = unfence(line);
     let fence = inner.as_ptr() as usize - line.as_ptr() as usize;
+    let within = &line[..fence + inner.len()];
     let start = fence + inner.len() - inner.trim_start().len();
-    let sigil = line[start..]
+    let sigil = within[start..]
         .chars()
         .next()
         .filter(|&c| prefix.accepts(c))?;
-    if let Some(range) = known_match(line, start, sigil, extra_known) {
+    if let Some(range) = known_match(within, start, sigil, extra_known) {
         return Some(CommandSpan { range, known: true });
     }
     let word_start = start + sigil.len_utf8();
-    let word_len = line[word_start..]
+    let word_len = within[word_start..]
         .find(char::is_whitespace)
-        .unwrap_or(line.len() - word_start);
+        .unwrap_or(within.len() - word_start);
     (word_len > 0).then(|| CommandSpan {
         range: start..word_start + word_len,
         known: false,
@@ -317,6 +322,13 @@ mod tests {
     fn a_fenced_command_is_classified_inside_its_fence() {
         assert_eq!(
             classify_command(":::\n.help\n:::", CommandPrefix::Dot, &[]),
+            Some(CommandSpan {
+                range: 4..9,
+                known: true
+            })
+        );
+        assert_eq!(
+            classify_command(":::\n.help:::", CommandPrefix::Dot, &[]),
             Some(CommandSpan {
                 range: 4..9,
                 known: true

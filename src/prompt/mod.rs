@@ -356,7 +356,8 @@ impl fmt::Display for NeedsHuman {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "The {} prompt needs a human and none is attached to this run",
+            "The {} prompt needs a human and none is attached to this run; \
+             run it without --headless or --acp-server",
             self.0.name()
         )
     }
@@ -676,7 +677,10 @@ mod tests {
             assert_eq!(refusal.0, action);
             assert_eq!(
                 err.to_string(),
-                format!("The {name} prompt needs a human and none is attached to this run")
+                format!(
+                    "The {name} prompt needs a human and none is attached to this run; \
+                     run it without --headless or --acp-server"
+                )
             );
         }
     }

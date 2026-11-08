@@ -4,6 +4,7 @@
 //! turn ends.
 
 use super::DIM;
+use super::bottom_pane::first_line;
 use crate::events::Event;
 use crate::supervisor::notification::{NotificationQueue, SystemNotification};
 use ratatui::buffer::Buffer;
@@ -96,7 +97,7 @@ pub(super) fn preview_rows(queued: &[QueuedLine]) -> u16 {
 }
 
 /// The strip above the composer: `pending: N`, then the newest entries'
-/// first lines, all dim.
+/// first lines with how much follows, all dim.
 pub(super) struct QueuedPreview<'a>(pub(super) &'a [QueuedLine]);
 
 impl Widget for QueuedPreview<'_> {
@@ -111,8 +112,13 @@ impl Widget for QueuedPreview<'_> {
             DIM,
         ))];
         lines.extend(self.0[self.0.len() - shown..].iter().map(|line| {
-            let first = line.text.lines().next().unwrap_or_default();
-            Line::from(Span::styled(first.to_string(), DIM))
+            let (first, tail) = first_line(&line.text);
+            let shown = if tail.is_empty() {
+                first
+            } else {
+                format!("{first}  {tail}")
+            };
+            Line::from(Span::styled(shown, DIM))
         }));
         Paragraph::new(lines).render(area, buf);
     }
@@ -218,6 +224,6 @@ mod tests {
                     .to_string()
             })
             .collect();
-        assert_eq!(rows, ["pending: 4", "two", "three", "four"]);
+        assert_eq!(rows, ["pending: 4", "two  +1 line", "three", "four"]);
     }
 }
