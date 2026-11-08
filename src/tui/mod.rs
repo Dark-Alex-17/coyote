@@ -57,9 +57,11 @@ use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use terminal::Screen;
 use todo::TodoPanel;
@@ -2707,12 +2709,15 @@ fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> 
 /// and whatever the editor left in it are removed on every path.
 fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     let dir = crate::utils::temp_file("-tui-edit-", "");
-    let mut dir_options = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let dir_options = {
         use std::os::unix::fs::DirBuilderExt;
-        dir_options.mode(0o700);
-    }
+        let mut options = std::fs::DirBuilder::new();
+        options.mode(0o700);
+        options
+    };
+    #[cfg(not(unix))]
+    let dir_options = std::fs::DirBuilder::new();
     dir_options.create(&dir)?;
     let path = dir.join("buffer.md");
     let mut options = std::fs::OpenOptions::new();
