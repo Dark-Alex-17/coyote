@@ -297,23 +297,30 @@ impl std::error::Error for EnvoyMemoryError {
 /// fixed-width, so the zero bytes mark no boundary; they are fixed separators that keep
 /// this digest's input distinct from `destination_address`'s, which also chains an
 /// address hash. The address bytes, not their hex, so the key is the same whatever case
-/// the caller spelt. `None` when `identity` or `destination` is not a 32-hex address hash.
+/// the caller spelt.
+fn key_of(identity: &AddressHash, destination: &AddressHash, thread: &str) -> String {
+    AddressHash::new_from_hash(&Hash::new(
+        Hash::generator()
+            .chain_update(identity.as_slice())
+            .chain_update([0u8])
+            .chain_update(destination.as_slice())
+            .chain_update([0u8])
+            .chain_update(thread.as_bytes())
+            .finalize()
+            .into(),
+    ))
+    .to_hex_string()
+}
+
+/// `key_of` for hex spellings, as the tests and the pinned vector name a record; `None`
+/// when `identity` or `destination` is not a 32-hex address hash.
+#[cfg(test)]
 pub(crate) fn session_key(identity: &str, destination: &str, thread: &str) -> Option<String> {
-    let identity = parse_hash(identity)?;
-    let destination = parse_hash(destination)?;
-    Some(
-        AddressHash::new_from_hash(&Hash::new(
-            Hash::generator()
-                .chain_update(identity.as_slice())
-                .chain_update([0u8])
-                .chain_update(destination.as_slice())
-                .chain_update([0u8])
-                .chain_update(thread.as_bytes())
-                .finalize()
-                .into(),
-        ))
-        .to_hex_string(),
-    )
+    Some(key_of(
+        &parse_hash(identity)?,
+        &parse_hash(destination)?,
+        thread,
+    ))
 }
 
 pub(crate) fn stores_dir(cache_dir: &Path) -> PathBuf {
@@ -462,8 +469,9 @@ impl EnvoySessions {
     }
 
     /// Every identity remembered in any instance's store under `cache_dir` with the
-    /// threads remembered of it, each named once however many instances hold it. Same
-    /// sweep as `delete_identity_everywhere`; empty when no store exists.
+    /// threads remembered of it, each named once however many instance stores hold it
+    /// and from however many of the identity's destinations. Same sweep as
+    /// `delete_identity_everywhere`; empty when no store exists.
     pub(crate) fn remembered_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
@@ -1197,16 +1205,14 @@ struct Resolved {
 }
 
 fn resolve(identity: &str, destination: &str, thread: &str) -> Result<Resolved, EnvoyMemoryError> {
-    let canonical_identity = canonical_hash(identity)
+    let identity_hash = parse_hash(identity)
         .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
-    let canonical_destination = canonical_hash(destination)
+    let destination_hash = parse_hash(destination)
         .ok_or_else(|| EnvoyMemoryError::NotADestination(destination.to_string()))?;
-    let key = session_key(identity, destination, thread)
-        .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
     Ok(Resolved {
-        identity: canonical_identity,
-        destination: canonical_destination,
-        key,
+        key: key_of(&identity_hash, &destination_hash, thread),
+        identity: identity_hash.to_hex_string(),
+        destination: destination_hash.to_hex_string(),
     })
 }
 
@@ -1706,9 +1712,23 @@ mod tests {
             Err(EnvoyMemoryError::WrongDestination { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), planted);
+        install_log_collector();
+        let warned_before = warn_snapshot().len();
         let session = store.session_thread(IDENTITY_A, DEST_A, Some("thread-one"), "m-2", t(1_001));
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
+        let warned: Vec<String> = warn_snapshot()
+            .into_iter()
+            .skip(warned_before)
+            .filter(|line| line.contains("belongs to another destination"))
+            .collect();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains(short(DEST_A)), "{}", warned[0]);
+        assert!(
+            !warned[0].contains(DEST_A) && !warned[0].contains(DEST_A2),
+            "no full hash is logged: {}",
+            warned[0]
+        );
 
         plant(&path, DEST_A2, DEST_A);
         plant(&store.index_path(), DEST_A, DEST_A2);

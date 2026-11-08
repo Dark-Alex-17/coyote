@@ -1806,6 +1806,7 @@ fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_b
         "identity",
         "thread",
         "the proved sending destination",
+        "forget every thread of the identity, whichever of its instances it was held for",
         "`mesh.envoy_memory.*`",
         "whose index cannot be read is counted and named so you can empty it with `.mesh memory forget all`",
         "256 threads across all peers",
@@ -8027,7 +8028,7 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
         "config.example.yaml",
         "assets/config-template.yaml",
     ] {
-        let text = read(repo_root().join(twin));
+        let text = flat(&read(repo_root().join(twin)));
         assert!(
             text.contains("per (sender identity, sending destination, thread)"),
             "{twin} does not key the envoy memory by the sending destination"
@@ -8037,6 +8038,12 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
             "{twin} still keys the envoy memory by identity and thread alone"
         );
     }
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    let several_instances = "when several instance stores held the same thread, or one store held it for several instances of the identity, more records went than conversations were counted";
+    assert!(
+        commands.contains(several_instances),
+        "Mesh-Commands.md does not say {several_instances:?}"
+    );
 }
 
 /// The value of the one `const NAME: &str = "...";` line in `path`.
