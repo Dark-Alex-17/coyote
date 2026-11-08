@@ -950,12 +950,23 @@ fn wait_for_process_gone(pid: i32, limit: Duration) -> bool {
     true
 }
 
-/// The sleepers a test forked, killed by pid when it ends however it
-/// ends, so a failed assertion leaves none behind.
+/// The sleepers a test forked and has not yet seen die. A pid proven
+/// gone is taken out at once, since a freed pid may be someone else's
+/// by now; the rest are killed only when the test panics, so a failed
+/// assertion leaves none behind.
 struct Sleepers(Vec<i32>);
+
+impl Sleepers {
+    fn forget(&mut self, pid: i32) {
+        self.0.retain(|&held| held != pid);
+    }
+}
 
 impl Drop for Sleepers {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
         for &pid in &self.0 {
             // SAFETY: kill takes a pid and a signal number and touches no memory.
             let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -1026,7 +1037,9 @@ fn a_backtick_document_commands_grandchild_dies_on_esc_even_after_its_shell_exit
         pty.read_for(Duration::from_millis(800));
         pty.send(b"\x1b").unwrap();
         let esc_at = Instant::now();
-        if !wait_for_process_gone(pid, Duration::from_secs(2)) {
+        if wait_for_process_gone(pid, Duration::from_secs(2)) {
+            sleepers.forget(pid);
+        } else {
             misses.push(format!(
                 "{what}: the sleeper (pid {pid}) outlived Esc by two seconds:\n{}",
                 since(&pty, turn_at)

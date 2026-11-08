@@ -1521,16 +1521,18 @@ mod tests {
             unsafe { libc::kill(pid, 0) == 0 }
         }
 
-        /// Fails unless `pid` is gone within `deadline`. A reaped pid answers
-        /// ESRCH to a null signal; a zombie or a still-running process
-        /// answers 0.
+        /// Fails unless `pid` is gone within `deadline`; a pid still alive
+        /// at the deadline is killed on the way out so the failed test
+        /// leaves nothing behind. A reaped pid answers ESRCH to a null
+        /// signal; a zombie or a still-running process answers 0.
         fn assert_process_gone(pid: i32, deadline: std::time::Duration, what: &str) {
             let deadline = std::time::Instant::now() + deadline;
             while process_alive(pid) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{what} (pid {pid}) outlived its future"
-                );
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: kill takes a pid and a signal number and touches no memory.
+                    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                    panic!("{what} (pid {pid}) outlived its future");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
@@ -1628,8 +1630,6 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 "the orphaned grandchild of the document command",
             );
-            // SAFETY: kill takes a pid and a signal number and touches no memory.
-            let _ = unsafe { libc::kill(grandchild, libc::SIGKILL) };
             let _ = fs::remove_dir_all(&dir);
         }
     }

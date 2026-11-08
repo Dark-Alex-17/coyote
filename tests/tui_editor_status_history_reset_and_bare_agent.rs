@@ -862,11 +862,13 @@ fn taking_a_queued_line_back_restarts_the_history_walk() {
             bodies.join("\n---\n")
         ));
     } else {
-        if !bodies[4].contains("h2-w4q") {
+        // The walked entry sits in every request's history already; only
+        // one more mention proves it rode as a new message.
+        if bodies[4].matches("h2-w4q").count() != bodies[3].matches("h2-w4q").count() + 1 {
             misses.push(format!(
                 "the draft Alt+Up held in the queue did not ride the next request as a new \
-                 user message:\n{}",
-                bodies[4]
+                 user message:\n{}\n--- previous request ---\n{}",
+                bodies[4], bodies[3]
             ));
         }
         if bodies[4].contains("q-w4q") {

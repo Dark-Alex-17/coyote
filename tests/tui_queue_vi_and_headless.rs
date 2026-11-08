@@ -31,12 +31,23 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// The sleepers a test forked, killed by pid when it ends however it
-/// ends, so a failed assertion leaves none behind.
+/// The sleepers a test forked and has not yet seen die. A pid proven
+/// gone is taken out at once, since a freed pid may be someone else's
+/// by now; the rest are killed only when the test panics, so a failed
+/// assertion leaves none behind.
 struct Sleepers(Vec<i32>);
+
+impl Sleepers {
+    fn forget(&mut self, pid: i32) {
+        self.0.retain(|&held| held != pid);
+    }
+}
 
 impl Drop for Sleepers {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
         for &pid in &self.0 {
             // SAFETY: kill takes a pid and a signal number and touches no memory.
             let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -943,7 +954,7 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
         .trim()
         .parse()
         .unwrap();
-    let _sleepers = Sleepers(vec![pid]);
+    let mut sleepers = Sleepers(vec![pid]);
     pty.read_for(Duration::from_millis(1500));
     pty.send(b"\x1b").unwrap();
     let esc_at = Instant::now();
@@ -961,6 +972,7 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
         !alive,
         "the aborted backtick command outlived the session (pid {pid})"
     );
+    sleepers.forget(pid);
 }
 
 // ---------------------------------------------------------------------
