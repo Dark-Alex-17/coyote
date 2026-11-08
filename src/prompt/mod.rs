@@ -155,7 +155,7 @@ impl PromptAnswer {
             // Only the headless prompter answers a confirm with text (its
             // `needs_human` JSON), so the refusal is what the caller sees.
             PromptAnswer::Text(_) if expected == PromptAction::Confirm => {
-                NeedsHuman(expected).into()
+                NeedsHuman::Prompt(expected).into()
             }
             _ => anyhow!("Unexpected answer to the {} prompt", expected.name()),
         }
@@ -348,11 +348,29 @@ impl Prompter for InquirePrompter {
 pub struct HeadlessPrompter;
 
 /// The refusal a run with no human gives a prompt whose answer would
-/// otherwise be read as text.
+/// otherwise be read as text, or an action that would have to ask one.
 #[derive(Debug)]
-pub(crate) struct NeedsHuman(pub(crate) PromptAction);
+pub(crate) enum NeedsHuman {
+    Prompt(PromptAction),
+    /// A `kind` named `name` would have been created behind a prompt;
+    /// the gate refuses before any prompter is reached.
+    Creating {
+        kind: &'static str,
+        name: String,
+    },
+}
+
+const NO_HUMAN_ATTACHED: &str =
+    "and none is attached to this run; run it without --headless or --acp-server";
 
 impl NeedsHuman {
+    pub(crate) fn for_creating(kind: &'static str, name: &str) -> Self {
+        Self::Creating {
+            kind,
+            name: name.to_string(),
+        }
+    }
+
     /// Whether `err` is, or wraps through `context`, this refusal.
     pub(crate) fn caused(err: &anyhow::Error) -> bool {
         err.chain()
@@ -362,12 +380,17 @@ impl NeedsHuman {
 
 impl fmt::Display for NeedsHuman {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "The {} prompt needs a human and none is attached to this run; \
-             run it without --headless or --acp-server",
-            self.0.name()
-        )
+        match self {
+            Self::Prompt(action) => write!(
+                f,
+                "The {} prompt needs a human {NO_HUMAN_ATTACHED}",
+                action.name()
+            ),
+            Self::Creating { kind, name } => write!(
+                f,
+                "Creating {kind} '{name}' needs a human to answer the prompt {NO_HUMAN_ATTACHED}"
+            ),
+        }
     }
 }
 
@@ -388,7 +411,7 @@ impl Prompter for HeadlessPrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
         match req.action {
             PromptAction::Confirm => Ok(PromptAnswer::Text(headless_reply(&req).to_string())),
-            action => Err(NeedsHuman(action).into()),
+            action => Err(NeedsHuman::Prompt(action).into()),
         }
     }
 
@@ -682,7 +705,10 @@ mod tests {
             let refusal = err
                 .downcast_ref::<NeedsHuman>()
                 .unwrap_or_else(|| panic!("{name}: {err}"));
-            assert_eq!(refusal.0, action);
+            assert!(
+                matches!(refusal, NeedsHuman::Prompt(refused) if *refused == action),
+                "{name}: {refusal:?}"
+            );
             assert_eq!(
                 err.to_string(),
                 format!(
@@ -691,6 +717,19 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// The creation gate's refusal shares its tail with the prompt
+    /// refusals, so the two never drift apart.
+    #[test]
+    fn a_creation_refusal_names_the_thing_and_the_missing_human() {
+        let err: anyhow::Error = NeedsHuman::for_creating("role", "coder").into();
+        assert!(NeedsHuman::caused(&err));
+        assert_eq!(
+            err.to_string(),
+            "Creating role 'coder' needs a human to answer the prompt and none is attached to \
+             this run; run it without --headless or --acp-server"
+        );
     }
 
     #[test]

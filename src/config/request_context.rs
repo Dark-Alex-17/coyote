@@ -45,8 +45,8 @@ use crate::mcp::{
     is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::prompt::{
-    HeadlessPrompter, InquirePrompter, PromptAction, PromptAnswer, PromptMemory, PromptRequest,
-    Prompter, human_present,
+    HeadlessPrompter, InquirePrompter, NeedsHuman, PromptAction, PromptAnswer, PromptMemory,
+    PromptRequest, Prompter, human_present,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -4126,6 +4126,11 @@ impl RequestContext {
 
     pub fn new_role(&self, app: &AppConfig, name: &str) -> Result<()> {
         if self.macro_flag {
+            // A macro step never opens an editor; with no human on the run
+            // the refusal says who is missing rather than a bare `No role`.
+            if !human_present() {
+                return Err(NeedsHuman::for_creating("role", name).into());
+            }
             bail!("No role");
         }
         crate::tui::ensure_terminal_lendable()?;
@@ -4248,6 +4253,9 @@ impl RequestContext {
             bail!("'{name}' is a reserved macro name");
         }
         if self.macro_flag {
+            if !human_present() {
+                return Err(NeedsHuman::for_creating("macro", name).into());
+            }
             bail!("No macro");
         }
         crate::tui::ensure_terminal_lendable()?;
@@ -12161,6 +12169,45 @@ mod tests {
 
         let err = ctx.new_macro(&app, "headless-macro").unwrap_err();
         assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        assert!(!paths::macros_dir().exists());
+    }
+
+    /// A macro step reaches the creation gate before any prompter. With
+    /// no human on the run the refusal names what would have been created
+    /// and who is missing; an interactive macro keeps its terse refusal.
+    #[test]
+    #[serial]
+    fn a_macro_step_creating_a_role_or_macro_names_the_missing_human_when_headless() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.macro_flag = true;
+        {
+            let _headless = AtomicFlagGuard::set(&utils::HEADLESS, true);
+            let err = ctx.new_role(&app, "gate-role").unwrap_err();
+            assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Creating role 'gate-role' needs a human to answer the prompt and none is \
+                 attached to this run; run it without --headless or --acp-server"
+            );
+            let err = ctx.new_macro(&app, "gate-macro").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Creating macro 'gate-macro' needs a human to answer the prompt and none is \
+                 attached to this run; run it without --headless or --acp-server"
+            );
+        }
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        assert_eq!(
+            ctx.new_role(&app, "gate-role").unwrap_err().to_string(),
+            "No role"
+        );
+        assert_eq!(
+            ctx.new_macro(&app, "gate-macro").unwrap_err().to_string(),
+            "No macro"
+        );
+        assert!(!paths::role_file("gate-role").exists());
         assert!(!paths::macros_dir().exists());
     }
 
