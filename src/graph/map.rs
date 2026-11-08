@@ -2421,6 +2421,7 @@ nodes:
                 max_concurrency: 4,
                 abort_signal: &h.abort,
                 branch_mode: false,
+                headless_answers: HeadlessAnswerGuard::default(),
             };
             let items = json!([{"field": 7}, {"field": 9}]);
             let mut parent = StateManager::new(HashMap::from([("items".to_string(), items)]));
