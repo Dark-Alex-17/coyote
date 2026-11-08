@@ -153,10 +153,7 @@ pub async fn handle_user_tool(
     }
 
     if HEADLESS.load(Ordering::SeqCst) {
-        eprintln!(
-            "{}",
-            headless_default_line(None, &format!("{USER_FUNCTION_PREFIX}{action}"), None)
-        );
+        emit_headless_default(None, &format!("{USER_FUNCTION_PREFIX}{action}"), None);
         return Ok(handle_headless(action, args));
     }
 
@@ -186,8 +183,29 @@ pub fn headless_default_line(node: Option<&str>, kind: &str, answer: Option<&str
     )
 }
 
+pub(crate) fn emit_headless_default(node: Option<&str>, kind: &str, answer: Option<&str>) {
+    let line = headless_default_line(node, kind, answer);
+    eprintln!("{line}");
+    #[cfg(test)]
+    headless_capture::CAPTURED.lock().push(line);
+}
+
+#[cfg(test)]
+pub(crate) mod headless_capture {
+    pub(super) static CAPTURED: parking_lot::Mutex<Vec<String>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Drains every line emitted so far. Callers must be `#[serial]` and
+    /// drain once before acting so earlier tests' lines do not leak in.
+    pub(crate) fn take_captured_headless_lines() -> Vec<String> {
+        std::mem::take(&mut *CAPTURED.lock())
+    }
+}
+
 /// Sets the process-wide headless and ACP flags for a test and restores the
-/// previous values on drop. Tests holding one must be `#[serial]`.
+/// previous values on drop. Tests holding one must be `#[serial]`, and so
+/// must any test that reaches `handle_user_tool` or an approval or input
+/// graph node, since those read the flags.
 #[cfg(test)]
 pub(crate) struct HeadlessModeGuard {
     headless: bool,
@@ -410,6 +428,7 @@ fn parse_options(args: &Value) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::headless_capture::take_captured_headless_lines;
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
     use crate::function::agents::handle_agent_tool;
@@ -464,6 +483,7 @@ mod tests {
     #[serial]
     async fn headless_prose_question_still_returns_needs_human_without_answer() {
         let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         let args = json!({ "question": "headless prose pick", "options": ["a", "b"] });
 
@@ -474,12 +494,38 @@ mod tests {
         assert_eq!(result, handle_headless("select", &args));
         assert_eq!(result["guidance"], HEADLESS_GUIDANCE);
         assert!(result.get("answer").is_none());
+        assert_eq!(
+            take_captured_headless_lines(),
+            vec!["[headless-default] node=- type=user__select answer=null"]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_prose_question_logs_exactly_one_line_per_action() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let args = json!({ "question": "headless prose any", "options": ["a", "b"] });
+
+        for action in ["select", "confirm", "input", "checkbox"] {
+            handle_user_tool(&mut ctx, &format!("user__{action}"), &args)
+                .await
+                .unwrap();
+            assert_eq!(
+                take_captured_headless_lines(),
+                vec![format!(
+                    "[headless-default] node=- type=user__{action} answer=null"
+                )]
+            );
+        }
     }
 
     #[tokio::test]
     #[serial]
     async fn acp_question_keeps_needs_human_result_and_queues_permission() {
         let _mode = HeadlessModeGuard::set(true, true);
+        take_captured_headless_lines();
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         let question = "acp pick unchanged-q7v";
         let args = json!({ "question": question, "options": ["a", "b"] });
@@ -498,6 +544,7 @@ mod tests {
             queued,
             vec![json!({ "action": "select", "question": question, "options": ["a", "b"] })]
         );
+        assert!(take_captured_headless_lines().is_empty());
     }
 
     #[test]

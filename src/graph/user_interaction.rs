@@ -2,7 +2,7 @@ use super::state::StateManager;
 use super::types::{ApprovalNode, InputNode};
 use crate::config::RequestContext;
 use crate::function::user_interaction::{
-    HEADLESS_GUIDANCE, USER_FUNCTION_PREFIX, handle_user_tool, headless_default_line,
+    HEADLESS_GUIDANCE, USER_FUNCTION_PREFIX, emit_headless_default, handle_user_tool,
     headless_without_acp,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,7 +18,9 @@ const REPEATS_BEFORE_SECOND_OPTION: usize = 2;
 
 /// Counts headless auto-answers for one graph execution so a loop that keeps
 /// re-asking the same question eventually takes a different option, and a
-/// node that never stops asking fails the run. Clones share the counts.
+/// node that never stops asking fails the run. Clones share the counts, so
+/// frontier branches of one run count together; each map item chain gets
+/// its own guard and counts separately, and a child graph run starts fresh.
 #[derive(Clone, Default)]
 pub struct HeadlessAnswerGuard {
     counts: Arc<Mutex<HeadlessAnswerCounts>>,
@@ -31,23 +33,29 @@ struct HeadlessAnswerCounts {
 }
 
 impl HeadlessAnswerGuard {
-    /// Records one auto-answer and returns how many times this node already
-    /// auto-answered this exact question.
-    fn record(&self, node_id: &str, question: &str) -> Result<usize> {
+    /// Counts one auto-answer against the node, failing once the node has
+    /// already been auto-answered the maximum number of times.
+    fn record_node(&self, node_id: &str) -> Result<()> {
         let mut counts = self.counts.lock();
         let node_total = counts.per_node.entry(node_id.to_string()).or_default();
         if *node_total >= MAX_HEADLESS_ANSWERS_PER_NODE {
             bail!("headless: node {node_id} auto-answered {MAX_HEADLESS_ANSWERS_PER_NODE} times");
         }
         *node_total += 1;
+        Ok(())
+    }
 
+    /// Returns how many times this node already auto-answered this exact
+    /// question, then counts the current ask.
+    fn record_question(&self, node_id: &str, question: &str) -> usize {
+        let mut counts = self.counts.lock();
         let repeats = counts
             .per_question
             .entry((node_id.to_string(), question.to_string()))
             .or_default();
         let previous = *repeats;
         *repeats += 1;
-        Ok(previous)
+        previous
     }
 }
 
@@ -67,10 +75,7 @@ impl ApprovalNodeExecutor {
 
         let choice = if headless_without_acp() {
             let choice = headless_approval_choice(node_id, node, &question, guard)?;
-            eprintln!(
-                "{}",
-                headless_default_line(Some(node_id), "approval", Some(&choice))
-            );
+            emit_headless_default(Some(node_id), "approval", Some(&choice));
             choice
         } else {
             prompt_approval(node, &question, ctx).await?
@@ -115,7 +120,8 @@ fn headless_approval_choice(
     let Some(first) = node.options.first() else {
         bail!("headless: approval node {node_id} has no options to default to");
     };
-    let repeats = guard.record(node_id, question)?;
+    guard.record_node(node_id)?;
+    let repeats = guard.record_question(node_id, question);
     let choice = if repeats >= REPEATS_BEFORE_SECOND_OPTION {
         node.options.get(1).unwrap_or(first)
     } else {
@@ -138,12 +144,9 @@ impl InputNodeExecutor {
         let question = build_input_question(node, state_manager)?;
 
         let input_text = if headless_without_acp() {
-            guard.record(node_id, &question)?;
+            guard.record_node(node_id)?;
             let text = headless_input_text(node, state_manager);
-            eprintln!(
-                "{}",
-                headless_default_line(Some(node_id), "input", Some(&text))
-            );
+            emit_headless_default(Some(node_id), "input", Some(&text));
             text
         } else {
             prompt_input(node, &question, state_manager, ctx).await?
@@ -311,6 +314,7 @@ mod tests {
     use super::*;
     use crate::config::{AppState, WorkingMode};
     use crate::function::user_interaction::HeadlessModeGuard;
+    use crate::function::user_interaction::headless_capture::take_captured_headless_lines;
     use crate::supervisor::escalation::EscalationQueue;
     use serde_json::json;
     use serial_test::serial;
@@ -360,6 +364,7 @@ mod tests {
     #[serial]
     async fn headless_approval_takes_first_option_and_routes_to_it() {
         let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
         let mut node = approval(
             &["yes", "no"],
             &[("yes", "deploy"), ("no", "cancel")],
@@ -380,6 +385,10 @@ mod tests {
 
         assert_eq!(next, "deploy");
         assert_eq!(state.state().get("decision"), Some(&json!("yes")));
+        assert_eq!(
+            take_captured_headless_lines(),
+            vec![r#"[headless-default] node=gate type=approval answer="yes""#]
+        );
     }
 
     #[test]
@@ -461,6 +470,7 @@ mod tests {
     #[serial]
     async fn headless_input_answers_count_toward_the_node_backstop() {
         let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
         let mut node = input("Name?");
         node.default = Some("alice".into());
         let guard = HeadlessAnswerGuard::default();
@@ -477,6 +487,7 @@ mod tests {
             .await
             .unwrap();
         }
+        assert_eq!(take_captured_headless_lines().len(), 25);
 
         let err = InputNodeExecutor::execute(
             "ask",
@@ -490,6 +501,33 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "headless: node ask auto-answered 25 times");
+        assert!(take_captured_headless_lines().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_approval_backstop_writes_no_line_for_the_failed_ask() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let node = approval(&["yes", "no"], &[], "clarify");
+        let guard = HeadlessAnswerGuard::default();
+        let mut state = manager_with(&[]);
+        for _ in 0..25 {
+            ApprovalNodeExecutor::execute("gate", &node, &mut state, &mut test_ctx(), &guard)
+                .await
+                .unwrap();
+        }
+        assert_eq!(take_captured_headless_lines().len(), 25);
+
+        let err = ApprovalNodeExecutor::execute("gate", &node, &mut state, &mut test_ctx(), &guard)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "headless: node gate auto-answered 25 times"
+        );
+        assert!(take_captured_headless_lines().is_empty());
     }
 
     async fn run_headless_input(node: &InputNode, state: &mut StateManager) -> Result<String> {
@@ -508,6 +546,7 @@ mod tests {
     #[serial]
     async fn headless_input_uses_the_interpolated_default() {
         let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
         let mut node = input("Name?");
         node.default = Some("{{name}}".into());
         node.state_updates = capture_into("answer", INPUT_KEY);
@@ -517,6 +556,10 @@ mod tests {
 
         assert_eq!(next, "next");
         assert_eq!(state.state().get("answer"), Some(&json!("alice")));
+        assert_eq!(
+            take_captured_headless_lines(),
+            vec![r#"[headless-default] node=ask type=input answer="alice""#]
+        );
     }
 
     #[tokio::test]
@@ -573,6 +616,7 @@ mod tests {
     #[serial]
     async fn non_headless_approval_still_asks_and_routes_on_the_human_answer() {
         let _mode = HeadlessModeGuard::set(false, false);
+        take_captured_headless_lines();
         let node = approval(
             &["yes", "no"],
             &[("yes", "deploy"), ("no", "cancel")],
@@ -601,12 +645,51 @@ mod tests {
         let (next, ()) = tokio::join!(ask, reply);
 
         assert_eq!(next.unwrap(), "cancel");
+        assert!(take_captured_headless_lines().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_headless_input_still_asks_and_takes_the_default_on_an_empty_answer() {
+        let _mode = HeadlessModeGuard::set(false, false);
+        take_captured_headless_lines();
+        let mut node = input("Name?");
+        node.default = Some("{{name}}".into());
+        node.state_updates = capture_into("answer", INPUT_KEY);
+        let queue = Arc::new(EscalationQueue::new());
+        let mut ctx = test_ctx();
+        ctx.current_depth = 1;
+        ctx.escalation_queue = Some(Arc::clone(&queue));
+        let mut state = manager_with(&[("name", json!("alice"))]);
+
+        let guard = HeadlessAnswerGuard::default();
+        let ask =
+            InputNodeExecutor::execute("ask", &node, Some("next"), &mut state, &mut ctx, &guard);
+        let reply = async {
+            for _ in 0..1000 {
+                if let Some(entry) = queue.pending_summary().first() {
+                    let id = entry["escalation_id"].as_str().unwrap().to_string();
+                    let request = queue.take(&id).unwrap();
+                    assert_eq!(request.question, "[input] Name? [default: alice]");
+                    let _ = request.reply_tx.send(String::new());
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("input question must reach the escalation queue");
+        };
+        let (next, ()) = tokio::join!(ask, reply);
+
+        assert_eq!(next.unwrap(), "next");
+        assert_eq!(state.state().get("answer"), Some(&json!("alice")));
+        assert!(take_captured_headless_lines().is_empty());
     }
 
     #[tokio::test]
     #[serial]
     async fn acp_approval_still_fails_on_the_missing_answer_and_queues_permission() {
         let _mode = HeadlessModeGuard::set(true, true);
+        take_captured_headless_lines();
         let mut node = approval(&["yes", "no"], &[("yes", "deploy")], "clarify");
         node.question = "acp approval unchanged-m3d".into();
         let mut state = manager_with(&[]);
@@ -627,6 +710,7 @@ mod tests {
             .filter(|p| p["question"] == "acp approval unchanged-m3d")
             .count();
         assert_eq!(queued, 1);
+        assert!(take_captured_headless_lines().is_empty());
     }
 
     #[test]
