@@ -3817,15 +3817,17 @@ fn esc_still_cancels_a_clipped_confirm_question() {
     assert_tty_restored(&transcript);
 }
 
-/// Writes an `$EDITOR` that only records the path it was asked to open
-/// into `launched` and returns the editor's path.
+/// Writes an `$EDITOR` that records the path it was asked to open into
+/// `launched` and saves that file the way an editor's save would (a new
+/// role or macro exists only once its editor wrote it); returns the
+/// editor's path.
 fn recording_editor(dir: &Path, launched: &Path) -> String {
     use std::os::unix::fs::PermissionsExt;
     let editor = dir.join("recording-editor.sh");
     fs::write(
         &editor,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{}'\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{}'\n[ -e \"$1\" ] || printf 'saved\\n' > \"$1\"\nexit 0\n",
             launched.display()
         ),
     )

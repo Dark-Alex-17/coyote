@@ -429,18 +429,32 @@ fn assert_composer_takes_keys(pty: &mut Pty, after: usize, what: &str) {
 /// Lines above the composer's rule that mention the editor and an exit,
 /// status, failure or error: what a report of a failed editor looks like
 /// whatever its exact wording.
+/// Every editor report painted above the composer rule. A repainted
+/// frame carries no row breaks (its rows are cursor-positioned), so the
+/// report is cut out by its own shape: from `The editor` to the status
+/// number that ends it.
 fn editor_report_lines(frame: &str) -> Vec<String> {
-    above_rule(frame)
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            lower.contains("editor")
-                && ["exit", "status", "fail", "error", "code"]
-                    .iter()
-                    .any(|w| lower.contains(w))
-        })
-        .collect()
+    let flat = above_rule(frame)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut reports = Vec::new();
+    let mut rest = flat.as_str();
+    while let Some(at) = rest.find("The editor") {
+        let tail = &rest[at..];
+        let end = tail
+            .find(|c: char| c.is_ascii_digit())
+            .map(|digits| {
+                digits
+                    + tail[digits..]
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(tail.len() - digits)
+            })
+            .unwrap_or(tail.len());
+        reports.push(tail[..end].to_string());
+        rest = &tail[end..];
+    }
+    reports
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
