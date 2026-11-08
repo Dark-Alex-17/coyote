@@ -2,6 +2,7 @@ use super::executor::{PeerRetireGuard, StepContext, StepResult, step};
 use super::logging::route_suffix;
 use super::state::{StateManager, is_lone_template};
 use super::types::{ConcurrencyCap, Graph, MapNode, Node, NodeType};
+use super::user_interaction::HeadlessAnswerGuard;
 use super::validator::branch_subgraph;
 use crate::config::{RenderMode, RequestContext};
 use crate::graph::type_name;
@@ -93,7 +94,6 @@ async fn run_map(
         let max_concurrency = step_ctx.max_concurrency;
         let sem = semaphore.clone();
         let abort = step_ctx.abort_signal.clone();
-        let headless_answers = step_ctx.headless_answers.clone();
 
         // Cancellation net behind the chain runner's own retirement: a task
         // aborted before or during its chain still leaves the item's identity
@@ -121,7 +121,7 @@ async fn run_map(
                 max_concurrency,
                 abort_signal: &abort,
                 branch_mode: true,
-                headless_answers,
+                headless_answers: HeadlessAnswerGuard::default(),
             };
             let chain = ItemChain {
                 map_id: &map_id,
@@ -761,7 +761,6 @@ mod tests {
 mod chain_tests {
     use super::super::executor::GraphExecutor;
     use super::super::script::ScriptExecutor;
-    use super::super::user_interaction::HeadlessAnswerGuard;
     use super::*;
     use crate::config::paths;
     use crate::config::{AppState, Role, WorkingMode};
