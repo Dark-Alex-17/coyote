@@ -929,9 +929,6 @@ pub(crate) struct App {
     clock: Arc<dyn Clock>,
     frames: FrameScheduler,
     renderer: Renderer,
-    /// Read once at start: `NO_COLOR` drops the UI's own colours while the
-    /// attributes stay.
-    no_color: bool,
     /// The enabled macros as (name, description), refreshed with the
     /// context since a turn can enable or shadow one: the typed-command
     /// highlight accepts them as known and the palette lists them.
@@ -1008,7 +1005,6 @@ impl App {
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
-            no_color: *crate::utils::NO_COLOR,
             macros: Vec::new(),
             view: View::Composer,
             palette_snapshot: PaletteSnapshot::EMPTY,
@@ -1029,7 +1025,7 @@ impl App {
 
     #[cfg(test)]
     fn set_no_color(&mut self, no_color: bool) {
-        self.no_color = no_color;
+        self.renderer.no_color = no_color;
     }
 
     pub(crate) fn composer_text(&self) -> String {
@@ -1058,7 +1054,8 @@ impl App {
                 let background = field_background(config, &options);
                 Renderer::new(options).map(|renderer| (renderer, background))
             }) {
-                Ok((renderer, background)) => {
+                Ok((mut renderer, background)) => {
+                    renderer.no_color = self.renderer.no_color;
                     self.renderer = renderer;
                     self.composer.set_background(background);
                 }
@@ -2360,7 +2357,7 @@ impl App {
                     self.composer.view(
                         self.config.command_prefix,
                         &macro_names,
-                        self.no_color,
+                        self.renderer.no_color,
                         self.vi_mode == Some(ViMode::Normal),
                     ),
                     field,
@@ -4424,6 +4421,10 @@ mod tests {
             !buffer[(0, typed)].modifier.contains(Modifier::DIM),
             "{frame}"
         );
+        let placeholder = &buffer[(1, COMPOSER_TEXT_ROW)];
+        assert_eq!(placeholder.symbol(), "T", "{frame}");
+        assert!(placeholder.modifier.contains(Modifier::DIM), "{frame}");
+        assert_eq!(placeholder.bg, Color::Indexed(236), "{frame}");
     }
 
     #[test]
@@ -4433,6 +4434,11 @@ mod tests {
         let frame = mid_turn_transcript(&mut harness);
         insta::assert_snapshot!("mid_turn_cell_nocolor_80x24", &frame);
         assert!(frame.contains("(sent mid-turn)"), "{frame}");
+        let buffer = harness.terminal.backend().buffer();
+        let placeholder = &buffer[(1, COMPOSER_TEXT_ROW)];
+        assert_eq!(placeholder.symbol(), "T", "{frame}");
+        assert!(placeholder.modifier.contains(Modifier::DIM), "{frame}");
+        assert_eq!(placeholder.bg, Color::Reset, "{frame}");
     }
 
     /// Esc during a turn drops what was lined up behind it and says so.
@@ -5915,6 +5921,24 @@ mod tests {
             let style = chrome_style(dim, no_color);
             assert_eq!(style.fg, None);
             assert!(style.add_modifier.contains(Modifier::DIM));
+        }
+    }
+
+    /// The transcript's cells take the colour decision from the same
+    /// switch the composer does, so one flip covers the whole frame.
+    #[test]
+    fn a_drawn_error_cell_follows_the_no_color_switch() {
+        for (no_color, fg) in [(false, Color::Red), (true, Color::Reset)] {
+            let mut harness = Harness::standalone(60, 12);
+            harness.app.set_no_color(no_color);
+            harness.app.transcript.push(Cell::Error {
+                text: "broken q8c".to_string(),
+                cache: LineCache::default(),
+            });
+            let frame = harness.draw();
+            let row = screen_row(&harness, "broken q8c");
+            let buffer = harness.terminal.backend().buffer();
+            assert_eq!(buffer[(0, row)].fg, fg, "{no_color}: {frame}");
         }
     }
 

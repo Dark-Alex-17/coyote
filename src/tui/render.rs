@@ -289,6 +289,9 @@ pub(crate) struct Renderer {
     /// The user's `wrap` cap in columns, when it is a number; `auto` and
     /// `no` leave the pane width to decide alone.
     wrap_cap: Option<u16>,
+    /// `NO_COLOR` at start: the UI's own colours are dropped while the
+    /// attributes stay. Tests flip it through `App::set_no_color`.
+    pub(super) no_color: bool,
 }
 
 impl Renderer {
@@ -302,7 +305,11 @@ impl Renderer {
             wrap: None,
             ..options
         })?;
-        Ok(Self { markdown, wrap_cap })
+        Ok(Self {
+            markdown,
+            wrap_cap,
+            no_color: *crate::utils::NO_COLOR,
+        })
     }
 
     /// Markdown laid out at `width` by the renderer itself: it wraps prose

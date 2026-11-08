@@ -393,6 +393,21 @@ mod tests {
     }
 
     #[test]
+    fn the_placeholder_is_dim_with_and_without_colour() {
+        for no_color in [false, true] {
+            let buf = render("", CommandPrefix::Dot, &[], no_color);
+            let row: String = (1..AREA.width).map(|x| buf[(x, 1)].symbol()).collect();
+            assert!(row.starts_with("Type a prompt"), "{no_color}: {row:?}");
+            assert!(
+                (1..5).all(|x| buf[(x, 1)].modifier.contains(Modifier::DIM)),
+                "{no_color}: {:?}",
+                first_row(&buf)
+            );
+            assert_eq!(buf[(1, 1)].fg, Color::Reset);
+        }
+    }
+
+    #[test]
     fn the_rule_and_the_surface_frame_the_field() {
         let buf = render("hi", CommandPrefix::Dot, &[], false);
         assert_eq!(buf[(0, 0)].symbol(), HORIZONTAL);

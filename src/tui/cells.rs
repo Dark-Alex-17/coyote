@@ -380,7 +380,7 @@ impl Cell {
     }
 
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
-        let no_color = *crate::utils::NO_COLOR;
+        let no_color = renderer.no_color;
         match self {
             Cell::User {
                 text,
