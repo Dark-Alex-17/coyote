@@ -13,8 +13,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 pub const USER_FUNCTION_PREFIX: &str = "user__";
-pub const HEADLESS_GUIDANCE: &str =
-    "No human is present. Apply a sensible default or abort the task.";
+pub const HEADLESS_GUIDANCE: &str = "No human is available to answer. Go with the recommended option; if none is marked, use your best judgment.";
 
 const DEFAULT_ESCALATION_TIMEOUT_SECS: u64 = 0;
 const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
@@ -457,6 +456,18 @@ mod tests {
         assert_eq!(v["needs_human"], true);
         assert_eq!(v["action"], "confirm");
         assert_eq!(v["options"], json!([]));
+    }
+
+    #[test]
+    fn headless_guidance_is_neutral_and_names_no_terminal_action() {
+        assert_eq!(
+            HEADLESS_GUIDANCE,
+            "No human is available to answer. Go with the recommended option; if none is marked, use your best judgment."
+        );
+        let lowered = HEADLESS_GUIDANCE.to_lowercase();
+        for word in ["abort", "stop", "cancel", "quit", "skip", "reject"] {
+            assert!(!lowered.contains(word), "guidance contains {word:?}");
+        }
     }
 
     #[test]
