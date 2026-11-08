@@ -113,6 +113,10 @@ pub(crate) fn classify_command(
     // fence glued to the command is not read as part of its name.
     let inner = unfence(line);
     let fence = inner.as_ptr() as usize - line.as_ptr() as usize;
+    debug_assert!(
+        fence + inner.len() <= line.len(),
+        "unfence returned text that is not a subslice of its input"
+    );
     let within = &line[..fence + inner.len()];
     let start = fence + inner.len() - inner.trim_start().len();
     let sigil = within[start..]

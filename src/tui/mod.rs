@@ -7062,6 +7062,18 @@ mod tests {
             reply.clone(),
         );
         let checkbox = PendingPrompt::new(list_request(PromptAction::Checkbox, None), reply);
+        let dot = crate::config::CommandPrefix::Dot;
+        let palette = PaletteState::build(".in", dot, PaletteSnapshot::EMPTY, &[], None)
+            .expect("`.in` lists commands");
+        let mut history = ComposerHistory::default();
+        history.push("one");
+        let search = SearchState::new(&history);
+        let (rewind, _) = RewindState::from_cells(plain.app.transcript.cells(), dot);
+        let rewind = rewind.expect("the exchange is a rewind row");
+        let queued = vec![QueuedLine {
+            text: "later".to_string(),
+            command: false,
+        }];
         let mut widgets: Vec<(&str, Draw<'_>)> = vec![
             (
                 "transcript (welcome)",
@@ -7126,6 +7138,22 @@ mod tests {
             (
                 "todo panel",
                 Box::new(|area, buf| (&todo).render(area, buf)),
+            ),
+            (
+                "palette band",
+                Box::new(|area, buf| PaletteView(&palette).render(area, buf)),
+            ),
+            (
+                "search band",
+                Box::new(|area, buf| SearchView(&search).render(area, buf)),
+            ),
+            (
+                "rewind band",
+                Box::new(|area, buf| RewindView(&rewind).render(area, buf)),
+            ),
+            (
+                "queued preview",
+                Box::new(|area, buf| QueuedPreview(&queued).render(area, buf)),
             ),
         ];
         let screen = Rect::new(0, 0, 10, 3);

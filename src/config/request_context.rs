@@ -12140,6 +12140,26 @@ mod tests {
         assert_eq!(ctx.role.as_ref().unwrap().name(), TEMP_ROLE_NAME);
     }
 
+    /// With no human to confirm, `.role <new>` and `.macro new` fail on
+    /// the headless prompter's text answer and open no editor and write
+    /// nothing, not even the macros directory.
+    #[test]
+    #[serial]
+    fn new_role_and_new_macro_with_no_human_create_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+
+        let err = ctx.new_role(&app, "headless-role").unwrap_err();
+        assert_eq!(err.to_string(), "Unexpected answer to the confirm prompt");
+        assert!(!paths::role_file("headless-role").exists());
+
+        let err = ctx.new_macro(&app, "headless-macro").unwrap_err();
+        assert_eq!(err.to_string(), "Unexpected answer to the confirm prompt");
+        assert!(!paths::macros_dir().exists());
+    }
+
     /// A seeded child hands out the very signal `agent__cancel` sets; the
     /// root, with nothing seeded, gets a fresh one each time.
     #[test]

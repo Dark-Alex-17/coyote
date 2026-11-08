@@ -509,7 +509,11 @@ fn a_hidden_verb_typed_in_full_still_runs_and_the_ui_survives() {
     pty.resize(60, 140).unwrap();
     pty.read_for(Duration::from_millis(500));
 
-    for verb in ["rag", "vault", "uninstall"] {
+    for (verb, outcome) in [
+        ("rag", "Interactive prompts are not available"),
+        ("vault", "Usage: .vault"),
+        ("uninstall", "Usage: .uninstall"),
+    ] {
         let at = pty.raw().len();
         pty.send(format!(".{verb}\r").as_bytes()).unwrap();
         let started = Instant::now();
@@ -522,10 +526,13 @@ fn a_hidden_verb_typed_in_full_still_runs_and_the_ui_survives() {
             "`.{verb}` held the turn for {:?}",
             started.elapsed()
         );
-        let after = since(&pty, at);
+        // The command cell's header and its refusal or usage: the typed
+        // line alone would also be echoed by the composer.
+        let after = squeezed(&since(&pty, at));
         assert!(
-            after.contains(&format!(".{verb}")),
-            "`.{verb}` left no trace in the transcript (not run at all?):\n{after}"
+            after.contains(&format!(">.{verb}")) && after.contains(&squeezed(outcome)),
+            "`.{verb}` did not run to `{outcome}` in the transcript:\n{}",
+            since(&pty, at)
         );
     }
     quit_and_check(&mut pty);

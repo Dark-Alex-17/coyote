@@ -113,6 +113,9 @@ impl PromptAnswer {
             PromptAnswer::Selected(choice) => choice.clone(),
             PromptAnswer::Checked(choices) => json!(choices).to_string(),
             PromptAnswer::Text(_) if action == PromptAction::Password => "<redacted>".to_string(),
+            // Only the headless prompter answers a confirm with text: its
+            // `needs_human` JSON, which the bus reports like a refusal.
+            PromptAnswer::Text(_) if action == PromptAction::Confirm => "<needs_human>".to_string(),
             PromptAnswer::Text(text) => text.clone(),
             PromptAnswer::Cancelled => "<cancelled>".to_string(),
         }
@@ -701,6 +704,7 @@ mod tests {
         let text = PromptAnswer::Text("hunter2".to_string());
         assert_eq!(text.summary(PromptAction::Password), "<redacted>");
         assert_eq!(text.summary(PromptAction::Input), "hunter2");
+        assert_eq!(text.summary(PromptAction::Confirm), "<needs_human>");
         assert_eq!(
             PromptAnswer::Confirmed(true).summary(PromptAction::Confirm),
             "yes"

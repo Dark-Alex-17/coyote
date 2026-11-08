@@ -307,9 +307,6 @@ impl Drop for CacheDirGuard {
 
 /// A fresh directory under the temp dir for a test's scratch files,
 /// removed on drop, including on panic, so no outcome leaves them behind.
-/// It reads `std::env::temp_dir()` at construction, so a test using it
-/// runs `#[serial]` alongside the users of `TmpdirRedirectGuard`, whose
-/// redirected root is removed when that guard drops.
 pub(crate) struct ScratchDirGuard {
     pub(crate) path: PathBuf,
 }
@@ -343,6 +340,11 @@ pub(crate) struct TempNeedleGuard {
 
 impl TempNeedleGuard {
     pub(crate) fn new(needle: &str) -> Self {
+        assert!(
+            needle.len() >= 12,
+            "a temp needle of {} bytes could match another test's files: {needle:?}",
+            needle.len()
+        );
         let guard = Self {
             needle: needle.to_string(),
         };

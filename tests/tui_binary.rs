@@ -3935,6 +3935,8 @@ fn dot_edit_session_opens_the_editor_on_the_lent_terminal() {
         "no named-sess-xk3 session file appeared under {dir:?}:\n{since}"
     );
 
+    pty.wait_for_after("Type a prompt", re_entered, PTY_DEADLINE)
+        .expect("the composer was not repainted after the session editor returned");
     pty.send(b".info\r").unwrap();
     pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
         .expect("keys were not handled after the session editor returned");
