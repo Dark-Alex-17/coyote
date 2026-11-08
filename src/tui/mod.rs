@@ -1253,6 +1253,15 @@ impl App {
         self.palette_dirty = false;
     }
 
+    /// Puts a history entry in the composer. Walking the history is not
+    /// an edit: the palette stays closed so the next Up or Down keeps
+    /// walking, and it reopens with the first real edit.
+    fn recall_history_entry(&mut self, text: &str) {
+        self.composer.set_text(text);
+        self.close_view();
+        self.schedule_frame();
+    }
+
     fn record_history(&mut self, line: &str) {
         self.history.push(line);
         if let Some(path) = &self.history_file
@@ -1557,13 +1566,13 @@ impl App {
             Action::HistoryPrev => {
                 let draft = self.composer_text();
                 if let Some(entry) = self.history.prev(&draft).map(str::to_string) {
-                    self.set_composer_text(&entry);
+                    self.recall_history_entry(&entry);
                 }
                 None
             }
             Action::HistoryNext => {
                 if let Some(text) = self.history.next() {
-                    self.set_composer_text(&text);
+                    self.recall_history_entry(&text);
                 }
                 None
             }
@@ -7312,6 +7321,28 @@ mod tests {
         assert_eq!(harness.app.composer_text(), "draft");
         harness.press(KeyCode::Up);
         assert_eq!(harness.app.composer_text(), "second");
+    }
+
+    /// A recalled command line is not an edit: the palette stays shut so
+    /// Up keeps walking instead of moving a highlight, and the first real
+    /// edit brings the palette back.
+    #[test]
+    fn walking_the_history_does_not_reopen_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        for line in [".info", "plain", ".help"] {
+            harness.app.history.push(line);
+        }
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".info");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Backspace);
+        assert_eq!(harness.app.composer_text(), ".inf");
+        assert!(palette(&harness).is_some());
     }
 
     #[test]
