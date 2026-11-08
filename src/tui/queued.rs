@@ -66,11 +66,13 @@ pub(super) fn unqueue_user_message(queue: &NotificationQueue, text: &str) -> boo
         .is_some()
 }
 
-/// Drops the prompts the turn's driver handed to the model. Drains are
-/// whole and in order, so the prompts still held appear in `unsent` in
-/// order, after anything an interrupt dropped from the strip but not yet
-/// from the queue; the match walks both from the newest end and skips
-/// those stale leading entries. The commands, never pushed, all stay.
+/// The end-of-turn backstop behind `remove_sent`: a line normally leaves
+/// the strip the moment the driver reports it sent, so this pass only
+/// catches a report the turn's end overtook. Drains are whole and in
+/// order, so the prompts still held appear in `unsent` in order, after
+/// anything an interrupt dropped from the strip but not yet from the
+/// queue; the match walks both from the newest end and skips those
+/// stale leading entries. The commands, never pushed, all stay.
 pub(super) fn reconcile_queue(queued: &mut Vec<QueuedLine>, unsent: &[String]) {
     let mut unsent = unsent.iter().rev().peekable();
     let mut kept: Vec<QueuedLine> = Vec::with_capacity(queued.len());

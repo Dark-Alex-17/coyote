@@ -910,8 +910,25 @@ fn esc_esc_with_nothing_above_the_macro_turn_does_not_crash_or_pop() {
 // still leads the group.
 // ---------------------------------------------------------------------
 
-fn pid_in(path: &Path) -> Option<i32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+/// The pid a script wrote to `path`. The file is created empty before
+/// the pid lands in it, so an empty or partial read is retried until the
+/// deadline.
+fn wait_for_pid_in(pty: &mut Pty, path: &Path, what: &str) -> i32 {
+    let deadline = Instant::now() + PTY_DEADLINE;
+    loop {
+        if let Some(pid) = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        let text = pty.read_for(Duration::from_millis(50));
+        assert!(
+            Instant::now() < deadline,
+            "{what}: no pid landed in {}:\n{text}",
+            path.display()
+        );
+    }
 }
 
 /// A reaped pid answers ESRCH to a null signal; a zombie or a running
@@ -998,8 +1015,7 @@ fn a_backtick_document_commands_grandchild_dies_on_esc_while_its_shell_leads_the
         pty.send(format!(".file `sh {script}` -- summarize\r").as_bytes())
             .unwrap();
         // The sleeper must be up before Esc, or the test proves nothing.
-        wait_for_file(&mut pty, pid_file, &format!("{what}: the sleeper's pid"));
-        let pid = pid_in(pid_file).expect("the pid file holds a pid");
+        let pid = wait_for_pid_in(&mut pty, pid_file, &format!("{what}: the sleeper's pid"));
         sleepers.push(pid);
         assert!(
             process_alive(pid),

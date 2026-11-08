@@ -1446,16 +1446,22 @@ mod tests {
 
         /// Runs `script` as a document command under the TUI and drops the
         /// future as soon as `ready` reads a pid out of `pid_file`.
-        /// Returns that pid and how long the drop took.
+        /// Returns that pid and how long the drop took. The script is
+        /// written beside the pid file and `exec`ed into `sh`, so its `$$`
+        /// and `$!` do not depend on whatever `$SHELL` the command line
+        /// uses and `$$` is the group leader's pid.
         fn drop_document_command_once_pid_written(
             script: &str,
             pid_file: &std::path::Path,
             ready: impl Fn(&str) -> Option<i32>,
         ) -> (i32, std::time::Duration) {
             let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+            let script_file = pid_file.with_extension("sh");
+            fs::write(&script_file, script).unwrap();
+            let command = format!("exec sh '{}'", script_file.display());
             let mut dropped_at = None;
             let pid = run_async(async {
-                let command = run_document_command(script);
+                let command = run_document_command(&command);
                 tokio::pin!(command);
                 loop {
                     tokio::select! {

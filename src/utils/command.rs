@@ -292,23 +292,29 @@ pub fn ensure_prompts_available() -> Result<()> {
 }
 
 /// Opens `path` in `editor` and waits for it; under the TUI the editor
-/// gets the terminal lent to it.
+/// gets the terminal lent to it. An editor that exits non-zero is
+/// reported, not failed on: the file may well have been written.
 pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
-    if crate::tui::active() {
+    let status = if crate::tui::active() {
         let editor = editor.to_string();
         let path = path.to_path_buf();
-        return crate::tui::lend_terminal(move |tty| {
+        crate::tui::lend_terminal(move |tty| -> io::Result<ExitStatus> {
             Command::new(&editor)
                 .arg(&path)
                 .stdin(Stdio::inherit())
                 .stdout(tty.stdio()?)
                 .stderr(tty.stdio()?)
-                .status()?;
-            Ok(())
-        })?;
+                .status()
+        })??
+    } else {
+        Command::new(editor).arg(path).status()?
+    };
+    if !status.success() {
+        println!(
+            "{}",
+            warning_text(&format!("The editor exited with {status}"))
+        );
     }
-    let mut child = Command::new(editor).arg(path).spawn()?;
-    child.wait()?;
     Ok(())
 }
 

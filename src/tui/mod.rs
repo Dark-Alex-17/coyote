@@ -839,9 +839,10 @@ fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix
 /// What stops the rewind picker at a command line, under the macros
 /// enabled when it ran: a macro (`.<name>` or `.macro <name>`, not the
 /// enable/disable toggles) stands for exchanges the transcript never
-/// counted; `.session`, `.agent`, `.fork`, `.undo`, `.edit session` and
-/// the session and agent forms of `.exit`, `.empty` and `.compress` leave
-/// the context holding history the transcript never showed.
+/// counted; `.session`, `.agent <name>`, `.fork`, `.undo`, `.edit
+/// session` and the session and agent forms of `.exit`, `.empty` and
+/// `.compress` leave the context holding history the transcript never
+/// showed. A bare `.agent` only prints its usage.
 fn rewind_barrier(
     line: &str,
     prefix: crate::config::CommandPrefix,
@@ -853,7 +854,7 @@ fn rewind_barrier(
         (".macro", Some(first)) => {
             (!matches!(first, "enable" | "disable")).then_some(RewindBarrier::Macro)
         }
-        (".session" | ".agent" | ".fork" | ".undo", _) => Some(RewindBarrier::Session),
+        (".session" | ".fork" | ".undo", _) | (".agent", Some(_)) => Some(RewindBarrier::Session),
         (".exit", Some("session" | "agent"))
         | (".empty" | ".compress" | ".edit", Some("session")) => Some(RewindBarrier::Session),
         (word, _) => word
@@ -1042,6 +1043,9 @@ impl App {
 
     pub(crate) fn set_composer_text(&mut self, text: &str) {
         self.composer.set_text(text);
+        // Text put there by anything but the walk ends the walk: the next
+        // Up starts from the newest entry again.
+        self.history.reset();
         self.palette_dirty = true;
         self.schedule_frame();
     }
@@ -1430,6 +1434,7 @@ impl App {
                     Some(text) => self.recall_history_entry(&text),
                     None => self.close_view(),
                 }
+                self.history.reset();
                 None
             }
             View::Rewind(rewind) => {
@@ -1860,6 +1865,9 @@ impl App {
             }
             UiMsg::TodoUpdated(items) => self.todo.set_items(items),
             UiMsg::QueuedInputSent(text) => {
+                // The cell is committed whether or not a held line matched:
+                // the model received the text either way, and the strip may
+                // already have let it go (an interrupt's drop, a swap).
                 remove_sent(&mut self.queued, &text);
                 self.transcript.push(Cell::user_mid_turn(plain_text(&text)))
             }
@@ -4482,7 +4490,9 @@ mod tests {
         let frame = mid_turn_transcript(&mut harness);
         insta::assert_snapshot!("mid_turn_cell_nocolor_80x24", &frame);
         assert!(frame.contains("(sent mid-turn)"), "{frame}");
+        let row = screen_row(&harness, "> follow-up k4e-m (sent mid-turn)");
         let buffer = harness.terminal.backend().buffer();
+        assert!(buffer[(0, row)].modifier.contains(Modifier::DIM), "{frame}");
         let placeholder = &buffer[(1, COMPOSER_TEXT_ROW)];
         assert_eq!(placeholder.symbol(), "T", "{frame}");
         assert!(placeholder.modifier.contains(Modifier::DIM), "{frame}");
@@ -7767,6 +7777,33 @@ mod tests {
         assert_eq!(harness.app.composer_text(), "plain");
     }
 
+    /// Clearing the composer mid-walk, or recalling an entry through the
+    /// search mid-walk, ends the walk: the next Up starts from the newest
+    /// entry rather than carrying on from where the walk was.
+    #[test]
+    fn clearing_or_searching_ends_the_history_walk() {
+        let mut harness = Harness::standalone(80, 24);
+        for line in [".info", "plain", ".help"] {
+            harness.app.history.push(line);
+        }
+        harness.press(KeyCode::Up);
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
+        harness.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert!(harness.app.composer.is_empty());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        harness.type_text(".in");
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert_eq!(harness.app.composer_text(), ".info");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+    }
+
     #[test]
     fn the_arrows_of_a_multi_line_draft_stay_with_the_cursor() {
         let mut harness = Harness::standalone(80, 24);
@@ -8305,6 +8342,7 @@ mod tests {
             rewind_barrier(".agent coder", dot, &[]),
             Some(RewindBarrier::Session)
         );
+        assert_eq!(rewind_barrier(".agent", dot, &[]), None);
         assert_eq!(
             rewind_barrier(".exit session", dot, &[]),
             Some(RewindBarrier::Session)
