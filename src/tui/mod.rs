@@ -1330,15 +1330,15 @@ impl App {
         if !second {
             return;
         }
-        let (rewind, skipped_macros) = RewindState::from_cells(
+        let (rewind, stopped_at_macro) = RewindState::from_cells(
             self.transcript.cells(),
             self.config.command_prefix,
             &self.macros,
         );
-        if skipped_macros {
+        if stopped_at_macro {
             self.push_notice(
                 NoticeKind::ToolWarning,
-                "Rewind skips macro turns".to_string(),
+                "Rewind stops at the last macro turn".to_string(),
             );
         }
         if let Some(rewind) = rewind {
@@ -2896,12 +2896,14 @@ fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> (usize, Option<any
 }
 
 /// Takes the chosen exchanges out of the session and the transcript and
-/// gives the oldest one's prompt back to the composer. The transcript
-/// goes back only as far as the session did, so the two stay in step,
-/// and a stop short of the choice is said. Without a session there is
-/// nothing to pop and the transcript is the whole of the rewind. The
-/// composer gets the row's own text, not the session's prefill: a
-/// command row holds the command, which the session never did.
+/// gives the oldest one's prompt back to the composer. Every offered row
+/// sits above the newest macro turn, so each one is a single exchange
+/// and popping one per row keeps the session and the transcript in
+/// step; the transcript goes back only as far as the session did, and a
+/// stop short of the choice is said. Without a session there is nothing
+/// to pop and the transcript is the whole of the rewind. The composer
+/// gets the row's own text, not the session's prefill: a command row
+/// holds the command, which the session never did.
 fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
     let chosen = target.rows.len();
     let (cut, stopped) = if ctx.session.is_some() {
@@ -7751,6 +7753,79 @@ mod tests {
         assert!(!ctx.session.as_ref().unwrap().has_user_messages());
         let frame = harness.draw();
         assert!(frame.contains("Rewind stopped: Nothing to undo"), "{frame}");
+    }
+
+    /// A macro's one transcript row stands for every exchange it ran, so
+    /// the picker offers only the rows above it: popping one exchange per
+    /// offered row leaves the session holding exactly what the transcript
+    /// still shows.
+    #[test]
+    fn a_rewind_above_a_macro_row_pops_one_exchange_per_offered_row() {
+        let mut ctx = chat_ctx();
+        let mut session = Session::default();
+        for prompt in [
+            "first question",
+            "macro step one",
+            "macro step two",
+            "third question",
+        ] {
+            let input = Input::from_str(&ctx, prompt, None).unwrap();
+            session.add_message(&input, "an answer").unwrap();
+        }
+        ctx.session = Some(session);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.macros = vec![("deploy".to_string(), "ship it".to_string())];
+        for (line, command) in [
+            ("first question", false),
+            (".deploy prod", true),
+            ("third question", false),
+        ] {
+            harness.app.begin_turn(line, command);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+            harness.app.end_turn(command, &TurnOutcome::default());
+        }
+        assert_eq!(harness.app.transcript.len(), 6);
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        let picker = rewind(&harness).expect("the newest row is offered");
+        assert_eq!(
+            picker.rows.len(),
+            1,
+            "nothing at or below the macro is offered"
+        );
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Rewind stops at the last macro turn"),
+            "{frame}"
+        );
+        let target = match harness.press(KeyCode::Enter) {
+            Some(Command::Rewind(target)) => target,
+            other => panic!("the row did not rewind: {other:?}"),
+        };
+        apply_rewind(&mut harness.app, &mut ctx, target);
+        let cells = harness.app.transcript.cells();
+        assert!(matches!(&cells[2], Cell::Command { name, .. } if name == ".deploy prod"));
+        assert!(
+            !cells
+                .iter()
+                .any(|cell| matches!(cell, Cell::User { text, .. } if text == "third question"))
+        );
+        assert_eq!(harness.app.composer_text(), "third question");
+        let session = ctx.session.as_ref().unwrap();
+        let prompts: Vec<&str> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role.is_user())
+            .filter_map(|m| m.content.as_text())
+            .collect();
+        assert_eq!(
+            prompts,
+            ["first question", "macro step one", "macro step two"],
+            "the macro's exchanges stay in the session as its row stays in the transcript"
+        );
+        assert!(!harness.draw().contains("Rewind stopped"));
     }
 
     #[test]

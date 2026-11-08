@@ -342,29 +342,41 @@ pub(super) struct RewindState {
 
 impl RewindState {
     /// None when no cell opened an exchange, so there is nothing to go
-    /// back to. A macro's row is skipped, since its one cell stands for
-    /// as many exchanges as the macro ran; the flag says whether any was.
+    /// back to. The rows stop at the newest macro: its one cell stands
+    /// for as many exchanges as the macro ran, so nothing at or below it
+    /// can be offered as a countable step back. The flag says whether a
+    /// macro cut the list short. A `.macro <name>` invocation counts as a
+    /// macro; `.macro enable`/`disable` only toggle one.
     pub(super) fn from_cells(
         cells: &[Cell],
         prefix: CommandPrefix,
         macros: &[(String, String)],
     ) -> (Option<Self>, bool) {
         let is_macro = |cell: &Cell| {
-            matches!(cell, Cell::Command { name, .. }
-                if super::command_word(name, prefix)
-                    .and_then(|word| word.strip_prefix('.').map(str::to_string))
-                    .is_some_and(|word| macros.iter().any(|(name, _)| *name == word)))
+            let Cell::Command { name, .. } = cell else {
+                return false;
+            };
+            let Some(line) = prefix.normalize(name.trim()) else {
+                return false;
+            };
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some(".macro"), Some(first)) => !matches!(first, "enable" | "disable"),
+                (Some(word), _) => word
+                    .strip_prefix('.')
+                    .is_some_and(|word| macros.iter().any(|(name, _)| *name == word)),
+                (None, _) => false,
+            }
         };
-        let mut skipped_macros = false;
+        let mut stopped_at_macro = false;
         let rows: Vec<RewindRow> = cells
             .iter()
             .enumerate()
             .rev()
             .filter(|(_, cell)| super::opens_exchange(cell, prefix))
-            .filter(|(_, cell)| {
-                let skip = is_macro(cell);
-                skipped_macros |= skip;
-                !skip
+            .take_while(|(_, cell)| {
+                stopped_at_macro = is_macro(cell);
+                !stopped_at_macro
             })
             .map(|(opener, cell)| {
                 let text = match cell {
@@ -380,7 +392,7 @@ impl RewindState {
             .collect();
         (
             (!rows.is_empty()).then_some(Self { rows, highlight: 0 }),
-            skipped_macros,
+            stopped_at_macro,
         )
     }
 
@@ -978,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn a_macro_row_is_skipped_and_reported() {
+    fn the_picker_stops_at_the_newest_macro_turn() {
         let macros = [("deploy".to_string(), "ship it".to_string())];
         let cells = [
             opened(Cell::user("first")),
@@ -987,13 +999,37 @@ mod tests {
             Cell::assistant("done".to_string(), true),
             opened(Cell::user("third")),
         ];
-        let (rewind, skipped) = RewindState::from_cells(&cells, CommandPrefix::Dot, &macros);
-        assert!(skipped);
+        let (rewind, stopped) = RewindState::from_cells(&cells, CommandPrefix::Dot, &macros);
+        assert!(stopped);
         let openers: Vec<usize> = rewind.unwrap().rows.iter().map(|row| row.opener).collect();
-        assert_eq!(openers, [4, 0]);
-        let (rewind, skipped) = RewindState::from_cells(&cells[2..4], CommandPrefix::Dot, &macros);
+        assert_eq!(openers, [4]);
+        let (rewind, stopped) = RewindState::from_cells(&cells[2..4], CommandPrefix::Dot, &macros);
         assert!(rewind.is_none());
-        assert!(skipped);
+        assert!(stopped);
+
+        let (rewind, stopped) = RewindState::from_cells(&cells[..2], CommandPrefix::Dot, &macros);
+        assert!(!stopped);
+        assert_eq!(rewind.unwrap().rows.len(), 1);
+
+        let by_verb = [
+            opened(Cell::user("first")),
+            opened(Cell::command(".macro deploy prod")),
+            opened(Cell::user("third")),
+        ];
+        let (rewind, stopped) = RewindState::from_cells(&by_verb, CommandPrefix::Dot, &[]);
+        assert!(stopped);
+        let openers: Vec<usize> = rewind.unwrap().rows.iter().map(|row| row.opener).collect();
+        assert_eq!(openers, [2]);
+
+        let toggle = [
+            opened(Cell::user("first")),
+            opened(Cell::command(".macro enable deploy")),
+            opened(Cell::user("third")),
+        ];
+        let (rewind, stopped) = RewindState::from_cells(&toggle, CommandPrefix::Dot, &macros);
+        assert!(!stopped);
+        let openers: Vec<usize> = rewind.unwrap().rows.iter().map(|row| row.opener).collect();
+        assert_eq!(openers, [2, 1, 0]);
     }
 
     #[test]
