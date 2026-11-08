@@ -31,7 +31,8 @@ use bottom_pane::{
     SearchView, View,
 };
 use cells::{
-    AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, ToolStatus, append_output,
+    AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, RewindBarrier, ToolStatus,
+    append_output,
 };
 use composer::{Composer, field_background};
 use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKind};
@@ -825,6 +826,34 @@ fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix
         .rposition(|cell| opens_exchange(cell, prefix))
 }
 
+/// What stops the rewind picker at a command line, under the macros
+/// enabled when it ran: a macro (`.<name>` or `.macro <name>`, not the
+/// enable/disable toggles) stands for exchanges the transcript never
+/// counted; `.session`, `.agent`, `.fork`, `.undo` and the session and
+/// agent forms of `.exit`, `.empty` and `.compress` leave the context
+/// holding history the transcript never showed.
+fn rewind_barrier(
+    line: &str,
+    prefix: crate::config::CommandPrefix,
+    macros: &[(String, String)],
+) -> Option<RewindBarrier> {
+    let line = prefix.normalize(line.trim())?;
+    let mut words = line.split_whitespace();
+    match (words.next()?, words.next()) {
+        (".macro", Some(first)) => {
+            (!matches!(first, "enable" | "disable")).then_some(RewindBarrier::Macro)
+        }
+        (".session" | ".agent" | ".fork" | ".undo", _) => Some(RewindBarrier::Session),
+        (".exit", Some("session" | "agent")) | (".empty" | ".compress", Some("session")) => {
+            Some(RewindBarrier::Session)
+        }
+        (word, _) => word
+            .strip_prefix('.')
+            .filter(|word| macros.iter().any(|(name, _)| name == word))
+            .map(|_| RewindBarrier::Macro),
+    }
+}
+
 /// Something the loop, not the app, has to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -1093,6 +1122,7 @@ impl App {
                 name,
                 output,
                 opened,
+                rewind_barrier: barrier,
                 cache,
             }) = self.transcript.cell_mut(index)
             else {
@@ -1100,6 +1130,7 @@ impl App {
             };
             *output = outcome.captured.clone();
             *opened = turn.requested;
+            *barrier = rewind_barrier(name, prefix, &self.macros);
             *cache = LineCache::default();
             // `.undo` took the last exchange out of the context; the
             // transcript drops it too, back to the cell that opened it,
@@ -1343,16 +1374,14 @@ impl App {
         if !second {
             return;
         }
-        let (rewind, stopped_at_macro) = RewindState::from_cells(
-            self.transcript.cells(),
-            self.config.command_prefix,
-            &self.macros,
-        );
-        if stopped_at_macro {
-            self.push_notice(
-                NoticeKind::ToolWarning,
-                "Rewind stops at the last macro turn".to_string(),
-            );
+        let (rewind, barrier) =
+            RewindState::from_cells(self.transcript.cells(), self.config.command_prefix);
+        if let Some(barrier) = barrier {
+            let text = match barrier {
+                RewindBarrier::Macro => "Rewind stops at the last macro turn",
+                RewindBarrier::Session => "Rewind stops at the last session command",
+            };
+            self.push_notice(NoticeKind::ToolWarning, text.to_string());
         }
         if let Some(rewind) = rewind {
             self.view = View::Rewind(rewind);
@@ -7926,6 +7955,101 @@ mod tests {
             "the macro's exchanges stay in the session as its row stays in the transcript"
         );
         assert!(!harness.draw().contains("Rewind stopped"));
+    }
+
+    #[test]
+    fn a_rewind_barrier_is_read_from_the_command_word_and_the_enabled_macros() {
+        let deploy = [("deploy".to_string(), "ship it".to_string())];
+        let dot = crate::config::CommandPrefix::Dot;
+        assert_eq!(
+            rewind_barrier(".deploy prod", dot, &deploy),
+            Some(RewindBarrier::Macro)
+        );
+        assert_eq!(rewind_barrier(".deploy prod", dot, &[]), None);
+        assert_eq!(
+            rewind_barrier(".macro deploy", dot, &[]),
+            Some(RewindBarrier::Macro)
+        );
+        assert_eq!(rewind_barrier(".macro enable deploy", dot, &deploy), None);
+        assert_eq!(rewind_barrier(".macro disable deploy", dot, &deploy), None);
+        assert_eq!(rewind_barrier(".macro", dot, &deploy), None);
+        assert_eq!(
+            rewind_barrier(".session other", dot, &[]),
+            Some(RewindBarrier::Session)
+        );
+        assert_eq!(
+            rewind_barrier(".agent coder", dot, &[]),
+            Some(RewindBarrier::Session)
+        );
+        assert_eq!(
+            rewind_barrier(".exit session", dot, &[]),
+            Some(RewindBarrier::Session)
+        );
+        assert_eq!(
+            rewind_barrier(".empty session", dot, &[]),
+            Some(RewindBarrier::Session)
+        );
+        assert_eq!(rewind_barrier(".exit role", dot, &[]), None);
+        assert_eq!(rewind_barrier(".info", dot, &[]), None);
+        assert_eq!(rewind_barrier("plain words", dot, &deploy), None);
+        assert_eq!(
+            rewind_barrier("/session other", crate::config::CommandPrefix::Slash, &[]),
+            Some(RewindBarrier::Session)
+        );
+    }
+
+    /// The barrier is committed with the cell: disabling the macro
+    /// afterwards does not let the picker count past the turn it ran,
+    /// and a session swap, which opened no exchange, stops it the same
+    /// way with its own notice.
+    #[test]
+    fn the_picker_stops_at_a_barrier_committed_before_the_macros_changed() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.macros = vec![("deploy".to_string(), "ship it".to_string())];
+        for (line, command) in [
+            ("first question", false),
+            (".deploy prod", true),
+            ("third question", false),
+        ] {
+            harness.app.begin_turn(line, command);
+            harness
+                .app
+                .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+            harness.app.end_turn(command, &TurnOutcome::default());
+        }
+        harness.app.macros.clear();
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert_eq!(rewind(&harness).map(|picker| picker.rows.len()), Some(1));
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Rewind stops at the last macro turn"),
+            "{frame}"
+        );
+        harness.press(KeyCode::Esc);
+
+        harness.app.begin_turn(".session other", true);
+        harness.app.end_turn(true, &TurnOutcome::default());
+        harness.app.begin_turn("fourth question", false);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("an answer".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        let picker = rewind(&harness).expect("the row above the swap is offered");
+        assert_eq!(
+            picker
+                .rows
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["fourth question"]
+        );
+        assert!(matches!(
+            harness.app.transcript.cells().last(),
+            Some(Cell::Notice { text, .. }) if text == "Rewind stops at the last session command"
+        ));
     }
 
     #[test]

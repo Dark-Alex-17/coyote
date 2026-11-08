@@ -85,6 +85,19 @@ impl FoldedCall {
     }
 }
 
+/// Why the rewind picker cannot count exchanges past a command cell.
+/// Decided when the command's turn is committed, from the command word
+/// and the macros enabled at that moment, so a macro disabled later
+/// still stops the picker at the turn it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewindBarrier {
+    /// A macro: its one cell stands for as many exchanges as it ran.
+    Macro,
+    /// A verb that swapped or rewrote the session's history behind the
+    /// transcript (`.session`, `.agent`, `.exit session`, ...).
+    Session,
+}
+
 /// One entry of the transcript, kept as source so any width can render it.
 pub(super) enum Cell {
     User {
@@ -116,6 +129,7 @@ pub(super) enum Cell {
         output: String,
         /// As `User::opened`.
         opened: bool,
+        rewind_barrier: Option<RewindBarrier>,
         cache: LineCache,
     },
     /// Dim lines: tool output that belongs to no tool row, such as a
@@ -271,6 +285,7 @@ impl Cell {
             name: name.to_string(),
             output: String::new(),
             opened: false,
+            rewind_barrier: None,
             cache: LineCache::default(),
         }
     }

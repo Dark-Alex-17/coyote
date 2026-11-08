@@ -5,7 +5,7 @@
 //! open.
 
 use super::DIM;
-use super::cells::Cell;
+use super::cells::{Cell, RewindBarrier};
 use super::history::ComposerHistory;
 use crate::config::{CommandPrefix, RequestContext, StateFlags};
 use crate::repl::{command_candidates, macro_candidates, split_line};
@@ -359,42 +359,30 @@ pub(super) struct RewindState {
 
 impl RewindState {
     /// None when no cell opened an exchange, so there is nothing to go
-    /// back to. The rows stop at the newest macro: its one cell stands
-    /// for as many exchanges as the macro ran, so nothing at or below it
-    /// can be offered as a countable step back. The flag says whether a
-    /// macro cut the list short. A `.macro <name>` invocation counts as a
-    /// macro; `.macro enable`/`disable` only toggle one.
+    /// back to. The rows stop at the newest command cell committed as a
+    /// barrier (a macro turn, a session swap): nothing at or below it can
+    /// be offered as a countable step back. The barrier that cut the list
+    /// short comes back with the rows.
     pub(super) fn from_cells(
         cells: &[Cell],
         prefix: CommandPrefix,
-        macros: &[(String, String)],
-    ) -> (Option<Self>, bool) {
-        let is_macro = |cell: &Cell| {
-            let Cell::Command { name, .. } = cell else {
-                return false;
-            };
-            let Some(line) = prefix.normalize(name.trim()) else {
-                return false;
-            };
-            let mut words = line.split_whitespace();
-            match (words.next(), words.next()) {
-                (Some(".macro"), Some(first)) => !matches!(first, "enable" | "disable"),
-                (Some(word), _) => word
-                    .strip_prefix('.')
-                    .is_some_and(|word| macros.iter().any(|(name, _)| *name == word)),
-                (None, _) => false,
-            }
-        };
-        let mut stopped_at_macro = false;
+    ) -> (Option<Self>, Option<RewindBarrier>) {
+        let mut barrier = None;
         let rows: Vec<RewindRow> = cells
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, cell)| super::opens_exchange(cell, prefix))
             .take_while(|(_, cell)| {
-                stopped_at_macro = is_macro(cell);
-                !stopped_at_macro
+                if let Cell::Command {
+                    rewind_barrier: Some(found),
+                    ..
+                } = cell
+                {
+                    barrier = Some(*found);
+                }
+                barrier.is_none()
             })
+            .filter(|(_, cell)| super::opens_exchange(cell, prefix))
             .map(|(opener, cell)| {
                 let text = match cell {
                     Cell::User { text, .. } => text.as_str(),
@@ -409,7 +397,7 @@ impl RewindState {
             .collect();
         (
             (!rows.is_empty()).then_some(Self { rows, highlight: 0 }),
-            stopped_at_macro,
+            barrier,
         )
     }
 
@@ -967,6 +955,15 @@ mod tests {
         cell
     }
 
+    /// A command cell as `end_turn` commits it when the line was a
+    /// barrier.
+    fn barrier(mut cell: Cell, kind: RewindBarrier) -> Cell {
+        if let Cell::Command { rewind_barrier, .. } = &mut cell {
+            *rewind_barrier = Some(kind);
+        }
+        cell
+    }
+
     #[test]
     fn the_rewind_rows_are_the_openers_newest_first() {
         let cells = [
@@ -979,11 +976,11 @@ mod tests {
             opened(Cell::user("third")),
         ];
         assert_eq!(
-            RewindState::from_cells(&cells[1..3], CommandPrefix::Dot, &[]),
-            (None, false)
+            RewindState::from_cells(&cells[1..3], CommandPrefix::Dot),
+            (None, None)
         );
-        let (rewind, skipped) = RewindState::from_cells(&cells, CommandPrefix::Dot, &[]);
-        assert!(!skipped);
+        let (rewind, stopped) = RewindState::from_cells(&cells, CommandPrefix::Dot);
+        assert_eq!(stopped, None);
         let mut rewind = rewind.unwrap();
         let titles: Vec<(usize, &str)> = rewind
             .rows
@@ -1027,35 +1024,38 @@ mod tests {
         assert!(buf[(0, 1)].modifier.contains(Modifier::REVERSED));
     }
 
+    /// The barrier is the cell's own record of its commit, so a macro
+    /// disabled since still stops the picker at the turn it ran.
     #[test]
-    fn the_picker_stops_at_the_newest_macro_turn() {
-        let macros = [("deploy".to_string(), "ship it".to_string())];
+    fn the_picker_stops_at_the_newest_barrier_cell() {
         let cells = [
             opened(Cell::user("first")),
             Cell::assistant("answer".to_string(), true),
-            opened(Cell::command(".deploy prod")),
+            barrier(opened(Cell::command(".deploy prod")), RewindBarrier::Macro),
             Cell::assistant("done".to_string(), true),
             opened(Cell::user("third")),
         ];
-        let (rewind, stopped) = RewindState::from_cells(&cells, CommandPrefix::Dot, &macros);
-        assert!(stopped);
+        let (rewind, stopped) = RewindState::from_cells(&cells, CommandPrefix::Dot);
+        assert_eq!(stopped, Some(RewindBarrier::Macro));
         let openers: Vec<usize> = rewind.unwrap().rows.iter().map(|row| row.opener).collect();
         assert_eq!(openers, [4]);
-        let (rewind, stopped) = RewindState::from_cells(&cells[2..4], CommandPrefix::Dot, &macros);
+        let (rewind, stopped) = RewindState::from_cells(&cells[2..4], CommandPrefix::Dot);
         assert!(rewind.is_none());
-        assert!(stopped);
+        assert_eq!(stopped, Some(RewindBarrier::Macro));
 
-        let (rewind, stopped) = RewindState::from_cells(&cells[..2], CommandPrefix::Dot, &macros);
-        assert!(!stopped);
+        let (rewind, stopped) = RewindState::from_cells(&cells[..2], CommandPrefix::Dot);
+        assert_eq!(stopped, None);
         assert_eq!(rewind.unwrap().rows.len(), 1);
 
-        let by_verb = [
+        // A session swap never opened an exchange, so it is no row; it
+        // still stops the walk.
+        let swapped = [
             opened(Cell::user("first")),
-            opened(Cell::command(".macro deploy prod")),
+            barrier(Cell::command(".session other"), RewindBarrier::Session),
             opened(Cell::user("third")),
         ];
-        let (rewind, stopped) = RewindState::from_cells(&by_verb, CommandPrefix::Dot, &[]);
-        assert!(stopped);
+        let (rewind, stopped) = RewindState::from_cells(&swapped, CommandPrefix::Dot);
+        assert_eq!(stopped, Some(RewindBarrier::Session));
         let openers: Vec<usize> = rewind.unwrap().rows.iter().map(|row| row.opener).collect();
         assert_eq!(openers, [2]);
 
@@ -1064,8 +1064,8 @@ mod tests {
             opened(Cell::command(".macro enable deploy")),
             opened(Cell::user("third")),
         ];
-        let (rewind, stopped) = RewindState::from_cells(&toggle, CommandPrefix::Dot, &macros);
-        assert!(!stopped);
+        let (rewind, stopped) = RewindState::from_cells(&toggle, CommandPrefix::Dot);
+        assert_eq!(stopped, None);
         let openers: Vec<usize> = rewind.unwrap().rows.iter().map(|row| row.opener).collect();
         assert_eq!(openers, [2, 1, 0]);
     }
@@ -1077,7 +1077,7 @@ mod tests {
         let search = SearchState::new(&history(&names));
         assert_eq!(search.band_rows(), BAND_MAX_ROWS);
         let cells: Vec<Cell> = names.iter().map(|name| opened(Cell::user(name))).collect();
-        let (rewind, _) = RewindState::from_cells(&cells, CommandPrefix::Dot, &[]);
+        let (rewind, _) = RewindState::from_cells(&cells, CommandPrefix::Dot);
         let rewind = rewind.unwrap();
         assert_eq!(rewind.band_rows(), BAND_MAX_ROWS);
         assert_eq!(View::Composer.band_rows(), 0);
