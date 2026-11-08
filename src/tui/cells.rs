@@ -110,6 +110,10 @@ pub(super) enum Cell {
         /// A line queued while a turn ran and handed to the model on a
         /// tool result of that turn. It opens no exchange of its own (the
         /// running turn's holds it), so it is never a rewind row.
+        /// The cell is committed when the line joins the next request's
+        /// history, not when that request succeeds: the history keeps the
+        /// line through a failed or interrupted request, so the cell is
+        /// still the record of what the model receives.
         mid_turn: bool,
         cache: LineCache,
     },

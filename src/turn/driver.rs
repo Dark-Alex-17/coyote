@@ -823,4 +823,69 @@ mod tests {
         assert_eq!(outcome, TurnOutcome::Completed);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+
+    /// The sent event marks the line joining the next request's history,
+    /// not that request succeeding: when the request then fails, the
+    /// event has fired exactly once and the merged tool result the turn
+    /// keeps for a retry still carries the line.
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_user_message_is_announced_once_even_when_the_next_request_fails() {
+        let mut ctx = silent_ctx();
+        let probe = "queued-failed-probe-x7x";
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: probe.to_string(),
+            });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut runner = completion_runner(move |_input, ctx, _abort| {
+            match seen.fetch_add(1, Ordering::SeqCst) + 1 {
+                1 => boxed_completion(async move {
+                    let call = ToolCall::new(
+                        "unknown_tool".to_string(),
+                        json!({}),
+                        Some("id-1".to_string()),
+                    );
+                    let results = eval_tool_calls(ctx, vec![call]).await?;
+                    Ok((String::new(), results))
+                }),
+                _ => boxed_completion(async { Err(anyhow::anyhow!("the request failed")) }),
+            }
+        });
+        let sink = RecordingSink::install();
+
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut driver = TurnDriver {
+            runner: &mut runner,
+            mode: TurnMode::Repl,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            driver.run_turn(&mut ctx, create_abort_signal(), input, false, None),
+        )
+        .await
+        .expect("the failing turn did not finish within 5s");
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let sent: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::QueuedInputSent { text } if text == probe))
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let kept = ctx
+            .last_message
+            .as_ref()
+            .expect("the failed request's input is kept for a retry");
+        let results = &kept
+            .input
+            .tool_calls()
+            .as_ref()
+            .expect("the kept input carries the tool round")
+            .tool_results;
+        let notifications = &results.last().unwrap().output["system_notifications"];
+        assert_eq!(notifications[0]["text"], probe);
+    }
 }

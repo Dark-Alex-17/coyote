@@ -527,7 +527,8 @@ fn enter_on_a_draft_while_a_tool_sleeps_queues_it_and_the_model_gets_it_next_rou
     );
 
     // Ctrl+L repaints the whole screen, so what follows is the current
-    // frame alone: no strip, and no draft left in the field.
+    // frame alone: no strip, the mid-turn cell in the transcript, and no
+    // draft left in the field.
     let repaint_at = pty.raw().len();
     pty.send(b"\x0c").unwrap();
     pty.read_for(Duration::from_millis(600));
@@ -536,9 +537,15 @@ fn enter_on_a_draft_while_a_tool_sleeps_queues_it_and_the_model_gets_it_next_rou
         !repainted.contains("pending:"),
         "the queue strip outlived the turn:\n{repainted}"
     );
+    let frame = squeezed(&repainted);
     assert!(
-        !squeezed(&repainted).contains("draft-r12-d"),
-        "the queued line is still on screen after it went to the model:\n{repainted}"
+        frame.contains(">draft-r12-d(sentmid-turn)"),
+        "the transcript has no mid-turn cell for the line the model read:\n{repainted}"
+    );
+    assert_eq!(
+        frame.matches("draft-r12-d").count(),
+        1,
+        "the queued line is still in the composer after it went to the model:\n{repainted}"
     );
 
     pty.send(b"\x04").unwrap();

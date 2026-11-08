@@ -1,3 +1,8 @@
+//! Command highlighting for the REPL line. Only the word that opens the
+//! line is classified: a known command or macro paints green, an unknown
+//! word after the sigil paints red, and the rest of the line keeps the
+//! default colour.
+
 use super::{REPL_COMMANDS, unfence};
 
 use crate::config::{CommandPrefix, RequestContext};
