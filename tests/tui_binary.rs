@@ -6642,8 +6642,15 @@ fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
         find(pty.raw(), LEAVE_ALT, 0).is_none(),
         "the session exit left the alternate screen:\n{since}"
     );
-    let command_rows = painted_at(pty.raw(), b".exit session", command_at);
-    let saved_rows = painted_at(pty.raw(), b"Saved", named_at);
+    // The order is read off one full repaint: the stream before it holds
+    // cell diffs from several frames (the transcript scrolls as the footer
+    // flips), and a needle's nearest cursor move may belong to a frame
+    // other than the one that painted it.
+    let repaint_at = pty.raw().len();
+    pty.resize(24, 81).unwrap();
+    pty.read_for(Duration::from_millis(600));
+    let command_rows = painted_at(pty.raw(), b".exit session", repaint_at);
+    let saved_rows = painted_at(pty.raw(), b"Saved", repaint_at);
     let (Some(&(command_row, _)), Some(&(saved_row, _))) =
         (command_rows.first(), saved_rows.last())
     else {
