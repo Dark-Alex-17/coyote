@@ -363,6 +363,28 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn session_candidates_include_nested_sessions() {
+        let _guard = TestConfigDirGuard::new("cli-nested-session-completer");
+        let _agent_data_dir = EnvVarGuard::unset("ONCALL_DATA_DIR");
+        let sessions = paths::agent_sessions_dir("oncall");
+        seed(&sessions.join("oncall"), "incident-1");
+        seed(&sessions, "triage");
+
+        assert_eq!(
+            labeled(session_candidates("onc", Some("oncall"))),
+            vec![("oncall/incident-1".to_string(), Some("global".to_string()))]
+        );
+        assert_eq!(
+            labeled(session_candidates("", Some("oncall"))),
+            vec![
+                ("oncall/incident-1".to_string(), Some("global".to_string())),
+                ("triage".to_string(), Some("global".to_string())),
+            ]
+        );
+    }
+
     fn seed_graph_agent(name: &str, session_block: &str) {
         let agent_dir = paths::agent_data_dir(name);
         fs::create_dir_all(&agent_dir).unwrap();

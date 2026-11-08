@@ -309,13 +309,42 @@ pub fn labeled_session_names(
         (workspace_dir, SessionScope::Workspace),
         (global_dir, SessionScope::Global),
     ] {
-        for name in list_file_names(dir, ".yaml") {
+        for name in list_session_names(dir) {
             if seen.insert(name.clone()) {
                 values.push((name, scope));
             }
         }
     }
     values
+}
+
+/// Every session saved under `dir`, sorted, a nested one named by its path
+/// relative to `dir` (`oncall/incident-1`). The top-level auto-name directory
+/// is skipped since its sessions are listed under their own label, and a
+/// symlinked directory is not descended into.
+pub fn list_session_names(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_session_names(dir, "", &mut names);
+    names.sort_unstable();
+    names
+}
+
+fn collect_session_names(dir: &Path, prefix: &str, names: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if prefix.is_empty() && file_name == AUTONAME_PLACEHOLDER {
+                continue;
+            }
+            collect_session_names(&entry.path(), &format!("{prefix}{file_name}/"), names);
+        } else if let Some(name) = file_name.strip_suffix(".yaml") {
+            names.push(format!("{prefix}{name}"));
+        }
+    }
 }
 
 pub fn merged_session_names(workspace_dir: &Path, global_dir: &Path) -> Vec<String> {

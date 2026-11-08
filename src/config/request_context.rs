@@ -7,8 +7,8 @@ use super::rag_cache::{RagCache, RagKey};
 use super::session::{
     AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, ForkRekey,
     INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope, SystemPromptSplit,
-    keep_token_budget, labeled_session_names, merged_session_names, min_reclaim_tokens,
-    session_scope_dirs, valve_limit,
+    keep_token_budget, labeled_session_names, list_session_names, merged_session_names,
+    min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -71,8 +71,7 @@ use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    estimate_token_length, fuzzy_filter, get_env_name, list_file_names, now, render_prompt,
-    temp_file,
+    estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -2347,10 +2346,11 @@ impl RequestContext {
         };
         let session_name = match name {
             Some(v) => v.to_string(),
-            None => session
-                .autoname()
-                .unwrap_or_else(|| session.name())
-                .to_string(),
+            None => match session.autoname() {
+                Some(autoname) if session.name() == TEMP_SESSION_NAME => autoname,
+                _ => session.name(),
+            }
+            .to_string(),
         };
         self.refuse_builtin_named_session(Some(&session_name))?;
         let scope = scope.unwrap_or_else(|| session.scope());
@@ -5541,7 +5541,7 @@ impl RequestContext {
         [SessionScope::Workspace, SessionScope::Global]
             .into_iter()
             .flat_map(|scope| {
-                list_file_names(self.sessions_dir_for(scope), ".yaml")
+                list_session_names(&self.sessions_dir_for(scope))
                     .into_iter()
                     .map(move |name| (name, scope))
             })
@@ -19460,6 +19460,52 @@ mod tests {
 
     #[test]
     #[serial]
+    fn nested_sessions_are_listed_completed_and_deletable() {
+        let _config = HelperConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "top", SessionScope::Global, "messages: []\n");
+        write_session_file(
+            &ctx,
+            "oncall/incident-1",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        write_session_file(&ctx, "oncall/deep/x", SessionScope::Workspace, "");
+        write_session_file(
+            &ctx,
+            &format!("{AUTONAME_PLACEHOLDER}/auto"),
+            SessionScope::Global,
+            "",
+        );
+
+        assert_eq!(
+            ctx.list_sessions(),
+            vec!["oncall/deep/x", "oncall/incident-1", "top"]
+        );
+        assert_eq!(
+            ctx.labeled_sessions(),
+            vec![
+                ("oncall/deep/x".to_string(), Some("workspace".to_string())),
+                ("oncall/incident-1".to_string(), Some("global".to_string())),
+                ("top".to_string(), Some("global".to_string())),
+            ]
+        );
+        assert_eq!(
+            ctx.session_delete_entries(),
+            vec![
+                ("oncall/deep/x".to_string(), SessionScope::Workspace),
+                ("oncall/incident-1".to_string(), SessionScope::Global),
+                ("top".to_string(), SessionScope::Global),
+            ]
+        );
+
+        ctx.delete_session_at("oncall/incident-1", SessionScope::Global)
+            .unwrap();
+        assert_eq!(ctx.list_sessions(), vec!["oncall/deep/x", "top"]);
+    }
+
+    #[test]
+    #[serial]
     fn repl_complete_session_labels_workspace_and_global() {
         let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
@@ -19630,6 +19676,29 @@ mod tests {
             .unwrap();
         assert!(
             ctx.session_file_for("named", SessionScope::Workspace)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_keeps_user_name_over_autoname() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        ctx.session.as_mut().unwrap().set_autoname("auto title");
+
+        ctx.save_session(Some("named"), Some(SessionScope::Workspace))
+            .unwrap();
+        ctx.save_session(None, None).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.name(), "named");
+        let named_file = ctx.session_file_for("named", SessionScope::Workspace);
+        assert_eq!(session.path(), Some(named_file.as_path()));
+        assert!(
+            !ctx.session_file_for("auto-title", SessionScope::Workspace)
                 .exists()
         );
     }
