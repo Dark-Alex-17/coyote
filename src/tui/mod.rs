@@ -8600,6 +8600,7 @@ mod tests {
                 "Ok((Vec::new(), missing.to_vec()))",
             ),
             ("src/tui/redirect.rs", "String::new()"),
+            ("src/tui/bottom_pane.rs", "\".uninstall\", \".update\"];"),
             (
                 "tests/tui_binary.rs",
                 "the transcript is not yet printed on the normal screen when the UI leaves",

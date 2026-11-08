@@ -4,6 +4,7 @@ expression: frame
 ---
 "                                                                                "
 "                                                                                "
+"                                                                                "
 "┌──────────────────────────────────────────────────────────────────────────────┐"
 "│ coyote X.Y.Z │"
 "│ model: openai:test-model                                                     │"
@@ -20,7 +21,6 @@ expression: frame
 "                                                                                "
 ".info             Show system info                                              "
 ".info mcp-server  Show an MCP server's tool filters and effective catalog       "
-".install          Reinstall bundled assets, install a bundle from a git repo, or"
 "────────────────────────────────────────────────────────────────────────────────"
 ".in                                                                             "
 "                                                                                "

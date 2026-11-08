@@ -648,10 +648,40 @@ fn two_drafts_while_a_tool_sleeps_show_pending_two_and_drain_after_release() {
 }
 
 // ---------------------------------------------------------------------
-// The palette's set equals the REPL completer's set, per prefix, in the
-// same (cold) state. The oracle is the REPL itself: its Tab menu on the
-// bare sigil lists every candidate as `<sigil>name   description`.
+// The palette's set equals the REPL completer's set less the verbs hidden
+// until their prompts are routed, per prefix, in the same (cold) state.
+// The oracle is the REPL itself: its Tab menu on the bare sigil lists
+// every candidate as `<sigil>name   description`.
 // ---------------------------------------------------------------------
+
+/// The verbs `HIDDEN_UNTIL_ROUTED` names, read from the palette's source
+/// so this suite never carries a copy: the binary has no library target
+/// to import the constant from.
+fn hidden_until_routed() -> Vec<String> {
+    let source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/bottom_pane.rs"))
+            .unwrap();
+    let start = source
+        .find("const HIDDEN_UNTIL_ROUTED")
+        .expect("the palette names its hidden verbs");
+    let list = &source[start..];
+    let list = &list[list.find("&[").unwrap() + 2..];
+    let list = &list[..list.find(']').unwrap()];
+    let verbs: Vec<String> = list
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"').to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    assert!(!verbs.is_empty(), "no hidden verbs parsed from:\n{list}");
+    verbs
+}
+
+/// Whether the completer candidate `name` (sigil stripped) is hidden from
+/// the palette's command rows: its first word is a hidden verb.
+fn is_hidden(hidden: &[String], name: &str) -> bool {
+    let verb = format!(".{}", name.split(' ').next().unwrap_or(name));
+    hidden.contains(&verb)
+}
 
 /// One command the REPL completer offers: its name without the sigil and
 /// its description.
@@ -781,14 +811,29 @@ fn offers(frame: &str, sigil: char, c: &Candidate) -> bool {
     row_markers(sigil, c).iter().any(|m| flat.contains(m))
 }
 
-/// Cold start under `sigil`: every candidate the REPL completer offers is
-/// a palette row when its name is typed, and the bare-sigil band's total
-/// (rows shown plus the `+N more` tail) equals the completer's count.
+/// Cold start under `sigil`: every candidate the REPL completer offers
+/// outside the hidden verbs is a palette row when its name is typed, no
+/// hidden verb is a row when it is typed, the completer does offer every
+/// hidden verb (the list is not stale), and the bare-sigil band's total
+/// (rows shown plus the `+N more` tail) equals the completer's count less
+/// the hidden candidates.
 fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &str) {
+    let hidden = hidden_until_routed();
     let repl_dir = fresh_config_dir(&format!("{scenario}-repl"));
     let _repl_guard = TempDirGuard(repl_dir.clone());
     write_dry_run_config(&repl_dir, prefix_yaml);
     let completer = repl_completer_candidates(&repl_dir, sigil);
+    let (hidden_candidates, listed): (Vec<&Candidate>, Vec<&Candidate>) =
+        completer.iter().partition(|c| is_hidden(&hidden, &c.name));
+    for verb in &hidden {
+        assert!(
+            hidden_candidates
+                .iter()
+                .any(|c| format!(".{}", c.name) == *verb),
+            "under `{sigil}` the REPL completer no longer offers the hidden verb {verb}; \
+             the hidden list is stale"
+        );
+    }
 
     let dir = fresh_config_dir(&format!("{scenario}-tui"));
     let _guard = TempDirGuard(dir.clone());
@@ -801,10 +846,15 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
     let mut toggle = false;
     let bare = palette_frame_for(&mut pty, sigil, "", &mut toggle);
     let bare_flat = squeezed(&bare);
-    let shown = completer
+    let shown = listed
         .iter()
         .filter(|c| bare_flat.contains(&row_markers(sigil, c)[0]))
         .count();
+    let hidden_shown: Vec<&str> = hidden_candidates
+        .iter()
+        .filter(|c| bare_flat.contains(&row_markers(sigil, c)[0]))
+        .map(|c| c.name.as_str())
+        .collect();
     let more: usize = bare_flat
         .split("(+")
         .nth(1)
@@ -813,7 +863,7 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
         .unwrap_or(0);
 
     let mut missing = Vec::new();
-    for c in &completer {
+    for c in &listed {
         // Keys typed in one write are handled one per loop iteration and
         // the band can be painted mid-word; one retry separates a
         // torn frame from a row that is not offered.
@@ -825,6 +875,17 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
             missing.push(c.name.clone());
         }
     }
+    // A hidden candidate is typed by its verb alone: with the space the
+    // band is at the argument position, where a group's sub-verbs are
+    // argument rows and stay offered.
+    let mut leaked = Vec::new();
+    for c in &hidden_candidates {
+        let verb = c.name.split(' ').next().unwrap();
+        let frame = palette_frame_for(&mut pty, sigil, verb, &mut toggle);
+        if offers(&frame, sigil, c) {
+            leaked.push(c.name.clone());
+        }
+    }
     pty.read_for(HOTKEY_GAP);
     quit_and_check(&mut pty);
 
@@ -833,15 +894,20 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
         "under `{sigil}` the palette does not offer {} of the {} commands the REPL \
          completer offers cold: {missing:?}",
         missing.len(),
-        completer.len()
+        listed.len()
     );
-    let completer_names: Vec<&str> = completer.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        leaked.is_empty() && hidden_shown.is_empty(),
+        "under `{sigil}` the palette offers hidden verbs: typed {leaked:?}, in the bare \
+         band {hidden_shown:?}"
+    );
+    let completer_names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         shown + more,
-        completer.len(),
+        listed.len(),
         "under `{sigil}` the bare palette band counts {shown} rows + {more} more, the REPL \
-         completer offers {} commands: {completer_names:?}",
-        completer.len()
+         completer offers {} commands outside the hidden verbs: {completer_names:?}",
+        listed.len()
     );
 }
 

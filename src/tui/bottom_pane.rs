@@ -72,6 +72,24 @@ fn rows_within_cap(len: usize) -> u16 {
         .min(BAND_MAX_ROWS)
 }
 
+/// Command verbs the palette does not list while a prompt on their path
+/// still refuses under the UI (`ensure_prompts_available` bails): `.rag`
+/// creates through the init wizard and `.rag attach` through the attach
+/// one, `.vault` adds and updates through a password prompt, `.install`
+/// and `.uninstall` confirm obsolete files, conflicts, secrets and the
+/// removal itself, `.update` confirms a package-managed update. The
+/// completer still offers them and typing them still runs them; only the
+/// first word of a table entry is matched, so `.rag attach` goes with
+/// `.rag`.
+pub(crate) const HIDDEN_UNTIL_ROUTED: &[&str] =
+    &[".rag", ".vault", ".install", ".uninstall", ".update"]; // TASK-388
+
+fn hidden_until_routed(name: &str) -> bool {
+    name.split_whitespace()
+        .next()
+        .is_some_and(|verb| HIDDEN_UNTIL_ROUTED.contains(&verb))
+}
+
 /// What the palette needs from the context to list commands while the
 /// context is away on a turn: the completer reads these live, the
 /// palette reads the copy taken when the context was last in hand.
@@ -120,6 +138,7 @@ impl PaletteState {
     /// its own and a space follows it, the palette is at the argument
     /// position: the command rows are not offered again, and the group's
     /// sub-verbs (`.info tools` after `.info `) come as argument rows.
+    /// Command rows leave out `HIDDEN_UNTIL_ROUTED`; argument rows do not.
     pub(super) fn build(
         line: &str,
         prefix: CommandPrefix,
@@ -184,6 +203,7 @@ impl PaletteState {
             rows.extend(
                 candidates(&command_filter)
                     .into_iter()
+                    .filter(|command| !hidden_until_routed(command.name()))
                     .map(|command| PaletteRow {
                         value: format!("{} ", with_sigil(command.name())),
                         description: command.description().to_string(),
@@ -590,7 +610,9 @@ mod tests {
 
     /// The palette and the rustyline completer offer the same command
     /// names for the bare sigil, under every prefix and with and without
-    /// function calling in the state.
+    /// function calling in the state, less the verbs hidden until their
+    /// prompts are routed: the palette offers none of those, and every
+    /// other completer name, both ways.
     #[test]
     fn palette_rows_match_the_completer_for_a_bare_sigil() {
         for prefix in [
@@ -603,12 +625,19 @@ mod tests {
                     let ctx = ctx_with(prefix, function_calling);
                     let palette = palette_names(&ctx, sigil);
                     let completer = completer_names(ctx_with(prefix, function_calling), sigil);
-                    assert_eq!(
-                        palette, completer,
-                        "{prefix} fc={function_calling} {sigil:?}"
-                    );
+                    let hidden_name =
+                        |name: &String| hidden_until_routed(&name.replacen(sigil, ".", 1));
+                    let (hidden, listed): (HashSet<String>, HashSet<String>) =
+                        completer.into_iter().partition(hidden_name);
+                    assert_eq!(palette, listed, "{prefix} fc={function_calling} {sigil:?}");
+                    assert!(palette.iter().all(|name| !hidden_name(name)), "{palette:?}");
                     if prefix.accepts(sigil.chars().next().unwrap()) {
                         assert!(!palette.is_empty(), "{prefix} {sigil:?}");
+                        assert_eq!(
+                            hidden.len(),
+                            HIDDEN_UNTIL_ROUTED.len() + 1,
+                            "the completer offers every hidden verb (`.rag` twice): {hidden:?}"
+                        );
                     } else {
                         assert!(palette.is_empty(), "{prefix} {sigil:?}");
                     }
@@ -649,6 +678,7 @@ mod tests {
                         .collect();
                 let table: HashSet<String> = command_candidates(state, false, ".")
                     .into_iter()
+                    .filter(|command| !hidden_until_routed(command.name()))
                     .map(|command| command.name()[1..].to_string())
                     .collect();
                 assert_eq!(palette, table, "{state:?} {prefix}");
