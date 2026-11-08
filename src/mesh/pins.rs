@@ -693,14 +693,16 @@ mod tests {
         }
     }
 
-    /// The envoy memory file name for one (identity, thread) is fixed by this vector: a
-    /// change to the digest input would silently orphan every record on disk.
+    /// The envoy memory file name for one (identity, sending destination, thread) is
+    /// fixed by this vector: a change to the digest input would silently orphan every
+    /// record on disk.
     #[test]
-    fn envoy_session_key_is_the_truncated_sha256_of_identity_nul_thread() {
+    fn envoy_session_key_is_the_truncated_sha256_of_identity_nul_destination_nul_thread() {
         let identity = "0123456789abcdef0123456789abcdef";
-        let key = envoy_sessions::session_key(identity, "thread-one").unwrap();
+        let destination = "00112233445566778899aabbccddeeff";
+        let key = envoy_sessions::session_key(identity, destination, "thread-one").unwrap();
 
-        assert_eq!(key, "8ebad0226f3717c3cebe929e4b7c49ca");
+        assert_eq!(key, "c30ed34cc8dcab685b1f6ed55ae34094");
         assert_eq!(key.len(), 32);
         assert!(
             key.bytes()
@@ -709,11 +711,31 @@ mod tests {
         );
         assert_ne!(
             key,
-            envoy_sessions::session_key(identity, "thread-two").unwrap()
+            envoy_sessions::session_key(identity, destination, "thread-two").unwrap()
         );
         assert_ne!(
             key,
-            envoy_sessions::session_key("fedcba9876543210fedcba9876543210", "thread-one").unwrap()
+            envoy_sessions::session_key(
+                "fedcba9876543210fedcba9876543210",
+                destination,
+                "thread-one"
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            key,
+            envoy_sessions::session_key(identity, "ffeeddccbbaa99887766554433221100", "thread-one")
+                .unwrap()
+        );
+        assert_eq!(
+            key,
+            envoy_sessions::session_key(identity, &destination.to_ascii_uppercase(), "thread-one")
+                .unwrap(),
+            "the key digests the destination's bytes, not its spelling"
+        );
+        assert_eq!(
+            envoy_sessions::session_key(identity, "not-a-hash", "thread-one"),
+            None
         );
     }
 

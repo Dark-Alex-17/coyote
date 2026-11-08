@@ -6407,6 +6407,7 @@ pub(crate) mod network {
             .expect("an enabled store is opened at start")
             .save(
                 &b_identity,
+                crate::mesh::envoy_sessions::TEST_DESTINATION,
                 "first",
                 vec![
                     EnvoyTurn {

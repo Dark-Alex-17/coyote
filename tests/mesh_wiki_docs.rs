@@ -1779,8 +1779,9 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
 }
 
 /// The `### Conversation memory` section on `Mesh.md` names the wipe verb, says the
-/// memory is kept per identity and thread, and states every bound; the bounds are
-/// spelt as their default values, not as the `mesh.envoy_memory.*` key names.
+/// memory is kept per identity, sending destination and thread, and states every bound;
+/// the bounds are spelt as their default values, not as the `mesh.envoy_memory.*` key
+/// names.
 #[test]
 fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_bound() {
     let Some(wiki) = wiki_dir() else { return };
@@ -1804,6 +1805,7 @@ fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_b
         ".mesh memory forget",
         "identity",
         "thread",
+        "the proved sending destination",
         "`mesh.envoy_memory.*`",
         "whose index cannot be read is counted and named so you can empty it with `.mesh memory forget all`",
         "256 threads across all peers",
@@ -7979,7 +7981,10 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
         format!("`kind: unknown_thread`, the message ``{refusal}``"),
         "`kind: asked_by_another_session`".to_string(),
         "a Coyote sender names only a thread its own session sent or received, so your other sessions start their own conversations".to_string(),
-        "A new conversation is keyed by the proved sending identity and the message's own id, never by a thread the sender names".to_string(),
+        "A new conversation is keyed by the proved sending identity, the proved sending destination (the instance that sent it) and the message's own id, never by a thread the sender names".to_string(),
+        "A message resumes only when its thread names a conversation this node already holds for that identity at that destination; another instance of the same identity naming the same thread".to_string(),
+        "A record is never loaded for a run on behalf of another identity or another destination of the same identity".to_string(),
+        "A conversation remembered before the sending destination was part of the key is never resumed; it is still listed, forgotten and aged out like the rest.".to_string(),
     ] {
         assert!(prose.contains(&needle), "Mesh.md does not say {needle:?}");
     }
@@ -7987,6 +7992,8 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
         "in any of your sessions on this config dir",
         "A thread one session opened can be continued from another",
         "never by the destination",
+        "A new conversation is keyed by the proved sending identity and the message's own id",
+        "A record is never loaded for a run on behalf of another identity:",
     ] {
         assert!(!prose.contains(gone), "Mesh.md still says {gone:?}");
     }
@@ -7994,6 +8001,8 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
     let configuration = flat(&read(wiki.join("Mesh-Configuration.md")));
     for needle in [
         "A Coyote sender continues a thread only from the session that sent or received it, so a different session of the same identity starts a new conversation.",
+        "The receiving node holds to the same line: another instance of the identity naming the same thread is answered as a new conversation.",
+        "per (proved sender identity, sending destination, thread)",
         "`mesh/sent-threads-<instance_id>.json` (the threads each session may continue)",
     ] {
         assert!(
@@ -8008,9 +8017,25 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
             "`mesh/sent-threads.json`",
             "any of your sessions on this config dir sent or received",
             "can be continued from another",
+            "sender identity, thread)",
         ] {
             assert!(!text.contains(gone), "{page} still says {gone:?}");
         }
+    }
+    for twin in [
+        "README.md",
+        "config.example.yaml",
+        "assets/config-template.yaml",
+    ] {
+        let text = read(repo_root().join(twin));
+        assert!(
+            text.contains("per (sender identity, sending destination, thread)"),
+            "{twin} does not key the envoy memory by the sending destination"
+        );
+        assert!(
+            !text.contains("sender identity, thread)"),
+            "{twin} still keys the envoy memory by identity and thread alone"
+        );
     }
 }
 

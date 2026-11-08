@@ -377,10 +377,10 @@ guide covers a ready-to-run LXMF propagation node: store-and-forward across devi
 [Prerequisites](#prerequisites).
 The envoy that answers trusted peers for you starts every run with no memory of the peer: a follow-up in the same
 thread is answered as if it were the first message. `mesh.envoy_memory.enabled: true` changes that, keeping the
-peer's turns and what the node sent back per (sender identity, thread) so a follow-up is answered in context; the
-record never holds your own transcript, is bounded by the five `mesh.envoy_memory.*` limits, goes with the identity's
-trust when you `.mesh untrust --identity` or `.mesh block` it (untrusting one of its destinations leaves it), and
-`.mesh memory forget <identity|all> [thread]` wipes it at will. See
+peer's turns and what the node sent back per (sender identity, sending destination, thread) so a follow-up is
+answered in context; the record never holds your own transcript, is bounded by the five `mesh.envoy_memory.*` limits,
+goes with the identity's trust when you `.mesh untrust --identity` or `.mesh block` it (untrusting one of its
+destinations leaves it), and `.mesh memory forget <identity|all> [thread]` wipes it at will. See
 [Conversation memory](https://github.com/Dark-Alex-17/coyote/wiki/Mesh#conversation-memory).
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
@@ -408,7 +408,7 @@ trust when you `.mesh untrust --identity` or `.mesh block` it (untrusting one of
 | `mesh.fetch.inline_max_bytes`     | `65536`         | Largest file a peer may attach inline to one message; larger ones are dropped from the message and counted; `1` to `98304`, the per-message inline total                      |
 | `mesh.fetch.max_bytes`            | `4194304`       | Largest file this node serves to a peer that fetches it; a larger one is refused with `too_large` and the limit applied; `1` to `4194304` (4 MiB) |
 | `mesh.fetch.inbox_dir`            | `null`          | Absolute directory where files peers send inline, and files this node fetches, are staged, under `<inbox_dir>/<instance id>`; `null` stages them under `<cache dir>/mesh/inbox/<instance id>`; keep it outside any workspace you share, or peers could fetch each other's staged files |
-| `mesh.envoy_memory.enabled`       | `false`         | Remember a trusted peer's thread between messages, so the envoy answers a follow-up in context: the peer's turns and what the node said, keyed by the proved identity and thread, kept owner-only under `<cache dir>/mesh/envoy-sessions/<instance id>`; off by default, so nothing a peer says is carried into its next run (the inbox still files every message) |
+| `mesh.envoy_memory.enabled`       | `false`         | Remember a trusted peer's thread between messages, so the envoy answers a follow-up in context: the peer's turns and what the node said, keyed by the proved identity, sending destination and thread, kept owner-only under `<cache dir>/mesh/envoy-sessions/<instance id>`; off by default, so nothing a peer says is carried into its next run (the inbox still files every message) |
 | `mesh.envoy_memory.max_sessions`  | `256`           | Most threads remembered across all peers; the least recently used go first; must be `1` or more                                                                              |
 | `mesh.envoy_memory.max_per_identity` | `16`         | Most threads remembered for one peer identity; the least recently used go first; must be `1` or more                                                                         |
 | `mesh.envoy_memory.max_turns`     | `40`            | Most turns kept per thread; the oldest exchange goes first; must be `1` or more                                                                                              |

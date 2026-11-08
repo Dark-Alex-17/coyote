@@ -1,8 +1,10 @@
 //! What the envoy remembers of a trusted peer's thread between messages: the peer's turns
-//! and the envoy's answers, one record per (proved sender identity, thread), under
-//! `<cache_dir>/mesh/envoy-sessions/<instance_id>/`. The owner's own transcript is never
-//! in here and neither is a system prompt; a record is only ever handed back to the
-//! identity that wrote it. The store exists nowhere while `mesh.envoy_memory.enabled` is
+//! and the envoy's answers, one record per (proved sender identity, sending destination,
+//! thread), under `<cache_dir>/mesh/envoy-sessions/<instance_id>/`. The owner's own
+//! transcript is never in here and neither is a system prompt; a record is only ever
+//! handed back to the identity that wrote it, sending from the destination it wrote it
+//! from: another instance of the same identity is another party to the conversation.
+//! The store exists nowhere while `mesh.envoy_memory.enabled` is
 //! false, not even as an empty directory, and every file and directory it does create is
 //! readable by its owner alone. `index.json` is the enumeration: what it does not name
 //! is not a conversation, and a record it names that is not on disk is forgotten on the
@@ -100,8 +102,12 @@ pub(crate) struct SessionThread {
 /// One `<key>.yaml`: the retained turns of one peer thread. The shape is a stable on-disk
 /// record other code reads back; it rejects fields it does not know, so any change to the
 /// layout bumps `ENVOY_SESSION_VERSION` and a reader refuses the file on a version it
-/// does not write. There is no system slot by construction: what the envoy is told about
-/// its owner is composed afresh on every run and never stored beside a peer's words.
+/// does not write, except a field added with `#[serde(default)]`, which keeps the
+/// version. `destination` is such a field: a record written before it existed loads with
+/// it empty, which is no sender's destination, so it is never resumed; it is still
+/// listed, forgotten, swept and aged out. There is no system slot by construction: what
+/// the envoy is told about its owner is composed afresh on every run and never stored
+/// beside a peer's words.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnvoySessionFile {
@@ -109,6 +115,11 @@ pub(crate) struct EnvoySessionFile {
     /// Lower-hex, the proved identity of the peer whose thread this is; a reader hands
     /// the record to no other.
     pub identity: String,
+    /// Lower-hex, the proved destination the peer sent the thread from; a reader hands
+    /// the record to no other destination of the same identity. Empty on a record
+    /// written before the field existed.
+    #[serde(default)]
+    pub destination: String,
     pub thread: String,
     /// RFC 3339 UTC seconds, bumped on every save; what the age and recency bounds judge.
     pub last_used: String,
@@ -147,6 +158,9 @@ pub(crate) struct EnvoySessionIndex {
 pub(crate) struct EnvoySessionEntry {
     pub key: String,
     pub identity: String,
+    /// As the record's: empty on an entry written before the field existed.
+    #[serde(default)]
+    pub destination: String,
     pub thread: String,
     pub last_used: String,
     pub turns: usize,
@@ -188,8 +202,17 @@ pub(crate) enum EnvoyMemoryError {
         asked: String,
         found: String,
     },
+    /// The record under `key` names another sending destination than the one asking;
+    /// it is not handed back.
+    WrongDestination {
+        key: String,
+        asked: String,
+        found: String,
+    },
     /// The identity given is not a 32-hex address hash, so it keys nothing.
     NotAnIdentity(String),
+    /// The sending destination given is not a 32-hex address hash, so it keys nothing.
+    NotADestination(String),
 }
 
 impl fmt::Display for EnvoyMemoryError {
@@ -234,9 +257,18 @@ impl fmt::Display for EnvoyMemoryError {
                 f,
                 "Mesh {STORE_NAME} record {key} belongs to identity {found}, not {asked}; refusing to hand it over"
             ),
+            Self::WrongDestination { key, asked, found } => write!(
+                f,
+                "Mesh {STORE_NAME} record {key} belongs to destination {}, not {asked}; refusing to hand it over",
+                if found.is_empty() { "(none)" } else { found }
+            ),
             Self::NotAnIdentity(text) => write!(
                 f,
                 "'{text}' is not a 32-hex identity hash; the envoy memory is keyed by one"
+            ),
+            Self::NotADestination(text) => write!(
+                f,
+                "'{text}' is not a 32-hex destination hash; the envoy memory is keyed by one"
             ),
         }
     }
@@ -250,25 +282,31 @@ impl std::error::Error for EnvoyMemoryError {
             | Self::Unversioned { .. }
             | Self::NotARecord { .. }
             | Self::WrongIdentity { .. }
-            | Self::NotAnIdentity(_) => None,
+            | Self::WrongDestination { .. }
+            | Self::NotAnIdentity(_)
+            | Self::NotADestination(_) => None,
         }
     }
 }
 
 /// The file name of one session's record: the truncated SHA-256 of the identity's address
-/// bytes, a zero byte and the session's thread, as 32 lowercase hex. The thread is the one
+/// bytes, a zero byte, the sending destination's address bytes, a zero byte and the
+/// session's thread, as 32 lowercase hex. The thread is the one
 /// `EnvoySessions::session_thread` picks: the id of the message that opened the session,
-/// never a thread a message named that the store did not hold. The identity is fixed-width,
-/// so the zero byte marks no boundary; it is a fixed separator that keeps this digest's
-/// input distinct from `destination_address`'s, which also chains an address hash. The
-/// identity bytes, not its hex, so the key is the same whatever case the caller spelt.
-/// `None` when `identity` is not a 32-hex address hash.
-pub(crate) fn session_key(identity: &str, thread: &str) -> Option<String> {
+/// never a thread a message named that the store did not hold. Both hashes are
+/// fixed-width, so the zero bytes mark no boundary; they are fixed separators that keep
+/// this digest's input distinct from `destination_address`'s, which also chains an
+/// address hash. The address bytes, not their hex, so the key is the same whatever case
+/// the caller spelt. `None` when `identity` or `destination` is not a 32-hex address hash.
+pub(crate) fn session_key(identity: &str, destination: &str, thread: &str) -> Option<String> {
     let identity = parse_hash(identity)?;
+    let destination = parse_hash(destination)?;
     Some(
         AddressHash::new_from_hash(&Hash::new(
             Hash::generator()
                 .chain_update(identity.as_slice())
+                .chain_update([0u8])
+                .chain_update(destination.as_slice())
                 .chain_update([0u8])
                 .chain_update(thread.as_bytes())
                 .finalize()
@@ -281,6 +319,10 @@ pub(crate) fn session_key(identity: &str, thread: &str) -> Option<String> {
 pub(crate) fn stores_dir(cache_dir: &Path) -> PathBuf {
     mesh_cache_dir(cache_dir).join("envoy-sessions")
 }
+
+/// A sending destination for tests that file conversations without a live sender.
+#[cfg(test)]
+pub(crate) const TEST_DESTINATION: &str = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
 
 /// The conversations one instance's envoy remembers, keyed by instance because a fork
 /// answers its own peers and must not read the original's.
@@ -379,18 +421,20 @@ impl EnvoySessions {
         })
     }
 
-    /// Forgets `identity`'s `thread` in every instance's store under `cache_dir`, with
-    /// the same sweep as `delete_identity_everywhere`; `removed` is how many held it.
+    /// Forgets `identity`'s `thread`, from whichever of its destinations it was held
+    /// under, in every instance's store under `cache_dir`, with the same sweep as
+    /// `delete_identity_everywhere`; `removed` is how many conversations went.
     pub(crate) fn delete_thread_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
         identity: &str,
         thread: &str,
     ) -> Result<Forgotten, EnvoyMemoryError> {
-        let (identity, _) = resolve(identity, thread)?;
+        let identity = canonical_hash(identity)
+            .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
         let mut removed = 0;
         let unreadable_stores = Self::sweep(cache_dir, config, "swept", |store| {
-            removed += usize::from(store.delete(&identity, thread)?);
+            removed += store.delete(&identity, thread)?;
             Ok(())
         })?;
         Ok(Forgotten {
@@ -498,25 +542,31 @@ impl EnvoySessions {
         &self.dir
     }
 
-    /// The record for `identity`'s `thread`, or `None` when the store holds none. A
-    /// record the index names but the disk lacks is dropped from the index on the way.
-    /// A record under this key that names another identity is refused, never returned.
-    /// One past `ttl_hours` since its last save is forgotten here and now rather than
-    /// handed back; the rest of the store waits for `prune`.
+    /// The record for `identity`'s `thread` sent from `destination`, or `None` when the
+    /// store holds none. A record the index names but the disk lacks is dropped from the
+    /// index on the way. A record under this key that names another identity or another
+    /// destination is refused, never returned. One past `ttl_hours` since its last save
+    /// is forgotten here and now rather than handed back; the rest of the store waits
+    /// for `prune`.
     pub(crate) fn load(
         &self,
         identity: &str,
+        destination: &str,
         thread: &str,
         now: SystemTime,
     ) -> Result<Option<EnvoySessionFile>, EnvoyMemoryError> {
-        let (identity, key) = resolve(identity, thread)?;
+        let Resolved {
+            identity,
+            destination,
+            key,
+        } = resolve(identity, destination, thread)?;
         if !self.dir.exists() {
             return Ok(None);
         }
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
         let mut index = self.read_index()?;
-        let Some(indexed) = self.owned(&index, &key, &identity)? else {
+        let Some(indexed) = self.owned(&index, &key, &identity, &destination)? else {
             return Ok(None);
         };
         if is_expired(
@@ -538,16 +588,18 @@ impl EnvoySessions {
     }
 
     /// The thread a message's session is kept under. A message resumes only the
-    /// session `identity` already holds under its `wire_thread`, live and its own; any
-    /// other message, a root or one naming a thread the store does not hold, opens a
-    /// new session under its own `message_id`. A record under the wire thread that
-    /// cannot be read, or that names another identity, is warned about and not
-    /// resumed; so is a store whose index or lock cannot be used, with advice for the
-    /// whole store rather than the thread. The record resumed comes back with the
-    /// choice, so it is loaded once.
+    /// session `identity` already holds from `destination` under its `wire_thread`,
+    /// live and its own; any other message, a root, one naming a thread the store does
+    /// not hold, or one naming a thread another destination of the same identity holds,
+    /// opens a new session under its own `message_id`. A record under the wire thread
+    /// that cannot be read, or that names another identity or destination, is warned
+    /// about and not resumed; so is a store whose index or lock cannot be used, with
+    /// advice for the whole store rather than the thread. The record resumed comes back
+    /// with the choice, so it is loaded once.
     pub(crate) fn session_thread(
         &self,
         identity: &str,
+        destination: &str,
         wire_thread: Option<&str>,
         message_id: &str,
         now: SystemTime,
@@ -559,7 +611,7 @@ impl EnvoySessions {
         let Some(thread) = wire_thread.filter(|thread| *thread != message_id) else {
             return fresh();
         };
-        match self.load(identity, thread, now) {
+        match self.load(identity, destination, thread, now) {
             Ok(Some(record)) => SessionThread {
                 thread: thread.to_string(),
                 resumed: Some(record),
@@ -572,7 +624,14 @@ impl EnvoySessions {
                 );
                 fresh()
             }
-            Err(err) if self.is_record_error(&err, identity, thread) => {
+            Err(EnvoyMemoryError::WrongDestination { .. }) => {
+                warn!(
+                    "Mesh envoy memory for thread {thread} belongs to another destination than {}, so it was not resumed for this sender. A new conversation starts under message {message_id} and the other record is left alone; nothing needs to be done.",
+                    short(destination)
+                );
+                fresh()
+            }
+            Err(err) if self.is_record_error(&err, identity, destination, thread) => {
                 warn!(
                     "Mesh envoy memory for thread {thread} could not be read ({}), so it was not resumed. A new conversation starts under message {message_id}; run `.mesh memory forget {} {thread}` to clear the unreadable record.",
                     redact_hashes(&err.to_string()),
@@ -590,10 +649,16 @@ impl EnvoySessions {
         }
     }
 
-    /// Whether `err` is about the one record `identity`'s `thread` is kept in, rather
-    /// than the index, the lock or the store as a whole.
-    fn is_record_error(&self, err: &EnvoyMemoryError, identity: &str, thread: &str) -> bool {
-        let Ok((_, key)) = resolve(identity, thread) else {
+    /// Whether `err` is about the one record `identity`'s `thread` from `destination`
+    /// is kept in, rather than the index, the lock or the store as a whole.
+    fn is_record_error(
+        &self,
+        err: &EnvoyMemoryError,
+        identity: &str,
+        destination: &str,
+        thread: &str,
+    ) -> bool {
+        let Ok(Resolved { key, .. }) = resolve(identity, destination, thread) else {
             return false;
         };
         let record = self.record_path(&key);
@@ -608,34 +673,37 @@ impl EnvoySessions {
     }
 
     /// Writes `turns`, cut to `max_turns` and `max_bytes` oldest exchange first, as the
-    /// whole of `identity`'s `thread`, stamped `now`, creating the store on the first
-    /// save; then drops every other conversation past `ttl_hours` and what the save
-    /// pushed over `max_per_identity` or `max_sessions`, least recently used first and
-    /// never the thread just saved. Turns that cut to nothing delete the record instead
-    /// of writing an empty one. On either branch a record already under the key that
-    /// this build cannot read, or that names another identity, is refused: neither
-    /// written over nor removed.
+    /// whole of `identity`'s `thread` from `destination`, stamped `now`, creating the
+    /// store on the first save; then drops every other conversation past `ttl_hours`
+    /// and what the save pushed over `max_per_identity` or `max_sessions`, least
+    /// recently used first and never the thread just saved. Turns that cut to nothing
+    /// delete the record instead of writing an empty one. On either branch a record
+    /// already under the key that this build cannot read, or that names another
+    /// identity or destination, is refused: neither written over nor removed.
     pub(crate) fn save(
         &self,
         identity: &str,
+        destination: &str,
         thread: &str,
         turns: Vec<EnvoyTurn>,
         now: SystemTime,
     ) -> Result<(), EnvoyMemoryError> {
-        self.write(identity, thread, turns, now, Write::Replace)
+        self.write(identity, destination, thread, turns, now, Write::Replace)
     }
 
-    /// Adds `new_turns` after what the store holds of `identity`'s `thread`, then bounds
-    /// and evicts as `save` does. The read and the write are one locked step, so two
-    /// writers landing together (a run's exchange and the owner's late answer) both
-    /// stay. With `create`, a thread the store does not hold becomes a record of
-    /// `new_turns` alone; without it nothing is written for one. A record under the
-    /// key that this build cannot read, or that names another identity, is refused. One
-    /// past `ttl_hours` since its last save is forgotten first and counts as not held:
-    /// a late turn never revives an expired thread.
+    /// Adds `new_turns` after what the store holds of `identity`'s `thread` from
+    /// `destination`, then bounds and evicts as `save` does. The read and the write are
+    /// one locked step, so two writers landing together (a run's exchange and the
+    /// owner's late answer) both stay. With `create`, a thread the store does not hold
+    /// becomes a record of `new_turns` alone; without it nothing is written for one. A
+    /// record under the key that this build cannot read, or that names another identity
+    /// or destination, is refused. One past `ttl_hours` since its last save is
+    /// forgotten first and counts as not held: a late turn never revives an expired
+    /// thread.
     pub(crate) fn append(
         &self,
         identity: &str,
+        destination: &str,
         thread: &str,
         new_turns: Vec<EnvoyTurn>,
         now: SystemTime,
@@ -643,6 +711,7 @@ impl EnvoySessions {
     ) -> Result<(), EnvoyMemoryError> {
         self.write(
             identity,
+            destination,
             thread,
             new_turns,
             now,
@@ -660,6 +729,7 @@ impl EnvoySessions {
     pub(crate) fn append_once(
         &self,
         identity: &str,
+        destination: &str,
         thread: &str,
         turn: EnvoyTurn,
         now: SystemTime,
@@ -668,18 +738,23 @@ impl EnvoySessions {
             create: false,
             skip_if_last_equal: true,
         };
-        self.write(identity, thread, vec![turn], now, mode)
+        self.write(identity, destination, thread, vec![turn], now, mode)
     }
 
     fn write(
         &self,
         identity: &str,
+        destination: &str,
         thread: &str,
         mut turns: Vec<EnvoyTurn>,
         now: SystemTime,
         mode: Write,
     ) -> Result<(), EnvoyMemoryError> {
-        let (identity, key) = resolve(identity, thread)?;
+        let Resolved {
+            identity,
+            destination,
+            key,
+        } = resolve(identity, destination, thread)?;
         if !self.dir.exists() {
             // Nothing is under any key yet, so the turns given are the whole record;
             // one that comes to nothing creates no store.
@@ -691,7 +766,7 @@ impl EnvoySessions {
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
         let mut index = self.read_index()?;
-        let indexed = match self.owned(&index, &key, &identity)? {
+        let indexed = match self.owned(&index, &key, &identity, &destination)? {
             Some(indexed)
                 if matches!(mode, Write::Append { .. })
                     && is_expired(
@@ -738,6 +813,7 @@ impl EnvoySessions {
         let record = EnvoySessionFile {
             version: ENVOY_SESSION_VERSION,
             identity,
+            destination,
             thread: thread.to_string(),
             last_used: rfc3339_utc(now),
             turns,
@@ -746,6 +822,7 @@ impl EnvoySessions {
         let entry = EnvoySessionEntry {
             key: key.clone(),
             identity: record.identity,
+            destination: record.destination,
             thread: record.thread,
             last_used: record.last_used,
             turns: record.turns.len(),
@@ -761,14 +838,18 @@ impl EnvoySessions {
         self.write_index(&index)
     }
 
-    /// `true` when `identity`'s `thread` was there to remove. Removes the record by key
-    /// without reading it: the caller asked for it gone, whatever it holds.
-    pub(crate) fn delete(&self, identity: &str, thread: &str) -> Result<bool, EnvoyMemoryError> {
-        let (_, key) = resolve(identity, thread)?;
-        Ok(self.delete_where(|entry| entry.key == key)? > 0)
+    /// Forgets `identity`'s `thread` from every destination it was held under, records
+    /// written before the destination was kept included, and says how many went. Each
+    /// record is removed by the key its index entry names, without reading it: the
+    /// caller asked for it gone, whatever it holds.
+    pub(crate) fn delete(&self, identity: &str, thread: &str) -> Result<usize, EnvoyMemoryError> {
+        let identity = canonical_hash(identity)
+            .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
+        self.delete_where(|entry| entry.identity == identity && entry.thread == thread)
     }
 
-    /// Forgets every thread of `identity`, each record removed by key without reading it.
+    /// Forgets every thread of `identity` from every destination, each record removed by
+    /// the key its index entry names, without reading it.
     pub(crate) fn delete_identity(&self, identity: &str) -> Result<usize, EnvoyMemoryError> {
         let identity = canonical_hash(identity)
             .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
@@ -906,15 +987,17 @@ impl EnvoySessions {
         Ok(records.len())
     }
 
-    /// `key`'s entry and record as far as `identity` may see them: `None` when the index
-    /// does not name the key, the record `None` when the index names it but the disk
-    /// lacks it. An entry or record under the key that names another identity is
-    /// refused, never read and never written over.
+    /// `key`'s entry and record as far as `identity` sending from `destination` may see
+    /// them: `None` when the index does not name the key, the record `None` when the
+    /// index names it but the disk lacks it. An entry or record under the key that names
+    /// another identity or another destination is refused, never read and never written
+    /// over.
     fn owned(
         &self,
         index: &EnvoySessionIndex,
         key: &str,
         identity: &str,
+        destination: &str,
     ) -> Result<Option<Indexed>, EnvoyMemoryError> {
         let Some(position) = index.entries.iter().position(|entry| entry.key == key) else {
             return Ok(None);
@@ -924,15 +1007,26 @@ impl EnvoySessions {
             asked: identity.to_string(),
             found: found.to_string(),
         };
+        let wrong_destination = |found: &str| EnvoyMemoryError::WrongDestination {
+            key: key.to_string(),
+            asked: destination.to_string(),
+            found: found.to_string(),
+        };
         let entry = &index.entries[position];
         if entry.identity != identity {
             return Err(wrong_identity(&entry.identity));
         }
+        if entry.destination != destination {
+            return Err(wrong_destination(&entry.destination));
+        }
         let record = self.read_record(key)?;
-        if let Some(record) = &record
-            && record.identity != identity
-        {
-            return Err(wrong_identity(&record.identity));
+        if let Some(record) = &record {
+            if record.identity != identity {
+                return Err(wrong_identity(&record.identity));
+            }
+            if record.destination != destination {
+                return Err(wrong_destination(&record.destination));
+            }
         }
         Ok(Some(Indexed { position, record }))
     }
@@ -1095,11 +1189,25 @@ enum Write {
     },
 }
 
-fn resolve(identity: &str, thread: &str) -> Result<(String, String), EnvoyMemoryError> {
-    match (canonical_hash(identity), session_key(identity, thread)) {
-        (Some(identity), Some(key)) => Ok((identity, key)),
-        _ => Err(EnvoyMemoryError::NotAnIdentity(identity.to_string())),
-    }
+/// The canonical identity and destination a caller named, and the key they file under.
+struct Resolved {
+    identity: String,
+    destination: String,
+    key: String,
+}
+
+fn resolve(identity: &str, destination: &str, thread: &str) -> Result<Resolved, EnvoyMemoryError> {
+    let canonical_identity = canonical_hash(identity)
+        .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
+    let canonical_destination = canonical_hash(destination)
+        .ok_or_else(|| EnvoyMemoryError::NotADestination(destination.to_string()))?;
+    let key = session_key(identity, destination, thread)
+        .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
+    Ok(Resolved {
+        identity: canonical_identity,
+        destination: canonical_destination,
+        key,
+    })
 }
 
 fn text_bytes(turns: &[EnvoyTurn]) -> u64 {
@@ -1272,6 +1380,19 @@ mod tests {
 
     const IDENTITY_A: &str = "0123456789abcdef0123456789abcdef";
     const IDENTITY_B: &str = "fedcba9876543210fedcba9876543210";
+    /// The destination each identity sends from in these tests.
+    const DEST_A: &str = "00112233445566778899aabbccddeeff";
+    const DEST_B: &str = "ffeeddccbbaa99887766554433221100";
+    /// A second instance of `IDENTITY_A`.
+    const DEST_A2: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf";
+
+    fn dest(identity: &str) -> &'static str {
+        if identity.eq_ignore_ascii_case(IDENTITY_B) {
+            DEST_B
+        } else {
+            DEST_A
+        }
+    }
 
     fn t(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -1310,7 +1431,7 @@ mod tests {
     }
 
     fn record_path(store: &EnvoySessions, identity: &str, thread: &str) -> PathBuf {
-        store.record_path(&session_key(identity, thread).unwrap())
+        store.record_path(&session_key(identity, dest(identity), thread).unwrap())
     }
 
     fn names_in(dir: &Path) -> Vec<String> {
@@ -1327,6 +1448,7 @@ mod tests {
         let record = EnvoySessionFile {
             version: ENVOY_SESSION_VERSION,
             identity: IDENTITY_A.to_string(),
+            destination: DEST_A.to_string(),
             thread: "thread-one".to_string(),
             last_used: rfc3339_utc(t(1_000)),
             turns: vec![user("hello"), assistant("hi")],
@@ -1343,7 +1465,14 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            ["version", "identity", "thread", "last_used", "turns"]
+            [
+                "version",
+                "identity",
+                "destination",
+                "thread",
+                "last_used",
+                "turns"
+            ]
         );
         assert!(!yaml.contains("system"), "{yaml}");
         assert!(yaml.contains("role: user\n"), "{yaml}");
@@ -1352,16 +1481,27 @@ mod tests {
 
     #[test]
     fn two_identities_with_the_same_thread_get_different_keys() {
-        let a = session_key(IDENTITY_A, "thread-one").unwrap();
-        let b = session_key(IDENTITY_B, "thread-one").unwrap();
+        let a = session_key(IDENTITY_A, DEST_A, "thread-one").unwrap();
+        let b = session_key(IDENTITY_B, DEST_A, "thread-one").unwrap();
         assert_ne!(a, b);
-        assert_ne!(a, session_key(IDENTITY_A, "thread-two").unwrap());
+        assert_ne!(
+            a,
+            session_key(IDENTITY_A, DEST_A2, "thread-one").unwrap(),
+            "another instance of the same identity keys another record"
+        );
+        assert_ne!(a, session_key(IDENTITY_A, DEST_A, "thread-two").unwrap());
         assert_eq!(
             a,
-            session_key(&IDENTITY_A.to_ascii_uppercase(), "thread-one").unwrap(),
+            session_key(&IDENTITY_A.to_ascii_uppercase(), DEST_A, "thread-one").unwrap(),
             "the key digests the identity's bytes, not its spelling"
         );
-        assert_eq!(session_key("not-a-hash", "thread-one"), None);
+        assert_eq!(
+            a,
+            session_key(IDENTITY_A, &DEST_A.to_ascii_uppercase(), "thread-one").unwrap(),
+            "the key digests the destination's bytes, not its spelling"
+        );
+        assert_eq!(session_key("not-a-hash", DEST_A, "thread-one"), None);
+        assert_eq!(session_key(IDENTITY_A, "not-a-hash", "thread-one"), None);
     }
 
     #[test]
@@ -1381,13 +1521,15 @@ mod tests {
         assert_eq!(store.prune(t(1_000)).unwrap(), 0);
         assert_eq!(store.stats().unwrap(), (0, 0));
         assert_eq!(
-            store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap(),
+            store
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                .unwrap(),
             None
         );
-        assert!(!store.delete(IDENTITY_A, "thread-one").unwrap());
+        assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 0);
         assert_eq!(store.delete_identity(IDENTITY_A).unwrap(), 0);
         store
-            .save(IDENTITY_A, "thread-one", Vec::new(), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", Vec::new(), t(1_000))
             .unwrap();
 
         assert!(!tmp.path.join("mesh").exists(), "{:?}", names_in(&tmp.path));
@@ -1399,12 +1541,12 @@ mod tests {
         let store = store(&tmp, &enabled());
 
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
 
         let dir = tmp.path.join("mesh").join("envoy-sessions").join("inst");
         assert_eq!(store.dir(), dir);
-        let key = session_key(IDENTITY_A, "thread-one").unwrap();
+        let key = session_key(IDENTITY_A, DEST_A, "thread-one").unwrap();
         assert_eq!(
             names_in(&dir),
             [
@@ -1415,10 +1557,11 @@ mod tests {
             "the record, the index and its lock, and no temp file"
         );
         let loaded = store
-            .load(IDENTITY_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.identity, IDENTITY_A);
+        assert_eq!(loaded.destination, DEST_A);
         assert_eq!(loaded.thread, "thread-one");
         assert_eq!(loaded.last_used, rfc3339_utc(t(1_000)));
         assert_eq!(loaded.turns, exchange(1));
@@ -1430,6 +1573,7 @@ mod tests {
             vec![EnvoySessionEntry {
                 key,
                 identity: IDENTITY_A.to_string(),
+                destination: DEST_A.to_string(),
                 thread: "thread-one".to_string(),
                 last_used: rfc3339_utc(t(1_000)),
                 turns: 2,
@@ -1453,7 +1597,7 @@ mod tests {
         let store = store(&tmp, &enabled());
 
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
 
         let mesh = tmp.path.join("mesh");
@@ -1475,16 +1619,18 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-wrong-identity");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
-        let key = session_key(IDENTITY_A, "thread-one").unwrap();
+        let key = session_key(IDENTITY_A, DEST_A, "thread-one").unwrap();
         let path = store.record_path(&key);
         let planted = fs::read_to_string(&path)
             .unwrap()
             .replace(IDENTITY_A, IDENTITY_B);
         fs::write(&path, planted).unwrap();
 
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(&err, EnvoyMemoryError::WrongIdentity { key: k, asked, found }
                 if *k == key && asked == IDENTITY_A && found == IDENTITY_B),
@@ -1492,7 +1638,9 @@ mod tests {
         );
         assert!(err.to_string().contains("refusing"), "{err}");
         assert_eq!(
-            store.load(IDENTITY_B, "thread-one", t(1_000)).unwrap(),
+            store
+                .load(IDENTITY_B, DEST_B, "thread-one", t(1_000))
+                .unwrap(),
             None,
             "B's key differs, so B sees nothing either"
         );
@@ -1502,11 +1650,334 @@ mod tests {
             .unwrap()
             .replace(IDENTITY_A, IDENTITY_B);
         fs::write(&index_path, swapped).unwrap();
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::WrongIdentity { .. }),
             "an index entry under A's key naming B is refused too: {err:?}"
         );
+    }
+
+    /// Replaces `from` with `to` in the file at `path`.
+    fn plant(path: &Path, from: &str, to: &str) {
+        let text = fs::read_to_string(path).unwrap();
+        assert!(text.contains(from), "{text}");
+        fs::write(path, text.replace(from, to)).unwrap();
+    }
+
+    #[test]
+    fn a_record_whose_destination_differs_from_the_asked_destination_is_never_loaded() {
+        let tmp = TempDir::new("envoy-sessions-wrong-destination");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        let key = session_key(IDENTITY_A, DEST_A, "thread-one").unwrap();
+        let path = store.record_path(&key);
+        plant(&path, DEST_A, DEST_A2);
+
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
+        assert!(
+            matches!(&err, EnvoyMemoryError::WrongDestination { key: k, asked, found }
+                if *k == key && asked == DEST_A && found == DEST_A2),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("refusing"), "{err}");
+        let planted = fs::read_to_string(&path).unwrap();
+        assert!(
+            matches!(
+                store.append(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-one",
+                    exchange(2),
+                    t(1_001),
+                    true
+                ),
+                Err(EnvoyMemoryError::WrongDestination { .. })
+            ),
+            "a record naming another destination is not written over"
+        );
+        assert!(matches!(
+            store.save(IDENTITY_A, DEST_A, "thread-one", exchange(2), t(1_001)),
+            Err(EnvoyMemoryError::WrongDestination { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), planted);
+        let session = store.session_thread(IDENTITY_A, DEST_A, Some("thread-one"), "m-2", t(1_001));
+        assert_eq!(session.thread, "m-2");
+        assert!(session.resumed.is_none());
+
+        plant(&path, DEST_A2, DEST_A);
+        plant(&store.index_path(), DEST_A, DEST_A2);
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
+        assert!(
+            matches!(err, EnvoyMemoryError::WrongDestination { .. }),
+            "an index entry under the key naming another destination is refused too: {err:?}"
+        );
+    }
+
+    #[test]
+    fn another_destination_of_the_same_identity_does_not_see_the_thread() {
+        let tmp = TempDir::new("envoy-sessions-other-destination");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .load(IDENTITY_A, DEST_A2, "thread-one", t(1_001))
+                .unwrap(),
+            None
+        );
+        let session =
+            store.session_thread(IDENTITY_A, DEST_A2, Some("thread-one"), "m-2", t(1_001));
+        assert_eq!(
+            session.thread, "m-2",
+            "a new session under the message's id"
+        );
+        assert!(session.resumed.is_none());
+        let own = store.session_thread(IDENTITY_A, DEST_A, Some("thread-one"), "m-3", t(1_001));
+        assert_eq!(own.thread, "thread-one");
+        assert_eq!(own.resumed.unwrap().turns, exchange(1));
+
+        store
+            .append(
+                IDENTITY_A,
+                DEST_A2,
+                "thread-one",
+                exchange(2),
+                t(1_002),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_002))
+                .unwrap()
+                .unwrap()
+                .turns,
+            exchange(1),
+            "each destination's thread is its own record"
+        );
+        assert_eq!(
+            store
+                .load(IDENTITY_A, DEST_A2, "thread-one", t(1_002))
+                .unwrap()
+                .unwrap()
+                .turns,
+            exchange(2)
+        );
+        assert_eq!(store.stats().unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn forgetting_a_thread_or_an_identity_reaches_every_destination() {
+        let tmp = TempDir::new("envoy-sessions-forget-every-destination");
+        let config = enabled();
+        let store = store(&tmp, &config);
+        for (destination, thread) in [
+            (DEST_A, "thread-one"),
+            (DEST_A2, "thread-one"),
+            (DEST_A, "thread-two"),
+            (DEST_A2, "thread-three"),
+        ] {
+            store
+                .save(IDENTITY_A, destination, thread, exchange(1), t(1_000))
+                .unwrap();
+        }
+        store
+            .save(IDENTITY_B, DEST_B, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+
+        assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 2);
+        assert_eq!(store.stats().unwrap(), (3, 2));
+        assert_eq!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A).unwrap(),
+            Forgotten {
+                removed: 2,
+                unreadable_stores: 0,
+            }
+        );
+        assert_eq!(threads_of(&store, IDENTITY_A), Vec::<String>::new());
+        assert_eq!(threads_of(&store, IDENTITY_B), ["thread-one"]);
+
+        for destination in [DEST_A, DEST_A2] {
+            store
+                .save(IDENTITY_A, destination, "thread-one", exchange(1), t(1_000))
+                .unwrap();
+        }
+        assert_eq!(
+            EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
+                .unwrap(),
+            Forgotten {
+                removed: 2,
+                unreadable_stores: 0,
+            }
+        );
+        assert_eq!(
+            names_in(store.dir()),
+            [
+                format!(
+                    "{}.yaml",
+                    session_key(IDENTITY_B, DEST_B, "thread-one").unwrap()
+                ),
+                "index.json".to_string(),
+                "index.json.lock".to_string()
+            ],
+            "B's record, the index and its lock"
+        );
+    }
+
+    /// The file name a record of `identity`'s `thread` had before the sending destination
+    /// was part of the key.
+    fn legacy_key(identity: &str, thread: &str) -> String {
+        AddressHash::new_from_hash(&Hash::new(
+            Hash::generator()
+                .chain_update(parse_hash(identity).unwrap().as_slice())
+                .chain_update([0u8])
+                .chain_update(thread.as_bytes())
+                .finalize()
+                .into(),
+        ))
+        .to_hex_string()
+    }
+
+    /// Writes a record of `identity`'s `thread` and its index entry as a build that did
+    /// not keep the destination wrote them: under the old key and with no `destination`
+    /// field. The store is created first by a save of `IDENTITY_B`'s `other`.
+    fn plant_legacy(store: &EnvoySessions, identity: &str, thread: &str, at: SystemTime) {
+        store
+            .save(IDENTITY_B, DEST_B, "other", exchange(9), at)
+            .unwrap();
+        let key = legacy_key(identity, thread);
+        let last_used = rfc3339_utc(at);
+        let record = format!(
+            "version: {ENVOY_SESSION_VERSION}\nidentity: {identity}\nthread: {thread}\nlast_used: {last_used}\nturns:\n- role: user\n  text: old question\n- role: assistant\n  text: old answer\n"
+        );
+        fs::write(store.record_path(&key), record).unwrap();
+        let mut index: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(store.index_path()).unwrap()).unwrap();
+        index["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "key": key,
+                "identity": identity,
+                "thread": thread,
+                "last_used": last_used,
+                "turns": 2,
+                "bytes": 22,
+            }));
+        fs::write(store.index_path(), index.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_record_written_before_the_destination_was_kept_never_resumes() {
+        let tmp = TempDir::new("envoy-sessions-legacy-no-resume");
+        let config = enabled();
+        let store = store(&tmp, &config);
+        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+
+        let index = store.read_index().unwrap();
+        let legacy = index
+            .entries
+            .iter()
+            .find(|entry| entry.identity == IDENTITY_A)
+            .unwrap();
+        assert_eq!(legacy.destination, "", "the field defaults to empty");
+        assert_eq!(
+            store.read_record(&legacy.key).unwrap().unwrap().destination,
+            ""
+        );
+        for destination in [DEST_A, DEST_A2] {
+            assert_eq!(
+                store
+                    .load(IDENTITY_A, destination, "thread-one", t(1_001))
+                    .unwrap(),
+                None
+            );
+            let session =
+                store.session_thread(IDENTITY_A, destination, Some("thread-one"), "m-2", t(1_001));
+            assert_eq!(session.thread, "m-2");
+            assert!(session.resumed.is_none());
+        }
+        store
+            .append(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t(1_002),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_002))
+                .unwrap()
+                .unwrap()
+                .turns,
+            exchange(1),
+            "the old turns are never carried into the new record"
+        );
+        assert!(
+            store
+                .record_path(&legacy_key(IDENTITY_A, "thread-one"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_record_written_before_the_destination_was_kept_is_listed_forgotten_swept_and_aged_out() {
+        let tmp = TempDir::new("envoy-sessions-legacy-forget");
+        let config = enabled();
+        let store = store(&tmp, &config);
+        let legacy = store.record_path(&legacy_key(IDENTITY_A, "thread-one"));
+
+        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        let remembered = EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap();
+        assert_eq!(remembered.by_identity[IDENTITY_A], ["thread-one"]);
+        assert_eq!(
+            remembered.orphans, 0,
+            "the old record is named by the index"
+        );
+        assert_eq!(store.stats().unwrap(), (2, 2));
+        assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 1);
+        assert!(!legacy.exists(), "removed by the key its entry names");
+
+        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        assert_eq!(
+            EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(!legacy.exists());
+
+        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        assert_eq!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A)
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(!legacy.exists());
+        assert_eq!(threads_of(&store, IDENTITY_B), ["other"]);
+
+        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        let ttl = Duration::from_secs(config.ttl_hours * 3600);
+        assert_eq!(
+            store.prune(t(1_000) + ttl).unwrap(),
+            2,
+            "the old record ages out with the rest"
+        );
+        assert!(!legacy.exists());
     }
 
     #[test]
@@ -1514,23 +1985,25 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-delete");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-two", exchange(2), t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_001))
             .unwrap();
 
-        assert!(store.delete(IDENTITY_A, "thread-one").unwrap());
-        assert!(!store.delete(IDENTITY_A, "thread-one").unwrap());
+        assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 1);
+        assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 0);
 
         assert_eq!(
-            store.load(IDENTITY_A, "thread-one", t(1_001)).unwrap(),
+            store
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                .unwrap(),
             None
         );
         assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
         assert!(
             store
-                .load(IDENTITY_A, "thread-two", t(1_001))
+                .load(IDENTITY_A, DEST_A, "thread-two", t(1_001))
                 .unwrap()
                 .is_some()
         );
@@ -1542,13 +2015,13 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-delete-identity");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-two", exchange(2), t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_001))
             .unwrap();
         store
-            .save(IDENTITY_B, "thread-one", exchange(3), t(1_002))
+            .save(IDENTITY_B, DEST_B, "thread-one", exchange(3), t(1_002))
             .unwrap();
 
         assert_eq!(store.delete_identity(IDENTITY_A).unwrap(), 2);
@@ -1558,7 +2031,7 @@ mod tests {
         assert!(!record_path(&store, IDENTITY_A, "thread-two").exists());
         assert_eq!(
             store
-                .load(IDENTITY_B, "thread-one", t(1_002))
+                .load(IDENTITY_B, DEST_B, "thread-one", t(1_002))
                 .unwrap()
                 .unwrap()
                 .turns,
@@ -1590,14 +2063,14 @@ mod tests {
             .collect();
         for (n, store) in stores.iter().enumerate() {
             store
-                .save(IDENTITY_A, "thread-one", exchange(n), t(1_000))
+                .save(IDENTITY_A, DEST_A, "thread-one", exchange(n), t(1_000))
                 .unwrap();
             store
-                .save(IDENTITY_B, "thread-one", exchange(n), t(1_000))
+                .save(IDENTITY_B, DEST_B, "thread-one", exchange(n), t(1_000))
                 .unwrap();
         }
         stores[0]
-            .save(IDENTITY_A, "thread-two", exchange(9), t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(9), t(1_001))
             .unwrap();
         let refused_index = stores[2].index_path();
         let planted = fs::read_to_string(&refused_index)
@@ -1614,12 +2087,14 @@ mod tests {
 
         for store in &stores[..2] {
             assert_eq!(
-                store.load(IDENTITY_A, "thread-one", t(1_001)).unwrap(),
+                store
+                    .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                    .unwrap(),
                 None
             );
             assert!(
                 store
-                    .load(IDENTITY_B, "thread-one", t(1_001))
+                    .load(IDENTITY_B, DEST_B, "thread-one", t(1_001))
                     .unwrap()
                     .is_some()
             );
@@ -1641,9 +2116,9 @@ mod tests {
     fn delete_identity_everywhere_sweeps_while_the_memory_is_off() {
         let tmp = TempDir::new("envoy-sessions-delete-while-off");
         let on = store(&tmp, &enabled());
-        on.save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+        on.save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
-        on.save(IDENTITY_B, "thread-one", exchange(2), t(1_000))
+        on.save(IDENTITY_B, DEST_B, "thread-one", exchange(2), t(1_000))
             .unwrap();
 
         let off = EnvoyMemoryConfig::default();
@@ -1658,12 +2133,14 @@ mod tests {
 
         let reopened = store(&tmp, &enabled());
         assert_eq!(
-            reopened.load(IDENTITY_A, "thread-one", t(1_001)).unwrap(),
+            reopened
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                .unwrap(),
             None
         );
         assert_eq!(
             reopened
-                .load(IDENTITY_B, "thread-one", t(1_001))
+                .load(IDENTITY_B, DEST_B, "thread-one", t(1_001))
                 .unwrap()
                 .map(|record| record.turns),
             Some(exchange(2))
@@ -1680,14 +2157,14 @@ mod tests {
             .collect();
         for (n, store) in stores.iter().enumerate() {
             store
-                .save(IDENTITY_A, "thread-one", exchange(n), t(1_000))
+                .save(IDENTITY_A, DEST_A, "thread-one", exchange(n), t(1_000))
                 .unwrap();
             store
-                .save(IDENTITY_B, "thread-one", exchange(n), t(1_000))
+                .save(IDENTITY_B, DEST_B, "thread-one", exchange(n), t(1_000))
                 .unwrap();
         }
         stores[0]
-            .save(IDENTITY_A, "thread-two", exchange(9), t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(9), t(1_001))
             .unwrap();
         let refused_index = stores[2].index_path();
         let planted = fs::read_to_string(&refused_index)
@@ -1784,7 +2261,7 @@ mod tests {
         let config = enabled();
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         let elsewhere = tmp.path.join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
@@ -1931,7 +2408,7 @@ mod tests {
         let config = enabled();
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         let orphan = store.dir().join(format!("{}.yaml", "de".repeat(16)));
         fs::write(&orphan, "version: 1\n").unwrap();
@@ -1963,9 +2440,9 @@ mod tests {
     fn the_everywhere_helpers_take_an_unvalidated_config_while_the_memory_is_off() {
         let tmp = TempDir::new("envoy-sessions-everywhere-unvalidated");
         let on = store(&tmp, &enabled());
-        on.save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+        on.save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
-        on.save(IDENTITY_B, "thread-one", exchange(2), t(1_000))
+        on.save(IDENTITY_B, DEST_B, "thread-one", exchange(2), t(1_000))
             .unwrap();
         let off = EnvoyMemoryConfig {
             enabled: false,
@@ -2007,11 +2484,11 @@ mod tests {
     fn the_everywhere_helpers_read_and_wipe_while_the_memory_is_off() {
         let tmp = TempDir::new("envoy-sessions-everywhere-while-off");
         let on = store(&tmp, &enabled());
-        on.save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+        on.save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
-        on.save(IDENTITY_A, "thread-two", exchange(2), t(1_000))
+        on.save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_000))
             .unwrap();
-        on.save(IDENTITY_B, "thread-one", exchange(3), t(1_000))
+        on.save(IDENTITY_B, DEST_B, "thread-one", exchange(3), t(1_000))
             .unwrap();
 
         let off = EnvoyMemoryConfig::default();
@@ -2058,19 +2535,34 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-append");
         let store = store(&tmp, &enabled());
         store
-            .append(IDENTITY_A, "thread-one", exchange(1), t(1_000), false)
+            .append(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t(1_000),
+                false,
+            )
             .unwrap();
         assert!(
             !tmp.path.join("mesh").exists(),
             "an append to a store that does not exist creates nothing"
         );
         store
-            .append(IDENTITY_A, "thread-one", exchange(1), t(1_000), true)
+            .append(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t(1_000),
+                true,
+            )
             .unwrap();
 
         store
             .append(
                 IDENTITY_A,
+                DEST_A,
                 "thread-one",
                 vec![assistant("late")],
                 t(1_001),
@@ -2078,14 +2570,28 @@ mod tests {
             )
             .unwrap();
         store
-            .append(IDENTITY_A, "thread-two", exchange(2), t(1_002), false)
+            .append(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(2),
+                t(1_002),
+                false,
+            )
             .unwrap();
         store
-            .append(IDENTITY_A, "thread-three", exchange(3), t(1_003), true)
+            .append(
+                IDENTITY_A,
+                DEST_A,
+                "thread-three",
+                exchange(3),
+                t(1_003),
+                true,
+            )
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, "thread-one", t(1_001))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2095,14 +2601,16 @@ mod tests {
         assert_eq!(loaded.last_used, rfc3339_utc(t(1_001)));
         assert_eq!(store.stats().unwrap(), (2, 1));
         assert_eq!(
-            store.load(IDENTITY_A, "thread-two", t(1_002)).unwrap(),
+            store
+                .load(IDENTITY_A, DEST_A, "thread-two", t(1_002))
+                .unwrap(),
             None,
             "an append without create to a thread not held writes nothing"
         );
         assert!(!record_path(&store, IDENTITY_A, "thread-two").exists());
         assert_eq!(
             store
-                .load(IDENTITY_A, "thread-three", t(1_003))
+                .load(IDENTITY_A, DEST_A, "thread-three", t(1_003))
                 .unwrap()
                 .unwrap()
                 .turns,
@@ -2115,7 +2623,7 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-append-once");
         let store = store(&tmp, &enabled());
         store
-            .append_once(IDENTITY_A, "thread-one", assistant("yes"), t(1_000))
+            .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("yes"), t(1_000))
             .unwrap();
         assert!(
             !tmp.path.join("mesh").exists(),
@@ -2124,6 +2632,7 @@ mod tests {
         store
             .save(
                 IDENTITY_A,
+                DEST_A,
                 "thread-one",
                 vec![user("may I?"), assistant("yes")],
                 t(1_000),
@@ -2131,20 +2640,20 @@ mod tests {
             .unwrap();
 
         store
-            .append_once(IDENTITY_A, "thread-one", assistant("yes"), t(1_001))
+            .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("yes"), t(1_001))
             .unwrap();
         let held = store
-            .load(IDENTITY_A, "thread-one", t(1_001))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
             .unwrap()
             .unwrap();
         assert_eq!(held.turns, vec![user("may I?"), assistant("yes")]);
         assert_eq!(held.last_used, rfc3339_utc(t(1_000)));
 
         store
-            .append_once(IDENTITY_A, "thread-one", assistant("no"), t(1_002))
+            .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("no"), t(1_002))
             .unwrap();
         let held = store
-            .load(IDENTITY_A, "thread-one", t(1_002))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_002))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2163,24 +2672,30 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         let late = t(1_000 + 3_601);
 
         store
-            .append_once(IDENTITY_A, "thread-one", assistant("late"), late)
+            .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("late"), late)
             .unwrap();
-        assert_eq!(store.load(IDENTITY_A, "thread-one", late).unwrap(), None);
+        assert_eq!(
+            store.load(IDENTITY_A, DEST_A, "thread-one", late).unwrap(),
+            None
+        );
         assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
         assert_eq!(store.stats().unwrap(), (0, 0));
 
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         store
-            .append(IDENTITY_A, "thread-one", exchange(2), late, true)
+            .append(IDENTITY_A, DEST_A, "thread-one", exchange(2), late, true)
             .unwrap();
-        let held = store.load(IDENTITY_A, "thread-one", late).unwrap().unwrap();
+        let held = store
+            .load(IDENTITY_A, DEST_A, "thread-one", late)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             held.turns,
             exchange(2),
@@ -2203,37 +2718,49 @@ mod tests {
         let store = store(&tmp, &config);
         let saved = vec![user("may I?"), assistant("yes")];
         store
-            .save(IDENTITY_A, "thread-one", saved.clone(), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", saved.clone(), t(1_000))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-two", saved.clone(), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-two", saved.clone(), t(1_000))
             .unwrap();
 
         // Half an hour in: a read and a retry of the turn the record ends with.
         assert!(
             store
-                .load(IDENTITY_A, "thread-one", t(1_000 + 1_800))
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 1_800))
                 .unwrap()
                 .is_some()
         );
         store
-            .append_once(IDENTITY_A, "thread-one", assistant("yes"), t(1_000 + 1_800))
+            .append_once(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                assistant("yes"),
+                t(1_000 + 1_800),
+            )
             .unwrap();
         // The same half hour in: a turn that is written.
         store
-            .append_once(IDENTITY_A, "thread-two", assistant("no"), t(1_000 + 1_800))
+            .append_once(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                assistant("no"),
+                t(1_000 + 1_800),
+            )
             .unwrap();
 
         assert_eq!(
             store
-                .load(IDENTITY_A, "thread-one", t(1_000 + 3_600))
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 3_600))
                 .unwrap(),
             None,
             "neither the read nor the skipped retry kept the thread past its hour"
         );
         assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
         let held = store
-            .load(IDENTITY_A, "thread-two", t(1_000 + 1_800 + 3_599))
+            .load(IDENTITY_A, DEST_A, "thread-two", t(1_000 + 1_800 + 3_599))
             .unwrap()
             .expect("the written turn started the hour over");
         assert_eq!(
@@ -2243,7 +2770,7 @@ mod tests {
         assert_eq!(held.last_used, rfc3339_utc(t(1_000 + 1_800)));
         assert_eq!(
             store
-                .load(IDENTITY_A, "thread-two", t(1_000 + 1_800 + 3_600))
+                .load(IDENTITY_A, DEST_A, "thread-two", t(1_000 + 1_800 + 3_600))
                 .unwrap(),
             None
         );
@@ -2264,6 +2791,7 @@ mod tests {
             store
                 .append(
                     IDENTITY_A,
+                    DEST_A,
                     "thread-one",
                     exchange(n),
                     t(1_000 + n as u64),
@@ -2273,7 +2801,7 @@ mod tests {
         }
 
         let loaded = store
-            .load(IDENTITY_A, "thread-one", t(1_003))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_003))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.turns, [exchange(2), exchange(3)].concat());
@@ -2284,19 +2812,19 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-stats");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-two", exchange(2), t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_001))
             .unwrap();
         store
-            .save(IDENTITY_B, "thread-one", exchange(3), t(1_002))
+            .save(IDENTITY_B, DEST_B, "thread-one", exchange(3), t(1_002))
             .unwrap();
 
         assert_eq!(store.stats().unwrap(), (3, 2));
 
         store
-            .save(IDENTITY_A, "thread-one", exchange(4), t(1_003))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(4), t(1_003))
             .unwrap();
         assert_eq!(
             store.stats().unwrap(),
@@ -2310,12 +2838,14 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-missing-record");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         fs::remove_file(record_path(&store, IDENTITY_A, "thread-one")).unwrap();
 
         assert_eq!(
-            store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap(),
+            store
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                .unwrap(),
             None
         );
         assert_eq!(store.stats().unwrap(), (0, 0));
@@ -2329,11 +2859,28 @@ mod tests {
         let not_hex = "g".repeat(32);
         for identity in ["", "abc", not_hex.as_str()] {
             let err = store
-                .save(identity, "thread", exchange(1), t(1_000))
+                .save(identity, DEST_A, "thread", exchange(1), t(1_000))
                 .unwrap_err();
             assert!(matches!(err, EnvoyMemoryError::NotAnIdentity(_)), "{err:?}");
-            assert!(store.load(identity, "thread", t(1_000)).is_err());
+            assert!(store.load(identity, DEST_A, "thread", t(1_000)).is_err());
             assert!(store.delete_identity(identity).is_err());
+            assert!(store.delete(identity, "thread").is_err());
+        }
+        for destination in ["", "abc", not_hex.as_str()] {
+            let err = store
+                .save(IDENTITY_A, destination, "thread", exchange(1), t(1_000))
+                .unwrap_err();
+            assert!(
+                matches!(err, EnvoyMemoryError::NotADestination(_)),
+                "{err:?}"
+            );
+            assert!(
+                matches!(
+                    store.load(IDENTITY_A, destination, "thread", t(1_000)),
+                    Err(EnvoyMemoryError::NotADestination(_))
+                ),
+                "a malformed destination keys nothing"
+            );
         }
         assert!(!tmp.path.join("mesh").exists());
     }
@@ -2414,11 +2961,11 @@ mod tests {
         let turns: Vec<EnvoyTurn> = (1..=3).flat_map(exchange).collect();
 
         store
-            .save(IDENTITY_A, "thread-one", turns, t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", turns, t(1_000))
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2443,11 +2990,11 @@ mod tests {
         assert_eq!(text_bytes(&turns), 54);
 
         store
-            .save(IDENTITY_A, "thread-one", turns, t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", turns, t(1_000))
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.turns, [exchange(2), exchange(3)].concat());
@@ -2474,11 +3021,11 @@ mod tests {
         );
 
         store
-            .save(IDENTITY_A, "thread-one", turns, t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", turns, t(1_000))
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2513,13 +3060,14 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         assert!(record_path(&store, IDENTITY_A, "thread-one").exists());
 
         store
             .save(
                 IDENTITY_A,
+                DEST_A,
                 "thread-one",
                 vec![user("q"), assistant(&"a".repeat(32))],
                 t(1_001),
@@ -2528,7 +3076,9 @@ mod tests {
 
         assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
         assert_eq!(
-            store.load(IDENTITY_A, "thread-one", t(1_001)).unwrap(),
+            store
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                .unwrap(),
             None
         );
         assert_eq!(store.stats().unwrap(), (0, 0));
@@ -2543,13 +3093,13 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         store
-            .save(IDENTITY_B, "thread-one", exchange(2), t(1_002))
+            .save(IDENTITY_B, DEST_B, "thread-one", exchange(2), t(1_002))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-two", exchange(3), t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(3), t(1_001))
             .unwrap();
 
         assert_eq!(store.stats().unwrap(), (2, 2));
@@ -2573,19 +3123,19 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_B, "thread-one", exchange(1), t(900))
+            .save(IDENTITY_B, DEST_B, "thread-one", exchange(1), t(900))
             .unwrap();
         store
-            .save(IDENTITY_B, "thread-two", exchange(2), t(901))
+            .save(IDENTITY_B, DEST_B, "thread-two", exchange(2), t(901))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-two", exchange(3), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(3), t(1_000))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-one", exchange(4), t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(4), t(1_001))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-three", exchange(5), t(1_002))
+            .save(IDENTITY_A, DEST_A, "thread-three", exchange(5), t(1_002))
             .unwrap();
 
         assert_eq!(
@@ -2611,22 +3161,22 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         store
-            .save(IDENTITY_A, "thread-two", exchange(2), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_000))
             .unwrap();
 
         assert!(
             store
-                .load(IDENTITY_A, "thread-one", t(1_000 + 3_599))
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 3_599))
                 .unwrap()
                 .is_some(),
             "one second short of the ttl is still a conversation"
         );
         assert_eq!(
             store
-                .load(IDENTITY_A, "thread-one", t(1_000 + 3_600))
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 3_600))
                 .unwrap(),
             None
         );
@@ -2652,7 +3202,9 @@ mod tests {
             (IDENTITY_B, "b-old", 1_003),
             (IDENTITY_B, "b-new", 1_004),
         ] {
-            lenient.save(identity, thread, exchange(1), t(at)).unwrap();
+            lenient
+                .save(identity, dest(identity), thread, exchange(1), t(at))
+                .unwrap();
         }
         assert_eq!(lenient.stats().unwrap(), (6, 2));
         let store = store(
@@ -2709,14 +3261,14 @@ mod tests {
         let tmp = TempDir::new(tag);
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         (tmp, store)
     }
 
     fn assert_refused_in_place(store: &EnvoySessions, path: &Path, planted: &str) {
         let err = store
-            .load(IDENTITY_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
             .unwrap_err()
             .to_string();
         assert!(err.contains(&path.display().to_string()), "{err}");
@@ -2724,12 +3276,19 @@ mod tests {
         assert!(err.contains("move the file aside"), "{err}");
         assert!(
             store
-                .save(IDENTITY_A, "thread-one", exchange(2), t(1_001))
+                .save(IDENTITY_A, DEST_A, "thread-one", exchange(2), t(1_001))
                 .is_err()
         );
         assert!(
             store
-                .append(IDENTITY_A, "thread-one", exchange(2), t(1_001), false)
+                .append(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-one",
+                    exchange(2),
+                    t(1_001),
+                    false
+                )
                 .is_err()
         );
         assert_eq!(
@@ -2756,7 +3315,9 @@ mod tests {
         );
         fs::write(&path, &planted).unwrap();
 
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::Version { found, expected, .. }
                 if found == ENVOY_SESSION_VERSION + 1 && expected == ENVOY_SESSION_VERSION),
@@ -2782,7 +3343,7 @@ mod tests {
         fs::write(&path, &planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
             .unwrap_err()
             .to_string();
         assert!(err.contains("version 0"), "{err}");
@@ -2800,7 +3361,9 @@ mod tests {
             .replace(&format!("version: {ENVOY_SESSION_VERSION}\n"), "");
         fs::write(&path, &planted).unwrap();
 
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::Unversioned { .. }),
             "{err:?}"
@@ -2819,7 +3382,9 @@ mod tests {
         let planted = format!("{}added_later: true\n", fs::read_to_string(&path).unwrap());
         fs::write(&path, &planted).unwrap();
 
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::NotARecord { .. }),
             "{err:?}"
@@ -2839,7 +3404,9 @@ mod tests {
         let planted = index.to_string();
         fs::write(&path, &planted).unwrap();
 
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::Version { found, expected, .. }
                 if found == ENVOY_SESSION_INDEX_VERSION + 1 && expected == ENVOY_SESSION_INDEX_VERSION),
@@ -2867,7 +3434,9 @@ mod tests {
         let planted = index.to_string();
         fs::write(&path, &planted).unwrap();
 
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::NotARecord { .. }),
             "{err:?}"
@@ -2878,7 +3447,9 @@ mod tests {
         let mut entry_field = original;
         entry_field["entries"][0]["added_later"] = serde_json::json!(1);
         fs::write(&path, entry_field.to_string()).unwrap();
-        let err = store.load(IDENTITY_A, "thread-one", t(1_000)).unwrap_err();
+        let err = store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::NotARecord { .. }),
             "an unknown field on an entry refuses too: {err:?}"
@@ -2897,10 +3468,14 @@ mod tests {
         let before = names_in(store.dir());
 
         for _ in 0..3 {
-            assert!(store.load(IDENTITY_A, "thread-one", t(1_000)).is_err());
             assert!(
                 store
-                    .save(IDENTITY_A, "thread-one", exchange(2), t(1_001))
+                    .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                    .is_err()
+            );
+            assert!(
+                store
+                    .save(IDENTITY_A, DEST_A, "thread-one", exchange(2), t(1_001))
                     .is_err()
             );
         }
@@ -2920,7 +3495,7 @@ mod tests {
             },
         );
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         let path = record_path(&store, IDENTITY_A, "thread-one");
         let planted = fs::read_to_string(&path).unwrap().replace(
@@ -2931,7 +3506,7 @@ mod tests {
         let oversized = vec![user("q"), assistant(&"a".repeat(32))];
 
         let err = store
-            .save(IDENTITY_A, "thread-one", oversized, t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-one", oversized, t(1_001))
             .unwrap_err();
 
         assert!(
@@ -2956,7 +3531,7 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-orphans");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
             .unwrap();
         let orphan = store.dir().join(format!("{}.yaml", "ab".repeat(16)));
         fs::write(&orphan, "version: 1\n").unwrap();
@@ -3013,11 +3588,11 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-own-id");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "m-1", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t(1_000))
             .unwrap();
 
         for wire_thread in [Some("m-1"), None] {
-            let session = store.session_thread(IDENTITY_A, wire_thread, "m-1", t(1_000));
+            let session = store.session_thread(IDENTITY_A, DEST_A, wire_thread, "m-1", t(1_000));
 
             assert_eq!(session.thread, "m-1", "{wire_thread:?}");
             assert!(session.resumed.is_none(), "{wire_thread:?}");
@@ -3029,10 +3604,10 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-held");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "m-1", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t(1_000))
             .unwrap();
 
-        let session = store.session_thread(IDENTITY_A, Some("m-1"), "m-2", t(1_000));
+        let session = store.session_thread(IDENTITY_A, DEST_A, Some("m-1"), "m-2", t(1_000));
 
         assert_eq!(session.thread, "m-1");
         let record = session.resumed.expect("the held record comes back");
@@ -3045,15 +3620,18 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-not-held");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "m-1", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t(1_000))
             .unwrap();
 
-        let session = store.session_thread(IDENTITY_A, Some("build-status"), "m-2", t(1_000));
+        let session =
+            store.session_thread(IDENTITY_A, DEST_A, Some("build-status"), "m-2", t(1_000));
 
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
         assert_eq!(
-            store.load(IDENTITY_A, "build-status", t(1_000)).unwrap(),
+            store
+                .load(IDENTITY_A, DEST_A, "build-status", t(1_000))
+                .unwrap(),
             None
         );
     }
@@ -3064,7 +3642,7 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-other-identity");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "t-other", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "t-other", exchange(1), t(1_000))
             .unwrap();
         let path = record_path(&store, IDENTITY_A, "t-other");
         let planted = fs::read_to_string(&path)
@@ -3072,7 +3650,7 @@ mod tests {
             .replace(IDENTITY_A, IDENTITY_B);
         fs::write(&path, &planted).unwrap();
 
-        let session = store.session_thread(IDENTITY_A, Some("t-other"), "m-2", t(1_000));
+        let session = store.session_thread(IDENTITY_A, DEST_A, Some("t-other"), "m-2", t(1_000));
 
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
@@ -3091,11 +3669,12 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-unreadable");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "t-unreadable", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "t-unreadable", exchange(1), t(1_000))
             .unwrap();
         fs::write(record_path(&store, IDENTITY_A, "t-unreadable"), "{not yaml").unwrap();
 
-        let session = store.session_thread(IDENTITY_A, Some("t-unreadable"), "m-2", t(1_000));
+        let session =
+            store.session_thread(IDENTITY_A, DEST_A, Some("t-unreadable"), "m-2", t(1_000));
 
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
@@ -3120,11 +3699,11 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-index-unreadable");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, "t-held", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "t-held", exchange(1), t(1_000))
             .unwrap();
         fs::write(store.dir().join(INDEX_FILE), "{not json").unwrap();
 
-        let session = store.session_thread(IDENTITY_A, Some("t-held"), "m-3", t(1_000));
+        let session = store.session_thread(IDENTITY_A, DEST_A, Some("t-held"), "m-3", t(1_000));
 
         assert_eq!(session.thread, "m-3");
         assert!(session.resumed.is_none());

@@ -147,8 +147,8 @@ impl Default for MeshFetch {
 }
 
 /// What the envoy remembers of a trusted peer's thread between messages: the peer's turns
-/// and the envoy's answers, keyed by the proved sender identity and the thread, never the
-/// owner's own transcript.
+/// and the envoy's answers, keyed by the proved sender identity, the proved sending
+/// destination and the thread, never the owner's own transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnvoyMemoryConfig {

@@ -20869,7 +20869,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
 
-                    store.save(&id_a, "a-first", turns.clone(), now).unwrap();
+                    store
+                        .save(
+                            &id_a,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            "a-first",
+                            turns.clone(),
+                            now,
+                        )
+                        .unwrap();
                     let out = out_of(&mut ctx, ".mesh status").await.unwrap();
                     assert_eq!(
                         status_envoy_memory(&out),
@@ -20877,8 +20885,24 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
 
-                    store.save(&id_a, "a-second", turns.clone(), now).unwrap();
-                    store.save(&id_b, "b-first", turns, now).unwrap();
+                    store
+                        .save(
+                            &id_a,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            "a-second",
+                            turns.clone(),
+                            now,
+                        )
+                        .unwrap();
+                    store
+                        .save(
+                            &id_b,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            "b-first",
+                            turns,
+                            now,
+                        )
+                        .unwrap();
                     let out = out_of(&mut ctx, ".mesh status").await.unwrap();
                     assert_eq!(
                         status_envoy_memory(&out),
@@ -28058,10 +28082,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         (&id_b, "b-first"),
                         (&id_c, "c-first"),
                     ] {
-                        store.save(identity, thread, turns.clone(), now).unwrap();
+                        store
+                            .save(
+                                identity,
+                                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                thread,
+                                turns.clone(),
+                                now,
+                            )
+                            .unwrap();
                     }
                     let held = |identity: &str, thread: &str| {
-                        store.load(identity, thread, now).unwrap().is_some()
+                        store
+                            .load(
+                                identity,
+                                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                thread,
+                                now,
+                            )
+                            .unwrap()
+                            .is_some()
                     };
 
                     let out = out_of(&mut ctx, &format!(".mesh untrust {dest_b} --yes"))
@@ -28113,6 +28153,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 ["b-first", "c-first"].iter().any(|thread| {
                                     crate::mesh::envoy_sessions::session_key(
                                         if *thread == "b-first" { &id_b } else { &id_c },
+                                        crate::mesh::envoy_sessions::TEST_DESTINATION,
                                         thread,
                                     )
                                     .as_deref()
@@ -28174,7 +28215,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         role: EnvoyRole::User,
                         text: "where were we?".into(),
                     }];
-                    store.save(&id, "only", turns, now).unwrap();
+                    store
+                        .save(
+                            &id,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            "only",
+                            turns,
+                            now,
+                        )
+                        .unwrap();
                     let before = trust_file(&trust);
                     let token = format!("forget-{}", short(&id));
 
@@ -28187,7 +28236,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "Forgetting identity {id} erases:\n  1 remembered envoy conversation\nThis was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
                         )
                     );
-                    assert!(store.load(&id, "only", now).unwrap().is_some());
+                    assert!(
+                        store
+                            .load(
+                                &id,
+                                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                "only",
+                                now
+                            )
+                            .unwrap()
+                            .is_some()
+                    );
 
                     let out = out_of(
                         &mut ctx,
@@ -28202,7 +28261,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             short(&id)
                         )
                     );
-                    assert!(store.load(&id, "only", now).unwrap().is_none());
+                    assert!(
+                        store
+                            .load(
+                                &id,
+                                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                "only",
+                                now
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
                     assert_eq!(trust_file(&trust), before, "nothing was written");
 
                     let err = refusal(&mut ctx, &format!(".mesh forget --identity {id}")).await;
@@ -28323,11 +28392,27 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         for (identity, thread) in
                             [(&id_a, "a-first"), (&id_b, "b-first"), (&id_c, "c-first")]
                         {
-                            store.save(identity, thread, turns.clone(), now).unwrap();
+                            store
+                                .save(
+                                    identity,
+                                    crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                    thread,
+                                    turns.clone(),
+                                    now,
+                                )
+                                .unwrap();
                         }
                     }
                     let held = |store: &EnvoySessions, identity: &str, thread: &str| {
-                        store.load(identity, thread, now).unwrap().is_some()
+                        store
+                            .load(
+                                identity,
+                                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                thread,
+                                now,
+                            )
+                            .unwrap()
+                            .is_some()
                     };
                     let both_hold = |identity: &str, thread: &str| {
                         held(&served, identity, thread) && held(&unserved, identity, thread)
@@ -28451,13 +28536,31 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         for (identity, thread) in
                             [(&id_a, "a-first"), (&id_b, "b-first"), (&id_c, "c-first")]
                         {
-                            store.save(identity, thread, turns.clone(), now).unwrap();
+                            store
+                                .save(
+                                    identity,
+                                    crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                    thread,
+                                    turns.clone(),
+                                    now,
+                                )
+                                .unwrap();
                         }
                     }
                     let holders = |identity: &str, thread: &str| {
                         stores
                             .iter()
-                            .filter(|store| store.load(identity, thread, now).unwrap().is_some())
+                            .filter(|store| {
+                                store
+                                    .load(
+                                        identity,
+                                        crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                        thread,
+                                        now,
+                                    )
+                                    .unwrap()
+                                    .is_some()
+                            })
                             .count()
                     };
 
@@ -28592,7 +28695,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         (&unserved, &id_a, "a-third"),
                         (&unserved, &id_b, "b-first"),
                     ] {
-                        store.save(identity, thread, turns.clone(), now).unwrap();
+                        store
+                            .save(
+                                identity,
+                                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                thread,
+                                turns.clone(),
+                                now,
+                            )
+                            .unwrap();
                     }
                     let remembered_of = |identity: &str| {
                         EnvoySessions::remembered_everywhere(started.runtime.cache_dir(), &config)
@@ -28795,8 +28906,24 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ];
                     let dest_a = heard_trusted_peer(&started.runtime, slot);
                     let id_a = identity_of(&trust, &dest_a);
-                    served.save(&id_a, "a-served", turns.clone(), now).unwrap();
-                    unserved.save(&id_a, "a-forked", turns, now).unwrap();
+                    served
+                        .save(
+                            &id_a,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            "a-served",
+                            turns.clone(),
+                            now,
+                        )
+                        .unwrap();
+                    unserved
+                        .save(
+                            &id_a,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            "a-forked",
+                            turns,
+                            now,
+                        )
+                        .unwrap();
                     let remembered_of = |identity: &str| {
                         EnvoySessions::remembered_everywhere(&cache_dir, &config)
                             .unwrap()
@@ -29052,6 +29179,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     served
                         .save(
                             &id_a,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
                             "a-served",
                             vec![
                                 EnvoyTurn {
@@ -29584,7 +29712,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             text: "the build".into(),
                         },
                     ];
-                    store.save(&id, "thread-1", turns, now).unwrap();
+                    store
+                        .save(
+                            &id,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            "thread-1",
+                            turns,
+                            now,
+                        )
+                        .unwrap();
 
                     let out = out_of(
                         &mut ctx,
@@ -29602,7 +29738,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             short(&id)
                         )
                     );
-                    assert!(store.load(&id, "thread-1", now).unwrap().is_none());
+                    assert!(
+                        store
+                            .load(
+                                &id,
+                                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                                "thread-1",
+                                now
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -46326,11 +46472,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             text: "which one?".to_string(),
                         };
                         memory
-                            .save(&identity, id, vec![asked.clone()], now)
+                            .save(&identity, &to, id, vec![asked.clone()], now)
                             .unwrap();
                         let turns_of = |memory: &crate::mesh::envoy_sessions::EnvoySessions| {
                             memory
-                                .load(&identity, id, SystemTime::now())
+                                .load(&identity, &to, id, SystemTime::now())
                                 .unwrap()
                                 .map(|file| file.turns)
                                 .unwrap_or_default()
@@ -50410,7 +50556,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     (&second, ID_A, "a-first"),
                     (&second, ID_B, "b-first"),
                 ] {
-                    store.save(identity, thread, turns.clone(), now).unwrap();
+                    store
+                        .save(
+                            identity,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
+                            thread,
+                            turns.clone(),
+                            now,
+                        )
+                        .unwrap();
                 }
             }
 
@@ -51678,6 +51832,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     linked
                         .save(
                             ID_B,
+                            crate::mesh::envoy_sessions::TEST_DESTINATION,
                             "b-linked",
                             vec![EnvoyTurn {
                                 role: EnvoyRole::User,

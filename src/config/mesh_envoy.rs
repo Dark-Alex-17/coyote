@@ -614,10 +614,12 @@ impl EnvoyRunner {
     /// The sender's conversation as the envoy remembers it, when the memory is on and
     /// the thread id is one the store keys; `None` when nothing will be remembered. The
     /// session is decided here, once: a message naming a thread the store holds for
-    /// its sender resumes it, and every other message opens a new session under its own
-    /// id and loads nothing, whatever is under that id from before. A record that
-    /// cannot be read, or that names another identity, is never used: the
-    /// conversation starts over and the run goes on.
+    /// its sender's identity at the destination it proved it sent from resumes it, and
+    /// every other message, another instance of the same identity naming that thread
+    /// included, opens a new session under its own id and loads nothing, whatever is
+    /// under that id from before. A record that cannot be read, or that names another
+    /// identity or destination, is never used: the conversation starts over and the run
+    /// goes on.
     fn recall(&self, message: &PeerMessage) -> Option<RunMemory> {
         let store = self.app.load().mesh.envoy_memory()?;
         if !is_wire_id(message.thread()) {
@@ -626,6 +628,7 @@ impl EnvoyRunner {
         let now = SystemTime::now();
         let session = store.session_thread(
             &message.source_identity,
+            &message.source_destination,
             message.thread.as_deref(),
             &message.message_id,
             now,
@@ -1415,13 +1418,29 @@ fn remember_exchange(memory: &RunMemory, message: &PeerMessage, card: &PeerCard,
     let thread = memory.thread.as_str();
     let now = SystemTime::now();
     let written = if memory.resumed {
-        store.append(&message.source_identity, thread, exchange, now, true)
+        store.append(
+            &message.source_identity,
+            &message.source_destination,
+            thread,
+            exchange,
+            now,
+            true,
+        )
     } else {
-        store.save(&message.source_identity, thread, exchange, now)
+        store.save(
+            &message.source_identity,
+            &message.source_destination,
+            thread,
+            exchange,
+            now,
+        )
     };
     match written {
         Ok(()) => {}
-        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) => warn!(
+        Err(
+            err @ (EnvoyMemoryError::WrongIdentity { .. }
+            | EnvoyMemoryError::WrongDestination { .. }),
+        ) => warn!(
             "Mesh envoy memory for thread {thread} could not be saved: {}. Nothing needs to be done: the conversation starts over and the other record is left alone.",
             redact_hashes(&err.to_string())
         ),
@@ -9105,6 +9124,11 @@ mod tests {
 
     const OTHER_IDENTITY: [u8; 16] = [0xee; 16];
 
+    /// The instance every `raw_job` message is sent from.
+    fn sent_from() -> String {
+        hex_lower(&[0xab; 16])
+    }
+
     /// An enabled envoy memory under `tmp`, given to the slot of `app`.
     fn memory_for(app: &AppState, tmp: &TempDir) -> Arc<EnvoySessions> {
         let config = EnvoyMemoryConfig {
@@ -9359,11 +9383,25 @@ mod tests {
     }
 
     fn turns_of(store: &EnvoySessions, identity: &[u8; 16], thread: &str) -> Vec<EnvoyTurn> {
+        turns_from(store, identity, &sent_from(), thread)
+    }
+
+    fn turns_from(
+        store: &EnvoySessions,
+        identity: &[u8; 16],
+        destination: &str,
+        thread: &str,
+    ) -> Vec<EnvoyTurn> {
         store
-            .load(&hex_lower(identity), thread, SystemTime::now())
+            .load(&hex_lower(identity), destination, thread, SystemTime::now())
             .unwrap()
             .map(|record| record.turns)
             .unwrap_or_default()
+    }
+
+    /// A second instance of the identity `raw_job` sends as.
+    fn another_instance() -> String {
+        hex_lower(&[0xac; 16])
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9702,6 +9740,13 @@ mod tests {
                 .is_ok()
         );
         wait_until("the second reply", || idle.count("envoy replied:") == 2).await;
+        let from_another_instance = {
+            let mut job = threaded_job(&PEER_IDENTITY, "q-3", "t-9", "and from here?");
+            job.message.source_destination = another_instance();
+            job
+        };
+        assert!(runner.accept(from_another_instance).is_ok());
+        wait_until("the third reply", || idle.count("envoy replied:") == 3).await;
         runner.stop().await;
 
         let seen = seen.lock();
@@ -9710,6 +9755,11 @@ mod tests {
             vec![MessageRole::System, MessageRole::User],
             "the same thread id from another identity loads nothing"
         );
+        assert_eq!(
+            roles_of(&seen[2]),
+            vec![MessageRole::System, MessageRole::User],
+            "the same thread id from another instance of the same identity loads nothing"
+        );
         assert_eq!(turns_of(&store, &PEER_IDENTITY, "t-9").len(), 2);
         assert_eq!(
             turns_of(&store, &OTHER_IDENTITY, "q-2").len(),
@@ -9717,6 +9767,12 @@ mod tests {
             "and opens a new session under its own id"
         );
         assert!(turns_of(&store, &OTHER_IDENTITY, "t-9").is_empty());
+        assert_eq!(
+            turns_from(&store, &PEER_IDENTITY, &another_instance(), "q-3").len(),
+            2,
+            "the other instance opens a new session under its own id"
+        );
+        assert!(turns_from(&store, &PEER_IDENTITY, &another_instance(), "t-9").is_empty());
         source.remove_dir();
     }
 
@@ -9773,6 +9829,7 @@ mod tests {
         store
             .append(
                 &hex_lower(&PEER_IDENTITY),
+                &sent_from(),
                 "t-9",
                 vec![EnvoyTurn {
                     role: EnvoyRole::Assistant,
@@ -9832,6 +9889,7 @@ mod tests {
         store
             .save(
                 &hex_lower(&PEER_IDENTITY),
+                &sent_from(),
                 "q-9",
                 vec![
                     EnvoyTurn {
@@ -9940,7 +9998,7 @@ mod tests {
         };
         let remembered = || {
             store
-                .load(&identity, "t-9", SystemTime::now())
+                .load(&identity, &to, "t-9", SystemTime::now())
                 .unwrap()
                 .map(|record| record.turns)
                 .unwrap_or_default()
@@ -9972,7 +10030,10 @@ mod tests {
         assert!(
             !store
                 .dir()
-                .join(format!("{}.yaml", session_key(&identity, "t-9").unwrap()))
+                .join(format!(
+                    "{}.yaml",
+                    session_key(&identity, &to, "t-9").unwrap()
+                ))
                 .exists(),
             "the run's end wrote nothing back for a sender no longer trusted"
         );
@@ -9998,6 +10059,7 @@ mod tests {
         store
             .save(
                 &mine,
+                &sent_from(),
                 thread,
                 vec![
                     EnvoyTurn {
@@ -10012,9 +10074,10 @@ mod tests {
                 SystemTime::now(),
             )
             .unwrap();
-        let path = store
-            .dir()
-            .join(format!("{}.yaml", session_key(&mine, thread).unwrap()));
+        let path = store.dir().join(format!(
+            "{}.yaml",
+            session_key(&mine, &sent_from(), thread).unwrap()
+        ));
         let planted = std::fs::read_to_string(&path)
             .unwrap()
             .replace(&mine, &theirs);
@@ -10081,6 +10144,7 @@ mod tests {
         store
             .save(
                 &mine,
+                &sent_from(),
                 root_id,
                 vec![
                     EnvoyTurn {
@@ -10095,9 +10159,10 @@ mod tests {
                 SystemTime::now(),
             )
             .unwrap();
-        let path = store
-            .dir()
-            .join(format!("{}.yaml", session_key(&mine, root_id).unwrap()));
+        let path = store.dir().join(format!(
+            "{}.yaml",
+            session_key(&mine, &sent_from(), root_id).unwrap()
+        ));
         let planted = std::fs::read_to_string(&path)
             .unwrap()
             .replace(&mine, &theirs);
@@ -10170,6 +10235,7 @@ mod tests {
         store
             .save(
                 &mine,
+                &sent_from(),
                 "t-9",
                 vec![
                     EnvoyTurn {
@@ -10605,6 +10671,7 @@ mod tests {
         });
         runner.attach();
         let asker = peer.a.runtime.fingerprint().to_string();
+        let asked_from = peer.a.runtime.current_destination_hash();
         let to_b = peer.to_b.clone();
 
         let id = peer.ask("merge the branch").await;
@@ -10614,7 +10681,7 @@ mod tests {
         .await;
         let remembered = || {
             store
-                .load(&asker, &id, SystemTime::now())
+                .load(&asker, &asked_from, &id, SystemTime::now())
                 .unwrap()
                 .map(|record| record.turns)
                 .unwrap_or_default()
@@ -10855,6 +10922,7 @@ mod tests {
         store
             .save(
                 &hex_lower(&PEER_IDENTITY),
+                &sent_from(),
                 "t-9",
                 on_disk.clone(),
                 SystemTime::now(),
@@ -10980,6 +11048,7 @@ mod tests {
         store
             .save(
                 &hex_lower(&PEER_IDENTITY),
+                &sent_from(),
                 "t-9",
                 earlier,
                 SystemTime::now(),
@@ -11144,9 +11213,10 @@ mod tests {
         source.remove_dir();
     }
 
-    /// A new session is keyed by the sender's identity and the message's own id; a
-    /// message resumes only a session already held for that identity under its thread.
-    /// The reply carries the thread the message came with either way.
+    /// A new session is keyed by the sender's identity, its sending destination and the
+    /// message's own id; a message resumes only a session already held for that identity
+    /// at that destination under its thread. The reply carries the thread the message
+    /// came with either way.
     mod session_keying_tests {
         use super::*;
 
@@ -11314,7 +11384,7 @@ mod tests {
         wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
         let first_record = std::fs::read_to_string(first.dir().join(format!(
             "{}.yaml",
-            session_key(&hex_lower(&PEER_IDENTITY), "t-9").unwrap()
+            session_key(&hex_lower(&PEER_IDENTITY), &sent_from(), "t-9").unwrap()
         )))
         .unwrap();
 
@@ -11344,7 +11414,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(first.dir().join(format!(
                 "{}.yaml",
-                session_key(&hex_lower(&PEER_IDENTITY), "t-9").unwrap()
+                session_key(&hex_lower(&PEER_IDENTITY), &sent_from(), "t-9").unwrap()
             )),)
             .unwrap(),
             first_record,
@@ -11647,7 +11717,7 @@ mod tests {
                 .dir()
                 .join(format!(
                     "{}.yaml",
-                    session_key(&hex_lower(&PEER_IDENTITY), "q-4").unwrap()
+                    session_key(&hex_lower(&PEER_IDENTITY), &sent_from(), "q-4").unwrap()
                 ))
                 .exists(),
             "no record was written for a thread that was never answered"
@@ -11705,6 +11775,7 @@ mod tests {
         store
             .save(
                 &hex_lower(&PEER_IDENTITY),
+                &sent_from(),
                 "t-9",
                 held.clone(),
                 SystemTime::now(),
@@ -11787,8 +11858,9 @@ mod tests {
                 .is_ok()
         );
         wait_until("the second run to be held", || held.load(Ordering::SeqCst)).await;
-        assert!(
+        assert_eq!(
             store.delete(&hex_lower(&PEER_IDENTITY), "t-9").unwrap(),
+            1,
             "the thread was held and is now forgotten"
         );
         gate.add_permits(1);

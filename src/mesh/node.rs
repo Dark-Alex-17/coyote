@@ -5266,9 +5266,11 @@ impl MeshSlot {
     /// session always wrote under the question's own id and a resumed one never did, so
     /// a record under the id is the session, and only with none there is it the wire
     /// thread. Choosing afresh could pick a thread that became held after the run, hours
-    /// before this answer. No standing is re-checked here: the send that just
-    /// succeeded was authorized, and an append that never creates a thread cannot undo
-    /// a sweep. A record that cannot be read or saved is left as it is.
+    /// before this answer. The conversation is the one held from the instance that
+    /// asked, never another instance of the same identity. No standing is re-checked
+    /// here: the send that just succeeded was authorized, and an append that never
+    /// creates a thread cannot undo a sweep. A record that cannot be read or saved is
+    /// left as it is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
         let Some(store) = self.envoy_memory() else {
             return;
@@ -5283,7 +5285,12 @@ impl MeshSlot {
             // A record under the id that cannot be read is still the session: the
             // append below refuses it and says so, rather than landing in the wire
             // thread.
-            match store.load(&record.peer_identity, &record.id, now) {
+            match store.load(
+                &record.peer_identity,
+                &record.peer_destination,
+                &record.id,
+                now,
+            ) {
                 Ok(None) => record.thread.as_str(),
                 Ok(Some(_)) | Err(_) => record.id.as_str(),
             }
@@ -5292,7 +5299,13 @@ impl MeshSlot {
             role: EnvoyRole::Assistant,
             text: spoken.to_string(),
         };
-        if let Err(err) = store.append_once(&record.peer_identity, thread, answer, now) {
+        if let Err(err) = store.append_once(
+            &record.peer_identity,
+            &record.peer_destination,
+            thread,
+            answer,
+            now,
+        ) {
             warn!(
                 "Mesh envoy memory for thread {thread} could not be saved; the owner's answer was not remembered: {}",
                 redact_hashes(&err.to_string())
@@ -9907,7 +9920,13 @@ mod tests {
             .envoy_memory()
             .expect("an enabled store is opened at start");
         let now = SystemTime::now();
-        memory.save(&identity, "a-1", peer_turns(), now).unwrap();
+        memory
+            .save(&identity, &to, "a-1", peer_turns(), now)
+            .unwrap();
+        let other_instance = hex_lower(&[0x6e; 16]);
+        memory
+            .save(&identity, &other_instance, "a-1", peer_turns(), now)
+            .unwrap();
         let store = slot.inbound_store().unwrap();
         for id in ["a-1", "a-2"] {
             store
@@ -9928,18 +9947,30 @@ mod tests {
         slot.answer_inbound("a-2", "and no to that").await.unwrap();
 
         let turns = memory
-            .load(&identity, "a-1", now)
+            .load(&identity, &to, "a-1", now)
             .unwrap()
             .expect("the thread stays remembered")
             .turns;
         assert_eq!(turns.len(), 3, "{turns:?}");
         assert_eq!(turns[2].role, EnvoyRole::Assistant);
         assert_eq!(turns[2].text, "the owner says yes");
-        assert!(memory.load(&identity, "a-2", now).unwrap().is_none());
+        assert_eq!(
+            memory
+                .load(&identity, &other_instance, "a-1", now)
+                .unwrap()
+                .expect("the other instance's thread stays")
+                .turns,
+            peer_turns(),
+            "the answer joins the asking instance's thread only"
+        );
+        assert!(memory.load(&identity, &to, "a-2", now).unwrap().is_none());
         assert!(
             !memory
                 .dir()
-                .join(format!("{}.yaml", session_key(&identity, "a-2").unwrap()))
+                .join(format!(
+                    "{}.yaml",
+                    session_key(&identity, &to, "a-2").unwrap()
+                ))
                 .exists(),
             "an answer alone starts no conversation"
         );
@@ -10014,7 +10045,9 @@ mod tests {
             .envoy_memory()
             .expect("an enabled store is opened at start");
         let now = SystemTime::now();
-        memory.save(&identity, "a-1", peer_turns(), now).unwrap();
+        memory
+            .save(&identity, &to, "a-1", peer_turns(), now)
+            .unwrap();
         let store = slot.inbound_store().unwrap();
         store
             .upsert(
@@ -10026,7 +10059,13 @@ mod tests {
                 now,
             )
             .unwrap();
-        let held = || memory.load(&identity, "a-1", now).unwrap().unwrap().turns;
+        let held = || {
+            memory
+                .load(&identity, &to, "a-1", now)
+                .unwrap()
+                .unwrap()
+                .turns
+        };
 
         let err = slot
             .answer_inbound("a-1", "yes, go ahead")
@@ -10109,13 +10148,16 @@ mod tests {
         let now = SystemTime::now();
         let two_hours_ago = now - Duration::from_secs(2 * 3_600);
         // The live thread first: a save sweeps the other expired threads of the store.
-        memory.save(&identity, "a-2", peer_turns(), now).unwrap();
         memory
-            .save(&identity, "a-1", peer_turns(), two_hours_ago)
+            .save(&identity, &to, "a-2", peer_turns(), now)
             .unwrap();
-        let expired = memory
-            .dir()
-            .join(format!("{}.yaml", session_key(&identity, "a-1").unwrap()));
+        memory
+            .save(&identity, &to, "a-1", peer_turns(), two_hours_ago)
+            .unwrap();
+        let expired = memory.dir().join(format!(
+            "{}.yaml",
+            session_key(&identity, &to, "a-1").unwrap()
+        ));
         assert!(
             expired.exists(),
             "the expired thread is on disk before the answer"
@@ -10142,7 +10184,7 @@ mod tests {
             "the answer went out and settled the question"
         );
         assert_eq!(
-            memory.load(&identity, "a-1", now).unwrap(),
+            memory.load(&identity, &to, "a-1", now).unwrap(),
             None,
             "an expired thread is not revived by the answer"
         );
@@ -10153,7 +10195,7 @@ mod tests {
 
         slot.answer_inbound("a-2", "and no to that").await.unwrap();
         let turns = memory
-            .load(&identity, "a-2", now)
+            .load(&identity, &to, "a-2", now)
             .unwrap()
             .expect("the live thread stays remembered")
             .turns;
@@ -18054,6 +18096,11 @@ mod tests {
 
     const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";
 
+    /// The destination `REMEMBERED_PEER` sends from: the instance `inbound_record` names.
+    fn remembered_from() -> String {
+        hex_lower(&PEER_INSTANCE)
+    }
+
     mod own_grant_seed_tests {
         use super::*;
         #[cfg(unix)]
@@ -18141,7 +18188,7 @@ mod tests {
     fn remembered_record(store: &EnvoySessions, thread: &str) -> PathBuf {
         store.dir().join(format!(
             "{}.yaml",
-            session_key(REMEMBERED_PEER, thread).unwrap()
+            session_key(REMEMBERED_PEER, &remembered_from(), thread).unwrap()
         ))
     }
 
@@ -18162,7 +18209,13 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "not a wire id!", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "not a wire id!",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let slot = MeshSlot::default();
         slot.set_envoy_memory_for_tests(store.clone());
@@ -18177,7 +18230,7 @@ mod tests {
         );
 
         let turns = store
-            .load(REMEMBERED_PEER, "not a wire id!", now)
+            .load(REMEMBERED_PEER, &remembered_from(), "not a wire id!", now)
             .unwrap()
             .expect("the planted record is left as it was")
             .turns;
@@ -18196,7 +18249,13 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "t-9", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "t-9",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let slot = MeshSlot::default();
         slot.set_envoy_memory_for_tests(store.clone());
@@ -18210,7 +18269,7 @@ mod tests {
         slot.remember_human_answer(&record, "the owner says yes");
 
         let turns = store
-            .load(REMEMBERED_PEER, "t-9", now)
+            .load(REMEMBERED_PEER, &remembered_from(), "t-9", now)
             .unwrap()
             .unwrap()
             .turns;
@@ -18231,7 +18290,13 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "a-1",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let slot = MeshSlot::default();
         slot.set_envoy_memory_for_tests(store.clone());
@@ -18246,7 +18311,7 @@ mod tests {
         );
 
         let turns = store
-            .load(REMEMBERED_PEER, "a-1", now)
+            .load(REMEMBERED_PEER, &remembered_from(), "a-1", now)
             .unwrap()
             .expect("the session the run used holds the answer")
             .turns;
@@ -18254,7 +18319,7 @@ mod tests {
         assert_eq!(turns.last().unwrap().text, "the owner says yes");
         assert!(
             store
-                .load(REMEMBERED_PEER, "t-authored", now)
+                .load(REMEMBERED_PEER, &remembered_from(), "t-authored", now)
                 .unwrap()
                 .is_none(),
             "nothing is kept under the thread the question named"
@@ -18275,10 +18340,22 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "a-1",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         store
-            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "t-later",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
         let slot = MeshSlot::default();
@@ -18294,7 +18371,7 @@ mod tests {
         );
 
         let turns = store
-            .load(REMEMBERED_PEER, "a-1", now)
+            .load(REMEMBERED_PEER, &remembered_from(), "a-1", now)
             .unwrap()
             .expect("the session the run used holds the answer")
             .turns;
@@ -18319,7 +18396,13 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "t-9", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "t-9",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let path = remembered_record(&store, "t-9");
         let other = "fedcba9876543210fedcba9876543210";
@@ -18341,7 +18424,7 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), planted);
         assert!(matches!(
-            store.load(REMEMBERED_PEER, "t-9", now),
+            store.load(REMEMBERED_PEER, &remembered_from(), "t-9", now),
             Err(EnvoyMemoryError::WrongIdentity { .. })
         ));
     }
@@ -18359,10 +18442,22 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "a-1",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         store
-            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "t-later",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
         let slot = MeshSlot::default();
@@ -18379,7 +18474,7 @@ mod tests {
         );
 
         let turns = store
-            .load(REMEMBERED_PEER, "a-1", now)
+            .load(REMEMBERED_PEER, &remembered_from(), "a-1", now)
             .unwrap()
             .expect("the session the record names holds the answer")
             .turns;
@@ -18405,10 +18500,22 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "a-1",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         store
-            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "t-later",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         store.delete(REMEMBERED_PEER, "a-1").unwrap();
         let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
@@ -18425,7 +18532,12 @@ mod tests {
             "the owner says yes",
         );
 
-        assert!(store.load(REMEMBERED_PEER, "a-1", now).unwrap().is_none());
+        assert!(
+            store
+                .load(REMEMBERED_PEER, &remembered_from(), "a-1", now)
+                .unwrap()
+                .is_none()
+        );
         assert!(!remembered_record(&store, "a-1").exists());
         assert_eq!(
             std::fs::read(remembered_record(&store, "t-later")).unwrap(),
@@ -18447,10 +18559,22 @@ mod tests {
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         let now = SystemTime::now();
         store
-            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "a-1",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         store
-            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "t-later",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         std::fs::write(remembered_record(&store, "a-1"), "turns: [unclosed").unwrap();
         let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
@@ -18466,7 +18590,11 @@ mod tests {
             "the owner says yes",
         );
 
-        assert!(store.load(REMEMBERED_PEER, "a-1", now).is_err());
+        assert!(
+            store
+                .load(REMEMBERED_PEER, &remembered_from(), "a-1", now)
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(remembered_record(&store, "t-later")).unwrap(),
             held_since,
@@ -18493,10 +18621,22 @@ mod tests {
         let planted =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).unwrap();
         planted
-            .save(REMEMBERED_PEER, "fresh", peer_turns(), SystemTime::now())
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "fresh",
+                peer_turns(),
+                SystemTime::now(),
+            )
             .unwrap();
         planted
-            .save(REMEMBERED_PEER, "stale", peer_turns(), two_hours_ago())
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "stale",
+                peer_turns(),
+                two_hours_ago(),
+            )
             .unwrap();
         assert!(
             remembered_record(&planted, "stale").exists(),
@@ -18725,7 +18865,13 @@ mod tests {
         };
         let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
         store
-            .save(REMEMBERED_PEER, "first", peer_turns(), two_hours_ago())
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "first",
+                peer_turns(),
+                two_hours_ago(),
+            )
             .unwrap();
         let cancel = CancellationToken::new();
         let bound = Arc::new(ArcSwapOption::new(Some(store.clone())));
@@ -18752,7 +18898,13 @@ mod tests {
         assert!(!remembered_record(&store, "first").exists());
 
         store
-            .save(REMEMBERED_PEER, "second", peer_turns(), two_hours_ago())
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "second",
+                peer_turns(),
+                two_hours_ago(),
+            )
             .unwrap();
         tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
         settle().await;
@@ -18765,6 +18917,7 @@ mod tests {
         store
             .save(
                 REMEMBERED_PEER,
+                &remembered_from(),
                 "left-behind",
                 peer_turns(),
                 two_hours_ago(),
@@ -18772,7 +18925,13 @@ mod tests {
             .unwrap();
         let fork_store = Arc::new(EnvoySessions::open(&tmp.path, "fork", &config).unwrap());
         fork_store
-            .save(REMEMBERED_PEER, "third", peer_turns(), two_hours_ago())
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "third",
+                peer_turns(),
+                two_hours_ago(),
+            )
             .unwrap();
         bound.store(Some(fork_store.clone()));
         tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
@@ -20050,14 +20209,32 @@ mod tests {
             .envoy_memory()
             .expect("an enabled store is opened at start");
         original_store
-            .save(REMEMBERED_PEER, "original", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "original",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let fork_store = EnvoySessions::open(&cache_dir, &fork_id, &config).unwrap();
         fork_store
-            .save(REMEMBERED_PEER, "fork", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "fork",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         fork_store
-            .save(REMEMBERED_PEER, "stale", peer_turns(), two_hours_ago())
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "stale",
+                peer_turns(),
+                two_hours_ago(),
+            )
             .unwrap();
         let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
@@ -20071,10 +20248,15 @@ mod tests {
 
         let bound = started.runtime.envoy_memory().unwrap();
         assert_eq!(bound.dir(), fork_store.dir());
-        assert!(bound.load(REMEMBERED_PEER, "fork", now).unwrap().is_some());
         assert!(
             bound
-                .load(REMEMBERED_PEER, "original", now)
+                .load(REMEMBERED_PEER, &remembered_from(), "fork", now)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            bound
+                .load(REMEMBERED_PEER, &remembered_from(), "original", now)
                 .unwrap()
                 .is_none(),
             "the fork does not read the original's conversations"
@@ -20114,10 +20296,18 @@ mod tests {
         let other = hex_lower(&[0x77; 16]);
         for thread in ["first", "second"] {
             store
-                .save(REMEMBERED_PEER, thread, peer_turns(), now)
+                .save(
+                    REMEMBERED_PEER,
+                    &remembered_from(),
+                    thread,
+                    peer_turns(),
+                    now,
+                )
                 .unwrap();
         }
-        store.save(&other, "theirs", peer_turns(), now).unwrap();
+        store
+            .save(&other, &remembered_from(), "theirs", peer_turns(), now)
+            .unwrap();
         let trust = started.runtime.trust();
         let origin = [9u8; NAME_HASH_LEN];
         let instance =
@@ -20150,7 +20340,10 @@ mod tests {
         );
         for thread in ["first", "second"] {
             assert!(
-                store.load(REMEMBERED_PEER, thread, now).unwrap().is_some(),
+                store
+                    .load(REMEMBERED_PEER, &remembered_from(), thread, now)
+                    .unwrap()
+                    .is_some(),
                 "{thread} went with an untrust"
             );
         }
@@ -20161,12 +20354,20 @@ mod tests {
 
         for thread in ["first", "second"] {
             assert!(
-                store.load(REMEMBERED_PEER, thread, now).unwrap().is_none(),
+                store
+                    .load(REMEMBERED_PEER, &remembered_from(), thread, now)
+                    .unwrap()
+                    .is_none(),
                 "{thread} outlived the forget"
             );
             assert!(!remembered_record(&store, thread).exists());
         }
-        assert!(store.load(&other, "theirs", now).unwrap().is_some());
+        assert!(
+            store
+                .load(&other, &remembered_from(), "theirs", now)
+                .unwrap()
+                .is_some()
+        );
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }
@@ -20195,9 +20396,17 @@ mod tests {
         let other = hex_lower(&[0x77; 16]);
         for store in [served.as_ref(), &other_instance] {
             store
-                .save(REMEMBERED_PEER, "first", peer_turns(), now)
+                .save(
+                    REMEMBERED_PEER,
+                    &remembered_from(),
+                    "first",
+                    peer_turns(),
+                    now,
+                )
                 .unwrap();
-            store.save(&other, "theirs", peer_turns(), now).unwrap();
+            store
+                .save(&other, &remembered_from(), "theirs", peer_turns(), now)
+                .unwrap();
         }
         assert_eq!(
             runtime
@@ -20217,14 +20426,19 @@ mod tests {
         assert_eq!(runtime.remembered_of(REMEMBERED_PEER).unwrap().threads, 0);
         for store in [served.as_ref(), &other_instance] {
             assert_eq!(
-                store.load(REMEMBERED_PEER, "first", now).unwrap(),
+                store
+                    .load(REMEMBERED_PEER, &remembered_from(), "first", now)
+                    .unwrap(),
                 None,
                 "{}",
                 store.dir().display()
             );
             assert!(!remembered_record(store, "first").exists());
             assert!(
-                store.load(&other, "theirs", now).unwrap().is_some(),
+                store
+                    .load(&other, &remembered_from(), "theirs", now)
+                    .unwrap()
+                    .is_some(),
                 "{}",
                 store.dir().display()
             );
@@ -20258,7 +20472,12 @@ mod tests {
         let now = SystemTime::now();
         let identity = hex_lower(&[0x5c; 16]);
         let short_form = short(&identity).to_string();
-        served.save(&identity, "first", peer_turns(), now).unwrap();
+        let other_instance = hex_lower(&[0x5d; 16]);
+        for destination in [remembered_from(), other_instance.clone()] {
+            served
+                .save(&identity, &destination, "first", peer_turns(), now)
+                .unwrap();
+        }
         let broken = runtime
             .cache_dir()
             .join("mesh")
@@ -20283,9 +20502,9 @@ mod tests {
         assert_eq!(
             logged,
             [format!(
-                "Mesh forgot 1 remembered envoy conversation(s) of {short_form}; 1 store(s) could not be swept"
+                "Mesh forgot 2 remembered envoy conversation(s) of {short_form}; 1 store(s) could not be swept"
             )],
-            "one sweep, one line: {:?}",
+            "one sweep, one line, every destination's thread: {:?}",
             debug_snapshot()
         );
         assert!(
@@ -20293,7 +20512,12 @@ mod tests {
             "the identity is named by its short form only: {}",
             logged[0]
         );
-        assert_eq!(served.load(&identity, "first", now).unwrap(), None);
+        for destination in [remembered_from(), other_instance] {
+            assert_eq!(
+                served.load(&identity, &destination, "first", now).unwrap(),
+                None
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(broken.join("index.json")).unwrap(),
             "{not json",
@@ -20342,7 +20566,13 @@ mod tests {
         let now = SystemTime::now();
         let original_store = started.runtime.envoy_memory().unwrap();
         original_store
-            .save(REMEMBERED_PEER, "original", peer_turns(), now)
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "original",
+                peer_turns(),
+                now,
+            )
             .unwrap();
         let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
@@ -20359,7 +20589,7 @@ mod tests {
         assert_eq!(bound.dir(), original_store.dir());
         assert!(
             bound
-                .load(REMEMBERED_PEER, "original", now)
+                .load(REMEMBERED_PEER, &remembered_from(), "original", now)
                 .unwrap()
                 .is_some(),
             "the original's memory is back in force"

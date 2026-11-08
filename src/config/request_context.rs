@@ -20462,6 +20462,7 @@ mod tests {
         store
             .save(
                 identity,
+                crate::mesh::envoy_sessions::TEST_DESTINATION,
                 "t-1",
                 vec![
                     EnvoyTurn {
@@ -20476,7 +20477,12 @@ mod tests {
                 SystemTime::now(),
             )
             .unwrap();
-        let key = session_key(identity, "t-1").unwrap();
+        let key = session_key(
+            identity,
+            crate::mesh::envoy_sessions::TEST_DESTINATION,
+            "t-1",
+        )
+        .unwrap();
         assert!(
             cache
                 .join("mesh")
@@ -41638,7 +41644,15 @@ mod tests {
             (&fork, REMEMBERED_IDENTITY_A, "a-second"),
             (&fork, REMEMBERED_IDENTITY_B, "b-first"),
         ] {
-            store.save(identity, thread, turns.clone(), now).unwrap();
+            store
+                .save(
+                    identity,
+                    crate::mesh::envoy_sessions::TEST_DESTINATION,
+                    thread,
+                    turns.clone(),
+                    now,
+                )
+                .unwrap();
         }
     }
 
@@ -41781,6 +41795,7 @@ mod tests {
         store
             .save(
                 &fixture.trusted_peer_identity,
+                crate::mesh::envoy_sessions::TEST_DESTINATION,
                 "bea-first",
                 turns.clone(),
                 now,
@@ -41789,13 +41804,20 @@ mod tests {
         store
             .save(
                 &fixture.trusted_peer_identity,
+                crate::mesh::envoy_sessions::TEST_DESTINATION,
                 "bea-second",
                 turns.clone(),
                 now,
             )
             .unwrap();
         store
-            .save(REMEMBERED_IDENTITY_A, "stranger-first", turns, now)
+            .save(
+                REMEMBERED_IDENTITY_A,
+                crate::mesh::envoy_sessions::TEST_DESTINATION,
+                "stranger-first",
+                turns,
+                now,
+            )
             .unwrap();
 
         let values = fixture.complete(&["memory", "forget", ""]);
