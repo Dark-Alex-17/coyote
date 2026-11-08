@@ -631,7 +631,7 @@ const MACRO_INVOCATIONS: [&str; 2] = [".macro two-step", ".two-step"];
 
 /// The placeholder is on screen: the composer holds no draft.
 fn shows_placeholder(flat: &str) -> bool {
-    flat.contains("Typeapromptora.command")
+    flat.contains("Typeapromptora.command") || flat.contains("Typeapromptora/command")
 }
 
 /// Clears a prefilled draft without risking the idle-empty Ctrl+C quit.

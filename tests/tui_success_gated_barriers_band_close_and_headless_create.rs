@@ -273,7 +273,7 @@ fn composer_row(frame: &str, footer_marker: &str) -> String {
 
 /// The placeholder is on screen: the composer holds no draft.
 fn shows_placeholder(flat: &str) -> bool {
-    flat.contains("Typeapromptora.command")
+    flat.contains("Typeapromptora.command") || flat.contains("Typeapromptora/command")
 }
 
 /// Clears a prefilled draft without risking the idle-empty Ctrl+C quit.

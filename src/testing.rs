@@ -499,7 +499,7 @@ pub(crate) fn read_all(reader: &mut File) -> String {
 }
 
 mod tests {
-    use super::{TempNeedleGuard, TestConfigDirGuard, is_outside_system32};
+    use super::{ScratchDirGuard, TempNeedleGuard, TestConfigDirGuard, is_outside_system32};
     use crate::utils;
     use serial_test::serial;
     use std::path::Path;
@@ -541,6 +541,19 @@ mod tests {
             !cache_root.exists(),
             "the temp cache dir is removed on drop"
         );
+    }
+
+    /// The scratch dir exists, with what the test put in it, while the
+    /// guard lives and is gone once it is dropped.
+    #[test]
+    fn scratch_dir_guard_removes_its_dir_on_drop() {
+        let path = {
+            let guard = ScratchDirGuard::new("scratch-guard-unit");
+            std::fs::write(guard.path.join("inner.txt"), "kept until drop").unwrap();
+            assert!(guard.path.is_dir());
+            guard.path.clone()
+        };
+        assert!(!path.exists(), "the scratch dir is removed on drop");
     }
 
     /// The guard's sweeps, on creation and on drop, remove only entries

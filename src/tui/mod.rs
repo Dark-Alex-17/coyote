@@ -183,18 +183,17 @@ pub(crate) fn notice(kind: NoticeKind, text: String) -> bool {
 /// line discipline cooked), the way Ctrl+O hands it to the editor, and
 /// blocks until the loop has taken the screen back. For the shell
 /// passthrough and the file editors, which run on a work thread while
-/// the UI owns the terminal; fails when no UI is lending it.
+/// the UI owns the terminal; fails when no UI is lending it, and on the
+/// loop thread itself, where the wait would never end.
 pub(crate) fn lend_terminal<T: Send + 'static>(
     job: impl FnOnce(&TtyHandles) -> T + Send + 'static,
 ) -> Result<T> {
     let Some((tx, loop_thread)) = lender() else {
         bail!(NOT_LENDING);
     };
-    debug_assert_ne!(
-        std::thread::current().id(),
-        loop_thread,
-        "lend_terminal on the loop thread would wait on itself"
-    );
+    if std::thread::current().id() == loop_thread {
+        bail!("lend_terminal on the loop thread would wait on itself");
+    }
     let (reply_tx, reply_rx) = mpsc::channel();
     let job = LendJob(Box::new(move |tty: &TtyHandles| {
         // The asker gave up waiting; the result has nowhere to go.

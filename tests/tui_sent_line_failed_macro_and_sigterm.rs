@@ -1,13 +1,12 @@
-//! Black-box pins for the bottom pane's sent-line and refusal edges: a
-//! queued line the model received leaves the `pending:` strip while the
-//! SAME turn still runs and Alt+Up never brings it back; a non-isolated
-//! macro that recorded an exchange before a later step failed is still
-//! a rewind barrier (one that failed before any exchange is not);
-//! SIGTERM with queued lines drops them even when the tool is released
-//! in the same instant. The built binary on a pseudo-terminal, a
-//! scripted fake model where a tool round
-//! or a session is needed. Unix-only and serial like its sibling pty
-//! suites.
+//! Black-box pins for the bottom pane's sent-line, failed-macro and
+//! SIGTERM edges: a queued line the model received leaves the `pending:`
+//! strip while the SAME turn still runs and Alt+Up never brings it back;
+//! a non-isolated macro that recorded an exchange before a later step
+//! failed is still a rewind barrier (one that failed before any exchange
+//! is not); SIGTERM with queued lines drops them even when the tool is
+//! released in the same instant. The built binary on a pseudo-terminal,
+//! a scripted fake model where a tool round or a session is needed.
+//! Unix-only and serial like its sibling pty suites.
 #![cfg(unix)]
 
 mod common;
@@ -340,7 +339,7 @@ fn above_rule(frame: &str) -> String {
 
 /// The placeholder is on screen: the composer holds no draft.
 fn shows_placeholder(flat: &str) -> bool {
-    flat.contains("Typeapromptora.command")
+    flat.contains("Typeapromptora.command") || flat.contains("Typeapromptora/command")
 }
 
 /// Clears a prefilled draft without risking the idle-empty Ctrl+C quit.
