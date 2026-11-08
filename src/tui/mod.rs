@@ -2948,6 +2948,16 @@ fn quit_abort(abort: &AbortSignal, turn_running: bool) {
     }
 }
 
+/// Takes the user's lines off the running turn's queue. The strip was
+/// cleared with the interrupt or the quit; the copies on the queue must
+/// go too, or the next tool round would still hand them to the model
+/// and a quit's final tool result could carry them.
+fn purge_turn_queue(task: &Option<Task>) {
+    if let Some(Task::Turn { queue, .. }) = task {
+        take_user_messages(queue);
+    }
+}
+
 /// Takes the `pops` newest exchanges out of the session, stopping at
 /// the first that cannot be undone: how many came out, and what stopped
 /// it short.
@@ -3126,16 +3136,12 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     }
                     Some(Command::Interrupt) => {
                         abort.set_ctrlc();
-                        // The strip was cleared with the interrupt; the
-                        // copies on the queue must go too, or the next
-                        // tool round would still hand them to the model.
-                        if let Some(Task::Turn { queue, .. }) = &task {
-                            take_user_messages(queue);
-                        }
+                        purge_turn_queue(&task);
                     }
                     Some(Command::Quit) => {
                         quit_requested = true;
                         quit_abort(abort, task.is_some());
+                        purge_turn_queue(&task);
                     }
                     Some(Command::Suspend) => {
                         #[cfg(unix)]
@@ -3234,6 +3240,11 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                                 quit_requested = true;
                             }
                             reconcile_queue(&mut app.queued, &take_user_messages(&queue));
+                            // An `.exit` that ran from the queue ends the
+                            // session for the lines behind it as well.
+                            if quit_requested {
+                                app.drop_queued();
+                            }
                             if quit_requested || app.queued.is_empty() {
                                 ctx = Some(returned);
                             } else {
@@ -4372,6 +4383,28 @@ mod tests {
         assert!(harness.app.queued.is_empty());
         let frame = harness.draw();
         assert!(frame.contains("Dropped 1 queued line(s)"), "{frame}");
+    }
+
+    /// The loop's half of the drop: the user's lines come off the queue
+    /// the running turn reads, a task's notification stays for the exit
+    /// work, and no task at all is nothing to purge.
+    #[tokio::test]
+    async fn purging_the_turn_queue_takes_only_the_users_lines() {
+        let queue = Arc::new(NotificationQueue::new());
+        queued::queue_user_message(&queue, "later");
+        queue.push(crate::supervisor::notification::job_notification(
+            "job-1", "tool", true,
+        ));
+        let task = Some(Task::Turn {
+            handle: tokio::spawn(std::future::pending()),
+            command: false,
+            queue: Arc::clone(&queue),
+        });
+        purge_turn_queue(&task);
+        purge_turn_queue(&None);
+        let left = queue.drain();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id(), Some("job-1"));
     }
 
     /// A line queued after the interrupt, before the turn actually ends,
