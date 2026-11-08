@@ -1,5 +1,6 @@
 //! Black-box pins for the bottom pane: an interrupt takes queued lines
-//! off the turn's queue, the rewind picker stops at a non-isolated
+//! off the turn's queue, a line the model reads mid-turn gets its
+//! transcript cell, the rewind picker stops at a non-isolated
 //! macro's row, the palette rebuilt after an editor shortens the line
 //! (Tab and Enter), and the vi layer's cursor clamp at the end of a line.
 //! The built binary on a pseudo-terminal, a scripted fake model where a
@@ -556,6 +557,68 @@ fn esc_during_a_tool_round_ends_the_turn_even_when_the_tool_finishes_on_its_own(
     );
     let settled_at = pty.raw().len();
     assert_composer_takes_keys(&mut pty, settled_at, "Esc during the tool round");
+    quit_and_check(&mut pty);
+}
+
+/// A line queued during a tool round rides the next request and, at
+/// that moment, is committed to the transcript as a dim cell with its
+/// marker, so what the model read is on record once the strip's preview
+/// is gone. Under NO_COLOR the marker is the only distinction left.
+#[test]
+#[serial]
+fn a_line_sent_mid_turn_is_committed_to_the_transcript_when_the_model_reads_it() {
+    let dir = fresh_config_dir("mid-turn-cell");
+    let _guard = TempDirGuard(dir.clone());
+    let tool_a = dir.join("tool-a");
+    let fake = FakeLlm::start(vec![
+        sleep_call(&tool_a),
+        Reply::Text("done-one".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[("NO_COLOR", "1")]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+
+    let turn_at = pty.raw().len();
+    pty.send(b"first-turn\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-a-started"),
+        "the sleep tool's start marker",
+    );
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"follow-up k4e-m\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let frame = repainted_frame(&mut pty, 40, 101);
+    assert!(
+        squeezed(&frame).contains("pending:1"),
+        "the line queued while the tool slept did not show `pending: 1`:\n{frame}"
+    );
+    assert!(
+        !squeezed(&frame).contains("(sentmid-turn)"),
+        "the cell was committed before the model read the line:\n{frame}"
+    );
+
+    fs::write(dir.join("tool-a-release"), b"").unwrap();
+    wait_for_squeezed_after(&mut pty, "done-one", turn_at, "the turn's reply");
+    wait_until_no_pending(&mut pty);
+
+    let bodies = fake.bodies();
+    assert_eq!(bodies.len(), 2, "{}", bodies.join("\n---\n"));
+    assert!(
+        bodies[1].contains("follow-up k4e-m"),
+        "the queued line did not ride the tool round:\n{}",
+        bodies[1]
+    );
+    let frame = repainted_frame(&mut pty, 40, 100);
+    assert!(
+        squeezed(&frame).contains(">follow-upk4e-m(sentmid-turn)"),
+        "the transcript has no mid-turn cell for the line the model read:\n{frame}"
+    );
+    assert!(
+        !frame.contains("pending:"),
+        "the queue strip outlived the line it previewed:\n{frame}"
+    );
     quit_and_check(&mut pty);
 }
 

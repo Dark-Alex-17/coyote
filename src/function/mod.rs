@@ -3425,6 +3425,45 @@ mod tests {
         );
     }
 
+    /// Each user message leaving the queue is announced once, in queue
+    /// order; task events are not, whatever their fate.
+    #[test]
+    #[serial]
+    fn drain_live_notifications_announces_each_sent_user_message_in_order() {
+        let recording = crate::events::RecordingSink::install();
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "sent-probe-k4e-a".into(),
+            });
+        ctx.notification_queue
+            .push(job_notification("job_gone", "execute_command", true));
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "sent-probe-k4e-b".into(),
+            });
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 2);
+        let sent: Vec<Event> = recording
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::QueuedInputSent { text } if text.contains("sent-probe-k4e")))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                Event::QueuedInputSent {
+                    text: "sent-probe-k4e-a".into()
+                },
+                Event::QueuedInputSent {
+                    text: "sent-probe-k4e-b".into()
+                },
+            ]
+        );
+    }
+
     fn ctx_with_registered_agent(id: &str) -> RequestContext {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -4353,6 +4353,83 @@ mod tests {
         );
     }
 
+    /// The moment the model is handed a queued line, the transcript gets
+    /// a cell for it where it was read, scrubbed like a typed line.
+    #[test]
+    fn a_line_sent_mid_turn_is_committed_as_a_scrubbed_cell() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness
+            .app
+            .handle_msg(UiMsg::QueuedInputSent("\x1b[31mred\x1b[0m".to_string()));
+        assert!(matches!(
+            harness.app.transcript.cells(),
+            [
+                Cell::User {
+                    mid_turn: false,
+                    ..
+                },
+                Cell::User {
+                    text,
+                    mid_turn: true,
+                    opened: false,
+                    ..
+                }
+            ] if text == "red"
+        ));
+    }
+
+    /// A user line, a reply, the line sent mid-turn, the next reply. The
+    /// mid-turn cell carries its marker in the text itself and is drawn
+    /// dim, so it reads as sent-by-the-queue with or without colour.
+    fn mid_turn_transcript(harness: &mut Harness) -> String {
+        harness.app.begin_turn("explain", false);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("first reply".to_string()));
+        harness
+            .app
+            .handle_msg(UiMsg::QueuedInputSent("follow-up k4e-m".to_string()));
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("second reply".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.draw()
+    }
+
+    #[test]
+    fn the_mid_turn_cell_is_dim_with_a_marker() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(false);
+        let frame = mid_turn_transcript(&mut harness);
+        insta::assert_snapshot!("mid_turn_cell_80x24", &frame);
+        let row = screen_row(&harness, "> follow-up k4e-m (sent mid-turn)");
+        let buffer = harness.terminal.backend().buffer();
+        assert!(buffer[(0, row)].modifier.contains(Modifier::DIM), "{frame}");
+        assert!(
+            !buffer[(0, row)].modifier.contains(Modifier::BOLD),
+            "{frame}"
+        );
+        let typed = screen_row(&harness, "> explain");
+        assert!(
+            buffer[(0, typed)].modifier.contains(Modifier::BOLD),
+            "{frame}"
+        );
+        assert!(
+            !buffer[(0, typed)].modifier.contains(Modifier::DIM),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn the_mid_turn_marker_survives_no_color() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(true);
+        let frame = mid_turn_transcript(&mut harness);
+        insta::assert_snapshot!("mid_turn_cell_nocolor_80x24", &frame);
+        assert!(frame.contains("(sent mid-turn)"), "{frame}");
+    }
+
     /// Esc during a turn drops what was lined up behind it and says so.
     /// The second held line went in through the palette, which the queue
     /// closes: the Esc that follows reaches the turn, not a band.

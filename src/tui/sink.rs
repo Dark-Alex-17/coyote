@@ -615,4 +615,19 @@ mod tests {
         });
         assert!(matches!(rx.try_recv(), Ok(UiMsg::TodoUpdated(got)) if got == items));
     }
+
+    /// Queueing a line is the composer's own doing and already on screen;
+    /// only the line's hand-over to the model is forwarded.
+    #[test]
+    fn a_sent_queued_line_reaches_the_transcript_but_a_queued_one_does_not() {
+        let (sink, mut rx) = sink();
+        sink.on_event(&Event::QueuedInput {
+            text: "later".to_string(),
+        });
+        sink.on_event(&Event::QueuedInputSent {
+            text: "later".to_string(),
+        });
+        assert!(matches!(rx.try_recv(), Ok(UiMsg::QueuedInputSent(text)) if text == "later"));
+        assert!(rx.try_recv().is_err());
+    }
 }

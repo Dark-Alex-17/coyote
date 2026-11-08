@@ -1090,6 +1090,27 @@ mod tests {
         assert_eq!(openers, [2, 1, 0]);
     }
 
+    /// A line handed to the model mid-turn belongs to the running turn's
+    /// exchange: no row of its own and nothing that stops the walk.
+    #[test]
+    fn a_mid_turn_line_is_neither_a_row_nor_a_barrier() {
+        let cells = [
+            opened(Cell::user("first")),
+            Cell::user_mid_turn("follow-up".to_string()),
+            Cell::assistant("answer".to_string(), true),
+            opened(Cell::user("third")),
+        ];
+        let (rewind, stopped) = RewindState::from_cells(&cells, CommandPrefix::Dot);
+        assert_eq!(stopped, None);
+        let rewind = rewind.unwrap();
+        let titles: Vec<(usize, &str)> = rewind
+            .rows
+            .iter()
+            .map(|row| (row.opener, row.title.as_str()))
+            .collect();
+        assert_eq!(titles, [(3, "third"), (0, "first")]);
+    }
+
     #[test]
     fn band_rows_stay_within_the_cap_with_their_header() {
         let names: Vec<String> = (0..20).map(|i| format!("entry {i}")).collect();
