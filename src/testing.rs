@@ -332,31 +332,52 @@ impl Drop for ScratchDirGuard {
     }
 }
 
-/// Points the process temp dir (`TMPDIR`, and `TMP` for Windows) at a fresh
-/// scratch directory for the guard's lifetime, so whatever the code under
-/// test writes through `env::temp_dir()` lands there and goes with it; a
-/// leak check then reads that directory and not the shared one. Tests
-/// using it must serialize (`#[serial]`); the env vars are process-global.
-pub(crate) struct TmpdirRedirectGuard {
-    pub(crate) scratch: ScratchDirGuard,
-    _tmpdir: EnvVarGuard,
-    _tmp: EnvVarGuard,
+/// A fragment only one test's files carry under the shared
+/// `env::temp_dir()`. Entries named with it are removed when the guard is
+/// made (a run killed mid-test must not fail the next one) and when it is
+/// dropped; everything else in the directory, including what tests
+/// running alongside write there, is left alone.
+pub(crate) struct TempNeedleGuard {
+    needle: String,
 }
 
-impl TmpdirRedirectGuard {
-    pub(crate) fn new(label: &str) -> Self {
-        let scratch = ScratchDirGuard::new(label);
-        let tmpdir = EnvVarGuard::set("TMPDIR", &scratch.path);
-        let tmp = EnvVarGuard::set("TMP", &scratch.path);
-        Self {
-            scratch,
-            _tmpdir: tmpdir,
-            _tmp: tmp,
-        }
+impl TempNeedleGuard {
+    pub(crate) fn new(needle: &str) -> Self {
+        let guard = Self {
+            needle: needle.to_string(),
+        };
+        guard.remove_leftovers();
+        guard
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.scratch.path
+    /// The entries under the temp dir whose file name carries the needle.
+    pub(crate) fn leftovers(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(&self.needle))
+            })
+            .collect()
+    }
+
+    fn remove_leftovers(&self) {
+        for path in self.leftovers() {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+}
+
+impl Drop for TempNeedleGuard {
+    fn drop(&mut self) {
+        self.remove_leftovers();
     }
 }
 
