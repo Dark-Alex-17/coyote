@@ -863,9 +863,13 @@ pub(crate) enum Command {
     /// A prompt typed during a turn; the loop offers it to the running
     /// turn's model.
     Queue(String),
-    /// A queued prompt taken back into the composer before the model got
-    /// it; the loop withdraws it from the running turn.
-    Unqueue(String),
+    /// A held line taken back into the composer: the loop withdraws the
+    /// prompt from the running turn and offers the draft it displaced,
+    /// each `None` when it was a command the turn never saw.
+    Unqueue {
+        held: Option<String>,
+        draft: Option<String>,
+    },
     Interrupt,
     Quit,
     Suspend,
@@ -1329,27 +1333,37 @@ impl App {
         self.take_composer_line().map(Command::Submit)
     }
 
-    /// Holds the draft for the running turn. A prompt also goes to the
-    /// loop, which offers it to the model; a command only waits.
     fn queue_composer(&mut self) -> Option<Command> {
         if self.exiting {
             return None;
         }
+        self.hold_composer_line().map(Command::Queue)
+    }
+
+    /// Holds the draft for the running turn. A prompt is returned for the
+    /// loop, which offers it to the model; a command only waits.
+    fn hold_composer_line(&mut self) -> Option<String> {
         let line = self.take_composer_line()?;
         let command = is_command(&line, self.config.command_prefix);
         self.queued.push(QueuedLine {
             text: line.clone(),
             command,
         });
-        (!command).then_some(Command::Queue(line))
+        (!command).then_some(line)
     }
 
-    /// Takes the newest held line back into the composer, over whatever
-    /// draft is there the way a history recall does.
+    /// Takes the newest held line back into the composer. A draft under
+    /// it is not lost: it joins the end of the queue, so the two trade
+    /// places.
     fn edit_queued(&mut self) -> Option<Command> {
         let line = self.queued.pop()?;
+        let draft = self.hold_composer_line();
         self.set_composer_text(&line.text);
-        (!line.command).then_some(Command::Unqueue(line.text))
+        let held = (!line.command).then_some(line.text);
+        if held.is_none() && draft.is_none() {
+            return None;
+        }
+        Some(Command::Unqueue { held, draft })
     }
 
     /// An interrupt, or the quit that follows one, is for everything the
@@ -3095,14 +3109,19 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             queued::queue_user_message(queue, &text);
                         }
                     }
-                    Some(Command::Unqueue(text)) => {
-                        if let Some(Task::Turn { queue, .. }) = &task
-                            && !queued::unqueue_user_message(queue, &text)
-                        {
-                            app.handle_msg(UiMsg::Notice {
-                                kind: NoticeKind::ToolWarning,
-                                text: "already sent to the model".to_string(),
-                            });
+                    Some(Command::Unqueue { held, draft }) => {
+                        if let Some(Task::Turn { queue, .. }) = &task {
+                            if let Some(text) = held
+                                && !queued::unqueue_user_message(queue, &text)
+                            {
+                                app.handle_msg(UiMsg::Notice {
+                                    kind: NoticeKind::ToolWarning,
+                                    text: "already sent to the model".to_string(),
+                                });
+                            }
+                            if let Some(text) = draft {
+                                queued::queue_user_message(queue, &text);
+                            }
                         }
                     }
                     Some(Command::Interrupt) => {
@@ -4066,6 +4085,28 @@ mod tests {
                 "{kind}: the full second did not answer"
             );
         }
+
+        // A checkbox's Space is held to the same gate: typed ahead it
+        // ticks nothing and re-arms, after the idle second it ticks.
+        let mut harness = Harness::standalone(80, 24);
+        harness.clock.advance(10 * HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Checkbox, None));
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert!(harness.draw().contains("[ ] alpha"));
+        harness
+            .clock
+            .advance(HOTKEY_IDLE - Duration::from_millis(1));
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert!(harness.draw().contains("[ ] alpha"));
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char(' ')), None);
+        assert!(harness.draw().contains("[x] alpha"));
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Checked(vec!["alpha".to_string()])
+        );
     }
 
     /// Answering one question re-arms the idle gate for the next queued
@@ -4242,13 +4283,54 @@ mod tests {
         let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
         assert_eq!(harness.app.handle_key(alt_up), None);
         assert_eq!(harness.app.composer_text(), ".info");
+        // The second Alt+Up finds `.info` as the draft and holds it again.
         assert_eq!(
             harness.app.handle_key(alt_up),
-            Some(Command::Unqueue("hello q9d-q".to_string()))
+            Some(Command::Unqueue {
+                held: Some("hello q9d-q".to_string()),
+                draft: None,
+            })
         );
         assert_eq!(harness.app.composer_text(), "hello q9d-q");
-        assert!(harness.app.queued.is_empty());
-        assert!(!harness.draw().contains("pending:"));
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: ".info".to_string(),
+                command: true
+            }]
+        );
+        assert!(harness.draw().contains("pending: 1"));
+    }
+
+    /// Alt+Up over a draft trades places with it: the held line comes
+    /// out, the draft goes to the end of the queue, and the loop is told
+    /// to withdraw the one and offer the other.
+    #[test]
+    fn editing_a_queued_line_keeps_the_draft_on_the_queue() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("a");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("a".to_string()))
+        );
+        harness.type_text("d");
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(
+            harness.app.handle_key(alt_up),
+            Some(Command::Unqueue {
+                held: Some("a".to_string()),
+                draft: Some("d".to_string()),
+            })
+        );
+        assert_eq!(harness.app.composer_text(), "a");
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: "d".to_string(),
+                command: false
+            }]
+        );
     }
 
     /// Esc during a turn drops what was lined up behind it and says so.
@@ -4479,17 +4561,19 @@ mod tests {
         );
     }
 
-    /// A checkbox ticks rows with Space, ungated, and Enter sends the
-    /// ticked options in the list's order.
+    /// A checkbox ticks rows with Space and Enter sends the ticked
+    /// options in the list's order.
     #[test]
     fn a_checkbox_modal_ticks_rows_and_sends_them_in_order() {
         let mut harness = Harness::standalone(80, 24);
         let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Checkbox, None));
         assert_eq!(harness.press(KeyCode::Down), None);
         assert_eq!(harness.press(KeyCode::Down), None);
+        harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char(' ')), None);
         assert_eq!(harness.press(KeyCode::Up), None);
         assert_eq!(harness.press(KeyCode::Up), None);
+        harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char(' ')), None);
         let frame = harness.draw();
         assert_welcome_snapshot("checkbox_modal_80x24", &frame);

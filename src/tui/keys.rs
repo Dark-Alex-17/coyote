@@ -236,8 +236,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
                 KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
                 KeyCode::Up => Action::ModalMove(-1),
                 KeyCode::Down => Action::ModalMove(1),
-                KeyCode::Char(' ') if checkbox => Action::ModalToggle,
                 _ if !answerable => Action::Nothing,
+                KeyCode::Char(' ') if checkbox => Action::ModalToggle,
                 KeyCode::Enter => Action::SubmitModalChoice,
                 KeyCode::Char('k') if !ctrl => Action::ModalMove(-1),
                 KeyCode::Char('j') if !ctrl => Action::ModalMove(1),
@@ -1226,10 +1226,11 @@ mod tests {
         }
     }
 
-    /// The list modals: the arrows move without the gate, Space ticks a
-    /// checkbox row without it; Enter, the `j`/`k` letters and a select's
-    /// digits wait for it. A checkbox has no digit shortcuts (a digit
-    /// would have to both move and answer), and a select has no Space.
+    /// The list modals: the arrows move without the gate; Enter, Space on
+    /// a checkbox, the `j`/`k` letters and a select's digits wait for it,
+    /// so a typed-ahead space cannot tick a row the user never saw. A
+    /// checkbox has no digit shortcuts (a digit would have to both move
+    /// and answer), and a select has no Space.
     #[test]
     fn list_modal_keys() {
         let select = KeyContext {
@@ -1270,11 +1271,7 @@ mod tests {
             (plain(KeyCode::Char('2')), select_clipped, Action::Nothing),
             (plain(KeyCode::Char('2')), checkbox, Action::Nothing),
             (plain(KeyCode::Char(' ')), checkbox, Action::ModalToggle),
-            (
-                plain(KeyCode::Char(' ')),
-                checkbox_busy,
-                Action::ModalToggle,
-            ),
+            (plain(KeyCode::Char(' ')), checkbox_busy, Action::Nothing),
             (plain(KeyCode::Char(' ')), select, Action::Nothing),
             (plain(KeyCode::Enter), select, Action::SubmitModalChoice),
             (plain(KeyCode::Enter), checkbox, Action::SubmitModalChoice),
