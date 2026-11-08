@@ -279,7 +279,7 @@ fn filter_lines(text: &str, pattern: &str) -> Result<String, RenderError> {
     Ok(out.join("\n"))
 }
 
-fn decode_base64_bounded(b64: &str) -> Result<Vec<u8>, RenderError> {
+pub(crate) fn decode_base64_bounded(b64: &str) -> Result<Vec<u8>, RenderError> {
     // The encoded length puts a lower bound on the decoded size; reject
     // inputs that bound already proves oversized before decoding anything.
     let min_decoded = (b64.len() / 4).saturating_mul(3).saturating_sub(2);

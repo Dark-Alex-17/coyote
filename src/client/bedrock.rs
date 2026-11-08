@@ -3,6 +3,7 @@ use std::mem;
 
 use super::*;
 
+use crate::function::ToolResult;
 use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256, strip_think_tag};
 
 use anyhow::{Context, Result, bail};
@@ -461,7 +462,7 @@ fn build_chat_completions_body(
                             user_parts.push(json!({
                                 "toolResult": {
                                     "toolUseId": tool_result.call.id,
-                                    "content": [bedrock_tool_result_content(&tool_result.output)]
+                                    "content": bedrock_tool_result_blocks(tool_result)
                                 }
                             }));
                         }
@@ -540,7 +541,7 @@ fn build_chat_completions_body(
                             user_parts.push(json!({
                                 "toolResult": {
                                     "toolUseId": tool_result.call.id,
-                                    "content": [bedrock_tool_result_content(&tool_result.output)]
+                                    "content": bedrock_tool_result_blocks(tool_result)
                                 }
                             }));
                         }
@@ -680,6 +681,19 @@ fn bedrock_tool_result_content(output: &Value) -> Value {
         Value::String(text) => json!({ "text": text }),
         _ => json!({ "text": output.to_string() }),
     }
+}
+
+fn bedrock_tool_result_blocks(tool_result: &ToolResult) -> Vec<Value> {
+    let mut blocks = vec![bedrock_tool_result_content(&tool_result.output)];
+    blocks.extend(tool_result.attachments.iter().map(|attachment| {
+        json!({
+            "image": {
+                "format": attachment.mime_type.replace("image/", ""),
+                "source": { "bytes": attachment.data },
+            }
+        })
+    }));
+    blocks
 }
 
 /// Maps a ThinkingBlock (Anthropic tagged shape) to the Converse
@@ -878,7 +892,50 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::function::{FunctionDeclaration, ToolCall, ToolResult};
+    use crate::function::{FunctionDeclaration, ImageAttachment, ToolCall, ToolResult};
+
+    #[test]
+    fn interleaved_user_parts_keep_their_order() {
+        let body = build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("bedrock", "test"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                { "text": "before" },
+                { "image": { "format": "png", "source": { "bytes": "QQ==" } } },
+                { "text": "after" },
+                { "image": { "format": "jpeg", "source": { "bytes": "Qg==" } } },
+            ]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn interleaved_user_parts_keep_their_order_with_prompt_cache() {
+        let body = build_chat_completions_body(
+            interleaved_user_data(),
+            &Model::new("bedrock", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                { "text": "before" },
+                { "image": { "format": "png", "source": { "bytes": "QQ==" } } },
+                { "text": "after" },
+                { "image": { "format": "jpeg", "source": { "bytes": "Qg==" } } },
+                { "cachePoint": { "type": "default" } },
+            ]),
+            "body: {body}"
+        );
+    }
 
     fn tool_result(output: Value) -> ToolResult {
         ToolResult {
@@ -890,6 +947,7 @@ mod tests {
             output,
             text: None,
             thinking: vec![],
+            attachments: vec![],
         }
     }
 
@@ -899,6 +957,7 @@ mod tests {
             output: json!("ok"),
             text: text.map(|t| t.to_string()),
             thinking: vec![],
+            attachments: vec![],
         }
     }
 
@@ -957,6 +1016,29 @@ mod tests {
     fn tool_result_content_block(output: Value) -> Value {
         let body = build_body(vec![tool_result(output)]);
         body["messages"][2]["content"][0]["toolResult"]["content"][0].clone()
+    }
+
+    fn image_attachment(mime_type: &str, data: &str) -> ImageAttachment {
+        ImageAttachment {
+            source: "/tmp/a".into(),
+            mime_type: mime_type.into(),
+            data: data.into(),
+        }
+    }
+
+    fn jpeg_tool_result(id: &str) -> ToolResult {
+        ToolResult {
+            call: ToolCall::new("fs_read".into(), json!({"path": "x"}), Some(id.into())),
+            ..tool_result(json!({"a": 1}))
+        }
+        .with_attachments(vec![image_attachment("image/jpeg", "aGVsbG8=")])
+    }
+
+    fn expected_jpeg_content() -> Value {
+        json!([
+            {"json": {"a": 1}},
+            {"image": {"format": "jpeg", "source": {"bytes": "aGVsbG8="}}}
+        ])
     }
 
     fn assert_unique_tool_use_ids_per_message(body: &Value) {
@@ -1324,6 +1406,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bedrock_tool_result_without_attachments_has_single_block() {
+        let body = build_body(vec![tool_result(json!({"a": 1}))]);
+
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["content"],
+            json!([{"json": {"a": 1}}]),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn test_bedrock_tool_result_appends_image_blocks() {
+        for sequence in [false, true] {
+            let body = build_body_with(vec![jpeg_tool_result("tool_A")], "", sequence);
+
+            assert_eq!(
+                body["messages"][2]["content"][0]["toolResult"]["content"],
+                expected_jpeg_content(),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bedrock_round_starts_tool_result_appends_image_blocks() {
+        let body = build_body_rounds(
+            vec![sequence_tool_result("tool_A", None), jpeg_tool_result("tool_B")],
+            vec![0, 1],
+        );
+
+        assert_eq!(body["messages"].as_array().unwrap().len(), 5, "body: {body}");
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["content"],
+            json!([{"text": "ok"}]),
+            "body: {body}"
+        );
+        assert_eq!(
+            body["messages"][4]["content"][0]["toolResult"]["content"],
+            expected_jpeg_content(),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn test_bedrock_tool_result_images_keep_order_and_format() {
+        let result = tool_result(json!("done")).with_attachments(vec![
+            image_attachment("image/gif", "Z2lm"),
+            image_attachment("image/png", "cG5n"),
+        ]);
+        let body = build_body(vec![result]);
+
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["content"],
+            json!([
+                {"text": "done"},
+                {"image": {"format": "gif", "source": {"bytes": "Z2lm"}}},
+                {"image": {"format": "png", "source": {"bytes": "cG5n"}}}
+            ]),
+            "body: {body}"
+        );
+    }
+
     fn thinking_tool_result() -> ToolResult {
         ToolResult {
             call: ToolCall::new(
@@ -1342,6 +1487,7 @@ mod tests {
                     data: "b64data".into(),
                 },
             ],
+            attachments: vec![],
         }
     }
 
@@ -1384,6 +1530,7 @@ mod tests {
                 summary: json!([{ "type": "summary_text", "text": "thinking" }]),
                 encrypted_content: Some("enc123".into()),
             }],
+            attachments: vec![],
         };
 
         for sequence in [false, true] {
