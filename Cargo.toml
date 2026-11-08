@@ -154,13 +154,17 @@ arboard = { version = "3.3.0", default-features = false }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Windows named-pipe prompt reply channel; no consumer in this crate yet.
+# The prompt reply pipe (src/function/prompt_channel.rs), the console
+# writer and escape processing (src/tui/terminal.rs) and the std-handle
+# redirect (src/tui/redirect.rs).
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Pipes",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
   "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_IO",
   "Win32_System_Threading",
 ] }
 

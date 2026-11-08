@@ -3068,7 +3068,9 @@ mod tests {
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
         Supervisor,
     };
-    use crate::turn::{NoticeProbe, SilentSink, StdoutSink};
+    use crate::turn::NoticeProbe;
+    #[cfg(unix)]
+    use crate::turn::{SilentSink, StdoutSink};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use jobs::RingBuf;
@@ -3076,6 +3078,7 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
+    #[cfg(unix)]
     use std::sync::mpsc;
     use std::{mem, process};
 

@@ -2584,10 +2584,10 @@ impl Termination {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 struct Termination;
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl Termination {
     fn arm() -> std::io::Result<Self> {
         Ok(Self)
@@ -2777,7 +2777,7 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
         options.mode(0o700);
         options
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     let dir_options = std::fs::DirBuilder::new();
     dir_options.create(&dir)?;
     let path = dir.join("buffer.md");
@@ -9252,10 +9252,6 @@ mod tests {
         // id of the work that removes it.
         let allowlisted: &[(&str, &str)] = &[
             (
-                "src/function/prompt_channel.rs",
-                "bail!(\"Prompt reply channel is not implemented on this platform\")",
-            ),
-            (
                 "src/utils/command.rs",
                 "bail!(\"Interactive prompts are not available in the TUI yet\")",
             ),
@@ -9279,7 +9275,6 @@ mod tests {
                 "src/config/install_remote.rs",
                 "Ok((Vec::new(), missing.to_vec()))",
             ),
-            ("src/tui/redirect.rs", "String::new()"),
             ("src/tui/bottom_pane.rs", "\".uninstall\", \".update\"];"),
             (
                 "tests/tui_binary.rs",
