@@ -133,8 +133,9 @@ pub async fn fetch_with_loaders(
             bail!("Unsupported media type '{content_type}': {SUPPORTED_IMAGE_FORMATS_NOTE}")
         }
         let image_bytes = read_capped_body(res, path, MAX_IMAGE_SOURCE_BYTES).await?;
-        let prepared =
-            prepare_image_bytes(&image_bytes).with_context(|| format!("Invalid image '{path}'"))?;
+        let prepared = prepare_image_bytes_blocking(image_bytes)
+            .await
+            .with_context(|| format!("Invalid image '{path}'"))?;
         (prepared.to_data_url(), extension)
     } else {
         match loaders.get(&extension) {

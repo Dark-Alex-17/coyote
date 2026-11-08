@@ -37,7 +37,7 @@ use crate::config::{memory, memory_migrate, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
-use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket};
+use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket, sweep_stale_pasted_images};
 use crate::utils::*;
 use crate::vault::{Vault, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -670,6 +670,7 @@ async fn run(
             }
             maybe_spawn_models_refresh(&ctx.app.config);
             config::child_sessions::sweep_orphans();
+            sweep_stale_pasted_images();
             start_interactive(ctx).await
         }
     }

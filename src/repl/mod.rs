@@ -1,10 +1,14 @@
 mod completer;
 mod highlighter;
+mod placeholder_edit;
 mod prompt;
 mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
+use self::placeholder_edit::{
+    PlaceholderAwareEditMode, PlaceholderDelete, SharedLineSnapshot, recorded_placeholder_indices,
+};
 use self::prompt::ReplPrompt;
 
 use crate::client::{
@@ -26,11 +30,11 @@ use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
 use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
-    AbortSignal, ClipboardContent, IMAGE_SLOT, SHELL, TaskCancelGuard, UserInterrupt,
-    abortable_run_with_spinner, create_abort_signal, dimmed_text, drain_stale_tty_input,
-    hex_encode, image_marker, is_supported_image_path, read_for_paste, resolve_home_dir,
-    resync_cursor_queries, run_command, set_text, sniff_supported_image, strip_image_slots,
-    temp_file, wait_user_interrupt,
+    AbortSignal, ClipboardContent, IMAGE_SLOT, IS_STDOUT_TERMINAL, SHELL, TaskCancelGuard,
+    UserInterrupt, abortable_run_with_spinner, abortable_run_with_spinner_on, create_abort_signal,
+    dimmed_text, drain_stale_tty_input, hex_encode, image_marker, is_supported_image_path,
+    read_for_paste, resolve_home_dir, resync_cursor_queries, run_command, set_text,
+    sniff_supported_image, strip_image_slots, temp_file, wait_user_interrupt,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -56,9 +60,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{env, process, sync::Arc};
 use tokio::task;
 
@@ -635,6 +639,12 @@ impl Repl {
                         }
                     }
                 }
+                Ok(Signal::HostCommand(cmd)) => {
+                    if let Some(delete) = PlaceholderDelete::from_host_command(&cmd) {
+                        let pasted = self.ctx.read().pasted_images.len();
+                        delete_placeholder(&mut self.editor, delete, pasted);
+                    }
+                }
                 _ => {}
             }
         }
@@ -657,9 +667,10 @@ impl Repl {
 
     fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
-        let highlighter = ReplHighlighter::new(Arc::clone(&ctx));
+        let snapshot = SharedLineSnapshot::default();
+        let highlighter = ReplHighlighter::new(Arc::clone(&ctx), Arc::clone(&snapshot));
         let menu = Self::create_menu();
-        let edit_mode = Self::create_edit_mode(app);
+        let edit_mode = Self::create_edit_mode(app, snapshot);
         let cursor_config = CursorConfig {
             vi_insert: Some(SetCursorStyle::BlinkingBar),
             vi_normal: Some(SetCursorStyle::SteadyBlock),
@@ -732,7 +743,7 @@ impl Repl {
         );
     }
 
-    fn create_edit_mode(app: &AppConfig) -> Box<dyn EditMode> {
+    fn create_edit_mode(app: &AppConfig, snapshot: SharedLineSnapshot) -> Box<dyn EditMode> {
         let edit_mode: Box<dyn EditMode> = if app.keybindings == "vi" {
             let mut insert_keybindings = default_vi_insert_keybindings();
             Self::extra_keybindings(&mut insert_keybindings);
@@ -746,7 +757,7 @@ impl Repl {
             Self::extra_keybindings(&mut keybindings);
             Box::new(Emacs::new(keybindings))
         };
-        edit_mode
+        Box::new(PlaceholderAwareEditMode::new(edit_mode, snapshot))
     }
 
     fn create_menu() -> ReedlineMenu {
@@ -3045,17 +3056,11 @@ struct InlineImage {
 /// Finds the `[Image #N]` placeholders that name a pasted image. A number
 /// with no pasted image stays as text.
 fn pasted_placeholders(line: &str, pasted: &[String]) -> Vec<InlineImage> {
-    IMAGE_PLACEHOLDER_RE
-        .captures_iter(line)
-        .filter_map(|captures| {
-            let captures = captures.ok()?;
-            let number: usize = captures.get(1)?.as_str().parse().ok()?;
-            let path = pasted.get(number.checked_sub(1)?)?;
-            Some(InlineImage {
-                span: captures.get(0)?.range(),
-                keep_text: false,
-                path: path.clone(),
-            })
+    recorded_placeholder_indices(line, pasted.len())
+        .map(|(span, index)| InlineImage {
+            span,
+            keep_text: false,
+            path: pasted[index].clone(),
         })
         .collect()
 }
@@ -3253,6 +3258,30 @@ fn image_file_names(paths: &[String]) -> String {
         .join(", ")
 }
 
+/// Loads the line's text and images behind the "Loading images" spinner.
+/// `on_terminal` stands in for the spinner's own terminal check so a test can
+/// reach the abort path.
+async fn load_image_route_input(
+    ctx: &RequestContext,
+    text: &str,
+    images: &[String],
+    abort_signal: AbortSignal,
+    on_terminal: bool,
+) -> Result<Input> {
+    abortable_run_with_spinner_on(
+        async {
+            let mut input = Input::from_files_with_image_slots(ctx, text, Vec::new(), None).await?;
+            input.extend_image_medias(images).await?;
+            Ok(input)
+        },
+        "Loading images",
+        abort_signal,
+        on_terminal,
+        UserInterrupt::Owned,
+    )
+    .await
+}
+
 async fn handle_image_route(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
@@ -3271,14 +3300,19 @@ async fn handle_image_route(
         } => {
             let discarded = pasted_images_discarded(ctx);
             let clear_hint = ctx.render_hints(".clear images");
-            let loaded = Input::from_files_with_image_slots(ctx, &text, Vec::new(), None)
-                .await
-                .and_then(|mut input| {
-                    input.extend_image_medias(&images)?;
-                    Ok(input)
-                });
+            let loaded = load_image_route_input(
+                ctx,
+                &text,
+                &images,
+                abort_signal.clone(),
+                *IS_STDOUT_TERMINAL,
+            )
+            .await;
             let input = match loaded {
                 Ok(input) => input,
+                // A Ctrl-C is not a failed load, so it gets no hint to clear
+                // the images.
+                Err(err) if abort_signal.aborted() => return Err(err),
                 Err(err) if !ctx.pending_images.is_empty() => {
                     let hint = if discarded.is_empty() {
                         format!("pending images can be discarded with {clear_hint}")
@@ -3396,16 +3430,43 @@ fn handle_clipboard_paste(ctx: &mut RequestContext, content: ClipboardContent) -
     PasteOutcome::InsertText(placeholders.join(" "))
 }
 
+/// Removes the placeholder at the cursor as one edit. `ctx.pasted_images`
+/// keeps its entry: placeholder N names entry N-1, so removing one would move
+/// every later placeholder onto the wrong image. The deleted image is simply
+/// no longer named, so it is not sent.
+fn delete_placeholder(editor: &mut Reedline, delete: PlaceholderDelete, pasted: usize) {
+    // A selection is the user's target, so the plain key deletes it instead.
+    let pasted = if editor.current_selection().is_some() {
+        0
+    } else {
+        pasted
+    };
+    let command = delete.edit_command(
+        editor.current_buffer_contents(),
+        editor.current_insertion_point(),
+        pasted,
+    );
+    editor.run_edit_commands(&[command]);
+}
+
 /// Names the file by its content hash so pasting the same image again reuses
 /// the file instead of writing a copy. A size mismatch means an earlier write
-/// was cut short, so the file is written again.
+/// was cut short, so the file is written again. A reused file gets a fresh
+/// mtime so the stale sweep keeps it. Anything at the path that is not a
+/// regular file, such as a planted symlink, is replaced rather than touched.
 fn save_pasted_png(bytes: &[u8]) -> Result<String> {
-    let dir = paths::cache_dir().join("pasted-images");
+    let dir = pasted_images_dir();
     crate::utils::fs::create_private_dir_all(&dir)
         .with_context(|| format!("Failed to create '{}'", dir.display()))?;
     let hash = hex_encode(&Sha256::digest(bytes));
     let path = dir.join(format!("{hash}.png"));
-    let reusable = fs::metadata(&path).is_ok_and(|meta| meta.len() == bytes.len() as u64);
+    let reusable = fs::symlink_metadata(&path)
+        .is_ok_and(|meta| meta.is_file() && meta.len() == bytes.len() as u64)
+        && fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+            .is_ok();
     if !reusable {
         crate::utils::fs::write_private_atomic(&path, bytes)
             .with_context(|| format!("Failed to write '{}'", path.display()))?;
@@ -3413,6 +3474,65 @@ fn save_pasted_png(bytes: &[u8]) -> Result<String> {
     path.to_str()
         .map(str::to_string)
         .with_context(|| format!("Cache path '{}' is not valid UTF-8", path.display()))
+}
+
+fn pasted_images_dir() -> PathBuf {
+    paths::cache_dir().join("pasted-images")
+}
+
+const STALE_PASTED_IMAGE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Removes pasted images no line has used for a day. Never fails. The cache
+/// is shared by every REPL, so an image pasted in another REPL and left
+/// unsent for over a day may be pruned before that line is sent.
+pub fn sweep_stale_pasted_images() {
+    sweep_pasted_images_older_than(&pasted_images_dir(), STALE_PASTED_IMAGE_MAX_AGE);
+}
+
+fn sweep_pasted_images_older_than(dir: &Path, max_age: Duration) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            debug!(
+                "Skipping stale pasted-image sweep in {}: {err}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let is_png = Path::new(&entry.file_name())
+            .extension()
+            .is_some_and(|ext| ext == "png");
+        if !is_png {
+            continue;
+        }
+        // DirEntry::metadata does not traverse symlinks, so a planted link
+        // is skipped rather than followed.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age >= max_age);
+        if !stale {
+            continue;
+        }
+
+        match fs::remove_file(entry.path()) {
+            Ok(()) => debug!("Removed stale pasted image {}", entry.path().display()),
+            Err(err) => debug!(
+                "Failed to remove stale pasted image {}: {err}",
+                entry.path().display()
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -12490,6 +12610,87 @@ local_hello() {\n\
         );
     }
 
+    fn editor_with(text: &str, cursor: usize) -> Reedline {
+        let mut editor = Reedline::create();
+        editor.run_edit_commands(&[
+            EditCommand::InsertString(text.into()),
+            EditCommand::Move(reedline::MotionTarget::Position(cursor)),
+        ]);
+        editor
+    }
+
+    #[test]
+    fn deleting_a_placeholder_removes_it_in_one_edit() {
+        let mut editor = editor_with("see [Image #1] now", 14);
+        delete_placeholder(&mut editor, PlaceholderDelete::Back, 1);
+        assert_eq!(editor.current_buffer_contents(), "see  now");
+        assert_eq!(editor.current_insertion_point(), 4);
+
+        let mut editor = editor_with("see [Image #1] now", 4);
+        delete_placeholder(&mut editor, PlaceholderDelete::Forward, 1);
+        assert_eq!(editor.current_buffer_contents(), "see  now");
+        assert_eq!(editor.current_insertion_point(), 4);
+    }
+
+    #[test]
+    fn deleting_with_a_selection_deletes_the_selection() {
+        let mut editor = editor_with("see [Image #1] now", 18);
+        editor.run_edit_commands(&[EditCommand::MoveToPosition {
+            position: 14,
+            select: true,
+        }]);
+        assert!(editor.current_selection().is_some());
+        delete_placeholder(&mut editor, PlaceholderDelete::Back, 1);
+        assert_eq!(editor.current_buffer_contents(), "see [Image #1]");
+    }
+
+    #[test]
+    fn deleting_with_no_placeholder_at_the_cursor_is_a_plain_keystroke() {
+        let mut editor = editor_with("see [Image #1] now", 13);
+        delete_placeholder(&mut editor, PlaceholderDelete::Back, 1);
+        assert_eq!(editor.current_buffer_contents(), "see [Image #] now");
+
+        let mut editor = editor_with("see [Image #1] now", 14);
+        delete_placeholder(&mut editor, PlaceholderDelete::Forward, 1);
+        assert_eq!(editor.current_buffer_contents(), "see [Image #1]now");
+
+        let mut editor = editor_with("see [Image #1] now", 14);
+        delete_placeholder(&mut editor, PlaceholderDelete::Back, 0);
+        assert_eq!(editor.current_buffer_contents(), "see [Image #1 now");
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_a_placeholder_keeps_later_placeholders_on_their_images() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let files = vec![dir.png_of_width("a.png", 2), dir.png_of_width("b.png", 3)];
+        let mut ctx = image_ctx(true);
+        let PasteOutcome::InsertText(placeholders) = handle_clipboard_paste(
+            &mut ctx,
+            ClipboardContent::ImageFiles(files.iter().map(Into::into).collect()),
+        ) else {
+            panic!("expected placeholders");
+        };
+        let mut editor = editor_with(&format!("{placeholders} please"), 10);
+
+        delete_placeholder(
+            &mut editor,
+            PlaceholderDelete::Back,
+            ctx.pasted_images.len(),
+        );
+
+        let line = editor.current_buffer_contents().to_string();
+        assert_eq!(line, " [Image #2] please");
+        assert_eq!(ctx.pasted_images, files);
+        run_async(async {
+            repl_line(&mut ctx, &line, CommandPrefix::Dot)
+                .await
+                .unwrap();
+            assert_eq!(sent_parts(&ctx), vec!["image:b.png", "please"]);
+        });
+    }
+
     #[test]
     #[serial]
     fn a_macro_step_does_not_reuse_the_lines_pasted_images() {
@@ -13097,6 +13298,105 @@ local_hello() {\n\
         assert_eq!(std::fs::read(&saved[0]).unwrap(), bytes);
     }
 
+    fn age(path: &Path, by: Duration) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - by)
+            .unwrap();
+    }
+
+    fn mtime_age(path: &Path) -> Duration {
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        SystemTime::now().duration_since(mtime).unwrap_or_default()
+    }
+
+    #[test]
+    #[serial]
+    fn pasting_an_image_again_refreshes_its_mtime() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let mut ctx = image_ctx(true);
+        handle_clipboard_paste(&mut ctx, ClipboardContent::ImagePng(tiny_png()));
+        let saved = pasted_images();
+        age(&saved[0], STALE_PASTED_IMAGE_MAX_AGE * 2);
+
+        handle_clipboard_paste(&mut ctx, ClipboardContent::ImagePng(tiny_png()));
+
+        assert_eq!(pasted_images(), saved);
+        assert!(fs::symlink_metadata(&saved[0]).unwrap().is_file());
+        assert!(mtime_age(&saved[0]) < STALE_PASTED_IMAGE_MAX_AGE);
+        sweep_stale_pasted_images();
+        assert!(saved[0].exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pasting_over_a_planted_symlink_replaces_it_with_the_image() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let decoy = vec![0u8; tiny_png().len()];
+        let target = dir.0.join("target.png");
+        fs::write(&target, &decoy).unwrap();
+        age(&target, STALE_PASTED_IMAGE_MAX_AGE * 2);
+        let cache = pasted_images_dir();
+        fs::create_dir_all(&cache).unwrap();
+        let link = cache.join(format!("{}.png", hex_encode(&Sha256::digest(tiny_png()))));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let saved = save_pasted_png(&tiny_png()).unwrap();
+
+        assert_eq!(PathBuf::from(saved), link);
+        assert!(fs::symlink_metadata(&link).unwrap().is_file());
+        assert_eq!(fs::read(&link).unwrap(), tiny_png());
+        assert_eq!(fs::read(&target).unwrap(), decoy);
+        assert!(mtime_age(&target) >= STALE_PASTED_IMAGE_MAX_AGE);
+    }
+
+    #[test]
+    fn the_sweep_removes_only_stale_pasted_images() {
+        let dir = ImageDir::new();
+        let stale = PathBuf::from(dir.png("stale.png"));
+        let young = PathBuf::from(dir.png("young.png"));
+        let other = PathBuf::from(dir.file("notes.txt", "keep"));
+        let nested = dir.0.join("nested.png");
+        fs::create_dir_all(&nested).unwrap();
+        age(&stale, STALE_PASTED_IMAGE_MAX_AGE * 2);
+        age(&other, STALE_PASTED_IMAGE_MAX_AGE * 2);
+
+        sweep_pasted_images_older_than(&dir.0, STALE_PASTED_IMAGE_MAX_AGE);
+
+        assert!(!stale.exists());
+        assert!(young.exists());
+        assert!(other.exists());
+        assert!(nested.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_skips_symlinks() {
+        let dir = ImageDir::new();
+        let target = PathBuf::from(dir.png("target.png"));
+        let link = dir.0.join("link.png");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        sweep_pasted_images_older_than(&dir.0, Duration::ZERO);
+
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn the_sweep_ignores_a_missing_directory() {
+        let dir = ImageDir::new();
+        let missing = dir.0.join("missing");
+
+        sweep_pasted_images_older_than(&missing, Duration::ZERO);
+
+        assert!(!missing.exists());
+    }
+
     #[test]
     #[serial]
     fn pasting_non_image_files_reports_an_error() {
@@ -13234,6 +13534,59 @@ local_hello() {\n\
             assert_eq!(ctx.pending_images, vec![broken]);
             assert!(ctx.last_message.is_none());
             assert_eq!(session_message_count(&ctx), 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_aborted_image_load_keeps_the_queue_and_skips_the_hint() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let broken = dir.0.join("broken.png");
+        std::fs::write(&broken, b"\x89PNG\r\n\x1a\ntruncated").unwrap();
+        let broken = broken.to_str().unwrap().to_string();
+        run_async(async {
+            let mut ctx = image_session_ctx(true);
+            ctx.pending_images = vec![broken.clone()];
+            let abort_signal = create_abort_signal();
+            abort_signal.set_ctrlc();
+
+            let err = Box::pin(run_repl_command_with_prefix(
+                &mut ctx,
+                abort_signal,
+                "describe it",
+                CommandPrefix::Dot,
+            ))
+            .await
+            .unwrap_err();
+
+            let message = format!("{err:#}");
+            assert!(
+                !message.contains("Unable to prepare the message"),
+                "{message}"
+            );
+            assert_eq!(ctx.pending_images, vec![broken]);
+            assert!(ctx.last_message.is_none());
+            assert_eq!(session_message_count(&ctx), 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn image_loading_runs_behind_the_abortable_spinner() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let dir = ImageDir::new();
+        let shot = dir.png("shot.png");
+        run_async(async {
+            let ctx = image_ctx(true);
+            let abort_signal = create_abort_signal();
+            abort_signal.set_ctrlc();
+
+            let err = load_image_route_input(&ctx, "describe it", &[shot], abort_signal, true)
+                .await
+                .unwrap_err();
+
+            assert_eq!(format!("{err:#}"), "Aborted.");
         });
     }
 }

@@ -6,8 +6,8 @@ use crate::client::{
 };
 use crate::function::ToolResult;
 use crate::utils::{
-    AbortSignal, IMAGE_SLOT, UserInterrupt, is_loader_protocol, render_image_slots, sha256,
-    strip_image_slots,
+    AbortSignal, IMAGE_SLOT, UserInterrupt, is_loader_protocol, prepare_image_file_blocking,
+    render_image_slots, sha256, strip_image_slots,
 };
 
 use anyhow::{Context, Result, bail};
@@ -340,9 +340,10 @@ impl Input {
 
     /// Attaches images in the given order, keeping repeats, unlike
     /// `from_files`, which loads each distinct path once.
-    pub fn extend_image_medias(&mut self, paths: &[String]) -> Result<()> {
+    pub async fn extend_image_medias(&mut self, paths: &[String]) -> Result<()> {
         for path in paths {
-            let contents = prepare_image_file(Path::new(path))
+            let contents = prepare_image_file_blocking(path.into())
+                .await
                 .with_context(|| format!("Unable to read media '{path}'"))?
                 .to_data_url();
             self.data_urls.insert(sha256(&contents), path.clone());
@@ -813,7 +814,8 @@ async fn load_documents(
     let local_files = expand_glob_paths(&local_paths, true).await?;
     for file_path in local_files {
         if is_supported_image_path(&file_path) {
-            let contents = prepare_image_file(Path::new(&file_path))
+            let contents = prepare_image_file_blocking(file_path.as_str().into())
+                .await
                 .with_context(|| format!("Unable to read media '{file_path}'"))?
                 .to_data_url();
             data_urls.insert(sha256(&contents), file_path);

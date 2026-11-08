@@ -7,7 +7,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Anthropic's per-image limit once a request carries more than 20 images.
 pub const MAX_IMAGE_DIMENSION: u32 = 2000;
@@ -167,6 +167,21 @@ pub fn prepare_image_file(path: &Path) -> Result<PreparedImage> {
         bail!("'{display}' is larger than the {MAX_IMAGE_SOURCE_BYTES} byte image limit");
     }
     prepare_image_bytes(&bytes).with_context(|| format!("Invalid image '{display}'"))
+}
+
+/// `prepare_image_file` on the blocking pool, so decoding and resizing a
+/// large image does not stall the async worker or the spinner. A panic in
+/// the decoder comes back as an error. Dropping the returned future, as an
+/// aborted caller does, does not cancel the decode; it runs to completion
+/// and its result is discarded.
+pub async fn prepare_image_file_blocking(path: PathBuf) -> Result<PreparedImage> {
+    tokio::task::spawn_blocking(move || prepare_image_file(&path)).await?
+}
+
+/// `prepare_image_bytes` on the blocking pool; see
+/// `prepare_image_file_blocking`.
+pub async fn prepare_image_bytes_blocking(bytes: Vec<u8>) -> Result<PreparedImage> {
+    tokio::task::spawn_blocking(move || prepare_image_bytes(&bytes)).await?
 }
 
 pub fn prepare_image_bytes(bytes: &[u8]) -> Result<PreparedImage> {
@@ -499,6 +514,27 @@ mod tests {
         assert_eq!(prepared.mime_type, "image/png");
         assert_eq!((prepared.width, prepared.height), (100, 100));
         assert_eq!(prepared.original_size, None);
+    }
+
+    #[tokio::test]
+    async fn blocking_preparation_matches_the_synchronous_result() {
+        let dir = TempDir::new();
+        let path = dir.path("shot.png");
+        let bytes = png_bytes(3000, 10);
+        fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            prepare_image_file_blocking(path.clone()).await.unwrap(),
+            prepare_image_file(&path).unwrap()
+        );
+        assert_eq!(
+            prepare_image_bytes_blocking(bytes.clone()).await.unwrap(),
+            prepare_image_bytes(&bytes).unwrap()
+        );
+        let err = prepare_image_file_blocking(dir.path("missing.png"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("missing.png"), "{err:#}");
     }
 
     #[test]
