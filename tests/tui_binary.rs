@@ -3512,13 +3512,19 @@ fn dot_skill_scaffolds_the_file_and_opens_it_on_the_lent_terminal() {
 
     let edited = fs::read_to_string(&launched)
         .unwrap_or_else(|e| panic!("`.skill` never launched the editor ({e}):\n{since}"));
+    let opened = edited.lines().next().unwrap_or_default();
     assert!(
-        edited.contains("probe-skill-zq7") && edited.contains("SKILL.md"),
+        opened.contains("probe-skill-zq7") && opened.contains("SKILL.md"),
         "the editor was not handed the skill file: {edited:?}\n{since}"
     );
     assert!(
-        Path::new(edited.trim()).exists(),
-        "the skill file {edited:?} was not scaffolded:\n{since}"
+        edited.lines().nth(1) == Some("existed"),
+        "the skill file {opened:?} was not scaffolded before the editor opened: {edited:?}\n{since}"
+    );
+    let body = fs::read_to_string(opened).unwrap();
+    assert!(
+        body.starts_with("---\n") && body.contains("description:"),
+        "the skill file {opened:?} holds {body:?}, not the scaffold:\n{since}"
     );
     let skill_files = new_files_named(&dir, &files_before, "probe-skill-zq7");
     assert!(
@@ -3817,18 +3823,21 @@ fn esc_still_cancels_a_clipped_confirm_question() {
     assert_tty_restored(&transcript);
 }
 
-/// Writes an `$EDITOR` that records the path it was asked to open into
-/// `launched` and saves that file the way an editor's save would (a new
-/// role or macro exists only once its editor wrote it); returns the
-/// editor's path.
+/// Writes an `$EDITOR` that records into `launched` the path it was asked
+/// to open and, on a second line, whether that file `existed` or was
+/// `missing` when the editor started; a missing file is saved the way an
+/// editor's save would (a new role or macro exists only once its editor
+/// wrote it). Returns the editor's path.
 fn recording_editor(dir: &Path, launched: &Path) -> String {
     use std::os::unix::fs::PermissionsExt;
     let editor = dir.join("recording-editor.sh");
     fs::write(
         &editor,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{}'\n[ -e \"$1\" ] || printf 'saved\\n' > \"$1\"\nexit 0\n",
-            launched.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{launched}'\n\
+             if [ -e \"$1\" ]; then echo existed; else echo missing; printf 'saved\\n' > \"$1\"; fi >> '{launched}'\n\
+             exit 0\n",
+            launched = launched.display()
         ),
     )
     .unwrap();
@@ -3881,8 +3890,15 @@ fn dot_role_for_a_new_role_asks_in_the_modal_and_opens_the_editor_on_y() {
     let edited = fs::read_to_string(&launched)
         .unwrap_or_else(|e| panic!("`y` never launched the editor ({e}):\n{since}"));
     assert!(
-        edited.contains("new-role-xk3"),
+        edited
+            .lines()
+            .next()
+            .is_some_and(|path| path.contains("new-role-xk3")),
         "the editor was not handed the new role's file: {edited:?}\n{since}"
+    );
+    assert!(
+        edited.lines().nth(1) == Some("missing"),
+        "the new role's file existed before its editor opened: {edited:?}\n{since}"
     );
     let role_files = new_files_named(&dir, &[], "new-role-xk3");
     assert!(
@@ -3928,13 +3944,14 @@ fn dot_edit_session_opens_the_editor_on_the_lent_terminal() {
 
     let edited = fs::read_to_string(&launched)
         .unwrap_or_else(|e| panic!("`.edit session` never launched the editor ({e}):\n{since}"));
+    let opened = edited.lines().next().unwrap_or_default();
     assert!(
-        edited.contains("named-sess-xk3"),
+        opened.contains("named-sess-xk3"),
         "the editor was not handed the session file: {edited:?}\n{since}"
     );
     assert!(
-        Path::new(edited.trim()).exists(),
-        "the session file {edited:?} was not written before the editor opened:\n{since}"
+        edited.lines().nth(1) == Some("existed"),
+        "the session file {opened:?} was not written before the editor opened: {edited:?}\n{since}"
     );
     let session_files = new_files_named(&dir, &files_before, "named-sess-xk3");
     assert!(
