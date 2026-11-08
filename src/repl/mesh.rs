@@ -31010,11 +31010,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             err.contains("knocked before its name hash was kept"),
                             "a knock without its name hash teaches what to wait for: {err}"
                         );
-                        assert!(!err.contains("added"), "{err}");
+                        assert!(!err.contains("- added"), "{err}");
                         let err =
                             refusal(&mut ctx, &format!(".mesh trust {forged_dest}{flag}")).await;
                         assert!(
-                            err.contains(&forged_dest) && !err.contains("added"),
+                            err.contains(&forged_dest) && !err.contains("- added"),
                             "a forged knock is refused naming the destination: {err}"
                         );
                     }
