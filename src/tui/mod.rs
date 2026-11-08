@@ -9212,7 +9212,10 @@ mod tests {
                 "src/config/install_remote.rs",
                 "return Ok(ObsoleteAction::Keep);",
             ),
-            ("src/config/install_remote.rs", "bail!(\"{refusal}\");"),
+            (
+                "src/config/install_remote.rs",
+                "conflict::rerun_hint() // TASK-388",
+            ),
             (
                 "src/config/install_remote.rs",
                 "Ok((Vec::new(), missing.to_vec()))",
