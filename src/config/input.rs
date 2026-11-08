@@ -702,11 +702,12 @@ async fn run_document_command(cmd: &str) -> String {
     }
 }
 
-/// The output pipe is ours rather than duct's. duct reaps the shell the
-/// moment it exits, freeing its pid while a grandchild may still hold
-/// the pipe, and from then on no group could safely be signalled. Here
-/// the shell is reaped only once the pipe has closed, so until then its
-/// pid, which is also its group id, is held for the drop.
+/// The output pipe is ours rather than duct's: duct reaps the shell the
+/// moment it exits, and a reaped pid may be reused, so from then on no
+/// group could safely be signalled. Here the shell is reaped only once
+/// it has exited AND the pipe has hit EOF; until both hold it stays a
+/// zombie, and its pid, which is also its group id, is the drop's to
+/// signal.
 async fn run_document_command_under_tui(cmd: &str) -> std::io::Result<String> {
     let (mut reader, writer) = std::io::pipe()?;
     let child = {
@@ -738,13 +739,16 @@ async fn run_document_command_under_tui(cmd: &str) -> std::io::Result<String> {
 }
 
 /// A document command that does not outlive the future waiting on it.
-/// On unix the shell leads its own process group so the kill also reaches
-/// whatever it spawned; killing the shell alone would leave those
-/// orphans holding the output pipe. The shell inside is never reaped
-/// while the guard is armed, so an exited shell is a zombie whose pid
-/// cannot be reused: the group id equal to it is still ours when the
-/// drop signals it. The drop blocks its thread, a tokio worker when a
-/// turn is aborted, for as long as reaping the just-killed shell takes.
+/// On unix the shell leads its own process group and the drop signals
+/// the whole group, so the kill also reaches whatever the shell spawned;
+/// killing the shell alone would leave those orphans holding the output
+/// pipe. The shell inside is never reaped while the guard is armed, so
+/// an exited shell is a zombie whose pid cannot be reused, and the drop
+/// signals the group named by that pid unconditionally. The one escape
+/// is a grandchild that left the group with setsid: it is neither
+/// signalled nor waited on. The drop blocks its thread, a tokio worker
+/// when a turn is aborted, until the just-killed shell is reaped; the
+/// wait has no bound, but a SIGKILLed shell is reapable at once.
 struct KillOnDrop(Option<std::process::Child>);
 
 impl KillOnDrop {
@@ -767,8 +771,9 @@ impl KillOnDrop {
         }
     }
 
-    /// Reaps a shell that has exited and disarms the guard: its pid may
-    /// now belong to another process, so nothing is signalled later.
+    /// Reaps a shell that has exited and whose pipe has closed, and
+    /// disarms the guard: its pid may now belong to another process, so
+    /// nothing is signalled later.
     fn reap(mut self) -> std::io::Result<()> {
         let mut child = self.0.take().expect("reap runs once");
         child.wait().map(drop)
@@ -806,12 +811,14 @@ impl Drop for KillOnDrop {
             // SAFETY: killpg has no memory-safety preconditions. Nothing
             // has reaped the shell yet, so it is running or a zombie and
             // its pid, which is also its group id, cannot have been
-            // reused: the group signalled is the one it leads.
+            // reused: the group signalled is the one it leads, however
+            // long ago it exited.
             let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
         }
         let _ = child.kill();
-        // Only the shell is waited on; a grandchild that survived the
-        // kill closes the pipe in its own time and nothing waits on it.
+        // Only the shell is waited on. A grandchild that left the group
+        // with setsid survives the signal, closes the pipe in its own
+        // time, and nothing waits on it.
         let _ = child.wait();
     }
 }
