@@ -40,7 +40,9 @@ use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
 use history::ComposerHistory;
 use keys::{Action, KeyContext, ModalKind, PopupKind, ViMode};
-use queued::{QueuedLine, QueuedPreview, carry_over, reconcile_queue, take_user_messages};
+use queued::{
+    QueuedLine, QueuedPreview, carry_over, reconcile_queue, remove_sent, take_user_messages,
+};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -1854,6 +1856,7 @@ impl App {
             }
             UiMsg::TodoUpdated(items) => self.todo.set_items(items),
             UiMsg::QueuedInputSent(text) => {
+                remove_sent(&mut self.queued, &text);
                 self.transcript.push(Cell::user_mid_turn(plain_text(&text)))
             }
             UiMsg::Busy(message) => {
@@ -4353,6 +4356,46 @@ mod tests {
                 command: false
             }]
         );
+    }
+
+    /// The strip follows the model: a line it was handed leaves the queue
+    /// the moment the cell is committed, so the count is right and Alt+Up
+    /// cannot pull a sent line back into the composer.
+    #[test]
+    fn a_line_sent_mid_turn_leaves_the_queue_at_once() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        for text in ["a", "b"] {
+            harness.type_text(text);
+            assert_eq!(
+                harness.press(KeyCode::Enter),
+                Some(Command::Queue(text.to_string()))
+            );
+        }
+        assert!(harness.draw().contains("pending: 2"));
+        harness
+            .app
+            .handle_msg(UiMsg::QueuedInputSent("a".to_string()));
+        assert_eq!(
+            harness.app.queued,
+            vec![QueuedLine {
+                text: "b".to_string(),
+                command: false
+            }]
+        );
+        let frame = harness.draw();
+        assert!(frame.contains("pending: 1"), "{frame}");
+        assert!(frame.contains("> a (sent mid-turn)"), "{frame}");
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(
+            harness.app.handle_key(alt_up),
+            Some(Command::Unqueue {
+                held: Some("b".to_string()),
+                draft: None,
+            })
+        );
+        assert_eq!(harness.app.composer_text(), "b");
+        assert!(harness.app.queued.is_empty());
     }
 
     /// The moment the model is handed a queued line, the transcript gets

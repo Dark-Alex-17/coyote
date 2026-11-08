@@ -88,6 +88,18 @@ pub(super) fn reconcile_queue(queued: &mut Vec<QueuedLine>, unsent: &[String]) {
     *queued = kept;
 }
 
+/// Takes the oldest held prompt reading `text` off the strip: the model
+/// drains in order, so that is the one it was just handed. Commands are
+/// never sent and never match.
+pub(super) fn remove_sent(queued: &mut Vec<QueuedLine>, text: &str) {
+    if let Some(index) = queued
+        .iter()
+        .position(|line| !line.command && line.text == text)
+    {
+        queued.remove(index);
+    }
+}
+
 /// The header plus the newest entries, up to the cap.
 pub(super) fn preview_rows(queued: &[QueuedLine]) -> u16 {
     if queued.is_empty() {
@@ -178,6 +190,16 @@ mod tests {
         let mut queued = vec![prompt("a"), command(".cmd"), prompt("b")];
         reconcile_queue(&mut queued, &[]);
         assert_eq!(texts(&queued), [".cmd"]);
+    }
+
+    #[test]
+    fn a_sent_line_takes_the_oldest_matching_prompt_and_skips_commands() {
+        let mut queued = vec![command("a"), prompt("a"), prompt("b"), prompt("a")];
+        remove_sent(&mut queued, "a");
+        assert_eq!(texts(&queued), ["a", "b", "a"]);
+        assert!(queued[0].command);
+        remove_sent(&mut queued, "zzz");
+        assert_eq!(texts(&queued), ["a", "b", "a"]);
     }
 
     #[test]
