@@ -385,6 +385,147 @@ fn every_mesh_verb_a_page_spells_is_one_the_repl_dispatches() {
     );
 }
 
+/// Every `.mesh <verb> ...` sample on `text`, as `(line number, verb, rest)`: inside a
+/// code span in prose, or anywhere on a line of a fenced block (one line may carry
+/// several). `rest` drops quoted strings and ends at a backtick, `;`, `,`, `(` or `)`,
+/// so the sentence around a sample is not read as its flags.
+fn mesh_command_samples(text: &str) -> Vec<(usize, String, String)> {
+    let rest_of = |chunk: &str| -> Option<(String, String)> {
+        let verb: String = chunk.chars().take_while(char::is_ascii_lowercase).collect();
+        if verb.is_empty() {
+            return None;
+        }
+        let mut rest = String::new();
+        let mut quoted = false;
+        for c in chunk[verb.len()..].chars() {
+            match c {
+                '"' => quoted = !quoted,
+                _ if quoted => {}
+                '`' | ';' | ',' | '(' | ')' => break,
+                c => rest.push(c),
+            }
+        }
+        Some((verb, rest))
+    };
+    let mut samples = Vec::new();
+    let mut fenced = false;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        let chunks: Vec<&str> = if fenced {
+            line.split(".mesh ").skip(1).collect()
+        } else {
+            let pieces: Vec<&str> = line.split('`').collect();
+            (0..pieces.len() / 2)
+                .filter_map(|i| pieces[2 * i + 1].strip_prefix(".mesh "))
+                .collect()
+        };
+        for chunk in chunks {
+            if let Some((verb, rest)) = rest_of(chunk) {
+                samples.push((index + 1, verb, rest));
+            }
+        }
+    }
+    samples
+}
+
+/// Every `--flag` token in `text`.
+fn flags_in(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|word| {
+            word.strip_prefix("--")
+                .is_some_and(|name| name.starts_with(|c: char| c.is_ascii_lowercase()))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `label:line: ...` for every flag a `.mesh <verb>` sample on `text` spells that the
+/// verb's `VERBS` usage does not name; `verbs` is `(verb, usage)`. Returns the hits and
+/// how many samples carried a flag.
+fn unknown_flag_hits(label: &str, text: &str, verbs: &[(String, String)]) -> (Vec<String>, usize) {
+    let mut hits = Vec::new();
+    let mut flagged = 0;
+    for (line, verb, rest) in mesh_command_samples(text) {
+        let flags = flags_in(&rest);
+        if flags.is_empty() {
+            continue;
+        }
+        flagged += 1;
+        let Some((_, usage)) = verbs.iter().find(|(known, _)| *known == verb) else {
+            continue;
+        };
+        let usage_flags = flags_in(usage);
+        for flag in flags {
+            if !usage_flags.contains(&flag) {
+                hits.push(format!(
+                    "{label}:{line}: `.mesh {verb}` takes no {flag} (usage: {usage})"
+                ));
+            }
+        }
+    }
+    (hits, flagged)
+}
+
+/// Every `--flag` a mesh page shows on a `.mesh <verb>` sample, in prose code spans and in
+/// fenced transcripts alike, is one that verb's `VERBS` usage names, so a reader who
+/// copies a sample is never refused for a flag the verb does not take.
+#[test]
+fn every_flag_a_mesh_sample_spells_is_in_that_verbs_usage() {
+    let verbs: Vec<(String, String)> = repl_verbs()
+        .into_iter()
+        .map(|(verb, _, usage)| (verb, usage))
+        .collect();
+    let request = &verbs
+        .iter()
+        .find(|(verb, _)| verb == "request")
+        .expect("VERBS has a request row")
+        .1;
+    assert!(
+        flags_in(request).contains(&"--reason".to_string()),
+        "the `.mesh request` usage no longer names --reason: {request}"
+    );
+    let fixture = "prose `.mesh request bob a.md --reasons \"x\"` and `.mesh request bob a.md --reason \"x; --yes\"`\n\
+         ```text\n\
+         > .mesh trust bob --label ci; then .mesh off --force (or --macro)\n\
+         ```\n";
+    let (hits, flagged) = unknown_flag_hits("fixture", fixture, &verbs);
+    assert_eq!(
+        flagged, 4,
+        "the fixture's flagged samples were not all read"
+    );
+    assert_eq!(
+        hits.len(),
+        2,
+        "the scan does not go red on exactly --reasons and --force: {hits:?}"
+    );
+    assert!(
+        hits[0].contains("--reasons") && hits[1].contains("--force"),
+        "{hits:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let mut hits = Vec::new();
+    let mut flagged = 0;
+    for page in mesh_pages(&wiki) {
+        let label = page.file_name().unwrap().to_string_lossy().to_string();
+        let (page_hits, page_flagged) = unknown_flag_hits(&label, &read(&page), &verbs);
+        hits.extend(page_hits);
+        flagged += page_flagged;
+    }
+    assert!(
+        flagged >= 20,
+        "only {flagged} `.mesh` samples with a flag were found across Mesh*.md; the scan reads nothing"
+    );
+    assert!(
+        hits.is_empty(),
+        "a mesh page shows a flag the verb's VERBS usage does not name:\n{}",
+        hits.join("\n")
+    );
+}
+
 /// The `.mesh info` section names the announces the `last announce` row counts, and each
 /// of them is something the node does: the start announce, a reconnect, the heartbeat.
 /// It must not name a `.mesh` verb that does not exist as one of them.
