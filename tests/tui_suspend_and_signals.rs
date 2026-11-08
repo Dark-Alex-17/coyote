@@ -964,10 +964,20 @@ fn sigterm_with_a_queued_line_does_not_hand_it_to_the_model() {
     pty.read_for(Duration::from_millis(300));
     let typed_at = pty.raw().len();
     pty.send(b"queued-r12-q\r").unwrap();
-    pty.read_for(Duration::from_millis(800));
-    let mid = squeezed(&since(&pty, typed_at));
+    wait_for_squeezed_after(
+        &mut pty,
+        "pending: 1",
+        typed_at,
+        "the queue strip after Enter on a draft",
+    );
+    // A full repaint: the incremental frame can carry a torn cell diff
+    // of the strip's text, so the queued line is read from a fresh one.
+    let repaint_at = pty.raw().len();
+    pty.resize(24, 81).unwrap();
+    pty.read_for(Duration::from_millis(600));
+    let mid = squeezed(&since(&pty, repaint_at));
     assert!(
-        mid.contains("pending:1") && mid.contains("queued-r12-q"),
+        mid.contains("queued-r12-q"),
         "Enter on a draft while a tool ran did not queue it:\n{mid}"
     );
     let started = Instant::now();
