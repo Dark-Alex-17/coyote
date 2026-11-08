@@ -1,0 +1,28 @@
+---
+source: src/tui/mod.rs
+expression: frame
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"┌──────────────────────────────────────────────────────────────────────────────┐"
+"│ coyote X.Y.Z │"
+"│ model: openai:test-model                                                     │"
+"│                                                                              │"
+"│ Tip: Press Ctrl-C as the model works to interrupt the turn and send another  │"
+"│ prompt.                                                                      │"
+"│ Press it again at the idle prompt to cancel background work it left running. │"
+"│                                                                              │"
+"│ Type ".help" for additional help.                                            │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"AWS region:                                                                     "
+"Where your secrets live (e.g. us-east-1, eu-west-2)                             "
+"us-east-1                                                                       "
+"Enter = answer  Esc = cancel                                                    "
+"openai:test-model . no session . agents 0 . jobs 0                              "

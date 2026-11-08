@@ -1246,6 +1246,8 @@ pub(crate) fn parse_request(
             call_id,
             job_id,
             origin,
+            help: None,
+            closed: false,
         },
         raw_options,
     })

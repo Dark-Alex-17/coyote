@@ -7,7 +7,7 @@
 
 use crate::utils::{IS_STDOUT_TERMINAL, ensure_prompts_available};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use inquire::Select;
 use std::fs;
 use std::path::Path;
@@ -78,13 +78,12 @@ pub(crate) fn resolve_conflict(
     if !is_interactive() {
         match non_interactive {
             NonInteractive::Keep => return Ok(ConflictAction::Keep),
-            NonInteractive::Bail => bail!(
-                "Refusing to overwrite local file {} non-interactively. \
-                 {}, with --install-force (installs), \
-                 or with --yes (updates).",
-                dst.display(),
-                rerun_hint()
-            ),
+            NonInteractive::Bail => {
+                return Err(refuse_non_interactive(
+                    format_args!("overwrite local file {}", dst.display()),
+                    ", with --install-force (installs), or with --yes (updates).",
+                ));
+            }
         }
     }
 
@@ -129,6 +128,18 @@ pub(crate) fn rerun_hint() -> &'static str {
     } else {
         "Re-run in a terminal"
     }
+}
+
+/// The refusal for a question nothing can show; every site builds it
+/// here so the message has one shape.
+pub(crate) fn refuse_non_interactive(
+    action: impl std::fmt::Display,
+    remedy: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow!(
+        "Refusing to {action} non-interactively. {}{remedy}",
+        rerun_hint()
+    )
 }
 
 fn select_choice(prompt: &str) -> Result<String> {
@@ -271,6 +282,24 @@ mod tests {
         assert!(
             err.to_string().contains("not available in the TUI"),
             "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_refusal_names_the_action_and_where_to_re_run() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let err = refuse_non_interactive("overwrite local file", " or pass --force.");
+        assert_eq!(
+            err.to_string(),
+            "Refusing to overwrite local file non-interactively. Re-run in a terminal or pass --force."
+        );
+
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = refuse_non_interactive("pick a bundle", ".");
+        assert_eq!(
+            err.to_string(),
+            "Refusing to pick a bundle non-interactively. Re-run in the plain REPL."
         );
     }
 

@@ -519,8 +519,19 @@ struct PendingPrompt {
 
 impl PendingPrompt {
     fn new(req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) -> Self {
-        let field = matches!(req.action, PromptAction::Input | PromptAction::Password)
-            .then(|| new_field(req.action == PromptAction::Password));
+        let field = match req.action {
+            PromptAction::Input => {
+                let mut field = new_field(false);
+                // An input's default is offered as the field's text, so
+                // Enter alone accepts it the way inquire's widget does.
+                if let Some(default) = req.default.as_ref().and_then(serde_json::Value::as_str) {
+                    field.insert_str(default);
+                }
+                Some(field)
+            }
+            PromptAction::Password => Some(new_field(true)),
+            _ => None,
+        };
         let checked = vec![false; req.options.len()];
         Self {
             req,
@@ -565,13 +576,19 @@ impl PendingPrompt {
         !agent_id.is_empty() && self.req.origin.agent_id.as_deref() == Some(agent_id)
     }
 
-    /// The rows of a list modal: the options, plus the custom row of a
-    /// select.
+    /// Whether the select ends in the custom row: every select that is
+    /// not closed.
+    fn has_custom_row(&self) -> bool {
+        self.req.action == PromptAction::Select && !self.req.closed
+    }
+
+    /// The rows of a list modal: the options, plus the custom row of an
+    /// open select.
     fn list_len(&self) -> usize {
         match self.kind() {
             ModalKind::Select {
                 custom_field_open: false,
-            } => self.req.options.len() + 1,
+            } => self.req.options.len() + usize::from(self.has_custom_row()),
             ModalKind::Checkbox => self.req.options.len(),
             _ => 0,
         }
@@ -689,10 +706,10 @@ impl PendingPrompt {
             .max(row_count(self.hint_lines(width, true).len()))
     }
 
-    /// The question wrapped to `width`, every line of it: what the user
-    /// approves is read from here, so none of it may be clipped away.
-    /// Blank lines are dropped so a run of newlines cannot push the rest
-    /// of the question past the pane.
+    /// The question wrapped to `width`, every line of it, with the help
+    /// line dimmed under it: what the user approves is read from here,
+    /// so none of it may be clipped away. Blank lines are dropped so a
+    /// run of newlines cannot push the rest of the question past the pane.
     fn question_lines(&self, width: u16) -> Vec<Line<'static>> {
         // A tool controls the question's text; escape sequences in it
         // are stripped so none can move the cursor or hide a word.
@@ -701,7 +718,13 @@ impl PendingPrompt {
             .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-        render::plain_lines(&question, width, Style::new().add_modifier(Modifier::BOLD))
+        let mut lines =
+            render::plain_lines(&question, width, Style::new().add_modifier(Modifier::BOLD));
+        if let Some(help) = &self.req.help {
+            let help = render::plain_text(help).replace('\n', " ");
+            lines.extend(render::plain_lines(&help, width, DIM));
+        }
+        lines
     }
 
     /// Rows the question may take on a frame `height` tall: the status
@@ -770,7 +793,7 @@ impl PendingPrompt {
             .options
             .iter()
             .map(|option| render::plain_text(option).replace('\n', " "))
-            .chain((!checkbox).then(|| CUSTOM_CHOICE_ROW.to_string()))
+            .chain(self.has_custom_row().then(|| CUSTOM_CHOICE_ROW.to_string()))
             .collect();
         let first = if self.cursor < visible {
             0
@@ -4819,6 +4842,71 @@ mod tests {
             asker.join().unwrap().unwrap(),
             PromptAnswer::Text("hunter2".to_string())
         );
+    }
+
+    /// An input's default is already in the field with the cursor after
+    /// it, so Enter alone accepts it and typing appends; its help line
+    /// sits dimmed between the question and the field.
+    #[test]
+    fn an_input_modal_offers_its_default_in_the_field_under_the_help() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest {
+            default: Some(serde_json::json!("us-east-1")),
+            help: Some("Where your secrets live\n(e.g. us-east-1, eu-west-2)".to_string()),
+            ..PromptRequest::new(PromptAction::Input, "AWS region:", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        assert_welcome_snapshot("prompt_modal_input_with_default_and_help", &frame);
+        assert!(
+            frame.contains("Where your secrets live (e.g. us-east-1, eu-west-2)"),
+            "{frame}"
+        );
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Text("us-east-1".to_string())
+        );
+
+        let req = PromptRequest {
+            default: Some(serde_json::json!("x")),
+            ..PromptRequest::new(PromptAction::Input, "Letter:", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.type_text("yz");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Text("xyz".to_string())
+        );
+    }
+
+    /// A closed select lists only its options: the marker stops at the
+    /// last one and Enter there sends it rather than opening a field.
+    #[test]
+    fn a_closed_select_modal_has_no_custom_row() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest {
+            closed: true,
+            ..list_request(PromptAction::Select, None)
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        for _ in 0..5 {
+            assert_eq!(harness.press(KeyCode::Down), None);
+        }
+        let frame = harness.draw();
+        assert_welcome_snapshot("prompt_modal_closed_select_no_custom_row", &frame);
+        assert!(!frame.contains(CUSTOM_CHOICE_ROW), "{frame}");
+        assert_eq!(harness.app.prompts.front().unwrap().list_len(), 3);
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Selected("gamma".to_string())
+        );
+        assert!(harness.app.prompts.is_empty());
     }
 
     /// A list taller than the rows it gets scrolls to keep the marker in
@@ -8940,6 +9028,8 @@ mod tests {
             ("src/mcp/manage.rs", "handle_add", CLI_ONLY),
             ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
             ("src/prompt/mod.rs", "select", REPL_PROMPTER),
+            ("src/prompt/mod.rs", "input", REPL_PROMPTER),
+            ("src/prompt/mod.rs", "password", REPL_PROMPTER),
             ("src/prompt/mod.rs", "confirm", REPL_PROMPTER),
             ("src/prompt/mod.rs", "prompt", REPL_PROMPTER),
             ("src/rag/mod.rs", "attach", PROMPT_GATED),
@@ -8970,23 +9060,6 @@ mod tests {
                 "src/utils/command.rs",
                 "run_loader_command",
                 LOADER_STDIN_CLOSED,
-            ),
-            ("src/vault/mod.rs", "add_secret", PROMPT_GATED),
-            ("src/vault/mod.rs", "update_secret", PROMPT_GATED),
-            (
-                "src/vault/utils.rs",
-                "create_vault_password_file",
-                PROMPT_GATED,
-            ),
-            ("src/vault/utils.rs", "prompt_provider_choice", PROMPT_GATED),
-            ("src/vault/utils.rs", "prompt_aws_provider", PROMPT_GATED),
-            ("src/vault/utils.rs", "prompt_gcp_provider", PROMPT_GATED),
-            ("src/vault/utils.rs", "prompt_azure_provider", PROMPT_GATED),
-            ("src/vault/utils.rs", "prompt_gopass_provider", PROMPT_GATED),
-            (
-                "src/vault/utils.rs",
-                "prompt_one_password_provider",
-                PROMPT_GATED,
             ),
         ];
         let readers = keyboard_readers();

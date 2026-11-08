@@ -1667,7 +1667,7 @@ pub async fn run_repl_command_with_prefix(
             ".vault" => match split_first_arg(args) {
                 Some(("add", name)) => {
                     if let Some(name) = name {
-                        ctx.app.vault.add_secret(name)?;
+                        ctx.app.vault.add_secret(name, ctx.prompter.as_ref())?;
                     } else {
                         println!("{}", ctx.render_hints("Usage: .vault add <name>"));
                     }
@@ -1681,7 +1681,7 @@ pub async fn run_repl_command_with_prefix(
                 }
                 Some(("update", name)) => {
                     if let Some(name) = name {
-                        ctx.app.vault.update_secret(name)?;
+                        ctx.app.vault.update_secret(name, ctx.prompter.as_ref())?;
                     } else {
                         println!("{}", ctx.render_hints("Usage: .vault update <name>"));
                     }

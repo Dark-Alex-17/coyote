@@ -329,7 +329,7 @@ async fn async_main() -> Result<()> {
             AppConfig::from_config(cfg)?
         };
         let vault = Vault::init(&app_config)?;
-        return Vault::handle_vault_flags(cli, &vault);
+        return Vault::handle_vault_flags(cli, &vault, &InquirePrompter::default());
     }
 
     let abort_signal = create_abort_signal();

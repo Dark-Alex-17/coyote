@@ -15,8 +15,9 @@ pub(crate) enum ModalKind {
         tool: bool,
     },
     Input,
-    /// One row per option plus an "Other (custom)" row; choosing that
-    /// row opens a text field in the list's place.
+    /// One row per option plus, unless the request is closed, an "Other
+    /// (custom)" row; choosing that row opens a text field in the list's
+    /// place.
     Select {
         custom_field_open: bool,
     },

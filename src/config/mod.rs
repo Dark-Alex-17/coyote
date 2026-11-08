@@ -1045,19 +1045,20 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         return create_config_file_sandbox(config_path).await;
     }
 
-    let provider_choice = prompt_provider_choice()?;
+    let prompter = crate::prompt::InquirePrompter::default();
+    let provider_choice = prompt_provider_choice(&prompter)?;
     let mut vault = match &provider_choice {
         None => Vault::default_local(),
         Some(provider) => Vault::from_provider(provider.clone()),
     };
-    create_vault_password_file(&mut vault)?;
+    create_vault_password_file(&mut vault, &prompter)?;
     if provider_choice.is_some() {
         vault.validate_round_trip()?;
     }
 
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 
-    let (model, clients_config) = create_client_config(client, &vault).await?;
+    let (model, clients_config) = create_client_config(client, &vault, &prompter).await?;
     let secrets = match &provider_choice {
         None => json!({
             "vault_password_file": vault.local_password_file()?.display().to_string()

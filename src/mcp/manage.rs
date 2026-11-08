@@ -341,6 +341,7 @@ fn provision_secrets(cli: &Cli, vault: &Vault) -> Result<()> {
     }
 
     let existing: HashSet<String> = vault.list_secrets(false)?.into_iter().collect();
+    let prompter = crate::prompt::InquirePrompter::default();
     for name in needed {
         if existing.contains(&name) {
             continue;
@@ -355,7 +356,7 @@ fn provision_secrets(cli: &Cli, vault: &Vault) -> Result<()> {
                  Add it later with `coyote --add-secret {name}`."
             );
         }
-        vault.add_secret(&name)?;
+        vault.add_secret(&name, &prompter)?;
     }
 
     Ok(())

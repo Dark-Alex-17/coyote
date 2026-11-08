@@ -519,6 +519,7 @@ pub async fn create_config(
     prompts: &[PromptAction<'static>],
     client: &str,
     vault: &Vault,
+    prompter: &dyn crate::prompt::Prompter,
 ) -> Result<(String, Value)> {
     let mut config = json!({
         "type": client,
@@ -531,7 +532,7 @@ pub async fn create_config(
         let value = if !is_secret {
             prompt_input_string(desc, required, *help_message)?
         } else {
-            vault.add_secret(&env_name)?;
+            vault.add_secret(&env_name, prompter)?;
             format!("{{{{{}}}}}", env_name)
         };
         if !value.is_empty() {

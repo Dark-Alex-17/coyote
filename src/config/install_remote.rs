@@ -2341,6 +2341,7 @@ fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String
     // the check here is defence in depth for any other caller.
     ensure_prompts_available()?;
     let mut vault = Vault::init_bare()?;
+    let prompter = crate::prompt::InquirePrompter::default();
     let mut password_file_ensured = false;
     let mut added = Vec::new();
     let mut deferred = Vec::new();
@@ -2355,12 +2356,12 @@ fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String
             continue;
         }
         if !password_file_ensured {
-            create_vault_password_file(&mut vault)
+            create_vault_password_file(&mut vault, &prompter)
                 .context("Failed to initialize the vault password file")?;
             password_file_ensured = true;
         }
 
-        match vault.add_secret(name) {
+        match vault.add_secret(name, &prompter) {
             Ok(()) => added.push(name.clone()),
             Err(e) => {
                 eprintln!("Failed to add '{name}' to vault: {e:#}");

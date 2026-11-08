@@ -1,9 +1,9 @@
 use crate::config::ensure_parent_exists;
+use crate::events::Origin;
+use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask};
 use crate::sandbox::{SANDBOX_ENV_FLAG, sandbox_secret_env_var};
-use crate::utils::{drain_stale_tty_input, ensure_prompts_available};
 use crate::vault::{SECRET_RE, Vault};
-use anyhow::Result;
-use anyhow::anyhow;
+use anyhow::{Context, Result, anyhow, bail};
 use gman::SecretError;
 use gman::providers::SupportedProvider;
 use gman::providers::aws_secrets_manager::AwsSecretsManagerProvider;
@@ -13,9 +13,8 @@ use gman::providers::gopass::GopassProvider;
 use gman::providers::local::LocalProvider;
 use gman::providers::one_password::OnePasswordProvider;
 use indoc::formatdoc;
-use inquire::validator::Validation;
-use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text, min_length, required};
 use log::debug;
+use serde_json::json;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,7 +44,104 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
     }
 }
 
-pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
+fn confirm(prompter: &dyn Prompter, question: String, default: bool) -> Result<bool> {
+    let req = PromptRequest {
+        default: Some(json!(default)),
+        ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
+    };
+    ask(prompter, req).and_then(PromptAnswer::into_confirmed)
+}
+
+fn input(
+    prompter: &dyn Prompter,
+    question: &str,
+    default: Option<&str>,
+    help: Option<&str>,
+) -> Result<String> {
+    let req = PromptRequest {
+        default: default.map(|value| json!(value)),
+        help: help.map(str::to_string),
+        ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
+    };
+    ask(prompter, req).and_then(PromptAnswer::into_text)
+}
+
+/// The question asked again after a rejected answer. The label stays so
+/// the field keeps its name under the TUI, where the modal is all the
+/// user sees; the reason comes first so it is read before answering.
+pub(super) fn reask(reason: &str, label: &str) -> String {
+    format!("{reason} {label}")
+}
+
+/// Asks `label` until the answer is non-empty; an empty one is asked
+/// again with inquire's own wording in front of the label.
+fn required_input(
+    prompter: &dyn Prompter,
+    label: &str,
+    default: Option<&str>,
+    help: Option<&str>,
+) -> Result<String> {
+    let mut question = label.to_string();
+    loop {
+        let answer = input(prompter, &question, default, help)?;
+        if answer.is_empty() {
+            question = reask("A response is required.", label);
+            continue;
+        }
+        return Ok(answer);
+    }
+}
+
+/// The password that encrypts the vault, asked until it is at least ten
+/// characters; each shortfall is asked again with inquire's wording in
+/// front of the label.
+fn ask_vault_password(prompter: &dyn Prompter) -> Result<String> {
+    let label = "Enter a password to encrypt all vault secrets:";
+    let mut question = label.to_string();
+    loop {
+        let req = PromptRequest::new(PromptAction::Password, &question, Origin::detached());
+        let password = ask(prompter, req).and_then(PromptAnswer::into_text)?;
+        if password.is_empty() {
+            question = reask("A response is required.", label);
+            continue;
+        }
+        if password.chars().count() < 10 {
+            question = reask("The length of the response should be at least 10.", label);
+            continue;
+        }
+        return Ok(password);
+    }
+}
+
+/// Where to create the password file, asked until the answer names a
+/// file that does not exist in a directory that does.
+fn ask_password_file_path(prompter: &dyn Prompter, default: &Path) -> Result<PathBuf> {
+    let default = default.display().to_string();
+    let label = "Enter the path to the password file to create:";
+    let mut question = label.to_string();
+    loop {
+        let answer = input(prompter, &question, Some(&default), None)?;
+        if answer.is_empty() {
+            question = reask("Password file path is required.", label);
+            continue;
+        }
+        let path = PathBuf::from(answer);
+        if path.exists() {
+            question = reask(
+                "File already exists. Please choose a different path.",
+                label,
+            );
+            continue;
+        }
+        if path.parent().is_some_and(|parent| !parent.exists()) {
+            question = reask("Parent directory does not exist.", label);
+            continue;
+        }
+        return Ok(path);
+    }
+}
+
+pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) -> Result<()> {
     let SupportedProvider::Local {
         provider_def: local_provider,
     } = &mut vault.provider
@@ -69,17 +165,14 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             }
         }
 
-        ensure_prompts_available()?;
-        drain_stale_tty_input();
-        let ans = Confirm::new(
+        let ans = confirm(
+            prompter,
             format!(
                 "The configured password file '{}' is empty. Create a password?",
                 vault_password_file.display()
-            )
-            .as_str(),
-        )
-        .with_default(true)
-        .prompt()?;
+            ),
+            true,
+        )?;
 
         if !ans {
             return Err(anyhow!(
@@ -88,33 +181,20 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             ));
         }
 
-        let password = Password::new("Enter a password to encrypt all vault secrets:")
-            .with_validator(required!())
-            .with_validator(min_length!(10))
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .prompt();
-
-        match password {
-            Ok(pw) => {
-                std::fs::write(&vault_password_file, pw.as_bytes())?;
-                set_password_file_permissions(&vault_password_file)?;
-                println!(
-                    "✓ Password file '{}' updated.",
-                    vault_password_file.display()
-                );
-            }
-            Err(_) => {
-                return Err(anyhow!(
-                    "Failed to read password from input. Password file not updated."
-                ));
-            }
-        }
+        let password = ask_vault_password(prompter)
+            .context("Failed to read password from input. Password file not updated.")?;
+        std::fs::write(&vault_password_file, password.as_bytes())?;
+        set_password_file_permissions(&vault_password_file)?;
+        println!(
+            "✓ Password file '{}' updated.",
+            vault_password_file.display()
+        );
     } else {
-        ensure_prompts_available()?;
-        drain_stale_tty_input();
-        let ans = Confirm::new("No password file configured. Do you want to create one now?")
-            .with_default(true)
-            .prompt()?;
+        let ans = confirm(
+            prompter,
+            "No password file configured. Do you want to create one now?".to_string(),
+            true,
+        )?;
 
         if !ans {
             return Err(anyhow!(
@@ -122,29 +202,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             ));
         }
 
-        let password_file: PathBuf = Text::new("Enter the path to the password file to create:")
-            .with_default(&vault_password_file.display().to_string())
-            .with_validator(required!("Password file path is required"))
-            .with_validator(|input: &str| {
-                let path = PathBuf::from(input);
-                if path.exists() {
-                    Ok(Validation::Invalid(
-                        "File already exists. Please choose a different path.".into(),
-                    ))
-                } else if let Some(parent) = path.parent() {
-                    if !parent.exists() {
-                        Ok(Validation::Invalid(
-                            "Parent directory does not exist.".into(),
-                        ))
-                    } else {
-                        Ok(Validation::Valid)
-                    }
-                } else {
-                    Ok(Validation::Valid)
-                }
-            })
-            .prompt()?
-            .into();
+        let password_file = ask_password_file_path(prompter, &vault_password_file)?;
 
         if password_file != vault_password_file {
             debug!(
@@ -162,87 +220,76 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
 
         ensure_parent_exists(&password_file)?;
 
-        let password = Password::new("Enter a password to encrypt all vault secrets:")
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .with_validator(required!())
-            .with_validator(min_length!(10))
-            .prompt();
-
-        match password {
-            Ok(pw) => {
-                std::fs::write(&password_file, pw.as_bytes())?;
-                set_password_file_permissions(&password_file)?;
-                local_provider.password_file = Some(password_file);
-                println!(
-                    "✓ Password file '{}' created.",
-                    vault_password_file.display()
-                );
-            }
-            Err(_) => {
-                return Err(anyhow!(
-                    "Failed to read password from input. Password file not created."
-                ));
-            }
-        }
+        let password = ask_vault_password(prompter)
+            .context("Failed to read password from input. Password file not created.")?;
+        std::fs::write(&password_file, password.as_bytes())?;
+        set_password_file_permissions(&password_file)?;
+        local_provider.password_file = Some(password_file);
+        println!(
+            "✓ Password file '{}' created.",
+            vault_password_file.display()
+        );
     }
 
     Ok(())
 }
 
-pub fn prompt_provider_choice() -> Result<Option<SupportedProvider>> {
-    ensure_prompts_available()?;
-    drain_stale_tty_input();
-    let choices = vec![
-        "local - encrypted file on this machine",
-        "aws_secrets_manager - AWS Secrets Manager",
-        "gcp_secret_manager - Google Cloud Secret Manager",
-        "azure_key_vault - Azure Key Vault",
-        "gopass - gopass password manager (requires the `gopass` CLI)",
-        "one_password - 1Password (requires the `op` CLI)",
-    ];
-    let choice = Select::new("Which secrets provider would you like to use?", choices)
-        .with_starting_cursor(0)
-        .prompt()?;
+pub fn prompt_provider_choice(prompter: &dyn Prompter) -> Result<Option<SupportedProvider>> {
+    let req = PromptRequest {
+        options: [
+            "local - encrypted file on this machine",
+            "aws_secrets_manager - AWS Secrets Manager",
+            "gcp_secret_manager - Google Cloud Secret Manager",
+            "azure_key_vault - Azure Key Vault",
+            "gopass - gopass password manager (requires the `gopass` CLI)",
+            "one_password - 1Password (requires the `op` CLI)",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        closed: true,
+        ..PromptRequest::new(
+            PromptAction::Select,
+            "Which secrets provider would you like to use?",
+            Origin::detached(),
+        )
+    };
+    let choice = ask(prompter, req).and_then(PromptAnswer::into_selected)?;
 
     if choice.starts_with("local") {
         return Ok(None);
     }
 
     let provider = if choice.starts_with("aws_secrets_manager") {
-        prompt_aws_provider()?
+        prompt_aws_provider(prompter)?
     } else if choice.starts_with("gcp_secret_manager") {
-        prompt_gcp_provider()?
+        prompt_gcp_provider(prompter)?
     } else if choice.starts_with("azure_key_vault") {
-        prompt_azure_provider()?
+        prompt_azure_provider(prompter)?
     } else if choice.starts_with("gopass") {
-        prompt_gopass_provider()?
+        prompt_gopass_provider(prompter)?
     } else if choice.starts_with("one_password") {
-        prompt_one_password_provider()?
+        prompt_one_password_provider(prompter)?
     } else {
-        return Err(anyhow!("unexpected provider choice: {choice}"));
+        bail!("unexpected provider choice: {choice}");
     };
+    preflight(&provider);
 
     Ok(Some(provider))
 }
 
-fn prompt_aws_provider() -> Result<SupportedProvider> {
-    ensure_prompts_available()?;
-    let aws_profile = Text::new("AWS profile name:")
-        .with_default("default")
-        .with_validator(required!())
-        .with_help_message("From your ~/.aws/config and ~/.aws/credentials")
-        .prompt()?;
-    let aws_region = Text::new("AWS region:")
-        .with_default("us-east-1")
-        .with_validator(required!())
-        .with_help_message("Where your secrets live (e.g. us-east-1, eu-west-2)")
-        .prompt()?;
-
-    advisory_preflight(
-        "AWS",
-        "aws",
-        &["sts", "get-caller-identity", "--profile", &aws_profile],
-    );
+fn prompt_aws_provider(prompter: &dyn Prompter) -> Result<SupportedProvider> {
+    let aws_profile = required_input(
+        prompter,
+        "AWS profile name:",
+        Some("default"),
+        Some("From your ~/.aws/config and ~/.aws/credentials"),
+    )?;
+    let aws_region = required_input(
+        prompter,
+        "AWS region:",
+        Some("us-east-1"),
+        Some("Where your secrets live (e.g. us-east-1, eu-west-2)"),
+    )?;
 
     Ok(SupportedProvider::AwsSecretsManager {
         provider_def: AwsSecretsManagerProvider {
@@ -252,18 +299,13 @@ fn prompt_aws_provider() -> Result<SupportedProvider> {
     })
 }
 
-fn prompt_gcp_provider() -> Result<SupportedProvider> {
-    ensure_prompts_available()?;
-    let gcp_project_id = Text::new("GCP project ID:")
-        .with_validator(required!())
-        .with_help_message("The project that hosts your Secret Manager secrets")
-        .prompt()?;
-
-    advisory_preflight(
-        "GCP",
-        "gcloud",
-        &["auth", "application-default", "print-access-token"],
-    );
+fn prompt_gcp_provider(prompter: &dyn Prompter) -> Result<SupportedProvider> {
+    let gcp_project_id = required_input(
+        prompter,
+        "GCP project ID:",
+        None,
+        Some("The project that hosts your Secret Manager secrets"),
+    )?;
 
     Ok(SupportedProvider::GcpSecretManager {
         provider_def: GcpSecretManagerProvider {
@@ -272,14 +314,13 @@ fn prompt_gcp_provider() -> Result<SupportedProvider> {
     })
 }
 
-fn prompt_azure_provider() -> Result<SupportedProvider> {
-    ensure_prompts_available()?;
-    let vault_name = Text::new("Azure Key Vault name:")
-        .with_validator(required!())
-        .with_help_message("Just the vault name; the https endpoint is auto-derived")
-        .prompt()?;
-
-    advisory_preflight("Azure", "az", &["account", "show"]);
+fn prompt_azure_provider(prompter: &dyn Prompter) -> Result<SupportedProvider> {
+    let vault_name = required_input(
+        prompter,
+        "Azure Key Vault name:",
+        None,
+        Some("Just the vault name; the https endpoint is auto-derived"),
+    )?;
 
     Ok(SupportedProvider::AzureKeyVault {
         provider_def: AzureKeyVaultProvider {
@@ -288,44 +329,84 @@ fn prompt_azure_provider() -> Result<SupportedProvider> {
     })
 }
 
-fn prompt_gopass_provider() -> Result<SupportedProvider> {
-    ensure_prompts_available()?;
-    let store_raw = Text::new("gopass store (leave blank for default):").prompt()?;
+fn prompt_gopass_provider(prompter: &dyn Prompter) -> Result<SupportedProvider> {
+    let store_raw = input(
+        prompter,
+        "gopass store (leave blank for default):",
+        None,
+        None,
+    )?;
     let store = match store_raw.trim() {
         "" => None,
         s => Some(s.to_string()),
     };
-
-    required_cli_preflight("gopass", "gopass", "https://www.gopass.pw/");
 
     Ok(SupportedProvider::Gopass {
         provider_def: GopassProvider { store },
     })
 }
 
-fn prompt_one_password_provider() -> Result<SupportedProvider> {
-    ensure_prompts_available()?;
-    let vault_raw = Text::new("1Password vault (leave blank for default):").prompt()?;
+fn prompt_one_password_provider(prompter: &dyn Prompter) -> Result<SupportedProvider> {
+    let vault_raw = input(
+        prompter,
+        "1Password vault (leave blank for default):",
+        None,
+        None,
+    )?;
     let vault = match vault_raw.trim() {
         "" => None,
         s => Some(s.to_string()),
     };
 
-    let account_raw = Text::new("1Password account (leave blank for default):").prompt()?;
+    let account_raw = input(
+        prompter,
+        "1Password account (leave blank for default):",
+        None,
+        None,
+    )?;
     let account = match account_raw.trim() {
         "" => None,
         s => Some(s.to_string()),
     };
 
-    required_cli_preflight(
-        "1Password CLI",
-        "op",
-        "https://developer.1password.com/docs/cli/",
-    );
-
     Ok(SupportedProvider::OnePassword {
         provider_def: OnePasswordProvider { vault, account },
     })
+}
+
+/// Checks the chosen backend's CLI once the answers are in: advisory for
+/// the clouds, whose SDKs have other credential paths, required for the
+/// managers that are nothing without theirs.
+fn preflight(provider: &SupportedProvider) {
+    match provider {
+        SupportedProvider::AwsSecretsManager { provider_def } => advisory_preflight(
+            "AWS",
+            "aws",
+            &[
+                "sts",
+                "get-caller-identity",
+                "--profile",
+                provider_def.aws_profile.as_deref().unwrap_or("default"),
+            ],
+        ),
+        SupportedProvider::GcpSecretManager { .. } => advisory_preflight(
+            "GCP",
+            "gcloud",
+            &["auth", "application-default", "print-access-token"],
+        ),
+        SupportedProvider::AzureKeyVault { .. } => {
+            advisory_preflight("Azure", "az", &["account", "show"]);
+        }
+        SupportedProvider::Gopass { .. } => {
+            required_cli_preflight("gopass", "gopass", "https://www.gopass.pw/");
+        }
+        SupportedProvider::OnePassword { .. } => required_cli_preflight(
+            "1Password CLI",
+            "op",
+            "https://developer.1password.com/docs/cli/",
+        ),
+        SupportedProvider::Local { .. } => {}
+    }
 }
 
 fn advisory_preflight(label: &str, cli: &str, args: &[&str]) {
@@ -484,6 +565,8 @@ fn set_password_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
+    use crate::testing::AtomicFlagGuard;
     use anyhow::Error;
     use serial_test::serial;
     use std::cell::RefCell;
@@ -661,25 +744,381 @@ mod tests {
         );
     }
 
-    /// The provider wizard asks on the raw tty; under the full-screen UI
-    /// every one of its prompts is refused before it is built.
+    fn text(value: &str) -> PromptAnswer {
+        PromptAnswer::Text(value.to_string())
+    }
+
+    fn questions(prompter: &ScriptedPrompter) -> Vec<String> {
+        prompter
+            .requests()
+            .into_iter()
+            .map(|req| req.question)
+            .collect()
+    }
+
+    /// A fresh temp dir that is removed with the test.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = env::temp_dir().join(format!("coyote-vault-password-{label}-{unique}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn local_vault(&self, password_file: &str) -> Vault {
+            Vault::from_provider(SupportedProvider::Local {
+                provider_def: LocalProvider {
+                    password_file: Some(self.0.join(password_file)),
+                    git_branch: None,
+                    ..LocalProvider::default()
+                },
+            })
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The provider wizard asks through the prompter, so under the
+    /// full-screen UI its choice is a closed select and its fields are
+    /// inputs carrying the defaults and help the inquire widgets showed;
+    /// the answers land in the provider it returns.
     #[test]
     #[serial]
-    fn provider_prompts_under_the_tui_refuse_before_asking() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+    fn provider_prompts_under_the_tui_ask_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        let choice = ScriptedPrompter::new(vec![PromptAnswer::Selected(
+            "local - encrypted file on this machine".to_string(),
+        )]);
+        assert!(prompt_provider_choice(&choice).unwrap().is_none());
+        let [req] = choice.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(
+            req.question,
+            "Which secrets provider would you like to use?"
+        );
+        assert!(req.closed);
+        assert_eq!(req.options.len(), 6);
+        assert_eq!(req.options[0], "local - encrypted file on this machine");
+        assert_eq!(
+            req.options[5],
+            "one_password - 1Password (requires the `op` CLI)"
+        );
+
+        let aws = ScriptedPrompter::new(vec![text("work"), text("eu-west-2")]);
+        let SupportedProvider::AwsSecretsManager { provider_def } =
+            prompt_aws_provider(&aws).unwrap()
+        else {
+            panic!("not an AWS provider");
+        };
+        assert_eq!(provider_def.aws_profile.as_deref(), Some("work"));
+        assert_eq!(provider_def.aws_region.as_deref(), Some("eu-west-2"));
+        let [profile, region] = aws.requests().try_into().unwrap();
+        assert_eq!(profile.action, PromptAction::Input);
+        assert_eq!(profile.question, "AWS profile name:");
+        assert_eq!(profile.default, Some(json!("default")));
+        assert_eq!(
+            profile.help.as_deref(),
+            Some("From your ~/.aws/config and ~/.aws/credentials")
+        );
+        assert_eq!(region.action, PromptAction::Input);
+        assert_eq!(region.question, "AWS region:");
+        assert_eq!(region.default, Some(json!("us-east-1")));
+        assert_eq!(
+            region.help.as_deref(),
+            Some("Where your secrets live (e.g. us-east-1, eu-west-2)")
+        );
+
+        let gcp = ScriptedPrompter::new(vec![text("my-project")]);
+        let SupportedProvider::GcpSecretManager { provider_def } =
+            prompt_gcp_provider(&gcp).unwrap()
+        else {
+            panic!("not a GCP provider");
+        };
+        assert_eq!(provider_def.gcp_project_id.as_deref(), Some("my-project"));
+        let [project] = gcp.requests().try_into().unwrap();
+        assert_eq!(project.action, PromptAction::Input);
+        assert_eq!(project.question, "GCP project ID:");
+        assert_eq!(project.default, None);
+        assert_eq!(
+            project.help.as_deref(),
+            Some("The project that hosts your Secret Manager secrets")
+        );
+
+        let azure = ScriptedPrompter::new(vec![text("kv-prod")]);
+        let SupportedProvider::AzureKeyVault { provider_def } =
+            prompt_azure_provider(&azure).unwrap()
+        else {
+            panic!("not an Azure provider");
+        };
+        assert_eq!(provider_def.vault_name.as_deref(), Some("kv-prod"));
+        let [name] = azure.requests().try_into().unwrap();
+        assert_eq!(name.action, PromptAction::Input);
+        assert_eq!(name.question, "Azure Key Vault name:");
+        assert_eq!(
+            name.help.as_deref(),
+            Some("Just the vault name; the https endpoint is auto-derived")
+        );
+
+        let gopass = ScriptedPrompter::new(vec![text("  ")]);
+        let SupportedProvider::Gopass { provider_def } = prompt_gopass_provider(&gopass).unwrap()
+        else {
+            panic!("not a gopass provider");
+        };
+        assert_eq!(provider_def.store, None);
+        let [store] = gopass.requests().try_into().unwrap();
+        assert_eq!(store.action, PromptAction::Input);
+        assert_eq!(store.question, "gopass store (leave blank for default):");
+        assert_eq!(store.default, None);
+        assert_eq!(store.help, None);
+
+        let one_password = ScriptedPrompter::new(vec![text("Private"), text("")]);
+        let SupportedProvider::OnePassword { provider_def } =
+            prompt_one_password_provider(&one_password).unwrap()
+        else {
+            panic!("not a 1Password provider");
+        };
+        assert_eq!(provider_def.vault.as_deref(), Some("Private"));
+        assert_eq!(provider_def.account, None);
+        assert_eq!(
+            questions(&one_password),
+            vec![
+                "1Password vault (leave blank for default):",
+                "1Password account (leave blank for default):"
+            ]
+        );
+    }
+
+    /// A required field left empty is asked again with inquire's own
+    /// wording in front of its label; the first non-empty answer lands.
+    #[test]
+    fn an_empty_required_field_is_asked_again() {
+        let prompter = ScriptedPrompter::new(vec![text(""), text("proj")]);
+        let SupportedProvider::GcpSecretManager { provider_def } =
+            prompt_gcp_provider(&prompter).unwrap()
+        else {
+            panic!("not a GCP provider");
+        };
+        assert_eq!(provider_def.gcp_project_id.as_deref(), Some("proj"));
+        assert_eq!(
+            questions(&prompter),
+            vec!["GCP project ID:", "A response is required. GCP project ID:"]
+        );
+    }
+
+    /// A choice outside the offered providers is an error that names
+    /// it, not a crash.
+    #[test]
+    fn an_unknown_provider_choice_is_an_error() {
+        let prompter =
+            ScriptedPrompter::new(vec![PromptAnswer::Selected("vaultwarden".to_string())]);
+        let err = prompt_provider_choice(&prompter).unwrap_err();
+        assert_eq!(err.to_string(), "unexpected provider choice: vaultwarden");
+    }
+
+    /// A missing password file is created where the user says, with the
+    /// configured path offered as the default and the password the
+    /// user typed; the provider is pointed at the new file.
+    #[test]
+    #[serial]
+    fn a_missing_password_file_is_created_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = TempDir::new("create");
+        let mut vault = dir.local_vault("configured");
+        let chosen = dir.0.join("chosen");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            text(&chosen.display().to_string()),
+            text("correct horse battery"),
+        ]);
+
+        create_vault_password_file(&mut vault, &prompter).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&chosen).unwrap(),
+            "correct horse battery"
+        );
+        assert_eq!(vault.local_password_file().unwrap(), chosen);
+        let [ask_create, ask_path, ask_password] = prompter.requests().try_into().unwrap();
+        assert_eq!(ask_create.action, PromptAction::Confirm);
+        assert_eq!(
+            ask_create.question,
+            "No password file configured. Do you want to create one now?"
+        );
+        assert_eq!(ask_create.default, Some(json!(true)));
+        assert_eq!(ask_path.action, PromptAction::Input);
+        assert_eq!(
+            ask_path.question,
+            "Enter the path to the password file to create:"
+        );
+        assert_eq!(
+            ask_path.default,
+            Some(json!(dir.0.join("configured").display().to_string()))
+        );
+        assert_eq!(ask_password.action, PromptAction::Password);
+        assert_eq!(
+            ask_password.question,
+            "Enter a password to encrypt all vault secrets:"
+        );
+    }
+
+    /// An empty configured password file is filled through the
+    /// prompter after a confirm that defaults to yes.
+    #[test]
+    fn an_empty_password_file_is_filled_through_the_prompter() {
+        let dir = TempDir::new("fill");
+        let configured = dir.0.join("configured");
+        std::fs::write(&configured, "  \n").unwrap();
+        let mut vault = dir.local_vault("configured");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            text("correct horse battery"),
+        ]);
+
+        create_vault_password_file(&mut vault, &prompter).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&configured).unwrap(),
+            "correct horse battery"
+        );
+        let [ask_create, ask_password] = prompter.requests().try_into().unwrap();
+        assert_eq!(ask_create.action, PromptAction::Confirm);
+        assert_eq!(
+            ask_create.question,
+            format!(
+                "The configured password file '{}' is empty. Create a password?",
+                configured.display()
+            )
+        );
+        assert_eq!(ask_create.default, Some(json!(true)));
+        assert_eq!(ask_password.action, PromptAction::Password);
+    }
+
+    /// Each path the inquire validators rejected is asked again with the
+    /// validator's own wording in front of the label, and so is a
+    /// password that is empty or shorter than ten characters.
+    #[test]
+    fn a_rejected_path_or_short_password_is_asked_again() {
+        let dir = TempDir::new("re-ask");
+        let taken = dir.0.join("taken");
+        std::fs::write(&taken, "x").unwrap();
+        let chosen = dir.0.join("chosen");
+        let orphan = dir.0.join("missing-parent").join("file");
+        let mut vault = dir.local_vault("configured");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            text(""),
+            text(&taken.display().to_string()),
+            text(&orphan.display().to_string()),
+            text(&chosen.display().to_string()),
+            text(""),
+            text("short"),
+            text("long enough"),
+        ]);
+
+        create_vault_password_file(&mut vault, &prompter).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&chosen).unwrap(), "long enough");
+        assert_eq!(
+            questions(&prompter)[1..],
+            [
+                "Enter the path to the password file to create:",
+                "Password file path is required. Enter the path to the password file to create:",
+                "File already exists. Please choose a different path. Enter the path to the password file to create:",
+                "Parent directory does not exist. Enter the path to the password file to create:",
+                "Enter a password to encrypt all vault secrets:",
+                "A response is required. Enter a password to encrypt all vault secrets:",
+                "The length of the response should be at least 10. Enter a password to encrypt all vault secrets:",
+            ]
+        );
+    }
+
+    /// Declining leaves the file alone with the same errors as before; a
+    /// cancelled password keeps the wording the inquire failure had.
+    #[test]
+    fn declining_or_cancelling_writes_no_password_file() {
+        let dir = TempDir::new("decline");
+        let configured = dir.0.join("configured");
+
+        let mut vault = dir.local_vault("configured");
+        let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let err = create_vault_password_file(&mut vault, &declined).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("A password file is required to utilize the Coyote vault."),
+            "{err}"
+        );
+
+        let mut vault = dir.local_vault("configured");
+        let cancelled = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            text(&configured.display().to_string()),
+            PromptAnswer::Cancelled,
+        ]);
+        let err = create_vault_password_file(&mut vault, &cancelled).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Failed to read password from input. Password file not created."
+        );
+        assert!(!configured.exists());
+
+        std::fs::write(&configured, "").unwrap();
+        let mut vault = dir.local_vault("configured");
+        let cancelled =
+            ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true), PromptAnswer::Cancelled]);
+        let err = create_vault_password_file(&mut vault, &cancelled).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Failed to read password from input. Password file not updated."
+        );
+        assert_eq!(std::fs::read_to_string(&configured).unwrap(), "");
+    }
+
+    /// With no human to answer, every prompt of the wizard is refused
+    /// and nothing is written or chosen.
+    #[test]
+    fn provider_and_password_prompts_without_a_human_are_refused() {
+        let dir = TempDir::new("headless");
+        let mut vault = dir.local_vault("configured");
+        let err = create_vault_password_file(&mut vault, &HeadlessPrompter).unwrap_err();
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+        assert!(!dir.0.join("configured").exists());
+        assert_eq!(
+            vault.local_password_file().unwrap(),
+            dir.0.join("configured")
+        );
+
         let errors = [
-            prompt_provider_choice().map(|_| ()).unwrap_err(),
-            prompt_aws_provider().map(|_| ()).unwrap_err(),
-            prompt_gcp_provider().map(|_| ()).unwrap_err(),
-            prompt_azure_provider().map(|_| ()).unwrap_err(),
-            prompt_gopass_provider().map(|_| ()).unwrap_err(),
-            prompt_one_password_provider().map(|_| ()).unwrap_err(),
+            prompt_provider_choice(&HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            prompt_aws_provider(&HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            prompt_gcp_provider(&HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            prompt_azure_provider(&HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            prompt_gopass_provider(&HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            prompt_one_password_provider(&HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
         ];
         for err in errors {
-            assert!(
-                err.to_string().contains("not available in the TUI"),
-                "{err}"
-            );
+            assert!(NeedsHuman::caused(&err), "{err:#}");
         }
     }
 }

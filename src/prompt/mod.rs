@@ -31,8 +31,9 @@ pub(crate) const NO_HUMAN_FOR_OAUTH: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptAction {
     Confirm,
-    /// `InquirePrompter` appends a free-text "Other (custom)" entry after
-    /// the offered options, so the answer need not be one of them.
+    /// The prompters append a free-text "Other (custom)" entry after the
+    /// offered options, so the answer need not be one of them, unless the
+    /// request is `closed`.
     Select,
     Checkbox,
     Input,
@@ -64,6 +65,12 @@ pub struct PromptRequest {
     pub call_id: Option<String>,
     pub job_id: Option<String>,
     pub origin: Origin,
+    /// A line shown under the question; rendering detail, so it is not
+    /// published with the request.
+    pub help: Option<String>,
+    /// A select whose answer must be one of `options`: no "Other
+    /// (custom)" row is offered. Not published either.
+    pub closed: bool,
 }
 
 impl PromptRequest {
@@ -79,6 +86,8 @@ impl PromptRequest {
             call_id: None,
             job_id: None,
             origin,
+            help: None,
+            closed: false,
         }
     }
 
@@ -272,10 +281,22 @@ impl InquirePrompter {
         &self.memory
     }
 
-    fn select(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
+    /// The rows of a select: the offered options, plus the free-text row
+    /// unless the request is closed.
+    fn select_options(req: &PromptRequest) -> Vec<String> {
         let mut options = req.options.clone();
-        options.push(CUSTOM_MULTI_CHOICE_ANSWER_OPTION.to_string());
-        let mut answer = Select::new(&req.question, options)
+        if !req.closed {
+            options.push(CUSTOM_MULTI_CHOICE_ANSWER_OPTION.to_string());
+        }
+        options
+    }
+
+    fn select(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
+        if req.closed {
+            let answer = Select::new(&req.question, Self::select_options(req)).prompt()?;
+            return Ok(PromptAnswer::Selected(answer));
+        }
+        let mut answer = Select::new(&req.question, Self::select_options(req))
             .without_filtering()
             .with_help_message("↑↓ to move, enter to select") // debris-exempt: inquire help text reused verbatim
             .prompt()?;
@@ -283,6 +304,27 @@ impl InquirePrompter {
             answer = Text::new("Custom response:").prompt()?;
         }
         Ok(PromptAnswer::Selected(answer))
+    }
+
+    fn input(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
+        let mut text = Text::new(&req.question);
+        if let Some(default) = req.default.as_ref().and_then(Value::as_str) {
+            text = text.with_default(default);
+        }
+        if let Some(help) = req.help.as_deref() {
+            text = text.with_help_message(help);
+        }
+        text.prompt().map(PromptAnswer::Text)
+    }
+
+    fn password(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
+        let mut password = Password::new(&req.question)
+            .without_confirmation()
+            .with_display_mode(PasswordDisplayMode::Masked);
+        if let Some(help) = req.help.as_deref() {
+            password = password.with_help_message(help);
+        }
+        password.prompt().map(PromptAnswer::Text)
     }
 
     fn confirm(&self, req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
@@ -316,15 +358,11 @@ impl Prompter for InquirePrompter {
         let answer = match req.action {
             PromptAction::Select => Self::select(&req),
             PromptAction::Confirm => self.confirm(&req),
-            PromptAction::Input => Text::new(&req.question).prompt().map(PromptAnswer::Text),
+            PromptAction::Input => Self::input(&req),
             PromptAction::Checkbox => MultiSelect::new(&req.question, req.options.clone())
                 .prompt()
                 .map(PromptAnswer::Checked),
-            PromptAction::Password => Password::new(&req.question)
-                .without_confirmation()
-                .with_display_mode(PasswordDisplayMode::Masked)
-                .prompt()
-                .map(PromptAnswer::Text),
+            PromptAction::Password => Self::password(&req),
         };
         match answer {
             Ok(answer) => Ok(answer),
@@ -542,6 +580,31 @@ mod tests {
         let first = new_prompt_id();
         assert!(first.starts_with("prompt_"));
         assert_ne!(first, new_prompt_id());
+    }
+
+    #[test]
+    fn help_and_closed_are_not_published_with_the_request() {
+        let bare = request(PromptAction::Select, None);
+        let decorated = PromptRequest {
+            help: Some("pick carefully".to_string()),
+            closed: true,
+            ..bare.clone()
+        };
+        assert_eq!(decorated.requested_event(), bare.requested_event());
+    }
+
+    #[test]
+    fn a_closed_select_offers_no_custom_row_and_an_open_one_does() {
+        let open = request(PromptAction::Select, None);
+        let closed = PromptRequest {
+            closed: true,
+            ..open.clone()
+        };
+        assert_eq!(
+            InquirePrompter::select_options(&open),
+            vec!["a", "b", CUSTOM_MULTI_CHOICE_ANSWER_OPTION]
+        );
+        assert_eq!(InquirePrompter::select_options(&closed), vec!["a", "b"]);
     }
 
     #[test]

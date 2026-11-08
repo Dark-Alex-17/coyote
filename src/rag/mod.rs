@@ -2342,7 +2342,7 @@ fn resolve_or_create_api_key_secret(vault: &Vault, secret_name: &str) -> Result<
     }
 
     vault
-        .add_secret(secret_name)
+        .add_secret(secret_name, &crate::prompt::InquirePrompter::default())
         .with_context(|| format!("Failed to store secret '{secret_name}' in the vault"))?;
     vault
         .get_secret(secret_name, false)
