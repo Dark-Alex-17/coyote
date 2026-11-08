@@ -152,6 +152,11 @@ impl PromptAnswer {
     fn mismatch(self, expected: PromptAction) -> anyhow::Error {
         match self {
             PromptAnswer::Cancelled => anyhow!("Operation was canceled by the user"),
+            // Only the headless prompter answers a confirm with text (its
+            // `needs_human` JSON), so the refusal is what the caller sees.
+            PromptAnswer::Text(_) if expected == PromptAction::Confirm => {
+                NeedsHuman(expected).into()
+            }
             _ => anyhow!("Unexpected answer to the {} prompt", expected.name()),
         }
     }
@@ -751,10 +756,14 @@ mod tests {
 
     #[test]
     fn accessors_reject_a_mismatch_and_a_cancel() {
-        let err = PromptAnswer::Text("t".to_string())
+        let err = PromptAnswer::Selected("t".to_string())
             .into_confirmed()
             .unwrap_err();
         assert_eq!(err.to_string(), "Unexpected answer to the confirm prompt");
+        let err = PromptAnswer::Text("t".to_string())
+            .into_confirmed()
+            .unwrap_err();
+        assert!(err.is::<NeedsHuman>(), "{err}");
         let err = PromptAnswer::Confirmed(true).into_selected().unwrap_err();
         assert_eq!(err.to_string(), "Unexpected answer to the select prompt");
         let err = PromptAnswer::Confirmed(true).into_checked().unwrap_err();

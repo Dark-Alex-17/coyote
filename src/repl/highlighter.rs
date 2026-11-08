@@ -101,7 +101,8 @@ pub(crate) struct CommandSpan {
 /// later in a sentence is left alone. Known is the longest built-in name, or a
 /// name from `extra_known`, after the sigil that ends at the end of the
 /// line or before whitespace, so `.roles` is not `.role`. Unknown is a
-/// sigil followed by a word that matches nothing.
+/// sigil followed by a word that matches nothing, or a bare sigil: the
+/// dispatcher takes either as a command and refuses it by name.
 pub(crate) fn classify_command(
     line: &str,
     prefix: CommandPrefix,
@@ -130,7 +131,7 @@ pub(crate) fn classify_command(
     let word_len = within[word_start..]
         .find(char::is_whitespace)
         .unwrap_or(within.len() - word_start);
-    (word_len > 0).then(|| CommandSpan {
+    Some(CommandSpan {
         range: start..word_start + word_len,
         known: false,
     })
@@ -300,8 +301,20 @@ mod tests {
                 known: false
             })
         );
-        assert_eq!(classify_command(".", CommandPrefix::Dot, &[]), None);
-        assert_eq!(classify_command(". x", CommandPrefix::Dot, &[]), None);
+        assert_eq!(
+            classify_command(".", CommandPrefix::Dot, &[]),
+            Some(CommandSpan {
+                range: 0..1,
+                known: false
+            })
+        );
+        assert_eq!(
+            classify_command(". x", CommandPrefix::Dot, &[]),
+            Some(CommandSpan {
+                range: 0..1,
+                known: false
+            })
+        );
         assert_eq!(
             classify_command("see /tmp/exit", CommandPrefix::Slash, &[]),
             None

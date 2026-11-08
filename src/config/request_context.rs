@@ -12141,8 +12141,8 @@ mod tests {
     }
 
     /// With no human to confirm, `.role <new>` and `.macro new` fail on
-    /// the headless prompter's text answer and open no editor and write
-    /// nothing, not even the macros directory.
+    /// the headless prompter's refusal, by name, and open no editor and
+    /// write nothing, not even the macros directory.
     #[test]
     #[serial]
     fn new_role_and_new_macro_with_no_human_create_nothing() {
@@ -12152,11 +12152,15 @@ mod tests {
         ctx.prompter = Arc::new(HeadlessPrompter);
 
         let err = ctx.new_role(&app, "headless-role").unwrap_err();
-        assert_eq!(err.to_string(), "Unexpected answer to the confirm prompt");
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        assert!(
+            err.to_string().contains("confirm prompt needs a human"),
+            "{err}"
+        );
         assert!(!paths::role_file("headless-role").exists());
 
         let err = ctx.new_macro(&app, "headless-macro").unwrap_err();
-        assert_eq!(err.to_string(), "Unexpected answer to the confirm prompt");
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
         assert!(!paths::macros_dir().exists());
     }
 

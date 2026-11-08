@@ -79,8 +79,9 @@ pub(crate) fn active() -> bool {
 }
 
 /// The loop's inbox while `run` owns the terminal, for work elsewhere in
-/// the process that needs the terminal in its normal modes.
-static LENDER: Mutex<Option<UnboundedSender<UiMsg>>> = Mutex::new(None);
+/// the process that needs the terminal in its normal modes, and the
+/// thread the loop runs on: a lend from that thread would wait on itself.
+static LENDER: Mutex<Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)>> = Mutex::new(None);
 
 /// A duplicate of the terminal taken before the screen was entered.
 /// During a turn fds 1 and 2 are pointed at the capture pipe for the
@@ -89,13 +90,13 @@ static LENDER: Mutex<Option<UnboundedSender<UiMsg>>> = Mutex::new(None);
 #[cfg(unix)]
 static TTY_OUT: OnceLock<Option<std::os::fd::OwnedFd>> = OnceLock::new();
 
-fn set_lender(tx: Option<UnboundedSender<UiMsg>>) {
+fn set_lender(tx: Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)>) {
     *LENDER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = tx;
 }
 
-fn lender() -> Option<UnboundedSender<UiMsg>> {
+fn lender() -> Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)> {
     LENDER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -168,9 +169,14 @@ pub(crate) fn ensure_terminal_lendable() -> Result<()> {
 pub(crate) fn lend_terminal<T: Send + 'static>(
     job: impl FnOnce(&TtyHandles) -> T + Send + 'static,
 ) -> Result<T> {
-    let Some(tx) = lender() else {
+    let Some((tx, loop_thread)) = lender() else {
         bail!(NOT_LENDING);
     };
+    debug_assert_ne!(
+        std::thread::current().id(),
+        loop_thread,
+        "lend_terminal on the loop thread would wait on itself"
+    );
     let (reply_tx, reply_rx) = mpsc::channel();
     let job = LendJob(Box::new(move |tty: &TtyHandles| {
         // The asker gave up waiting; the result has nowhere to go.
@@ -279,7 +285,7 @@ struct ActiveGuard;
 
 impl ActiveGuard {
     fn set(lender: UnboundedSender<UiMsg>) -> Self {
-        set_lender(Some(lender));
+        set_lender(Some((lender, std::thread::current().id())));
         TUI_ACTIVE.store(true, Ordering::SeqCst);
         Self
     }
@@ -9046,7 +9052,7 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let lent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&lent);
-        std::thread::spawn(move || {
+        let lender = std::thread::spawn(move || {
             while let Some(msg) = rx.blocking_recv() {
                 if let UiMsg::LendTerminal(LendJob(job)) = msg {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -9054,7 +9060,7 @@ mod tests {
                 }
             }
         });
-        set_lender(Some(tx));
+        set_lender(Some((tx, lender.thread().id())));
         (LenderGuard, lent)
     }
 

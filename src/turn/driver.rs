@@ -888,4 +888,62 @@ mod tests {
         let notifications = &results.last().unwrap().output["system_notifications"];
         assert_eq!(notifications[0]["text"], probe);
     }
+
+    /// An interrupt that lands during the tool round the line was merged
+    /// into ends the turn there: the event has fired once and the
+    /// committed tool result still carries the line for the next request.
+    #[tokio::test]
+    #[serial]
+    async fn a_queued_user_message_survives_an_interrupt_after_it_was_merged() {
+        let mut ctx = silent_ctx();
+        let probe = "queued-interrupted-probe-x7x";
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: probe.to_string(),
+            });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut runner = completion_runner(move |_input, ctx, abort| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            boxed_completion(async move {
+                let call = ToolCall::new(
+                    "unknown_tool".to_string(),
+                    json!({}),
+                    Some("id-1".to_string()),
+                );
+                let results = eval_tool_calls(ctx, vec![call]).await?;
+                abort.set_ctrlc();
+                Ok((String::new(), results))
+            })
+        });
+        let sink = RecordingSink::install();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive(&mut ctx, TurnMode::Repl, "hi", &mut runner),
+        )
+        .await
+        .expect("the interrupted turn did not finish within 5s");
+
+        assert_eq!(outcome, TurnOutcome::Interrupted);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let sent: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::QueuedInputSent { text } if text == probe))
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let kept = ctx
+            .last_message
+            .as_ref()
+            .expect("the interrupted round is committed");
+        let results = &kept
+            .input
+            .tool_calls()
+            .as_ref()
+            .expect("the committed input carries the tool round")
+            .tool_results;
+        let notifications = &results.last().unwrap().output["system_notifications"];
+        assert_eq!(notifications[0]["text"], probe);
+    }
 }

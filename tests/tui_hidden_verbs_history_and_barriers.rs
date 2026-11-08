@@ -30,7 +30,8 @@ const REPAINT_SETTLE: Duration = Duration::from_millis(500);
 const MACRO_STOP_NOTICE: &str = "Rewind stops at the last macro turn";
 /// The verbs hidden from the palette until their prompt sites are
 /// routed, each paired with a typed head that narrows the palette to it
-/// (and to nothing else spelling it).
+/// (and to nothing else spelling it). The heads are hand-picked, so the
+/// verbs are checked against the palette's own list before they are used.
 const HIDDEN_HEADS: [(&str, &str); 5] = [
     ("ra", "rag"),
     ("va", "vault"),
@@ -38,6 +39,41 @@ const HIDDEN_HEADS: [(&str, &str); 5] = [
     ("unin", "uninstall"),
     ("upd", "update"),
 ];
+
+/// The verbs `HIDDEN_UNTIL_ROUTED` names, read from the palette's source
+/// the way the palette suite does: the binary has no library target to
+/// import the constant from.
+fn hidden_until_routed() -> Vec<String> {
+    let source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/bottom_pane.rs"))
+            .unwrap();
+    let start = source
+        .find("const HIDDEN_UNTIL_ROUTED")
+        .expect("the palette names its hidden verbs");
+    let list = &source[start..];
+    let list = &list[list.find('=').unwrap() + 1..];
+    let list = &list[list.find("&[").unwrap() + 2..];
+    let list = &list[..list.find(']').unwrap()];
+    list.split(',')
+        .map(|entry| entry.trim().trim_matches('"').to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Fails when `HIDDEN_HEADS` and the palette's list name different verbs.
+fn assert_hidden_heads_match_the_palette() {
+    let mut listed = hidden_until_routed();
+    listed.sort();
+    let mut heads: Vec<String> = HIDDEN_HEADS
+        .iter()
+        .map(|(_, verb)| format!(".{verb}"))
+        .collect();
+    heads.sort();
+    assert_eq!(
+        heads, listed,
+        "HIDDEN_HEADS drifted from the palette's HIDDEN_UNTIL_ROUTED"
+    );
+}
 
 struct TempDirGuard(PathBuf);
 
@@ -419,6 +455,7 @@ fn hidden_verbs_shown(pty: &mut Pty, sigil: char, toggle: &mut bool, state: &str
 /// an `.agent` switch rebuilt the palette's state; the `session` control
 /// row is offered in every state.
 fn assert_hidden_verbs_stay_hidden(prefix_yaml: &str, sigil: char, scenario: &str) {
+    assert_hidden_heads_match_the_palette();
     let dir = fresh_config_dir(scenario);
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir, prefix_yaml);
