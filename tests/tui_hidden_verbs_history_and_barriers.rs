@@ -5,10 +5,10 @@
 //! it; the history walk (Up/Down, Ctrl+R) never reopens the palette over
 //! the recalled line; `.macro enable` is not a rewind stop and a picker
 //! with nothing above the macro cannot crash; a backtick document
-//! command's grandchild dies on Esc; Ctrl+D during a turn drops the
-//! queued lines. The built binary on a pseudo-terminal, a scripted fake
-//! model where a turn has to be held open. Unix-only and serial like its
-//! sibling pty suites.
+//! command's grandchild dies on Esc while its shell still leads the
+//! group; Ctrl+D during a turn drops the queued lines. The built binary
+//! on a pseudo-terminal, a scripted fake model where a turn has to be
+//! held open. Unix-only and serial like its sibling pty suites.
 #![cfg(unix)]
 
 mod common;
@@ -906,7 +906,8 @@ fn esc_esc_with_nothing_above_the_macro_turn_does_not_crash_or_pop() {
 }
 
 // ---------------------------------------------------------------------
-// A backtick document command's grandchild dies on Esc.
+// A backtick document command's grandchild dies on Esc while its shell
+// still leads the group.
 // ---------------------------------------------------------------------
 
 fn pid_in(path: &Path) -> Option<i32> {
@@ -950,11 +951,14 @@ fn write_script(dir: &Path, name: &str, body: &str) -> String {
 /// it backgrounds the sleeper and exits, leaving it holding the capture
 /// pipe. Each script records the sleeper's pid, so the checks and the
 /// cleanup touch that process and no other. Esc ends each turn within
-/// ten seconds, the composer takes keys, and no sleeper survives Esc by
-/// more than two seconds.
+/// ten seconds and the composer takes keys. The waited-on sleeper dies
+/// with its shell's group within two seconds of Esc. The orphaned one
+/// survives: its shell was reaped the moment it exited, and a group
+/// whose leader is gone is not provably ours to signal, so the UI
+/// leaves it alone and this test kills it by pid afterwards.
 #[test]
 #[serial]
-fn a_backtick_document_commands_grandchild_dies_on_esc() {
+fn a_backtick_document_commands_grandchild_dies_on_esc_while_its_shell_leads_the_group() {
     let dir = fresh_config_dir("backtick-grandchild");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir, "");
@@ -981,9 +985,14 @@ fn a_backtick_document_commands_grandchild_dies_on_esc() {
 
     let mut misses: Vec<String> = Vec::new();
     let mut sleepers = Vec::new();
-    for (script, pid_file, what) in [
-        (waits, &waits_pid, "a waited-on grandchild"),
-        (orphans, &orphans_pid, "a backgrounded, orphaned grandchild"),
+    for (script, pid_file, what, dies_on_esc) in [
+        (waits, &waits_pid, "a waited-on grandchild", true),
+        (
+            orphans,
+            &orphans_pid,
+            "a backgrounded, orphaned grandchild",
+            false,
+        ),
     ] {
         let turn_at = pty.raw().len();
         pty.send(format!(".file `sh {script}` -- summarize\r").as_bytes())
@@ -1000,10 +1009,18 @@ fn a_backtick_document_commands_grandchild_dies_on_esc() {
         pty.read_for(Duration::from_millis(800));
         pty.send(b"\x1b").unwrap();
         let esc_at = Instant::now();
-        if !wait_for_process_gone(pid, Duration::from_secs(2)) {
+        let gone = wait_for_process_gone(pid, Duration::from_secs(2));
+        if dies_on_esc && !gone {
             kill_leftover(pid);
             misses.push(format!(
                 "{what}: the sleeper (pid {pid}) outlived Esc by two seconds:\n{}",
+                since(&pty, turn_at)
+            ));
+        }
+        if !dies_on_esc && gone {
+            misses.push(format!(
+                "{what}: the sleeper (pid {pid}) was signalled though its shell's group was \
+                 no longer ours:\n{}",
                 since(&pty, turn_at)
             ));
         }
@@ -1017,10 +1034,7 @@ fn a_backtick_document_commands_grandchild_dies_on_esc() {
     }
     quit_and_check(&mut pty);
     for pid in sleepers {
-        if process_alive(pid) {
-            kill_leftover(pid);
-            misses.push(format!("the sleeper (pid {pid}) outlived the session"));
-        }
+        kill_leftover(pid);
     }
     assert!(
         misses.is_empty(),

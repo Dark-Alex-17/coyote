@@ -739,23 +739,35 @@ impl KillOnDrop {
     }
 }
 
+/// Whether `pid` is still a process (running or a zombie) that leads its
+/// own group. duct reaps the shell with `waitpid` as soon as it exits,
+/// even while its capture reader is still blocked on a pipe a grandchild
+/// inherited, so by the time the guard drops the number may be free and
+/// `try_wait` returning `Ok(None)` says nothing about it. A reaped pid
+/// fails both checks. The one case they cannot tell apart is a reused
+/// pid whose new owner also leads a group; only a pidfd, or forking the
+/// shell ourselves, would close that.
+#[cfg(unix)]
+fn leads_own_group(pid: i32) -> bool {
+    // SAFETY: a null signal and getpgid only check the pid; neither
+    // touches memory.
+    unsafe { libc::kill(pid, 0) == 0 && libc::getpgid(pid) == pid }
+}
+
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let Some(handle) = self.0.take() else {
             return;
         };
-        // Only an unreaped leader (running or a zombie) still owns its
-        // pid and so its group; once reaped the number may belong to a
-        // stranger, and killing that group is never acceptable. A reaped
-        // handle has nothing left to kill, and `kill` on it is a no-op.
         #[cfg(unix)]
-        match (handle.try_wait(), handle.pids().first()) {
-            (Ok(None), Some(&pid)) => {
-                // SAFETY: killpg has no memory-safety preconditions. The
-                // pid came from this spawn, leads its own group, and the
-                // handle has not reaped it, so the group is still ours.
+        match handle.pids().first() {
+            Some(&pid) if leads_own_group(pid as i32) => {
+                // SAFETY: killpg has no memory-safety preconditions.
                 let _ = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
             }
+            // The shell is gone: a grandchild left alone in its group is
+            // not signalled, because the group id is no longer provably
+            // ours. `kill` on the reaped handle is a no-op.
             _ => {
                 let _ = handle.kill();
             }
@@ -1433,11 +1445,12 @@ mod tests {
         }
 
         /// Runs `script` as a document command under the TUI and drops the
-        /// future as soon as the script has written a pid to `pid_file`.
+        /// future as soon as `ready` reads a pid out of `pid_file`.
         /// Returns that pid and how long the drop took.
         fn drop_document_command_once_pid_written(
             script: &str,
             pid_file: &std::path::Path,
+            ready: impl Fn(&str) -> Option<i32>,
         ) -> (i32, std::time::Duration) {
             let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
             let mut dropped_at = None;
@@ -1450,7 +1463,7 @@ mod tests {
                         () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                             if let Some(pid) = fs::read_to_string(pid_file)
                                 .ok()
-                                .and_then(|text| text.trim().parse::<i32>().ok())
+                                .and_then(|text| ready(&text))
                             {
                                 dropped_at = Some(std::time::Instant::now());
                                 break pid;
@@ -1462,12 +1475,23 @@ mod tests {
             (pid, dropped_at.unwrap().elapsed())
         }
 
+        fn whole_pid(text: &str) -> Option<i32> {
+            text.trim().parse().ok()
+        }
+
+        /// A reaped pid answers ESRCH to a null signal; a zombie or a
+        /// still-running process answers 0.
+        fn process_alive(pid: i32) -> bool {
+            // SAFETY: a null signal only checks the pid.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
         /// Fails unless `pid` is gone within `deadline`. A reaped pid answers
         /// ESRCH to a null signal; a zombie or a still-running process
         /// answers 0.
         fn assert_process_gone(pid: i32, deadline: std::time::Duration, what: &str) {
             let deadline = std::time::Instant::now() + deadline;
-            while unsafe { libc::kill(pid, 0) } == 0 {
+            while process_alive(pid) {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "{what} (pid {pid}) outlived its future"
@@ -1492,7 +1516,7 @@ mod tests {
             create_dir_all(&dir).unwrap();
             let pid_file = dir.join("pid");
             let script = format!("echo $$ > '{}'; sleep 30", pid_file.display());
-            let (pid, _) = drop_document_command_once_pid_written(&script, &pid_file);
+            let (pid, _) = drop_document_command_once_pid_written(&script, &pid_file, whole_pid);
             assert_process_gone(
                 pid,
                 std::time::Duration::from_secs(5),
@@ -1518,7 +1542,7 @@ mod tests {
             let pid_file = dir.join("pid");
             let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
             let (grandchild, drop_took) =
-                drop_document_command_once_pid_written(&script, &pid_file);
+                drop_document_command_once_pid_written(&script, &pid_file, whole_pid);
             assert!(
                 drop_took < std::time::Duration::from_secs(2),
                 "dropping the command took {drop_took:?}"
@@ -1528,6 +1552,48 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 "the grandchild of the document command",
             );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// A shell that backgrounds its work and exits without waiting on
+        /// it leaves the grandchild alone in the group, and duct reaps the
+        /// shell the moment it exits. With the leader gone the group id is
+        /// no longer provably ours, so the drop signals nothing: the
+        /// grandchild survives, and the drop still comes back promptly
+        /// rather than waiting on the pipe it holds. Killing it would need
+        /// a pidfd or a shell we fork ourselves.
+        #[test]
+        #[serial]
+        fn dropping_a_document_command_whose_shell_already_exited_spares_the_orphan() {
+            let dir = env::temp_dir().join(format!(
+                "coyote-input-test-orphan-{}",
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            create_dir_all(&dir).unwrap();
+            let pid_file = dir.join("pid");
+            let script = format!("sleep 30 & echo $$ $! > '{}'", pid_file.display());
+            // The drop waits for the shell to be reaped: while it still
+            // leads the group the grandchild would go with it.
+            let (grandchild, drop_took) =
+                drop_document_command_once_pid_written(&script, &pid_file, |text| {
+                    let (shell, grandchild) = text.trim().split_once(' ')?;
+                    let shell: i32 = shell.parse().ok()?;
+                    (!process_alive(shell)).then(|| grandchild.parse().ok())?
+                });
+            assert!(
+                drop_took < std::time::Duration::from_secs(2),
+                "dropping the command took {drop_took:?}"
+            );
+            assert!(
+                process_alive(grandchild),
+                "the orphaned grandchild (pid {grandchild}) was signalled though its shell was \
+                 already reaped"
+            );
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            let _ = unsafe { libc::kill(grandchild, libc::SIGKILL) };
             let _ = fs::remove_dir_all(&dir);
         }
 
