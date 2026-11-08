@@ -510,7 +510,9 @@ fn a_text_line_queued_behind_a_dot_agent_command_still_reaches_the_model() {
 /// `--headless --macro` with a temp role and a bare `.save role`: the
 /// prompter has no human, so the name question is refused and NO role
 /// file is written (before the fix the JSON refusal was taken as the
-/// role's name).
+/// role's name). The positional `go` matters: with no prompt argument
+/// and no stdin text `--headless` bails before the macro runs, so the
+/// step's echo is asserted too.
 #[test]
 #[serial]
 fn a_headless_macro_save_role_on_a_temp_role_writes_no_role_file() {
@@ -532,7 +534,7 @@ fn a_headless_macro_save_role_on_a_temp_role_writes_no_role_file() {
 
     let mut cmd = Command::new(built_binary());
     base_env(&mut cmd, &dir);
-    cmd.args(["--headless", "--macro", "temp-save"])
+    cmd.args(["--headless", "--macro", "temp-save", "go"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -562,15 +564,19 @@ fn a_headless_macro_save_role_on_a_temp_role_writes_no_role_file() {
     );
     let everything = format!("{stdout}\n{stderr}");
     assert!(
+        everything.contains(">> .save role"),
+        "the macro never echoed its `.save role` step (exit {status}):\n{everything}"
+    );
+    assert!(
         !everything.contains("Saved role") && !everything.contains("saved role"),
         "the headless run claims a saved role (exit {status}):\n{everything}"
     );
     assert!(
-        everything.to_lowercase().contains("human")
-            || everything.to_lowercase().contains("headless")
-            || everything.to_lowercase().contains("not available")
-            || everything.to_lowercase().contains("refus"),
-        "the headless run neither saved nor explained the refusal (exit {status}):\n{everything}"
+        everything.contains(
+            "The input prompt needs a human and none is attached to this run; run it without \
+             --headless or --acp-server"
+        ),
+        "the headless run did not give the prompter's refusal (exit {status}):\n{everything}"
     );
 }
 

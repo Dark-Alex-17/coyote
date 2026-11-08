@@ -324,19 +324,40 @@ fn sgr_since(raw: &[u8], from: usize, at: usize) -> Vec<Vec<u16>> {
 }
 
 /// Whether the lists set the dim attribute (SGR 2) without a later reset
-/// or un-dim (SGR 0 / 22) cancelling it.
+/// or un-dim (SGR 0 / 22) cancelling it. The parameters are read in
+/// order: an extended colour (38 / 48 / 58) carries its own arguments,
+/// `5;N` or `2;r;g;b`, and the `2` inside those is not an attribute.
 fn ends_dim(params: &[Vec<u16>]) -> bool {
     let mut dim = false;
     for list in params {
-        for &p in list {
+        let mut rest = list.as_slice();
+        while let Some((&p, tail)) = rest.split_first() {
+            rest = tail;
             match p {
                 2 => dim = true,
                 0 | 22 => dim = false,
+                38 | 48 | 58 => {
+                    let arguments = match rest.first() {
+                        Some(5) => 2,
+                        Some(2) => 4,
+                        _ => 0,
+                    };
+                    rest = &rest[arguments.min(rest.len())..];
+                }
                 _ => {}
             }
         }
     }
     dim
+}
+
+#[test]
+fn ends_dim_reads_an_extended_colours_arguments_as_arguments() {
+    assert!(!ends_dim(&[vec![38, 5, 2]]));
+    assert!(ends_dim(&[vec![2], vec![38, 5, 2]]));
+    assert!(!ends_dim(&[vec![2], vec![22]]));
+    assert!(!ends_dim(&[vec![48, 2, 2, 2, 2]]));
+    assert!(ends_dim(&[vec![38, 2, 10, 20, 30, 2]]));
 }
 
 /// Forces a full repaint by resizing and returns the raw offset it starts

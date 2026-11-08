@@ -839,7 +839,7 @@ fn band_closes_before_the_key_quits(band: Band, key: &[u8], key_name: &str) -> V
     let live_at = pty.raw().len();
     assert_composer_takes_keys(&mut pty, live_at, &what);
 
-    // The same key on the idle empty composer quits (D5).
+    // The same key on an idle empty composer is the quit chord.
     pty.send(key).unwrap();
     match pty.wait_for("tty-probe-done", PTY_DEADLINE) {
         Ok(transcript) => {
@@ -884,12 +884,15 @@ fn ctrl_c_and_ctrl_d_close_an_open_band_before_they_quit() {
 // Headless `.role <new>` / `.macro <new>` create nothing.
 // ---------------------------------------------------------------------
 
-/// Runs `--headless --macro <name>` with stdin closed and a recording
-/// editor; returns (exit status text, stdout+stderr).
+/// Runs `--headless --macro <name> go` with stdin closed and a recording
+/// editor; returns (exit status text, stdout+stderr). The positional
+/// `go` matters: with no prompt argument and no stdin text `--headless`
+/// bails with "requires a prompt argument" before the macro runs. A
+/// macro without variables tolerates the surplus argument.
 fn run_headless_macro(dir: &Path, name: &str, editor: &str) -> (String, String) {
     let mut cmd = Command::new(built_binary());
     base_env(&mut cmd, dir);
-    cmd.args(["--headless", "--macro", name])
+    cmd.args(["--headless", "--macro", name, "go"])
         .env("EDITOR", editor)
         .env("VISUAL", editor)
         .stdin(Stdio::null())
@@ -913,24 +916,9 @@ fn run_headless_macro(dir: &Path, name: &str, editor: &str) -> (String, String) 
     (status.to_string(), format!("{stdout}\n{stderr}"))
 }
 
-fn explains_refusal(everything: &str) -> bool {
-    let lower = everything.to_lowercase();
-    [
-        "human",
-        "headless",
-        "not available",
-        "refus",
-        "cancel",
-        "no tty",
-        "interactive",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-/// Macro `mkrole` = `.role m8-role`: no role file, no editor, an
-/// explanation. Macro `mkmacro` = `.macro m8-macro`: no macro file,
-/// no editor, an explanation.
+/// Macro `mkrole` = `.role m8-role`: the step is echoed, no role file,
+/// no editor, the creation gate's refusal. Macro `mkmacro` = `.macro
+/// m8-macro`: the same for a macro.
 #[test]
 #[serial]
 fn a_headless_macro_cannot_create_a_role_or_a_macro() {
@@ -963,6 +951,12 @@ fn a_headless_macro_cannot_create_a_role_or_a_macro() {
         ("mkmacro", "m8-macro", "macro"),
     ] {
         let (status, everything) = run_headless_macro(&dir, macro_name, &editor);
+        if !everything.contains(&format!(">> .{kind} {needle}")) {
+            misses.push(format!(
+                "`--headless --macro {macro_name}` never echoed its step (did the macro run at \
+                 all?) (exit {status}):\n{everything}"
+            ));
+        }
         let created = files_named(&dir, needle);
         if !created.is_empty() {
             misses.push(format!(
@@ -976,9 +970,14 @@ fn a_headless_macro_cannot_create_a_role_or_a_macro() {
             ));
             let _ = fs::remove_file(&launched);
         }
-        if !explains_refusal(&everything) {
+        let refusal = format!(
+            "Creating {kind} '{needle}' needs a human to answer the prompt and none is attached \
+             to this run; run it without --headless or --acp-server"
+        );
+        if !everything.contains(&refusal) {
             misses.push(format!(
-                "headless `.{kind} {needle}` neither created nor explained the refusal (exit {status}):\n{everything}"
+                "headless `.{kind} {needle}` did not give the refusal `{refusal}` (exit \
+                 {status}):\n{everything}"
             ));
         }
     }

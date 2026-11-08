@@ -99,6 +99,10 @@ fn write_dry_run_config_with(dir: &Path, extra: &str) {
 /// The fake-LLM config, prompt-free on every exit path; `extra` is
 /// appended as top-level YAML.
 fn write_fake_llm_config(dir: &Path, fake: &FakeLlm, extra: &str) {
+    write_fake_llm_config_saving(dir, fake, extra, false);
+}
+
+fn write_fake_llm_config_saving(dir: &Path, fake: &FakeLlm, extra: &str, save_session: bool) {
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
     fs::write(
@@ -107,7 +111,7 @@ fn write_fake_llm_config(dir: &Path, fake: &FakeLlm, extra: &str) {
             "model: fake:fake-model\n\
              function_calling_support: true\n\
              stream: true\n\
-             save_session: false\n\
+             save_session: {save_session}\n\
              vault_password_file: '{vault_pass}'\n\
              clients:\n\
              \x20 - type: openai-compatible\n\
@@ -934,8 +938,9 @@ fn sigterm_during_a_slow_file_loader_kills_it_and_leaves_the_tty_cooked() {
 
 /// A line queued while a tool sleeps, then SIGTERM: the exit takes the
 /// line off the turn's queue before the turn is told to stop, so the
-/// tool result the interrupt closes cannot hand it to the model and no
-/// saved session carries it. The process still leaves cleanly.
+/// tool result the interrupt closes cannot hand it to the model and the
+/// session the exit autosaves (one is open, under `save_session: true`)
+/// does not carry it either. The process still leaves cleanly.
 #[test]
 #[serial]
 fn sigterm_with_a_queued_line_does_not_hand_it_to_the_model() {
@@ -949,12 +954,21 @@ fn sigterm_with_a_queued_line_does_not_hand_it_to_the_model() {
         },
         Reply::Text("never reached r12-q".to_string()),
     ]);
-    write_fake_llm_config(&dir, &fake, "");
+    write_fake_llm_config_saving(&dir, &fake, "", true);
     write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
     let mut pty = spawn_tui(&dir, &[]);
 
     let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let pid = child_pid(&transcript);
+    let session_at = pty.raw().len();
+    pty.send(b".session sigq-r12\r").unwrap();
+    wait_for_squeezed_after(
+        &mut pty,
+        "sigq-r12 . agents",
+        session_at,
+        "the footer's session token",
+    );
+    pty.read_for(Duration::from_millis(400));
     pty.send(b"call the sleep tool\r").unwrap();
     wait_for_file(
         &mut pty,
@@ -1000,9 +1014,21 @@ fn sigterm_with_a_queued_line_does_not_hand_it_to_the_model() {
         "the queued line reached the model through the signal exit:\n{:?}",
         fake.bodies()
     );
-    for entry in fs::read_dir(dir.join("sessions")).unwrap() {
-        let path = entry.unwrap().path();
-        let saved = fs::read_to_string(&path).unwrap_or_default();
+    let saved: Vec<(PathBuf, String)> = fs::read_dir(dir.join("sessions"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            (path, text)
+        })
+        .collect();
+    assert!(
+        !saved.is_empty(),
+        "the signal exit saved no session under {}:\n{transcript}",
+        dir.join("sessions").display()
+    );
+    for (path, saved) in saved {
         assert!(
             !saved.contains("queued-r12-q"),
             "the queued line was saved with the session {}:\n{saved}",
