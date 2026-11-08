@@ -7264,12 +7264,22 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
     let end = find("'s sessions when one syncs");
     assert_eq!(held, "; held at the propagation node, delivered to any of ");
     assert_eq!(end, "'s sessions when one syncs");
+    let held_reply = find("; held at the propagation node, delivered to the session");
+    assert_eq!(
+        held_reply,
+        "; held at the propagation node, delivered to the session that asked when it syncs"
+    );
     let status = string_literals(&method_body("src/mesh/message.rs", "status"));
     let no_route =
         " has no route (its last link failed and it has not announced since; last heard {})";
     assert_eq!(status, [" left {}", no_route], "Departure::status moved");
     let see_back = const_str("src/repl/mesh.rs", "SEE_WHEN_IT_IS_BACK");
     assert_eq!(see_back, ".mesh peers shows when it announces again.");
+    let own_reply = fn_body("src/repl/mesh.rs", "own_reply_sent_line");
+    assert!(
+        own_reply.contains("held_reply_sentence(short(destination), departed, now)"),
+        "a follow-up on this node's own question no longer words its held line as a reply:\n{own_reply}"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
@@ -7278,6 +7288,9 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
         format!("`<name>{}`", no_route.replace("{}", "<age>")),
         format!(
             "`request <id8> to <dest8>: pending; <dest8> left 2h ago{held}<dest8>{end} (the decision arrives as an idle line; .mesh inbox lists it)`"
+        ),
+        format!(
+            "`Sent <id8> to <dest8> as a reply to <id8> (via store-and-forward). <dest8> left 2h ago{held_reply}. {see_back}`"
         ),
     ] {
         assert!(
@@ -7288,12 +7301,71 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
     let mesh = flat(&read(wiki.join("Mesh.md")));
     let tools = format!("`<hash> left 2h ago{held}<hash>{end}`");
     assert!(mesh.contains(&tools), "Mesh.md does not quote {tools}");
+    let reply_tools = format!("`<hash> left 2h ago{held_reply}`");
+    assert!(
+        mesh.contains(&reply_tools),
+        "Mesh.md does not quote {reply_tools}"
+    );
     assert!(
         mesh.contains(
             "`departed`: `state` (`left` or `no_route`), `left_secs_ago` for `left`, `last_seen_secs_ago` for `no_route`"
         ),
         "Mesh.md does not describe the departed object"
     );
+}
+
+/// A held reply is left on the propagation node for the session whose question or thread
+/// it answers: the Mesh page says so, with the question tried before the thread and the
+/// thread's collision risk; the Configuration page says what it means for a session that
+/// never syncs on its own; and the Commands page's `.mesh sync` section quotes the two
+/// lines that count such replies as the code builds them.
+#[test]
+fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
+    let left = const_str("src/mesh/idle.rs", "LEFT_FOR_ANOTHER_SESSION");
+    assert_eq!(left, "left on the node for another session");
+    let render = fn_body("src/repl/mesh.rs", "render_sync");
+    for needle in [
+        "\"Nothing new held for this node at {node}: {} listed, {processed}{left} {LEFT_FOR_ANOTHER_SESSION}.\"",
+        "format!(\"{processed} already processed, \")",
+        "line.push_str(&format!(\" {left} {LEFT_FOR_ANOTHER_SESSION}.\"));",
+    ] {
+        assert!(
+            render.contains(needle),
+            "render_sync no longer builds {needle}:\n{render}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let mesh = flat(&read(wiki.join("Mesh.md")));
+    for needle in [
+        "A propagation node keeps one mailbox per identity, not per session",
+        "A held reply is the exception: it goes only to the session whose question or thread it answers.",
+        "without telling the node it has it, and does not ask for it again until that session restarts",
+        "The question is checked first because it is tied to the sender: thread ids are chosen by whoever starts a conversation, so two peers' threads can share one",
+        "If the session that asked never syncs again, its reply ages out on the propagation node",
+    ] {
+        assert!(mesh.contains(needle), "Mesh.md does not say {needle:?}");
+    }
+    let configuration = flat(&read(wiki.join("Mesh-Configuration.md")));
+    let needle = "except a reply to another session's question or thread, which it leaves on the node for that session";
+    assert!(
+        configuration.contains(needle),
+        "Mesh-Configuration.md does not say {needle:?}"
+    );
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for needle in [
+        format!(
+            "`Fetched from <node8>: N listed, N wanted, N received, N delivered, N duplicates, N discarded, N deferred. N {left}.`"
+        ),
+        format!(
+            "`Nothing new held for this node at <node8>: N listed, N already processed, N {left}.`"
+        ),
+    ] {
+        assert!(
+            commands.contains(&needle),
+            "Mesh-Commands.md does not quote {needle}"
+        );
+    }
 }
 
 /// The Commands page's `.mesh dismiss` section quotes what the verb prints as the code

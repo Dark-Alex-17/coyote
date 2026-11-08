@@ -455,6 +455,10 @@ impl SyncSchedule {
     }
 }
 
+/// How a sync names the held messages it left for another session of this identity,
+/// after their count.
+pub(crate) const LEFT_FOR_ANOTHER_SESSION: &str = "left on the node for another session";
+
 /// `synced 3 messages from deadbeef: 2 delivered, 1 duplicate`, naming only the non-zero
 /// outcomes. A deferral that followed an ask for the sender's announce says so, with
 /// what to do next.
@@ -464,6 +468,11 @@ fn synced_line(report: &FetchReport) -> String {
         (report.duplicates, "duplicate", "duplicates"),
         (report.discarded, "discarded", "discarded"),
         (report.deferred, "deferred", "deferred"),
+        (
+            report.left_for_session,
+            LEFT_FOR_ANOTHER_SESSION,
+            LEFT_FOR_ANOTHER_SESSION,
+        ),
     ]
     .into_iter()
     .filter(|(count, _, _)| *count > 0)
@@ -526,6 +535,7 @@ mod synced_ask_line_tests {
             deferred: 1,
             deferred_after_ask: 0,
             acknowledged: 1,
+            left_for_session: 0,
         };
         assert_eq!(
             synced_line(&report),
@@ -552,6 +562,7 @@ mod synced_ask_line_tests {
             deferred: 3,
             deferred_after_ask: 1,
             acknowledged: 0,
+            left_for_session: 0,
         };
         assert_eq!(
             synced_line(&report),
@@ -566,6 +577,27 @@ mod synced_ask_line_tests {
         assert_eq!(
             synced_line(&report),
             "synced 3 messages from deadbeef: 3 deferred (source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh sync in a minute)"
+        );
+    }
+
+    #[test]
+    fn a_reply_left_for_another_session_is_named_after_the_other_outcomes() {
+        let report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 2,
+            wanted: 2,
+            received: 2,
+            delivered: 1,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 0,
+            deferred_after_ask: 0,
+            acknowledged: 1,
+            left_for_session: 1,
+        };
+        assert_eq!(
+            synced_line(&report),
+            "synced 2 messages from deadbeef: 1 delivered, 1 left on the node for another session"
         );
     }
 }
@@ -816,6 +848,7 @@ mod tests {
             deferred: 0,
             deferred_after_ask: 0,
             acknowledged: received,
+            left_for_session: 0,
         }
     }
 

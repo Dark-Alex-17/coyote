@@ -10,6 +10,7 @@ use crate::mesh::message::{Disposition, PEER_ID_MAX_CHARS, PeerMessage};
 use crate::mesh::notify::NoticeText;
 use crate::mesh::request::{redact_hashes, short};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
+use crate::mesh::sent_threads::instances_holding_thread;
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 use crate::render::QuotingError;
@@ -279,23 +280,12 @@ pub(crate) fn other_sessions_asked(
     own_instance_id: &str,
     now: SystemTime,
 ) -> Vec<OtherSessionAsk> {
-    let Ok(entries) = fs::read_dir(mesh_cache_dir(cache_dir)) else {
-        return Vec::new();
-    };
     let mut asks: Vec<OtherSessionAsk> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(instance_id) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("pending-"))
-            .and_then(|rest| rest.strip_suffix(".jsonl"))
-        else {
-            continue;
-        };
-        if instance_id == own_instance_id || instance_id.is_empty() {
+    for instance_id in pending_instances(cache_dir) {
+        if instance_id == own_instance_id {
             continue;
         }
-        match PendingStore::new(cache_dir, instance_id).list(now) {
+        match PendingStore::new(cache_dir, &instance_id).list(now) {
             Ok(records) => asks.extend(
                 records
                     .into_iter()
@@ -303,13 +293,13 @@ pub(crate) fn other_sessions_asked(
                         record.state != PendingState::Answered || record.reply.is_some()
                     })
                     .map(|record| OtherSessionAsk {
-                        instance_id: instance_id.to_string(),
+                        instance_id: instance_id.clone(),
                         record,
                     }),
             ),
             Err(err) => log::debug!(
                 "Questions asked from instance {} are left out of `.mesh pending`: {}",
-                short(instance_id),
+                short(&instance_id),
                 redact_hashes(&format!("{err:#}"))
             ),
         }
@@ -321,6 +311,78 @@ pub(crate) fn other_sessions_asked(
             .then_with(|| a.record.id.cmp(&b.record.id))
     });
     asks
+}
+
+/// The instances with a `pending-<instance_id>.jsonl` on `cache_dir`, sorted.
+fn pending_instances(cache_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(mesh_cache_dir(cache_dir)) else {
+        return Vec::new();
+    };
+    let mut instances: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let instance_id = name
+                .to_str()?
+                .strip_prefix("pending-")?
+                .strip_suffix(".jsonl")?;
+            (!instance_id.is_empty()).then(|| instance_id.to_string())
+        })
+        .collect();
+    instances.sort();
+    instances
+}
+
+/// The other session of this identity on `cache_dir` a propagated reply belongs to, when
+/// it is not this one's. The reply names question `in_reply_to` in `thread` and was
+/// signed by `identity`.
+///
+/// A session owns the reply when its pending store lists the question, in any state,
+/// asked of `identity` (the identity test `Correlations::answer` makes), or else when
+/// its sent-threads list holds `thread`, which still names the session once the question
+/// has aged out. The question is tried first, in every session, because it is checked
+/// against the signer; a thread id is minted by whoever opened the conversation and two
+/// peers can mint the same one, so a thread match alone can name the wrong session.
+/// This session owning it by either test returns `None`, as does no session owning it:
+/// the reply is then delivered here as any message is.
+///
+/// Every file is read as it stands and never written, so a running session's stores are
+/// left alone; a file that cannot be read counts as not naming the reply.
+pub(crate) fn sibling_owner(
+    cache_dir: &Path,
+    own_instance_id: &str,
+    in_reply_to: &str,
+    thread: Option<&str>,
+    identity: &str,
+    now: SystemTime,
+) -> Option<String> {
+    let askers: Vec<String> = pending_instances(cache_dir)
+        .into_iter()
+        .filter(|instance_id| {
+            PendingStore::new(cache_dir, instance_id)
+                .list(now)
+                .is_ok_and(|records| {
+                    records.iter().any(|record| {
+                        record.id == in_reply_to
+                            && record.peer_identity.eq_ignore_ascii_case(identity)
+                    })
+                })
+        })
+        .collect();
+    let holders = if askers.is_empty() {
+        thread.map_or_else(Vec::new, |thread| {
+            instances_holding_thread(cache_dir, thread)
+        })
+    } else {
+        askers
+    };
+    if holders
+        .iter()
+        .any(|instance_id| instance_id == own_instance_id)
+    {
+        return None;
+    }
+    holders.into_iter().next()
 }
 
 fn is_expired(record: &PendingRecord, now: SystemTime) -> bool {
@@ -1315,6 +1377,119 @@ mod tests {
             );
         }
         assert!(other_sessions_asked(&tmp.path.join("nowhere"), "own", now).is_empty());
+    }
+
+    /// A reply belongs to the session whose store lists its question asked of the signer,
+    /// in any state; else to the session whose sent-threads list holds its thread. This
+    /// session owning it, or nobody, is `None`. The question test runs in every session
+    /// before any thread test, a question asked of another identity names nobody, an
+    /// expired one falls back to the thread, and nothing on disk is written.
+    #[test]
+    fn sibling_owner_names_the_session_that_asked_or_holds_the_thread() {
+        use crate::mesh::sent_threads::SentThreads;
+
+        let tmp = TempDir::new("pending-sibling-owner");
+        let base = 3_000_000;
+        let now = t(base);
+        let signer = hex_lower(&[0xcd; 16]);
+        let stranger = hex_lower(&[0xee; 16]);
+        let a = PendingStore::new(&tmp.path, "inst-a");
+        a.upsert(record("q-open", t(base - 5), PendingState::Open), now)
+            .unwrap();
+        a.upsert(
+            record("q-answered", t(base - 6), PendingState::Answered),
+            now,
+        )
+        .unwrap();
+        let expired_at = t(base - PENDING_TTL.as_secs() - 60);
+        a.upsert(
+            record("q-expired", expired_at, PendingState::Open),
+            expired_at,
+        )
+        .unwrap();
+        PendingStore::new(&tmp.path, "inst-c")
+            .upsert(record("q-own", t(base - 7), PendingState::Open), now)
+            .unwrap();
+        let a_threads = SentThreads::open(&tmp.path, "inst-a").unwrap();
+        a_threads.record_sent("t-a").unwrap();
+        a_threads.record_sent("t-both").unwrap();
+        let c_threads = SentThreads::open(&tmp.path, "inst-c").unwrap();
+        c_threads.record_received("t-both").unwrap();
+        fs::write(
+            mesh_cache_dir(&tmp.path).join("pending-broken.jsonl"),
+            b"{not json\n",
+        )
+        .unwrap();
+        let before: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(mesh_cache_dir(&tmp.path))
+            .unwrap()
+            .flatten()
+            .map(|entry| (entry.path(), fs::read(entry.path()).unwrap_or_default()))
+            .collect();
+        let owner = |id: &str, thread: Option<&str>, identity: &str| {
+            sibling_owner(&tmp.path, "inst-c", id, thread, identity, now)
+        };
+
+        assert_eq!(owner("q-open", None, &signer).as_deref(), Some("inst-a"));
+        assert_eq!(
+            owner("q-answered", Some("t-unknown"), &signer).as_deref(),
+            Some("inst-a"),
+            "a question already answered still names the session that asked it"
+        );
+        assert_eq!(
+            owner("q-open", Some("t-both"), &signer).as_deref(),
+            Some("inst-a"),
+            "the question is tried before this session's thread"
+        );
+        assert_eq!(
+            owner("q-open", None, &signer.to_uppercase()).as_deref(),
+            Some("inst-a")
+        );
+        assert_eq!(owner("q-open", None, &stranger), None);
+        assert_eq!(
+            owner("q-expired", Some("t-a"), &signer).as_deref(),
+            Some("inst-a"),
+            "an expired question falls back to the thread"
+        );
+        assert_eq!(owner("q-expired", None, &signer), None);
+        assert_eq!(
+            owner("q-unknown", Some("t-a"), &stranger).as_deref(),
+            Some("inst-a")
+        );
+        assert_eq!(
+            owner("q-own", Some("t-a"), &signer),
+            None,
+            "this session asked it"
+        );
+        assert_eq!(
+            owner("q-unknown", Some("t-both"), &signer),
+            None,
+            "this session holds the thread too"
+        );
+        assert_eq!(owner("q-unknown", Some("t-none"), &signer), None);
+        assert_eq!(
+            sibling_owner(&tmp.path, "inst-a", "q-open", None, &signer, now),
+            None,
+            "the session that asked is never left out of its own replies"
+        );
+        assert_eq!(
+            sibling_owner(
+                &tmp.path.join("nowhere"),
+                "inst-c",
+                "q-open",
+                Some("t-a"),
+                &signer,
+                now
+            ),
+            None
+        );
+        for (path, bytes) in before {
+            assert_eq!(
+                fs::read(&path).unwrap_or_default(),
+                bytes,
+                "{} changed",
+                path.display()
+            );
+        }
     }
 
     #[test]

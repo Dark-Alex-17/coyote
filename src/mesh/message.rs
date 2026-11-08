@@ -15,8 +15,9 @@ use crate::mesh::limits::PeerRefusal;
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::notify::NoticeText;
 use crate::mesh::peers::PeerRecord;
+use crate::mesh::pending::sibling_owner;
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
-use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
+use crate::mesh::propagation_fetch::{HoldPolicy, InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, NoAnswer,
@@ -1682,6 +1683,10 @@ impl Departure {
 pub(crate) const HELD_FOR_DEPARTED: &str = "; held at the propagation node, delivered to any of ";
 /// The end of `held_sentence`, after the second naming.
 pub(crate) const HELD_FOR_DEPARTED_END: &str = "'s sessions when one syncs";
+/// The words after the peer's status in `held_reply_sentence`: a held reply is taken
+/// only by the session whose question or thread it answers.
+pub(crate) const HELD_REPLY_FOR_DEPARTED: &str =
+    "; held at the propagation node, delivered to the session that asked when it syncs";
 
 /// Why a send or access request to a peer that said it left was not tried over a link,
 /// as the debug log says it.
@@ -1697,6 +1702,13 @@ pub(crate) fn held_sentence(name: &str, departure: Departure, now: SystemTime) -
         "{name}{}{HELD_FOR_DEPARTED}{name}{HELD_FOR_DEPARTED_END}",
         departure.status(now)
     )
+}
+
+/// `held_sentence` for a reply, which only the session that asked takes off the node:
+/// `bob left 2h ago; held at the propagation node, delivered to the session that asked
+/// when it syncs`.
+pub(crate) fn held_reply_sentence(name: &str, departure: Departure, now: SystemTime) -> String {
+    format!("{name}{}{HELD_REPLY_FOR_DEPARTED}", departure.status(now))
 }
 
 /// Timeouts for one send: the direct attempt, then the fallback post, which
@@ -2989,6 +3001,42 @@ impl InboundSink for PeerRouting<'_> {
             peer.message_id
         );
         surface.deliver_peer(peer);
+    }
+}
+
+/// The propagation node keeps one mailbox per identity, so every session of it fetches
+/// the same held messages. A reply to a question another session asked, or in a thread
+/// another session had, is that session's: it is left on the node for it, as
+/// `pending::sibling_owner` decides from the sessions' own files on `cache_dir`. Every
+/// other message, a reply this session owns and a reply no session owns are taken here
+/// as before.
+pub(crate) struct RepliesForOtherSessions {
+    pub cache_dir: PathBuf,
+    pub instance_id: String,
+}
+
+impl HoldPolicy for RepliesForOtherSessions {
+    fn leave_on_node(&self, message: &InboundMessage) -> Option<String> {
+        let PeerLxmf::Peer(peer) = decode_peer_lxmf(message) else {
+            return None;
+        };
+        if peer.kind != PeerKind::Reply {
+            return None;
+        }
+        let in_reply_to = peer.in_reply_to.as_deref()?;
+        let owner = sibling_owner(
+            &self.cache_dir,
+            &self.instance_id,
+            in_reply_to,
+            peer.thread.as_deref(),
+            &message.source_identity_hash,
+            SystemTime::now(),
+        )?;
+        Some(format!(
+            "session {}, whose question or thread reply {} answers",
+            short(&owner),
+            peer.id
+        ))
     }
 }
 

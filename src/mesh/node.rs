@@ -37,8 +37,8 @@ use crate::mesh::message::{
     CHECK_INBOX_NEXT_ACTION, Disposition, Farewell, INBOX_FULL_TEXT_POINTER, ModelNotes,
     OutboundPeer, PEER_INBOX_CAPACITY, PEER_LINE_MAX_CHARS, PRESENCE_LEAVING, Part, PartLimits,
     PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface,
-    PeerVia, RawPart, RawPeerMessage, Route, SendError, SendOutcome, collect_next_action,
-    from_request_body, is_farewell, is_wire_id, unix_now,
+    PeerVia, RawPart, RawPeerMessage, RepliesForOtherSessions, Route, SendError, SendOutcome,
+    collect_next_action, from_request_body, is_farewell, is_wire_id, unix_now,
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
@@ -769,6 +769,9 @@ pub(crate) struct MeshRuntime {
     /// Held for the length of one propagation fetch; a second caller is refused, never
     /// queued behind the first.
     fetching: Mutex<()>,
+    /// The held messages this process left on the propagation node for another session
+    /// of the identity, which later fetches neither ask for again nor name as read.
+    left_for_sessions: parking_lot::Mutex<propagation_fetch::LeftIds>,
     /// Held across one knock's or message's propagation-node post. `propagate` needs calls
     /// for the same node serialised, so a second poster waits here rather than sharing
     /// the out-link.
@@ -1048,6 +1051,7 @@ impl MeshRuntime {
             joined_at: SystemTime::now(),
             last_announce_at,
             fetching: Mutex::new(()),
+            left_for_sessions: parking_lot::Mutex::default(),
             posting: Mutex::new(()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -1868,6 +1872,10 @@ impl MeshRuntime {
             gate: &self.knock_gate,
             inner: &access,
         };
+        let hold = RepliesForOtherSessions {
+            cache_dir: self.cache_dir.clone(),
+            instance_id: self.current_instance_id(),
+        };
         propagation_fetch::fetch(
             &transport,
             &self.transport_identity,
@@ -1876,6 +1884,8 @@ impl MeshRuntime {
             &self.trust,
             &mut store,
             &routing,
+            &hold,
+            &self.left_for_sessions,
             &FetchOptions {
                 path_requested: asked,
                 ..FetchOptions::default()

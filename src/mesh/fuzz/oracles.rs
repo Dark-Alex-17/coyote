@@ -29,7 +29,7 @@ use crate::mesh::pending::{
 };
 use crate::mesh::propagation::lxmf_delivery_hash;
 use crate::mesh::propagation_fetch::{
-    BodyOutcome, BodyPipeline, Discard, FetchStore, InboundMessage, InboundSink,
+    BodyOutcome, BodyPipeline, Discard, FetchStore, HoldPolicy, InboundMessage, InboundSink,
     MAX_FETCHED_MESSAGE_BYTES, MAX_UNKNOWN_SOURCE_DEFERRALS, MIN_FETCHED_MESSAGE_BYTES, SourceKeys,
     UNKNOWN_SOURCE_DEFERRAL_HORIZON,
 };
@@ -1225,6 +1225,15 @@ struct CountingSink {
     delivered: Mutex<Vec<[u8; 32]>>,
 }
 
+/// Takes every message: the receipt table the model follows has no other reader.
+struct TakeAll;
+
+impl HoldPolicy for TakeAll {
+    fn leave_on_node(&self, _message: &InboundMessage) -> Option<String> {
+        None
+    }
+}
+
 impl InboundSink for CountingSink {
     fn deliver(&self, message: InboundMessage) {
         self.delivered.lock().unwrap().push(message.message_id);
@@ -1301,6 +1310,7 @@ impl Model {
                 | Discard::UnknownSource { .. },
             ) => {}
             BodyOutcome::Discarded(_) => self.record(transient),
+            BodyOutcome::LeftForSession => {}
         }
     }
 
@@ -1644,6 +1654,7 @@ impl ReceiptFixture {
             keys: &bench.keys,
             trust: &self.trust,
             sink: &bench.sink,
+            hold: &TakeAll,
             node: "fuzz",
             asked: Default::default(),
             cancel: Default::default(),

@@ -14,7 +14,8 @@ use crate::mesh::fetch::{
 };
 use crate::mesh::message::{
     Departure, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, Route,
-    SendError, collect_next_action, held_sentence, left_mesh_hint, unreachable_head,
+    SendError, collect_next_action, held_reply_sentence, held_sentence, left_mesh_hint,
+    unreachable_head,
 };
 use crate::mesh::pending::{
     DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PENDING_TTL,
@@ -1061,7 +1062,12 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
                 result["note"] = json!(REPLY_THREAD_IS_THE_RECEIVERS);
             }
             if let Some(departed) = outcome.departed {
-                result["departed"] = departed_result(to, departed, SystemTime::now());
+                let held = if out.kind == PeerKind::Reply {
+                    held_reply_sentence
+                } else {
+                    held_sentence
+                };
+                result["departed"] = departed_result(to, departed, held, SystemTime::now());
             }
             Ok(result)
         }
@@ -1131,7 +1137,8 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
         if let Some(departed) = outcome.departed
             && result.is_object()
         {
-            result["departed"] = departed_result(&destination, departed, SystemTime::now());
+            result["departed"] =
+                departed_result(&destination, departed, held_sentence, SystemTime::now());
         }
         return Ok(result);
     }
@@ -1148,7 +1155,8 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
         ),
     });
     if let Some(departed) = outcome.departed {
-        result["departed"] = departed_result(&destination, departed, SystemTime::now());
+        result["departed"] =
+            departed_result(&destination, departed, held_sentence, SystemTime::now());
     }
     Ok(result)
 }
@@ -1524,19 +1532,24 @@ async fn handle_request_access(slot: &MeshSlot, args: &Value) -> Result<Value> {
     let departed = outcome.as_ref().ok().and_then(|outcome| outcome.departed);
     let mut result = access_result(outcome);
     if let Some(departed) = departed {
-        result["departed"] = departed_result(peer, departed, SystemTime::now());
+        result["departed"] = departed_result(peer, departed, held_sentence, SystemTime::now());
     }
     Ok(result)
 }
 
 /// The `departed` object of a result whose message or request a propagation node holds
 /// because the peer had gone: its state, how long ago it left when it said so, and the
-/// sentence for the user, naming the peer by its destination hash.
-fn departed_result(peer: &str, departed: Departure, now: SystemTime) -> Value {
+/// sentence `held` words for the user, naming the peer by its destination hash.
+fn departed_result(
+    peer: &str,
+    departed: Departure,
+    held: fn(&str, Departure, SystemTime) -> String,
+    now: SystemTime,
+) -> Value {
     let destination = canonical_hash(peer).unwrap_or_else(|| peer.to_string());
     let mut result = json!({
         "state": departed.state(),
-        "message": held_sentence(&destination, departed, now),
+        "message": held(&destination, departed, now),
     });
     let secs_ago = |at: SystemTime| json!(now.duration_since(at).unwrap_or_default().as_secs());
     match departed {
@@ -4716,6 +4729,7 @@ mod tests {
         let left = departed_result(
             &dest.to_uppercase(),
             Departure::Left(now - Duration::from_secs(7200)),
+            held_sentence,
             now,
         );
         assert_eq!(
@@ -4731,6 +4745,7 @@ mod tests {
             Departure::NoRoute {
                 last_seen: now - Duration::from_secs(60),
             },
+            held_sentence,
             now,
         );
         assert_eq!(no_route["state"], "no_route");
@@ -4741,6 +4756,19 @@ mod tests {
             format!(
                 "{dest} has no route (its last link failed and it has not announced since; last heard 1m ago); held at the propagation node, delivered to any of {dest}'s sessions when one syncs"
             )
+        );
+        let reply = departed_result(
+            &dest,
+            Departure::Left(now - Duration::from_secs(7200)),
+            held_reply_sentence,
+            now,
+        );
+        assert_eq!(
+            reply["message"],
+            format!(
+                "{dest} left 2h ago; held at the propagation node, delivered to the session that asked when it syncs"
+            ),
+            "a held reply is taken only by the session that asked"
         );
     }
 

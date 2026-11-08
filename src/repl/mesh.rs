@@ -17,7 +17,7 @@ use crate::mesh::fetch::{
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
-use crate::mesh::idle::{plural, sync_ask_suffix};
+use crate::mesh::idle::{LEFT_FOR_ANOTHER_SESSION, plural, sync_ask_suffix};
 use crate::mesh::knock::{
     DroppedKnocks, KNOCK_BUCKET_REFILL_INTERVAL, KNOCK_DROPS_REMEMBERED,
     KNOCK_IS_NOT_FIRST_CONTACT, KnockFallback, KnockIntro, KnockOutcome, KnockVia,
@@ -26,8 +26,8 @@ use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, HELD_FOR_DEPARTED, HELD_FOR_DEPARTED_END, OutboundPeer,
     PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part, PartLimits, PeerKind, PeerMessage, PeerVia,
-    RawPart, RecipientOutcome, Route, SendError, SendOutcome, held_sentence, is_wire_id,
-    left_mesh_hint, unreachable_head,
+    RawPart, RecipientOutcome, Route, SendError, SendOutcome, held_reply_sentence, held_sentence,
+    is_wire_id, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
@@ -1325,7 +1325,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 }
 
 /// `reply_sent_line` for a follow-up on this node's own question, saying, when the peer
-/// had gone, that the propagation node holds it and for whom.
+/// had gone, that the propagation node holds it for the session that asked.
 fn own_reply_sent_line(
     outcome: &SendOutcome,
     destination: &str,
@@ -1336,7 +1336,7 @@ fn own_reply_sent_line(
     match outcome.departed {
         Some(departed) => line.frame(format!(
             " {}. {SEE_WHEN_IT_IS_BACK}",
-            held_sentence(short(destination), departed, now)
+            held_reply_sentence(short(destination), departed, now)
         )),
         None => line,
     }
@@ -1689,8 +1689,8 @@ mod dismiss_and_answer_line_tests {
                 };
                 (
                     own_reply_sent_line(&held, DESTINATION, ".vault", now),
-                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to any of 1a2b3c4d's sessions when one syncs. .mesh peers shows when it announces again.",
-                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to any of 1a2b3c4d's sessions when one syncs. /mesh peers shows when it announces again.",
+                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. .mesh peers shows when it announces again.",
+                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. /mesh peers shows when it announces again.",
                 )
             },
         ]
@@ -3536,7 +3536,20 @@ fn unreadable_note(stores: usize) -> Option<String> {
 
 fn render_sync(report: &FetchReport) -> String {
     let node = short(&report.node);
+    let left = report.left_for_session;
     if report.listed > 0 && report.wanted == 0 {
+        if left > 0 {
+            let processed = report.listed.saturating_sub(left);
+            let processed = if processed > 0 {
+                format!("{processed} already processed, ")
+            } else {
+                String::new()
+            };
+            return format!(
+                "Nothing new held for this node at {node}: {} listed, {processed}{left} {LEFT_FOR_ANOTHER_SESSION}.",
+                report.listed
+            );
+        }
         return format!(
             "Nothing new held for this node at {node}: {} listed, all already processed.",
             report.listed
@@ -3570,6 +3583,9 @@ fn render_sync(report: &FetchReport) -> String {
         line.push_str(&format!(": {suffix}"));
     }
     line.push('.');
+    if left > 0 {
+        line.push_str(&format!(" {left} {LEFT_FOR_ANOTHER_SESSION}."));
+    }
     if report.wanted == MAX_WANTS_PER_FETCH {
         line.push_str(" More may be held; run .mesh sync again.");
     }
@@ -3593,6 +3609,7 @@ mod sync_ask_line_tests {
             deferred: 1,
             deferred_after_ask: 1,
             acknowledged: 0,
+            left_for_session: 0,
         };
         assert_eq!(
             render_sync(&report),
@@ -3613,6 +3630,7 @@ mod sync_ask_line_tests {
             deferred: 3,
             deferred_after_ask: 1,
             acknowledged: 0,
+            left_for_session: 0,
         };
         assert_eq!(
             render_sync(&report),
@@ -3622,6 +3640,48 @@ mod sync_ask_line_tests {
         assert_eq!(
             render_sync(&report),
             "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh sync in a minute."
+        );
+    }
+
+    /// Replies left on the node for the session that asked are counted on their own, on
+    /// the sync that read them and on the later ones that did not ask for them again.
+    #[test]
+    fn replies_left_for_another_session_are_counted_apart() {
+        let report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 2,
+            wanted: 2,
+            received: 2,
+            delivered: 1,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 0,
+            deferred_after_ask: 0,
+            acknowledged: 1,
+            left_for_session: 1,
+        };
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from deadbeef: 2 listed, 2 wanted, 2 received, 1 delivered, 0 duplicates, 0 discarded, 0 deferred. 1 left on the node for another session."
+        );
+        let not_asked_again = FetchReport {
+            wanted: 0,
+            received: 0,
+            delivered: 0,
+            acknowledged: 0,
+            ..report.clone()
+        };
+        assert_eq!(
+            render_sync(&not_asked_again),
+            "Nothing new held for this node at deadbeef: 2 listed, 1 already processed, 1 left on the node for another session."
+        );
+        let only_left = FetchReport {
+            listed: 1,
+            ..not_asked_again
+        };
+        assert_eq!(
+            render_sync(&only_left),
+            "Nothing new held for this node at deadbeef: 1 listed, 1 left on the node for another session."
         );
     }
 }
@@ -16356,6 +16416,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 deferred: 1,
                 deferred_after_ask: 0,
                 acknowledged: 5,
+                left_for_session: 0,
             };
             let line = render_sync(&report);
             assert_eq!(
@@ -31962,6 +32023,25 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(result["via"], "store_and_forward", "{tool}: {result}");
                         pn.next_received().await;
                     }
+                    // A held reply is taken only by the session that asked, so its
+                    // sentence names that session rather than any of the peer's.
+                    let result = handle_mesh_tool(
+                        &mut ctx,
+                        "mesh__send",
+                        &serde_json::json!({ "to": peer, "message": "the answer", "in_reply_to": "q-from-tia" }),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(result["departed"]["state"], "left", "{result}");
+                    let message = result["departed"]["message"].as_str().unwrap_or_default();
+                    assert!(
+                        message.starts_with(&format!("{peer} left "))
+                            && message.ends_with(
+                                "s ago; held at the propagation node, delivered to the session that asked when it syncs"
+                            ),
+                        "{result}"
+                    );
+                    pn.next_received().await;
                     for (what, took) in &timings {
                         assert!(
                             *took < PATH_REQUEST_TIMEOUT,

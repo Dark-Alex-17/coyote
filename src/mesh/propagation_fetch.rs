@@ -35,7 +35,7 @@ use rns_transport::identity_bridge::{to_core_identity, to_core_private_identity}
 use rns_transport::transport::Transport;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::future::Future;
@@ -347,6 +347,41 @@ pub(crate) trait InboundSink: Send + Sync {
     fn deliver(&self, message: InboundMessage);
 }
 
+/// Asked of every message that passed the checks, before anything about it is recorded:
+/// `Some` leaves it on the node for another reader of this identity's mailbox, named in
+/// the returned text for the log, instead of taking it here.
+pub(crate) trait HoldPolicy: Send + Sync {
+    fn leave_on_node(&self, message: &InboundMessage) -> Option<String>;
+}
+
+/// The transient ids this process left on the node for another reader, oldest first and
+/// at most `MAX_DEFERRED_IDS`, so a later fetch neither downloads them again nor names
+/// them as `haves`. Held in memory only: an id in the fetch store goes out as a `have`
+/// on the next fetch of any reader, since the store is shared, and the node would delete
+/// the message before its reader had it. After a restart each is downloaded once more.
+#[derive(Debug, Default)]
+pub(crate) struct LeftIds {
+    ids: VecDeque<TransientId>,
+}
+
+impl LeftIds {
+    pub(crate) fn contains(&self, id: &TransientId) -> bool {
+        self.ids.contains(id)
+    }
+
+    /// `false` when `id` was already held. Past the cap the oldest is forgotten.
+    pub(crate) fn insert(&mut self, id: TransientId) -> bool {
+        if self.contains(&id) {
+            return false;
+        }
+        self.ids.push_back(id);
+        while self.ids.len() > MAX_DEFERRED_IDS {
+            self.ids.pop_front();
+        }
+        true
+    }
+}
+
 /// Notes each delivered message in the debug log by its hashes and lengths; the title and
 /// content are the sender's bytes and are never logged raw.
 pub(crate) struct LoggingInboundSink;
@@ -367,9 +402,9 @@ impl InboundSink for LoggingInboundSink {
     }
 }
 
-/// `received` splits into `delivered`, `duplicates`, `discarded` and `deferred`;
-/// `acknowledged` is what round 3 told the node to delete, every received body but the
-/// deferred ones.
+/// `received` splits into `delivered`, `duplicates`, `discarded`, `deferred` and the
+/// bodies left for another reader; `acknowledged` is what round 3 told the node to
+/// delete, every received body but the deferred and left ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchReport {
     pub node: String,
@@ -384,6 +419,10 @@ pub(crate) struct FetchReport {
     /// deferring them.
     pub deferred_after_ask: usize,
     pub acknowledged: usize,
+    /// Messages left on the node for another reader of this identity's mailbox: those
+    /// this fetch received and left, and those listed that an earlier fetch of this
+    /// process left, which were not asked for again.
+    pub left_for_session: usize,
 }
 
 /// Why a body was deferred after this node asked the mesh for its sender's announce.
@@ -403,6 +442,7 @@ impl FetchReport {
             deferred: 0,
             deferred_after_ask: 0,
             acknowledged: 0,
+            left_for_session: 0,
         }
     }
 }
@@ -1102,6 +1142,9 @@ pub(crate) enum BodyOutcome {
         asked: bool,
     },
     Discarded(Discard),
+    /// Left on the node for another reader of this identity's mailbox, as the hold
+    /// policy decided: neither recorded nor acknowledged, and never delivered here.
+    LeftForSession,
 }
 
 /// What came of asking the mesh for a sender's announce.
@@ -1244,6 +1287,8 @@ pub(crate) struct BodyPipeline<'a> {
     pub keys: &'a dyn SourceKeys,
     pub trust: &'a TrustStore,
     pub sink: &'a dyn InboundSink,
+    /// Asked of every message that passed the checks, before it is recorded or delivered.
+    pub hold: &'a dyn HoldPolicy,
     pub node: &'a str,
     /// The sources this fetch has asked the mesh for or found nothing to ask for, so one
     /// sender's bodies cost one ask however many of them the node serves. A skip for
@@ -1267,13 +1312,16 @@ pub(crate) fn check_bounds(body: &[u8]) -> Result<(), Discard> {
 
 impl BodyPipeline<'_> {
     /// Bounds, dedups, decrypts, resolves and verifies the signer, consults the trust list,
-    /// then delivers. Dedup runs before decryption as in the reference (`LXMRouter.py:2319`)
-    /// on the transient id, and again on the message id once decrypted (`:1799-1803`). The
-    /// verdict decides what the store remembers: a delivered or discarded body's transient
+    /// asks the hold policy, then delivers. Dedup runs before decryption as in the
+    /// reference (`LXMRouter.py:2319`) on the transient id, and again on the message id
+    /// once decrypted (`:1799-1803`). The verdict decides what the store remembers: a
+    /// delivered or discarded body's transient
     /// id is recorded (`:2323`) so it is not tried again, except one refused on length,
     /// which was never read; a body whose source has no known key is deferred instead and
     /// left unrecorded, so the node keeps serving it until a key turns up or the deferral
-    /// budget is spent. The signature is checked before the trust list is consulted, so the
+    /// budget is spent. A body the hold policy leaves for another reader is not recorded
+    /// either, since a recorded id is purged from the node on the next fetch of any
+    /// reader. The signature is checked before the trust list is consulted, so the
     /// trust list is only ever asked about a proven signer. Only a transport wait that
     /// expires is an error; every verdict about the body is an outcome.
     pub(crate) async fn process(
@@ -1285,6 +1333,14 @@ impl BodyPipeline<'_> {
         let transient_id = transient_id_of(body);
         match self.screen(body, &transient_id, store).await? {
             Ok(message) => {
+                if let Some(reader) = self.hold.leave_on_node(&message) {
+                    debug!(
+                        "Propagation fetch from {}: left transient {} on the node for {reader}",
+                        self.node,
+                        short(&hex_lower(&transient_id))
+                    );
+                    return Ok(BodyOutcome::LeftForSession);
+                }
                 store.insert(transient_id, now);
                 store.record_delivered(message.message_id, now);
                 self.sink.deliver(message);
@@ -1528,6 +1584,10 @@ async fn unless_cancelled<T>(
 /// the next fetch purges them as `haves` instead of receiving them again. `cancel` firing
 /// abandons the fetch at whichever wait on the node it is in, with `Cancelled`; between
 /// those waits it runs on, so what was recorded always reaches the disk.
+///
+/// `hold` is asked of every message that passes the checks; one it leaves for another
+/// reader of the mailbox goes into `left`, which this fetch and later ones neither ask
+/// for again nor name as `haves`, so the node keeps it for that reader.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch(
     transport: &Transport,
@@ -1537,6 +1597,8 @@ pub(crate) async fn fetch(
     trust: &TrustStore,
     store: &mut FetchStore,
     sink: &dyn InboundSink,
+    hold: &dyn HoldPolicy,
+    left: &Mutex<LeftIds>,
     options: &FetchOptions,
     cancel: CancellationToken,
 ) -> Result<FetchReport, FetchError> {
@@ -1595,11 +1657,16 @@ pub(crate) async fn fetch(
 
     let mut wants = Vec::new();
     let mut haves = Vec::new();
-    for id in &ids {
-        if store.contains(id) {
-            haves.push(*id);
-        } else if wants.len() < MAX_WANTS_PER_FETCH {
-            wants.push(*id);
+    {
+        let left = left.lock();
+        for id in &ids {
+            if store.contains(id) {
+                haves.push(*id);
+            } else if left.contains(id) {
+                report.left_for_session += 1;
+            } else if wants.len() < MAX_WANTS_PER_FETCH {
+                wants.push(*id);
+            }
         }
     }
     report.wanted = wants.len();
@@ -1609,6 +1676,12 @@ pub(crate) async fn fetch(
         wants.len(),
         haves.len()
     );
+    if report.left_for_session > 0 {
+        debug!(
+            "Propagation fetch from {node_short}: not asking again for {} left on the node for another session",
+            report.left_for_session
+        );
+    }
     debug!(
         "Propagation fetch from {node_short}: round 2 requested {} bodies within {FETCH_TRANSFER_LIMIT_KB} kB",
         wants.len()
@@ -1648,12 +1721,21 @@ pub(crate) async fn fetch(
         keys: &keys,
         trust,
         sink,
+        hold,
         node: node_short,
         asked: Mutex::default(),
         cancel: cancel.clone(),
     };
-    let acks =
-        process_and_persist(&pipeline, &bodies, store, &mut report, &node_hex, failed).await?;
+    let acks = process_and_persist(
+        &pipeline,
+        &bodies,
+        store,
+        left,
+        &mut report,
+        &node_hex,
+        failed,
+    )
+    .await?;
 
     debug!(
         "Propagation fetch from {node_short}: round 3 acknowledging {} bodies, leaving {} deferred on the node",
@@ -1682,20 +1764,21 @@ pub(crate) async fn fetch(
 
 /// Persists the store before the loop's outcome is looked at, so what it recorded survives
 /// a transport error inside it; the sync is only recorded when the loop completed. Returns
-/// the ids round 3 tells the node to delete: every body but the deferred ones, each id once
-/// however often it was served. The body loop is non-cancellable by design, so cancellation
-/// is not a loop exit path; aborting the `fetch_propagated` future mid-loop skips the
-/// persist here, but not the one `ask_then_retry` makes before waiting on the network, so
-/// only the bodies since the last ask can be delivered again.
+/// the ids round 3 tells the node to delete: every body but the deferred and left ones,
+/// each id once however often it was served. The body loop is non-cancellable by design,
+/// so cancellation is not a loop exit path; aborting the `fetch_propagated` future
+/// mid-loop skips the persist here, but not the one `ask_then_retry` makes before waiting
+/// on the network, so only the bodies since the last ask can be delivered again.
 async fn process_and_persist(
     pipeline: &BodyPipeline<'_>,
     bodies: &[Vec<u8>],
     store: &mut FetchStore,
+    left: &Mutex<LeftIds>,
     report: &mut FetchReport,
     node_hex: &str,
     failed: impl Fn(RequestError) -> FetchError,
 ) -> Result<Vec<TransientId>, FetchError> {
-    let processed = process_bodies(pipeline, bodies, store, report).await;
+    let processed = process_bodies(pipeline, bodies, store, left, report).await;
     if processed.is_ok() {
         store.record_sync(node_hex, SystemTime::now(), bodies.len());
     }
@@ -1707,6 +1790,7 @@ async fn process_bodies(
     pipeline: &BodyPipeline<'_>,
     bodies: &[Vec<u8>],
     store: &mut FetchStore,
+    left: &Mutex<LeftIds>,
     report: &mut FetchReport,
 ) -> Result<Vec<TransientId>, RequestError> {
     let mut acks = Vec::with_capacity(bodies.len());
@@ -1717,6 +1801,12 @@ async fn process_bodies(
                 report.deferred += 1;
                 if asked {
                     report.deferred_after_ask += 1;
+                }
+                continue;
+            }
+            BodyOutcome::LeftForSession => {
+                if left.lock().insert(transient_id_of(body)) {
+                    report.left_for_session += 1;
                 }
                 continue;
             }
@@ -1766,6 +1856,37 @@ mod tests {
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, value).unwrap();
         bytes
+    }
+
+    /// Takes every message, as a mailbox with a single reader does.
+    struct TakeAll;
+
+    impl HoldPolicy for TakeAll {
+        fn leave_on_node(&self, _message: &InboundMessage) -> Option<String> {
+            None
+        }
+    }
+
+    /// Leaves every message whose content is `content`, and counts what it was asked.
+    struct LeaveContent {
+        content: &'static [u8],
+        asked: Mutex<usize>,
+    }
+
+    impl LeaveContent {
+        fn new(content: &'static [u8]) -> Self {
+            Self {
+                content,
+                asked: Mutex::new(0),
+            }
+        }
+    }
+
+    impl HoldPolicy for LeaveContent {
+        fn leave_on_node(&self, message: &InboundMessage) -> Option<String> {
+            *self.asked.lock() += 1;
+            (message.content.as_deref() == Some(self.content)).then(|| "the other one".to_string())
+        }
     }
 
     fn id(byte: u8) -> TransientId {
@@ -2159,6 +2280,25 @@ mod tests {
             } = self;
             run_body(recipient, keys, trust, sink, store, body, SystemTime::now()).await
         }
+
+        /// `process` with `hold` asked before a body that passed the checks is taken.
+        async fn process_holding(&mut self, body: &[u8], hold: &dyn HoldPolicy) -> BodyOutcome {
+            let pipeline = BodyPipeline {
+                recipient: &self.recipient,
+                delivery: lxmf_delivery_hash(&self.me()),
+                keys: &self.keys,
+                trust: &self.trust,
+                sink: &self.sink,
+                hold,
+                node: "fake",
+                asked: Mutex::default(),
+                cancel: CancellationToken::new(),
+            };
+            pipeline
+                .process(body, &mut self.store, SystemTime::now())
+                .await
+                .unwrap()
+        }
     }
 
     async fn run_body(
@@ -2176,6 +2316,7 @@ mod tests {
             keys,
             trust,
             sink,
+            hold: &TakeAll,
             node: "fake",
             asked: Mutex::default(),
             cancel: CancellationToken::new(),
@@ -2190,6 +2331,7 @@ mod tests {
             BodyOutcome::Deferred { attempts, .. } => {
                 panic!("expected a discard, deferred {attempts}")
             }
+            BodyOutcome::LeftForSession => panic!("expected a discard, the body was left"),
         }
     }
 
@@ -2796,6 +2938,74 @@ mod tests {
         assert_eq!(inbox.count(), 1);
     }
 
+    /// The hold policy is asked only about a message that passed every check. One it
+    /// leaves is neither delivered nor recorded, on disk or in memory, as a transient or a
+    /// message id: a recorded id would go out as a `have` on the next fetch of any session
+    /// sharing the store, and the node would delete the message before its reader had it.
+    #[tokio::test]
+    async fn a_body_the_hold_policy_leaves_is_neither_delivered_nor_recorded() {
+        let sender = CorePrivateIdentity::new_from_rand(OsRng);
+        let sender_id = transport_identity_of(&sender);
+        let stranger = CorePrivateIdentity::new_from_rand(OsRng);
+        let mut bench = Bench::new(
+            "fetch-hold-left",
+            TrustList::default().identity(&identity_hex(&sender_id), true),
+        );
+        bench.keys.know(&sender_id);
+        bench.keys.know(&transport_identity_of(&stranger));
+        let me = bench.me();
+        let hold = LeaveContent::new(b"for another session");
+        let body = honest_body(&sender, &me, b"for another session");
+        let transient = transient_id_of(&body);
+        let untrusted = honest_body(&stranger, &me, b"for another session");
+
+        assert_eq!(
+            discarded(bench.process_holding(&untrusted, &hold).await),
+            Discard::UntrustedSource
+        );
+        assert_eq!(
+            *hold.asked.lock(),
+            0,
+            "a refused body never reaches the policy"
+        );
+
+        assert_eq!(
+            bench.process_holding(&body, &hold).await,
+            BodyOutcome::LeftForSession
+        );
+        assert_eq!(*hold.asked.lock(), 1);
+        assert_eq!(bench.sink.count(), 0);
+        assert!(!bench.store.contains(&transient));
+        assert_eq!(bench.store.deferral_of(&transient), None);
+        bench.store.persist().unwrap();
+        let reloaded = FetchStore::load(bench.store.path.clone(), SystemTime::now()).unwrap();
+        assert!(!reloaded.contains(&transient));
+        let on_disk = std::fs::read_to_string(&bench.store.path).unwrap();
+        assert!(
+            !on_disk.contains(&hex_lower(&transient)),
+            "the left body's id is not in the store file: {on_disk}"
+        );
+
+        // The same body taken by the session it is for is delivered as any other, and its
+        // message id was not remembered as delivered by the session that left it.
+        assert_eq!(bench.process(&body).await, BodyOutcome::Delivered);
+        assert_eq!(bench.sink.count(), 1);
+    }
+
+    #[test]
+    fn left_ids_are_bounded_and_forget_the_oldest_first() {
+        let mut left = LeftIds::default();
+        assert!(left.insert(id(0)));
+        assert!(!left.insert(id(0)), "an id already held is not held twice");
+        for i in 1..=MAX_DEFERRED_IDS {
+            let mut next = [0u8; 32];
+            next[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(left.insert(next));
+        }
+        assert_eq!(left.ids.len(), MAX_DEFERRED_IDS);
+        assert!(!left.contains(&id(0)), "the oldest is forgotten first");
+    }
+
     fn store_at(tmp: &TempDir, now: SystemTime) -> FetchStore {
         FetchStore::load(tmp.path.join("mesh").join("propagation.json"), now).unwrap()
     }
@@ -3341,14 +3551,21 @@ mod tests {
                     keys,
                     trust: &self.trust,
                     sink: &self.sink,
+                    hold: &TakeAll,
                     node: "fake",
                     asked: Mutex::default(),
                     cancel: CancellationToken::new(),
                 };
                 let mut report = FetchReport::new("fake".to_string());
-                process_bodies(&pipeline, bodies, &mut self.store, &mut report)
-                    .await
-                    .unwrap();
+                process_bodies(
+                    &pipeline,
+                    bodies,
+                    &mut self.store,
+                    &Mutex::default(),
+                    &mut report,
+                )
+                .await
+                .unwrap();
                 report
             }
         }
@@ -3543,6 +3760,7 @@ mod tests {
                     keys: &stalled,
                     trust: &bench.trust,
                     sink: &bench.sink,
+                    hold: &TakeAll,
                     node: "fake",
                     asked: Mutex::default(),
                     cancel: cancel.clone(),
@@ -3555,7 +3773,13 @@ mod tests {
 
                 let finished = tokio::time::timeout(
                     Duration::from_secs(5),
-                    process_bodies(&pipeline, &bodies, &mut bench.store, &mut report),
+                    process_bodies(
+                        &pipeline,
+                        &bodies,
+                        &mut bench.store,
+                        &Mutex::default(),
+                        &mut report,
+                    ),
                 )
                 .await;
 
@@ -3625,15 +3849,22 @@ mod tests {
                     keys: &keys,
                     trust: &bench.trust,
                     sink: &bench.sink,
+                    hold: &TakeAll,
                     node: "fake",
                     asked: Mutex::default(),
                     cancel: CancellationToken::new(),
                 };
                 let mut report = FetchReport::new("fake".to_string());
 
-                process_bodies(&pipeline, &bodies, &mut bench.store, &mut report)
-                    .await
-                    .unwrap();
+                process_bodies(
+                    &pipeline,
+                    &bodies,
+                    &mut bench.store,
+                    &Mutex::default(),
+                    &mut report,
+                )
+                .await
+                .unwrap();
 
                 assert_eq!(*keys.asks.lock(), 2);
                 assert_eq!((report.deferred, report.deferred_after_ask), (2, 0));
@@ -3708,6 +3939,7 @@ mod tests {
                 keys: &stalled,
                 trust: &bench.trust,
                 sink: &bench.sink,
+                hold: &TakeAll,
                 node: "fake",
                 asked: Mutex::default(),
                 cancel: CancellationToken::new(),
@@ -3716,7 +3948,13 @@ mod tests {
 
             let dropped = tokio::time::timeout(
                 Duration::from_millis(200),
-                process_bodies(&pipeline, &bodies, &mut bench.store, &mut report),
+                process_bodies(
+                    &pipeline,
+                    &bodies,
+                    &mut bench.store,
+                    &Mutex::default(),
+                    &mut report,
+                ),
             )
             .await;
 
@@ -3778,6 +4016,10 @@ mod tests {
             trust: Arc<TrustStore>,
             store_path: PathBuf,
             sink: CountingSink,
+            /// What `fetch` asks before taking a message, and the ids it left, which live
+            /// as long as this `Fetcher` does, as a runtime's do.
+            hold: Box<dyn HoldPolicy>,
+            left: Mutex<LeftIds>,
             _cache: TempDir,
             _trust_dir: TempDir,
         }
@@ -3799,6 +4041,8 @@ mod tests {
                     trust,
                     store_path: cache.path.join("propagation.json"),
                     sink: CountingSink::default(),
+                    hold: Box::new(TakeAll),
+                    left: Mutex::default(),
                     _cache: cache,
                     _trust_dir: trust_dir,
                 }
@@ -3894,6 +4138,8 @@ mod tests {
                         &self.trust,
                         &mut store,
                         &self.sink,
+                        self.hold.as_ref(),
+                        &self.left,
                         &options,
                         CancellationToken::new(),
                     ),
@@ -3956,6 +4202,7 @@ mod tests {
                     deferred: 0,
                     deferred_after_ask: 0,
                     acknowledged: 2,
+                    left_for_session: 0,
                 }
             );
             let seen = fake.script.seen();
@@ -4150,6 +4397,109 @@ mod tests {
             let seen = fake.script.seen();
             assert_eq!(seen.len(), 5, "no round 3 when round 2 brought nothing");
             assert_eq!(packed(&seen[4].data), expected_get(&[], &ids));
+
+            fetcher.stop().await;
+            fake.stop().await;
+        }
+
+        /// A body the hold policy leaves is not acknowledged, never reaches the store file
+        /// and so is never a `have`, and is not asked for again by a later fetch of the
+        /// same process; the counter says so on both fetches. A new process asks for it
+        /// once more and leaves it again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_body_left_for_another_session_stays_on_the_node_and_is_not_wanted_again() {
+            install_log_collector();
+            let fake = FakeNode::listen().await;
+            let sender = TransportIdentity::new_from_rand(OsRng);
+            let sender_core = to_core_private_identity(&sender);
+            let mut fetcher = Fetcher::join(
+                &fake,
+                "fetch-net-left",
+                TrustList::default().identity(&identity_hex(sender.as_identity()), true),
+            )
+            .await;
+            fetcher.learn_delivery(&fake, sender).await;
+            fetcher.hold = Box::new(LeaveContent::new(b"for another session"));
+            let me = fetcher.identity();
+            let left = honest_body(&sender_core, &me, b"for another session");
+            let taken = honest_body(&sender_core, &me, b"for this session");
+            let (left_id, taken_id) = (transient_id_of(&left), transient_id_of(&taken));
+            fake.script.reply_with([
+                ids_value(&[left_id, taken_id]),
+                bodies(&[left.clone(), taken]),
+                Value::Array(vec![]),
+            ]);
+
+            let first = fetcher.fetch().await.unwrap();
+
+            assert_eq!(
+                (
+                    first.received,
+                    first.delivered,
+                    first.left_for_session,
+                    first.acknowledged
+                ),
+                (2, 1, 1, 1)
+            );
+            assert_eq!(
+                fetcher.sink.only().content,
+                Some(b"for this session".to_vec())
+            );
+            assert_eq!(
+                packed(&fake.script.seen()[2].data),
+                expected_ack(&[taken_id]),
+                "round 3 never names the left body"
+            );
+            let store = fetcher.store();
+            assert!(store.contains(&taken_id));
+            assert!(!store.contains(&left_id));
+            assert_eq!(store.deferral_of(&left_id), None);
+            let on_disk = std::fs::read_to_string(&fetcher.store_path).unwrap();
+            assert!(!on_disk.contains(&hex_lower(&left_id)), "{on_disk}");
+            let left_line = format!(
+                "Propagation fetch from {}: left transient {} on the node for the other one",
+                short(&fake.hex()),
+                short(&hex_lower(&left_id))
+            );
+            assert!(
+                debug_snapshot().iter().any(|line| line == &left_line),
+                "{left_line:?}"
+            );
+
+            fake.script
+                .reply_with([ids_value(&[left_id, taken_id]), Value::Array(vec![])]);
+            let second = fetcher.fetch().await.unwrap();
+
+            assert_eq!(
+                (second.listed, second.wanted, second.left_for_session),
+                (2, 0, 1)
+            );
+            let seen = fake.script.seen();
+            assert_eq!(seen.len(), 5);
+            assert_eq!(
+                packed(&seen[4].data),
+                expected_get(&[], &[taken_id]),
+                "the left body is neither wanted nor a have"
+            );
+
+            // A restarted process holds no left ids, so it downloads the body once more.
+            fetcher.left = Mutex::default();
+            fake.script.reply_with([
+                ids_value(&[left_id, taken_id]),
+                bodies(&[left]),
+                Value::Array(vec![]),
+            ]);
+            let third = fetcher.fetch().await.unwrap();
+
+            assert_eq!(
+                (third.wanted, third.left_for_session, third.acknowledged),
+                (1, 1, 0)
+            );
+            let seen = fake.script.seen();
+            assert_eq!(packed(&seen[6].data), expected_get(&[left_id], &[taken_id]));
+            assert_eq!(packed(&seen[7].data), expected_ack(&[]));
+            assert!(!fetcher.store().contains(&left_id));
+            assert_eq!(fetcher.sink.count(), 1);
 
             fetcher.stop().await;
             fake.stop().await;
@@ -4511,6 +4861,7 @@ mod tests {
                 keys: &keys,
                 trust: &fetcher.trust,
                 sink: &fetcher.sink,
+                hold: &TakeAll,
                 node: "fake",
                 asked: Mutex::default(),
                 cancel: CancellationToken::new(),
@@ -4521,6 +4872,7 @@ mod tests {
                 &pipeline,
                 &[first, second.clone()],
                 &mut store,
+                &Mutex::default(),
                 &mut report,
                 &fake.hex(),
                 FetchError::Link,
@@ -4892,6 +5244,248 @@ mod tests {
             let slot = Arc::new(MeshSlot::default());
             slot.install(b.runtime.clone()).unwrap();
             assert!(slot.stop().await.unwrap());
+            fake.stop().await;
+        }
+
+        /// The peer messages in `slot`'s inbox, by id.
+        fn inbox_ids(slot: &MeshSlot) -> Vec<String> {
+            slot.peer_inbox()
+                .drain()
+                .0
+                .into_iter()
+                .map(|envelope| match envelope.payload {
+                    EnvelopePayload::Peer(message) => message.message_id,
+                    other => panic!("not a peer envelope: {other:?}"),
+                })
+                .collect()
+        }
+
+        /// Two sessions, A and C, of one identity share its mailbox on the node. Peer B's
+        /// reply to the question A asked, and its reply in a thread A sent whose question
+        /// record is gone, wait there with an ordinary message from B. C syncs first: it
+        /// takes the message and leaves both replies, which it neither acknowledges nor
+        /// records in the store the sessions share, and its next sync asks for neither
+        /// again. A's sync then takes them, the first answering A's open question.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_held_reply_is_left_for_the_session_that_asked_and_answers_it_there() {
+            use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState};
+
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("fetch-net-two-sessions");
+            let b = CorePrivateIdentity::new_from_rand(OsRng);
+            let b_id = transport_identity_of(&b);
+            TrustList::default()
+                .identity(&identity_hex(&b_id), true)
+                .write(&tmp.path.join("config"));
+            let persisted = PropagationNodeTable::load(
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE),
+                SystemTime::now(),
+            )
+            .unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: fake.listener.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+            let start = || async {
+                let runtime = MeshRuntime::start(
+                    &private_config(fake.listener.port),
+                    true,
+                    &mut Session::default(),
+                    mesh_paths(&tmp),
+                    NodeOptions::default(),
+                )
+                .await
+                .unwrap();
+                let slot = Arc::new(MeshSlot::default());
+                slot.install(runtime.clone()).unwrap();
+                (runtime, slot)
+            };
+            let (a, slot_a) = start().await;
+            let (c, slot_c) = start().await;
+            assert_ne!(a.current_instance_id(), c.current_instance_id());
+            let me = transport_identity_of(
+                &load_or_mint_identity(&mesh_paths(&tmp).identity_path).unwrap(),
+            );
+
+            // The fake relays nothing between its clients, so it announces B itself.
+            let origin = OriginName::of(&session_destination_name("b-session"));
+            let b_destination = destination_address(&origin.0, &b_id.address_hash).to_hex_string();
+            let app_data = AnnounceAppData {
+                version: 1,
+                display_name: Some("Bea".to_string()),
+            }
+            .encode()
+            .unwrap();
+            let announced = fake
+                .listener
+                .transport
+                .add_destination(
+                    to_transport_private_identity(&b),
+                    session_destination_name("b-session"),
+                )
+                .await;
+            let packet = announced
+                .lock()
+                .await
+                .announce(OsRng, Some(&app_data))
+                .unwrap();
+            fake.listener.transport.send_packet(packet).await;
+            for runtime in [&a, &c] {
+                let peers = runtime.peers();
+                wait_until("both sessions to file B with its public key", || {
+                    peers.snapshot().iter().any(|peer| {
+                        peer.destination_hash == b_destination && peer.public_key.is_some()
+                    })
+                })
+                .await;
+            }
+
+            let now = SystemTime::now();
+            slot_a
+                .correlations()
+                .open(PendingRecord {
+                    version: PENDING_RECORD_VERSION,
+                    id: "q-a".to_string(),
+                    peer_destination: b_destination.clone(),
+                    peer_identity: identity_hex(&b_id),
+                    thread: "t-a".to_string(),
+                    question: "what time is it".to_string(),
+                    sent_at: rfc3339_utc(now),
+                    timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                    state: PendingState::Open,
+                    reply: None,
+                })
+                .unwrap();
+            a.sent_threads().record_sent("t-a").unwrap();
+            a.sent_threads().record_sent("t-old").unwrap();
+
+            let sealed = |out: &OutboundPeer| {
+                build_signed_message(
+                    &b,
+                    &lxmf_delivery_hash(&me),
+                    &peer_lxmf_message(out, &origin),
+                    1_700_000_000.5,
+                )
+                .unwrap()
+                .pack_propagation_transient_with_rng(&to_core_identity(&me), OsRng)
+                .unwrap()
+                .0
+            };
+            let answer = OutboundPeer::new(PeerKind::Reply, "noon", None, Some("q-a"), None)
+                .unwrap()
+                .with_thread(Some("t-a".to_string()))
+                .unwrap();
+            let late = OutboundPeer::new(PeerKind::Reply, "still noon", None, Some("q-gone"), None)
+                .unwrap()
+                .with_thread(Some("t-old".to_string()))
+                .unwrap();
+            let note = OutboundPeer::new(PeerKind::Message, "hello all", None, None, None).unwrap();
+            let bodies_held = [sealed(&answer), sealed(&late), sealed(&note)];
+            let ids: Vec<TransientId> = bodies_held
+                .iter()
+                .map(|body| transient_id_of(body))
+                .collect();
+            let (answer_id, late_id, note_id) = (ids[0], ids[1], ids[2]);
+            let fetch = |runtime: &Arc<MeshRuntime>| {
+                let runtime = runtime.clone();
+                async move {
+                    timeout(
+                        FETCH_DEADLINE,
+                        runtime.fetch_propagated(&CountingSink::default()),
+                    )
+                    .await
+                    .expect("the fetch must finish within FETCH_DEADLINE")
+                    .unwrap()
+                }
+            };
+            let store_path = mesh_cache_dir(&tmp.path.join("cache")).join("propagation.json");
+
+            // C syncs first.
+            fake.script
+                .reply_with([ids_value(&ids), bodies(&bodies_held), Value::Array(vec![])]);
+            let report = fetch(&c).await;
+            assert_eq!(
+                (
+                    report.received,
+                    report.delivered,
+                    report.left_for_session,
+                    report.acknowledged
+                ),
+                (3, 1, 2, 1),
+                "{report:?}"
+            );
+            assert_eq!(
+                packed(&fake.script.seen()[2].data),
+                expected_ack(&[note_id])
+            );
+            assert_eq!(inbox_ids(&slot_c), [note.id.clone()]);
+            assert!(slot_a.correlations().is_open("q-a"));
+            let store = FetchStore::load(store_path.clone(), SystemTime::now()).unwrap();
+            assert!(store.contains(&note_id));
+            for left in [&answer_id, &late_id] {
+                assert!(
+                    !store.contains(left),
+                    "a left reply is never in the shared store"
+                );
+            }
+
+            // C again: neither reply is asked for, and neither is a have.
+            fake.script
+                .reply_with([ids_value(&[answer_id, late_id]), Value::Array(vec![])]);
+            let report = fetch(&c).await;
+            assert_eq!(
+                (report.wanted, report.left_for_session),
+                (0, 2),
+                "{report:?}"
+            );
+            assert_eq!(packed(&fake.script.seen()[4].data), expected_get(&[], &[]));
+
+            // A takes both; the first answers A's question.
+            fake.script.reply_with([
+                ids_value(&[answer_id, late_id, note_id]),
+                bodies(&bodies_held[..2]),
+                Value::Array(vec![]),
+            ]);
+            let report = fetch(&a).await;
+            assert_eq!(
+                (
+                    report.wanted,
+                    report.delivered,
+                    report.left_for_session,
+                    report.acknowledged
+                ),
+                (2, 2, 0, 2),
+                "{report:?}"
+            );
+            let seen = fake.script.seen();
+            assert_eq!(
+                packed(&seen[6].data),
+                expected_get(&[answer_id, late_id], &[note_id]),
+                "A purges what C took and asks for what C left"
+            );
+            assert_eq!(packed(&seen[7].data), expected_ack(&[answer_id, late_id]));
+            assert!(!slot_a.correlations().is_open("q-a"));
+            assert_eq!(
+                slot_a
+                    .correlations()
+                    .take_answer("q-a")
+                    .map(|reply| reply.message_id),
+                Some(answer.id.clone())
+            );
+            let in_a = inbox_ids(&slot_a);
+            assert!(in_a.contains(&late.id), "{in_a:?}");
+            assert!(!in_a.contains(&note.id), "{in_a:?}");
+            assert!(inbox_ids(&slot_c).is_empty());
+
+            assert!(slot_a.stop().await.unwrap());
+            assert!(slot_c.stop().await.unwrap());
             fake.stop().await;
         }
     }

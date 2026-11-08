@@ -241,6 +241,38 @@ fn parse_sent_threads(bytes: &[u8]) -> Result<SentThreadsFile, SentThreadsParse>
     })
 }
 
+/// The instances on `cache_dir` whose list holds `thread`, sent or received, sorted.
+/// Each `sent-threads-<instance_id>.json` is read as it stands and never written, moved
+/// or deleted, since the session it belongs to may be running: `SentThreads::open` is
+/// for a session's own list only. A file that cannot be read or parsed, or is of another
+/// version, counts as not holding the thread.
+pub(crate) fn instances_holding_thread(cache_dir: &Path, thread: &str) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(mesh_cache_dir(cache_dir)) else {
+        return Vec::new();
+    };
+    let mut holders: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let instance_id = name
+                .to_str()?
+                .strip_prefix("sent-threads-")?
+                .strip_suffix(".json")?;
+            if instance_id.is_empty() {
+                return None;
+            }
+            let file = parse_sent_threads(&fs::read(entry.path()).ok()?).ok()?;
+            file.sent
+                .iter()
+                .chain(&file.received)
+                .any(|held| held == thread)
+                .then(|| instance_id.to_string())
+        })
+        .collect();
+    holders.sort();
+    holders
+}
+
 /// Warns about a list that cannot be used, `cause` first and the raw `error` after it,
 /// renames it to `<path>.corrupt` (replacing any earlier one) and returns the empty lists
 /// the node starts with. A failed rename is only warned about; the file is cache and
@@ -295,6 +327,64 @@ mod tests {
             store(&tmp).path(),
             tmp.path.join("mesh").join("sent-threads-inst.json")
         );
+    }
+
+    /// Another session's list is read, never set aside: a thread in either list names
+    /// the session, and a corrupt file, one of another version, a set-aside copy and the
+    /// list earlier builds shared name nobody and are left byte for byte.
+    #[test]
+    fn instances_holding_a_thread_are_read_without_touching_any_file() {
+        let tmp = TempDir::new("sent-threads-holders");
+        let a = SentThreads::open(&tmp.path, "inst-a").unwrap();
+        a.record_sent("t-shared").unwrap();
+        let b = SentThreads::open(&tmp.path, "inst-b").unwrap();
+        b.record_received("t-shared").unwrap();
+        b.record_received("t-b").unwrap();
+        let dir = tmp.path.join("mesh");
+        fs::write(dir.join("sent-threads-broken.json"), b"{not json").unwrap();
+        fs::write(
+            dir.join("sent-threads-future.json"),
+            br#"{"version":99,"sent":["t-shared"],"received":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("sent-threads-aside.json.corrupt"),
+            br#"{"version":1,"sent":["t-shared"],"received":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("sent-threads.json"),
+            br#"{"version":1,"sent":["t-shared"],"received":[]}"#,
+        )
+        .unwrap();
+        let before: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| (entry.path(), fs::read(entry.path()).unwrap()))
+            .collect();
+
+        assert_eq!(
+            instances_holding_thread(&tmp.path, "t-shared"),
+            ["inst-a", "inst-b"]
+        );
+        assert_eq!(instances_holding_thread(&tmp.path, "t-b"), ["inst-b"]);
+        assert!(instances_holding_thread(&tmp.path, "t-none").is_empty());
+        assert!(instances_holding_thread(&tmp.path.join("nowhere"), "t-b").is_empty());
+
+        let after: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| (entry.path(), fs::read(entry.path()).unwrap()))
+            .collect();
+        assert_eq!(after.len(), before.len());
+        for (path, bytes) in before {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "{} changed",
+                path.display()
+            );
+        }
     }
 
     #[test]
