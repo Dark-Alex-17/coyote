@@ -96,16 +96,7 @@ impl ReplCompleter {
                 create_suggestion(&name, description, span)
             }));
 
-            let macros: Vec<(String, Option<String>)> = ctx
-                .visible_macro_completions()
-                .into_iter()
-                .map(|(name, description)| (format!(".{name}"), description))
-                .filter(|(name, _)| {
-                    command_filter.len() == 1
-                        || name.starts_with(command_filter.get(..2).unwrap_or(&command_filter))
-                })
-                .collect();
-            let macros = fuzzy_filter(macros, |(name, _)| name.as_str(), &command_filter);
+            let macros = macro_candidates(ctx.visible_macro_completions(), &command_filter);
             suggestions.extend(macros.iter().map(|(name, description)| {
                 create_suggestion(
                     &format!("{} ", with_sigil(name, sigil)),
@@ -158,6 +149,23 @@ pub(crate) fn command_candidates(
         })
         .collect();
     fuzzy_filter(commands, |v| v.name, command_filter)
+}
+
+/// The enabled macros offered for a typed command token, as `.name`
+/// rows, narrowed the same way as `command_candidates`.
+pub(crate) fn macro_candidates<D>(
+    macros: Vec<(String, D)>,
+    command_filter: &str,
+) -> Vec<(String, D)> {
+    let macros: Vec<(String, D)> = macros
+        .into_iter()
+        .map(|(name, description)| (format!(".{name}"), description))
+        .filter(|(name, _)| {
+            command_filter.len() == 1
+                || name.starts_with(command_filter.get(..2).unwrap_or(command_filter))
+        })
+        .collect();
+    fuzzy_filter(macros, |(name, _)| name.as_str(), command_filter)
 }
 
 fn with_sigil(name: &str, sigil: char) -> String {

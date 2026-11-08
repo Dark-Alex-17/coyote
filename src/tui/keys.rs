@@ -263,10 +263,6 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Up if ctrl => Action::FocusPrev,
             KeyCode::Down if ctrl => Action::FocusNext,
             KeyCode::Up if alt => Action::EditQueued,
-            // A draft keeps the letter: `G` mid-sentence is typing.
-            KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
-                Action::ScrollToBottom
-            }
             KeyCode::Esc if ctx.popup.is_some() => Action::ClosePopup,
             KeyCode::Up if ctx.popup.is_some() => Action::PaletteMove(-1),
             KeyCode::Down if ctx.popup.is_some() => Action::PaletteMove(1),
@@ -290,6 +286,11 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             }
             KeyCode::Backspace if ctx.popup == Some(PopupKind::HistorySearch) => {
                 Action::PopupBackspace
+            }
+            // A draft keeps the letter: `G` mid-sentence is typing, and a
+            // band that takes letters above gets it as a filter character.
+            KeyCode::Char('g') if shift && !ctrl && ctx.scrolled && ctx.composer_empty => {
+                Action::ScrollToBottom
             }
             // Interrupting the turn outranks a focused row; the focus
             // goes with it.
@@ -689,6 +690,10 @@ mod tests {
             popup: Some(PopupKind::HistorySearch),
             ..IDLE
         };
+        let scrolled_search = KeyContext {
+            scrolled: true,
+            ..search
+        };
         let rewind = KeyContext {
             popup: Some(PopupKind::Rewind),
             ..IDLE
@@ -697,6 +702,7 @@ mod tests {
         let cases = [
             (plain(KeyCode::Char('g')), search, Action::PopupChar('g')),
             (shifted_g, search, Action::PopupChar('G')),
+            (shifted_g, scrolled_search, Action::PopupChar('G')),
             (plain(KeyCode::Char(' ')), search, Action::PopupChar(' ')),
             (plain(KeyCode::Backspace), search, Action::PopupBackspace),
             (plain(KeyCode::Enter), search, Action::PaletteAccept),

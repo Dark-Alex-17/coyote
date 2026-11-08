@@ -223,7 +223,7 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
     let answer = match prompter.prompt(req) {
         Ok(answer) => answer,
         Err(err) => {
-            let answer = if err.is::<NeedsHuman>() {
+            let answer = if NeedsHuman::caused(&err) {
                 "<needs_human>"
             } else {
                 "<error>"
@@ -343,6 +343,14 @@ pub struct HeadlessPrompter;
 /// otherwise be read as text.
 #[derive(Debug)]
 pub(crate) struct NeedsHuman(pub(crate) PromptAction);
+
+impl NeedsHuman {
+    /// Whether `err` is, or wraps through `context`, this refusal.
+    pub(crate) fn caused(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.downcast_ref::<NeedsHuman>().is_some())
+    }
+}
 
 impl fmt::Display for NeedsHuman {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -569,9 +577,9 @@ mod tests {
         );
     }
 
-    /// The only `Password` pin: no `user__*` tool raises one, so the
-    /// variant stays exercised here alone until the vault prompts route
-    /// through the prompter.
+    /// No `user__*` tool raises a `Password` prompt; the variant reaches
+    /// the prompter from the wire protocol and is pinned here as well as
+    /// by the TUI's masked modal.
     #[test]
     #[serial]
     fn ask_returns_a_password_but_publishes_it_redacted() {
@@ -671,6 +679,17 @@ mod tests {
                 format!("The {name} prompt needs a human and none is attached to this run")
             );
         }
+    }
+
+    #[test]
+    fn a_refusal_is_recognised_under_added_context() {
+        use anyhow::Context;
+        let err = HeadlessPrompter
+            .prompt(request(PromptAction::Select, None))
+            .context("while asking for a role name")
+            .unwrap_err();
+        assert!(NeedsHuman::caused(&err));
+        assert!(!NeedsHuman::caused(&anyhow!("no tty here")));
     }
 
     #[test]

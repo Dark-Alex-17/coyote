@@ -45,7 +45,7 @@ pub(super) fn carry_over(queue: &NotificationQueue, queued: &[QueuedLine]) {
 /// on it for the next turn.
 pub(super) fn take_user_messages(queue: &NotificationQueue) -> Vec<String> {
     queue
-        .take_where(|notification| !matches!(notification, SystemNotification::UserMessage { .. }))
+        .take_where(|notification| matches!(notification, SystemNotification::UserMessage { .. }))
         .into_iter()
         .filter_map(|notification| match notification {
             SystemNotification::UserMessage { text } => Some(text),

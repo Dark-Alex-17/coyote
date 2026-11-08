@@ -3,7 +3,7 @@ mod highlighter;
 mod prompt;
 mod replay;
 
-pub(crate) use self::completer::{ReplCompleter, command_candidates, split_line};
+pub(crate) use self::completer::{ReplCompleter, command_candidates, macro_candidates, split_line};
 pub(crate) use self::highlighter::{CommandSpan, classify_command};
 use self::highlighter::{MacroNames, ReplHighlighter};
 use self::prompt::ReplPrompt;
@@ -2113,7 +2113,7 @@ fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Opt
 /// The text inside a `::: ... :::` multi-line fence, or the line itself
 /// when it has none. Every surface classifies a submitted line through
 /// this, so a fenced command runs and is shown as a command everywhere.
-fn unfence(line: &str) -> &str {
+pub(crate) fn unfence(line: &str) -> &str {
     match MULTILINE_RE.captures(line) {
         Ok(Some(captures)) => captures.get(1).map_or(line, |text| text.as_str()),
         _ => line,

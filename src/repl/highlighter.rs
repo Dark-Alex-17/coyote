@@ -1,4 +1,4 @@
-use super::REPL_COMMANDS;
+use super::{REPL_COMMANDS, unfence};
 
 use crate::config::{CommandPrefix, RequestContext};
 use crate::utils::NO_COLOR;
@@ -91,9 +91,9 @@ pub(crate) struct CommandSpan {
 }
 
 /// Classifies the command in `line`, if any. The command word opens the
-/// line, after any leading whitespace: that is the only place the line
-/// is dispatched as a command, so a path or a dotted word later in a
-/// sentence is left alone. Known is the longest built-in name, or a
+/// line, after any leading whitespace and a `:::` fence: that is the only
+/// place the line is dispatched as a command, so a path or a dotted word
+/// later in a sentence is left alone. Known is the longest built-in name, or a
 /// name from `extra_known`, after the sigil that ends at the end of the
 /// line or before whitespace, so `.roles` is not `.role`. Unknown is a
 /// sigil followed by a word that matches nothing.
@@ -102,7 +102,9 @@ pub(crate) fn classify_command(
     prefix: CommandPrefix,
     extra_known: &[&str],
 ) -> Option<CommandSpan> {
-    let start = line.len() - line.trim_start().len();
+    let inner = unfence(line);
+    let fence = inner.as_ptr() as usize - line.as_ptr() as usize;
+    let start = fence + inner.len() - inner.trim_start().len();
     let sigil = line[start..]
         .chars()
         .next()
@@ -308,6 +310,21 @@ mod tests {
                 range: 0..9,
                 known: false
             })
+        );
+    }
+
+    #[test]
+    fn a_fenced_command_is_classified_inside_its_fence() {
+        assert_eq!(
+            classify_command(":::\n.help\n:::", CommandPrefix::Dot, &[]),
+            Some(CommandSpan {
+                range: 4..9,
+                known: true
+            })
+        );
+        assert_eq!(
+            matched(":::\n.help\n:::", CommandPrefix::Dot),
+            Some(".help")
         );
     }
 }

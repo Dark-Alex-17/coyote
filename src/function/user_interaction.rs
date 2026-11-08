@@ -227,7 +227,7 @@ fn headless_value(ctx: &RequestContext, req: PromptRequest) -> Result<Value> {
     match ctx.prompt(req) {
         Ok(PromptAnswer::Text(json)) => Ok(serde_json::from_str(&json)?),
         Ok(other) => bail!("Unexpected answer to a headless prompt: {other:?}"),
-        Err(err) if err.is::<NeedsHuman>() => Ok(reply),
+        Err(err) if NeedsHuman::caused(&err) => Ok(reply),
         Err(err) => Err(err),
     }
 }

@@ -533,6 +533,10 @@ impl PendingPrompt {
         !job_id.is_empty() && self.req.job_id.as_deref() == Some(job_id)
     }
 
+    fn asked_by_agent(&self, agent_id: &str) -> bool {
+        !agent_id.is_empty() && self.req.origin.agent_id.as_deref() == Some(agent_id)
+    }
+
     /// The rows of a list modal: the options, plus the custom row of a
     /// select.
     fn list_len(&self) -> usize {
@@ -1315,8 +1319,8 @@ impl App {
         (!line.command).then_some(Command::Unqueue(line.text))
     }
 
-    /// An interrupt is for everything the user lined up, not just the
-    /// turn that is running.
+    /// An interrupt, or the quit that follows one, is for everything the
+    /// user lined up, not just the turn that is running.
     fn drop_queued(&mut self) {
         let dropped = self.queued.len();
         if dropped > 0 {
@@ -1484,7 +1488,10 @@ impl App {
                 self.idle_esc();
                 None
             }
-            Action::Quit => (!self.exiting).then_some(Command::Quit),
+            Action::Quit => {
+                self.drop_queued();
+                (!self.exiting).then_some(Command::Quit)
+            }
             Action::Suspend => Some(Command::Suspend),
             Action::OpenEditor => Some(Command::OpenEditor),
             Action::ScheduleFrame => Some(Command::Redraw),
@@ -1790,6 +1797,7 @@ impl App {
                     AgentOutcome::Interrupted => AgentStatus::Interrupted,
                 };
                 self.set_agent_status(&agent_id, status);
+                self.dismiss_prompts(|prompt| prompt.asked_by_agent(&agent_id));
             }
             UiMsg::TodoUpdated(items) => self.todo.set_items(items),
             UiMsg::Busy(message) => {
@@ -4232,6 +4240,24 @@ mod tests {
         assert!(!frame.contains("pending:"), "{frame}");
     }
 
+    /// Ctrl+D during a turn quits, and what was lined up behind the turn
+    /// goes the same way as on an interrupt, with the same notice.
+    #[test]
+    fn a_quit_drops_the_queued_lines_with_a_notice() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("later");
+        harness.press(KeyCode::Enter);
+        assert_eq!(harness.app.queued.len(), 1);
+        let quit = harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(quit, Some(Command::Quit));
+        assert!(harness.app.queued.is_empty());
+        let frame = harness.draw();
+        assert!(frame.contains("Dropped 1 queued line(s)"), "{frame}");
+    }
+
     /// A line queued after the interrupt, before the turn actually ends,
     /// survives the reconcile even when the dropped one is still on the
     /// queue the turn hands back.
@@ -4487,9 +4513,9 @@ mod tests {
     }
 
     /// A question whose asker ends is taken down with a cancel: the tool
-    /// call or job that asked is matched by its id, an empty id matches
-    /// nothing, a queued question goes the same way as the front, and
-    /// the front's successor gets a fresh gate.
+    /// call, job or agent that asked is matched by its id, an empty id
+    /// matches nothing, a queued question goes the same way as the front,
+    /// and the front's successor gets a fresh gate.
     #[test]
     fn a_prompt_is_cancelled_when_its_asker_ends() {
         fn asked_by(call_id: Option<&str>, job_id: Option<&str>) -> PromptRequest {
@@ -4498,6 +4524,11 @@ mod tests {
                 job_id: job_id.map(str::to_string),
                 ..list_request(PromptAction::Select, None)
             }
+        }
+        fn asked_by_agent(agent_id: &str) -> PromptRequest {
+            let mut req = asked_by(None, None);
+            req.origin.agent_id = Some(agent_id.to_string());
+            req
         }
         fn tool_finished(call_id: &str) -> UiMsg {
             UiMsg::ToolFinished {
@@ -4517,6 +4548,12 @@ mod tests {
         fn job_cancelled(job_id: &str) -> UiMsg {
             UiMsg::JobCancelled {
                 job_id: job_id.to_string(),
+            }
+        }
+        fn agent_finished(agent_id: &str) -> UiMsg {
+            UiMsg::AgentFinished {
+                agent_id: agent_id.to_string(),
+                outcome: AgentOutcome::Interrupted,
             }
         }
         let cases = [
@@ -4539,12 +4576,23 @@ mod tests {
             (asked_by(None, Some("job-1")), job_cancelled("job-1"), true),
             (asked_by(None, Some("job-1")), job_finished("job-2"), false),
             (asked_by(None, Some("job-1")), tool_finished("job-1"), false),
+            (asked_by_agent("agent-1"), agent_finished("agent-1"), true),
+            (asked_by_agent("agent-1"), agent_finished("agent-2"), false),
+            (
+                asked_by(None, Some("job-1")),
+                agent_finished("job-1"),
+                false,
+            ),
             (asked_by(None, None), tool_finished(""), false),
             (asked_by(None, None), job_finished(""), false),
+            (asked_by(None, None), agent_finished(""), false),
         ];
         for (req, msg, dismissed) in cases {
             let mut harness = Harness::standalone(80, 24);
-            let label = format!("{:?}/{:?} on {msg:?}", req.call_id, req.job_id);
+            let label = format!(
+                "{:?}/{:?}/{:?} on {msg:?}",
+                req.call_id, req.job_id, req.origin.agent_id
+            );
             let asker = ask_on_a_thread(&mut harness, req);
             harness.app.handle_msg(msg);
             assert_eq!(harness.app.prompts.is_empty(), dismissed, "{label}");
@@ -7617,7 +7665,7 @@ mod tests {
         );
         assert_eq!(picker.highlight, 0);
         let frame = harness.draw();
-        insta::assert_snapshot!("rewind_picker_80x24", &frame);
+        assert_welcome_snapshot("rewind_picker_80x24", &frame);
         assert!(frame.contains("third question"), "{frame}");
         assert!(frame.contains("+1 line"), "{frame}");
         harness.press(KeyCode::Down);

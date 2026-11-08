@@ -273,6 +273,16 @@ fn has_indexed_foreground(params: &[Vec<u16>], index: u16) -> bool {
         .any(|p| p.windows(3).any(|w| w == [38, 5, index]))
 }
 
+/// Whether any SGR list sets a foreground colour at all: an indexed or
+/// truecolor `38`, or one of the basic `30-37` / `90-97` codes. `39`
+/// (default) and `0` (reset) are not colours.
+fn sets_a_foreground(params: &[Vec<u16>]) -> bool {
+    params.iter().any(|p| {
+        p.iter()
+            .any(|&code| code == 38 || (30..=37).contains(&code) || (90..=97).contains(&code))
+    })
+}
+
 const GREEN: u16 = 2;
 const RED: u16 = 1;
 
@@ -630,13 +640,14 @@ fn a_command_prefix_followed_by_more_letters_is_painted_red_not_green() {
             has_indexed_foreground(&name_style, GREEN),
             "`{known}` before an argument was not painted green: {name_style:?}\n{frame}"
         );
-        // Between the command word and its argument, no red is set up.
+        // Between the command word and its argument the colour is reset:
+        // the argument is plain, neither red nor green.
         let arg_at = find(pty.raw(), b" x", name_at + known.len())
             .unwrap_or_else(|| panic!("the argument of `{with_arg}` was not repainted:\n{frame}"));
         let arg_style = sgr_between(pty.raw(), name_at + known.len(), arg_at + 2);
         assert!(
-            !has_indexed_foreground(&arg_style, RED),
-            "the argument after `{known}` carries the error colour: {arg_style:?}\n{frame}"
+            !sets_a_foreground(&arg_style),
+            "the argument after `{known}` is painted, not plain: {arg_style:?}\n{frame}"
         );
         clear_draft(&mut pty);
         pty.read_for(HOTKEY_GAP);
@@ -713,9 +724,10 @@ fn ctrl_r_recalls_an_earlier_prompt_into_the_composer_and_esc_backs_out() {
         1,
         "Enter on the history match submitted the prompt instead of recalling it:\n{frame}"
     );
-    assert!(
-        flat.matches("alpha-history-kq7").count() >= 2,
-        "the recalled prompt is not in the composer:\n{frame}"
+    assert_eq!(
+        composer_row(&frame),
+        "alpha-history-kq7",
+        "the recalled prompt is not the composer's line:\n{frame}"
     );
 
     quit_clearing_any_draft(&mut pty);

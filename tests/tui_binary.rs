@@ -281,6 +281,14 @@ fn child_pid(transcript: &str) -> i32 {
         .unwrap()
 }
 
+/// Types `text` into a field modal and sends it. Enter on a field modal
+/// only counts once the modal has been up for a second; the gate runs
+/// from its appearance, not from typing.
+fn answer_field_modal(pty: &mut Pty, text: &str) {
+    pty.read_for(HOTKEY_GAP);
+    pty.send(format!("{text}\r").as_bytes()).unwrap();
+}
+
 /// Also the one place a REPL command's `print!` output is seen through the
 /// fd capture: in-process tests never see it, because libtest diverts
 /// `print!` before it reaches fd 1. The screen is made tall enough for the
@@ -1237,10 +1245,7 @@ fn exit_session_shows_the_save_modal_and_saves_on_y() {
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
-    // Enter on a field modal only counts once the modal has been up for
-    // a second; the gate runs from its appearance, not from typing.
-    pty.read_for(HOTKEY_GAP);
-    pty.send(b"probe-saved\r").unwrap();
+    answer_field_modal(&mut pty, "probe-saved");
     // The footer said "no session" at startup too; only a fresh one means
     // the session was written and closed.
     pty.wait_for_after("no session", named_at, PTY_DEADLINE)
@@ -1601,10 +1606,7 @@ fn ctrl_d_on_a_dirty_session_asks_to_save_and_y_writes_it_before_leaving() {
     pty.read_for(HOTKEY_GAP);
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
-    // Enter on a field modal only counts once the modal has been up for
-    // a second; the gate runs from its appearance, not from typing.
-    pty.read_for(HOTKEY_GAP);
-    pty.send(b"probe-ctrl-d\r").unwrap();
+    answer_field_modal(&mut pty, "probe-ctrl-d");
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -4294,10 +4296,7 @@ fn dot_save_role_on_a_temp_role_asks_for_the_name_in_the_modal() {
     pty.send(b".save role\r").unwrap();
     pty.wait_for_after("Role name:", before, PTY_DEADLINE)
         .expect("`.save role` on a temp role did not ask `Role name:` in a modal");
-    // Enter on a field modal only counts once the modal has been up for
-    // a second; the gate runs from its appearance, not from typing.
-    pty.read_for(HOTKEY_GAP);
-    pty.send(b"saved-role-xk3\r").unwrap();
+    answer_field_modal(&mut pty, "saved-role-xk3");
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
     let saved = loop {
         let saved = new_files_named(&dir, &files_before, "saved-role-xk3");
@@ -6613,10 +6612,7 @@ fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
-    // Enter on a field modal only counts once the modal has been up for
-    // a second; the gate runs from its appearance, not from typing.
-    pty.read_for(HOTKEY_GAP);
-    pty.send(b"probe-r9-session\r").unwrap();
+    answer_field_modal(&mut pty, "probe-r9-session");
     // The painter skips cells that were already blank, so the words of a
     // line can reach the stream without the spaces between them.
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
@@ -6693,10 +6689,7 @@ fn dot_exit_saving_the_session_on_y_carries_the_saved_line_to_the_normal_screen(
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
-    // Enter on a field modal only counts once the modal has been up for
-    // a second; the gate runs from its appearance, not from typing.
-    pty.read_for(HOTKEY_GAP);
-    pty.send(b"probe-r9-exit\r").unwrap();
+    answer_field_modal(&mut pty, "probe-r9-exit");
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);

@@ -411,13 +411,13 @@ fn finish_after_tool(pty: &mut Pty) {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
 }
 
-/// The palette lists what the context allows from the first key, the
-/// rows the REPL completer gives: with function calling on, the `.tool`
-/// verbs are in the band before any command has run, under either
-/// prefix.
+/// The palette lists what the context allows from the first key: with
+/// function calling on, the `.tool` verbs are in the band before any
+/// command has run, under either prefix. The full completer parity is
+/// pinned by the unit tests of the shared table.
 #[test]
 #[serial]
-fn the_cold_start_palette_matches_the_repl_completer() {
+fn the_cold_start_palette_lists_the_tool_verbs_under_either_prefix() {
     for (prefix, typed, rows) in [
         ("slash", "/tool", ["/tool enable", "/tool disable"]),
         ("dot", ".tool", [".tool enable", ".tool disable"]),

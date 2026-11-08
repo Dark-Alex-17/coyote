@@ -8,8 +8,7 @@ use super::DIM;
 use super::cells::Cell;
 use super::history::ComposerHistory;
 use crate::config::{CommandPrefix, RequestContext, StateFlags};
-use crate::repl::{command_candidates, split_line};
-use crate::utils::fuzzy_filter;
+use crate::repl::{command_candidates, macro_candidates, split_line};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -210,15 +209,13 @@ impl PaletteState {
                     }),
             );
             if ctx.is_some() {
-                let macros: Vec<(String, &str)> = macros
-                    .iter()
-                    .map(|(name, description)| (format!(".{name}"), description.as_str()))
-                    .filter(|(name, _)| {
-                        command_filter.len() == 1
-                            || name.starts_with(command_filter.get(..2).unwrap_or(&command_filter))
-                    })
-                    .collect();
-                let macros = fuzzy_filter(macros, |(name, _)| name.as_str(), &command_filter);
+                let macros = macro_candidates(
+                    macros
+                        .iter()
+                        .map(|(name, description)| (name.clone(), description.as_str()))
+                        .collect(),
+                    &command_filter,
+                );
                 rows.extend(macros.into_iter().map(|(name, description)| PaletteRow {
                     value: format!("{} ", with_sigil(&name)),
                     description: description.to_string(),

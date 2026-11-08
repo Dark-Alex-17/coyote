@@ -144,7 +144,8 @@ impl Composer {
     }
 
     /// A normal-mode motion: `l` and `$` stop on the last character
-    /// instead of the column after it.
+    /// instead of the column after it, and `j`/`k` landing on a shorter
+    /// line are pulled back onto its last character.
     pub(super) fn move_cursor(&mut self, motion: ViMotion) {
         match motion {
             ViMotion::Forward => {
@@ -153,8 +154,8 @@ impl Composer {
                     self.textarea.move_cursor(CursorMove::Forward);
                 }
             }
-            ViMotion::End => {
-                self.textarea.move_cursor(CursorMove::End);
+            ViMotion::End | ViMotion::Down | ViMotion::Up => {
+                self.textarea.move_cursor(Self::cursor_move(motion));
                 self.clamp_normal_cursor();
             }
             other => self.textarea.move_cursor(Self::cursor_move(other)),
@@ -486,6 +487,22 @@ mod tests {
     }
 
     #[test]
+    fn j_and_k_onto_a_shorter_line_land_on_its_last_character() {
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        composer.set_text("one two\nab\nthree four");
+        composer.move_cursor(ViMotion::Up);
+        composer.move_cursor(ViMotion::Up);
+        composer.move_cursor(ViMotion::End);
+        assert_eq!(composer.textarea.cursor(), (0, 6));
+        composer.move_cursor(ViMotion::Down);
+        assert_eq!(composer.textarea.cursor(), (1, 1));
+        composer.move_cursor(ViMotion::Down);
+        composer.move_cursor(ViMotion::End);
+        composer.move_cursor(ViMotion::Up);
+        assert_eq!(composer.textarea.cursor(), (1, 1));
+    }
+
+    #[test]
     fn a_at_the_last_character_appends_on_the_same_line() {
         let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         composer.set_text("ab\ncd");
@@ -504,7 +521,8 @@ mod tests {
     fn x_at_the_end_of_a_line_deletes_the_last_character_and_keeps_the_lines() {
         let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         composer.set_text("ab\ncd");
-        composer.move_cursor(ViMotion::Up);
+        // Past the end, as insert mode leaves the cursor; `k` would clamp.
+        composer.textarea.move_cursor(CursorMove::Up);
         assert_eq!(composer.textarea.cursor(), (0, 2));
         composer.delete_next_char();
         assert_eq!(composer.text(), "a\ncd");
