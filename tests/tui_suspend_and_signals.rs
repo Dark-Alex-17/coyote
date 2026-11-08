@@ -932,6 +932,75 @@ fn sigterm_during_a_slow_file_loader_kills_it_and_leaves_the_tty_cooked() {
     );
 }
 
+/// A line queued while a tool sleeps, then SIGTERM: the exit takes the
+/// line off the turn's queue before the turn is told to stop, so the
+/// tool result the interrupt closes cannot hand it to the model and no
+/// saved session carries it. The process still leaves cleanly.
+#[test]
+#[serial]
+fn sigterm_with_a_queued_line_does_not_hand_it_to_the_model() {
+    let dir = fresh_config_dir("sigterm-queued");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_sleep".to_string(),
+            arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+        },
+        Reply::Text("never reached r12-q".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake, "");
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&transcript);
+    pty.send(b"call the sleep tool\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-started"),
+        "the sleep tool's start marker",
+    );
+    pty.read_for(Duration::from_millis(300));
+    let typed_at = pty.raw().len();
+    pty.send(b"queued-r12-q\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let mid = squeezed(&since(&pty, typed_at));
+    assert!(
+        mid.contains("pending:1") && mid.contains("queued-r12-q"),
+        "Enter on a draft while a tool ran did not queue it:\n{mid}"
+    );
+    let started = Instant::now();
+    // SAFETY: kill takes a pid and a signal number and touches no memory.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let took = started.elapsed();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(count(pty.raw(), LEAVE_ALT), 1, "{transcript}");
+    assert!(
+        took < Duration::from_secs(8),
+        "the exit waited the tool out instead of aborting it: {took:?}"
+    );
+    assert!(
+        fake.bodies()
+            .iter()
+            .all(|body| !body.contains("queued-r12-q")),
+        "the queued line reached the model through the signal exit:\n{:?}",
+        fake.bodies()
+    );
+    for entry in fs::read_dir(dir.join("sessions")).unwrap() {
+        let path = entry.unwrap().path();
+        let saved = fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !saved.contains("queued-r12-q"),
+            "the queued line was saved with the session {}:\n{saved}",
+            path.display()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // With the keyboard-enhancement flags pushed, a
 // terminal encodes control chords as CSI u. They must drive the composer

@@ -744,12 +744,21 @@ impl Drop for KillOnDrop {
         let Some(handle) = self.0.take() else {
             return;
         };
-        // Failures mean the child is already reaped.
+        // Only an unreaped leader (running or a zombie) still owns its
+        // pid and so its group; once reaped the number may belong to a
+        // stranger, and killing that group is never acceptable. A reaped
+        // handle has nothing left to kill, and `kill` on it is a no-op.
         #[cfg(unix)]
-        if let Some(&pid) = handle.pids().first() {
-            // SAFETY: killpg has no memory-safety preconditions; the pid
-            // came from the spawn and leads its own group.
-            let _ = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+        match (handle.try_wait(), handle.pids().first()) {
+            (Ok(None), Some(&pid)) => {
+                // SAFETY: killpg has no memory-safety preconditions. The
+                // pid came from this spawn, leads its own group, and the
+                // handle has not reaped it, so the group is still ours.
+                let _ = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+            }
+            _ => {
+                let _ = handle.kill();
+            }
         }
         #[cfg(not(unix))]
         let _ = handle.kill();
@@ -1520,6 +1529,21 @@ mod tests {
                 "the grandchild of the document command",
             );
             let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// A handle whose leader was already reaped has no group of its
+        /// own any more; dropping it kills nothing and comes back at once.
+        #[test]
+        fn dropping_a_reaped_handle_signals_nothing() {
+            let handle = duct::cmd("true", Vec::<&str>::new())
+                .stdout_capture()
+                .start()
+                .unwrap();
+            handle.wait().unwrap();
+            assert!(matches!(handle.try_wait(), Ok(Some(_))));
+            let started = std::time::Instant::now();
+            drop(KillOnDrop(Some(handle)));
+            assert!(started.elapsed() < std::time::Duration::from_millis(400));
         }
     }
 

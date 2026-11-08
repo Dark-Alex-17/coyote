@@ -3082,6 +3082,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 auto_cancel.store(true, Ordering::SeqCst);
                 app.begin_exit();
                 app.abandon_prompts();
+                purge_turn_queue(&task);
                 return match task.take() {
                     Some(Task::Turn { handle, .. }) => {
                         abort.set_ctrlc();
