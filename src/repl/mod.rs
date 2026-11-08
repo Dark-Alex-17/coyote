@@ -9475,7 +9475,9 @@ local_hello() {\n\
     }
 
     #[test]
+    #[serial]
     fn exit_session_with_nothing_attached_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
         run_async(async {
             let mut ctx = repl_ctx();
             assert!(ctx.session.is_none());
@@ -9494,7 +9496,9 @@ local_hello() {\n\
     }
 
     #[test]
+    #[serial]
     fn exit_session_with_a_session_attached_cancels_background_work() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
         run_async(async {
             let mut ctx = repl_ctx();
             let mut session = Session::default();
