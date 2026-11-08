@@ -300,6 +300,9 @@ pub(crate) struct PeerLimits {
 
 /// Told the sending identity each time one of its runs gives its place back, after
 /// the window is updated and its lock released, so the hook may look at the limits.
+/// It runs wherever the reservation is dropped, which can be a fetch task or a caller
+/// holding its own locks, so it must not block or take locks and should hand any real
+/// work off.
 pub(crate) type ReleaseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// One envoy run's place in its sender's concurrency count, given back when dropped, so

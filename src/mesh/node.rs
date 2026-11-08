@@ -3843,7 +3843,8 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// was interrupted or failed) stays remembered: the envoy had the body, and the human
 /// already has the fallback line in the inbox, so its repeat is filed and not run again.
 /// A pair parked for its sender's run in flight counts as accepted: refused or filed when
-/// it leaves the queue, it stays remembered the same way.
+/// it leaves the queue, it stays remembered the same way, so a re-fetch of that one
+/// message with the same id is filed rather than run (a fresh send carries a new id).
 #[derive(Default)]
 struct BodyDedup {
     at: BTreeMap<(String, String), SystemTime>,
@@ -3989,9 +3990,10 @@ impl OwnEntryMarks {
 /// already has `peer_max_concurrent` runs in flight, at most `ENVOY_QUEUE_MAX` per sender
 /// in the order they were fetched, so several held messages from one sender that arrive
 /// in one sync run one after another instead of all but the first being throttled.
-/// `held_count` is how many are parked across every sender. `this` is the slot's own
-/// handle, set the first time it is asked to watch releases: a sender's run giving its
-/// place back schedules the next of its parked messages through it.
+/// `held_count` is how many are parked across every sender, and `held_turn` lets one
+/// dispatch or filing of them run at a time. `this` is the slot's own handle, set the
+/// first time it is asked to watch releases: a sender's run giving its place back
+/// schedules the next of its parked messages through it.
 ///
 /// `own_entries` marks the inbox entries this node filed itself, written as they are
 /// filed and read by `is_from_self`; `stop` and `rekey` leave it alone, so an entry filed
@@ -4027,6 +4029,7 @@ pub(crate) struct MeshSlot {
     envoy_bodies: parking_lot::Mutex<BodyDedup>,
     held: parking_lot::Mutex<HashMap<String, VecDeque<HeldMessage>>>,
     held_count: AtomicUsize,
+    held_turn: parking_lot::Mutex<()>,
     this: OnceLock<Weak<MeshSlot>>,
     own_entries: parking_lot::Mutex<OwnEntryMarks>,
     hooks: MeshHooks,
@@ -4238,7 +4241,6 @@ impl MeshSlot {
         let Some(runtime) = self.get() else {
             return Ok(());
         };
-        self.file_held(HeldEnd::Rekeyed);
         let now = SystemTime::now();
         // The carry copies only live rows, so an expired one left in the original's
         // file would never be announced once the slot serves the fork's. The sweep and
@@ -4313,6 +4315,10 @@ impl MeshSlot {
                 runtime.restore_sent_threads(original_threads);
                 runtime.restore_envoy_memory(original_envoy_memory);
             }
+        } else {
+            // Only a re-key that took hands the node to the fork; after a failed one the
+            // original still serves and its parked messages run as before.
+            self.file_held(HeldEnd::Rekeyed);
         }
         rekeyed
     }
@@ -4839,7 +4845,9 @@ impl MeshSlot {
     /// `ENVOY_QUEUE_MAX` parked it is refused as before. A message sent directly is
     /// offered once and refused when there is no room, since its sender is waiting on
     /// the answer. Parks only once the slot watches releases, since nothing else would
-    /// ever run a parked message.
+    /// ever run a parked message. Nothing is offered while `held` is locked: a refused
+    /// offer gives its reservation back, and the release hook that runs then must find
+    /// the slot's locks free.
     fn hand_to_envoy(
         &self,
         sink: &dyn EnvoySink,
@@ -4859,31 +4867,32 @@ impl MeshSlot {
             };
         }
         let identity = message.source_identity.clone();
-        let mut held = self.held.lock();
-        let waiting = held.get(&identity).map_or(0, VecDeque::len);
-        let refusal = if waiting == 0 {
+        let behind_others = self
+            .held
+            .lock()
+            .get(&identity)
+            .is_some_and(|queue| !queue.is_empty());
+        if !behind_others {
             match offer(message.clone()) {
                 Ok(()) => return HandOff::Taken,
                 Err(refusal)
                     if refusal.reason == RefusalReason::PeerConcurrency
-                        && self.limits.concurrency_room(&identity).is_some() =>
-                {
-                    refusal
-                }
+                        && self.limits.concurrency_room(&identity).is_some() => {}
                 Err(refusal) => return HandOff::Refused(Box::new(message), refusal),
             }
-        } else {
-            PeerRefusal::capacity(RefusalReason::PeerConcurrency)
-        };
-        if waiting >= ENVOY_QUEUE_MAX {
-            return HandOff::Refused(Box::new(message), refusal);
         }
-        held.entry(identity.clone())
-            .or_default()
-            .push_back(HeldMessage {
-                message,
-                received: received.clone(),
-            });
+        let mut held = self.held.lock();
+        let queue = held.entry(identity.clone()).or_default();
+        if queue.len() >= ENVOY_QUEUE_MAX {
+            return HandOff::Refused(
+                Box::new(message),
+                PeerRefusal::capacity(RefusalReason::PeerConcurrency),
+            );
+        }
+        queue.push_back(HeldMessage {
+            message,
+            received: received.clone(),
+        });
         self.held_count.fetch_add(1, Ordering::SeqCst);
         drop(held);
         // A run that ended between the refusal and the count above found nothing parked
@@ -4913,7 +4922,7 @@ impl MeshSlot {
     }
 
     /// Runs `dispatch_held` for `identity` on a blocking thread, never on the caller: a
-    /// release can come from a fetch task, or from a refused offer while `held` is locked.
+    /// release can come from a fetch task, or from an offer a dispatch is making.
     fn schedule_held(&self, identity: String) {
         let Some(slot) = self.this.get().and_then(Weak::upgrade) else {
             return;
@@ -4934,77 +4943,82 @@ impl MeshSlot {
     /// for another reason (its shared queue is full, the sender is over a ceiling) takes
     /// the inbox path with the typed refusal, as it would have on arrival; with no envoy
     /// attached any more they are filed as the envoy stopping. The received hook of each
-    /// fires as it leaves.
+    /// fires as it leaves. One dispatch or filing runs at a time (`held_turn`), and the
+    /// message offered stays at the front of its queue until the offer is decided, so a
+    /// message arriving meanwhile parks behind it; `held` itself is never locked across
+    /// an offer.
     fn dispatch_held(&self, identity: &str) {
-        let mut taken = Vec::new();
-        let mut refused = Vec::new();
-        {
-            let mut held = self.held.lock();
-            let Some(queue) = held.get_mut(identity) else {
+        let _turn = self.held_turn.lock();
+        loop {
+            let Some(message) = self
+                .held
+                .lock()
+                .get(identity)
+                .and_then(VecDeque::front)
+                .map(|next| next.message.clone())
+            else {
                 return;
             };
-            let before = queue.len();
-            let envoy = self.envoy.load_full();
-            while let Some(next) = queue.front() {
-                let offered = match &envoy {
-                    Some(sink) => sink.accept(EnvoyJob {
-                        message: next.message.clone(),
-                        reservation: None,
-                    }),
-                    None => Err(PeerRefusal::capacity(RefusalReason::EnvoyStopping)),
+            let offered = match self.envoy.load_full() {
+                Some(sink) => sink.accept(EnvoyJob {
+                    message,
+                    reservation: None,
+                }),
+                None => Err(PeerRefusal::capacity(RefusalReason::EnvoyStopping)),
+            };
+            if let Err(refusal) = &offered
+                && refusal.reason == RefusalReason::PeerConcurrency
+                && self.limits.concurrency_room(identity).is_some()
+            {
+                return;
+            }
+            let next = {
+                let mut held = self.held.lock();
+                let Some(queue) = held.get_mut(identity) else {
+                    return;
                 };
-                match offered {
-                    Ok(()) => {
-                        if let Some(next) = queue.pop_front() {
-                            taken.push(next);
-                        }
-                    }
-                    Err(refusal)
-                        if refusal.reason == RefusalReason::PeerConcurrency
-                            && self.limits.concurrency_room(identity).is_some() =>
-                    {
-                        break;
-                    }
-                    Err(refusal) => {
-                        if let Some(next) = queue.pop_front() {
-                            refused.push((next, refusal));
-                        }
-                    }
+                let next = queue.pop_front();
+                if queue.is_empty() {
+                    held.remove(identity);
+                }
+                next
+            };
+            let Some(next) = next else {
+                return;
+            };
+            self.held_count.fetch_sub(1, Ordering::SeqCst);
+            match offered {
+                Ok(()) => {
+                    debug!(
+                        "Mesh {} {} from {} handed to the envoy after waiting for the sender's run in flight",
+                        next.message.kind,
+                        next.message.message_id,
+                        short(identity)
+                    );
+                    self.hooks.fire(next.received.event(Routed::Envoy));
+                }
+                Err(refusal) => {
+                    debug!(
+                        "Mesh {} {} from {} refused by the envoy after waiting: {}; delivering it to the inbox",
+                        next.message.kind,
+                        next.message.message_id,
+                        short(identity),
+                        refusal.reason.as_str()
+                    );
+                    self.refuse_for_envoy(next.message, refusal);
+                    self.hooks.fire(next.received.event(Routed::Inbox));
                 }
             }
-            let left = before - queue.len();
-            if queue.is_empty() {
-                held.remove(identity);
-            }
-            self.held_count.fetch_sub(left, Ordering::SeqCst);
-        }
-        for next in taken {
-            debug!(
-                "Mesh {} {} from {} handed to the envoy after waiting for the sender's run in flight",
-                next.message.kind,
-                next.message.message_id,
-                short(identity)
-            );
-            self.hooks.fire(next.received.event(Routed::Envoy));
-        }
-        for (next, refusal) in refused {
-            debug!(
-                "Mesh {} {} from {} refused by the envoy after waiting: {}; delivering it to the inbox",
-                next.message.kind,
-                next.message.message_id,
-                short(identity),
-                refusal.reason.as_str()
-            );
-            self.refuse_for_envoy(next.message, refusal);
-            self.hooks.fire(next.received.event(Routed::Inbox));
         }
     }
 
     /// Files every parked message to the inbox: the propagation node already handed
     /// them over, so they are not left for a run that will not come. A stopping envoy
     /// refuses them as it refuses its own queued jobs; `.mesh off` and a re-key file them
-    /// with one idle line each, as a job the node went away under.
+    /// with one idle line each, as a job the node went away under. Waits for a dispatch
+    /// in progress, so a message is never both offered and filed.
     fn file_held(&self, end: HeldEnd) {
+        let _turn = self.held_turn.lock();
         let parked: Vec<HeldMessage> = {
             let mut held = self.held.lock();
             let parked: Vec<HeldMessage> = held.drain().flat_map(|(_, queue)| queue).collect();
@@ -8501,6 +8515,91 @@ mod tests {
         fn deliver(&self, message: InboundMessage) {
             self.0.lock().push(message);
         }
+    }
+
+    /// An offer the envoy refuses gives its reservation back on the spot, so the release
+    /// hook runs inside the offer. Neither a held message arriving with nothing parked
+    /// nor a parked one dispatched after its sender's run ends is offered with `held`
+    /// locked: the hook finds it free every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_offer_releases_with_the_held_queue_unlocked() {
+        struct BusyAfterReserving(Arc<PeerLimits>);
+
+        impl EnvoySink for BusyAfterReserving {
+            fn accept(&self, job: EnvoyJob) -> Result<(), PeerRefusal> {
+                let _reservation = self
+                    .0
+                    .try_reserve(&job.message.source_identity, Instant::now())?;
+                Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+            }
+
+            fn answer(&self, _: &str, _: &str) -> bool {
+                false
+            }
+
+            fn holds(&self, _: &str) -> bool {
+                false
+            }
+
+            fn interrupt(&self) {}
+        }
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.limits().configure(PeerLimitConfig {
+            concurrency: 1,
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        slot.set_envoy(
+            Arc::new(BusyAfterReserving(Arc::clone(slot.limits()))) as Arc<dyn EnvoySink>
+        );
+        slot.watch_releases();
+        let unlocked: Arc<parking_lot::Mutex<Vec<bool>>> = Arc::default();
+        slot.limits().set_release_hook({
+            let slot = Arc::downgrade(&slot);
+            let unlocked = Arc::clone(&unlocked);
+            Arc::new(move |identity: &str| {
+                if let Some(slot) = slot.upgrade() {
+                    unlocked.lock().push(slot.held.try_lock().is_some());
+                    if slot.held_count.load(Ordering::SeqCst) > 0 {
+                        slot.schedule_held(identity.to_string());
+                    }
+                }
+            })
+        });
+        let identity = hex_lower(&PEER_IDENTITY);
+        let stored = |id: &str| {
+            let mut message = peer_message(PeerKind::Message, id, None);
+            message.via = PeerVia::StoreAndForward;
+            message
+        };
+
+        slot.deliver_peer(stored("held-busy-0"));
+        assert_eq!(*unlocked.lock(), [true], "the arrival's refused offer");
+        assert_eq!(slot.peer_inbox().len(), 1);
+
+        let in_flight = slot
+            .limits()
+            .try_reserve(&identity, Instant::now())
+            .unwrap();
+        slot.deliver_peer(stored("held-busy-1"));
+        assert_eq!(slot.peer_inbox().len(), 1, "parked, not filed");
+        drop(in_flight);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while slot.peer_inbox().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked message was never refused and filed"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *unlocked.lock(),
+            [true, true, true],
+            "the run's own release, then the dispatch's refused offer"
+        );
+        assert_eq!(slot.held_count.load(Ordering::SeqCst), 0);
+        assert!(slot.held.lock().is_empty());
     }
 
     /// The store-and-forward path owes a refused sender one typed reply per identity,
