@@ -79,6 +79,9 @@ pub(crate) enum UiMsg {
         outcome: AgentOutcome,
     },
     TodoUpdated(Vec<TodoItem>),
+    /// A queued line the model has just been handed; the transcript
+    /// records it where it was read.
+    QueuedInputSent(String),
     Prompt {
         req: Box<PromptRequest>,
         reply: std::sync::mpsc::Sender<PromptAnswer>,
@@ -318,6 +321,7 @@ impl EventSink for TuiSink {
                 },
             }),
             Event::TodoUpdated { items } => self.send(UiMsg::TodoUpdated(items.clone())),
+            Event::QueuedInputSent { text } => self.send(UiMsg::QueuedInputSent(text.clone())),
             _ => {}
         }
     }

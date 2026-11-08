@@ -1851,6 +1851,9 @@ impl App {
                 self.dismiss_prompts(|prompt| prompt.asked_by_agent(&agent_id));
             }
             UiMsg::TodoUpdated(items) => self.todo.set_items(items),
+            UiMsg::QueuedInputSent(text) => {
+                self.transcript.push(Cell::user_mid_turn(plain_text(&text)))
+            }
             UiMsg::Busy(message) => {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.busy = message;

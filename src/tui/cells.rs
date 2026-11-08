@@ -107,6 +107,10 @@ pub(super) enum Cell {
         /// back; `.undo` takes that exchange and this cell with it. A
         /// turn that failed before the request recorded nothing.
         opened: bool,
+        /// A line queued while a turn ran and handed to the model on a
+        /// tool result of that turn. It opens no exchange of its own (the
+        /// running turn's holds it), so it is never a rewind row.
+        mid_turn: bool,
         cache: LineCache,
     },
     Assistant {
@@ -260,6 +264,16 @@ impl Cell {
         Self::User {
             text: text.to_string(),
             opened: false,
+            mid_turn: false,
+            cache: LineCache::default(),
+        }
+    }
+
+    pub(super) fn user_mid_turn(text: String) -> Self {
+        Self::User {
+            text,
+            opened: false,
+            mid_turn: true,
             cache: LineCache::default(),
         }
     }
@@ -364,12 +378,20 @@ impl Cell {
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
         let no_color = *crate::utils::NO_COLOR;
         match self {
-            Cell::User { text, cache, .. } => cache.get(width, || {
+            Cell::User {
+                text,
+                mid_turn: false,
+                cache,
+                ..
+            } => cache.get(width, || {
                 render::plain_lines(
                     &format!("> {text}"),
                     width,
                     Style::new().add_modifier(Modifier::BOLD),
                 )
+            }),
+            Cell::User { text, cache, .. } => cache.get(width, || {
+                render::plain_lines(&format!("> {text} (sent mid-turn)"), width, DIM)
             }),
             Cell::Assistant {
                 source,

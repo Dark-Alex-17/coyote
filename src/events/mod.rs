@@ -127,6 +127,11 @@ pub enum Event {
     QueuedInput {
         text: String,
     },
+    /// A queued line left the queue for the model: it rides the tool
+    /// result the turn is about to send, so this is the moment it was read.
+    QueuedInputSent {
+        text: String,
+    },
 }
 
 /// Observes events published on an [`EventBus`]. Called synchronously on the
