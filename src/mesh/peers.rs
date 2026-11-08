@@ -72,8 +72,9 @@ pub(crate) struct PeerRecord {
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
     /// When this node received the instance's farewell (`fields.presence: leaving`), by
-    /// this node's clock; `None` once it announces again, and on every row it has not
-    /// said goodbye from. Advisory: the row, its trust and its open questions stay.
+    /// this node's clock; `None` once it announces again or is heard over a link, and on
+    /// every row it has not said goodbye from. Advisory: the row, its trust and its open
+    /// questions stay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_at: Option<SystemTime>,
 }

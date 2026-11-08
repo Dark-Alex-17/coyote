@@ -1513,7 +1513,7 @@ async fn reference_requests_hear_the_specified_replies() {
 
     // The reference's farewell, a bulletin whose `fields.presence` is `leaving`, is
     // acknowledged by id and marks its row left; nothing is filed or counted, and its
-    // next announce lifts the mark.
+    // next announce, or any other request it makes over a link, lifts the mark.
     let identity = reference.ready.identity_hash.clone();
     let messages = || {
         node.slot

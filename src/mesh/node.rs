@@ -3206,7 +3206,10 @@ fn note_return(runtime: &Weak<MeshRuntime>, destination: &str) {
 /// arrives over a live link, so the instance is back as surely as if it had announced, and
 /// a reply to it must not be routed as if it were gone. Its farewell is the one request
 /// that does not count, since it is what set the mark. Held mail never reaches here: a
-/// held message can be older than the farewell.
+/// held message can be older than the farewell. Requests on concurrent links are not
+/// ordered against each other, so one the instance sent just before its farewell can
+/// still be let through after it and lift the fresh mark; the mark is advisory and the
+/// instance was alive a moment ago.
 struct LeftMarkLifter {
     peers: Arc<PeerTable>,
     runtime: Weak<MeshRuntime>,
@@ -3214,13 +3217,21 @@ struct LeftMarkLifter {
 
 impl AllowObserver for LeftMarkLifter {
     fn allowed(&self, destination: &AddressHash, path_hash: PathHash, body: &rmpv::Value) {
+        let destination = destination.to_hex_string();
+        // Most requests come from instances not marked left; they skip the body read.
+        if self
+            .peers
+            .get(&destination)
+            .is_none_or(|row| row.left_at.is_none())
+        {
+            return;
+        }
         if path_hash == PathHash::of(MESSAGE_PATH)
             && from_request_body(body)
                 .is_ok_and(|body| is_farewell(body.kind, body.fields.as_ref()))
         {
             return;
         }
-        let destination = destination.to_hex_string();
         if self.peers.clear_left(&destination) {
             debug!(
                 "Mesh instance {} was heard over a link; no longer marked left",
@@ -6229,9 +6240,10 @@ impl KnockSurface for MeshSlot {
     }
 }
 
-/// The one line the owner gets when a peer that said it left announces again while
-/// `open` questions to it still wait: `bob is back; your question from 2d ago is still
-/// open; .mesh pending lists it`, or, for several, how many and when the oldest was asked.
+/// The one line the owner gets when a peer that said it left announces again, or is heard
+/// over a link, while `open` questions to it still wait: `bob is back; your question from
+/// 2d ago is still open; .mesh pending lists it`, or, for several, how many and when the
+/// oldest was asked.
 /// `None` with nothing open. The name is quoted as it stands, since the peer chose it.
 fn return_line(name: &str, open: &[PendingRecord], now: SystemTime) -> Option<NoticeText> {
     let oldest = open
@@ -6327,9 +6339,9 @@ impl PeerSurface for MeshSlot {
     /// Marks the sending instance `left` in the peer table and fires
     /// `mesh.bulletin.received` with its presence. Its trust, the questions open with it
     /// and the grants it holds are left as they are: the mark is advisory and its next
-    /// announce lifts it. A farewell received before that instance's latest announce, or
-    /// from one the table does not hold, or a repeat while the mark stands, changes
-    /// nothing and fires nothing.
+    /// announce, or any other request from it over a link, lifts it. A farewell received
+    /// before that instance's latest announce, or from one the table does not hold, or a
+    /// repeat while the mark stands, changes nothing and fires nothing.
     fn note_farewell(&self, farewell: Farewell) {
         let Some(runtime) = self.get() else {
             return;

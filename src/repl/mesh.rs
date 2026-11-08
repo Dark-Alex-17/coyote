@@ -9258,7 +9258,7 @@ const NO_ROUTE_STATE: &str = "(no route: this node has no path to it, its last l
 /// this node's clock. It outranks `no route` and `stale`, being the peer's own word, and
 /// yields to `superseded`, which says where the identity went, and to a session of yours
 /// that has ended, which the registry already names gone and reads `no route`. The row's
-/// next announce lifts it.
+/// next announce lifts it, and so does any other request the instance makes over a link.
 fn left_state(now: SystemTime, left_at: SystemTime) -> String {
     format!(
         "(left {}: it said it was leaving the mesh)",
