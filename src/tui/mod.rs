@@ -1367,9 +1367,9 @@ impl App {
         match &self.view {
             View::HistorySearch(search) => {
                 let chosen = search.highlighted().map(str::to_string);
-                self.close_view();
-                if let Some(text) = chosen {
-                    self.set_composer_text(&text);
+                match chosen {
+                    Some(text) => self.recall_history_entry(&text),
+                    None => self.close_view(),
                 }
                 None
             }
@@ -7391,6 +7391,27 @@ mod tests {
         harness.press(KeyCode::Backspace);
         assert_eq!(harness.app.composer_text(), ".inf");
         assert!(palette(&harness).is_some());
+    }
+
+    /// A command line recalled through the Ctrl+R search is a history
+    /// walk too: no palette over it, and the next Up walks on.
+    #[test]
+    fn recalling_from_the_search_does_not_reopen_the_palette() {
+        let mut harness = Harness::standalone(80, 24);
+        for line in [".info", "plain", ".help"] {
+            harness.app.history.push(line);
+        }
+        harness.app.handle_key(ctrl(KeyCode::Char('r')));
+        harness.type_text(".he");
+        assert_eq!(search(&harness).unwrap().matches, [".help"]);
+        assert!(harness.press(KeyCode::Enter).is_none());
+        assert_eq!(harness.app.composer_text(), ".help");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), ".help");
+        assert!(palette(&harness).is_none());
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), "plain");
     }
 
     #[test]
