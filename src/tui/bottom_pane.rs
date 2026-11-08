@@ -546,7 +546,9 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
     use crate::repl::ReplCompleter;
+    use crate::testing::TestConfigDirGuard;
     use parking_lot::RwLock;
+    use serial_test::serial;
     use std::sync::Arc;
 
     fn rows(values: &[&str]) -> PaletteState {
@@ -609,9 +611,15 @@ mod tests {
     /// names for the bare sigil, under every prefix and with and without
     /// function calling in the state, less the verbs hidden until their
     /// prompts are routed: the palette offers none of those, and every
-    /// other completer name, both ways.
+    /// other completer name, both ways. Both sides read the same context,
+    /// with one enabled macro seeded so the macro rows are compared too.
     #[test]
+    #[serial]
     fn palette_rows_match_the_completer_for_a_bare_sigil() {
+        let _guard = TestConfigDirGuard::new("palette-bare-sigil");
+        let path = crate::config::paths::macro_file("seeded-macro-k4q");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "isolated: false\nsteps:\n  - \".info\"\n").unwrap();
         for prefix in [
             CommandPrefix::Dot,
             CommandPrefix::Slash,
@@ -621,7 +629,7 @@ mod tests {
                 for sigil in [".", "/"] {
                     let ctx = ctx_with(prefix, function_calling);
                     let palette = palette_names(&ctx, sigil);
-                    let completer = completer_names(ctx_with(prefix, function_calling), sigil);
+                    let completer = completer_names(ctx, sigil);
                     let hidden_name =
                         |name: &String| hidden_until_routed(&name.replacen(sigil, ".", 1));
                     let (hidden, listed): (HashSet<String>, HashSet<String>) =
@@ -629,7 +637,10 @@ mod tests {
                     assert_eq!(palette, listed, "{prefix} fc={function_calling} {sigil:?}");
                     assert!(palette.iter().all(|name| !hidden_name(name)), "{palette:?}");
                     if prefix.accepts(sigil.chars().next().unwrap()) {
-                        assert!(!palette.is_empty(), "{prefix} {sigil:?}");
+                        assert!(
+                            palette.contains(&format!("{sigil}seeded-macro-k4q")),
+                            "{prefix} {sigil:?}: {palette:?}"
+                        );
                         assert_eq!(
                             hidden.len(),
                             HIDDEN_UNTIL_ROUTED.len() + 1,
