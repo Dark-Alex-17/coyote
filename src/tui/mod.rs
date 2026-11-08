@@ -8511,6 +8511,7 @@ mod tests {
     /// Registers a lender on its own thread that runs every job it is
     /// sent, the way the loop does with the screen released, and counts
     /// them; unregistered when the guard drops.
+    #[cfg(unix)]
     fn test_lender() -> (LenderGuard, Arc<std::sync::atomic::AtomicUsize>) {
         let (tx, mut rx) = unbounded_channel();
         let lent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8527,8 +8528,10 @@ mod tests {
         (LenderGuard, lent)
     }
 
+    #[cfg(unix)]
     struct LenderGuard;
 
+    #[cfg(unix)]
     impl Drop for LenderGuard {
         fn drop(&mut self) {
             set_lender(None);
