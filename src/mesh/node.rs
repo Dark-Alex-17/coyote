@@ -38,7 +38,7 @@ use crate::mesh::message::{
     OutboundPeer, PEER_INBOX_CAPACITY, PEER_LINE_MAX_CHARS, PRESENCE_LEAVING, Part, PartLimits,
     PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface,
     PeerVia, RawPart, RawPeerMessage, Route, SendError, SendOutcome, collect_next_action,
-    is_wire_id, unix_now,
+    from_request_body, is_farewell, is_wire_id, unix_now,
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
@@ -59,10 +59,10 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 #[cfg(all(test, unix))]
 use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
-    ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS, LIST_PATH,
-    LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NoAnswer,
-    OriginName, RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH,
-    redact_hashes, request as link_request, short,
+    ACCESS_PATH, AllowObserver, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS,
+    LIST_PATH, LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH,
+    NoAnswer, OriginName, PathHash, RefusalCode, RemoteRefusal, RequestError, RequestOptions,
+    STATUS_PATH, redact_hashes, request as link_request, short,
 };
 use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
@@ -1056,6 +1056,10 @@ impl MeshRuntime {
             #[cfg(all(test, unix))]
             next_request_error: parking_lot::Mutex::new(None),
         });
+        runtime.dispatcher.set_observer(Arc::new(LeftMarkLifter {
+            peers: runtime.peers.clone(),
+            runtime: Arc::downgrade(&runtime),
+        }));
         runtime.register_task(tokio::spawn(receive_announces(
             announces,
             runtime.peers.clone(),
@@ -3187,13 +3191,43 @@ async fn receive_announces(
     }
 }
 
-/// Tells the slot that `destination`, marked left, has announced again.
+/// Tells the slot that `destination`, marked left, is back: it announced again or was
+/// heard over a link.
 fn note_return(runtime: &Weak<MeshRuntime>, destination: &str) {
     let surface = runtime
         .upgrade()
         .and_then(|runtime| runtime.peer_surface.lock().as_ref().and_then(Weak::upgrade));
     if let Some(surface) = surface {
         surface.note_return(destination);
+    }
+}
+
+/// Lifts the left mark of an instance whose request the trust gate let through: a request
+/// arrives over a live link, so the instance is back as surely as if it had announced, and
+/// a reply to it must not be routed as if it were gone. Its farewell is the one request
+/// that does not count, since it is what set the mark. Held mail never reaches here: a
+/// held message can be older than the farewell.
+struct LeftMarkLifter {
+    peers: Arc<PeerTable>,
+    runtime: Weak<MeshRuntime>,
+}
+
+impl AllowObserver for LeftMarkLifter {
+    fn allowed(&self, destination: &AddressHash, path_hash: PathHash, body: &rmpv::Value) {
+        if path_hash == PathHash::of(MESSAGE_PATH)
+            && from_request_body(body)
+                .is_ok_and(|body| is_farewell(body.kind, body.fields.as_ref()))
+        {
+            return;
+        }
+        let destination = destination.to_hex_string();
+        if self.peers.clear_left(&destination) {
+            debug!(
+                "Mesh instance {} was heard over a link; no longer marked left",
+                short(&destination)
+            );
+            note_return(&self.runtime, &destination);
+        }
     }
 }
 
@@ -6312,7 +6346,7 @@ impl PeerSurface for MeshSlot {
             return;
         }
         debug!(
-            "Mesh instance {dest8} said it is leaving the mesh; marked left until it announces again"
+            "Mesh instance {dest8} said it is leaving the mesh; marked left until it announces again or is heard over a link"
         );
         self.hooks.fire(MeshEvent::BulletinReceived {
             id: farewell.message_id,
@@ -15374,6 +15408,151 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
             }
             assert_eq!(idle.pushed.lock().len(), 1, "the line comes once");
+
+            assert!(pair.slot_a.stop().await.unwrap());
+            assert!(pair.slot_b.stop().await.unwrap());
+            pair.relay.stop().await;
+        }
+
+        /// Opens a question on A to B and returns the idle sink A's owner hears on.
+        fn question_open_with_b(pair: &Pair, id: &str) -> Arc<RecordingIdleSink> {
+            let idle = RecordingIdleSink::new(true);
+            pair.slot_a.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+            let mut question = pending(id);
+            question.peer_destination = pair.to_b();
+            question.peer_identity = pair.b.runtime.fingerprint().to_string();
+            pair.slot_a.correlations().open(question).unwrap();
+            idle
+        }
+
+        /// The idle lines A's owner heard that say a peer is back.
+        fn back_lines(idle: &RecordingIdleSink) -> Vec<String> {
+            idle.pushed
+                .lock()
+                .iter()
+                .map(|note| note.text.plain())
+                .filter(|text| text.contains(" is back; "))
+                .collect()
+        }
+
+        /// A holds B marked left, though B is still up: a send from A would skip the link.
+        /// B asks A over a link, which lifts the mark at once and tells A's owner once that
+        /// B is back; A's reply then goes over the link. B's next request says nothing more.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_left_peer_that_asks_over_a_link_is_back_and_its_reply_goes_over_the_link() {
+            let pair = Pair::start("node-left-asks").await;
+            let to_a = pair.a.runtime.current_destination_hash();
+            let to_b = pair.to_b();
+            let idle = question_open_with_b(&pair, "q-left-asks");
+            assert!(pair.a.runtime.peers().mark_left(&to_b, SystemTime::now()));
+            let stale =
+                OutboundPeer::new(PeerKind::Message, "still there?", None, None, None).unwrap();
+            assert_eq!(
+                pair.a.runtime.send_peer(&to_b, &stale).await.unwrap_err(),
+                SendError::NoPropagationNode,
+                "while marked left, no link is tried to B"
+            );
+
+            let ask = OutboundPeer::new(PeerKind::Ask, "are you up?", None, None, None).unwrap();
+            let asked = pair.b.runtime.send_peer(&to_a, &ask).await.unwrap();
+
+            assert_eq!(asked.via, PeerVia::Direct);
+            assert_eq!(pair.left_at_on_a(), None, "B's request lifted the mark");
+            let back = back_lines(&idle);
+            assert_eq!(back.len(), 1, "{back:?}");
+            let name = pair.slot_a.peer_name_at(&to_b);
+            assert!(
+                back[0].starts_with(&format!("{name} is back; your question from ")),
+                "{back:?}"
+            );
+            let reply =
+                OutboundPeer::new(PeerKind::Reply, "yes", None, Some(&ask.id), None).unwrap();
+            let replied = pair.a.runtime.send_peer(&to_b, &reply).await.unwrap();
+            assert_eq!(
+                replied,
+                SendOutcome {
+                    id: reply.id.clone(),
+                    via: PeerVia::Direct,
+                    departed: None,
+                }
+            );
+            let again = OutboundPeer::new(PeerKind::Message, "thanks", None, None, None).unwrap();
+            pair.b.runtime.send_peer(&to_a, &again).await.unwrap();
+            assert_eq!(back_lines(&idle).len(), 1, "the line comes once");
+
+            assert!(pair.slot_a.stop().await.unwrap());
+            assert!(pair.slot_b.stop().await.unwrap());
+            pair.relay.stop().await;
+        }
+
+        /// The farewell is the one request over a link that does not lift the mark: B's
+        /// second farewell neither moves the time of the first nor tells A's owner B is back.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_repeated_farewell_over_a_link_keeps_the_mark_and_says_nothing() {
+            let pair = Pair::start("node-left-repeat").await;
+            let idle = question_open_with_b(&pair, "q-left-repeat");
+            let farewell = FarewellOutcome {
+                audience: 1,
+                delivered: 1,
+            };
+            assert_eq!(pair.b.runtime.send_farewell().await, farewell);
+            let first = pair.left_at_on_a();
+            assert!(first.is_some(), "the first farewell marks B left");
+            // A second's gap, so a farewell that re-marked the row would move its time.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+
+            assert_eq!(pair.b.runtime.send_farewell().await, farewell);
+
+            assert_eq!(
+                pair.left_at_on_a(),
+                first,
+                "the first farewell's time is kept"
+            );
+            assert!(back_lines(&idle).is_empty(), "a farewell is not a return");
+
+            assert!(pair.slot_a.stop().await.unwrap());
+            assert!(pair.slot_b.stop().await.unwrap());
+            pair.relay.stop().await;
+        }
+
+        /// Held mail from a peer marked left is filed as any other but leaves the mark: a
+        /// held message can be older than the farewell.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn held_mail_from_a_left_peer_is_filed_and_leaves_the_mark() {
+            let pair = Pair::start("node-left-held").await;
+            let to_b = pair.to_b();
+            let idle = question_open_with_b(&pair, "q-left-held");
+            let left_at = SystemTime::now();
+            assert!(pair.a.runtime.peers().mark_left(&to_b, left_at));
+            let origin_b = pair.b.runtime.destination.lock().await.origin;
+            let out = OutboundPeer::new(PeerKind::Message, "held", None, None, None).unwrap();
+            let lxmf = peer_lxmf_message(&out, &origin_b);
+            let inner = NullSink;
+            let routing = PeerRouting {
+                trust: &pair.a.runtime.trust,
+                surface: Some(pair.slot_a.clone() as Arc<dyn PeerSurface>),
+                inner: &inner,
+            };
+
+            routing.deliver(InboundMessage {
+                transient_id: [1u8; 32],
+                message_id: [2u8; 32],
+                source_identity_hash: pair.b.runtime.fingerprint().to_string(),
+                source_delivery_hash: hex_lower(&[0x03; 16]),
+                timestamp: unix_now(),
+                title: None,
+                content: Some(lxmf.content),
+                fields: lxmf.fields,
+                stamp_value: None,
+            });
+
+            assert_eq!(
+                pair.slot_a.peer_inbox().len(),
+                1,
+                "the held message is filed"
+            );
+            assert_eq!(pair.left_at_on_a(), Some(left_at));
+            assert!(back_lines(&idle).is_empty(), "held mail is not a return");
 
             assert!(pair.slot_a.stop().await.unwrap());
             assert!(pair.slot_b.stop().await.unwrap());

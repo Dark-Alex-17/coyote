@@ -371,6 +371,21 @@ impl PeerTable {
         true
     }
 
+    /// Lifts the mark `mark_left` set, once the instance was heard from over a live link:
+    /// it is back as surely as if it had announced. `last_seen` stays the announce's. `true`
+    /// when the row was marked.
+    pub(crate) fn clear_left(&self, destination_hash: &str) -> bool {
+        let mut peers = self.inner.lock();
+        let Some(record) = peers.get_mut(destination_hash) else {
+            return false;
+        };
+        if record.left_at.take().is_none() {
+            return false;
+        }
+        self.dirty.store(true, Ordering::Release);
+        true
+    }
+
     pub(crate) fn sweep(&self, now: SystemTime) -> Vec<String> {
         let mut peers = self.inner.lock();
         let expired: Vec<String> = peers
@@ -857,6 +872,33 @@ mod tests {
             !table.mark_left("aa", left),
             "the farewell is older than the announce that followed it"
         );
+    }
+
+    /// Traffic over a live link lifts the mark once and leaves `last_seen` to announces; a
+    /// row with no mark, or no row, reports nothing lifted. The lifted mark is persisted.
+    #[test]
+    fn traffic_over_a_link_lifts_the_left_mark_once_and_keeps_last_seen() {
+        let (table, tmp) = table("peers-left-cleared");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        table.observe(sighting("aa", None), t0);
+        assert!(
+            !table.clear_left("aa"),
+            "an unmarked row has nothing to lift"
+        );
+        assert!(!table.clear_left("unknown"));
+        let left = t0 + Duration::from_secs(5);
+        assert!(table.mark_left("aa", left));
+        table.persist_if_dirty().unwrap();
+
+        assert!(table.clear_left("aa"));
+        assert!(!table.clear_left("aa"), "the mark lifts once");
+        let row = table.get("aa").unwrap();
+        assert_eq!(row.left_at, None);
+        assert_eq!(row.last_seen, t0, "traffic is not an announce");
+        table.persist_if_dirty().unwrap();
+        let reloaded = PeerTable::load(path, left).unwrap();
+        assert_eq!(reloaded.get("aa").unwrap().left_at, None);
     }
 
     #[test]

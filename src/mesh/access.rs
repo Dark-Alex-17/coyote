@@ -626,7 +626,7 @@ impl MeshRuntime {
         let dest8 = short(&dest_hex);
         let id = request.id.as_str();
         let departed = self.departure(&dest_hex);
-        // A peer that said it left is not tried over a link until it announces again.
+        // A peer that said it left is not tried over a link until it is back.
         let attempt = if matches!(departed, Some(Departure::Left(_))) {
             None
         } else {

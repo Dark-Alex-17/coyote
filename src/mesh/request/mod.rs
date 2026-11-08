@@ -14,16 +14,16 @@ mod tests;
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{
-    ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
-    KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES,
+    ACCESS_PATH, AdmittedRequest, AllowObserver, DispatchError, Dispatcher, FETCH_PATH, Handler,
+    KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES,
     MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
 pub(crate) use error::{
     NoAnswer, RefusalCode, RemoteRefusal, RequestError, refusal_remedy, request_remedy,
 };
-pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName};
+pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName, PathHash};
 #[cfg(test)]
-pub(crate) use frame::{EnvelopeError, PathHash, RequestId};
+pub(crate) use frame::{EnvelopeError, RequestId};
 #[cfg(test)]
 pub(crate) use handler::{
     Admission, HANDLER_TIMEOUT, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, RequestHandler,

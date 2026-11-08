@@ -18,7 +18,7 @@ use rns_transport::hash::{ADDRESS_HASH_SIZE, AddressHash};
 use rns_transport::identity::Identity;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 pub(crate) const KNOCK_PATH: &str = "/knock";
@@ -89,6 +89,13 @@ pub(crate) trait Handler: Send + Sync {
 /// trusted yet, or introducing itself on `/knock` outright.
 pub(crate) trait KnockSink: Send + Sync {
     fn knock(&self, knock: KnockEvent);
+}
+
+/// Told of every request the trust gate let through, before it is routed: `destination`
+/// is the requester's own instance, proven on a live link, and `body` is the envelope's,
+/// not yet read by any handler. Runs on the request path, so it must not block.
+pub(crate) trait AllowObserver: Send + Sync {
+    fn allowed(&self, destination: &AddressHash, path_hash: PathHash, body: &Value);
 }
 
 pub(crate) struct KnockEvent {
@@ -226,6 +233,7 @@ pub(crate) struct Dispatcher {
     knocks: Arc<dyn KnockSink>,
     /// Read for the length of a lookup only; a handler runs with the lock released.
     routes: RwLock<HashMap<PathHash, Route>>,
+    observer: OnceLock<Arc<dyn AllowObserver>>,
 }
 
 impl Dispatcher {
@@ -242,7 +250,14 @@ impl Dispatcher {
             trust,
             knocks,
             routes: RwLock::new(routes),
+            observer: OnceLock::new(),
         }
+    }
+
+    /// Sets the one observer every allowed request is shown to. `false`, and the first
+    /// observer kept, when one was already set.
+    pub(crate) fn set_observer(&self, observer: Arc<dyn AllowObserver>) -> bool {
+        self.observer.set(observer).is_ok()
     }
 
     /// Serves `path` with `handler`, returning the handler it displaces, if any. A
@@ -406,6 +421,9 @@ impl Dispatcher {
                         KeyChangeOutcome::Served,
                         now,
                     );
+                }
+                if let Some(observer) = self.observer.get() {
+                    observer.allowed(&destination_hash, request.path_hash, &envelope.body);
                 }
                 let route = self
                     .routes
@@ -693,6 +711,91 @@ mod tests {
         assert!(
             debug_snapshot().contains(&line),
             "the no-route drop must be logged: {line:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct SeenAllowed(Mutex<Vec<(AddressHash, PathHash, Value)>>);
+
+    impl AllowObserver for SeenAllowed {
+        fn allowed(&self, destination: &AddressHash, path_hash: PathHash, body: &Value) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((*destination, path_hash, body.clone()));
+        }
+    }
+
+    /// The observer sees each request the trust gate lets through, before its handler and
+    /// whether or not a provider serves the path, with the requester's own instance and the
+    /// envelope's body. A refused, unauthenticated or unknown requester is never shown to
+    /// it. Only one observer can be set.
+    #[tokio::test]
+    async fn the_observer_sees_only_the_requests_the_trust_gate_allowed() {
+        const ORIGIN: [u8; NAME_HASH_LEN] = [11; NAME_HASH_LEN];
+        let trusted = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+        let known = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+        let stranger = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+        let (store, _tmp) = TrustList::default()
+            .identity(&trusted.address_hash.to_hex_string(), true)
+            .identity(&known.address_hash.to_hex_string(), false)
+            .open("dispatch-observer");
+        let dispatcher = Dispatcher::new(store, Arc::new(NoKnocks));
+        let seen = Arc::new(SeenAllowed::default());
+        assert!(dispatcher.set_observer(seen.clone()));
+        assert!(
+            !dispatcher.set_observer(Arc::new(SeenAllowed::default())),
+            "the first observer is kept"
+        );
+        let recorder = Arc::new(Recorder::default());
+        dispatcher.register(STATUS_PATH, recorder.clone()).unwrap();
+        let ask = |identity: Option<Identity>, path: &str, body: Value| InboundRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity,
+            request_id: RequestId::from([11u8; 16]),
+            path_hash: PathHash::of(path),
+            data: Envelope::new(OriginName(ORIGIN), body).into_value(),
+        };
+
+        for refused in [
+            ask(Some(known), STATUS_PATH, Value::from("known")),
+            ask(Some(stranger), STATUS_PATH, Value::from("stranger")),
+            ask(None, STATUS_PATH, Value::from("anonymous")),
+        ] {
+            let reply = RequestHandler::handle(&dispatcher, refused).await;
+            assert!(!matches!(reply, Reply::Value(Value::Nil)));
+        }
+        assert!(seen.0.lock().unwrap().is_empty(), "nothing refused is seen");
+        assert!(recorder.0.lock().unwrap().is_none());
+
+        let served = RequestHandler::handle(
+            &dispatcher,
+            ask(Some(trusted), STATUS_PATH, Value::from("served")),
+        )
+        .await;
+        let unserved = RequestHandler::handle(
+            &dispatcher,
+            ask(Some(trusted), LIST_PATH, Value::from("no provider")),
+        )
+        .await;
+
+        assert!(matches!(served, Reply::Value(Value::Nil)));
+        assert!(matches!(unserved, Reply::Value(_)));
+        let destination = destination_address(&ORIGIN, &trusted.address_hash);
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            [
+                (
+                    destination,
+                    PathHash::of(STATUS_PATH),
+                    Value::from("served")
+                ),
+                (
+                    destination,
+                    PathHash::of(LIST_PATH),
+                    Value::from("no provider")
+                ),
+            ]
         );
     }
 }

@@ -9087,7 +9087,7 @@ mod peers_route_tests {
         );
         assert!(
             peers_legend().contains(
-                "left = the instance said it was leaving the mesh, until it announces again"
+                "left = the instance said it was leaving the mesh, until it announces again or is heard over a link"
             ),
             "{text}"
         );
@@ -9290,7 +9290,7 @@ fn trust_legend() -> &'static str {
 /// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -12000,7 +12000,7 @@ mod tests {
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                 NAME_ADDRESSING_LINE,
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
             ],
             "{text}"
         );
@@ -12144,7 +12144,7 @@ mod tests {
 6 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
 
     /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
     #[test]

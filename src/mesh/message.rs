@@ -1633,11 +1633,11 @@ pub(crate) struct SendOutcome {
 }
 
 /// How a peer had gone when a send to it started: it said it was leaving the mesh, or
-/// the last link to it failed. Either lasts until its next announce.
+/// the last link to it failed. Either lasts until it announces again or is heard over a link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Departure {
     /// Its farewell arrived at this time, by this node's clock. Nothing is tried over a
-    /// link until it announces again.
+    /// link until it announces again or reaches this node over one.
     Left(SystemTime),
     /// The last link attempt failed; `last_seen` is its latest announce. A link is still
     /// tried while the transport holds a path.
@@ -1987,7 +1987,7 @@ impl MeshRuntime {
     /// stored: the peer never read it, so the stored copy cannot land twice. Posts to
     /// the propagation node queue behind `posting`, since `propagate` needs one caller
     /// per node at a time. A peer that said it left the mesh is not tried over a link at
-    /// all while the send may be stored: its farewell holds until its next announce. The
+    /// all while the send may be stored: its farewell holds until it is back. The
     /// outcome of a stored send says how the peer had gone, if it had.
     pub(crate) async fn send_peer_with(
         &self,
@@ -2065,7 +2065,7 @@ impl MeshRuntime {
         let desc = route.desc;
         let dest8 = short(&destination);
         let (kind, id) = (message.kind, message.id.as_str());
-        // A peer that said it left is not tried over a link until it announces again. A
+        // A peer that said it left is not tried over a link until it is back. A
         // send that may go only over a link still tries it, and so does a bulletin, whose
         // fan-out reports each recipient on its own row.
         let skips_link = options.store_and_forward
@@ -2713,8 +2713,8 @@ pub(crate) trait PeerSurface: Send + Sync {
     /// A farewell: the sender is marked as having left, and nothing is filed, counted or
     /// handed to the envoy.
     fn note_farewell(&self, farewell: Farewell);
-    /// An instance marked left announced again, which lifted the mark. The owner hears of
-    /// it only when a question to it is still open.
+    /// An instance marked left announced again or was heard over a link, which lifted the
+    /// mark. The owner hears of it only when a question to it is still open.
     fn note_return(&self, _destination: &str) {}
     /// Lower-hex of the destination this node receives on right now; `None` while off.
     fn local_destination(&self) -> Option<String>;
