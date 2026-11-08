@@ -7904,18 +7904,43 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     }
 }
 
-/// The sent-threads list is one per config dir: the Mesh page's cache table names the
-/// file the code opens, with its cap, and says an earlier per-instance list is deleted;
-/// the `thread` paragraph says any of your sessions may continue a thread another one
-/// opened; and the `mesh__collect` row names the refusal for another session's question.
+/// The sent-threads list is one per session: the Mesh page's cache table names the file
+/// the code opens, with its cap, and says the shared list an earlier Coyote kept is
+/// deleted; the `thread` paragraph says another session's thread is refused with the
+/// refusal the code writes, and a resumed session continues its own; and the
+/// `mesh__collect` row names the refusal for another session's question.
 #[test]
-fn the_mesh_page_describes_the_shared_sent_threads_list() {
-    let file = const_str("src/mesh/sent_threads.rs", "SENT_THREADS_FILE");
+fn the_mesh_page_describes_the_per_session_sent_threads_list() {
+    let file = "sent-threads-<instance_id>.json";
     let cap = const_u64("src/mesh/sent_threads.rs", "SENT_THREADS_MAX_ENTRIES");
     let open = method_body("src/mesh/sent_threads.rs", "open");
+    for needle in [
+        "remove_shared_leftovers(&dir)",
+        "format!(\"sent-threads-{instance_id}.json\")",
+    ] {
+        assert!(
+            open.contains(needle),
+            "SentThreads::open no longer has {needle:?}:\n{open}"
+        );
+    }
+    let leftovers = read(repo_root().join("src/mesh/sent_threads.rs"));
     assert!(
-        open.contains("remove_per_instance_lists(&dir)"),
-        "SentThreads::open no longer deletes the per-instance lists:\n{open}"
+        leftovers.contains(
+            "const SHARED_LEFTOVERS: [&str; 2] = [\"sent-threads.json\", \"sent-threads.json.lock\"];"
+        ),
+        "the shared list and lock deleted on open moved"
+    );
+    let message_source = read(repo_root().join("src/mesh/message.rs"));
+    let (_, unknown_thread) = message_source
+        .split_once("Self::UnknownThread(thread) => write!(")
+        .expect("SendError::UnknownThread is written by Display");
+    let refusal = string_literals(unknown_thread.split_once("),").unwrap().0)
+        .pop()
+        .expect("SendError::UnknownThread writes a literal")
+        .replace("{thread}", "<thread>");
+    assert!(
+        refusal.contains("is not a thread this session sent or received"),
+        "the unknown_thread refusal no longer names this session: {refusal}"
     );
     let collect = fn_body("src/function/mesh.rs", "asked_by_another_session");
     assert!(
@@ -7930,9 +7955,12 @@ fn the_mesh_page_describes_the_shared_sent_threads_list() {
         .find(|line| line.starts_with(&format!("| `{file}`")))
         .unwrap_or_else(|| panic!("Mesh.md's cache table has no `{file}` row"));
     for needle in [
-        "any of your sessions on this config dir".to_string(),
+        "The threads this session sent or received".to_string(),
+        "another session's are refused, a resumed session keeps its own and a fork starts with none"
+            .to_string(),
         format!("At most {cap} in all"),
-        "`sent-threads-<instance_id>.json` left by an earlier Coyote is deleted unread".to_string(),
+        "A shared `sent-threads.json` (and its `.lock`) left by an earlier Coyote is deleted unread"
+            .to_string(),
     ] {
         assert!(
             row.contains(&needle),
@@ -7941,11 +7969,19 @@ fn the_mesh_page_describes_the_shared_sent_threads_list() {
     }
     let prose = flat(&page);
     for needle in [
+        "To continue, pass a thread this session sent or received".to_string(),
+        "A conversation belongs to the session that had it: your other sessions on this config dir, and a fork of this one, cannot continue it, while this session resumed later (`.session <session>` and `.mesh on`) can.".to_string(),
+        format!("`kind: unknown_thread`, the message ``{refusal}``"),
+        "`kind: asked_by_another_session`".to_string(),
+    ] {
+        assert!(prose.contains(&needle), "Mesh.md does not say {needle:?}");
+    }
+    for gone in [
         "in any of your sessions on this config dir",
         "A thread one session opened can be continued from another",
-        "`kind: asked_by_another_session`",
+        "never by the destination",
     ] {
-        assert!(prose.contains(needle), "Mesh.md does not say {needle:?}");
+        assert!(!prose.contains(gone), "Mesh.md still says {gone:?}");
     }
 }
 

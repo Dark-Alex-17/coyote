@@ -1463,7 +1463,7 @@ impl fmt::Display for SendError {
             ),
             Self::UnknownThread(thread) => write!(
                 f,
-                "\"{thread}\" is not a thread this node has seen. Omit thread to start a conversation; to continue one, pass the thread from the earlier message or reply."
+                "\"{thread}\" is not a thread this session sent or received; another session's conversations stay with that session. Leave `thread` out to start a new conversation."
             ),
             Self::InvalidParts(reason) => write!(
                 f,

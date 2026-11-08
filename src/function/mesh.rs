@@ -79,7 +79,7 @@ const REPLY_NEEDS_IN_REPLY_TO: &str = "kind: \"reply\" needs in_reply_to: the me
 
 const KIND_IS_REPLY_OR_NOTE: &str = "kind must be \"reply\" or \"note\"; with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open; without in_reply_to, omit kind for a plain message";
 
-const UNKNOWN_THREAD_NEXT_ACTION: &str = "Omit thread to start a new conversation, or pass the thread returned by an earlier mesh__send/mesh__ask or shown on a received message.";
+const UNKNOWN_THREAD_NEXT_ACTION: &str = "Omit thread to start a new conversation, or pass a thread this session's own earlier mesh__send/mesh__ask returned or a message it received showed.";
 
 pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     let message_schema = |what: &str| JsonSchema {
@@ -765,11 +765,12 @@ pub(crate) fn inherit_reply_thread(
     }
 }
 
-/// A thread the caller names is continued, never authored: it must be one a session on
-/// this config dir has sent or received (the shared sent-threads list), or one this
-/// node has a question in flight or a filed inbound in. A thread `inherit_reply_thread`
-/// fills in comes from those same records and is not checked. Runs before anything
-/// reaches the wire, so a refusal sends nothing.
+/// A thread the caller names is continued, never authored: it must be one this session
+/// has sent or received (its own sent-threads list), or one this node has a question in
+/// flight or a filed inbound in. Another session's threads, even of the same identity,
+/// are refused: a conversation belongs to the session that had it. A thread
+/// `inherit_reply_thread` fills in comes from those same records and is not checked.
+/// Runs before anything reaches the wire, so a refusal sends nothing.
 fn refuse_unseen_thread(slot: &MeshSlot, out: &OutboundPeer) -> Result<(), SendError> {
     let Some(thread) = out.thread.as_deref() else {
         return Ok(());
@@ -8040,7 +8041,11 @@ mod tests {
         mod thread_rule_tests {
             use super::*;
 
-            const UNKNOWN_THREAD_MESSAGE: &str = "\"conv-1\" is not a thread this node has seen. Omit thread to start a conversation; to continue one, pass the thread from the earlier message or reply.";
+            fn unknown_thread_message(thread: &str) -> String {
+                format!(
+                    "\"{thread}\" is not a thread this session sent or received; another session's conversations stay with that session. Leave `thread` out to start a new conversation."
+                )
+            }
 
             fn held_threads(live: &TrustedStub) -> Vec<String> {
                 let path = live.started.runtime.sent_threads().path().to_path_buf();
@@ -8075,7 +8080,8 @@ mod tests {
                     assert_eq!(refused["status"], "error", "{tool}: {refused}");
                     assert_eq!(refused["kind"], "unknown_thread", "{tool}: {refused}");
                     assert_eq!(
-                        refused["message"], UNKNOWN_THREAD_MESSAGE,
+                        refused["message"],
+                        unknown_thread_message("conv-1"),
                         "{tool}: {refused}"
                     );
                     assert_eq!(
@@ -8092,16 +8098,15 @@ mod tests {
             }
 
             /// Sessions `a` and `c` of one identity on one cache dir, both running before
-            /// `a` asks: `c` continues the thread `a`'s question opened, the receiver's
-            /// envoy resumes the conversation it holds for that identity under the thread,
-            /// and a thread neither session sent nor received is still refused.
+            /// `a` asks: `c` naming the thread `a`'s question opened is refused as an
+            /// unknown thread and nothing reaches the wire, since a conversation belongs to
+            /// the session that had it. A question `c` asks on its own is still `c`'s to
+            /// collect.
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
             #[serial]
-            async fn a_sibling_session_continues_a_thread_another_session_opened() {
+            async fn a_sibling_session_cannot_continue_a_thread_another_session_opened() {
                 use crate::config::Session;
-                use crate::config::mesh_config::EnvoyMemoryConfig;
-                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
-                use crate::mesh::test_support::{TempDir, mesh_paths, private_config};
+                use crate::mesh::test_support::{mesh_paths, private_config};
                 use crate::mesh::{MeshRuntime, NodeOptions};
 
                 let mut live = trusted_stub("mesh-tool-thread-sibling").await;
@@ -8137,72 +8142,47 @@ mod tests {
                 .unwrap();
                 assert_eq!(asked["status"], "asked", "{asked}");
                 let thread = asked["thread"].as_str().unwrap().to_string();
-                let receiver_dir = TempDir::new("mesh-tool-thread-sibling-receiver");
-                let receiver = EnvoySessions::open(
-                    &receiver_dir.path,
-                    "receiver",
-                    &EnvoyMemoryConfig {
-                        enabled: true,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-                let now = SystemTime::now();
-                let first = live
-                    .stub
-                    .seen()
-                    .into_iter()
-                    .find(|body| body.id == asked["id"])
-                    .expect("the stub received a's question");
-                let opened =
-                    receiver.session_thread(&identity, first.thread.as_deref(), &first.id, now);
-                assert_eq!(opened.thread, thread);
-                receiver
-                    .save(
-                        &identity,
-                        &opened.thread,
-                        vec![
-                            EnvoyTurn {
-                                role: EnvoyRole::User,
-                                text: first.content.clone(),
-                            },
-                            EnvoyTurn {
-                                role: EnvoyRole::Assistant,
-                                text: "Noted: teal.".to_string(),
-                            },
-                        ],
-                        now,
+                let seen_before = live.stub.seen().len();
+
+                for tool in ["send", "ask"] {
+                    let refused = handle_mesh_tool(
+                        &mut c_ctx,
+                        &format!("{MESH_FUNCTION_PREFIX}{tool}"),
+                        &json!({"to": live.to, "message": "What is my favourite colour?", "thread": thread}),
                     )
+                    .await
                     .unwrap();
+
+                    assert_eq!(refused["status"], "error", "{tool}: {refused}");
+                    assert_eq!(refused["kind"], "unknown_thread", "{tool}: {refused}");
+                    assert_eq!(
+                        refused["message"],
+                        unknown_thread_message(&thread),
+                        "{tool}: {refused}"
+                    );
+                    assert!(refused.get("id").is_none(), "{tool}: {refused}");
+                }
+                assert_eq!(
+                    live.stub.seen().len(),
+                    seen_before,
+                    "nothing reaches the wire: {:?}",
+                    live.stub.seen()
+                );
+                assert!(c_ctx.app.mesh.correlations().list().is_empty());
 
                 let follow_up = handle_mesh_tool(
                     &mut c_ctx,
                     &ask,
-                    &json!({"to": live.to, "message": "What is my favourite colour?", "thread": thread}),
+                    &json!({"to": live.to, "message": "What is my favourite colour?"}),
                 )
                 .await
                 .unwrap();
-
                 assert_eq!(follow_up["status"], "asked", "{follow_up}");
-                assert_eq!(follow_up["thread"], thread.as_str(), "{follow_up}");
-                let second = live
-                    .stub
-                    .seen()
-                    .into_iter()
-                    .find(|body| body.id == follow_up["id"])
-                    .expect("the stub received c's follow-up");
-                assert_eq!(second.thread.as_deref(), Some(thread.as_str()));
-                let resumed =
-                    receiver.session_thread(&identity, second.thread.as_deref(), &second.id, now);
-                assert_eq!(resumed.thread, thread);
-                let history = resumed
-                    .resumed
-                    .expect("the receiver resumes the conversation");
-                assert!(
-                    history.turns.iter().any(|turn| turn.text.contains("teal")),
-                    "{history:?}"
+                assert_ne!(
+                    follow_up["thread"],
+                    thread.as_str(),
+                    "left out, the thread is a new conversation: {follow_up}"
                 );
-
                 let follow_up_id = follow_up["id"].as_str().unwrap().to_string();
                 let collected = handle_mesh_tool(
                     &mut live.ctx,
@@ -8225,18 +8205,67 @@ mod tests {
                     "the asking session's question stays open"
                 );
 
-                let refused = handle_mesh_tool(
-                    &mut c_ctx,
+                assert!(c_ctx.app.mesh.stop().await.unwrap());
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
+            /// A resumed session keeps its instance, so after a stop and a start under the
+            /// same session it continues the thread its earlier question opened.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn a_resumed_session_continues_its_own_thread() {
+                use crate::mesh::test_support::{mesh_paths, private_config};
+                use crate::mesh::{MeshRuntime, NodeOptions};
+
+                let mut live = trusted_stub("mesh-tool-thread-resumed").await;
+                let ask = format!("{MESH_FUNCTION_PREFIX}ask");
+                let asked = handle_mesh_tool(
+                    &mut live.ctx,
                     &ask,
-                    &json!({"to": live.to, "message": "hi", "thread": "conv-1"}),
+                    &json!({"to": live.to, "message": "My favourite colour is teal."}),
                 )
                 .await
                 .unwrap();
-                assert_eq!(refused["kind"], "unknown_thread", "{refused}");
-                assert_eq!(refused["message"], UNKNOWN_THREAD_MESSAGE, "{refused}");
-
-                assert!(c_ctx.app.mesh.stop().await.unwrap());
+                assert_eq!(asked["status"], "asked", "{asked}");
+                let thread = asked["thread"].as_str().unwrap().to_string();
+                let instance_id = live.started.runtime.current_instance_id();
                 assert!(live.ctx.app.mesh.stop().await.unwrap());
+
+                let mut session = live.started.session.clone();
+                let resumed = MeshRuntime::start(
+                    &private_config(live.stub.port()),
+                    true,
+                    &mut session,
+                    mesh_paths(&live.started.tmp),
+                    NodeOptions::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(resumed.current_instance_id(), instance_id);
+                let mut resumed_ctx = plain_ctx();
+                resumed_ctx.app.mesh.install(resumed.clone()).unwrap();
+                live.stub.wait_to_be_filed(&resumed.peers(), &live.to).await;
+
+                let follow_up = handle_mesh_tool(
+                    &mut resumed_ctx,
+                    &ask,
+                    &json!({"to": live.to, "message": "What is my favourite colour?", "thread": thread}),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(follow_up["status"], "asked", "{follow_up}");
+                assert_eq!(follow_up["thread"], thread.as_str(), "{follow_up}");
+                let sent = live
+                    .stub
+                    .seen()
+                    .into_iter()
+                    .find(|body| body.id == follow_up["id"])
+                    .expect("the stub received the resumed session's follow-up");
+                assert_eq!(sent.thread.as_deref(), Some(thread.as_str()));
+
+                assert!(resumed_ctx.app.mesh.stop().await.unwrap());
                 live.stub.stop().await;
             }
 

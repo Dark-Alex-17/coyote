@@ -1,34 +1,25 @@
-use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::message::is_wire_id;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::{mesh_cache_dir, redact_hashes, write_atomically_owner_only};
-use crate::utils::fs::EXCLUSIVE_LOCK_WAIT;
 
 use anyhow::{Context, Result, bail};
 use log::{debug, warn};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Upper bound on remembered threads, sent and received together. Received threads are
-/// evicted first, so a peer sending many threads cannot push out the ones this identity
+/// evicted first, so a peer sending many threads cannot push out the ones this instance
 /// started.
 pub(crate) const SENT_THREADS_MAX_ENTRIES: usize = 1024;
 
 pub(crate) const SENT_THREADS_VERSION: u64 = 1;
 
-const SENT_THREADS_FILE: &str = "sent-threads.json";
-
-/// What the lock on the list is called in a refusal.
-const SENT_THREADS_LOCK_WHAT: &str = "mesh sent-threads list";
-
-/// How long `record_received` waits for the lock. A delivery can run on the propagation
-/// fetch task, an async worker, so the wait there is kept short; the holder keeps the
-/// lock for one read-modify-write of a small file, and a caller that runs out of it
-/// retries off the worker with `record_received_waiting`.
-pub(crate) const RECEIVED_LOCK_WAIT: Duration = Duration::from_millis(250);
+/// The list earlier builds shared between every session of a config dir, and its lock.
+/// Neither is read any more: a conversation belongs to the session that had it.
+const SHARED_LEFTOVERS: [&str; 2] = ["sent-threads.json", "sent-threads.json.lock"];
 
 /// The whole file: the version first, then each list oldest to newest. Rejects unknown
 /// fields, so any change to the layout bumps `SENT_THREADS_VERSION`.
@@ -82,55 +73,63 @@ impl Held {
             }
         }
     }
-
-    fn contains(&self, thread: &str) -> bool {
-        self.sent
-            .iter()
-            .chain(&self.received)
-            .any(|other| other == thread)
-    }
 }
 
-/// The threads any session on this cache dir has sent or received, in
-/// `<cache_dir>/mesh/sent-threads.json`: what `mesh__send` and `mesh__ask` accept as a
-/// thread to continue. One list per config dir, like the trust list and the peer table,
-/// so a thread one session (or a fork of it) opened or received is continuable from any
-/// other session of the same identity. Nothing is held in memory: every lookup reads the
-/// file and every change is a read-modify-write, both under `<file>.lock`, so a session
-/// sees a thread another one recorded after it started and no two writers lose each
-/// other's change.
+/// The threads this instance has sent or received, in
+/// `<cache_dir>/mesh/sent-threads-<instance_id>.json`: what `mesh__send` and `mesh__ask`
+/// accept as a thread to continue. Keyed by instance because a conversation belongs to
+/// the session that had it: a resumed session keeps its instance and so continues its
+/// own threads, while another session of the same identity, or a fork, holds its own.
+/// The instance lock keeps the file to one process. A change is made and serialized
+/// under `held`, and `write_lock` is taken before `held` is let go, so the fsync'd
+/// write blocks no reader and the snapshots reach the disk in the order they were
+/// taken.
 pub(crate) struct SentThreads {
     path: PathBuf,
-    lock_path: PathBuf,
+    held: Mutex<Held>,
+    write_lock: Mutex<()>,
 }
 
 impl SentThreads {
-    /// The list of `cache_dir`, checked as `load` checks it. The per-instance lists
-    /// earlier builds kept beside it are deleted unread: they are cache, and a thread
-    /// in one is continued again once the peer writes in it.
-    pub(crate) fn open(cache_dir: &Path) -> Result<Self> {
+    /// The list of `instance_id`, loaded as `load` says. The list and lock earlier
+    /// builds shared between every session of the cache dir are deleted unread: they
+    /// are cache, and no session may continue a thread another session had.
+    pub(crate) fn open(cache_dir: &Path, instance_id: &str) -> Result<Self> {
         let dir = mesh_cache_dir(cache_dir);
-        remove_per_instance_lists(&dir);
-        Self::load(dir.join(SENT_THREADS_FILE))
+        remove_shared_leftovers(&dir);
+        Self::load(dir.join(format!("sent-threads-{instance_id}.json")))
     }
 
-    /// The list at `path`. A missing file is empty and nothing is created until the
-    /// first thread is recorded. A file that cannot be read or parsed, or whose version
-    /// cannot be read, is moved aside to `<path>.corrupt` with a warning and the lists
-    /// start empty, as the peer table does. A readable version other than
-    /// `SENT_THREADS_VERSION` is refused and the file left in place. Past the open, only
-    /// a file that does not parse is moved aside: one that cannot be read is an error
-    /// for that lookup or record alone, so a passing fault never empties the list every
-    /// session shares.
+    /// Loads the lists at `path`. A missing file is empty and nothing is created until
+    /// the first thread is recorded. A file that cannot be read or parsed, or whose
+    /// version cannot be read, is moved aside to `<path>.corrupt` with a warning and the
+    /// lists start empty, as the peer table does. A readable version other than
+    /// `SENT_THREADS_VERSION` is refused and the file left in place. The lists read are
+    /// normalized as `Held::normalized` says, in memory only until the next write.
     pub(crate) fn load(path: PathBuf) -> Result<Self> {
-        let store = Self {
-            lock_path: path.with_added_extension("lock"),
-            path,
+        let held = match fs::read(&path) {
+            Ok(bytes) => match parse_sent_threads(&bytes) {
+                Ok(file) => Held::normalized(file),
+                Err(SentThreadsParse::Version(found)) => bail!(version_refusal(
+                    "sent-threads list",
+                    &path,
+                    None,
+                    found,
+                    SENT_THREADS_VERSION,
+                    Remedy::Cache
+                )),
+                Err(SentThreadsParse::Corrupt { cause, error }) => {
+                    set_aside_corrupt(&path, &cause, &error)
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Held::default(),
+            Err(err) => set_aside_corrupt(&path, "could not be read", &err.to_string()),
         };
-        if store.path.exists() {
-            store.locked(EXCLUSIVE_LOCK_WAIT, || store.read(Unreadable::SetAside))?;
-        }
-        Ok(store)
+        Ok(Self {
+            path,
+            held: Mutex::new(held),
+            write_lock: Mutex::new(()),
+        })
     }
 
     #[cfg(test)]
@@ -138,27 +137,18 @@ impl SentThreads {
         &self.path
     }
 
-    /// Whether any session on this cache dir sent or received `thread`, read from the
-    /// file under its lock. A list that cannot be read answers no, with a warning, so
-    /// the tools refuse the thread rather than continue one nobody can vouch for.
     pub(crate) fn contains(&self, thread: &str) -> bool {
-        match self.locked(EXCLUSIVE_LOCK_WAIT, || self.read(Unreadable::Refuse)) {
-            Ok(held) => held.contains(thread),
-            Err(err) => {
-                warn!(
-                    "Mesh sent-threads list '{}' could not be read, so mesh__send and mesh__ask treat thread {thread} as one this identity has not seen: {}. Try the call again in a moment; the error says what to do if it repeats.",
-                    self.path.display(),
-                    redact_hashes(&format!("{err:#}"))
-                );
-                false
-            }
-        }
+        let held = self.held.lock();
+        held.sent
+            .iter()
+            .chain(&held.received)
+            .any(|other| other == thread)
     }
 
-    /// Records `thread` as one this identity sent or opened, moving it out of the
+    /// Records `thread` as one this instance sent or opened, moving it out of the
     /// received list if a peer named it first.
     pub(crate) fn record_sent(&self, thread: &str) -> Result<()> {
-        self.record(thread, EXCLUSIVE_LOCK_WAIT, |held| {
+        self.record(thread, |held| {
             let was_received = held.received.iter().any(|other| other == thread);
             if was_received {
                 held.received.retain(|other| other != thread);
@@ -167,22 +157,10 @@ impl SentThreads {
         })
     }
 
-    /// Records `thread` as one a peer sent. A thread this identity sent stays in the sent
+    /// Records `thread` as one a peer sent. A thread this instance sent stays in the sent
     /// list, only moved to its newest end, so a peer cannot make it the first evicted.
-    /// The lock is waited for only `RECEIVED_LOCK_WAIT`, since a delivery may run on an
-    /// async worker; on an error the caller retries with `record_received_waiting` off
-    /// that worker.
     pub(crate) fn record_received(&self, thread: &str) -> Result<()> {
-        self.record_received_within(thread, RECEIVED_LOCK_WAIT)
-    }
-
-    /// `record_received` with the full lock wait, for a thread that may block.
-    pub(crate) fn record_received_waiting(&self, thread: &str) -> Result<()> {
-        self.record_received_within(thread, EXCLUSIVE_LOCK_WAIT)
-    }
-
-    fn record_received_within(&self, thread: &str, wait: Duration) -> Result<()> {
-        self.record(thread, wait, |held| {
+        self.record(thread, |held| {
             if held.sent.iter().any(|other| other == thread) {
                 Held::bump(&mut held.sent, thread)
             } else {
@@ -191,114 +169,44 @@ impl SentThreads {
         })
     }
 
-    /// Under the lock, reads the lists, applies `change` unless `thread` is not a wire
-    /// id, and writes the file back if `change` reports it changed them.
-    fn record(
-        &self,
-        thread: &str,
-        wait: Duration,
-        change: impl FnOnce(&mut Held) -> bool,
-    ) -> Result<()> {
+    /// Applies `change` to the lists unless `thread` is not a wire id, then writes the
+    /// file if `change` reports it changed them. The lists in memory keep the change when
+    /// the write fails, so the thread can still be continued until the node stops.
+    fn record(&self, thread: &str, change: impl FnOnce(&mut Held) -> bool) -> Result<()> {
         if !is_wire_id(thread) {
             return Ok(());
         }
-        self.locked(wait, || {
-            let mut held = self.read(Unreadable::Refuse)?;
-            if !change(&mut held) {
-                return Ok(());
-            }
-            held.evict_over_cap();
-            let file = SentThreadsFile {
-                version: SENT_THREADS_VERSION,
-                sent: held.sent.into_iter().collect(),
-                received: held.received.into_iter().collect(),
-            };
-            let json = serde_json::to_vec(&file)
-                .context("Failed to serialize the mesh sent-threads list")?;
-            write_atomically_owner_only(&self.path, &json)
-        })
-    }
-
-    fn locked<T>(&self, wait: Duration, body: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _held = acquire_mesh_lock(&self.lock_path, SENT_THREADS_LOCK_WHAT, wait)?;
-        body()
-    }
-
-    /// The lists on disk, normalized as `Held::normalized` says; called under the lock.
-    /// A file that does not parse is set aside; one that cannot be read is handled as
-    /// `unreadable` says.
-    fn read(&self, unreadable: Unreadable) -> Result<Held> {
-        match fs::read(&self.path) {
-            Ok(bytes) => match parse_sent_threads(&bytes) {
-                Ok(file) => Ok(Held::normalized(file)),
-                Err(SentThreadsParse::Version(found)) => bail!(version_refusal(
-                    "sent-threads list",
-                    &self.path,
-                    None,
-                    found,
-                    SENT_THREADS_VERSION,
-                    Remedy::Cache
-                )),
-                Err(SentThreadsParse::Corrupt { cause, error }) => {
-                    Ok(set_aside_corrupt(&self.path, &cause, &error))
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Held::default()),
-            Err(err) => match unreadable {
-                Unreadable::SetAside => Ok(set_aside_corrupt(
-                    &self.path,
-                    "could not be read",
-                    &err.to_string(),
-                )),
-                Unreadable::Refuse => Err(err).with_context(|| {
-                    format!(
-                        "Failed to read the mesh sent-threads list '{}'; check that it is readable",
-                        self.path.display()
-                    )
-                }),
-            },
+        let mut held = self.held.lock();
+        if !change(&mut held) {
+            return Ok(());
         }
-    }
-
-    #[cfg(test)]
-    fn snapshot(&self) -> Held {
-        self.locked(EXCLUSIVE_LOCK_WAIT, || self.read(Unreadable::Refuse))
-            .unwrap()
-    }
-}
-
-/// What `SentThreads::read` does with a file that exists but cannot be read.
-#[derive(Clone, Copy)]
-enum Unreadable {
-    /// Moves it aside and starts empty, as the open does.
-    SetAside,
-    /// Fails the one lookup or record and leaves the file for the next.
-    Refuse,
-}
-
-/// Deletes the `sent-threads-<instance_id>.json` lists earlier builds kept per instance
-/// in `dir`. A file that cannot be deleted is only logged: nothing reads it.
-fn remove_per_instance_lists(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
+        held.evict_over_cap();
+        let file = SentThreadsFile {
+            version: SENT_THREADS_VERSION,
+            sent: held.sent.iter().cloned().collect(),
+            received: held.received.iter().cloned().collect(),
         };
-        if !(name.starts_with("sent-threads-") && name.ends_with(".json")) {
-            continue;
-        }
-        let path = entry.path();
+        let json =
+            serde_json::to_vec(&file).context("Failed to serialize the mesh sent-threads list")?;
+        let _write = self.write_lock.lock();
+        drop(held);
+        write_atomically_owner_only(&self.path, &json)
+    }
+}
+
+/// Deletes the list and lock in `dir` that earlier builds shared between every session
+/// of the cache dir. A file that cannot be deleted is only logged: nothing reads it.
+fn remove_shared_leftovers(dir: &Path) {
+    for name in SHARED_LEFTOVERS {
+        let path = dir.join(name);
         match fs::remove_file(&path) {
             Ok(()) => debug!(
-                "Deleted the per-instance mesh sent-threads list '{}'; every session now shares '{SENT_THREADS_FILE}'",
+                "Deleted the shared mesh sent-threads file '{}'; each session now keeps its own list",
                 path.display()
             ),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => debug!(
-                "The per-instance mesh sent-threads list '{}' could not be deleted ({}); nothing reads it",
+                "The shared mesh sent-threads file '{}' could not be deleted ({}); nothing reads it",
                 path.display(),
                 redact_hashes(&err.to_string())
             ),
@@ -335,8 +243,8 @@ fn parse_sent_threads(bytes: &[u8]) -> Result<SentThreadsFile, SentThreadsParse>
 
 /// Warns about a list that cannot be used, `cause` first and the raw `error` after it,
 /// renames it to `<path>.corrupt` (replacing any earlier one) and returns the empty lists
-/// the next write starts from. A failed rename is only warned about; the file is cache
-/// and nothing downstream depends on the move.
+/// the node starts with. A failed rename is only warned about; the file is cache and
+/// nothing downstream depends on the move.
 fn set_aside_corrupt(path: &Path, cause: &str, error: &str) -> Held {
     let aside = path.with_extension("json.corrupt");
     warn!(
@@ -348,7 +256,7 @@ fn set_aside_corrupt(path: &Path, cause: &str, error: &str) -> Held {
     );
     if let Err(err) = fs::rename(path, &aside) {
         warn!(
-            "Mesh sent-threads list '{}' could not be moved to '{}' ({}), so it will be read and set aside again at the next lookup. Remove or move the file at '{}' to stop this warning.",
+            "Mesh sent-threads list '{}' could not be moved to '{}' ({}), so it will be read and set aside again at the next start. Remove or move the file at '{}' to stop this warning.",
             path.display(),
             aside.display(),
             redact_hashes(&err.to_string()),
@@ -365,15 +273,15 @@ mod tests {
     use crate::testing::{install_log_collector, warn_snapshot};
 
     fn store(tmp: &TempDir) -> SentThreads {
-        SentThreads::open(&tmp.path).unwrap()
+        SentThreads::open(&tmp.path, "inst").unwrap()
     }
 
     fn sent(store: &SentThreads) -> Vec<String> {
-        store.snapshot().sent.into_iter().collect()
+        store.held.lock().sent.iter().cloned().collect()
     }
 
     fn received(store: &SentThreads) -> Vec<String> {
-        store.snapshot().received.into_iter().collect()
+        store.held.lock().received.iter().cloned().collect()
     }
 
     fn written(path: &Path) -> SentThreadsFile {
@@ -381,11 +289,11 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_one_per_cache_dir_under_the_mesh_cache() {
+    fn the_file_is_per_instance_under_the_mesh_cache() {
         let tmp = TempDir::new("sent-threads-path");
         assert_eq!(
             store(&tmp).path(),
-            tmp.path.join("mesh").join("sent-threads.json")
+            tmp.path.join("mesh").join("sent-threads-inst.json")
         );
     }
 
@@ -395,76 +303,58 @@ mod tests {
 
         let store = store(&tmp);
 
-        assert!(!tmp.path.join("mesh").exists(), "opening creates nothing");
-        assert!(!store.contains("m-1"));
-        assert!(!store.path().exists());
+        assert!(sent(&store).is_empty());
+        assert!(received(&store).is_empty());
+        assert!(!tmp.path.join("mesh").exists());
     }
 
-    /// Two handles on one cache dir, both opened before either records, as two sessions
-    /// of one identity are: each sees what the other recorded afterwards, without
-    /// reopening, and a thread neither recorded is still unknown to both.
+    /// Two sessions of one identity on one cache dir keep apart: a thread one records
+    /// is unknown to the other, opened before or after, and each reopens with its own.
     #[test]
-    fn handles_opened_before_a_record_see_it() {
-        let tmp = TempDir::new("sent-threads-shared");
-        let a = store(&tmp);
-        let c = store(&tmp);
+    fn each_instance_keeps_its_own_threads() {
+        let tmp = TempDir::new("sent-threads-per-session");
+        let a = SentThreads::open(&tmp.path, "inst-a").unwrap();
+        let c = SentThreads::open(&tmp.path, "inst-c").unwrap();
 
         a.record_sent("m-a").unwrap();
         c.record_received("t-c").unwrap();
 
-        for handle in [&a, &c] {
-            assert!(handle.contains("m-a"));
-            assert!(handle.contains("t-c"));
-            assert!(!handle.contains("m-never"));
-        }
-        let file = written(a.path());
-        assert_eq!(file.sent, vec!["m-a"]);
-        assert_eq!(file.received, vec!["t-c"]);
-    }
-
-    /// Two handles recording at once lose none of each other's threads: every change is
-    /// a read-modify-write under the file's lock.
-    #[test]
-    fn racing_handles_lose_no_thread() {
-        let tmp = TempDir::new("sent-threads-race-handles");
-        let handles = [store(&tmp), store(&tmp)];
-        std::thread::scope(|scope| {
-            for (side, handle) in ["a", "c"].into_iter().zip(&handles) {
-                scope.spawn(move || {
-                    for i in 0..25 {
-                        handle.record_sent(&format!("{side}-{i}")).unwrap();
-                    }
-                });
-            }
-        });
-
-        let file = written(handles[0].path());
-        assert_eq!(file.sent.len(), 2 * 25, "{:?}", file.sent);
-        for side in ["a", "c"] {
-            for i in 0..25 {
-                assert!(handles[1].contains(&format!("{side}-{i}")));
-            }
-        }
+        assert!(!c.contains("m-a"));
+        assert!(!a.contains("t-c"));
+        assert!(
+            !SentThreads::open(&tmp.path, "inst-c")
+                .unwrap()
+                .contains("m-a")
+        );
+        let resumed = SentThreads::open(&tmp.path, "inst-a").unwrap();
+        assert!(
+            resumed.contains("m-a"),
+            "a resumed session keeps its threads"
+        );
+        assert!(!resumed.contains("t-c"));
     }
 
     #[test]
-    fn opening_deletes_the_per_instance_lists_unread() {
-        let tmp = TempDir::new("sent-threads-per-instance");
+    fn opening_deletes_the_shared_list_and_its_lock_unread() {
+        let tmp = TempDir::new("sent-threads-shared-leftovers");
         let dir = tmp.path.join("mesh");
         fs::create_dir_all(&dir).unwrap();
-        let old = dir.join("sent-threads-0123456789abcdef0123456789abcdef.json");
+        let shared = dir.join("sent-threads.json");
         fs::write(
-            &old,
+            &shared,
             br#"{"version": 1, "sent": ["m-old"], "received": ["t-old"]}"#,
         )
         .unwrap();
-        let aside = dir.join("sent-threads-inst.json.corrupt");
+        let lock = dir.join("sent-threads.json.lock");
+        fs::write(&lock, b"").unwrap();
+        let aside = dir.join("sent-threads.json.corrupt");
         fs::write(&aside, b"{not json").unwrap();
 
         let store = store(&tmp);
 
-        assert!(!old.exists(), "the per-instance list is deleted");
-        assert!(!store.contains("m-old"), "and never read");
+        assert!(!shared.exists(), "the shared list is deleted");
+        assert!(!lock.exists(), "and its lock");
+        assert!(!store.contains("m-old"), "and the list is never read");
         assert!(!store.contains("t-old"));
         assert!(aside.exists(), "a set-aside file is the user's to delete");
     }
@@ -498,12 +388,12 @@ mod tests {
         store.record_sent("has a space").unwrap();
         store.record_received("").unwrap();
 
+        assert!(sent(&store).is_empty());
+        assert!(received(&store).is_empty());
         assert!(
             !store.path().exists(),
             "nothing changed, so nothing is written"
         );
-        assert!(sent(&store).is_empty());
-        assert!(received(&store).is_empty());
     }
 
     #[test]
@@ -559,17 +449,14 @@ mod tests {
         let store = store(&tmp);
         store.record_sent("m-1").unwrap();
         store.record_received("t-1").unwrap();
-        // Spaced as no write of this build spaces it, so any write would show.
-        let marker = br#"{ "version": 1, "sent": ["m-1"], "received": ["t-1"] }"#;
-        fs::write(store.path(), marker).unwrap();
+        fs::remove_file(store.path()).unwrap();
 
         store.record_sent("m-1").unwrap();
         store.record_received("t-1").unwrap();
         store.record_received("m-1").unwrap();
 
-        assert_eq!(
-            fs::read(store.path()).unwrap(),
-            marker,
+        assert!(
+            !store.path().exists(),
             "nothing changed, so nothing is written"
         );
     }
@@ -577,10 +464,12 @@ mod tests {
     mod record_order_tests {
         use super::*;
 
-        /// Two threads recording at once through one handle: every change is read and
-        /// written under the lock, so the file ends with every thread either recorded.
+        /// Two threads recording at once: each write is the snapshot its change took, and
+        /// the writes land in the order those snapshots were taken, so the file left
+        /// behind is the newest snapshot, the lists as they are in memory, never an
+        /// older one written last.
         #[test]
-        fn racing_records_lose_no_thread() {
+        fn racing_records_leave_the_newest_snapshot_on_disk() {
             let tmp = TempDir::new("sent-threads-race");
             let store = store(&tmp);
             for round in 0..10 {
@@ -676,16 +565,16 @@ mod tests {
     fn load_sets_aside_a_corrupt_file_and_starts_empty() {
         install_log_collector();
         let tmp = TempDir::new("sent-threads-corrupt");
-        let path = tmp.path.join("sent-threads.json");
-        let aside = tmp.path.join("sent-threads.json.corrupt");
+        let path = tmp.path.join("sent-threads-inst.json");
+        let aside = tmp.path.join("sent-threads-inst.json.corrupt");
         fs::write(&path, b"{not json").unwrap();
 
         let store =
             SentThreads::load(path.clone()).expect("a corrupt list must not block the load");
 
-        assert!(!path.exists(), "the corrupt file must be moved aside");
         assert!(sent(&store).is_empty());
         assert!(received(&store).is_empty());
+        assert!(!path.exists(), "the corrupt file must be moved aside");
         assert_eq!(fs::read(&aside).unwrap(), b"{not json");
         let path_text = path.display().to_string();
         let warns = warn_snapshot();
@@ -700,98 +589,24 @@ mod tests {
         );
     }
 
-    /// A list that goes bad while a handle is open is set aside at the next lookup, which
-    /// answers no; the next record starts the list afresh.
-    #[test]
-    fn a_list_corrupted_after_open_is_set_aside_at_the_next_lookup() {
-        install_log_collector();
-        let tmp = TempDir::new("sent-threads-corrupt-later");
-        let store = store(&tmp);
-        store.record_sent("m-1").unwrap();
-        fs::write(store.path(), b"{not json").unwrap();
-
-        assert!(!store.contains("m-1"));
-        assert!(store.path().with_extension("json.corrupt").exists());
-        store.record_sent("m-2").unwrap();
-        assert_eq!(written(store.path()).sent, vec!["m-2"]);
-    }
-
-    /// A list that exists but cannot be read fails the one lookup or record and is left
-    /// in place, so a passing fault never empties the list every session shares.
-    #[test]
-    fn a_list_that_cannot_be_read_after_open_is_left_in_place() {
-        install_log_collector();
-        let tmp = TempDir::new("sent-threads-unreadable-later");
-        let store = store(&tmp);
-        fs::create_dir_all(store.path()).unwrap();
-
-        assert!(!store.contains("m-1"));
-        let err = format!("{:#}", store.record_sent("m-1").unwrap_err());
-
-        assert!(
-            err.contains("Failed to read the mesh sent-threads list"),
-            "{err}"
-        );
-        assert!(
-            store.path().is_dir(),
-            "the unreadable list is left where it is"
-        );
-        assert!(!store.path().with_extension("json.corrupt").exists());
-        let path_text = store.path().display().to_string();
-        let warns = warn_snapshot();
-        assert!(
-            warns.iter().any(|message| message.contains(&path_text)
-                && message.contains("treat thread m-1 as one this identity has not seen")
-                && message.contains("Try the call again in a moment")),
-            "no lookup warning names {path_text}; captured: {warns:#?}"
-        );
-    }
-
-    /// `record_received` gives up after `RECEIVED_LOCK_WAIT` while another holder keeps
-    /// the lock, well inside the full wait; `record_received_waiting` waits the holder
-    /// out and records the thread.
-    #[test]
-    fn record_received_waits_only_briefly_for_a_held_lock() {
-        let tmp = TempDir::new("sent-threads-received-wait");
-        let store = store(&tmp);
-        let held = acquire_mesh_lock(&store.lock_path, "test holder", Duration::ZERO).unwrap();
-
-        let started = std::time::Instant::now();
-        let err = store.record_received("t-1").unwrap_err();
-        let waited = started.elapsed();
-
-        assert!(waited >= RECEIVED_LOCK_WAIT, "{waited:?}");
-        assert!(waited < EXCLUSIVE_LOCK_WAIT, "{waited:?}");
-        assert!(err.to_string().contains("is held"), "{err}");
-        assert!(!store.path().exists(), "nothing was written");
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(RECEIVED_LOCK_WAIT * 2);
-                drop(held);
-            });
-            store.record_received_waiting("t-1").unwrap();
-        });
-        assert!(store.contains("t-1"));
-    }
-
     /// A file with a readable version 1 but another shape is not a list this build can
     /// use: it is set aside like any corrupt file and named for what it is not.
     #[test]
     fn load_sets_aside_an_earlier_shape_under_version_1_and_starts_empty() {
         install_log_collector();
         let tmp = TempDir::new("sent-threads-earlier-shape");
-        let path = tmp.path.join("sent-threads.json");
-        let aside = tmp.path.join("sent-threads.json.corrupt");
+        let path = tmp.path.join("sent-threads-inst.json");
+        let aside = tmp.path.join("sent-threads-inst.json.corrupt");
         let bytes = br#"{"version":1,"threads":["m-1"]}"#;
         fs::write(&path, bytes).unwrap();
 
         let store =
             SentThreads::load(path.clone()).expect("an earlier shape must not block the load");
 
-        assert!(!path.exists(), "the file must be moved aside");
         assert!(sent(&store).is_empty());
         assert!(received(&store).is_empty());
         assert!(!store.contains("m-1"));
+        assert!(!path.exists(), "the file must be moved aside");
         assert_eq!(fs::read(&aside).unwrap(), bytes);
         let path_text = path.display().to_string();
         let warns = warn_snapshot();
@@ -809,7 +624,7 @@ mod tests {
     #[test]
     fn load_normalizes_the_lists_it_reads() {
         let tmp = TempDir::new("sent-threads-normalize");
-        let path = tmp.path.join("sent-threads.json");
+        let path = tmp.path.join("sent-threads-inst.json");
         let mut received_ids = vec![
             "t-1".to_string(),
             "has a space".to_string(),
@@ -851,7 +666,7 @@ mod tests {
     /// unlike a corrupt file, its remedy depends on which Coyote wrote it.
     fn assert_version_is_refused(tag: &str, found: u64, cause: &str) {
         let tmp = TempDir::new(tag);
-        let path = tmp.path.join("sent-threads.json");
+        let path = tmp.path.join("sent-threads-inst.json");
         let bytes = serde_json::to_vec(&serde_json::json!({
             "version": found,
             "sent": ["m-1"],
@@ -878,7 +693,7 @@ mod tests {
             bytes,
             "a refused file is left as it was"
         );
-        assert!(!tmp.path.join("sent-threads.json.corrupt").exists());
+        assert!(!tmp.path.join("sent-threads-inst.json.corrupt").exists());
     }
 
     #[test]
@@ -889,21 +704,5 @@ mod tests {
     #[test]
     fn load_refuses_a_pre_baseline_version_as_having_no_migration() {
         assert_version_is_refused("sent-threads-older", 0, "no migration");
-    }
-
-    /// A list another build wrote at a version this one does not is refused at the
-    /// lookup too, which answers no rather than continue a thread it cannot vouch for.
-    #[test]
-    fn a_newer_list_written_after_open_answers_no_and_is_left_alone() {
-        install_log_collector();
-        let tmp = TempDir::new("sent-threads-newer-later");
-        let store = store(&tmp);
-        store.record_sent("m-1").unwrap();
-        let newer = br#"{"version": 2, "sent": ["m-1"], "received": []}"#;
-        fs::write(store.path(), newer).unwrap();
-
-        assert!(!store.contains("m-1"));
-        assert!(store.record_sent("m-2").is_err());
-        assert_eq!(fs::read(store.path()).unwrap(), newer);
     }
 }
