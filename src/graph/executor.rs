@@ -150,6 +150,8 @@ impl GraphExecutor {
             );
         }
         let graph = Arc::new(graph);
+        // One guard per execution; never pass it into a nested graph run,
+        // which must start counting from zero.
         let headless_answers = HeadlessAnswerGuard::default();
         let start = Instant::now();
 
@@ -3316,6 +3318,45 @@ nodes:
 
             assert_eq!(result, "retry,retry,stop,", "run {run}");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_backstop_fails_a_graph_whose_node_keeps_asking_new_questions() {
+        let _mode = crate::function::user_interaction::HeadlessModeGuard::set(true, false);
+        let yaml = r#"
+name: headless_backstop
+start: gate
+settings:
+  validate_before_run: false
+initial_state:
+  trail: ""
+nodes:
+  gate:
+    type: approval
+    question: "Retry {{trail}}?"
+    options: [retry, stop]
+    routes:
+      retry: gate
+      stop: done
+    on_other: done
+    state_updates:
+      trail: "{{trail}}x"
+  done:
+    type: end
+    output: "{{trail}}"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        let err = GraphExecutor::new(graph, &TestWorkspace::new().dir)
+            .execute(&mut make_ctx(), create_abort_signal())
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("headless: node gate auto-answered 25 times"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

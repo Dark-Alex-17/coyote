@@ -5337,7 +5337,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn eval_routes_user_prefix_to_user_handler() {
+        let _mode = user_interaction::HeadlessModeGuard::set(false, false);
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         ctx.tool_scope.functions.append_user_interaction_functions();
 
