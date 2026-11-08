@@ -20657,6 +20657,94 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// A re-key the node itself refuses, after the fork's list was already bound, puts
+    /// the original's own list back: the same handle, still answering the original's
+    /// threads.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_rekey_puts_back_the_original_sent_threads_list() {
+        let started = started_runtime("node-rekey-sent-threads-rollback").await;
+        let original_id = started.runtime.current_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.remember_sent_thread("m-original");
+        let before = slot.sent_threads().unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(fresh_instance_id()),
+            fork_instance_id: fresh_instance_id(),
+        })
+        .await
+        .unwrap_err();
+
+        let after = slot.sent_threads().unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the displaced list itself is put back"
+        );
+        assert!(after.contains("m-original"));
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A thread the list cannot write is warned about with the remedy and no hash, and
+    /// is still continuable from memory until the node stops.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sent_thread_that_cannot_be_written_is_warned_about_and_kept_in_memory() {
+        use crate::testing::{install_log_collector, warn_snapshot};
+        use std::os::unix::fs::PermissionsExt;
+
+        install_log_collector();
+        let started = started_runtime("node-sent-threads-unwritable").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let dir = started.runtime.cache_dir().join("mesh");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        let set_mode =
+            |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        set_mode(0o500);
+        let probe = dir.join("writable-probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            // Root writes anywhere; nothing to show here.
+            std::fs::remove_file(&probe).unwrap();
+            set_mode(mode);
+            assert!(slot.stop().await.unwrap());
+            started.relay_handle.abort();
+            return;
+        }
+
+        slot.remember_sent_thread("m-unwritten");
+        set_mode(mode);
+
+        assert!(slot.sent_threads().unwrap().contains("m-unwritten"));
+        let file = dir
+            .join(format!(
+                "sent-threads-{}.json",
+                started.runtime.current_instance_id()
+            ))
+            .display()
+            .to_string();
+        let warns = warn_snapshot();
+        let warned = warns
+            .iter()
+            .find(|message| {
+                message.starts_with(
+                    "Mesh sent-threads list could not be written, so the thread just sent or received can be continued only until the node stops. Check the permissions and free space of the mesh cache directory; the error says which file: ",
+                ) && message.contains(&dir.display().to_string())
+                    && !message.contains(&file)
+            })
+            .unwrap_or_else(|| panic!("no unwritable-list warning; captured: {warns:#?}"));
+        assert!(
+            !warned.contains(&started.runtime.current_instance_id()),
+            "{warned}"
+        );
+        assert!(!warned.contains(started.runtime.fingerprint()), "{warned}");
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
     #[test]
     fn deliver_peer_notes_name_the_sending_instance_never_the_peers_own_id() {
         let slot = MeshSlot::default();

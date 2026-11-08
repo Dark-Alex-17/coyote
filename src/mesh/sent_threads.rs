@@ -80,10 +80,10 @@ impl Held {
 /// accept as a thread to continue. Keyed by instance because a conversation belongs to
 /// the session that had it: a resumed session keeps its instance and so continues its
 /// own threads, while another session of the same identity, or a fork, holds its own.
-/// The instance lock keeps the file to one process. A change is made and serialized
-/// under `held`, and `write_lock` is taken before `held` is let go, so the fsync'd
-/// write blocks no reader and the snapshots reach the disk in the order they were
-/// taken.
+/// The instance lock keeps the file to one process while a node serves that instance.
+/// A change is made and serialized under `held`, and `write_lock` is taken before
+/// `held` is let go, so a single fsync'd write blocks no reader and the snapshots reach
+/// the disk in the order they were taken.
 pub(crate) struct SentThreads {
     path: PathBuf,
     held: Mutex<Held>,

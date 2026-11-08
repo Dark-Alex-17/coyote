@@ -79,7 +79,7 @@ const REPLY_NEEDS_IN_REPLY_TO: &str = "kind: \"reply\" needs in_reply_to: the me
 
 const KIND_IS_REPLY_OR_NOTE: &str = "kind must be \"reply\" or \"note\"; with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open; without in_reply_to, omit kind for a plain message";
 
-const UNKNOWN_THREAD_NEXT_ACTION: &str = "Omit thread to start a new conversation, or pass a thread this session's own earlier mesh__send/mesh__ask returned or a message it received showed.";
+const UNKNOWN_THREAD_NEXT_ACTION: &str = "Omit thread to start a new conversation, or pass a thread that this session's own mesh__send/mesh__ask returned or that a message it received showed.";
 
 pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     let message_schema = |what: &str| JsonSchema {
@@ -8448,6 +8448,84 @@ mod tests {
                 )
                 .await;
 
+                assert_eq!(sent["status"], "sent", "{sent}");
+                assert_eq!(sent["thread"], "t-x", "{sent}");
+                let seen = live.stub.seen();
+                assert_eq!(seen.len(), 1, "{seen:?}");
+                assert_eq!(seen[0].thread.as_deref(), Some("t-x"));
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
+            /// A fork starts with none of the original's sent threads, yet still continues
+            /// the thread of a question it carried over: the carried inbound record vouches
+            /// for it, while a thread the original only sent is refused.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn a_fork_continues_a_carried_question_but_not_the_originals_sent_thread() {
+                use crate::config::{ForkRekey, Session};
+
+                let mut live = trusted_stub("mesh-tool-thread-fork-carried").await;
+                let to = live.to.clone();
+                live.ctx
+                    .app
+                    .mesh
+                    .inbound_store()
+                    .unwrap()
+                    .upsert(
+                        InboundRecord {
+                            version: INBOUND_RECORD_VERSION,
+                            id: "a-x".into(),
+                            peer_destination: to.clone(),
+                            peer_identity: live.stub.identity_hex(),
+                            thread: "t-x".into(),
+                            question: "may I?".into(),
+                            envoy_question: String::new(),
+                            received_at: rfc3339_utc(SystemTime::now()),
+                            kind: InboundKind::Question,
+                            paths: Vec::new(),
+                            reason: String::new(),
+                            session_thread: String::new(),
+                        },
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                live.ctx.app.mesh.remember_sent_thread("m-original");
+                let identity = live.started.runtime.fingerprint().to_string();
+                live.stub.trust_identity(&identity);
+
+                live.ctx
+                    .app
+                    .mesh
+                    .rekey(ForkRekey {
+                        original_instance_id: Some(live.started.runtime.current_instance_id()),
+                        fork_instance_id: Session::default().ensure_mesh_instance_id().to_string(),
+                    })
+                    .await
+                    .unwrap();
+                let threads = live.ctx.app.mesh.sent_threads().unwrap();
+                assert!(!threads.contains("t-x"));
+                assert!(!threads.contains("m-original"));
+
+                let refused = send_in(
+                    &mut live,
+                    json!({"to": to, "message": "and that", "thread": "m-original"}),
+                )
+                .await;
+                assert_eq!(refused["kind"], "unknown_thread", "{refused}");
+                assert_eq!(
+                    refused["message"],
+                    unknown_thread_message("m-original"),
+                    "{refused}"
+                );
+                assert!(live.stub.seen().is_empty(), "{:?}", live.stub.seen());
+
+                let sent = send_in(
+                    &mut live,
+                    json!({"to": to, "message": "about that", "thread": "t-x"}),
+                )
+                .await;
                 assert_eq!(sent["status"], "sent", "{sent}");
                 assert_eq!(sent["thread"], "t-x", "{sent}");
                 let seen = live.stub.seen();

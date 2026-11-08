@@ -7934,10 +7934,15 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
     let (_, unknown_thread) = message_source
         .split_once("Self::UnknownThread(thread) => write!(")
         .expect("SendError::UnknownThread is written by Display");
-    let refusal = string_literals(unknown_thread.split_once("),").unwrap().0)
-        .pop()
-        .expect("SendError::UnknownThread writes a literal")
-        .replace("{thread}", "<thread>");
+    let refusal = string_literals(
+        unknown_thread
+            .split_once("),")
+            .expect("SendError::UnknownThread's write! ends with `),`")
+            .0,
+    )
+    .pop()
+    .expect("SendError::UnknownThread writes a literal")
+    .replace("{thread}", "<thread>");
     assert!(
         refusal.contains("is not a thread this session sent or received"),
         "the unknown_thread refusal no longer names this session: {refusal}"
@@ -7970,9 +7975,11 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
     let prose = flat(&page);
     for needle in [
         "To continue, pass a thread this session sent or received".to_string(),
-        "A conversation belongs to the session that had it: your other sessions on this config dir, and a fork of this one, cannot continue it, while this session resumed later (`.session <session>` and `.mesh on`) can.".to_string(),
+        "A conversation belongs to the session that had it: your other sessions on this config dir cannot continue it, a fork starts without this session's threads (it can still continue a peer's question it carried over), and this session resumed later (`.session <session>` and `.mesh on`) can.".to_string(),
         format!("`kind: unknown_thread`, the message ``{refusal}``"),
         "`kind: asked_by_another_session`".to_string(),
+        "a Coyote sender names only a thread its own session sent or received, so your other sessions start their own conversations".to_string(),
+        "A new conversation is keyed by the proved sending identity and the message's own id, never by a thread the sender names".to_string(),
     ] {
         assert!(prose.contains(&needle), "Mesh.md does not say {needle:?}");
     }
@@ -7982,6 +7989,28 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
         "never by the destination",
     ] {
         assert!(!prose.contains(gone), "Mesh.md still says {gone:?}");
+    }
+
+    let configuration = flat(&read(wiki.join("Mesh-Configuration.md")));
+    for needle in [
+        "A Coyote sender continues a thread only from the session that sent or received it, so a different session of the same identity starts a new conversation.",
+        "`mesh/sent-threads-<instance_id>.json` (the threads each session may continue)",
+    ] {
+        assert!(
+            configuration.contains(needle),
+            "Mesh-Configuration.md does not say {needle:?}"
+        );
+    }
+    for page in ["Mesh-Configuration.md", "Mesh-Commands.md"] {
+        let text = flat(&read(wiki.join(page)));
+        for gone in [
+            "`sent-threads.json`",
+            "`mesh/sent-threads.json`",
+            "any of your sessions on this config dir sent or received",
+            "can be continued from another",
+        ] {
+            assert!(!text.contains(gone), "{page} still says {gone:?}");
+        }
     }
 }
 
