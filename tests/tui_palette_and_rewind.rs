@@ -665,6 +665,8 @@ fn hidden_until_routed() -> Vec<String> {
         .find("const HIDDEN_UNTIL_ROUTED")
         .expect("the palette names its hidden verbs");
     let list = &source[start..];
+    // The value, not the `&[&str]` type annotation before the `=`.
+    let list = &list[list.find('=').unwrap() + 1..];
     let list = &list[list.find("&[").unwrap() + 2..];
     let list = &list[..list.find(']').unwrap()];
     let verbs: Vec<String> = list
