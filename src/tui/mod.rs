@@ -1134,11 +1134,10 @@ impl App {
             };
             *output = outcome.captured.clone();
             *opened = turn.requested;
-            // A command that failed changed nothing the picker has to
-            // stop at.
-            *barrier = outcome
-                .error
-                .is_none()
+            // A command that failed before asking the model changed
+            // nothing the picker has to stop at; a macro that failed at a
+            // later step already recorded the exchanges before it.
+            *barrier = (outcome.error.is_none() || turn.requested)
                 .then(|| rewind_barrier(name, prefix, &self.macros))
                 .flatten();
             *cache = LineCache::default();
@@ -1403,11 +1402,10 @@ impl App {
         let (rewind, barrier) =
             RewindState::from_cells(self.transcript.cells(), self.config.command_prefix);
         if let Some(barrier) = barrier {
-            let text = match barrier {
-                RewindBarrier::Macro => "Rewind stops at the last macro turn",
-                RewindBarrier::Session => "Rewind stops at the last session command",
-            };
-            self.push_notice(NoticeKind::ToolWarning, text.to_string());
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                format!("Rewind stops at the last {}", barrier.kind_name()),
+            );
         }
         if let Some(rewind) = rewind {
             self.view = View::Rewind(rewind);
@@ -8401,6 +8399,41 @@ mod tests {
         harness.press(KeyCode::Esc);
         harness.press(KeyCode::Esc);
         assert_eq!(rewind(&harness).map(|picker| picker.rows.len()), Some(1));
+    }
+
+    /// A macro that failed at a later step already recorded the exchanges
+    /// before it, so its cell is a barrier like a macro that finished.
+    #[test]
+    fn a_macro_that_asked_the_model_is_a_barrier_even_when_it_failed_later() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.macros = vec![("deploy".to_string(), "ship it".to_string())];
+        exchange(&mut harness);
+        harness.app.begin_turn(".deploy prod", true);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("step one done".to_string()));
+        harness.app.end_turn(
+            true,
+            &TurnOutcome {
+                error: Some("step two failed".to_string()),
+                ..TurnOutcome::default()
+            },
+        );
+        assert!(matches!(
+            &harness.app.transcript.cells()[3],
+            Cell::Command {
+                name,
+                rewind_barrier: Some(RewindBarrier::Macro),
+                ..
+            } if name == ".deploy prod"
+        ));
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Esc);
+        assert!(rewind(&harness).is_none());
+        assert!(matches!(
+            harness.app.transcript.cells().last(),
+            Some(Cell::Notice { text, .. }) if text == "Rewind stops at the last macro turn"
+        ));
     }
 
     #[test]

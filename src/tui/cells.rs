@@ -98,6 +98,16 @@ pub(crate) enum RewindBarrier {
     Session,
 }
 
+impl RewindBarrier {
+    /// What the picker's notice says it stopped at.
+    pub(crate) fn kind_name(self) -> &'static str {
+        match self {
+            RewindBarrier::Macro => "macro turn",
+            RewindBarrier::Session => "session command",
+        }
+    }
+}
+
 /// One entry of the transcript, kept as source so any width can render it.
 pub(super) enum Cell {
     User {
