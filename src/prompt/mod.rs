@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 pub(crate) const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 const YES_FOR_SESSION: &str = "Yes for this session";
+/// The published answer of a prompt a run with no human refused.
+pub(crate) const NEEDS_HUMAN_MARKER: &str = "<needs_human>";
 
 /// Whether a human can answer a prompt in this run. A headless run and the
 /// ACP server have none; every other run has a terminal.
@@ -115,7 +117,9 @@ impl PromptAnswer {
             PromptAnswer::Text(_) if action == PromptAction::Password => "<redacted>".to_string(),
             // Only the headless prompter answers a confirm with text: its
             // `needs_human` JSON, which the bus reports like a refusal.
-            PromptAnswer::Text(_) if action == PromptAction::Confirm => "<needs_human>".to_string(),
+            PromptAnswer::Text(_) if action == PromptAction::Confirm => {
+                NEEDS_HUMAN_MARKER.to_string()
+            }
             PromptAnswer::Text(text) => text.clone(),
             PromptAnswer::Cancelled => "<cancelled>".to_string(),
         }
@@ -232,7 +236,7 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
         Ok(answer) => answer,
         Err(err) => {
             let answer = if NeedsHuman::caused(&err) {
-                "<needs_human>"
+                NEEDS_HUMAN_MARKER
             } else {
                 "<error>"
             };

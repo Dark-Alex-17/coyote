@@ -105,15 +105,23 @@ fn lender() -> Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)> {
         .clone()
 }
 
+/// Takes the terminal duplicate for `TtyHandles::stdio`. Returns the
+/// reason when it could not be taken, for the transcript as well as the
+/// log: lent children then write into the turn's capture instead.
 #[cfg(unix)]
-fn remember_tty() {
+fn remember_tty() -> Option<String> {
+    let mut degraded = None;
     TTY_OUT.get_or_init(|| match dup_tty_out() {
         Ok(fd) => Some(fd),
         Err(err) => {
-            warn!("Children lent the terminal will inherit the turn's output capture: {err}");
+            let reason =
+                format!("Children lent the terminal will inherit the turn's output capture: {err}");
+            warn!("{reason}");
+            degraded = Some(reason);
             None
         }
     });
+    degraded
 }
 
 /// Duplicates fd 1 close-on-exec: the copy is for the loop to hand out
@@ -131,7 +139,9 @@ fn dup_tty_out() -> std::io::Result<std::os::fd::OwnedFd> {
 }
 
 #[cfg(not(unix))]
-fn remember_tty() {}
+fn remember_tty() -> Option<String> {
+    None
+}
 
 /// What a job lent the terminal spawns its child on.
 pub(crate) struct TtyHandles {
@@ -850,24 +860,28 @@ fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix
 /// counted; `.session`, `.agent <name>`, `.fork`, `.undo`, `.edit
 /// session` and the session and agent forms of `.exit`, `.empty` and
 /// `.compress` leave the context holding history the transcript never
-/// showed. A bare `.agent` only prints its usage.
+/// showed. A bare `.agent` only prints its usage, and `.macro <name>`
+/// for a name the list had not got, with the model never asked, created
+/// the macro in the editor rather than running one.
 fn rewind_barrier(
     line: &str,
     prefix: crate::config::CommandPrefix,
     macros: &[(String, String)],
+    asked_model: bool,
 ) -> Option<RewindBarrier> {
     let line = prefix.normalize(line.trim())?;
     let mut words = line.split_whitespace();
+    let known = |word: &str| macros.iter().any(|(name, _)| name == word);
     match (words.next()?, words.next()) {
-        (".macro", Some(first)) => {
-            (!matches!(first, "enable" | "disable")).then_some(RewindBarrier::Macro)
-        }
+        (".macro", Some(first)) => (!matches!(first, "enable" | "disable")
+            && (asked_model || known(first)))
+        .then_some(RewindBarrier::Macro),
         (".session" | ".fork" | ".undo", _) | (".agent", Some(_)) => Some(RewindBarrier::Session),
         (".exit", Some("session" | "agent"))
         | (".empty" | ".compress" | ".edit", Some("session")) => Some(RewindBarrier::Session),
         (word, _) => word
             .strip_prefix('.')
-            .filter(|word| macros.iter().any(|(name, _)| name == word))
+            .filter(|word| known(word))
             .map(|_| RewindBarrier::Macro),
     }
 }
@@ -1156,7 +1170,7 @@ impl App {
             // nothing the picker has to stop at; a macro that failed at a
             // later step already recorded the exchanges before it.
             *barrier = (outcome.error.is_none() || turn.requested)
-                .then(|| rewind_barrier(name, prefix, &self.macros))
+                .then(|| rewind_barrier(name, prefix, &self.macros, turn.requested))
                 .flatten();
             *cache = LineCache::default();
             // `.undo` took the last exchange out of the context; the
@@ -2841,7 +2855,9 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     app.sync_from_ctx(&mut ctx);
 
     // Fd 1 is still the terminal here; a turn's capture takes it over.
-    remember_tty();
+    if let Some(reason) = remember_tty() {
+        app.push_notice(NoticeKind::ToolWarning, reason);
+    }
     let mut screen = Screen::enter()?;
     // Armed only once the terminal is ours. Entering blocks on the
     // keyboard-enhancement probe, which spins on a tty whose master has
@@ -8332,45 +8348,41 @@ mod tests {
     fn a_rewind_barrier_is_read_from_the_command_word_and_the_enabled_macros() {
         let deploy = [("deploy".to_string(), "ship it".to_string())];
         let dot = crate::config::CommandPrefix::Dot;
+        let barrier =
+            |line: &str, macros: &[(String, String)]| rewind_barrier(line, dot, macros, false);
+        assert_eq!(barrier(".deploy prod", &deploy), Some(RewindBarrier::Macro));
+        assert_eq!(barrier(".deploy prod", &[]), None);
         assert_eq!(
-            rewind_barrier(".deploy prod", dot, &deploy),
+            barrier(".macro deploy", &deploy),
             Some(RewindBarrier::Macro)
         );
-        assert_eq!(rewind_barrier(".deploy prod", dot, &[]), None);
+        // `.macro <unknown>` that never asked the model created the
+        // macro; one that did ran a macro the list had not got.
+        assert_eq!(barrier(".macro deploy", &[]), None);
         assert_eq!(
-            rewind_barrier(".macro deploy", dot, &[]),
+            rewind_barrier(".macro deploy", dot, &[], true),
             Some(RewindBarrier::Macro)
         );
-        assert_eq!(rewind_barrier(".macro enable deploy", dot, &deploy), None);
-        assert_eq!(rewind_barrier(".macro disable deploy", dot, &deploy), None);
-        assert_eq!(rewind_barrier(".macro", dot, &deploy), None);
+        assert_eq!(barrier(".macro enable deploy", &deploy), None);
+        assert_eq!(barrier(".macro disable deploy", &deploy), None);
+        assert_eq!(barrier(".macro", &deploy), None);
+        assert_eq!(barrier(".session other", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".agent coder", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".agent", &[]), None);
+        assert_eq!(barrier(".exit session", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".empty session", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".edit session", &[]), Some(RewindBarrier::Session));
+        assert_eq!(barrier(".edit role", &[]), None);
+        assert_eq!(barrier(".exit role", &[]), None);
+        assert_eq!(barrier(".info", &[]), None);
+        assert_eq!(barrier("plain words", &deploy), None);
         assert_eq!(
-            rewind_barrier(".session other", dot, &[]),
-            Some(RewindBarrier::Session)
-        );
-        assert_eq!(
-            rewind_barrier(".agent coder", dot, &[]),
-            Some(RewindBarrier::Session)
-        );
-        assert_eq!(rewind_barrier(".agent", dot, &[]), None);
-        assert_eq!(
-            rewind_barrier(".exit session", dot, &[]),
-            Some(RewindBarrier::Session)
-        );
-        assert_eq!(
-            rewind_barrier(".empty session", dot, &[]),
-            Some(RewindBarrier::Session)
-        );
-        assert_eq!(
-            rewind_barrier(".edit session", dot, &[]),
-            Some(RewindBarrier::Session)
-        );
-        assert_eq!(rewind_barrier(".edit role", dot, &[]), None);
-        assert_eq!(rewind_barrier(".exit role", dot, &[]), None);
-        assert_eq!(rewind_barrier(".info", dot, &[]), None);
-        assert_eq!(rewind_barrier("plain words", dot, &deploy), None);
-        assert_eq!(
-            rewind_barrier("/session other", crate::config::CommandPrefix::Slash, &[]),
+            rewind_barrier(
+                "/session other",
+                crate::config::CommandPrefix::Slash,
+                &[],
+                false
+            ),
             Some(RewindBarrier::Session)
         );
     }

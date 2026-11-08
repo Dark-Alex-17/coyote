@@ -499,7 +499,7 @@ pub(crate) fn read_all(reader: &mut File) -> String {
 }
 
 mod tests {
-    use super::{TestConfigDirGuard, is_outside_system32};
+    use super::{TempNeedleGuard, TestConfigDirGuard, is_outside_system32};
     use crate::utils;
     use serial_test::serial;
     use std::path::Path;
@@ -541,5 +541,49 @@ mod tests {
             !cache_root.exists(),
             "the temp cache dir is removed on drop"
         );
+    }
+
+    /// The guard's sweeps, on creation and on drop, remove only entries
+    /// whose name carries the needle; a neighbour without it stays.
+    #[test]
+    fn temp_needle_guard_sweeps_needle_hits_only() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let needle = format!("needle-guard-unit-{unique}");
+        let temp = std::env::temp_dir();
+        let hit_file = temp.join(format!("{needle}-file"));
+        let hit_dir = temp.join(format!("{needle}-dir"));
+        let bystander = temp.join(format!("bystander-{unique}"));
+        std::fs::write(&hit_file, "").unwrap();
+        std::fs::create_dir_all(hit_dir.join("inner")).unwrap();
+        std::fs::write(&bystander, "").unwrap();
+
+        let guard = TempNeedleGuard::new(&needle);
+        assert!(!hit_file.exists(), "a leftover file survived the sweep");
+        assert!(!hit_dir.exists(), "a leftover directory survived the sweep");
+        assert!(bystander.exists(), "a file without the needle was removed");
+
+        std::fs::write(&hit_file, "").unwrap();
+        assert_eq!(guard.leftovers(), vec![hit_file.clone()]);
+        drop(guard);
+        assert!(
+            !hit_file.exists(),
+            "a file made under the guard survived its drop"
+        );
+        assert!(
+            bystander.exists(),
+            "the drop removed a file without the needle"
+        );
+        let _ = std::fs::remove_file(&bystander);
+    }
+
+    /// A needle shorter than twelve bytes could match another test's
+    /// files, so the guard refuses it.
+    #[test]
+    #[should_panic(expected = "could match another test's files")]
+    fn temp_needle_guard_refuses_a_short_needle() {
+        let _guard = TempNeedleGuard::new("short-x7x");
     }
 }

@@ -456,6 +456,7 @@ fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
         .into_iter()
         .filter(|event| event.id().is_none_or(task_is_live))
         .collect();
+    drop(sup);
     for event in &live {
         if let SystemNotification::UserMessage { text } = event {
             events::bus().publish(Event::QueuedInputSent { text: text.clone() });

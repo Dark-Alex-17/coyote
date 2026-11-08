@@ -385,7 +385,7 @@ mod tests {
     use crate::events::{Event, Origin, RecordingSink};
     use crate::function::agents::handle_agent_tool;
     use crate::hooks::{HookDef, HooksMap, test_sink};
-    use crate::prompt::{ScriptedPrompter, prompt_events};
+    use crate::prompt::{NEEDS_HUMAN_MARKER, ScriptedPrompter, prompt_events};
     use crate::supervisor::escalation::EscalationQueue;
     use crate::testing::AtomicFlagGuard;
     use crate::utils::drain_acp_permissions;
@@ -484,7 +484,7 @@ mod tests {
             answered,
             vec![Event::PromptAnswered {
                 id: id.clone(),
-                answer: "<needs_human>".to_string(),
+                answer: NEEDS_HUMAN_MARKER.to_string(),
                 auto: false,
             }]
         );

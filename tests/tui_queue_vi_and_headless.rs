@@ -31,6 +31,19 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// The sleepers a test forked, killed by pid when it ends however it
+/// ends, so a failed assertion leaves none behind.
+struct Sleepers(Vec<i32>);
+
+impl Drop for Sleepers {
+    fn drop(&mut self) {
+        for &pid in &self.0 {
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
 fn fresh_config_dir(scenario: &str) -> PathBuf {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -930,6 +943,7 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
         .trim()
         .parse()
         .unwrap();
+    let _sleepers = Sleepers(vec![pid]);
     pty.read_for(Duration::from_millis(1500));
     pty.send(b"\x1b").unwrap();
     let esc_at = Instant::now();
@@ -943,10 +957,6 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
     quit_and_check(&mut pty);
     // SAFETY: kill with signal 0 touches no memory; it only checks the pid.
     let alive = unsafe { libc::kill(pid, 0) == 0 };
-    if alive {
-        // SAFETY: kill takes a pid and a signal number and touches no memory.
-        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
     assert!(
         !alive,
         "the aborted backtick command outlived the session (pid {pid})"

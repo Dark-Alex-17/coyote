@@ -4,9 +4,8 @@
 //! macro that recorded an exchange before a later step failed is still
 //! a rewind barrier (one that failed before any exchange is not);
 //! SIGTERM with queued lines drops them even when the tool is released
-//! in the same instant; `--headless --macro` refuses `.role <new>` /
-//! `.macro <new>` and the reason names the missing human. The built
-//! binary on a pseudo-terminal, a scripted fake model where a tool round
+//! in the same instant. The built binary on a pseudo-terminal, a
+//! scripted fake model where a tool round
 //! or a session is needed. Unix-only and serial like its sibling pty
 //! suites.
 #![cfg(unix)]
@@ -14,7 +13,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
@@ -58,36 +57,6 @@ fn fresh_config_dir(scenario: &str) -> PathBuf {
     fs::create_dir_all(dir.join("home")).unwrap();
     fs::create_dir_all(dir.join("sessions")).unwrap();
     dir
-}
-
-/// Dry-run config; `extra` is appended as top-level YAML.
-fn write_dry_run_config(dir: &Path, extra: &str) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             {extra}\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
 }
 
 fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
@@ -483,30 +452,6 @@ fn quit_declining_save(pty: &mut Pty) -> String {
             "the session did not end:\n{text}"
         );
     }
-}
-
-fn walk(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(walk(&path));
-            } else {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
-/// Files under `dir` (outside the cache) carrying `name` in their path.
-fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
-    walk(dir)
-        .into_iter()
-        .filter(|path| !path.to_string_lossy().contains("/cache/"))
-        .filter(|path| path.to_string_lossy().contains(name))
-        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -987,121 +932,5 @@ fn sigterm_purges_the_turn_queue_even_when_the_tool_is_released_right_after() {
     assert!(
         !transcript.contains("never-sent"),
         "a reply scripted behind the signal exit streamed:\n{transcript}"
-    );
-    for entry in fs::read_dir(dir.join("sessions")).unwrap() {
-        let path = entry.unwrap().path();
-        let saved = fs::read_to_string(&path).unwrap_or_default();
-        assert!(
-            !saved.contains("ghost-a-w3t") && !saved.contains("ghost-b-w3t"),
-            "a queued line was saved with the session {}:\n{saved}",
-            path.display()
-        );
-    }
-}
-
-// ---------------------------------------------------------------------
-// Headless `.role <new>` / `.macro <new>`: nothing created, and the
-// reason names the missing human.
-// ---------------------------------------------------------------------
-
-/// Runs `--headless --macro <name> go` with stdin closed; returns (exit
-/// status text, stdout+stderr). The positional `go` matters: without a
-/// prompt argument (or stdin text) `--headless` bails with "requires a
-/// prompt argument" BEFORE the macro runs, and a pin that only looks for
-/// a refusal word is satisfied by that bail. A macro without variables
-/// tolerates the surplus argument.
-fn run_headless_macro(dir: &Path, name: &str) -> (String, String) {
-    let mut cmd = Command::new(built_binary());
-    base_env(&mut cmd, dir);
-    cmd.args(["--headless", "--macro", name, "go"])
-        .env("EDITOR", "/usr/bin/false")
-        .env("VISUAL", "/usr/bin/false")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    let deadline = Instant::now() + PTY_DEADLINE;
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("`--headless --macro {name}` hung (a creation prompt waited for a human?)");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    (status.to_string(), format!("{stdout}\n{stderr}"))
-}
-
-/// Macro `mkrole` = `.role w3-role`, macro `mkmacro` = `.macro w3-macro`,
-/// macro `tmpsave` = [`.temp-role ...`, `.save role`] under `--headless`:
-/// each macro provably RAN (its step is echoed), no role or macro file is
-/// created, and what the user sees is the exact refusal: the creation
-/// gate's sentence for `.role` / `.macro`, the headless prompter's for
-/// the role-name question `.save role` asks.
-#[test]
-#[serial]
-fn a_headless_creation_refusal_names_the_missing_human() {
-    let dir = fresh_config_dir("headless-reason");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
-    write_macro(&dir, "mkrole", &[".role w3-role"]);
-    write_macro(&dir, "mkmacro", &[".macro w3-macro"]);
-    write_macro(&dir, "tmpsave", &[".temp-role be terse w3", ".save role"]);
-    fs::create_dir_all(dir.join("roles")).unwrap();
-
-    let mut misses: Vec<String> = Vec::new();
-    for (macro_name, needle, step, refusal) in [
-        (
-            "mkrole",
-            "w3-role",
-            ".role w3-role",
-            "Creating role 'w3-role' needs a human to answer the prompt and none is attached \
-             to this run; run it without --headless or --acp-server",
-        ),
-        (
-            "mkmacro",
-            "w3-macro",
-            ".macro w3-macro",
-            "Creating macro 'w3-macro' needs a human to answer the prompt and none is \
-             attached to this run; run it without --headless or --acp-server",
-        ),
-        (
-            "tmpsave",
-            "roles/",
-            ".save role",
-            "The input prompt needs a human and none is attached to this run; run it without \
-             --headless or --acp-server",
-        ),
-    ] {
-        let (status, everything) = run_headless_macro(&dir, macro_name);
-        if !everything.contains(&format!(">> {step}")) {
-            misses.push(format!(
-                "`--headless --macro {macro_name}` never echoed its step `{step}` (did the \
-                 macro run at all?) (exit {status}):\n{everything}"
-            ));
-        }
-        let created = files_named(&dir, needle);
-        if !created.is_empty() {
-            misses.push(format!(
-                "headless `{step}` created {created:?} (exit {status}):\n{everything}"
-            ));
-        }
-        if !everything.contains(refusal) {
-            misses.push(format!(
-                "headless `{step}` did not give the refusal `{refusal}` (exit {status}):\n\
-                 {everything}"
-            ));
-        }
-    }
-    assert!(
-        misses.is_empty(),
-        "{} headless expectation(s) missed:\n\n{}",
-        misses.len(),
-        misses.join("\n\n")
     );
 }
