@@ -163,6 +163,12 @@ pub(crate) fn ensure_terminal_lendable() -> Result<()> {
     Ok(())
 }
 
+/// Puts a notice in the transcript from anywhere in the process, the
+/// loop's own thread included. False when no UI is running to show it.
+pub(crate) fn notice(kind: NoticeKind, text: String) -> bool {
+    lender().is_some_and(|(tx, _)| tx.send(UiMsg::Notice { kind, text }).is_ok())
+}
+
 /// Runs `job` with the terminal released to it (alternate screen left,
 /// line discipline cooked), the way Ctrl+O hands it to the editor, and
 /// blocks until the loop has taken the screen back. For the shell
@@ -2780,7 +2786,9 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     let status = std::process::Command::new(editor).arg(&path).status();
     let edited = std::fs::read_to_string(&path);
     let _ = std::fs::remove_dir_all(&dir);
-    if !status?.success() {
+    let status = status?;
+    crate::utils::report_editor_exit(status);
+    if !status.success() {
         return Ok(text.to_string());
     }
     Ok(edited?.trim_end_matches('\n').to_string())

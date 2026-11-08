@@ -309,13 +309,20 @@ pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
     } else {
         Command::new(editor).arg(path).status()?
     };
-    if !status.success() {
-        println!(
-            "{}",
-            warning_text(&format!("The editor exited with {status}"))
-        );
-    }
+    report_editor_exit(status);
     Ok(())
+}
+
+/// Says that an editor exited non-zero, in the transcript when a UI is
+/// running and as a warning line otherwise. A clean exit says nothing.
+pub(crate) fn report_editor_exit(status: ExitStatus) {
+    if status.success() {
+        return;
+    }
+    let text = format!("The editor exited with {status}");
+    if !crate::tui::notice(crate::events::NoticeKind::ToolWarning, text.clone()) {
+        println!("{}", warning_text(&text));
+    }
 }
 
 pub fn append_to_shell_history(shell: &str, command: &str, exit_code: i32) -> io::Result<()> {
