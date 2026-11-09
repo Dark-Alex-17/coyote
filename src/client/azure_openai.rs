@@ -1,4 +1,5 @@
 use super::openai::*;
+use super::structured_output::SchemaDialect;
 use super::*;
 
 use anyhow::Result;
@@ -41,6 +42,7 @@ impl_client_trait!(
     ),
     (prepare_embeddings, openai_embeddings),
     (noop_prepare_rerank, noop_rerank),
+    dialect: Some(SchemaDialect::OpenAiStrict),
 );
 
 fn prepare_chat_completions(
@@ -118,7 +120,16 @@ mod tests {
             functions: None,
             stream,
             prompt_cache_ttl: None,
+            structured_output: None,
         }
+    }
+
+    #[test]
+    fn native_structured_output_dialect_is_openai_strict() {
+        assert_eq!(
+            make_client().native_structured_output_dialect(),
+            Some(SchemaDialect::OpenAiStrict)
+        );
     }
 
     #[test]

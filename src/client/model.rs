@@ -216,7 +216,6 @@ impl Model {
         self.data.supports_function_calling
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-427: remove once prepare_completion_data reads it
     pub fn supports_structured_output(&self) -> bool {
         self.data.supports_structured_output
     }

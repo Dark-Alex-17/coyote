@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::mem;
 
+use super::structured_output::SchemaDialect;
 use super::*;
 
 use crate::function::ToolResult;
@@ -159,6 +160,10 @@ impl BedrockClient {
 #[async_trait::async_trait]
 impl Client for BedrockClient {
     client_common_fns!();
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        Some(SchemaDialect::Anthropic)
+    }
 
     async fn chat_completions_inner(
         &self,
@@ -365,6 +370,7 @@ fn build_chat_completions_body(
         functions,
         stream: _,
         prompt_cache_ttl,
+        structured_output: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -895,6 +901,20 @@ mod tests {
     use crate::function::{FunctionDeclaration, ImageAttachment, ToolCall, ToolResult};
 
     #[test]
+    fn native_structured_output_dialect_is_anthropic() {
+        let client = BedrockClient {
+            app_config: std::sync::Arc::new(crate::config::AppConfig::default()),
+            config: BedrockConfig::default(),
+            model: Model::new("bedrock", "anthropic.claude-sonnet-4"),
+        };
+
+        assert_eq!(
+            client.native_structured_output_dialect(),
+            Some(SchemaDialect::Anthropic)
+        );
+    }
+
+    #[test]
     fn interleaved_user_parts_keep_their_order() {
         let body = build_chat_completions_body(
             interleaved_user_data(),
@@ -981,6 +1001,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         build_chat_completions_body(data, &Model::new("bedrock", "test"), false).unwrap()
     }
@@ -1009,6 +1030,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         build_chat_completions_body(data, &Model::new("bedrock", "test"), false).unwrap()
     }
@@ -1080,6 +1102,7 @@ mod tests {
             }]),
             stream: false,
             prompt_cache_ttl: prompt_cache_ttl.map(str::to_string),
+            structured_output: None,
         }
     }
 

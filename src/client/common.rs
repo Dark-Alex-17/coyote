@@ -1,6 +1,7 @@
 use super::*;
 
 use super::access_token::{distrust_access_token, get_access_token};
+use super::structured_output::{SchemaDialect, StructuredOutputSpec};
 use crate::config::{RenderMode, RunCallOutcome, paths};
 use crate::hooks::{self, HookEvent};
 use crate::{
@@ -52,6 +53,10 @@ pub trait Client: Sync + Send {
 
     fn supports_oauth(&self) -> bool {
         false
+    }
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        None
     }
 
     fn build_client(&self) -> Result<ReqwestClient> {
@@ -388,6 +393,8 @@ pub struct ChatCompletionsData {
     /// Cache TTL for the system prompt and tool declarations (`"1h"`), or
     /// None for the provider default. Only the Anthropic clients read it.
     pub prompt_cache_ttl: Option<String>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "no production reader yet"))] // TASK-428
+    pub structured_output: Option<StructuredOutputSpec>,
 }
 
 #[derive(Debug, Clone, Default)]

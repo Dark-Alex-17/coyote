@@ -257,6 +257,17 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn native_structured_output_dialect_is_none() {
+        let client = CohereClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: CohereConfig::default(),
+            model: Model::new("cohere-test", "command-test"),
+        };
+
+        assert_eq!(client.native_structured_output_dialect(), None);
+    }
+
+    #[test]
     fn chat_bodies_omit_stream_options() {
         let client = CohereClient {
             app_config: Arc::new(AppConfig::default()),
@@ -280,6 +291,7 @@ mod tests {
                 functions: None,
                 stream,
                 prompt_cache_ttl: None,
+                structured_output: None,
             };
 
             let request_data = prepare_chat_completions(&client, data).unwrap();

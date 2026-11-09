@@ -3,6 +3,7 @@ use std::mem;
 
 use super::access_token::get_access_token;
 use super::oauth::{self, OAuthConfig};
+use super::structured_output::SchemaDialect;
 use super::*;
 
 use crate::function::ToolResult;
@@ -45,6 +46,10 @@ impl Client for ClaudeClient {
 
     fn supports_oauth(&self) -> bool {
         self.config.auth.as_deref() == Some("oauth")
+    }
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        Some(SchemaDialect::Anthropic)
     }
 
     async fn chat_completions_inner(
@@ -347,6 +352,7 @@ pub fn claude_build_chat_completions_body(
         functions,
         stream,
         prompt_cache_ttl,
+        structured_output: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -878,6 +884,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), prompt_cache)
             .unwrap()
@@ -907,6 +914,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), false)
             .unwrap()
@@ -940,6 +948,7 @@ mod tests {
             functions,
             stream: false,
             prompt_cache_ttl: prompt_cache_ttl.map(str::to_string),
+            structured_output: None,
         }
     }
 
@@ -1528,6 +1537,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_structured_output_dialect_is_anthropic() {
+        let client = make_client(ClaudeConfig::default(), vec![]);
+
+        assert_eq!(
+            client.native_structured_output_dialect(),
+            Some(SchemaDialect::Anthropic)
+        );
+    }
+
     fn prepare(client: &ClaudeClient) -> Result<RequestData> {
         let data = ChatCompletionsData {
             messages: vec![Message::new(
@@ -1540,6 +1559,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

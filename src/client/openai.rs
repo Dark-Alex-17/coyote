@@ -1,6 +1,7 @@
 use super::access_token::{get_access_token, get_access_token_account_id};
 use super::oauth::{self, OAuthConfig, OAuthProvider};
 use super::openai_oauth::OpenAIOAuthProvider;
+use super::structured_output::SchemaDialect;
 use super::*;
 
 use crate::function::ToolResult;
@@ -44,6 +45,10 @@ impl Client for OpenAIClient {
 
     fn supports_oauth(&self) -> bool {
         self.config.auth.as_deref() == Some("oauth")
+    }
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        Some(SchemaDialect::OpenAiStrict)
     }
 
     async fn chat_completions_inner(
@@ -484,6 +489,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         functions,
         stream,
         prompt_cache_ttl: _,
+        structured_output: _,
     } = data;
 
     let messages_len = messages.len();
@@ -767,6 +773,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
         functions,
         stream,
         prompt_cache_ttl: _,
+        structured_output: _,
     } = data;
 
     let messages_len = messages.len();
@@ -1156,6 +1163,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         openai_build_chat_completions_body(data, &Model::new("openai", "gpt-test"))
     }
@@ -1214,6 +1222,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         openai_build_chat_completions_body(data, &Model::new("openai", "gpt-test"))
     }
@@ -1422,6 +1431,7 @@ mod tests {
             functions,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         openai_build_responses_body(data, &Model::new("openai", "gpt-test"))
     }
@@ -1558,6 +1568,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
 
         let body = openai_build_responses_body(data, &Model::new("openai", "gpt-test"));
@@ -2564,6 +2575,7 @@ mod tests {
             functions: None,
             stream,
             prompt_cache_ttl: None,
+            structured_output: None,
         }
     }
 
@@ -2682,6 +2694,16 @@ mod tests {
     fn stock_chat_client(name: &str) -> OpenAIClient {
         let config = api_key_config(name, Some(WireApi::Chat));
         make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)])
+    }
+
+    #[test]
+    fn native_structured_output_dialect_is_openai_strict() {
+        let client = stock_chat_client("openai-dialect-test");
+
+        assert_eq!(
+            client.native_structured_output_dialect(),
+            Some(SchemaDialect::OpenAiStrict)
+        );
     }
 
     #[test]

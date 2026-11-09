@@ -1,6 +1,7 @@
 use super::access_token::get_access_token;
 use super::gemini_oauth::GeminiOAuthProvider;
 use super::oauth::{self, OAuthConfig, OAuthProvider};
+use super::structured_output::SchemaDialect;
 use super::vertexai::*;
 use super::*;
 
@@ -39,6 +40,10 @@ impl Client for GeminiClient {
 
     fn supports_oauth(&self) -> bool {
         self.config.auth.as_deref() == Some("oauth")
+    }
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        Some(SchemaDialect::Gemini)
     }
 
     async fn chat_completions_inner(
@@ -330,6 +335,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_structured_output_dialect_is_gemini() {
+        let client = make_client(GeminiConfig::default(), vec![]);
+
+        assert_eq!(
+            client.native_structured_output_dialect(),
+            Some(SchemaDialect::Gemini)
+        );
+    }
+
     fn minimal_oauth_config() -> OAuthConfig {
         serde_yaml::from_str("client_id: gateway\ntoken_url: https://gateway.example/token")
             .unwrap()
@@ -347,6 +362,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

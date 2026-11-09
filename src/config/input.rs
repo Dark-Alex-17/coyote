@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::client::structured_output::SchemaDialect;
 use crate::client::{
     ChatCompletionsData, Client, ImageUrl, Message, MessageContent, MessageContentPart,
     MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
@@ -502,6 +503,11 @@ impl Input {
         } else {
             None
         };
+        let structured_output = if model.supports_structured_output() {
+            self.role().structured_output().cloned()
+        } else {
+            None
+        };
         let extended_ttl = matches!(
             self.app_config.prompt_cache_ttl.as_deref(),
             None | Some(EXTENDED_PROMPT_CACHE_TTL)
@@ -516,7 +522,29 @@ impl Input {
             functions,
             stream,
             prompt_cache_ttl,
+            structured_output,
         })
+    }
+
+    /// The dialect the request will be built in when the provider enforces
+    /// the role's schema itself, or None when the caller must fall back.
+    /// Gated on the client's model because that is the model
+    /// `Client::chat_completions` passes to `prepare_completion_data`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-429
+    pub fn native_structured_output(&self, client: &dyn Client) -> Option<SchemaDialect> {
+        if self.role().structured_output().is_some() && client.model().supports_structured_output()
+        {
+            client.native_structured_output_dialect()
+        } else {
+            None
+        }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-429
+    pub fn without_structured_output(&self) -> Input {
+        let mut input = self.clone();
+        input.role.set_structured_output(None);
+        input
     }
 
     pub fn build_messages(&self) -> Result<Vec<Message>> {
@@ -1033,7 +1061,8 @@ fn limit_outgoing_images(messages: &mut [Message], model: &Model, current_user: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::ModelData;
+    use crate::client::structured_output::StructuredOutputSpec;
+    use crate::client::{ClientConfig, ModelData};
     use crate::config::request_context::RequestContext;
     use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
@@ -1433,6 +1462,126 @@ mod tests {
         ctx.session = Some(Session::default());
         let input = Input::from_str(&ctx, "test", None).unwrap();
         assert_eq!(prompt_cache_ttl_of(&input), None);
+    }
+
+    fn structured_spec() -> StructuredOutputSpec {
+        StructuredOutputSpec {
+            name: "answer".to_string(),
+            schema: json!({"type": "object"}),
+        }
+    }
+
+    fn structured_model(supports_structured_output: bool) -> Model {
+        let mut data = ModelData::new("structured");
+        data.supports_function_calling = true;
+        data.supports_structured_output = supports_structured_output;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn structured_input(
+        spec: Option<StructuredOutputSpec>,
+        supports_structured_output: bool,
+        functions: Option<Vec<FunctionDeclaration>>,
+    ) -> Input {
+        let mut input = Input::from_str(&create_test_ctx(), "test", None).unwrap();
+        input.set_role_model(structured_model(supports_structured_output));
+        input.role.set_structured_output(spec);
+        input.functions = functions;
+        input
+    }
+
+    #[test]
+    fn prepare_completion_data_gates_structured_output_on_spec_and_model_flag() {
+        let cases = [
+            (None, true, None),
+            (Some(structured_spec()), false, None),
+            (Some(structured_spec()), true, Some(structured_spec())),
+        ];
+        for (spec, flag, expected) in cases {
+            for functions in [None, Some(vec![declaration("lookup")])] {
+                let input = structured_input(spec.clone(), flag, functions);
+                let model = input.role().model().clone();
+
+                let data = input.prepare_completion_data(&model, false).unwrap();
+                let baseline = input
+                    .without_structured_output()
+                    .prepare_completion_data(&model, false)
+                    .unwrap();
+
+                assert_eq!(
+                    data.structured_output, expected,
+                    "spec {spec:?} flag {flag}"
+                );
+                assert_eq!(
+                    format!("{:?}", data.functions),
+                    format!("{:?}", baseline.functions)
+                );
+                assert!(baseline.structured_output.is_none());
+            }
+        }
+    }
+
+    fn structured_clients() -> Arc<AppConfig> {
+        Arc::new(AppConfig {
+            clients: vec![
+                ClientConfig::OpenAIConfig(Default::default()),
+                ClientConfig::CohereConfig(Default::default()),
+            ],
+            ..AppConfig::default()
+        })
+    }
+
+    #[test]
+    fn native_structured_output_requires_spec_model_flag_and_client_dialect() {
+        let app_config = structured_clients();
+        let client_for = |client_name: &str, flag: bool| {
+            let mut data = ModelData::new("structured");
+            data.supports_structured_output = flag;
+            init_client(
+                &app_config,
+                Model::from_config(client_name, &[data]).remove(0),
+            )
+            .unwrap()
+        };
+        let with_spec = structured_input(Some(structured_spec()), true, None);
+        let without_spec = structured_input(None, true, None);
+
+        assert_eq!(
+            with_spec.native_structured_output(client_for("openai", true).as_ref()),
+            Some(SchemaDialect::OpenAiStrict)
+        );
+        assert_eq!(
+            with_spec.native_structured_output(client_for("openai", false).as_ref()),
+            None
+        );
+        assert_eq!(
+            without_spec.native_structured_output(client_for("openai", true).as_ref()),
+            None
+        );
+        assert_eq!(
+            with_spec.native_structured_output(client_for("cohere", true).as_ref()),
+            None
+        );
+    }
+
+    #[test]
+    fn without_structured_output_clears_only_the_spec() {
+        let input = structured_input(Some(structured_spec()), true, Some(vec![declaration("f")]));
+
+        let stripped = input.without_structured_output();
+
+        assert!(stripped.role().structured_output().is_none());
+        assert_eq!(input.role().structured_output(), Some(&structured_spec()));
+        assert_eq!(stripped.role().model().id(), input.role().model().id());
+        assert_eq!(
+            format!("{:?}", stripped.functions),
+            format!("{:?}", input.functions)
+        );
+        assert_eq!(
+            format!("{:?}", stripped.build_messages().unwrap()),
+            format!("{:?}", input.build_messages().unwrap())
+        );
+        assert_eq!(stripped.text(), input.text());
     }
 
     #[test]

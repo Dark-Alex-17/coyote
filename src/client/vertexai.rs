@@ -1,6 +1,7 @@
 use super::access_token::*;
 use super::claude::*;
 use super::openai::*;
+use super::structured_output::SchemaDialect;
 use super::*;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,6 +39,14 @@ impl VertexAIClient {
 #[async_trait::async_trait]
 impl Client for VertexAIClient {
     client_common_fns!();
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        match ModelCategory::from_str(self.model().real_name()) {
+            Ok(ModelCategory::Gemini) => Some(SchemaDialect::Gemini),
+            Ok(ModelCategory::Claude) => Some(SchemaDialect::Anthropic),
+            Ok(ModelCategory::Mistral) | Err(_) => None,
+        }
+    }
 
     async fn chat_completions_inner(
         &self,
@@ -387,6 +396,7 @@ pub fn gemini_build_chat_completions_body(
         functions,
         stream: _,
         prompt_cache_ttl: _,
+        structured_output: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -674,6 +684,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
 
         let body = gemini_build_chat_completions_body(data, &Model::new("vertexai", "gemini-test"))
@@ -724,6 +735,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         gemini_build_chat_completions_body(data, &Model::new("vertexai", "gemini-test")).unwrap()
     }
@@ -829,6 +841,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
 
         let body = claude_build_chat_completions_body(
@@ -973,6 +986,30 @@ mod tests {
             functions: None,
             stream,
             prompt_cache_ttl: None,
+            structured_output: None,
+        }
+    }
+
+    #[test]
+    fn native_structured_output_dialect_follows_model_category() {
+        let cases = [
+            ("gemini-2.5-pro", Some(SchemaDialect::Gemini)),
+            ("claude-sonnet-4", Some(SchemaDialect::Anthropic)),
+            ("mistral-large", None),
+            ("llama-3", None),
+        ];
+        for (real_name, expected) in cases {
+            let client = VertexAIClient {
+                app_config: std::sync::Arc::new(crate::config::AppConfig::default()),
+                config: VertexAIConfig::default(),
+                model: Model::new("vertexai", real_name),
+            };
+
+            assert_eq!(
+                client.native_structured_output_dialect(),
+                expected,
+                "{real_name}"
+            );
         }
     }
 
