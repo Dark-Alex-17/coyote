@@ -382,6 +382,18 @@ fn round_one_error(err: RequestError, node: &str, identity_hash: &str) -> FetchE
     err
 }
 
+/// `link_error` for every failure that ends the fetch outside round 1, logged for the
+/// reason `round_one_error` logs: the request's send would otherwise be the fetch's last
+/// line.
+fn fetch_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
+    let err = link_error(err, node, identity_hash);
+    debug!(
+        "Propagation fetch from {node}: ended on an error: {}",
+        redact_hashes(&err.to_string())
+    );
+    err
+}
+
 /// One fetched message that passed every check, as plain owned data. Nothing of the wire
 /// types crosses this boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -1674,7 +1686,7 @@ pub(crate) async fn fetch(
     let node_hex = node.destination.address_hash.to_hex_string();
     let node_short = short(&node_hex);
     let identity_hex = identity.as_identity().address_hash.to_hex_string();
-    let failed = |err: RequestError| link_error(err, node_short, &identity_hex);
+    let failed = |err: RequestError| fetch_error(err, node_short, &identity_hex);
     let mut report = FetchReport::new(node_hex.clone());
 
     if let Some(cursor) = store.cursor() {
@@ -4579,6 +4591,11 @@ mod tests {
                 ))),
                 "the silence is logged where the fetch's own lines are"
             );
+            assert!(
+                !debug_snapshot().iter().any(|line| line
+                    .starts_with(&format!("Propagation fetch from {node}: ended on an error"))),
+                "round 1 logs its failure once, through its own classifier"
+            );
 
             fetcher.stop().await;
             fake.stop().await;
@@ -4625,8 +4642,10 @@ mod tests {
         /// then never serves it times out as a plain request timeout.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_node_silent_to_the_get_request_is_a_request_timeout_not_a_silent_list() {
+            install_log_collector();
             let fake = FakeNode::listen().await;
             let fetcher = Fetcher::join(&fake, "fetch-net-silent-get", TrustList::default()).await;
+            let node = short(&fake.hex()).to_string();
             fake.script.reply_with([ids_value(&[id(1)])]);
 
             let err = fetcher
@@ -4640,6 +4659,14 @@ mod tests {
             );
             assert_eq!(fake.script.seen().len(), 2, "the list and the get went out");
             assert_eq!(fetcher.store().cursor(), None);
+            let ended = format!(
+                "Propagation fetch from {node}: ended on an error: {}",
+                redact_hashes(&err.to_string())
+            );
+            assert!(
+                debug_snapshot().iter().any(|line| line == &ended),
+                "the silent get is logged where the fetch's own lines are: {ended}"
+            );
 
             fetcher.stop().await;
             fake.stop().await;
@@ -5196,6 +5223,69 @@ mod tests {
                 "the first body is not delivered twice"
             );
             assert!(fetcher.store().cursor().is_some());
+
+            fetcher.stop().await;
+            fake.stop().await;
+        }
+
+        /// The key lookups' deadline bounds the real transport wait: a lookup stuck behind
+        /// this node's own lock on the announced destination fails as a local timeout,
+        /// which says nothing about the propagation node.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_key_lookup_stuck_on_the_transport_past_its_deadline_is_a_local_timeout() {
+            let fake = FakeNode::listen().await;
+            let mut fetcher =
+                Fetcher::join(&fake, "fetch-net-keys-stuck", TrustList::default()).await;
+            let mut announces = fetcher.connector.transport.recv_announces().await;
+            let sender = TransportIdentity::new_from_rand(OsRng);
+            let sender_hash = sender.as_identity().address_hash;
+            let source = fetcher
+                .learn_announce(&fake, sender, DestinationName::new("lxmf", "delivery"))
+                .await;
+            let filed = loop {
+                let event = timeout(INTEROP_TIMEOUT, announces.recv())
+                    .await
+                    .expect("the transport must file the sender's announce")
+                    .unwrap();
+                if event.destination.lock().await.desc.address_hash == source {
+                    break event.destination;
+                }
+            };
+            let transport = &fetcher.connector.transport;
+
+            let keys = TransportKeys::build(
+                transport,
+                &fetcher.peers,
+                Deadline::after(Duration::from_millis(200)),
+            )
+            .await
+            .unwrap();
+            let held = filed.lock().await;
+            let looked_up = keys.identity_for(&source).await;
+            drop(held);
+            let Err(err) = looked_up else {
+                panic!("a lookup stuck past its deadline must fail");
+            };
+
+            assert!(
+                matches!(&err, RequestError::LocalTimeout { path, .. } if path == GET_PATH),
+                "{err:?}"
+            );
+            let text = FetchError::Link(err).to_string();
+            assert!(!text.contains("did not answer"), "{text}");
+
+            let keys =
+                TransportKeys::build(transport, &fetcher.peers, Deadline::after(INTEROP_TIMEOUT))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                keys.identity_for(&source)
+                    .await
+                    .unwrap()
+                    .map(|identity| identity.address_hash),
+                Some(sender_hash),
+                "the same lookup resolves once the lock is released"
+            );
 
             fetcher.stop().await;
             fake.stop().await;

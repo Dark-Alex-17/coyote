@@ -1053,9 +1053,14 @@ fn relay_scripts_say_why_the_propagation_node_announces_past_the_hour() {
             .iter()
             .position(|line| line.contains("# Your team's relay"))
             .unwrap_or_else(|| panic!("{name} lacks the Team Relay stanza"));
+        let closing = match name {
+            "mesh-relay.sh" => "EOF",
+            "mesh-relay.ps1" => "'@",
+            other => panic!("no closing marker known for {other}"),
+        };
         assert!(
-            at < teams_relay,
-            "{name}: the note sits before the Team Relay stanza, outside the text the script writes"
+            at > 0 && lines[at - 1] == closing && at < teams_relay,
+            "{name}: the announce note no longer sits before the Team Relay stanza, outside the text the script writes (the line above it must close that text with {closing})"
         );
     }
 }

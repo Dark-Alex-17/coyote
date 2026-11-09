@@ -211,6 +211,9 @@ fn shipped_lxmd_config_enables_the_node_and_requires_auth() {
         "announce_rate_target = 3600 s",
         "announce_rate_grace = 5",
         "strict compare",
+        "RNS Transport.py",
+        "a `<`",
+        "counts as a violation",
     ] {
         assert!(
             config.contains(reason),
@@ -676,6 +679,12 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         readme.contains("it posts the message to a propagation node"),
         "deployment README must say a message that cannot be delivered directly is posted to the node"
     );
+    let lxmd = read(deployment_dir().join("lxmd.config"));
+    let interval = lxmd
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("announce_interval = "))
+        .expect("lxmd.config sets announce_interval")
+        .trim();
     assert!(
         readme.contains("Held messages are fetched back automatically every"),
         "deployment README must state that fetch-back runs on a schedule in this build"
@@ -689,15 +698,15 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         "deployment README must say a Coyote node that does not announce never fetches on its own"
     );
     assert!(
-        readme.contains(
-            "Coyote keeps the propagation nodes it heard within the last day in `mesh/propagation-nodes.json` under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote that has not heard the node within the last day waits for the node's next announce (up to `announce_interval`, 61 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
-        ),
+        readme.contains(&format!(
+            "Coyote keeps the propagation nodes it heard within the last day in `mesh/propagation-nodes.json` under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote that has not heard the node within the last day waits for the node's next announce (up to `announce_interval`, {interval} minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
+        )),
         "deployment README must say the node table survives a restart and how long a first fetch can wait"
     );
     assert!(
-        readme.contains(
-            "`lxmd.config` is copied to `/data/lxmd/config` only on the first start: on a node set up from an earlier image, set `announce_interval = 61` in `/data/lxmd/config` and restart the container (`docker restart coyote-pn`)."
-        ),
+        readme.contains(&format!(
+            "`lxmd.config` is copied to `/data/lxmd/config` only on the first start: on a node set up from an earlier image, set `announce_interval = {interval}` in `/data/lxmd/config` and restart the container (`docker restart coyote-pn`)."
+        )),
         "deployment README must tell an existing operator how to take the new announce interval"
     );
     assert!(
