@@ -451,7 +451,7 @@ impl Role {
         let mut messages = if self.is_empty_prompt() {
             vec![Message::new(MessageRole::User, content)]
         } else if self.is_embedded_prompt() {
-            content.merge_prompt(|v: &str| self.prompt.replace(INPUT_PLACEHOLDER, v));
+            content.merge_prompt(&self.prompt, INPUT_PLACEHOLDER);
             vec![Message::new(MessageRole::User, content)]
         } else {
             let mut messages = vec![];
@@ -688,6 +688,7 @@ pub(crate) fn install_and_reconcile_role_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{ImageUrl, MessageContentPart};
 
     #[test]
     fn role_new_parses_prompt() {
@@ -1244,5 +1245,107 @@ Input 1
 
         assert!(!dir.exists(), "an empty shipped set must not create hooks/");
         let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    fn embed_in_role(content: MessageContent) -> Vec<String> {
+        let role = Role::new("embedded", "Before __INPUT__ after");
+        let mut content = content;
+        content.merge_prompt(role.prompt(), INPUT_PLACEHOLDER);
+        match content {
+            MessageContent::Array(list) => list
+                .into_iter()
+                .map(|part| match part {
+                    MessageContentPart::Text { text } => text,
+                    MessageContentPart::ImageUrl { image_url } => {
+                        format!("image:{}", image_url.url)
+                    }
+                })
+                .collect(),
+            MessageContent::Text(text) => vec![text],
+            MessageContent::ToolCalls(_) => unreachable!(),
+        }
+    }
+
+    fn text_part(text: &str) -> MessageContentPart {
+        MessageContentPart::Text { text: text.into() }
+    }
+
+    fn image_part(url: &str) -> MessageContentPart {
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl { url: url.into() },
+        }
+    }
+
+    #[test]
+    fn embedded_role_wraps_text_only_input_unchanged() {
+        assert_eq!(
+            embed_in_role(MessageContent::Text("hi".into())),
+            vec!["Before hi after"]
+        );
+        assert_eq!(
+            embed_in_role(MessageContent::Array(vec![
+                text_part("hi"),
+                image_part("a")
+            ])),
+            vec!["Before hi after", "image:a"]
+        );
+    }
+
+    #[test]
+    fn embedded_role_keeps_its_prompt_when_an_image_leads() {
+        assert_eq!(
+            embed_in_role(MessageContent::Array(vec![
+                image_part("a"),
+                text_part("hi")
+            ])),
+            vec!["Before ", "image:a", "hi after"]
+        );
+    }
+
+    #[test]
+    fn embedded_role_wraps_interleaved_parts() {
+        assert_eq!(
+            embed_in_role(MessageContent::Array(vec![
+                text_part("one"),
+                image_part("a"),
+                text_part("two"),
+                image_part("b"),
+            ])),
+            vec!["Before one", "image:a", "two after", "image:b"]
+        );
+    }
+
+    #[test]
+    fn embedded_role_wraps_an_image_without_text() {
+        assert_eq!(
+            embed_in_role(MessageContent::Array(vec![image_part("a")])),
+            vec!["Before ", "image:a", " after"]
+        );
+    }
+
+    #[test]
+    fn embedded_role_with_repeated_placeholder_leaves_no_literal_placeholder() {
+        let mut content = MessageContent::Array(vec![image_part("a"), text_part("hi")]);
+        content.merge_prompt("A __INPUT__ B __INPUT__ C", INPUT_PLACEHOLDER);
+        let MessageContent::Array(list) = content else {
+            unreachable!()
+        };
+        assert_eq!(list.len(), 3);
+        assert!(matches!(&list[0], MessageContentPart::Text { text } if text == "A "));
+        assert!(matches!(&list[2], MessageContentPart::Text { text } if text == "hi B  C"));
+    }
+
+    #[test]
+    fn embedded_role_with_repeated_placeholder_fills_each_for_a_text_first_input() {
+        let mut content = MessageContent::Array(vec![text_part("hi"), image_part("a")]);
+        content.merge_prompt("A __INPUT__ B __INPUT__ C", INPUT_PLACEHOLDER);
+        let MessageContent::Array(list) = content else {
+            unreachable!()
+        };
+        assert_eq!(list.len(), 2);
+        assert!(matches!(&list[0], MessageContentPart::Text { text } if text == "A hi B hi C"));
+        assert!(
+            matches!(&list[1], MessageContentPart::ImageUrl { image_url } if image_url.url == "a")
+        );
     }
 }

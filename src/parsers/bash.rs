@@ -653,6 +653,171 @@ mod tests {
         assert_eq!(run(&["--v=plain"]), "plain");
     }
 
+    /// Builds a bundled tool script and runs it once on `target` with
+    /// `LLM_OUTPUT` set and `LLM_ATTACHMENTS` set or unset, returning the
+    /// output and the attachments file contents (empty when never written).
+    #[cfg(unix)]
+    fn run_bundled_tool(
+        src: &str,
+        name: &str,
+        target: &std::path::Path,
+        with_attachments: bool,
+    ) -> (String, String) {
+        use std::fs;
+        use std::process::Command;
+
+        let script = crate::utils::temp_file(&format!("bundled-{name}"), ".sh");
+        fs::write(&script, src).expect("failed to write temp script");
+        generate_bash_declarations(File::open(&script).unwrap(), &script, name)
+            .expect("build failed");
+
+        let out = crate::utils::temp_file("bundled-out", ".txt");
+        let attachments = crate::utils::temp_file("bundled-attachments", ".txt");
+        let mut command = Command::new("bash");
+        command
+            .arg(&script)
+            .arg("--path")
+            .arg(target)
+            .env("LLM_OUTPUT", &out);
+        if with_attachments {
+            command.env("LLM_ATTACHMENTS", &attachments);
+        } else {
+            command.env_remove("LLM_ATTACHMENTS");
+        }
+        let status = command.status().expect("failed to run built script");
+        assert!(status.success(), "{name} failed for {}", target.display());
+
+        let output = fs::read_to_string(&out).unwrap_or_default();
+        let attached = fs::read_to_string(&attachments).unwrap_or_default();
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(&attachments);
+        fs::remove_file(&script).unwrap();
+        (output, attached)
+    }
+
+    #[cfg(unix)]
+    struct ImageFixture {
+        dir: std::path::PathBuf,
+        png: std::path::PathBuf,
+        text: std::path::PathBuf,
+        subdir: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ImageFixture {
+        fn new(label: &str) -> Self {
+            use std::fs;
+
+            let dir = crate::utils::temp_file(&format!("bundled-{label}"), "");
+            let subdir = dir.join("sub");
+            fs::create_dir_all(&subdir).unwrap();
+            fs::write(subdir.join("inner.txt"), "x").unwrap();
+            let png = dir.join("pic.PNG");
+            fs::write(&png, b"\x89PNG").unwrap();
+            let text = dir.join("notes.txt");
+            fs::write(&text, "hello\nworld\n").unwrap();
+            Self {
+                dir,
+                png,
+                text,
+                subdir,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ImageFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_fs_read_attaches_image_files_test() {
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let src = include_str!("../../assets/functions/tools/fs_read.sh");
+        let fixture = ImageFixture::new("fs-read");
+        let png = fixture.png.display().to_string();
+
+        let (output, attached) = run_bundled_tool(src, "fs_read", &fixture.png, true);
+        assert_eq!(
+            output,
+            format!(
+                "(image file: {png}, 4 bytes; submitted for attachment, see attached_images or image_notes in this result)\n"
+            )
+        );
+        assert_eq!(attached, format!("{png}\n"));
+
+        let (output, attached) = run_bundled_tool(src, "fs_read", &fixture.png, false);
+        assert_eq!(
+            output,
+            format!(
+                "(image file: {png}, 4 bytes; this tool cannot display images in this context)\n"
+            )
+        );
+        assert_eq!(attached, "");
+
+        let (output, attached) = run_bundled_tool(src, "fs_read", &fixture.text, true);
+        assert_eq!(output, "1: hello\n2: world\n");
+        assert_eq!(attached, "");
+
+        let (output, attached) = run_bundled_tool(src, "fs_read", &fixture.subdir, true);
+        assert_eq!(output, "inner.txt\n");
+        assert_eq!(attached, "");
+
+        let empty = fixture.dir.join("empty.png");
+        std::fs::write(&empty, b"").unwrap();
+        let (output, attached) = run_bundled_tool(src, "fs_read", &empty, true);
+        assert_eq!(output, format!("(file is empty: {})\n", empty.display()));
+        assert_eq!(attached, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_fs_cat_attaches_image_files_test() {
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let src = include_str!("../../assets/functions/tools/fs_cat.sh");
+        let fixture = ImageFixture::new("fs-cat");
+        let png = fixture.png.display().to_string();
+
+        let (output, attached) = run_bundled_tool(src, "fs_cat", &fixture.png, true);
+        assert_eq!(
+            output,
+            format!(
+                "(image file: {png}, 4 bytes; submitted for attachment, see attached_images or image_notes in this result)\n"
+            )
+        );
+        assert_eq!(attached, format!("{png}\n"));
+
+        let (output, attached) = run_bundled_tool(src, "fs_cat", &fixture.png, false);
+        assert_eq!(
+            output,
+            format!(
+                "(image file: {png}, 4 bytes; this tool cannot display images in this context)\n"
+            )
+        );
+        assert_eq!(attached, "");
+
+        let (output, attached) = run_bundled_tool(src, "fs_cat", &fixture.text, true);
+        assert_eq!(output, "hello\nworld\n");
+        assert_eq!(attached, "");
+
+        let subdir = fixture.subdir.display().to_string();
+        let (output, attached) = run_bundled_tool(src, "fs_cat", &fixture.subdir, true);
+        assert!(
+            output.ends_with(&format!("No such file or path: {subdir}\n")),
+            "{output:?}"
+        );
+        assert_eq!(attached, "");
+    }
+
     #[cfg(unix)]
     #[test]
     fn second_build_does_not_rewrite_tool_file_test() {

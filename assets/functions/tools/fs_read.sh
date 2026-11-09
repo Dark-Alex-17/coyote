@@ -6,12 +6,14 @@ set -e
 # If you need the FULL, untruncated contents of a file, use fs_cat instead.
 # Use this tool when you want line numbers, want to read a specific section via --offset/--limit, or are scanning a large file.
 # Use the grep tool to find specific content before reading, then read with offset to target the relevant section.
+# PNG, JPEG, GIF and WebP image files are attached to the result so a vision-capable model can view them.
 
 # @option --path! The absolute path to the file or directory to read
 # @option --offset <INT> The line number to start reading from (1-indexed, default: 1)
 # @option --limit <INT> The maximum number of lines to read (default: 2000)
 
 # @env LLM_OUTPUT=/dev/stdout The output path
+# @env LLM_ATTACHMENTS The file to append image paths to (one per line) to attach them to the result
 
 # Review lanes ground relative paths in the checkout under review and refuse
 # reads in another clone of the same repository (utils/review-paths.sh).
@@ -52,6 +54,24 @@ main() {
     if [[ -d "$target" ]]; then
         ls -1 "$target" >> "$LLM_OUTPUT" 2>&1
         return 0
+    fi
+
+    if [[ -f "$target" && -s "$target" ]]; then
+        case "$target" in
+            *.[pP][nN][gG]|*.[jJ][pP][gG]|*.[jJ][pP][eE][gG]|*.[gG][iI][fF]|*.[wW][eE][bB][pP])
+                local bytes
+                bytes=$(wc -c < "$target" | tr -d ' ')
+                # The path goes out exactly as given: under Git Bash a rewritten
+                # /c/... path would be unreadable to coyote.
+                if [[ -n "${LLM_ATTACHMENTS:-}" ]]; then
+                    printf '%s\n' "$target" >> "$LLM_ATTACHMENTS"
+                    echo "(image file: $target, $bytes bytes; submitted for attachment, see attached_images or image_notes in this result)" >> "$LLM_OUTPUT"
+                else
+                    echo "(image file: $target, $bytes bytes; this tool cannot display images in this context)" >> "$LLM_OUTPUT"
+                fi
+                return 0
+                ;;
+        esac
     fi
 
     local total_lines file_bytes

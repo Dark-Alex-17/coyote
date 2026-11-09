@@ -1,4 +1,4 @@
-use crate::client::{Message, MessageContent, MessageContentPart};
+use crate::client::{IMAGE_PART_TEXT, Message, MessageContent, MessageContentPart};
 
 /// Byte budget for the `previous_turns` state key. It has to leave room in
 /// the state size cap for everything else a graph carries.
@@ -183,24 +183,28 @@ fn speaker(message: &Message) -> Option<&'static str> {
 }
 
 fn render_line(message: &Message) -> Option<String> {
-    speaker(message).map(|speaker| format!("{speaker}: {}", message.content.to_text()))
+    speaker(message).map(|speaker| {
+        format!(
+            "{speaker}: {}",
+            message.content.to_text_with_image_placeholders()
+        )
+    })
 }
 
-/// Mirrors `MessageContent::to_text`, which joins the text parts of an array
-/// with a blank line.
+/// Mirrors `MessageContent::to_text_with_image_placeholders`, which joins
+/// the parts of an array with a single space.
 fn text_len(content: &MessageContent) -> usize {
     match content {
         MessageContent::Text(text) => text.len(),
         MessageContent::Array(list) => {
-            let mut len = 0;
-            let mut parts = 0usize;
-            for item in list {
-                if let MessageContentPart::Text { text } = item {
-                    len += text.len();
-                    parts += 1;
-                }
-            }
-            len + "\n\n".len() * parts.saturating_sub(1)
+            let len: usize = list
+                .iter()
+                .map(|item| match item {
+                    MessageContentPart::Text { text } => text.len(),
+                    MessageContentPart::ImageUrl { .. } => IMAGE_PART_TEXT.len(),
+                })
+                .sum();
+            len + list.len().saturating_sub(1)
         }
         // Unreachable from `Exchange::len`: `speaker` filters tool calls.
         MessageContent::ToolCalls(_) => 0,
@@ -513,9 +517,9 @@ mod tests {
         }
         assert_eq!(
             exchanges[1].render(),
-            "user: see\n\nthis\nassistant: \u{4e2d}\u{4e2d}"
+            "user: see this [image]\nassistant: \u{4e2d}\u{4e2d}"
         );
-        assert_eq!(exchanges[0].render(), "user: \nassistant: r");
+        assert_eq!(exchanges[0].render(), "user: [image]\nassistant: r");
     }
 
     #[test]

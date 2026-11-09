@@ -6,7 +6,7 @@ use super::rag_cache::{RagCache, RagKey};
 use super::session::{
     AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
     KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget, labeled_session_names,
-    merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
+    list_session_names, merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -52,8 +52,7 @@ use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    estimate_token_length, fuzzy_filter, get_env_name, list_file_names, now, render_prompt,
-    temp_file,
+    estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -620,6 +619,10 @@ pub struct RequestContext {
     pub last_continuation_response: Option<String>,
     pub auto_continue_paused: Option<String>,
     pub pending_prefill: Option<String>,
+    pub pending_images: Vec<String>,
+    /// Images pasted into the line being edited; `[Image #N]` in that line
+    /// refers to entry N - 1.
+    pub pasted_images: Vec<String>,
 
     pub session_abort: Option<AbortSignal>,
 
@@ -696,6 +699,8 @@ impl RequestContext {
             last_continuation_response: None,
             auto_continue_paused: None,
             pending_prefill: None,
+            pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: None,
             task_abort: None,
             top_level_agent_id: None,
@@ -783,6 +788,8 @@ impl RequestContext {
             last_continuation_response: None,
             auto_continue_paused: None,
             pending_prefill: None,
+            pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: None,
             task_abort: None,
             top_level_agent_id: None,
@@ -905,6 +912,8 @@ impl RequestContext {
             last_continuation_response: None,
             auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
+            pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: self.session_abort.clone(),
             task_abort: self.task_abort.clone(),
             // Branches never own the top-level `agent.*` bracket; only the
@@ -975,6 +984,8 @@ impl RequestContext {
             last_continuation_response: None,
             auto_continue_paused: None,
             pending_prefill: None,
+            pending_images: Vec::new(),
+            pasted_images: Vec::new(),
             session_abort: None,
             task_abort: None,
             top_level_agent_id: None,
@@ -1647,10 +1658,11 @@ impl RequestContext {
         };
         let session_name = match name {
             Some(v) => v.to_string(),
-            None => session
-                .autoname()
-                .unwrap_or_else(|| session.name())
-                .to_string(),
+            None => match session.autoname() {
+                Some(autoname) if session.name() == TEMP_SESSION_NAME => autoname,
+                _ => session.name(),
+            }
+            .to_string(),
         };
         let scope = scope.unwrap_or_else(|| session.scope());
         if scope == SessionScope::Workspace && session_name == TEMP_SESSION_NAME {
@@ -3537,6 +3549,9 @@ impl RequestContext {
         if let Some(agent) = &self.agent {
             output.insert("agent", agent.name().to_string());
         }
+        if !self.pending_images.is_empty() {
+            output.insert("images", self.pending_images.len().to_string());
+        }
 
         if app.highlight {
             output.insert("color.reset", "\u{1b}[0m".to_string());
@@ -4786,7 +4801,7 @@ impl RequestContext {
         [SessionScope::Workspace, SessionScope::Global]
             .into_iter()
             .flat_map(|scope| {
-                list_file_names(self.sessions_dir_for(scope), ".yaml")
+                list_session_names(&self.sessions_dir_for(scope))
                     .into_iter()
                     .map(move |name| (name, scope))
             })
@@ -7759,6 +7774,9 @@ fn summary_units<'a>(
     // `SummaryToolResult`), not as the live request carries them.
     let message_tokens = match &message.content {
         MessageContent::ToolCalls(tool_calls) => summary_tool_calls_tokens(tool_calls),
+        MessageContent::Array(_) => {
+            estimate_token_length(&message.content.to_text_with_image_placeholders())
+        }
         _ => model.total_tokens(slice::from_ref(message)),
     };
     if message_tokens <= budget {
@@ -7973,6 +7991,8 @@ fn summary_role_label(role: MessageRole) -> &'static str {
 /// into a text transcript they inflate a chunk the estimator sized as "safe"
 /// far past the summarizer's window (observed: a 440k-estimate chunk
 /// rejected as 1.02M tokens, 40% of its bytes being signatures).
+/// Image attachments appear only as their `source` labels; their base64
+/// would be the same kind of dead weight.
 #[derive(Serialize)]
 struct SummaryToolResult<'a> {
     call: SummaryToolCall<'a>,
@@ -7981,6 +8001,8 @@ struct SummaryToolResult<'a> {
     text: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     thinking: Vec<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<&'a str>,
 }
 
 impl<'a> From<&'a ToolResult> for SummaryToolResult<'a> {
@@ -7990,6 +8012,7 @@ impl<'a> From<&'a ToolResult> for SummaryToolResult<'a> {
             output,
             text,
             thinking,
+            attachments,
         } = result;
         let thinking = thinking
             .iter()
@@ -8006,6 +8029,7 @@ impl<'a> From<&'a ToolResult> for SummaryToolResult<'a> {
             output,
             text: text.as_deref(),
             thinking,
+            images: attachments.iter().map(|a| a.source.as_str()).collect(),
         }
     }
 }
@@ -8107,7 +8131,7 @@ fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
                         serde_json::to_string(&SummaryToolCalls::from(tool_calls))
                             .unwrap_or_else(|_| tool_calls.text.clone())
                     }
-                    content => content.to_text(),
+                    content => content.to_text_with_image_placeholders(),
                 };
                 format!("{}: {content}", summary_role_label(message.role))
             }
@@ -8578,6 +8602,17 @@ mod tests {
         assert_eq!(vars.get("last_input_tokens").map(String::as_str), Some("1"));
         assert!(!vars.contains_key("last_cost"));
         assert!(!vars.contains_key("total_cost"));
+    }
+
+    #[test]
+    fn generate_prompt_context_counts_pending_images() {
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        assert!(!ctx.generate_prompt_context(&app).contains_key("images"));
+
+        ctx.pending_images = vec!["/tmp/a.png".into(), "/tmp/b.png".into()];
+        let vars = ctx.generate_prompt_context(&app);
+        assert_eq!(vars.get("images").map(String::as_str), Some("2"));
     }
 
     fn test_decl(name: &str) -> FunctionDeclaration {
@@ -9564,6 +9599,74 @@ mod tests {
         let rendered = render_summarization_chunk(&units);
 
         assert_opaque_payloads_dropped(&rendered);
+    }
+
+    fn user_message_with_image() -> Message {
+        Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![
+                MessageContentPart::Text {
+                    text: "what is in this picture?".into(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: crate::client::ImageUrl {
+                        url: format!("data:image/png;base64,{}", "Q".repeat(4_096)),
+                    },
+                },
+            ]),
+        )
+    }
+
+    #[test]
+    fn render_summarization_chunk_lists_attachment_sources_without_base64() {
+        let data = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo".repeat(64);
+        let result = ToolResult::new(
+            ToolCall::new(
+                "fs_read".to_string(),
+                json!({"path": "/tmp/chart.png"}),
+                Some("call-1".to_string()),
+            ),
+            json!("read /tmp/chart.png"),
+        )
+        .with_attachments(vec![crate::function::ImageAttachment {
+            source: "/tmp/chart.png".into(),
+            mime_type: "image/png".into(),
+            data: data.clone(),
+        }]);
+        let message = tool_message(MessageContentToolCalls::new(vec![result], String::new()));
+
+        let rendered = render_summarization_chunk(&[SummaryUnit::Message(&message)]);
+
+        assert!(
+            rendered.contains(r#""images":["/tmp/chart.png"]"#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&data[..16]), "base64 leaked: {rendered}");
+    }
+
+    #[test]
+    fn render_summarization_chunk_renders_user_image_as_placeholder() {
+        let message = user_message_with_image();
+
+        let rendered = render_summarization_chunk(&[SummaryUnit::Message(&message)]);
+
+        assert_eq!(rendered, "USER: what is in this picture? [image]");
+    }
+
+    /// Measured tokens cover the rendered content only; the `USER: ` label is
+    /// left out, as it is for text messages.
+    #[test]
+    fn render_summarization_chunk_image_message_matches_measured_tokens() {
+        let message = user_message_with_image();
+
+        let units = summary_units(&Model::default(), &message, usize::MAX);
+        let rendered = render_summarization_chunk(&[SummaryUnit::Message(&message)]);
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].1,
+            estimate_token_length(rendered.strip_prefix("USER: ").unwrap())
+        );
     }
 
     #[test]
@@ -17128,6 +17231,52 @@ mod tests {
 
     #[test]
     #[serial]
+    fn nested_sessions_are_listed_completed_and_deletable() {
+        let _config = HelperConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "top", SessionScope::Global, "messages: []\n");
+        write_session_file(
+            &ctx,
+            "oncall/incident-1",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        write_session_file(&ctx, "oncall/deep/x", SessionScope::Workspace, "");
+        write_session_file(
+            &ctx,
+            &format!("{AUTONAME_PLACEHOLDER}/auto"),
+            SessionScope::Global,
+            "",
+        );
+
+        assert_eq!(
+            ctx.list_sessions(),
+            vec!["oncall/deep/x", "oncall/incident-1", "top"]
+        );
+        assert_eq!(
+            ctx.labeled_sessions(),
+            vec![
+                ("oncall/deep/x".to_string(), Some("workspace".to_string())),
+                ("oncall/incident-1".to_string(), Some("global".to_string())),
+                ("top".to_string(), Some("global".to_string())),
+            ]
+        );
+        assert_eq!(
+            ctx.session_delete_entries(),
+            vec![
+                ("oncall/deep/x".to_string(), SessionScope::Workspace),
+                ("oncall/incident-1".to_string(), SessionScope::Global),
+                ("top".to_string(), SessionScope::Global),
+            ]
+        );
+
+        ctx.delete_session_at("oncall/incident-1", SessionScope::Global)
+            .unwrap();
+        assert_eq!(ctx.list_sessions(), vec!["oncall/deep/x", "top"]);
+    }
+
+    #[test]
+    #[serial]
     fn repl_complete_session_labels_workspace_and_global() {
         let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
@@ -17256,6 +17405,29 @@ mod tests {
             .unwrap();
         assert!(
             ctx.session_file_for("named", SessionScope::Workspace)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_keeps_user_name_over_autoname() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        ctx.session.as_mut().unwrap().set_autoname("auto title");
+
+        ctx.save_session(Some("named"), Some(SessionScope::Workspace))
+            .unwrap();
+        ctx.save_session(None, None).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.name(), "named");
+        let named_file = ctx.session_file_for("named", SessionScope::Workspace);
+        assert_eq!(session.path(), Some(named_file.as_path()));
+        assert!(
+            !ctx.session_file_for("auto-title", SessionScope::Workspace)
                 .exists()
         );
     }

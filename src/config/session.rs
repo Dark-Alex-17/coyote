@@ -297,13 +297,42 @@ pub fn labeled_session_names(
         (workspace_dir, SessionScope::Workspace),
         (global_dir, SessionScope::Global),
     ] {
-        for name in list_file_names(dir, ".yaml") {
+        for name in list_session_names(dir) {
             if seen.insert(name.clone()) {
                 values.push((name, scope));
             }
         }
     }
     values
+}
+
+/// Every session saved under `dir`, sorted, a nested one named by its path
+/// relative to `dir` (`oncall/incident-1`). The top-level auto-name directory
+/// is skipped since its sessions are listed under their own label, and a
+/// symlinked directory is not descended into.
+pub fn list_session_names(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_session_names(dir, "", &mut names);
+    names.sort_unstable();
+    names
+}
+
+fn collect_session_names(dir: &Path, prefix: &str, names: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if prefix.is_empty() && file_name == AUTONAME_PLACEHOLDER {
+                continue;
+            }
+            collect_session_names(&entry.path(), &format!("{prefix}{file_name}/"), names);
+        } else if let Some(name) = file_name.strip_suffix(".yaml") {
+            names.push(format!("{prefix}{name}"));
+        }
+    }
 }
 
 pub fn merged_session_names(workspace_dir: &Path, global_dir: &Path) -> Vec<String> {
@@ -1574,7 +1603,7 @@ impl Session {
         } else {
             if self.messages.is_empty() {
                 if self.name == TEMP_SESSION_NAME && self.save_session == Some(true) {
-                    let raw_input = input.raw();
+                    let raw_input = input.raw_without_image_slots();
                     let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
                     self.autoname = Some(AutoName::new_from_chat_history(chat_history));
                 }
@@ -4177,6 +4206,39 @@ last_run:
         let session = Session::default();
 
         assert!(!session.need_autoname());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slotted_exchange_shows_its_marker_and_names_the_session_without_a_slot() {
+        let guard = crate::testing::TestConfigDirGuard::new("session-slot");
+        let image = guard.path.join("shot.png");
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let input = Input::from_files_with_image_slots(
+            &ctx,
+            &format!("see {} now", crate::utils::IMAGE_SLOT),
+            vec![image.to_string_lossy().to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+        let mut session = Session {
+            name: TEMP_SESSION_NAME.to_string(),
+            save_session: Some(true),
+            ..Default::default()
+        };
+
+        session.add_message(&input, "a pixel").unwrap();
+
+        let history = session.chat_history_for_autonaming().unwrap();
+        assert!(!history.contains(crate::utils::IMAGE_SLOT), "{history}");
+        assert!(history.contains("see  now"), "{history}");
+        let rendered = rendered_lines(&session).join("\n");
+        assert!(!rendered.contains(crate::utils::IMAGE_SLOT), "{rendered}");
+        assert!(rendered.contains("-- see [Image #1] now"), "{rendered}");
     }
 
     #[test]

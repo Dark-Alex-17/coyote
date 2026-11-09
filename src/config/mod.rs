@@ -46,7 +46,7 @@ pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
 pub use self::command_prefix::CommandPrefix;
 use self::conflict::{InstallMode, StickyMode};
-pub use self::input::Input;
+pub use self::input::{Input, vision_unsupported_message};
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
     update_bundle,
@@ -233,7 +233,7 @@ Rules:
 - Keep it under roughly 400 words unless critical details would otherwise be lost."#;
 const SUMMARY_CONTEXT_PROMPT: &str = "This is a summary of the chat history as a recap: ";
 
-const LEFT_PROMPT: &str = "{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
+const LEFT_PROMPT: &str = "{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.yellow}{?images  [{images} img]}{color.cyan}{?session )}{!session >}{color.reset} ";
 // `{?var}` treats "0" as falsy, so a reported-but-zero cache read intentionally hides the ⚡ segment.
 const RIGHT_PROMPT: &str = "{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?last_cache_read_tokens ⚡{last_cache_read_tokens} }{?total_cost ${total_cost} }{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
 
