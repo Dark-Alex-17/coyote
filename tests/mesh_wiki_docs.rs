@@ -7334,6 +7334,16 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
             "render_sync no longer builds {needle}:\n{render}"
         );
     }
+    let synced = fn_body("src/mesh/idle.rs", "synced_line");
+    assert!(
+        synced.contains("report.left_received(),") && synced.contains("LEFT_FOR_ANOTHER_SESSION,"),
+        "the idle sync line no longer counts the replies it left:\n{synced}"
+    );
+    let send = fn_body("src/function/mesh.rs", "handle_send");
+    assert!(
+        send.contains("if out.kind == PeerKind::Reply {") && send.contains("held_reply_sentence"),
+        "mesh__send no longer words a held reply for the session that asked:\n{send}"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let mesh = flat(&read(wiki.join("Mesh.md")));
@@ -7353,6 +7363,12 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
         "Mesh-Configuration.md does not say {needle:?}"
     );
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    let idle =
+        "(duplicates, discarded, deferred and left-on-the-node counts are added when non-zero)";
+    assert!(
+        commands.contains(idle),
+        "Mesh-Commands.md does not say the idle sync line counts what it left: {idle}"
+    );
     for needle in [
         format!(
             "`Fetched from <node8>: N listed, N wanted, N received, N delivered, N duplicates, N discarded, N deferred. N {left}.`"

@@ -460,8 +460,9 @@ impl SyncSchedule {
 pub(crate) const LEFT_FOR_ANOTHER_SESSION: &str = "left on the node for another session";
 
 /// `synced 3 messages from deadbeef: 2 delivered, 1 duplicate`, naming only the non-zero
-/// outcomes. A deferral that followed an ask for the sender's announce says so, with
-/// what to do next.
+/// outcomes of what the sync received, so a message an earlier sync left for another
+/// session and this one did not ask for again is not among them. A deferral that
+/// followed an ask for the sender's announce says so, with what to do next.
 fn synced_line(report: &FetchReport) -> String {
     let outcomes: Vec<String> = [
         (report.delivered, "delivered", "delivered"),
@@ -469,7 +470,7 @@ fn synced_line(report: &FetchReport) -> String {
         (report.discarded, "discarded", "discarded"),
         (report.deferred, "deferred", "deferred"),
         (
-            report.left_for_session,
+            report.left_received(),
             LEFT_FOR_ANOTHER_SESSION,
             LEFT_FOR_ANOTHER_SESSION,
         ),
@@ -598,6 +599,16 @@ mod synced_ask_line_tests {
         assert_eq!(
             synced_line(&report),
             "synced 2 messages from deadbeef: 1 delivered, 1 left on the node for another session"
+        );
+        let with_earlier = FetchReport {
+            listed: 4,
+            left_for_session: 3,
+            ..report
+        };
+        assert_eq!(
+            synced_line(&with_earlier),
+            "synced 2 messages from deadbeef: 1 delivered, 1 left on the node for another session",
+            "only what this sync received is counted, not what an earlier one left"
         );
     }
 }

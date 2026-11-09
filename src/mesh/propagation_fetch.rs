@@ -403,8 +403,9 @@ impl InboundSink for LoggingInboundSink {
 }
 
 /// `received` splits into `delivered`, `duplicates`, `discarded`, `deferred` and the
-/// bodies left for another reader; `acknowledged` is what round 3 told the node to
-/// delete, every received body but the deferred and left ones.
+/// bodies this fetch left for another reader, which `left_for_session` counts together
+/// with the listed ones an earlier fetch left; `acknowledged` is what round 3 told the
+/// node to delete, every received body but the deferred and left ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchReport {
     pub node: String,
@@ -444,6 +445,13 @@ impl FetchReport {
             acknowledged: 0,
             left_for_session: 0,
         }
+    }
+
+    /// The bodies this fetch received and left for another reader: what `received` holds
+    /// besides the other outcomes, with none of the listed ids an earlier fetch left.
+    pub(crate) fn left_received(&self) -> usize {
+        self.received
+            .saturating_sub(self.delivered + self.duplicates + self.discarded + self.deferred)
     }
 }
 
@@ -1315,15 +1323,15 @@ impl BodyPipeline<'_> {
     /// asks the hold policy, then delivers. Dedup runs before decryption as in the
     /// reference (`LXMRouter.py:2319`) on the transient id, and again on the message id
     /// once decrypted (`:1799-1803`). The verdict decides what the store remembers: a
-    /// delivered or discarded body's transient
-    /// id is recorded (`:2323`) so it is not tried again, except one refused on length,
-    /// which was never read; a body whose source has no known key is deferred instead and
-    /// left unrecorded, so the node keeps serving it until a key turns up or the deferral
-    /// budget is spent. A body the hold policy leaves for another reader is not recorded
-    /// either, since a recorded id is purged from the node on the next fetch of any
-    /// reader. The signature is checked before the trust list is consulted, so the
-    /// trust list is only ever asked about a proven signer. Only a transport wait that
-    /// expires is an error; every verdict about the body is an outcome.
+    /// delivered or discarded body's transient id is recorded (`:2323`) so it is not
+    /// tried again, except one refused on length, which was never read; a body whose
+    /// source has no known key is deferred instead and left unrecorded, so the node keeps
+    /// serving it until a key turns up or the deferral budget is spent. A body the hold
+    /// policy leaves for another reader is not recorded either, since a recorded id is
+    /// purged from the node on the next fetch of any reader. The signature is checked
+    /// before the trust list is consulted, so the trust list is only ever asked about a
+    /// proven signer. Only a transport wait that expires is an error; every verdict about
+    /// the body is an outcome.
     pub(crate) async fn process(
         &self,
         body: &[u8],
@@ -1742,6 +1750,12 @@ pub(crate) async fn fetch(
         acks.len(),
         report.deferred
     );
+    let left_now = report.left_received();
+    if left_now > 0 {
+        debug!(
+            "Propagation fetch from {node_short}: round 3 also leaves {left_now} on the node for another session"
+        );
+    }
     unless_cancelled(
         &cancel,
         request_on_link(
@@ -4473,6 +4487,11 @@ mod tests {
             assert_eq!(
                 (second.listed, second.wanted, second.left_for_session),
                 (2, 0, 1)
+            );
+            assert_eq!(
+                (first.left_received(), second.left_received()),
+                (1, 0),
+                "only the fetch that read the body counts it as received and left"
             );
             let seen = fake.script.seen();
             assert_eq!(seen.len(), 5);

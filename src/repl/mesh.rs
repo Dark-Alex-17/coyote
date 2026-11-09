@@ -3564,6 +3564,9 @@ fn render_sync(report: &FetchReport) -> String {
         if report.wanted == MAX_WANTS_PER_FETCH {
             line.push_str(" More may be held.");
         }
+        if left > 0 {
+            line.push_str(&format!(" {left} {LEFT_FOR_ANOTHER_SESSION}."));
+        }
         return line;
     }
     if report.received == 0 {
@@ -3682,6 +3685,15 @@ mod sync_ask_line_tests {
         assert_eq!(
             render_sync(&only_left),
             "Nothing new held for this node at deadbeef: 1 listed, 1 left on the node for another session."
+        );
+        let none_served = FetchReport {
+            listed: 3,
+            wanted: 2,
+            ..only_left
+        };
+        assert_eq!(
+            render_sync(&none_served),
+            "deadbeef lists 3 messages for this node and 2 were asked for, but none were served; run .mesh sync again or check the node's logs. 1 left on the node for another session."
         );
     }
 }
@@ -32039,6 +32051,23 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             && message.ends_with(
                                 "s ago; held at the propagation node, delivered to the session that asked when it syncs"
                             ),
+                        "{result}"
+                    );
+                    pn.next_received().await;
+                    // An interim note names a question too, but it is not a reply: any of
+                    // the peer's sessions takes it.
+                    let result = handle_mesh_tool(
+                        &mut ctx,
+                        "mesh__send",
+                        &serde_json::json!({ "to": peer, "message": "still looking", "in_reply_to": "q-from-tia", "kind": "note" }),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        held(
+                            result["departed"]["message"].as_str().unwrap_or_default(),
+                            &peer
+                        ),
                         "{result}"
                     );
                     pn.next_received().await;

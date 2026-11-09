@@ -6479,6 +6479,112 @@ mod tests {
         )
     }
 
+    /// Only a reply another session of this identity owns is left on the node. Every
+    /// other body is taken: a message (an interim note naming the question included), a
+    /// bulletin, an ask, a knock, an access request, a body that is not laid out as a peer
+    /// message, a reply this session owns, one from an identity the question was not
+    /// asked of and one nobody owns.
+    #[test]
+    fn only_a_reply_another_session_owns_is_left_on_the_node() {
+        use crate::mesh::access::{access_message, validate_access};
+        use crate::mesh::pending::{
+            PENDING_RECORD_VERSION, PendingRecord, PendingState, PendingStore,
+        };
+        use crate::mesh::rfc3339_utc;
+
+        let tmp = TempDir::new("message-hold-replies");
+        let signer = hash_of("s");
+        let now = SystemTime::now();
+        let asked = |instance_id: &str, id: &str| {
+            PendingStore::new(&tmp.path, instance_id)
+                .upsert(
+                    PendingRecord {
+                        version: PENDING_RECORD_VERSION,
+                        id: id.to_string(),
+                        peer_destination: hash_of("peer"),
+                        peer_identity: signer.clone(),
+                        thread: format!("t-{id}"),
+                        question: "what time is it".to_string(),
+                        sent_at: rfc3339_utc(now),
+                        timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                        state: PendingState::Open,
+                        reply: None,
+                    },
+                    now,
+                )
+                .unwrap();
+        };
+        asked("inst-a", "q-a");
+        asked("inst-c", "q-c");
+        let policy = RepliesForOtherSessions {
+            cache_dir: tmp.path.clone(),
+            instance_id: "inst-c".to_string(),
+        };
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let fetched = |stored: OutboundMessage, source: &str| {
+            inbound(
+                stored.fields.as_ref().map(round_trip),
+                stored.title,
+                Some(stored.content),
+                source,
+            )
+        };
+        let peer = |kind: PeerKind, in_reply_to: Option<&str>| {
+            let out = OutboundPeer::new(kind, "hi", None, in_reply_to, None).unwrap();
+            fetched(peer_lxmf_message(&out, &origin), &signer)
+        };
+
+        let left = policy.leave_on_node(&peer(PeerKind::Reply, Some("q-a")));
+        assert!(
+            left.as_deref()
+                .is_some_and(|reader| reader.contains("inst-a")),
+            "{left:?}"
+        );
+
+        let request = validate_access("acc-1", vec!["docs/a.md".to_string()], "why").unwrap();
+        let taken = [
+            ("a message", peer(PeerKind::Message, None)),
+            (
+                "a note on the question",
+                peer(PeerKind::Message, Some("q-a")),
+            ),
+            ("a bulletin", peer(PeerKind::Bulletin, None)),
+            ("an ask", peer(PeerKind::Ask, None)),
+            (
+                "a knock",
+                fetched(
+                    knock_message(&KnockIntro::new("hi").unwrap(), &origin),
+                    &signer,
+                ),
+            ),
+            (
+                "an access request",
+                fetched(access_message(&request, &origin), &signer),
+            ),
+            (
+                "a malformed body",
+                lxmf_data(PeerKind::Message, |data| {
+                    set_entry(data, "kind", Value::from("nonsense"))
+                }),
+            ),
+            ("this session's reply", peer(PeerKind::Reply, Some("q-c"))),
+            ("a reply nobody owns", peer(PeerKind::Reply, Some("q-none"))),
+            (
+                "a reply from another identity",
+                fetched(
+                    peer_lxmf_message(
+                        &OutboundPeer::new(PeerKind::Reply, "hi", None, Some("q-a"), None).unwrap(),
+                        &origin,
+                    ),
+                    &hash_of("someone else"),
+                ),
+            ),
+        ];
+        for (what, message) in taken {
+            assert_eq!(policy.leave_on_node(&message), None, "{what} is taken here");
+        }
+    }
+
     #[test]
     fn an_unknown_part_type_is_skipped_and_the_message_still_lands_with_its_content() {
         let body = body_entries(PeerKind::Message, |entries| {
