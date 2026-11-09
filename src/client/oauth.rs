@@ -5,6 +5,7 @@ use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::openai_oauth::OpenAIOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
+use crate::sandbox::SANDBOX_ENV_FLAG;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -16,12 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::{env, fs};
 use tokio::sync;
 use url::Url;
 use uuid::Uuid;
@@ -319,12 +320,21 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
 
     let _ = open::that(&authorize_url);
 
-    let (code, returned_state) = if use_callback_listener {
-        let (code, state) = listen_for_oauth_callback(&redirect_uri)?;
-        (code, Some(state))
-    } else {
-        let input = Text::new("Paste the authorization code or callback URL:").prompt()?;
-        parse_paste_input(input.trim())?
+    let (code, returned_state) = match code_capture(use_callback_listener) {
+        CodeCapture::Listener => {
+            let (code, state) = listen_for_oauth_callback(&redirect_uri)?;
+            (code, Some(state))
+        }
+        CodeCapture::SandboxPaste => {
+            println!("{}\n", sandbox_paste_hint(&redirect_uri));
+            let input =
+                Text::new("Paste the callback URL from your browser's address bar:").prompt()?;
+            parse_paste_input(input.trim())?
+        }
+        CodeCapture::Paste => {
+            let input = Text::new("Paste the authorization code or callback URL:").prompt()?;
+            parse_paste_input(input.trim())?
+        }
     };
 
     if let Some(returned) = returned_state.as_deref() {
@@ -557,7 +567,7 @@ async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -
         .as_deref()
         .unwrap_or(&verification_uri);
 
-    if std::env::var(crate::sandbox::SANDBOX_ENV_FLAG).is_ok()
+    if env::var(crate::sandbox::SANDBOX_ENV_FLAG).is_ok()
         && let Ok(qr) = qrcode::QrCode::new(url_to_open)
     {
         let rendered = qr
@@ -986,6 +996,33 @@ fn parse_paste_input(input: &str) -> Result<(String, Option<String>)> {
     }
 
     Ok((input.to_string(), None))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CodeCapture {
+    Listener,
+    Paste,
+    /// The browser runs on the host, so a loopback redirect never reaches a
+    /// listener inside the sandbox; the user pastes the failed redirect URL.
+    SandboxPaste,
+}
+
+fn code_capture(use_callback_listener: bool) -> CodeCapture {
+    if !use_callback_listener {
+        CodeCapture::Paste
+    } else if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+        CodeCapture::SandboxPaste
+    } else {
+        CodeCapture::Listener
+    }
+}
+
+fn sandbox_paste_hint(redirect_uri: &str) -> String {
+    format!(
+        "Coyote is running inside a sandbox, so your browser cannot reach its callback at \
+         {redirect_uri}. After you approve, the browser shows a connection error page: copy \
+         the full URL from its address bar and paste it below."
+    )
 }
 
 fn listen_for_oauth_callback(redirect_uri: &str) -> Result<(String, String)> {
@@ -1998,6 +2035,37 @@ echo_pkce_in_token_exchange: true
     fn parse_paste_input_empty_fails() {
         let err = parse_paste_input("").unwrap_err();
         assert!(err.to_string().contains("Empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn code_capture_listens_on_the_host() {
+        let _sandbox = crate::testing::EnvVarGuard::unset(SANDBOX_ENV_FLAG);
+        assert_eq!(code_capture(true), CodeCapture::Listener);
+        assert_eq!(code_capture(false), CodeCapture::Paste);
+    }
+
+    #[test]
+    #[serial]
+    fn code_capture_pastes_the_redirect_inside_a_sandbox() {
+        let _sandbox = crate::testing::EnvVarGuard::set(SANDBOX_ENV_FLAG, "1");
+        assert_eq!(code_capture(true), CodeCapture::SandboxPaste);
+        assert_eq!(code_capture(false), CodeCapture::Paste);
+    }
+
+    #[test]
+    fn sandbox_paste_hint_names_the_unreachable_callback() {
+        let hint = sandbox_paste_hint("http://127.0.0.1:63066/callback");
+        assert!(hint.contains("http://127.0.0.1:63066/callback"), "{hint}");
+        assert!(hint.contains("address bar"), "{hint}");
+    }
+
+    #[test]
+    fn parse_paste_input_failed_loopback_redirect_yields_code_and_state() {
+        let (code, state) =
+            parse_paste_input("http://127.0.0.1:63066/callback?code=abc123&state=xyz").unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state.as_deref(), Some("xyz"));
     }
 
     #[test]
