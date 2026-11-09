@@ -1729,7 +1729,7 @@ def verify_gate(state):
         arr.append(state["hygiene_lint_cmd"])
         cmds = json.dumps(arr)
     u["verification_commands_json"] = cmds
-    u["debris_exclude"] = state.get("debris_exclude") or ""
+    u["debris_exclude"] = state.get("debris_exclude") or _planning_exclude(state, code)
     rl.append({"round": n, "head": head, "scope": scope, "started": now_iso()})
     u["round_log"] = rounds_log
     u["verify_unit"] = unit
@@ -1753,6 +1753,29 @@ def _code_tree_dirty(state, code):
         if rel != "." and rel != ".." and not rel.startswith(".." + os.sep):
             pathspec = ["--", ".", f":(exclude,literal){rel}"]
     return bool(git_out(code, "status", "--porcelain", "--untracked-files=normal", *pathspec))
+
+
+def _planning_exclude(state, code):
+    """The debris lint's exclude list: the planning store and a code repo's plans/, when inside the git work tree.
+
+    Planning files are not implementation (sisyphus-next's intake rules the same for plans/). The lint reads its
+    excludes relative to the repository top, so each directory is made relative to it; "" when there is none.
+    """
+    if not code:
+        return ""
+    top = state.get("git_root") or git_out(code, "rev-parse", "--show-toplevel", default="") or code
+    found = []
+    for d in (state.get("plans_root"), os.path.join(code, "plans")):
+        if not d or not os.path.isdir(d):
+            continue
+        try:
+            rel = os.path.relpath(os.path.realpath(d), os.path.realpath(top))
+        except ValueError:
+            continue
+        rel = rel.replace(os.sep, "/")
+        if rel not in (".", "..") and not rel.startswith("../") and rel not in found:
+            found.append(rel)
+    return json.dumps(found) if found else ""
 
 
 def _gauntlet_header(text):

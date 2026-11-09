@@ -1167,6 +1167,43 @@ check("verify_gate: standard -> gauntlet, forced adversary only (no consumer sur
       u["_next"] == "run_gauntlet" and "Forced lanes: adversary" in u["gauntlet_prompt"] and "probe" not in u["gauntlet_prompt"].split("Forced lanes:")[1].splitlines()[0]
       and f"Diff: {t1['base_sha']}..HEAD" in u["gauntlet_prompt"] and u["verification_commands_json"] == '["true"]' and u["round_log"][T1][0]["round"] == 1)
 ts_c = copy.deepcopy(TS1)
+# the debris lint of every conformance reviewer leaves out the planning files inside the git work tree
+# the fixture's planning store is CODE/plans (_fixture.Store), which is also the conventional plans/ directory
+BARE_CODE = os.path.join(TMP, "code-no-plans")
+make_repo(BARE_CODE, {"README.md": "x\n"})
+
+
+def vg(**over):
+    return gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task", **over))
+
+
+bare = {"code_repo_path": BARE_CODE, "git_root": BARE_CODE}
+cases = {
+    "gauntlet, plans/": (vg(), "run_gauntlet", None),
+    "micro, plans/": (vg(task_granularity="micro"), "run_adversary", None),
+    "gauntlet, no plans/": (vg(**bare), "run_gauntlet", ""),
+    "micro, no plans/": (vg(task_granularity="micro", **bare), "run_adversary", ""),
+    "gauntlet, preset": (vg(debris_exclude='["docs"]'), "run_gauntlet", '["docs"]'),
+    "micro, preset": (vg(task_granularity="micro", debris_exclude='["docs"]'), "run_adversary", '["docs"]'),
+}
+want_plans = '["plans"]'
+bad = {k: (u.get("_next"), u.get("debris_exclude")) for k, (u, nxt, want) in cases.items()
+       if u.get("_next") != nxt or u.get("debris_exclude") != (want_plans if want is None else want)}
+check("verify_gate: debris_exclude for the gauntlet and the micro adversary -- the planning dirs with plans/, none without, a preset kept",
+      not bad, (want_plans, bad))
+DOCS_PLANS = os.path.join(BARE_CODE, "docs", "plans")
+SVC = os.path.join(BARE_CODE, "svc")
+os.makedirs(DOCS_PLANS)
+os.makedirs(os.path.join(SVC, "plans"))
+check("_planning_exclude: a custom plans_dir inside the repo, a project subdir and a store outside the repo",
+      gates._planning_exclude({"git_root": BARE_CODE, "plans_root": DOCS_PLANS}, BARE_CODE) == '["docs/plans"]'
+      and gates._planning_exclude({"git_root": BARE_CODE, "plans_root": os.path.join(SVC, "plans")}, SVC) == '["svc/plans"]'
+      and gates._planning_exclude({"git_root": BARE_CODE, "plans_root": os.path.join(TMP, "elsewhere")}, BARE_CODE) == ""
+      and gates._planning_exclude({"plans_root": os.path.join(SVC, "plans")}, SVC) == '["svc/plans"]',
+      [gates._planning_exclude({"git_root": BARE_CODE, "plans_root": DOCS_PLANS}, BARE_CODE),
+       gates._planning_exclude({"plans_root": os.path.join(SVC, "plans")}, SVC)])
+shutil.rmtree(BARE_CODE)
+shutil.rmtree(BARE_CODE + ".git")
 u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=ts_c, current_task=T2, verify_scope="task", local_run_recipe="make run"))
 check("verify_gate: consumer-facing task + recipe -> probe lane forced + house note per fork",
       "probe" in u["gauntlet_prompt"] and ((gates.PROBE_HOUSE_NOTE in u["gauntlet_prompt"]) if gates.PROBE_HOUSE_NOTE else True))
@@ -1480,7 +1517,9 @@ check("wave_claim: worktrees + task branches from the run branch; roster in ever
 WAVE = u["wave"]
 TS_W = u["tasks"]
 u = gates.wave_verify_build(base_state(plan_path=PROMOTED, tasks=TS_W, wtask=WAVE[0], wave_delegate_result=REPORT_OK))
-check("wave_verify_build: fork-local conformance prompt over the worktree", "Post-implementation review gate." in u["gauntlet_prompt"] and WAVE[0]["worktree"] in u["gauntlet_prompt"])
+check("wave_verify_build: fork-local conformance prompt over the worktree, the debris exclude carried",
+      "Post-implementation review gate." in u["gauntlet_prompt"] and WAVE[0]["worktree"] in u["gauntlet_prompt"]
+      and u.get("debris_exclude") == gates._planning_exclude(base_state(), CODE) != "", u.get("debris_exclude"))
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GPASS, wave_fix_rounds=0))
 check("wave_route: CONFORMS -> result conforms (chain ends)", "_next" not in u and u["wave_result"]["status"] == "conforms")
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=QUOTED, wave_gauntlet_result=GPASS, wave_fix_rounds=0))
