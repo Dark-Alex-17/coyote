@@ -430,7 +430,7 @@ impl SyncSchedule {
                     FetchError::ListUnanswered { .. } | FetchError::ListLinkClosed { .. }
                 );
                 if silent {
-                    self.log_silence(&node, &text, now);
+                    self.log_silence(&node, err, now);
                 }
                 // A silent node ends a fetch one of two ways from one try to the next, so the
                 // two count as the same failure for the prompt line.
@@ -453,12 +453,16 @@ impl SyncSchedule {
         line
     }
 
-    fn log_silence(&mut self, node: &str, text: &str, now: Instant) {
+    fn log_silence(&mut self, node: &str, err: &FetchError, now: Instant) {
         self.silence_logged
             .retain(|_, at| now.saturating_duration_since(*at) < SILENCE_LOG_PERIOD);
         if !self.silence_logged.contains_key(node) {
             self.silence_logged.insert(node.to_string(), now);
-            info!("Propagation {text}");
+            info!(
+                "Propagation sync from {} failed: {}",
+                short(node),
+                redact_hashes(&err.to_string())
+            );
         }
     }
 
