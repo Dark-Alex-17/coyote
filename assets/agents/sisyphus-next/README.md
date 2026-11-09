@@ -99,9 +99,9 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:1858:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:2451:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:2452:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/gates.py:1903:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:2456:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:2457:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
@@ -277,6 +277,21 @@ architect and narrow options, while a delegated one ends at `end_redirect`. `siz
 bounds the verdicts at `CLARIFY_MAX` (3) per run, after which the work is redirected. The
 wrapper's ignored `choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages` tail
 turns the key rows red.
+
+## Per-subtask review and the final whole-task review
+
+A compound run works through its sealed subtasks one at a time. Each subtask's review round
+checks that subtask's own outcome, constraints and acceptance criteria over the diff it made
+(`build_gauntlet_prompt` writes them as the `Plan / acceptance criteria:` block, with a scope
+line saying later subtasks deliver the rest), and the coder sees the parent task's criteria as
+context only. A subtask that changed no code outside the planning store (a read-only or
+research step: HEAD still at its base, clean tree) skips its conformance review, so it is never
+failed for having no implementation. A passed or accepted subtask round goes to
+`next_subtask`, never to the publish tail. After the last subtask `next_subtask` starts one
+final whole-task review (`final_review`, the diff from `run_base_sha`, the parent task's
+`spec_text`, fresh round counters) through `review_gate`; only that review goes on to the
+observability pass and publishing, so every parent acceptance criterion is still enforced.
+A single-subtask run is reviewed against the task's criteria once, as before.
 
 ## Verify
 

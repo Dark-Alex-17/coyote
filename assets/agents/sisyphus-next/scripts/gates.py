@@ -264,7 +264,7 @@ def intake(state):
         u["run_id"] = run_id
         u["run_dir"] = ensure_run_dir(run_id)
         u["resume_mode"] = True
-        for k in ("base_sha", "debt_base", "subtasks", "subtask_index", "current_task", "fix_round",
+        for k in ("base_sha", "debt_base", "run_base_sha", "final_review", "subtasks", "subtask_index", "current_task", "fix_round",
                   "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
                   "skipped_reviews", "debt_left_behind", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
@@ -668,6 +668,8 @@ def next_subtask(state):
     subtasks = as_list(state.get("subtasks"))
     idx = as_int(state.get("subtask_index"))
     if idx >= len(subtasks):
+        if len(subtasks) > 1 and not truthy(state.get("final_review")):
+            return _start_final_review(state, u, len(subtasks))
         u["_next"] = "final_report"
         return u
     s = subtasks[idx] if isinstance(subtasks[idx], dict) else {"title": "task", "outcome": str(subtasks[idx])}
@@ -696,9 +698,48 @@ def next_subtask(state):
         head = git_out(state.get("git_root") or state.get("project_dir") or ".", "rev-parse", "HEAD", default="")
         if head:
             u["base_sha"], u["debt_base"] = head, head
+    else:
+        u["run_base_sha"] = state.get("run_base_sha") or state.get("base_sha") or ""
     u["_next"] = "compose_brief" if state.get("intent") == "trivial" else "plan_research"
     snapshot(state, u, f"subtask {idx + 1}")
     return u
+
+
+def _start_final_review(state, u, n):
+    """After the last subtask, one review of the whole task's diff against the parent task's acceptance criteria."""
+    base = state.get("run_base_sha") or state.get("base_sha") or ""
+    u.update({
+        "final_review": True, "base_sha": base, "current_task": str(state.get("brief") or ""),
+        "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "lane_block_streak": {}, "debris_reruns": 0,
+        "round_heads": [], "gauntlet_lanes": {}, "strikeout_rounds": 0, "fix_instructions": "",
+    })
+    ledger(state, u, f"subtasks: all {n} reviewed against their own criteria -> one whole-task review over "
+                     f"{base or 'the worktree'}..HEAD against the parent task's acceptance criteria")
+    snapshot(state, u, "final whole-task review")
+    u["_next"] = "review_gate"
+    return u
+
+
+def _subtask_phase(state):
+    """True while one subtask of a multi-subtask run is under review; the final whole-task review is not."""
+    return len(as_list(state.get("subtasks"))) > 1 and not truthy(state.get("final_review"))
+
+
+def _subtask_spec(state):
+    """The current subtask's own scope and acceptance criteria, as the per-subtask review checks them."""
+    subtasks = as_list(state.get("subtasks"))
+    idx = max(as_int(state.get("subtask_index")) - 1, 0)
+    s = subtasks[idx] if idx < len(subtasks) and isinstance(subtasks[idx], dict) else {}
+    lines = [f"Subtask {idx + 1}/{len(subtasks)}: {s.get('title', '')}".rstrip(), "", f"Outcome: {s.get('outcome', '')}"]
+    if s.get("constraints"):
+        lines.append(f"Constraints: {s['constraints']}")
+    ac = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
+    lines += ["", "Acceptance criteria:"] + ([f"- {c}" for c in ac] or ["- the outcome above, as stated"])
+    lines += ["", f"Scope: this round reviews subtask {idx + 1} of {len(subtasks)} only, against its own criteria above. "
+                  "Later subtasks deliver the rest of the parent task, and one final whole-task review checks every "
+                  "parent acceptance criterion after the last subtask, so work that belongs to a later subtask is "
+                  "not missing here."]
+    return "\n".join(lines)
 
 
 # ====================================================================== 2.2
@@ -1459,7 +1500,7 @@ def apply_answer(state):
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Accepted without fix at the user's say-so: {tail(esc.get('evidence', ''), 300)}"]
-            u["_next"] = "observability_gate"
+            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     elif kind == "plan_defect":
         # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a stop reply stops
         a = "stop" if stop else _answered(state, {"continue": ["continue", "treat"]}, "stop")
@@ -1480,7 +1521,7 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 "Consumer-facing change could not be exercised locally (probe INCONCLUSIVE): "
                 "provide the local-run recipe / fixture and re-probe"]
-            u["_next"] = "observability_gate"
+            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     elif kind == "review_incomplete":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "accept": ["accept"]}, "retry")
         if a == "retry":
@@ -1489,7 +1530,7 @@ def apply_answer(state):
             lanes = as_list(state.get("gauntlet_incomplete")) or ["pipeline"]
             u["skipped_reviews"] = list(as_list(state.get("skipped_reviews"))) + [
                 f"round {len(as_list(state.get('round_heads')))}: {', '.join(lanes)} (NEEDS-HUMAN accepted)"]
-            u["_next"] = "observability_gate"
+            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
         else:
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
             u["_next"] = "end_aborted"
@@ -1504,7 +1545,7 @@ def apply_answer(state):
         elif a == "accept" and kind != "strikeout":
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Review blockers accepted unresolved at the user's say-so ({kind}); see the gauntlet report"]
-            u["_next"] = "observability_gate"
+            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
         else:
             u["failure_reason"] = f"stopped after repeated failures ({kind}); the code was left in a working state"
             u["_next"] = "end_aborted"
@@ -1731,7 +1772,11 @@ def render_coder_prompt(state):
         parts += [brief.get("context_block") or ""]
     spec = (state.get("spec_text") or "").strip()
     if spec and spec not in (brief.get("context_block") or ""):
-        parts += ["", "Acceptance criteria (verbatim):", spec]
+        if _subtask_phase(state):
+            parts += ["", "Parent task acceptance criteria (context only: this subtask delivers its own criteria in "
+                          "## TASK; later subtasks deliver the rest, and a final whole-task review checks these):", spec]
+        else:
+            parts += ["", "Acceptance criteria (verbatim):", spec]
     if state.get("quality_rigor"):
         parts += ["", f"Quality bar: rigor={state.get('quality_rigor')}, surfaces={state.get('quality_surfaces') or ''}"]
     for n in as_list(brief.get("skill_nudges")):
@@ -2010,13 +2055,28 @@ def review_gate(state):
     if cadence == "batch":
         u["review_skipped_note"] = ("review cadence batch: no gauntlet / reviewer / observability pass on this task; "
                                     "the parent orchestrator runs the full panel over the batch")
-        u["_next"] = "whetstone_gate"
+        u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
     elif state.get("intent") == "trivial" and len(as_list(state.get("changed_files"))) <= 1 and not truthy(state.get("has_spec")):
         u["review_skipped_note"] = "review skipped: trivial single-file change with no spec (coder self_review is sufficient)"
-        u["_next"] = "whetstone_gate"
+        u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
+    elif _subtask_phase(state) and not _subtask_changed_code(state):
+        # a read-only or research subtask has nothing to conform; the final whole-task review still checks the parent
+        ledger(state, u, f"review: subtask {as_int(state.get('subtask_index'))} changed no code since "
+                         f"{state.get('base_sha')}; its conformance review is skipped (the whole-task review follows)")
+        u["_next"] = "next_subtask"
     else:
         u["_next"] = "build_gauntlet_prompt"
     return u
+
+
+def _subtask_changed_code(state):
+    """Whether the subtask committed or left changes outside the planning store; unknown counts as changed."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    base = state.get("base_sha") or ""
+    head = git_out(root, "rev-parse", "HEAD", default="")
+    if not base or not head:
+        return True
+    return head != base or _code_tree_dirty(state, root)
 
 
 def _posture(state):
@@ -2054,7 +2114,13 @@ def build_gauntlet_prompt(state):
              f"Project: {state.get('project_dir')}",
              f"Diff: {diff}",
              f"Rigor: {state.get('quality_rigor') or 'production'}   Security posture: {_posture(state)}"]
-    spec = (state.get("spec_text") or "").strip()
+    if _subtask_phase(state):
+        spec = _subtask_spec(state)
+    else:
+        spec = (state.get("spec_text") or "").strip()
+        if spec and truthy(state.get("final_review")):
+            spec += (f"\n\nScope: the whole task, all {len(as_list(state.get('subtasks')))} subtasks, over the diff from "
+                     "the run base: every acceptance criterion above must hold.")
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
     if rounds:
@@ -2179,7 +2245,7 @@ def route_gauntlet(state):
               "gauntlet_blockers": blockers, "gauntlet_attention": attention, "round_heads": rounds})
     ledger(state, u, f"gauntlet: round {len(rounds)} -> {verdict}" + (f" incomplete={incomplete}" if incomplete else ""))
     if verdict == "PASS":
-        u["_next"] = "observability_gate"
+        u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     else:
         real = [b for b in blockers if not review_fault(b)]
         if real:
@@ -2317,7 +2383,7 @@ def triage_route(state):
                              evidence="\n".join(str(x.get("finding", "")) for x in escalations)[:2500])
         return raise_escalation(state, u, esc)
     ledger(state, u, "review: every blocker rejected with citation or deferred by the quality bar; proceeding")
-    u["_next"] = "observability_gate"
+    u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     return u
 
 
