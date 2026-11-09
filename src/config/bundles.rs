@@ -1289,6 +1289,29 @@ mod tests {
         );
     }
 
+    /// Without a terminal the same collision is not a question: the
+    /// install is tracked under the qualified name and nothing is asked.
+    #[test]
+    #[serial]
+    fn without_a_terminal_a_colliding_bundle_name_qualifies_without_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let dir = TempStoreDir::new("bundles-collision-no-tty");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("repo", metadata("https://github.com/a/repo", "abc123"))
+            .unwrap();
+
+        let prompter = ScriptedPrompter::refusing();
+        let resolved = store
+            .resolve_bundle_name("https://gitlab.com/b/repo.git", Some("repo"), &prompter)
+            .unwrap();
+
+        assert_eq!(resolved.name, "b/repo");
+        assert_eq!(resolved.qualified_from, Some("repo".to_string()));
+        assert!(prompter.requests().is_empty());
+    }
+
     #[test]
     fn upsert_merges_metadata_and_preserves_files_and_install_time() {
         let dir = TempStoreDir::new("bundles-merge");

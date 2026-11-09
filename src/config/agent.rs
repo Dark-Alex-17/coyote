@@ -1427,12 +1427,12 @@ async fn init_graph_rags(
                 && config.chunk_overlap.is_some();
             if !fully_specified {
                 if !menu_can_use_terminal() {
-                    bail!(
-                        "Agent '{agent_name}' requires RAG for rag node '{node_id}', but its \
-                         knowledge base is not built and the node does not fully specify how \
-                         to build it. Set `embedding_model`, `chunk_size`, and `chunk_overlap` \
-                         on the node, or run the agent once interactively."
-                    );
+                    return Err(conflict::refuse_non_interactive(
+                        format_args!(
+                            "build the knowledge base for rag node '{node_id}' of agent '{agent_name}'"
+                        ),
+                        ". Set `embedding_model`, `chunk_size`, and `chunk_overlap` on the node, or run the agent once interactively.",
+                    ));
                 }
 
                 let req = PromptRequest {
@@ -2751,6 +2751,57 @@ nodes: {}
             "Initialize RAG knowledge base for rag node 'lookup'?"
         );
         assert_eq!(req.default, Some(json!(true)));
+    }
+
+    /// Without a terminal an unbuilt rag node is refused in the shared
+    /// shape, naming the node fields that would make the question moot,
+    /// and nothing is asked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn without_a_terminal_an_unbuilt_rag_node_is_refused_without_asking() {
+        let _guard = TestConfigDirGuard::new("agent-rag-node-no-tty");
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let name = unique("rag_node_no_tty");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: lookup\nnodes:\n  lookup:\n    type: rag\n    documents: [notes.md]\n    next: done\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "Refusing to build the knowledge base for rag node 'lookup' of agent '"
+            ),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(
+                "non-interactively. Re-run in a terminal. Set `embedding_model`, `chunk_size`, \
+                 and `chunk_overlap` on the node, or run the agent once interactively."
+            ),
+            "got: {message}"
+        );
+        assert!(prompter.requests().is_empty());
     }
 
     fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {

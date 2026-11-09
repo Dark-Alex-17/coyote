@@ -454,24 +454,12 @@ impl Rag {
         let driver = select_closed(prompter, "Select driver:", vec!["qdrant".to_string()])?;
         let host = ask_qdrant_host(prompter)?;
 
-        let api_key_entry: Option<(String, String)> = {
-            let needs_key = confirm(
-                prompter,
-                "Does this instance require an API key?".to_string(),
-                true,
-            )?;
-            if needs_key {
-                let secret_name = required_input(
-                    prompter,
-                    "Vault secret name for API key:",
-                    Some("QDRANT_API_KEY"),
-                    None,
-                )?;
+        let api_key_entry: Option<(String, String)> = match ask_api_key_secret_name(prompter)? {
+            Some(secret_name) => {
                 let resolved = resolve_or_create_api_key_secret(vault, &secret_name, prompter)?;
                 Some((secret_name, resolved))
-            } else {
-                None
             }
+            None => None,
         };
 
         println!("⚙ Connecting to {host}...");
@@ -488,30 +476,12 @@ impl Rag {
             collections.len()
         );
 
-        let collection = select_closed(prompter, "Select collection:", collections)?;
+        let collection = choose_collection(prompter, collections)?;
 
         let sample_id = QdrantProvider::sample_point_id(&host, &collection, api_key).await?;
 
-        // `None` means the scroll came back with no points at all: the collection
-        // is empty. Attaching is not necessarily wrong — another tool may be about
-        // to fill it — but accepting it silently yields a RAG that answers every
-        // query with nothing and never explains why, and none of the checks below
-        // can tell that apart from a misconfiguration. Ask, defaulting to no, so it
-        // cannot happen by accident. (`attach` already refuses to run
-        // non-interactively, so there is no unattended path through this prompt.)
         if sample_id.is_none() {
-            println!(
-                "⚠️  Collection '{collection}' contains no points. Queries will return \
-                 nothing until something writes to it."
-            );
-            let attach_anyway = confirm(
-                prompter,
-                "Attach to this empty collection anyway?".to_string(),
-                false,
-            )?;
-            if !attach_anyway {
-                bail!("Collection '{collection}' is empty; nothing to attach to.");
-            }
+            confirm_empty_collection(prompter, &collection)?;
         }
 
         println!("ℹ  This collection must store document text in a 'page_content' payload field.");
@@ -2088,6 +2058,56 @@ fn ask_qdrant_host(prompter: &dyn Prompter) -> Result<String> {
     }
 }
 
+/// The vault secret name for the instance's API key, or `None` when the
+/// instance needs no key.
+fn ask_api_key_secret_name(prompter: &dyn Prompter) -> Result<Option<String>> {
+    let needs_key = confirm(
+        prompter,
+        "Does this instance require an API key?".to_string(),
+        true,
+    )?;
+    if !needs_key {
+        return Ok(None);
+    }
+    required_input(
+        prompter,
+        "Vault secret name for API key:",
+        Some("QDRANT_API_KEY"),
+        None,
+    )
+    .map(Some)
+}
+
+/// The collection to attach to, asked once the instance has answered.
+fn choose_collection(prompter: &dyn Prompter, collections: Vec<String>) -> Result<String> {
+    select_closed(prompter, "Select collection:", collections)
+}
+
+/// Whether to attach to a collection the scroll found empty; declining is
+/// fatal.
+///
+/// Attaching is not necessarily wrong (another tool may be about to fill
+/// it), but accepting silently yields a RAG that answers every query with
+/// nothing and never explains why, and none of the later checks can tell
+/// that apart from a misconfiguration. Asked defaulting to no, so it
+/// cannot happen by accident; `attach` already refuses to run
+/// non-interactively, so there is no unattended path through this prompt.
+fn confirm_empty_collection(prompter: &dyn Prompter, collection: &str) -> Result<()> {
+    println!(
+        "⚠️  Collection '{collection}' contains no points. Queries will return \
+         nothing until something writes to it."
+    );
+    let attach_anyway = confirm(
+        prompter,
+        "Attach to this empty collection anyway?".to_string(),
+        false,
+    )?;
+    if !attach_anyway {
+        bail!("Collection '{collection}' is empty; nothing to attach to.");
+    }
+    Ok(())
+}
+
 fn select_embedding_model(models: &[&Model], prompter: &dyn Prompter) -> Result<String> {
     let max_width = models.iter().map(|v| v.id().len()).max().unwrap_or(0);
     let models: Vec<_> = models
@@ -3246,6 +3266,77 @@ mod tests {
         assert_eq!(req.question, "Host (e.g. qdrant.company.com:6333):");
         assert_eq!(req.default, None);
         assert_eq!(req.help, None);
+    }
+
+    /// The API key question is a confirm defaulting to yes; `yes` is
+    /// followed by the secret name input defaulting to `QDRANT_API_KEY`,
+    /// `no` ends the question with no secret name.
+    #[test]
+    #[serial]
+    fn ask_api_key_secret_name_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let keyed = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true), text("MY_KEY")]);
+        assert_eq!(
+            ask_api_key_secret_name(&keyed).unwrap(),
+            Some("MY_KEY".to_string())
+        );
+        let [needs_key, secret_name] = keyed.requests().try_into().unwrap();
+        assert_eq!(needs_key.action, PromptAction::Confirm);
+        assert_eq!(needs_key.question, "Does this instance require an API key?");
+        assert_eq!(needs_key.default, Some(json!(true)));
+        assert_eq!(secret_name.action, PromptAction::Input);
+        assert_eq!(secret_name.question, "Vault secret name for API key:");
+        assert_eq!(secret_name.default, Some(json!("QDRANT_API_KEY")));
+        assert_eq!(secret_name.help, None);
+
+        let keyless = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        assert_eq!(ask_api_key_secret_name(&keyless).unwrap(), None);
+        let [req] = keyless.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Does this instance require an API key?");
+    }
+
+    /// The collection question is a closed select over the fetched
+    /// collections and hands back the chosen one.
+    #[test]
+    #[serial]
+    fn choose_collection_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let collections = vec!["docs".to_string(), "notes".to_string()];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("notes".to_string())]);
+        assert_eq!(
+            choose_collection(&prompter, collections.clone()).unwrap(),
+            "notes"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(req.question, "Select collection:");
+        assert!(req.closed);
+        assert_eq!(req.options, collections);
+    }
+
+    /// The empty-collection question is a confirm defaulting to no; `yes`
+    /// lets the attach go on and `no` ends it naming the collection.
+    #[test]
+    #[serial]
+    fn confirm_empty_collection_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let accepted = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+        confirm_empty_collection(&accepted, "docs").unwrap();
+        let [req] = accepted.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Attach to this empty collection anyway?");
+        assert_eq!(req.default, Some(json!(false)));
+
+        let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let err = confirm_empty_collection(&declined, "docs").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Collection 'docs' is empty; nothing to attach to."
+        );
+        let [req] = declined.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Attach to this empty collection anyway?");
     }
 
     /// The attach wizard's opening questions go through the prompter in

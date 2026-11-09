@@ -7185,7 +7185,7 @@ fn dot_vault_add_in_the_plain_repl_asks_once_reasks_on_empty_and_stores_the_valu
 }
 
 // ---------------------------------------------------------------------------
-// Usage probe: `Agent::init`'s "init RAG?" question. An agent with
+// `Agent::init`'s "init RAG?" question. An agent with
 // `documents:` attached asks whether to build its knowledge base when it
 // starts; under the UI the question is the Confirm modal, in the plain
 // REPL it is the inquire confirm it always was, and without a terminal
@@ -7479,7 +7479,7 @@ fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
         (
             "vault-add",
             ".vault add probe-secret-m7q",
-            &["m7q", "vault.json", "vault.enc"][..],
+            &["m7q", "vault.yml"][..],
         ),
         ("rag-create", ".rag probe-rag-m7q", &["m7q", "/rags/"][..]),
     ] {
@@ -7701,8 +7701,9 @@ fn dot_rag_for_a_new_rag_in_the_plain_repl_asks_with_inquire_and_esc_writes_noth
         "the plain REPL entered the alternate screen:\n{asked}"
     );
 
+    let esc_at = pty.raw().len();
     pty.send(b"\x1b").unwrap();
-    pty.wait_for_after("dry-model)>", before + 1, PTY_DEADLINE)
+    pty.wait_for_after("dry-model)>", esc_at, PTY_DEADLINE)
         .expect("Esc on the inquire select did not bring the prompt back");
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
     for footprint in ["r2p", "/rags/"] {
@@ -7718,4 +7719,485 @@ fn dot_rag_for_a_new_rag_in_the_plain_repl_asks_with_inquire_and_esc_writes_noth
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
+}
+
+// ---------------------------------------------------------------------------
+// The remaining rerouted menus, each driven as a consumer would from a
+// clean config dir.
+// ---------------------------------------------------------------------------
+
+/// The UI after `.info` still takes keys, then Ctrl+D leaves it clean.
+fn assert_ui_alive_then_quit(pty: &mut Pty, after: &str) -> String {
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .unwrap_or_else(|e| panic!("`.info` after {after} never rendered: {e:?}"));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    transcript
+}
+
+/// `.vault update <name>` under the UI: the question is the Password
+/// modal (`Enter the secret value:`), the replacement typed into it is
+/// never painted, the vault reports the update, and `.vault get` prints
+/// the new value and no longer the old one. The secret is seeded through
+/// the same modal by `.vault add`.
+#[test]
+#[serial]
+fn dot_vault_update_asks_in_the_password_modal_and_the_new_value_replaces_the_old() {
+    let dir = fresh_config_dir("vault-update-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let add_at = pty.raw().len();
+    pty.send(b".vault add vault-secret-u5v\r").unwrap();
+    wait_for_the_modal(&mut pty, add_at, ".vault add", &["Enterthesecretvalue:"]);
+    answer_field_modal(&mut pty, "old-value-u5v");
+    wait_for_squeezed(
+        &mut pty,
+        "Secret 'vault-secret-u5v' added to the vault",
+        "the seeded secret's confirmation",
+    );
+    pty.read_for(Duration::from_millis(300));
+
+    let update_at = pty.raw().len();
+    pty.send(b".vault update vault-secret-u5v\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        update_at,
+        ".vault update",
+        &["Enterthesecretvalue:"],
+    );
+    answer_field_modal(&mut pty, "new-value-u5v");
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let updated = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
+        if squeezed(&since).contains("Secret'vault-secret-u5v'updatedinthevault") {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the answered Password modal did not update the secret:\n{since}"
+        );
+    };
+    assert!(
+        !updated.contains("new-value-u5v"),
+        "the replacement typed into the Password modal was painted on the screen:\n{updated}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the Password modal released the terminal:\n{updated}"
+    );
+
+    let get_at = pty.raw().len();
+    pty.send(b".vault get vault-secret-u5v\r").unwrap();
+    pty.wait_for_after("new-value-u5v", get_at, PTY_DEADLINE)
+        .expect("`.vault get` did not print the value the update modal collected");
+    pty.read_for(Duration::from_millis(300));
+    let got = strip_ansi(&String::from_utf8_lossy(&pty.raw()[get_at..]));
+    assert!(
+        !got.contains("old-value-u5v"),
+        "`.vault get` still prints the value from before the update:\n{got}"
+    );
+
+    assert_ui_alive_then_quit(&mut pty, "the vault update");
+}
+
+/// `.rag attach <name>` under the UI: the first question is the driver
+/// Select modal, a closed select (only `qdrant`, no `Other (custom)`
+/// row); Enter on it moves the wizard on to the host Input modal (the
+/// answer flowed back); Esc there leaves no rag or kit behind and the
+/// terminal was never released.
+#[test]
+#[serial]
+fn dot_rag_attach_asks_for_the_driver_in_a_closed_select_modal_then_the_host_input() {
+    let dir = fresh_config_dir("rag-attach-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".rag attach attach-rag-u5v\r").unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        before,
+        ".rag attach",
+        &["Selectdriver:", "qdrant"],
+    );
+    assert!(
+        !squeezed(&modal).contains("Other(custom)"),
+        "the driver select is closed but the modal offers a custom row:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    let frame = repainted_frame(&mut pty, 50, 120);
+    assert!(
+        squeezed(&frame).contains("Host(e.g.qdrant.company.com:6333):")
+            && squeezed(&frame).contains("Esc=cancel"),
+        "Enter on the driver select did not move the attach wizard on to the host Input modal:\n{frame}"
+    );
+    assert!(
+        !squeezed(&frame).contains("Selectdriver:"),
+        "the driver select is still up after Enter:\n{frame}"
+    );
+
+    esc_cancels_the_modal(&mut pty, ".rag attach attach-rag-u5v");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in ["u5v", "/rags/"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "the cancelled attach still wrote {written:?}:\n{since}"
+        );
+    }
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "an attach question released the terminal:\n{since}"
+    );
+
+    assert_ui_alive_then_quit(&mut pty, "the cancelled attach");
+}
+
+/// `.install <category>` under the UI: the overwrite warning and its
+/// `Continue?` question are the Confirm modal (the warning body is the
+/// modal's help line, not a raw-tty `[y/N]` prompt); `n` aborts with
+/// `No files were changed.` and the category directory is untouched;
+/// asked again, `y` reinstalls and reports it.
+#[test]
+#[serial]
+fn dot_install_of_a_builtin_category_asks_continue_in_the_confirm_modal() {
+    let dir = fresh_config_dir("install-builtins-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let macros_dir = dir.join("macros");
+    let snapshot = |dir: &Path| -> Vec<(PathBuf, u64, SystemTime)> {
+        let mut rows: Vec<_> = walk(dir)
+            .into_iter()
+            .map(|path| {
+                let meta = fs::metadata(&path).unwrap();
+                (path, meta.len(), meta.modified().unwrap())
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let macros_before = snapshot(&macros_dir);
+
+    let before = pty.raw().len();
+    pty.send(b".install macros\r").unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        before,
+        ".install macros",
+        &["Continue?", "Reinstallingbundledmacrosoverwrites", "y=yes"],
+    );
+    assert!(
+        !squeezed(&modal).contains("[y/N]"),
+        "`Continue?` was asked on the raw tty, not in the modal:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "Aborted. No files were changed.",
+        "the abort after `n` on the modal",
+    );
+    pty.read_for(Duration::from_millis(500));
+    assert_eq!(
+        snapshot(&macros_dir),
+        macros_before,
+        "`n` on the overwrite modal still touched the macros dir"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the question released the terminal"
+    );
+
+    let again = pty.raw().len();
+    pty.send(b".install macros\r").unwrap();
+    wait_for_the_modal(&mut pty, again, ".install macros", &["Continue?", "y=yes"]);
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "Reinstalled bundled macros",
+        "the reinstall report after `y` on the modal",
+    );
+    pty.read_for(Duration::from_millis(500));
+    assert!(
+        macros_dir.is_dir() && !walk(&macros_dir).is_empty(),
+        "`y` on the overwrite modal reported a reinstall but left no macros under {}",
+        macros_dir.display()
+    );
+
+    assert_ui_alive_then_quit(&mut pty, "the reinstall");
+}
+
+/// A local bundle with no secrets (`write_bundle_repo` with none), so its
+/// install asks nothing and only the uninstall menus are exercised.
+fn install_bundle_without_questions(pty: &mut Pty, repo: &Path) {
+    let install_at = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+        assert!(
+            !squeezed(&since).contains("Esc=cancel"),
+            "`.install` of a bundle without secrets or conflicts asked a question:\n{since}"
+        );
+        if squeezed(&since).contains("Installed:2new") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`.install {}` did not report the installed files:\n{since}",
+            repo.display()
+        );
+    }
+    pty.read_for(Duration::from_millis(500));
+}
+
+/// `.uninstall <bundle>` under the UI: the question is the Confirm modal
+/// whose help line names the bundle's footprint (`owns N file(s) and M
+/// mcp.json server(s)`); `n` aborts with `nothing was changed` and every
+/// owned file stays. Asked again, `y` proceeds; a file edited locally
+/// after the install raises the `was modified locally after install`
+/// Select modal (keep / delete / keep-all / delete-all, closed: no
+/// custom row), `1` keeps it, the unmodified file is deleted, and the
+/// bundle is reported partially uninstalled with its record kept.
+#[test]
+#[serial]
+fn dot_uninstall_asks_in_the_confirm_modal_and_a_modified_file_in_the_select_modal() {
+    let dir = fresh_config_dir("uninstall-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-u5v";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    install_bundle_without_questions(&mut pty, &repo);
+    let role = dir.join("roles").join(format!("{name}-role.md"));
+    let edited = dir.join("roles").join(format!("{name}-obsolete.md"));
+    assert!(
+        role.exists() && edited.exists(),
+        "the bundle's roles were not installed under {}",
+        dir.display()
+    );
+    let edited_text = "---\nmodel: fake:fake-model\n---\nEdited locally by the user.\n";
+    fs::write(&edited, edited_text).unwrap();
+
+    // `n` on the Confirm modal: nothing changes.
+    let question = squeezed(&format!("Uninstall bundle '{name}'?"));
+    let first = pty.raw().len();
+    pty.send(format!(".uninstall {name}\r").as_bytes()).unwrap();
+    let modal = wait_for_the_modal(&mut pty, first, ".uninstall", &[question.as_str(), "y=yes"]);
+    assert!(
+        squeezed(&modal).contains("owns2file(s)and1mcp.jsonserver(s)"),
+        "the Confirm modal does not show the bundle's footprint as its help line:\n{modal}"
+    );
+    assert!(
+        !squeezed(&modal).contains("(y/N)"),
+        "`Uninstall bundle?` was asked on the raw tty, not in the modal:\n{modal}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        &format!("Uninstall of '{name}' aborted; nothing was changed."),
+        "the abort after `n` on the uninstall modal",
+    );
+    pty.read_for(Duration::from_millis(300));
+    assert!(
+        role.exists() && edited.exists(),
+        "`n` on the uninstall modal still removed a bundle file"
+    );
+    let records = walk(&dir)
+        .into_iter()
+        .filter(|p| {
+            let text = p.to_string_lossy();
+            !text.contains("/bundle-src/")
+                && !text.contains("/roles/")
+                && fs::read_to_string(p).is_ok_and(|body| body.contains(name))
+        })
+        .count();
+    assert!(records > 0, "the bundle record vanished after `n`");
+
+    // `y`, then `1` (keep) on the modified-file Select modal.
+    let second = pty.raw().len();
+    pty.send(format!(".uninstall {name}\r").as_bytes()).unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        second,
+        ".uninstall",
+        &[question.as_str(), "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    let select = wait_for_the_modal(
+        &mut pty,
+        second,
+        ".uninstall (modified file)",
+        &[
+            "wasmodifiedlocallyafterinstall",
+            "keep",
+            "delete",
+            "keep-all",
+            "delete-all",
+        ],
+    );
+    assert!(
+        !squeezed(&select).contains("Other(custom)"),
+        "the modified-file select is closed but the modal offers a custom row:\n{select}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"1").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        &format!("Bundle '{name}' partially uninstalled; its record keeps the remaining items"),
+        "the uninstall report after keeping the modified file",
+    );
+    pty.read_for(Duration::from_millis(500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[second..]));
+    assert!(
+        squeezed(&since).contains("keptmodifiedfile"),
+        "`1` on the Select modal was not taken as `keep`:\n{since}"
+    );
+    assert!(
+        !role.exists(),
+        "the unmodified role was not deleted by the uninstall:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&edited).ok().as_deref(),
+        Some(edited_text),
+        "the modified role was not kept as answered:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "an uninstall question released the terminal:\n{since}"
+    );
+
+    // The kept file is still owned, so the record stays and `.list
+    // bundles` keeps naming the bundle.
+    let list_at = pty.raw().len();
+    pty.send(b".list bundles\r").unwrap();
+    pty.wait_for_after(name, list_at + 20, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "`.list bundles` no longer names the partially uninstalled bundle whose record was kept: {e:?}"
+            )
+        });
+
+    assert_ui_alive_then_quit(&mut pty, "the uninstall");
+}
+
+/// Runs the binary with no terminal at all (detached, stdin /dev/null,
+/// pipes for stdout/stderr) and returns `(success, stdout+stderr)`,
+/// failing the test if it hangs on a prompt.
+fn run_ttyless(dir: &Path, args: &[&str], what: &str) -> (bool, String) {
+    let mut cmd = Command::new(built_binary());
+    base_env(&mut cmd, dir);
+    common::pty::detached(&mut cmd)
+        .env("COYOTE_UI", "repl")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!(
+                "{what}: `coyote {}` with no terminal hung on a prompt",
+                args.join(" ")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = child.wait_with_output().unwrap();
+    let everything = format!(
+        "--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), everything)
+}
+
+/// With no terminal, the no-tty silent paths keep their polarity and the
+/// refusals keep theirs: `--install <local bundle>` with nothing to ask
+/// proceeds and installs the files; `--uninstall <bundle>` without
+/// `--yes` is refused (exit non-zero, the refusal names the
+/// non-interactive run and `--yes`) with every owned file left in place
+/// and the record kept; `--uninstall --yes` then removes them.
+#[test]
+#[serial]
+fn a_tty_less_uninstall_without_yes_is_refused_and_keeps_the_bundle() {
+    let dir = fresh_config_dir("ttyless-uninstall");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-u5v";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let repo_arg = repo.to_str().unwrap();
+
+    let (ok, out) = run_ttyless(&dir, &["--install", repo_arg], "tty-less install");
+    let role = dir.join("roles").join(format!("{name}-role.md"));
+    assert!(
+        ok && role.exists(),
+        "a tty-less `--install` of a bundle with nothing to ask did not proceed silently:\n{out}"
+    );
+
+    let (ok, out) = run_ttyless(&dir, &["--uninstall", name], "tty-less uninstall");
+    assert!(
+        !ok,
+        "a tty-less `--uninstall` without `--yes` exited 0:\n{out}"
+    );
+    let lower = out.to_lowercase();
+    assert!(
+        lower.contains("non-interactive")
+            || lower.contains("not a terminal")
+            || lower.contains("not a tty"),
+        "the refusal does not say the run is non-interactive:\n{out}"
+    );
+    assert!(
+        out.contains("--yes"),
+        "the refusal does not name `--yes` as the remedy:\n{out}"
+    );
+    assert!(
+        role.exists(),
+        "the refused tty-less uninstall still removed a bundle file:\n{out}"
+    );
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--uninstall", name, "--yes"],
+        "tty-less uninstall --yes",
+    );
+    assert!(
+        ok && !role.exists(),
+        "`--uninstall --yes` with no terminal did not remove the bundle's files:\n{out}"
+    );
 }

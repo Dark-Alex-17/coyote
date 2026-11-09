@@ -849,11 +849,13 @@ fn select_uninstall_candidate(
                 .collect();
 
             if !conflict::menu_can_use_terminal() {
-                bail!(
-                    "'{spec}' matches multiple installed bundles: {}; re-run with the \
-                     exact bundle name or source URL",
-                    described.join(", ")
-                );
+                return Err(conflict::refuse_non_interactive(
+                    format_args!(
+                        "pick between the bundles matching '{spec}' ({})",
+                        described.join(", ")
+                    ),
+                    "; or re-run with the exact bundle name or source URL.",
+                ));
             }
 
             let picked = select_closed(
@@ -5629,12 +5631,12 @@ mod tests {
         let err =
             uninstall_bundle("someuser/omc", true, &ScriptedPrompter::refusing()).unwrap_err();
 
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("matches multiple installed bundles"),
-            "got: {err}"
+            message.starts_with("Refusing to pick between the bundles matching 'someuser/omc' ("),
+            "got: {message}"
         );
-        assert!(err.to_string().contains("omc-fork"), "got: {err}");
+        assert!(message.contains("omc-fork"), "got: {message}");
         let store = BundleStore::load().unwrap();
         assert!(store.get("omc").is_some());
         assert!(store.get("omc-fork").is_some());
@@ -6435,10 +6437,14 @@ mod tests {
         let err = select_uninstall_candidate(&store, "someuser/omc", &ScriptedPrompter::refusing())
             .unwrap_err();
 
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("matches multiple installed bundles"),
-            "got: {err}"
+            message.starts_with("Refusing to pick between the bundles matching 'someuser/omc' ("),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("non-interactively. Re-run in a terminal; or re-run with the exact bundle name or source URL."),
+            "got: {message}"
         );
     }
 
