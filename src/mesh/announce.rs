@@ -24,9 +24,12 @@ pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
 /// How many reconnects of one TCP client within an hour are greeted with an announce. A
 /// client that flaps more often than this stops greeting until an hour after its oldest
 /// counted greeting, and the heartbeat carries the announce; a relay's own rate limit would
-/// block those announces anyway. Four greetings and a heartbeat in one hour sit next to a
-/// downstream relay's grace of 5 (see `HEARTBEAT_SECS`), which the spec accepts: the
-/// violations they cost decay with the on-time heartbeats that follow.
+/// block those announces anyway. The bound is per client, while each greeting goes out on
+/// every interface: with one TCP client, four greetings and a heartbeat in one hour sit
+/// next to a downstream relay's grace of 5 (see `HEARTBEAT_SECS`), which the spec accepts,
+/// as the violations they cost decay with the on-time heartbeats that follow. N clients
+/// that reconnect together, as after a network blip on this host, send N greetings, so
+/// every relay hears up to N announces for each such blip.
 pub(crate) const RECONNECT_GREETINGS_PER_HOUR: usize = 4;
 /// How often a running node re-announces so peers can tell it is still there.
 /// An hour matches the Reticulum announce-rate default: a transport node rate-limits

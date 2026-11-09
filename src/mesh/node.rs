@@ -1958,7 +1958,7 @@ impl MeshRuntime {
         .await
         .map_err(|_| {
             anyhow!(
-                "The mesh transport did not send the announce for destination {} within {}s",
+                "The mesh transport did not send the announce for destination {} within {}s; run `.mesh off` and then `.mesh on` to restart the node",
                 state.hash.to_hex_string(),
                 REKEY_GRACE.as_secs()
             )
