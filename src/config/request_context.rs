@@ -3859,7 +3859,7 @@ impl RequestContext {
     /// Node-local job-ownership visibility rule: the `job__*` family is only
     /// declared where it can do something. `job__start` requires at least one
     /// backgroundable tool among this request's declarations; the lifecycle
-    /// verbs (`check`/`collect`/`cancel`/`list`) additionally survive while
+    /// verbs (`check`/`collect`/`wait`/`cancel`/`list`) additionally survive while
     /// the context still owns registered jobs, so a job started before a
     /// filter change stays reachable.
     fn apply_job_tool_visibility(&self, functions: &mut Vec<FunctionDeclaration>) {
@@ -11829,6 +11829,7 @@ mod tests {
                     child_supervisor: None,
                     session_id: None,
                     child_session_root: None,
+                    succeeded: Default::default(),
                 };
                 let old_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
                 old_sup.write().register(handle).unwrap();
@@ -12715,7 +12716,7 @@ mod tests {
         let input = Input::from_str(&ctx, "hello", Some(role)).unwrap();
         ctx.before_chat_completion(&input).unwrap();
 
-        assert_eq!(ctx.declared_function_names.len(), 6);
+        assert_eq!(ctx.declared_function_names.len(), 7);
         assert!(ctx.declared_function_names.contains("job__start"));
         assert!(ctx.declared_function_names.contains("echo"));
 
@@ -16075,6 +16076,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         }
     }
 
@@ -23103,6 +23105,58 @@ mod tests {
             !spawn.contains("task_1"),
             "DEFAULT_SPAWN_INSTRUCTIONS must not reference task_1-style IDs"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn bundled_assets_teach_agent_wait() {
+        let _guard = HelperConfigDirGuard::new();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+
+        for (path, base_rule) in [
+            (
+                paths::agents_data_dir()
+                    .join("sisyphus")
+                    .join("instructions.md"),
+                "Do not call `agent__collect` immediately",
+            ),
+            (
+                paths::agents_data_dir()
+                    .join("architect")
+                    .join("instructions.md"),
+                "Do not poll `agent__collect` on a running agent",
+            ),
+            (
+                paths::skill_file("parallel-research"),
+                "Do not call `agent__collect` immediately",
+            ),
+        ] {
+            let text = read_to_string(&path)
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let base = text
+                .find(base_rule)
+                .unwrap_or_else(|| panic!("{} lost {base_rule:?}", path.display()));
+            let exception = &text[base..];
+            let exception = &exception[exception.find("Exception:").unwrap_or_else(|| {
+                panic!("{} has no exception after {base_rule:?}", path.display())
+            })..];
+            let exception = &exception[..exception.find(". ").unwrap_or(exception.len())];
+            for clause in [
+                "may call `agent__wait` alone",
+                "collect the ids it reports",
+                "it consumes and reclaims nothing, so every agent still needs a collect or cancel",
+            ] {
+                assert!(
+                    exception.contains(clause),
+                    "{} exception after {base_rule:?} lost {clause:?}",
+                    path.display()
+                );
+            }
+        }
     }
 
     // A gauntlet output carrying the review-incomplete line is an infrastructure
@@ -32804,7 +32858,13 @@ mod tests {
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["job__check", "job__collect", "job__cancel", "job__list"],
+            vec![
+                "job__check",
+                "job__collect",
+                "job__wait",
+                "job__cancel",
+                "job__list"
+            ],
             "lifecycle verbs must stay reachable while the context owns a job; job__start must not"
         );
     }
@@ -32957,6 +33017,7 @@ mod tests {
             "job__start",
             "job__check",
             "job__collect",
+            "job__wait",
             "job__cancel",
             "job__list",
         ] {
@@ -33092,6 +33153,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         })
         .unwrap();
         sup.register(make_running_job(job_sig.clone())).unwrap();

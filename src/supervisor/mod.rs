@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -46,6 +46,9 @@ pub struct AgentHandle {
     /// cancel or collect records on it even after the spawner's own
     /// context has moved to another session.
     pub child_session_root: Option<Arc<ChildSessionRoot>>,
+    /// The agent's outcome, kept here because its completion notification
+    /// can be drained before anyone asks.
+    pub succeeded: Arc<OnceLock<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +308,14 @@ impl Supervisor {
         self.agent(id).and_then(|h| h.session_id.clone())
     }
 
+    pub fn agent_name(&self, id: &str) -> Option<&str> {
+        self.agent(id).map(|h| h.agent_name.as_str())
+    }
+
+    pub fn agent_succeeded(&self, id: &str) -> Option<bool> {
+        self.agent(id).and_then(|h| h.succeeded.get().copied())
+    }
+
     pub fn list_agents(&self) -> Vec<(&str, &str)> {
         self.agents()
             .map(|h| (h.id.as_str(), h.agent_name.as_str()))
@@ -398,6 +409,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         }
     }
 
@@ -469,6 +481,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         };
         let mut sup = Supervisor::new(1, 3);
         sup.register(running_handle).unwrap();
@@ -511,6 +524,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(running_handle).unwrap();
@@ -548,6 +562,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         };
         let mut child_sup = Supervisor::new(4, 3);
         child_sup.register(grandchild).unwrap();
