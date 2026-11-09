@@ -1,4 +1,5 @@
 mod completer;
+pub mod json_output;
 
 use crate::cli::completer::{
     ShellCompletion, agent_completer, bundle_completer, macro_completer, mcp_server_completer,
@@ -81,6 +82,20 @@ pub struct Cli {
     /// Display the message without sending it
     #[arg(long)]
     pub dry_run: bool,
+    /// Print the reply and the run's usage as a single JSON object on stdout (requires a prompt)
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "execute", "code", "dry_run", "raw_markdown", "macro_name", "acp_server",
+            "completions", "tail_logs", "generate_models", "update", "list_bundles", "install",
+            "install_builtins", "update_bundle", "uninstall", "mcp_add", "mcp_remove", "mcp_list",
+            "mcp_get", "sync_models", "list_models", "list_roles", "list_agents", "list_rags",
+            "list_macros", "list_skills", "build_tools", "list_sessions", "init_memory",
+            "init_instructions", "info", "authenticate", "auth_mcp", "add_secret", "get_secret",
+            "update_secret", "delete_secret", "list_secrets",
+        ]
+    )]
+    pub json: bool,
     /// Disable loading workspace MCP servers from .coyote/mcp.json, .coyote/.mcp.json, or .mcp.json
     #[arg(long)]
     pub no_workspace_mcp: bool,
@@ -138,7 +153,7 @@ pub struct Cli {
             "dangerously_skip_permissions", "agent_variable", "git_host", "filter",
             "install_force", "yes", "force", "transport", "url", "scope", "env", "header", "cwd",
             "client_id", "client_secret", "callback_port", "redirect_host", "mcp_force",
-            "disable_log_colors", "mcp_command",
+            "disable_log_colors", "mcp_command", "json",
         ]
     )]
     pub memory_migrate: Option<MigrateScope>,
@@ -773,6 +788,48 @@ mod tests {
             .map(|v| v.to_possible_value().unwrap().get_name().to_string())
             .collect();
         assert_eq!(names, ["global", "workspace", "all"]);
+    }
+
+    #[test]
+    fn json_conflicts_with_modes_that_cannot_emit_one_object() {
+        let rivals: &[&[&str]] = &[
+            &["-e"],
+            &["-c"],
+            &["--dry-run"],
+            &["--raw-markdown"],
+            &["--macro", "x"],
+            &["--acp-server"],
+            &["--memory-migrate", "all"],
+            &["--list-models"],
+            &["--info"],
+            &["--list-sessions"],
+            &["--build-tools"],
+            &["--init-instructions"],
+            &["--completions", "bash"],
+            &["--tail-logs"],
+            &["--list-secrets"],
+            &["--auth-mcp", "x"],
+        ];
+        for rival in rivals {
+            let mut args = vec!["coyote", "--json"];
+            args.extend_from_slice(rival);
+            args.push("hi");
+            assert_eq!(
+                Cli::try_parse_from(&args).err().map(|err| err.kind()),
+                Some(clap::error::ErrorKind::ArgumentConflict),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_accepts_no_stream_headless_and_a_session() {
+        let cli = parse(&["--json", "-S", "--headless", "--session", "s", "hi"]);
+
+        assert!(cli.json);
+        assert!(cli.no_stream);
+        assert!(cli.headless);
+        assert_eq!(cli.session, Some(Some("s".to_string())));
     }
 
     #[test]

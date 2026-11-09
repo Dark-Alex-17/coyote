@@ -1067,7 +1067,6 @@ impl RequestContext {
             .clone()
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-431: remove once --json begins run stats
     pub fn begin_run_stats(&mut self) -> Arc<RunStats> {
         self.run_stats
             .get_or_insert_with(|| Arc::new(RunStats::default()))

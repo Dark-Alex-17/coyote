@@ -63,6 +63,7 @@ pub static SHOW_TOOL_CALLS: LazyLock<bool> = LazyLock::new(|| {
 });
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
+pub static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 static ACP_PERMISSION_QUEUE: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
 

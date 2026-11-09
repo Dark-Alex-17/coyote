@@ -65,7 +65,6 @@ impl RunStats {
         inner.model_calls = inner.model_calls.saturating_add(1);
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "no production reader yet"))] // TASK-431: remove once --json reads the snapshot
     pub fn snapshot(&self) -> RunStatsSnapshot {
         let inner = self.inner.lock();
         RunStatsSnapshot {
