@@ -1626,6 +1626,10 @@ impl App {
                 if let Some(prompt) = self.prompts.front_mut() {
                     match prompt.choice() {
                         Some(answer) => self.answer_front(answer),
+                        // A closed select with no options has no row to
+                        // land on and no custom row to fall back to: the
+                        // caller asked an unanswerable question.
+                        None if prompt.req.closed => self.answer_front(PromptAnswer::Cancelled),
                         // The select's cursor is on the custom row: the
                         // field opens with a fresh gate, so the Enter that
                         // opened it cannot also send an empty answer.
@@ -4906,6 +4910,23 @@ mod tests {
             asker.join().unwrap().unwrap(),
             PromptAnswer::Selected("gamma".to_string())
         );
+        assert!(harness.app.prompts.is_empty());
+    }
+
+    /// A closed select with nothing to offer cannot be answered: Enter
+    /// cancels it instead of opening a custom field.
+    #[test]
+    fn an_empty_closed_select_modal_is_cancelled_on_enter() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest {
+            closed: true,
+            options: Vec::new(),
+            ..list_request(PromptAction::Select, None)
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
         assert!(harness.app.prompts.is_empty());
     }
 
@@ -9073,6 +9094,11 @@ mod tests {
         assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));
         let cursor_sync = include_str!("../utils/cursor_sync.rs");
         assert!(fn_body(cursor_sync, "fn resync_stdout").contains("crate::tui::active()"));
+        let prompt = include_str!("../prompt/mod.rs");
+        assert!(
+            fn_body(prompt, "impl Prompter for InquirePrompter")
+                .contains("drain_stale_tty_input()")
+        );
     }
 
     /// Registers a lender on its own thread that runs every job it is

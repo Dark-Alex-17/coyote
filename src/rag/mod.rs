@@ -316,7 +316,7 @@ impl Rag {
         let top_k = app.rag_top_k;
         let extractor_model = match app.rag_extractor_model.clone() {
             Some(model) => Some(model),
-            None => select_extractor_model(app, prompter)?,
+            None => select_extractor_model(&list_models(app, ModelType::Chat), prompter)?,
         };
         let graph_hops = if extractor_model.is_some() {
             set_graph_hops(app.rag_graph_hops, prompter)?
@@ -2012,11 +2012,12 @@ fn select_option(
 ) -> Result<String> {
     let displays = options.iter().map(ToString::to_string).collect();
     let chosen = select_closed(prompter, question, displays)?;
-    options
+    let value = options
         .into_iter()
         .find(|option| option.display == chosen)
         .map(|option| option.value)
-        .ok_or_else(|| anyhow!("'{chosen}' is not one of the offered options"))
+        .expect("select_closed only hands back an offered option");
+    Ok(value)
 }
 
 /// Asks `label` until the answer is non-empty; an empty one is asked
@@ -2123,8 +2124,7 @@ pub(crate) fn select_rag_driver(prompter: &dyn Prompter) -> Result<String> {
 
 const EXTRACTOR_SKIP: &str = "Skip";
 
-fn select_extractor_model(app: &AppConfig, prompter: &dyn Prompter) -> Result<Option<String>> {
-    let models = list_models(app, ModelType::Chat);
+fn select_extractor_model(models: &[&Model], prompter: &dyn Prompter) -> Result<Option<String>> {
     if models.is_empty() {
         return Ok(None);
     }
@@ -3041,7 +3041,9 @@ mod tests {
         // Under musl the driver question is not asked at all.
         #[cfg(not(target_env = "musl"))]
         {
-            let driver = ScriptedPrompter::new(vec![PromptAnswer::Selected("duckdb".to_string())]);
+            let driver = ScriptedPrompter::new(vec![PromptAnswer::Selected(
+                "duckdb - persistent on-disk store; vectors and content survive restarts; HNSW approximate search.".to_string(),
+            )]);
             assert_eq!(select_rag_driver(&driver).unwrap(), "duckdb");
             let [req] = driver.requests().try_into().unwrap();
             assert_eq!(req.action, PromptAction::Select);
@@ -3120,6 +3122,168 @@ mod tests {
         assert_eq!(req.question, "Select embedding model:");
         assert!(req.closed);
         assert_eq!(req.options, displays);
+    }
+
+    fn chat_model(name: &str) -> Model {
+        let mut data = ModelData::new(name);
+        data.model_type = "chat".to_string();
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    /// The extractor question is a closed select with the skip row first;
+    /// skipping yields no extractor and the model row yields its id.
+    #[test]
+    #[serial]
+    fn select_extractor_model_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let model = chat_model("test-chat");
+        let pad = model.id().len().max(EXTRACTOR_SKIP.len());
+        let skip_row = SelectOption::new(
+            EXTRACTOR_SKIP.to_string(),
+            "vector + full text search only (no graph)".to_string(),
+            pad,
+        )
+        .to_string();
+        let model_row = SelectOption::new(model.id(), model.description(), pad).to_string();
+
+        let skipped = ScriptedPrompter::new(vec![PromptAnswer::Selected(skip_row.clone())]);
+        assert_eq!(select_extractor_model(&[&model], &skipped).unwrap(), None);
+        let [req] = skipped.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(
+            req.question,
+            "Extractor model for graph-based RAG (optional):"
+        );
+        assert!(req.closed);
+        assert_eq!(req.options, vec![skip_row, model_row.clone()]);
+
+        let chosen = ScriptedPrompter::new(vec![PromptAnswer::Selected(model_row)]);
+        assert_eq!(
+            select_extractor_model(&[&model], &chosen).unwrap(),
+            Some(model.id())
+        );
+
+        let none = ScriptedPrompter::refusing();
+        assert_eq!(select_extractor_model(&[], &none).unwrap(), None);
+        assert!(none.requests().is_empty());
+    }
+
+    /// A local vault in a throwaway config dir, holding no secrets.
+    struct EmptyVault {
+        _xdg: crate::testing::EnvVarGuard,
+        _dir: TempDir,
+        vault: Vault,
+    }
+
+    impl EmptyVault {
+        fn new(tag: &str) -> Self {
+            let dir = TempDir::new(tag);
+            let password_file = dir.path.join("password");
+            fs::write(&password_file, "correct horse battery staple").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&password_file, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let vault = Vault::from_provider(gman::providers::SupportedProvider::Local {
+                provider_def: gman::providers::local::LocalProvider {
+                    password_file: Some(password_file),
+                    git_branch: None,
+                    ..Default::default()
+                },
+            });
+            Self {
+                _xdg: crate::testing::EnvVarGuard::set("XDG_CONFIG_HOME", &dir.path),
+                _dir: dir,
+                vault,
+            }
+        }
+    }
+
+    /// A missing API key secret is offered for creation through the
+    /// prompter; declining names the secret in the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn a_missing_api_key_secret_under_the_tui_is_offered_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let store = EmptyVault::new("attach-secret");
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let err = resolve_or_create_api_key_secret(&store.vault, "QDRANT_API_KEY", &prompter)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("This instance needs an API key, so 'QDRANT_API_KEY' has to exist"),
+            "{err}"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(
+            req.question,
+            "Secret 'QDRANT_API_KEY' is not in the vault. Create it now?"
+        );
+        assert_eq!(req.default, Some(json!(true)));
+    }
+
+    #[test]
+    #[serial]
+    fn ask_qdrant_host_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![text("qdrant.example:6333")]);
+        assert_eq!(ask_qdrant_host(&prompter).unwrap(), "qdrant.example:6333");
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Input);
+        assert_eq!(req.question, "Host (e.g. qdrant.company.com:6333):");
+        assert_eq!(req.default, None);
+        assert_eq!(req.help, None);
+    }
+
+    /// The attach wizard's opening questions go through the prompter in
+    /// order: driver, host, then the API key confirm. Without a key the
+    /// next step is the connection, which fails against a closed port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn attach_under_the_tui_asks_driver_host_and_api_key_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let store = EmptyVault::new("attach-wizard");
+        let dir = TempDir::new("attach-wizard-rag");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Selected("qdrant".to_string()),
+            text("127.0.0.1:9"),
+            PromptAnswer::Confirmed(false),
+        ]);
+
+        let err = Rag::attach(
+            &AppConfig::default(),
+            &store.vault,
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &prompter,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Failed to connect to 127.0.0.1:9. Check host and API key."),
+            "{err:#}"
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(requests[0].question, "Select driver:");
+        assert!(requests[0].closed);
+        assert_eq!(requests[0].options, vec!["qdrant".to_string()]);
+        assert_eq!(requests[1].action, PromptAction::Input);
+        assert_eq!(requests[1].question, "Host (e.g. qdrant.company.com:6333):");
+        assert_eq!(requests[2].action, PromptAction::Confirm);
+        assert_eq!(
+            requests[2].question,
+            "Does this instance require an API key?"
+        );
+        assert_eq!(requests[2].default, Some(json!(true)));
     }
 
     /// With no human to answer, every question of the wizard is refused.

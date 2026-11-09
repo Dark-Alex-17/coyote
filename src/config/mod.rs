@@ -617,7 +617,7 @@ fn confirm_asset_overwrite(
         ),
     };
     println!("{} {body}", warning_text("WARNING:"));
-    crate::prompt::confirm(prompter, "Continue?".to_string(), false)
+    crate::prompt::confirm_with_help(prompter, "Continue?".to_string(), false, &body)
 }
 
 pub fn default_sessions_dir() -> PathBuf {
@@ -2198,6 +2198,15 @@ hooks:
         assert_eq!(requests[0].action, PromptAction::Confirm);
         assert_eq!(requests[0].question, "Continue?");
         assert_eq!(requests[0].default, Some(json!(false)));
+        assert_eq!(
+            requests[0].help.as_deref(),
+            Some(
+                "Reinstalling bundled macros overwrites every bundled macros in \
+                 /tmp/coyote-macros with this build's packaged versions. Local changes to bundled \
+                 macros will be lost; macros you created yourself are left \
+                 untouched."
+            )
+        );
 
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
         let proceed = confirm_asset_overwrite(

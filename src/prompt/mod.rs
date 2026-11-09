@@ -5,7 +5,7 @@
 
 use crate::events::{Event, Origin, bus};
 use crate::utils::{ACP_SERVER, HEADLESS};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use inquire::{Confirm, InquireError, MultiSelect, Password, PasswordDisplayMode, Select, Text};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -66,7 +66,10 @@ pub struct PromptRequest {
     pub job_id: Option<String>,
     pub origin: Origin,
     /// A line shown under the question; rendering detail, so it is not
-    /// published with the request.
+    /// published with the request. The TUI modal renders it for every
+    /// kind. The inquire prompter renders it for Input and Password,
+    /// whose widgets have a help line, and leaves a Confirm's help to the
+    /// transcript the caller printed.
     pub help: Option<String>,
     /// A select whose answer must be one of `options`: no "Other
     /// (custom)" row is offered. Not published either.
@@ -273,18 +276,40 @@ pub(crate) fn confirm(prompter: &dyn Prompter, question: String, default: bool) 
     ask(prompter, req).and_then(PromptAnswer::into_confirmed)
 }
 
-/// A select whose answer must be one of `options`.
+/// A confirm whose context was printed to stdout before the question.
+/// Under the TUI that output lands in the transcript, so the same text
+/// rides along as the request's help and the modal shows it as well.
+pub(crate) fn confirm_with_help(
+    prompter: &dyn Prompter,
+    question: String,
+    default: bool,
+    help: &str,
+) -> Result<bool> {
+    let req = PromptRequest {
+        default: Some(json!(default)),
+        help: Some(help.to_string()),
+        ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
+    };
+    ask(prompter, req).and_then(PromptAnswer::into_confirmed)
+}
+
+/// A select whose answer must be one of `options`; an answer outside them
+/// is rejected here so no caller has to.
 pub(crate) fn select_closed(
     prompter: &dyn Prompter,
     question: &str,
     options: Vec<String>,
 ) -> Result<String> {
     let req = PromptRequest {
-        options,
+        options: options.clone(),
         closed: true,
         ..PromptRequest::new(PromptAction::Select, question, Origin::detached())
     };
-    ask(prompter, req).and_then(PromptAnswer::into_selected)
+    let choice = ask(prompter, req).and_then(PromptAnswer::into_selected)?;
+    if !options.contains(&choice) {
+        bail!("'{choice}' is not one of the offered options");
+    }
+    Ok(choice)
 }
 
 pub(crate) fn input(
@@ -398,6 +423,7 @@ impl Default for InquirePrompter {
 
 impl Prompter for InquirePrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
+        crate::utils::drain_stale_tty_input();
         let answer = match req.action {
             PromptAction::Select => Self::select(&req),
             PromptAction::Confirm => self.confirm(&req),
@@ -956,5 +982,64 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "boom");
         assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    fn select_closed_hands_back_an_offered_option() {
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("b".to_string())]);
+        let options = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            select_closed(&prompter, "pick one pm-sc1", options.clone()).unwrap(),
+            "b"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert!(req.closed);
+        assert_eq!(req.options, options);
+    }
+
+    #[test]
+    fn select_closed_rejects_an_answer_outside_the_options() {
+        let prompter =
+            ScriptedPrompter::new(vec![PromptAnswer::Selected("not-offered".to_string())]);
+        let err = select_closed(
+            &prompter,
+            "pick one pm-sc2",
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'not-offered' is not one of the offered options"
+        );
+    }
+
+    #[test]
+    fn select_closed_without_a_human_is_a_needs_human_refusal() {
+        let err = select_closed(
+            &HeadlessPrompter,
+            "pick one pm-sc3",
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .unwrap_err();
+        assert!(NeedsHuman::caused(&err), "{err}");
+    }
+
+    #[test]
+    fn confirm_with_help_carries_the_printed_context_as_help() {
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+        assert!(
+            confirm_with_help(
+                &prompter,
+                "Continue? pm-ch1".to_string(),
+                false,
+                "WARNING: body"
+            )
+            .unwrap()
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Continue? pm-ch1");
+        assert_eq!(req.default, Some(json!(false)));
+        assert_eq!(req.help.as_deref(), Some("WARNING: body"));
     }
 }

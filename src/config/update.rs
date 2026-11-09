@@ -133,16 +133,21 @@ fn update_binary_at(
         if force {
             println!("--force specified; updating anyway.");
         } else if menu_can_use_terminal() {
-            let proceed = crate::prompt::confirm(prompter, "Update anyway?".to_string(), false)?;
+            let proceed = crate::prompt::confirm_with_help(
+                prompter,
+                "Update anyway?".to_string(),
+                false,
+                &body,
+            )?;
             if !proceed {
                 println!("Update cancelled.");
                 return Ok(());
             }
         } else {
-            bail!(
-                "Refusing to update a {} install. Re-run with --force to override.",
-                source.label()
-            );
+            return Err(crate::config::conflict::refuse_non_interactive(
+                format_args!("update a {} install", source.label()),
+                " or pass --force.",
+            ));
         }
     }
 
@@ -288,6 +293,35 @@ mod tests {
         assert_eq!(requests[0].action, PromptAction::Confirm);
         assert_eq!(requests[0].question, "Update anyway?");
         assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+        assert_eq!(
+            requests[0].help.as_deref(),
+            Some(
+                "Coyote appears to be installed via `cargo install` (/home/u/.cargo/bin/coyote).\n\
+                 Updating in place leaves Cargo's records out of sync with the binary on disk.\n\
+                 The clean way to update is:  cargo install --locked coyote-ai"
+            )
+        );
+    }
+
+    /// Off a terminal and without --force, a package-managed update is
+    /// refused in the shape every non-interactive menu shares.
+    #[test]
+    #[serial]
+    fn package_managed_update_without_a_tty_is_refused() {
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err =
+            update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.starts_with("Refusing to update a"), "{message}");
+        assert!(
+            message.contains("non-interactively. Re-run in a terminal"),
+            "{message}"
+        );
+        assert!(message.ends_with(" or pass --force."), "{message}");
+        assert!(prompter.requests().is_empty());
     }
 
     #[test]

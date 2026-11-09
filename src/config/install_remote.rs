@@ -626,7 +626,7 @@ fn resolve_obsolete(
             *sticky = Some(ObsoleteAction::Delete);
             Ok(ObsoleteAction::Delete)
         }
-        _ => bail!("'{choice}' is not one of the offered options"),
+        _ => unreachable!("select_closed only hands back an offered option"),
     }
 }
 
@@ -733,14 +733,19 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -
                  re-run with --yes to confirm"
             );
         }
-        println!(
+        let ownership = format!(
             "Bundle '{name}' owns {} file(s) and {} mcp.json server(s).",
             record.files.len(),
             record.mcp_servers.len()
         );
-        let proceed =
-            crate::prompt::confirm(prompter, format!("Uninstall bundle '{name}'?"), false)
-                .with_context(|| "failed to read uninstall confirmation")?;
+        println!("{ownership}");
+        let proceed = crate::prompt::confirm_with_help(
+            prompter,
+            format!("Uninstall bundle '{name}'?"),
+            false,
+            &ownership,
+        )
+        .with_context(|| "failed to read uninstall confirmation")?;
         if !proceed {
             println!("Uninstall of '{name}' aborted; nothing was changed.");
             return Ok(());
@@ -861,7 +866,7 @@ fn select_uninstall_candidate(
             let index = described
                 .iter()
                 .position(|option| option == &picked)
-                .with_context(|| format!("'{picked}' is not one of the offered options"))?;
+                .expect("select_closed only hands back an offered option");
 
             Ok(Some(candidates[index].0.clone()))
         }
@@ -1049,7 +1054,7 @@ fn resolve_uninstall_action(
             *sticky = Some(ObsoleteAction::Delete);
             Ok(ObsoleteAction::Delete)
         }
-        _ => bail!("'{choice}' is not one of the offered options"),
+        _ => unreachable!("select_closed only hands back an offered option"),
     }
 }
 
@@ -2303,7 +2308,7 @@ fn resolve_mcp_conflict(
     } else if choice == "abort merge" {
         bail!("Aborted MCP merge by user.")
     } else {
-        bail!("'{choice}' is not one of the offered options")
+        unreachable!("select_closed only hands back an offered option")
     }
 }
 
@@ -6271,6 +6276,10 @@ mod tests {
         assert_eq!(requests[0].action, PromptAction::Confirm);
         assert_eq!(requests[0].question, "Uninstall bundle 'omc'?");
         assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+        assert_eq!(
+            requests[0].help.as_deref(),
+            Some("Bundle 'omc' owns 0 file(s) and 0 mcp.json server(s).")
+        );
 
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
         uninstall_bundle("omc", false, &prompter).unwrap();
@@ -6324,9 +6333,8 @@ mod tests {
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("other".into())]);
         let err = select_uninstall_candidate(&store, "someuser/omc", &prompter).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("'other' is not one of the offered options"),
-            "got: {err}"
+            format!("{err:#}").contains("'other' is not one of the offered options"),
+            "got: {err:#}"
         );
     }
 

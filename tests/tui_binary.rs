@@ -7017,3 +7017,336 @@ mod cold_start {
         assert_tty_restored(&transcript);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Prompter-routed command menus: the answer a modal (or, in the plain REPL,
+// the inquire prompt) collects reaches the command that asked, under both
+// shells, from a clean config dir.
+// ---------------------------------------------------------------------------
+
+/// Forces a full repaint and returns the stripped frame painted since the
+/// resize; the painter only repaints changed cells, so a frame read
+/// straight after a key may be a partial diff.
+fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
+    pty.read_for(Duration::from_millis(500));
+    let from = pty.raw().len();
+    pty.resize(rows, cols).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
+}
+
+/// The vault refuses a password file anyone else can read; the fixture
+/// writes it with the default mode, so a case that stores a secret
+/// tightens it first.
+fn secure_vault_password_file(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir.join("vault-pass"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// `.vault add <name>` under the UI, answered: the Password modal takes
+/// the value, Enter sends it, the vault reports the secret added, the
+/// typed value is never painted on the screen (it is a password), and
+/// `.vault get <name>` afterwards prints exactly the value that was typed
+/// into the modal. Then the UI keeps taking keys and leaves clean.
+#[test]
+#[serial]
+fn dot_vault_add_answered_in_the_password_modal_stores_the_value_without_echoing_it() {
+    let dir = fresh_config_dir("vault-add-modal-answered");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let before = pty.raw().len();
+    pty.send(b".vault add vault-secret-p7k\r").unwrap();
+    wait_for_the_modal(&mut pty, before, ".vault add", &["Enterthesecretvalue:"]);
+    answer_field_modal(&mut pty, "hush-value-p7k");
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let added = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        if squeezed(&since).contains("Secret'vault-secret-p7k'addedtothevault") {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the answered Password modal did not add the secret:\n{since}"
+        );
+    };
+    assert!(
+        !added.contains("hush-value-p7k"),
+        "the secret value typed into the Password modal was painted on the screen:\n{added}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the Password modal released the terminal:\n{added}"
+    );
+
+    let get_at = pty.raw().len();
+    pty.send(b".vault get vault-secret-p7k\r").unwrap();
+    pty.wait_for_after("hush-value-p7k", get_at, PTY_DEADLINE)
+        .expect("`.vault get` did not print the value the modal collected");
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the vault add");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The same `.vault add` in the plain REPL: the question is the inquire
+/// password prompt, asked once (no second "type it again" entry); an
+/// empty answer re-asks with `A response is required.` instead of storing
+/// an empty secret; the typed value is masked; and `.vault get` prints
+/// the value back. `.exit` then leaves the tty cooked.
+#[test]
+#[serial]
+fn dot_vault_add_in_the_plain_repl_asks_once_reasks_on_empty_and_stores_the_value() {
+    let dir = fresh_config_dir("vault-add-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b".vault add vault-secret-r2p\r").unwrap();
+    pty.wait_for_after("Enter the secret value:", before, PTY_DEADLINE)
+        .expect("`.vault add` in the plain REPL did not ask for the value");
+    pty.read_for(Duration::from_millis(300));
+
+    // An empty answer is re-asked, not stored.
+    pty.send(b"\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let reasked = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        if since.contains("is required") && since.matches("Enter the secret value:").count() >= 2 {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an empty secret value was not re-asked as required:\n{since}"
+        );
+    };
+    assert!(
+        !squeezed(&reasked).contains("addedtothevault"),
+        "an empty secret value was stored:\n{reasked}"
+    );
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"hush-value-r2p\r").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "Secret 'vault-secret-r2p' added to the vault",
+        "the plain REPL's `.vault add` confirmation",
+    );
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    assert!(
+        !since.contains("hush-value-r2p"),
+        "the secret value typed at the password prompt was echoed:\n{since}"
+    );
+    let lower = since.to_lowercase();
+    assert!(
+        !["again", "confirm", "re-enter", "repeat", "retype"]
+            .iter()
+            .any(|w| lower.contains(w)),
+        "the password was asked for a second confirmation entry; a single entry is the \
+         contract:\n{since}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{since}"
+    );
+
+    pty.wait_for_after(
+        "dry-model)>",
+        pty.raw().len().saturating_sub(64),
+        PTY_DEADLINE,
+    )
+    .expect("the prompt did not come back after the secret was added");
+    pty.read_for(Duration::from_millis(300));
+    let get_at = pty.raw().len();
+    pty.send(b".vault get vault-secret-r2p\r").unwrap();
+    pty.wait_for_after("hush-value-r2p", get_at, PTY_DEADLINE)
+        .expect("`.vault get` did not print the value the prompt collected");
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The questions the RAG wizard asks after the embedding model, in the
+/// order they can come up; any of them on screen means the chosen model
+/// reached the wizard and it moved on.
+const RAG_WIZARD_FOLLOW_UPS: [&str; 5] = [
+    "RAGstoragedriver:",
+    "Extractormodel",
+    "Setchunksize:",
+    "Setchunkoverlay:",
+    "Adddocuments:",
+];
+
+/// `.rag <new>` under the UI, answered: Enter on the Select modal picks
+/// the highlighted embedding model and the wizard moves on to its next
+/// question in a fresh modal (the answer flowed back); the modals are
+/// walked with Enter until `Set chunk size:` comes up, whose Input modal
+/// shows the default `1000` pre-filled; Esc there leaves no rag behind
+/// and the terminal was never released. The UI then keeps taking keys
+/// and leaves clean.
+#[test]
+#[serial]
+fn dot_rag_wizard_moves_on_after_the_select_modal_and_the_chunk_size_input_shows_its_default() {
+    let dir = fresh_config_dir("rag-wizard-answered");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".rag new-rag-p7k\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        before,
+        ".rag new-rag-p7k",
+        &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    let mut frame = repainted_frame(&mut pty, 50, 120);
+    assert!(
+        !squeezed(&frame).contains("Selectembeddingmodel:"),
+        "Enter on the Select modal did not take the highlighted embedding model:\n{frame}"
+    );
+    assert!(
+        RAG_WIZARD_FOLLOW_UPS
+            .iter()
+            .any(|q| squeezed(&frame).contains(q))
+            && squeezed(&frame).contains("Esc=cancel"),
+        "the wizard did not move on to its next question in a modal after the model was chosen:\n{frame}"
+    );
+
+    // Walk the wizard with Enter (the highlighted choice, or an empty /
+    // default answer) until the chunk-size question comes up.
+    let mut steps = 0;
+    let mut rows = 50;
+    while !squeezed(&frame).contains("Setchunksize:") {
+        assert!(
+            !squeezed(&frame).contains("Adddocuments:"),
+            "the wizard reached `Add documents:` without asking the chunk size:\n{frame}"
+        );
+        assert!(
+            steps < 4,
+            "the wizard did not reach `Set chunk size:` within 4 answers:\n{frame}"
+        );
+        pty.read_for(HOTKEY_GAP);
+        pty.send(b"\r").unwrap();
+        rows = if rows == 50 { 48 } else { 50 };
+        frame = repainted_frame(&mut pty, rows, 120);
+        steps += 1;
+    }
+    assert!(
+        squeezed(&frame).contains("Setchunksize:1000") && squeezed(&frame).contains("Esc=cancel"),
+        "the `Set chunk size:` Input modal does not show its default 1000:\n{frame}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "a wizard question released the terminal:\n{frame}"
+    );
+
+    esc_cancels_the_modal(&mut pty, ".rag new-rag-p7k");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in ["p7k", "/rags/"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "the cancelled wizard still wrote {written:?}:\n{since}"
+        );
+    }
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the cancelled wizard");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    for footprint in ["p7k", "/rags/"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "{written:?} appeared by the time the UI left:\n{transcript}"
+        );
+    }
+}
+
+/// `.rag <new>` in the plain REPL from the same clean config: the
+/// embedding-model question is the inquire select on the normal screen
+/// (no alternate screen, no modal legend), Esc cancels it, and no rag is
+/// written. Pins that the routing through the prompter left the REPL's
+/// inquire behaviour in place.
+#[test]
+#[serial]
+fn dot_rag_for_a_new_rag_in_the_plain_repl_asks_with_inquire_and_esc_writes_nothing() {
+    let dir = fresh_config_dir("rag-create-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".rag new-rag-r2p\r").unwrap();
+    let asked = pty
+        .wait_for_after("Select embedding model:", before, PTY_DEADLINE)
+        .expect("`.rag <new>` in the plain REPL did not ask for the embedding model");
+    pty.read_for(Duration::from_millis(500));
+    let asked = format!(
+        "{asked}{}",
+        strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+    );
+    assert!(
+        asked.contains("dry-embed-a") && asked.contains("dry-embed-b"),
+        "the inquire select does not list both embedding models:\n{asked}"
+    );
+    assert!(
+        !squeezed(&asked).contains("Esc=cancel"),
+        "the plain REPL drew the modal legend instead of the inquire prompt:\n{asked}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{asked}"
+    );
+
+    pty.send(b"\x1b").unwrap();
+    pty.wait_for_after("dry-model)>", before + 1, PTY_DEADLINE)
+        .expect("Esc on the inquire select did not bring the prompt back");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in ["r2p", "/rags/"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "the cancelled `.rag` still wrote {written:?}:\n{since}"
+        );
+    }
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}

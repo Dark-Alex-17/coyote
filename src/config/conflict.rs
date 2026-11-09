@@ -104,7 +104,7 @@ pub(crate) fn resolve_conflict(
             Ok(ConflictAction::Replace)
         }
         "abort" => bail!("Install aborted by user at conflict resolution."),
-        _ => bail!("'{choice}' is not one of the offered options"),
+        _ => unreachable!("select_closed only hands back an offered option"),
     }
 }
 
@@ -339,9 +339,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("'maybe' is not one of the offered options"),
-            "got: {err}"
+            format!("{err:#}").contains("'maybe' is not one of the offered options"),
+            "got: {err:#}"
         );
         assert_eq!(sticky, StickyMode::None);
     }
