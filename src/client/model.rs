@@ -216,6 +216,11 @@ impl Model {
         self.data.supports_function_calling
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-427: remove once prepare_completion_data reads it
+    pub fn supports_structured_output(&self) -> bool {
+        self.data.supports_structured_output
+    }
+
     pub fn supports_vision(&self) -> bool {
         self.data.supports_vision
     }
@@ -358,6 +363,8 @@ pub struct ModelData {
     pub supports_vision: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_function_calling: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_structured_output: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_levels: Vec<String>,
     #[serde(
@@ -707,6 +714,28 @@ reasoning_levels: [none, low, medium, high]
         data.supports_vision = false;
         let models = Model::from_config("openai", &[data]);
         assert!(!models[0].supports_vision());
+    }
+
+    #[test]
+    fn supports_structured_output_round_trips_through_yaml() {
+        let mut data = ModelData::new("structured");
+        let yaml = serde_yaml::to_string(&data).unwrap();
+        assert!(!yaml.contains("supports_structured_output"));
+
+        data.supports_structured_output = true;
+        let yaml = serde_yaml::to_string(&data).unwrap();
+        assert!(yaml.contains("supports_structured_output: true"));
+        let parsed: ModelData = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed.supports_structured_output);
+
+        let parsed: ModelData =
+            serde_yaml::from_str("name: structured\nsupports_structured_output: true\n").unwrap();
+        let models = Model::from_config("openai", &[parsed]);
+        assert!(models[0].supports_structured_output());
+
+        let parsed: ModelData = serde_yaml::from_str("name: plain\n").unwrap();
+        let models = Model::from_config("openai", &[parsed]);
+        assert!(!models[0].supports_structured_output());
     }
 
     #[test]

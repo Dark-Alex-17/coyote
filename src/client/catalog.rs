@@ -207,6 +207,7 @@ fn modelsdev_provider_models(api: &Value, provider_id: &str) -> Vec<SourcedModel
                 .as_array()
                 .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some("image")));
             data.supports_function_calling = entry["tool_call"].as_bool().unwrap_or(false);
+            data.supports_structured_output = entry["structured_output"].as_bool().unwrap_or(false);
             data.reasoning_levels = entry["reasoning_options"]
                 .as_array()
                 .and_then(|options| {
@@ -251,6 +252,14 @@ fn openrouter_model_data(name: &str, entry: &Value) -> ModelData {
     data.supports_function_calling = entry["supported_parameters"]
         .as_array()
         .is_some_and(|params| params.iter().any(|param| param.as_str() == Some("tools")));
+    data.supports_structured_output =
+        entry["supported_parameters"]
+            .as_array()
+            .is_some_and(|params| {
+                params
+                    .iter()
+                    .any(|param| param.as_str() == Some("structured_outputs"))
+            });
     data
 }
 
@@ -309,6 +318,9 @@ fn fill_from_openrouter(data: &mut ModelData, entry: &Value) {
     }
     if !data.supports_function_calling {
         data.supports_function_calling = filler.supports_function_calling;
+    }
+    if !data.supports_structured_output {
+        data.supports_structured_output = filler.supports_structured_output;
     }
 }
 
@@ -587,6 +599,8 @@ pub(crate) fn overlay_hand_owned(hand: ModelData, api: ModelData) -> ModelData {
         require_max_tokens: hand.require_max_tokens || api.require_max_tokens,
         supports_vision: hand.supports_vision || api.supports_vision,
         supports_function_calling: hand.supports_function_calling || api.supports_function_calling,
+        supports_structured_output: hand.supports_structured_output
+            || api.supports_structured_output,
         reasoning_levels: if hand.reasoning_levels.is_empty() {
             api.reasoning_levels
         } else {
@@ -660,6 +674,8 @@ pub struct QuirkRule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_function_calling: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_structured_output: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_levels: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<String>,
@@ -694,6 +710,8 @@ pub struct QuirkVariant {
     pub supports_vision: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_function_calling: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_structured_output: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_levels: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -737,6 +755,9 @@ pub fn apply_rules(provider_quirks: &ProviderQuirks, data: &mut ModelData) {
         }
         if let Some(supports_function_calling) = rule.supports_function_calling {
             data.supports_function_calling = supports_function_calling;
+        }
+        if let Some(supports_structured_output) = rule.supports_structured_output {
+            data.supports_structured_output = supports_structured_output;
         }
         if let Some(reasoning_levels) = &rule.reasoning_levels {
             data.reasoning_levels = reasoning_levels.clone();
@@ -783,6 +804,9 @@ fn apply_variant(variant: &QuirkVariant, data: &mut ModelData) {
     }
     if let Some(supports_function_calling) = variant.supports_function_calling {
         data.supports_function_calling = supports_function_calling;
+    }
+    if let Some(supports_structured_output) = variant.supports_structured_output {
+        data.supports_structured_output = supports_structured_output;
     }
     if let Some(reasoning_levels) = &variant.reasoning_levels {
         data.reasoning_levels = reasoning_levels.clone();
@@ -941,6 +965,7 @@ mod tests {
             "require_max_tokens",
             "supports_vision",
             "supports_function_calling",
+            "supports_structured_output",
             "reasoning_levels",
             "no_stream",
             "no_system_message",
@@ -1011,6 +1036,24 @@ rules:
     }
 
     #[test]
+    fn rule_can_clear_structured_output() {
+        let quirks: ProviderQuirks = serde_yaml::from_str(
+            r#"
+provider: openai
+rules:
+  - match: "model-*"
+    supports_structured_output: false
+"#,
+        )
+        .unwrap();
+
+        let mut data = ModelData::new("model-a");
+        data.supports_structured_output = true;
+        apply_rules(&quirks, &mut data);
+        assert!(!data.supports_structured_output);
+    }
+
+    #[test]
     fn glob_semantics() {
         assert!(glob_matches("claude-*", "claude-opus-4-8"));
         assert!(!glob_matches("claude-*", "gpt-4"));
@@ -1039,6 +1082,7 @@ rules:
         assert_eq!(gpt56.data.cache_write_price, Some(5.0));
         assert!(gpt56.data.supports_vision);
         assert!(gpt56.data.supports_function_calling);
+        assert!(gpt56.data.supports_structured_output);
         assert_eq!(
             gpt56.data.reasoning_levels,
             ["none", "low", "medium", "high", "xhigh", "max"]
@@ -1057,6 +1101,7 @@ rules:
         assert_eq!(qwen.data.cache_write_price, None);
         assert!(!qwen.data.supports_vision);
         assert!(qwen.data.supports_function_calling);
+        assert!(!qwen.data.supports_structured_output);
         assert!(qwen.data.reasoning_levels.is_empty());
         assert_eq!(qwen.release_date.as_deref(), Some("2024-04-03"));
 
@@ -1077,6 +1122,7 @@ rules:
         assert_eq!(data.cache_write_price, None);
         assert!(data.supports_vision);
         assert!(data.supports_function_calling);
+        assert!(data.supports_structured_output);
 
         let qwen = openrouter_model_data("qwen3.8-max", index["qwen/qwen3.8-max"]);
         assert_eq!(qwen.cache_read_price, Some(0.25));
@@ -1093,6 +1139,15 @@ rules:
         );
         assert_eq!(rounded.input_price, Some(1.2346));
         assert_eq!(rounded.output_price, Some(2.5));
+
+        let structured = openrouter_model_data(
+            "m",
+            &json!({"supported_parameters": ["structured_outputs"]}),
+        );
+        assert!(structured.supports_structured_output);
+        let response_format_only =
+            openrouter_model_data("m", &json!({"supported_parameters": ["response_format"]}));
+        assert!(!response_format_only.supports_structured_output);
     }
 
     #[test]
@@ -1230,6 +1285,32 @@ rules:
     }
 
     #[test]
+    fn openrouter_fills_structured_output_models_dev_left_unset() {
+        let modelsdev = json!({
+            "xai": {"models": {"m-1": {"structured_output": false}}}
+        })
+        .to_string();
+        let openrouter = json!({"data": [
+            {"id": "x-ai/m-1", "supported_parameters": ["structured_outputs"]},
+        ]})
+        .to_string();
+        let build = build_catalog(&make_sources(Some(&modelsdev), Some(&openrouter)), &[]);
+
+        assert!(find_model(find_provider(&build, "xai"), "m-1").supports_structured_output);
+    }
+
+    #[test]
+    fn overlay_hand_owned_ors_structured_output() {
+        let mut enabled = ModelData::new("m");
+        enabled.supports_structured_output = true;
+        let disabled = ModelData::new("m");
+
+        assert!(overlay_hand_owned(enabled.clone(), disabled.clone()).supports_structured_output);
+        assert!(overlay_hand_owned(disabled.clone(), enabled).supports_structured_output);
+        assert!(!overlay_hand_owned(disabled.clone(), disabled).supports_structured_output);
+    }
+
+    #[test]
     fn excludes_drop_api_models_but_never_hand_owned() {
         let quirks = parse_quirks(
             r#"
@@ -1286,6 +1367,24 @@ rules:
             Some("grok-4.5-fast")
         );
         assert_eq!(find_model(xai, "grok-4.6").real_name, None);
+    }
+
+    #[test]
+    fn variant_can_clear_structured_output() {
+        let quirks = parse_quirks(
+            r#"
+- provider: xai
+  variants:
+    - match: "grok-4.6"
+      suffix: ":plain"
+      supports_structured_output: false
+"#,
+        );
+        let build = build_catalog(&fixture_sources(), &quirks);
+        let xai = find_provider(&build, "xai");
+
+        assert!(find_model(xai, "grok-4.6").supports_structured_output);
+        assert!(!find_model(xai, "grok-4.6:plain").supports_structured_output);
     }
 
     #[test]
