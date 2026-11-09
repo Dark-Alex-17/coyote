@@ -450,4 +450,19 @@ mod tests {
             "data:image/png;base64,aGVsbG8="
         );
     }
+
+    #[test]
+    fn chat_bodies_omit_stream_options() {
+        let client = make_client(compat_config(Some(WireApi::Chat)));
+
+        for stream in [true, false] {
+            let (request_data, _) = prepare(&client, stream).unwrap();
+
+            assert!(
+                request_data.body.get("stream_options").is_none(),
+                "body: {}",
+                request_data.body
+            );
+        }
+    }
 }

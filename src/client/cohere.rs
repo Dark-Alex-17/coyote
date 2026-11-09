@@ -249,3 +249,46 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use std::sync::Arc;
+
+    #[test]
+    fn chat_bodies_omit_stream_options() {
+        let client = CohereClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: CohereConfig {
+                name: Some("cohere-test".into()),
+                api_key: Some("co-key".into()),
+                ..Default::default()
+            },
+            model: Model::new("cohere-test", "command-test"),
+        };
+
+        for stream in [true, false] {
+            let data = ChatCompletionsData {
+                messages: vec![Message::new(
+                    MessageRole::User,
+                    MessageContent::Text("hello".to_string()),
+                )],
+                temperature: None,
+                top_p: None,
+                reasoning_effort: None,
+                functions: None,
+                stream,
+                prompt_cache_ttl: None,
+            };
+
+            let request_data = prepare_chat_completions(&client, data).unwrap();
+
+            assert!(
+                request_data.body.get("stream_options").is_none(),
+                "body: {}",
+                request_data.body
+            );
+        }
+    }
+}
