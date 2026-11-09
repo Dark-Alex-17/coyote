@@ -30,11 +30,13 @@ const DEBUG_TARGET_PREFIXES: [&str; 6] = [
 
 /// Info capture also covers the mesh node start and the `inbox_dir` resolver,
 /// whose tests assert that a translation is announced at info level exactly
-/// once and never by the resolver itself.
-const INFO_TARGET_PREFIXES: [&str; 5] = [
+/// once and never by the resolver itself, and the propagation sync schedule,
+/// whose silence log is bounded per node.
+const INFO_TARGET_PREFIXES: [&str; 6] = [
     concat!(env!("CARGO_CRATE_NAME"), "::graph::script"),
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
     concat!(env!("CARGO_CRATE_NAME"), "::mesh::node"),
+    concat!(env!("CARGO_CRATE_NAME"), "::mesh::idle"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::mesh_config"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::child_sessions"),
 ];

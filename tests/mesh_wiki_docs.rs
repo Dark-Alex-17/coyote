@@ -3961,7 +3961,7 @@ fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemo
 fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     let Some(wiki) = wiki_dir() else { return };
     let announced = "[mesh] <label> reconnected; announced";
-    let past_cap = "[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now";
+    let past_cap = "[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now";
     let gotchas = flat(&section(
         "Mesh-Deployment.md",
         &read(wiki.join("Mesh-Deployment.md")),
@@ -4132,7 +4132,7 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_cap_is_four_an
     let node = read(repo_root().join("src/mesh/node.rs"));
     for format in [
         "\"{label} reconnected; announced\"",
-        "\"{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now\"",
+        "\"{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now\"",
     ] {
         assert!(
             node.contains(format),
@@ -4155,7 +4155,7 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_cap_is_four_an
     );
 
     let Some(wiki) = wiki_dir() else { return };
-    let past_cap = "`[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now`";
+    let past_cap = "`[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now`";
     for page in ["Mesh.md", "Mesh-Commands.md", "Mesh-Deployment.md"] {
         let text = flat(&read(wiki.join(page)));
         assert!(
@@ -4184,6 +4184,48 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_cap_is_four_an
             "{page} quotes the past-cap line without saying it is for a relay that reconnected more than four times within an hour: {around}"
         );
     }
+}
+
+/// `.mesh sync` quotes the two lines a propagation node that does not answer the request
+/// for its message list ends a sync with, word for word as the fetch writes them, and
+/// says how often the automatic sync repeats them.
+#[test]
+fn mesh_sync_documents_a_propagation_node_that_does_not_answer_the_list_request() {
+    let fetch = read(repo_root().join("src/mesh/propagation_fetch.rs"));
+    assert!(
+        fetch.contains(
+            "pub(crate) const FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);"
+        ),
+        "the page says `60 s` of the fetch request timeout; reword it and this pin with it"
+    );
+    let lines = [
+        "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced",
+        "The link to propagation node {node} closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh sync tries again, and .mesh info shows when it last announced",
+    ];
+    for line in lines {
+        assert!(
+            fetch.contains(&format!("\"{line}\"")),
+            "src/mesh/propagation_fetch.rs no longer writes {line:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let text = flat(&section(
+        "Mesh-Commands.md",
+        &read(wiki.join("Mesh-Commands.md")),
+        "### `.mesh sync`",
+    ));
+    for line in lines {
+        let shown = line.replace("{node}", "<node8>").replace("{}", "60 s");
+        assert!(
+            text.contains(&format!("`{shown}`")),
+            "Mesh-Commands.md's .mesh sync section does not quote {shown:?}"
+        );
+    }
+    assert!(
+        text.contains("writes it to the log at most once an hour per node"),
+        "Mesh-Commands.md's .mesh sync section does not say how often the automatic sync logs a silent node"
+    );
 }
 
 mod first_contact_wiki_pins {

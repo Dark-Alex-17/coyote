@@ -167,6 +167,20 @@ pub(crate) enum FetchError {
     Cancelled,
     /// Link establishment, a send, a bounded wait or the link request failed.
     Link(RequestError),
+    /// Round 1, the request for the node's message list, reached the node whole on an
+    /// active link and nothing of an answer came back within `after`. A node that does not
+    /// allow this identity answers `ERROR_NO_ACCESS` rather than staying silent
+    /// (`LXMRouter.message_get_request`), so the silence is the node or the way to it.
+    ListUnanswered {
+        node: String,
+        after: Duration,
+    },
+    /// The link closed while round 1 waited for the list. A node that stops answering
+    /// usually ends this way before the request deadline: the link's own liveness check
+    /// gives up on it first.
+    ListLinkClosed {
+        node: String,
+    },
     /// `ERROR_NO_IDENTITY` (`LXMPeer.py:24`): the node saw no identity on the link.
     NodeSawNoIdentity {
         node: String,
@@ -218,7 +232,21 @@ impl fmt::Display for FetchError {
                 path.display()
             ),
             Self::Cancelled => write!(f, "The propagation fetch was cancelled"),
+            Self::Link(RequestError::LocalTimeout { after, .. }) => write!(
+                f,
+                "This node's own mesh transport did not finish its part of the sync within {}, handing a request to the link or looking up a sender's key, so this says nothing about the propagation node; .mesh sync tries again",
+                seconds(*after)
+            ),
             Self::Link(err) => write!(f, "{err}"),
+            Self::ListUnanswered { node, after } => write!(
+                f,
+                "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced",
+                seconds(*after)
+            ),
+            Self::ListLinkClosed { node } => write!(
+                f,
+                "The link to propagation node {node} closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh sync tries again, and .mesh info shows when it last announced"
+            ),
             Self::NodeSawNoIdentity { node } => write!(
                 f,
                 "Propagation node {node} answered that it saw no identity on the link, so our identify did not reach it. Retry; if this persists the node may be running an incompatible LXMF version"
@@ -260,6 +288,15 @@ impl fmt::Display for FetchError {
 }
 
 impl std::error::Error for FetchError {}
+
+/// `60 s` for a whole number of seconds, `0.5 s` otherwise.
+fn seconds(after: Duration) -> String {
+    if after.subsec_nanos() == 0 {
+        format!("{} s", after.as_secs())
+    } else {
+        format!("{:.1} s", after.as_secs_f64())
+    }
+}
 
 /// Held for one fetch across every Coyote process of this identity; a sibling of the store
 /// file, taken with the same advisory lock the instance lock uses. Two sessions of one
@@ -321,6 +358,28 @@ fn link_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError 
         RequestError::Refused(code) => FetchError::NodeRefused(code),
         other => FetchError::Link(other),
     }
+}
+
+/// Round 1's failure as the fetch reports it: the node's silence to the list request, and
+/// the link closing under it, are their own errors, anything else is `link_error`'s. Logged
+/// here, since a refusal or a silence otherwise leaves the request's send as the last line
+/// of the fetch.
+fn round_one_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
+    let err = match err {
+        RequestError::Timeout { after, .. } => FetchError::ListUnanswered {
+            node: node.to_string(),
+            after,
+        },
+        RequestError::LinkClosed => FetchError::ListLinkClosed {
+            node: node.to_string(),
+        },
+        other => link_error(other, node, identity_hash),
+    };
+    debug!(
+        "Propagation fetch from {node}: round 1 ended without a list: {}",
+        redact_hashes(&err.to_string())
+    );
+    err
 }
 
 /// One fetched message that passed every check, as plain owned data. Nothing of the wire
@@ -1220,7 +1279,7 @@ impl<'a> TransportKeys<'a> {
                 Some(desc) => Some(desc.identity),
                 None => {
                     deadline
-                        .bound(GET_PATH, transport.destination_identity(&destination))
+                        .bound_locally(GET_PATH, transport.destination_identity(&destination))
                         .await?
                 }
             };
@@ -1247,7 +1306,7 @@ impl SourceKeys for TransportKeys<'_> {
         }
         if let Some(identity) = self
             .deadline
-            .bound(GET_PATH, self.transport.destination_identity(source))
+            .bound_locally(GET_PATH, self.transport.destination_identity(source))
             .await?
         {
             return Ok(Some(identity));
@@ -1257,7 +1316,7 @@ impl SourceKeys for TransportKeys<'_> {
         };
         let identity = self
             .deadline
-            .bound(GET_PATH, self.transport.destination_identity(destination))
+            .bound_locally(GET_PATH, self.transport.destination_identity(destination))
             .await?;
         Ok(identity.filter(|identity| lxmf_delivery_hash(identity) == *source))
     }
@@ -1277,7 +1336,7 @@ impl SourceKeys for TransportKeys<'_> {
         }
         let answer = self
             .deadline
-            .bound(
+            .bound_locally(
                 GET_PATH,
                 self.transport
                     .resolve_destination(destination, PATH_REQUEST_TIMEOUT),
@@ -1651,7 +1710,7 @@ pub(crate) async fn fetch(
             list_request(),
             options.request_timeout,
         ),
-        failed,
+        |err| round_one_error(err, node_short, &identity_hex),
     )
     .await?;
     let ids = parse_listed_ids(listed)?;
@@ -3392,6 +3451,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_silence_to_the_list_request_reads_as_the_node_not_answering() {
+        let silent = round_one_error(
+            RequestError::Timeout {
+                path: GET_PATH.to_string(),
+                after: FETCH_REQUEST_TIMEOUT,
+            },
+            "9af2fd91",
+            "id1",
+        );
+        assert_eq!(
+            silent,
+            FetchError::ListUnanswered {
+                node: "9af2fd91".to_string(),
+                after: FETCH_REQUEST_TIMEOUT,
+            }
+        );
+        assert_eq!(
+            silent.to_string(),
+            "Propagation node 9af2fd91 did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced"
+        );
+        assert_eq!(
+            round_one_error(RequestError::Refused(RefusalCode::NoAccess), "n", "i"),
+            FetchError::NodeRefusedAccess {
+                node: "n".to_string(),
+                identity_hash: "i".to_string(),
+            },
+            "a refusal is the node answering, not its silence"
+        );
+        let closed = round_one_error(RequestError::LinkClosed, "9af2fd91", "id1");
+        assert_eq!(
+            closed,
+            FetchError::ListLinkClosed {
+                node: "9af2fd91".to_string(),
+            }
+        );
+        assert_eq!(
+            closed.to_string(),
+            "The link to propagation node 9af2fd91 closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh sync tries again, and .mesh info shows when it last announced"
+        );
+        for not_silence in [
+            RequestError::LocalTimeout {
+                path: GET_PATH.to_string(),
+                after: FETCH_REQUEST_TIMEOUT,
+            },
+            RequestError::ResponseIncomplete {
+                path: GET_PATH.to_string(),
+                after: FETCH_REQUEST_TIMEOUT,
+            },
+            RequestError::RequestIncomplete {
+                path: GET_PATH.to_string(),
+                after: FETCH_REQUEST_TIMEOUT,
+            },
+            RequestError::LinkFailed("the relay hung up".to_string()),
+        ] {
+            assert_eq!(
+                round_one_error(not_silence.clone(), "n", "i"),
+                FetchError::Link(not_silence)
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_timeout_in_a_fetch_says_it_was_this_node_not_the_propagation_node() {
+        let text = FetchError::Link(RequestError::LocalTimeout {
+            path: GET_PATH.to_string(),
+            after: FETCH_REQUEST_TIMEOUT,
+        })
+        .to_string();
+        assert_eq!(
+            text,
+            "This node's own mesh transport did not finish its part of the sync within 60 s, handing a request to the link or looking up a sender's key, so this says nothing about the propagation node; .mesh sync tries again"
+        );
+        assert!(!text.contains("did not answer"), "{text}");
+        assert_eq!(seconds(Duration::from_millis(1500)), "1.5 s");
+    }
+
     #[tokio::test]
     async fn transport_keys_skip_peer_records_whose_destination_is_not_a_hash() {
         let tmp = TempDir::new("fetch-keys-guard");
@@ -4388,6 +4524,65 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_silent_to_the_list_request_is_reported_and_the_cursor_stays() {
+            install_log_collector();
+            let fake = FakeNode::listen().await;
+            let fetcher = Fetcher::join(&fake, "fetch-net-silent", TrustList::default()).await;
+            let node = short(&fake.hex()).to_string();
+            fake.script.reply_with([Value::Array(vec![])]);
+            fetcher.fetch().await.unwrap();
+            let before = fetcher
+                .store()
+                .cursor()
+                .cloned()
+                .expect("the empty list was a completed sync");
+
+            // Nothing scripted: the fake hears round 1 and never answers it.
+            let after = Duration::from_secs(2);
+            let err = fetcher.fetch_within(after).await.unwrap_err();
+
+            assert_eq!(
+                err,
+                FetchError::ListUnanswered {
+                    node: node.clone(),
+                    after,
+                }
+            );
+            let text = err.to_string();
+            assert!(
+                text.starts_with(&format!(
+                    "Propagation node {node} did not answer the request for its message list within 2 s"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.ends_with(
+                    ".mesh sync tries again, and .mesh info shows when it last announced"
+                ),
+                "{text}"
+            );
+            assert_eq!(
+                fake.script.seen().len(),
+                2,
+                "each fetch asked for the list once"
+            );
+            assert_eq!(
+                fetcher.store().cursor(),
+                Some(&before),
+                "a fetch that got no list is not a sync"
+            );
+            assert!(
+                debug_snapshot().iter().any(|line| line.contains(&format!(
+                    "Propagation fetch from {node}: round 1 ended without a list: Propagation node {node} did not answer"
+                ))),
+                "the silence is logged where the fetch's own lines are"
+            );
+
+            fetcher.stop().await;
+            fake.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn remembered_ids_are_purged_as_haves_after_a_restart() {
             let fake = FakeNode::listen().await;
             let fetcher = Fetcher::join(&fake, "fetch-net-restart", TrustList::default()).await;
@@ -4845,7 +5040,7 @@ mod tests {
             ) -> Result<Option<Identity>, RequestError> {
                 match self.lookups.fetch_add(1, Ordering::SeqCst) {
                     0 => Ok(Some(self.known)),
-                    _ => Err(RequestError::Timeout {
+                    _ => Err(RequestError::LocalTimeout {
                         path: GET_PATH.to_string(),
                         after: Duration::from_secs(1),
                     }),
@@ -4899,7 +5094,7 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                matches!(err, FetchError::Link(RequestError::Timeout { .. })),
+                matches!(err, FetchError::Link(RequestError::LocalTimeout { .. })),
                 "{err:?}"
             );
             assert_eq!((report.delivered, report.deferred), (1, 0));

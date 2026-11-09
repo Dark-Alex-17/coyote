@@ -9084,7 +9084,7 @@ mod peers_route_tests {
         assert_eq!(cells[1][6], "", "{text}");
         assert!(
             peers_legend().contains(
-                "no route = this node has no path to it, its last link failed or the session has ended"
+                "no route = this node has no path to it, because its last link failed, the session has ended, or a relay that restarted has no path to it until it announces again, and it may also have left the mesh;"
             ),
             "{text}"
         );
@@ -9292,7 +9292,7 @@ mod peers_you_tests {
             "{legend}"
         );
         assert!(
-            legend.contains("no route = this node has no path to it, its last link failed or the session has ended"),
+            legend.contains("no route = this node has no path to it, because its last link failed, the session has ended, or a relay that restarted has no path to it until it announces again, and it may also have left the mesh;"),
             "{legend}"
         );
     }
@@ -9323,8 +9323,9 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
 /// The `state` of a heard row with no route: the transport holds no path to it, the last
 /// link to it failed, or it is a session of yours that has gone. It outranks `stale`,
 /// which only says how long the row has been silent, and yields to `superseded`, which
-/// says where the identity went.
-const NO_ROUTE_STATE: &str = "(no route: this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh)";
+/// says where the identity went. A relay that restarted holds no path to a peer until that
+/// peer announces again, so the marker does not claim the peer has left.
+const NO_ROUTE_STATE: &str = "(no route: its link failed, the session ended or a restarted relay has no path until it announces, and it may have left)";
 
 /// The `state` of a heard row whose instance said it was leaving the mesh, `left_at` by
 /// this node's clock. It outranks `no route` and `stale`, being the peer's own word, and
@@ -9362,7 +9363,7 @@ fn trust_legend() -> &'static str {
 /// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, because its last link failed, the session has ended, or a relay that restarted has no path to it until it announces again, and it may also have left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -12072,7 +12073,7 @@ mod tests {
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                 NAME_ADDRESSING_LINE,
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, because its last link failed, the session has ended, or a relay that restarted has no path to it until it announces again, and it may also have left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
             ],
             "{text}"
         );
@@ -12202,11 +12203,11 @@ mod tests {
 ╞═════════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
 │ (you)       ┆ 2c3d4e5f ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                          │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (you, gone) ┆ 6a7b8c9d ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh) │
+│ (you, gone) ┆ 6a7b8c9d ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: its link failed, the session ended or a restarted relay has no path until it announces, and it may have left) │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ alice       ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                          │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob         ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh) │
+│ bob         ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: its link failed, the session ended or a restarted relay has no path until it announces, and it may have left) │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ bob         ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                                                         │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
@@ -12216,7 +12217,7 @@ mod tests {
 6 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, its last link failed or the session has ended, so it has probably left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it, because its last link failed, the session has ended, or a relay that restarted has no path to it until it announces again, and it may also have left the mesh; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
 
     /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
     #[test]

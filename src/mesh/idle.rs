@@ -10,6 +10,7 @@ use crate::mesh::propagation_fetch::{
 use crate::mesh::request::{RequestError, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
+use log::info;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,9 @@ pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 /// body or filled a page. The last case keeps this wait while fetches deliver something
 /// and doubles it from here while they do not.
 pub(crate) const PROPAGATION_SYNC_SHORT_RETRY: Duration = Duration::from_secs(15);
+/// How often the automatic sync logs that one propagation node stays silent to the list
+/// request. The prompt line is shown only on the first silence of a run.
+const SILENCE_LOG_PERIOD: Duration = Duration::from_secs(60 * 60);
 
 /// Who produced an event, which decides whether flood control applies. `Local` events
 /// come from this process (node lifecycle) and are never rate-limited or folded. `Peer`
@@ -279,6 +283,10 @@ pub(crate) struct SyncSchedule {
     stopped: bool,
     backoff: Option<Duration>,
     last_failure: Option<String>,
+    /// When each node's silence was last logged, keyed by lower-hex destination hash.
+    /// Entries older than `SILENCE_LOG_PERIOD` are dropped before each insert, so the map
+    /// holds at most the nodes that went silent within the last period.
+    silence_logged: BTreeMap<String, Instant>,
 }
 
 impl SyncSchedule {
@@ -295,6 +303,7 @@ impl SyncSchedule {
             stopped: false,
             backoff: None,
             last_failure: None,
+            silence_logged: BTreeMap::new(),
         }
     }
 
@@ -369,6 +378,10 @@ impl SyncSchedule {
     /// each time up to the interval, so a node that lists bodies it never serves, or a
     /// sender that never announces, cannot hold the short cadence. A fetch with nothing
     /// to come back for resets the backoff. Nothing is armed after `mesh_off`.
+    ///
+    /// A node silent to the list request, or whose link closed while it was asked, is also
+    /// logged at INFO, at most once per node per `SILENCE_LOG_PERIOD`, so a node that stays
+    /// silent for days leaves a trace in the log without filling it.
     pub(crate) fn finished(
         &mut self,
         outcome: &Result<FetchReport, FetchError>,
@@ -412,6 +425,12 @@ impl SyncSchedule {
                     short(&node),
                     redact_hashes(&err.to_string())
                 );
+                if matches!(
+                    err,
+                    FetchError::ListUnanswered { .. } | FetchError::ListLinkClosed { .. }
+                ) {
+                    self.log_silence(&node, &text, now);
+                }
                 if self.last_failure.as_deref() == Some(text.as_str()) {
                     None
                 } else {
@@ -424,6 +443,15 @@ impl SyncSchedule {
             self.due_at = Some(now);
         }
         line
+    }
+
+    fn log_silence(&mut self, node: &str, text: &str, now: Instant) {
+        self.silence_logged
+            .retain(|_, at| now.saturating_duration_since(*at) < SILENCE_LOG_PERIOD);
+        if !self.silence_logged.contains_key(node) {
+            self.silence_logged.insert(node.to_string(), now);
+            info!("Propagation {text}");
+        }
     }
 
     fn re_arm(&mut self, now: Instant) {
@@ -1276,6 +1304,103 @@ mod tests {
                 .finished(&link_failure("the relay hung up"), now)
                 .is_some(),
             "a success in between makes the failure news again"
+        );
+    }
+
+    #[test]
+    fn a_silent_node_is_said_once_and_logged_once_per_node_per_hour() {
+        crate::testing::install_log_collector();
+        let node = "5e1e07ce".repeat(4);
+        let other = "0dd5e1e0".repeat(4);
+        let silent = |node: &str| -> Result<FetchReport, FetchError> {
+            Err(FetchError::ListUnanswered {
+                node: short(node).to_string(),
+                after: Duration::from_secs(60),
+            })
+        };
+        let logged = |node: &str| {
+            let marker = format!(
+                "Propagation sync from {0} failed: Propagation node {0} did not answer",
+                short(node)
+            );
+            crate::testing::info_snapshot()
+                .iter()
+                .filter(|line| line.starts_with(&marker))
+                .count()
+        };
+        let start = Instant::now();
+        let mut schedule = SyncSchedule::new(60, true);
+
+        schedule.started(node.clone());
+        let line = schedule
+            .finished(&silent(&node), start)
+            .expect("the first silence is said");
+        assert_eq!(
+            line,
+            "sync from 5e1e07ce failed: Propagation node 5e1e07ce did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced"
+        );
+        assert_eq!(logged(&node), 1);
+
+        for minute in 1..60 {
+            schedule.started(node.clone());
+            assert_eq!(
+                schedule.finished(&silent(&node), start + Duration::from_secs(60 * minute)),
+                None,
+                "only the first silence of a run is said"
+            );
+        }
+        assert_eq!(logged(&node), 1, "nor logged again within the hour");
+
+        schedule.started(node.clone());
+        assert_eq!(
+            schedule.finished(&silent(&node), start + SILENCE_LOG_PERIOD),
+            None
+        );
+        assert_eq!(logged(&node), 2, "an hour on, the silence is logged again");
+
+        schedule.started(other.clone());
+        assert!(
+            schedule
+                .finished(&silent(&other), start + SILENCE_LOG_PERIOD)
+                .is_some(),
+            "another node's silence is its own news"
+        );
+        assert_eq!(logged(&other), 1, "and its own log line");
+        assert_eq!(schedule.silence_logged.len(), 2);
+
+        let closed_node = "c105edc1".repeat(4);
+        let closed = Err(FetchError::ListLinkClosed {
+            node: short(&closed_node).to_string(),
+        });
+        let closed_logged = || {
+            crate::testing::info_snapshot()
+                .iter()
+                .filter(|line| {
+                    line.starts_with(
+                        "Propagation sync from c105edc1 failed: The link to propagation node c105edc1 closed",
+                    )
+                })
+                .count()
+        };
+        for minute in 0..2 {
+            schedule.started(closed_node.clone());
+            schedule.finished(&closed, start + Duration::from_secs(60 * minute));
+        }
+        assert_eq!(
+            closed_logged(),
+            1,
+            "a link that closed under the list request is a silence too, logged once"
+        );
+
+        schedule.started(node.clone());
+        schedule.finished(
+            &link_failure("the relay hung up"),
+            start + SILENCE_LOG_PERIOD,
+        );
+        assert_eq!(
+            logged(&node),
+            2,
+            "a failure that is not silence is not logged as one"
         );
     }
 

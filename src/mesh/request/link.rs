@@ -82,18 +82,6 @@ impl Deadline {
         self.at.saturating_duration_since(Instant::now())
     }
 
-    pub(crate) async fn bound<T>(
-        self,
-        path: &str,
-        wait: impl Future<Output = T>,
-    ) -> Result<T, RequestError> {
-        self.bound_as(wait, |after| RequestError::Timeout {
-            path: path.to_string(),
-            after,
-        })
-        .await
-    }
-
     async fn bound_as<T>(
         self,
         wait: impl Future<Output = T>,
@@ -105,8 +93,8 @@ impl Deadline {
     }
 
     /// For the waits on this node's own link lock and transport, whose expiry says nothing
-    /// about the peer.
-    async fn bound_locally<T>(
+    /// about the peer, such as a fetch's key lookups.
+    pub(crate) async fn bound_locally<T>(
         self,
         path: &str,
         wait: impl Future<Output = T>,

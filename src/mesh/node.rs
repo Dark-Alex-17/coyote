@@ -3666,7 +3666,7 @@ fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
     match greeting {
         ReconnectGreeting::Announced => format!("{label} reconnected; announced"),
         ReconnectGreeting::PastCap => format!(
-            "{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now"
+            "{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
         ),
         ReconnectGreeting::Failed(_) => format!(
             "{label} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log)."
@@ -16988,7 +16988,7 @@ mod tests {
 
         relay = TransportRelay::start_on(port).await;
         let past_cap = format!(
-            "{label} reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now"
+            "{label} reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
         );
         wait_for_mesh_line(&a.notifier, &past_cap).await;
         wait_for_mesh_line(&b.notifier, &past_cap).await;
@@ -17392,8 +17392,8 @@ mod tests {
         }
 
         /// A greeted reconnect says so; past the cap the line says the relay came back
-        /// again, how often, that the heartbeat carries the announce within the hour, and
-        /// the commands that send one now.
+        /// again, how often, that the heartbeat carries the announce within about an hour
+        /// (its period is 3660 s), and the commands that send one now.
         #[test]
         fn the_greeted_and_past_cap_reconnect_lines_read_in_full() {
             let label = "private 127.0.0.1:4242";
@@ -17403,7 +17403,7 @@ mod tests {
             );
             assert_eq!(
                 reconnect_line(label, &ReconnectGreeting::PastCap),
-                "private 127.0.0.1:4242 reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now"
+                "private 127.0.0.1:4242 reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
             );
         }
 
