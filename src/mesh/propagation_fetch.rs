@@ -5425,7 +5425,7 @@ mod tests {
                 packed(&fake.script.seen()[2].data),
                 expected_ack(&[note_id])
             );
-            assert_eq!(inbox_ids(&slot_c), [note.id.clone()]);
+            assert_eq!(inbox_ids(&slot_c), vec![note.id.clone()]);
             assert!(slot_a.correlations().is_open("q-a"));
             let store = FetchStore::load(store_path.clone(), SystemTime::now()).unwrap();
             assert!(store.contains(&note_id));
