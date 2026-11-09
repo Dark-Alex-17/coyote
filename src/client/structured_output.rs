@@ -13,6 +13,15 @@ const DEFAULT_SCHEMA_NAME: &str = "output";
 const MAX_REF_DEPTH: usize = 32;
 const ALLOWS_NULL_BUDGET: usize = 4096;
 const EXPANSION_BUDGET: usize = 1024;
+const UNMODELLED_KEYWORDS: &[&str] = &[
+    "prefixItems",
+    "patternProperties",
+    "if",
+    "dependentRequired",
+    "dependentSchemas",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+];
 
 const OPENAI_STRICT_KEPT: &[&str] = &[
     "type",
@@ -32,6 +41,7 @@ const OPENAI_STRICT_KEPT: &[&str] = &[
     "format",
 ];
 
+// `format`, `minItems` and `allOf` are additionally gated by value in `is_kept`.
 const ANTHROPIC_KEPT: &[&str] = &[
     "type",
     "properties",
@@ -336,16 +346,21 @@ fn type_allows_null(t: &Value) -> bool {
     }
 }
 
-fn resolve_ref<'a>(schema: &'a Value, root: &'a Value, depth: &mut usize) -> Option<&'a Value> {
-    let mut current = schema;
-    while let Some(reference) = current.get("$ref").and_then(Value::as_str) {
-        if *depth >= MAX_REF_DEPTH {
-            return None;
-        }
-        *depth += 1;
-        current = lookup_local_ref(reference, root)?;
+/// Follows one `$ref` hop from `map`. `None` means the reference cannot be
+/// followed (non-local, missing, or past the cycle guard); `Some(None)` means
+/// `map` has no reference at all.
+fn ref_target<'a>(
+    map: &Map<String, Value>,
+    root: &'a Value,
+    chain: usize,
+) -> Option<Option<&'a Value>> {
+    let Some(reference) = map.get("$ref").and_then(Value::as_str) else {
+        return Some(None);
+    };
+    if chain >= MAX_REF_DEPTH {
+        return None;
     }
-    Some(current)
+    lookup_local_ref(reference, root).map(Some)
 }
 
 fn lookup_local_ref<'a>(reference: &str, root: &'a Value) -> Option<&'a Value> {
@@ -360,11 +375,6 @@ fn lookup_local_ref<'a>(reference: &str, root: &'a Value) -> Option<&'a Value> {
     root.get(container)?.get(name)
 }
 
-fn schema_allows_null(schema: &Value, root: &Value) -> bool {
-    let mut budget = ALLOWS_NULL_BUDGET;
-    allows_null(schema, root, 0, &mut budget)
-}
-
 /// Answers `false` only when every keyword that can reject `null` was evaluated
 /// and one of them does; an exhausted budget or an unresolvable reference
 /// answers `true`.
@@ -373,10 +383,9 @@ fn allows_null(schema: &Value, root: &Value, chain: usize, budget: &mut usize) -
         return true;
     }
     *budget -= 1;
-    let mut chain = chain;
-    let map = match resolve_ref(schema, root, &mut chain) {
-        Some(Value::Object(map)) => map,
-        Some(Value::Bool(accepts_anything)) => return *accepts_anything,
+    let map = match schema {
+        Value::Object(map) => map,
+        Value::Bool(accepts_anything) => return *accepts_anything,
         _ => return true,
     };
     if map.contains_key("not") {
@@ -409,7 +418,10 @@ fn allows_null(schema: &Value, root: &Value, chain: usize, budget: &mut usize) -
             return false;
         }
     }
-    true
+    match ref_target(map, root, chain) {
+        Some(Some(target)) => allows_null(target, root, chain + 1, budget),
+        Some(None) | None => true,
+    }
 }
 
 /// The schemas a value must satisfy: every entry of `schemas`, plus one
@@ -455,8 +467,10 @@ fn strip_value<'a>(value: &mut Value, constraint: &Constraint<'a>, root: &'a Val
     }
     match value {
         Value::Object(fields) => {
+            let mut null_budget = ALLOWS_NULL_BUDGET;
             fields.retain(|name, field| {
-                !(field.is_null() && null_field_is_injected(&resolved, name, root))
+                !(field.is_null()
+                    && null_field_is_injected(&resolved, name, root, &mut null_budget))
             });
             for (name, field) in fields.iter_mut() {
                 let child = child_constraint(&resolved, ChildKey::Field(name));
@@ -477,8 +491,13 @@ fn strip_value<'a>(value: &mut Value, constraint: &Constraint<'a>, root: &'a Val
     }
 }
 
-fn null_field_is_injected(resolved: &Resolved<'_>, name: &str, root: &Value) -> bool {
-    !field_required(resolved, name) && field_rejects_null(resolved, name, root)
+fn null_field_is_injected(
+    resolved: &Resolved<'_>,
+    name: &str,
+    root: &Value,
+    budget: &mut usize,
+) -> bool {
+    !field_required(resolved, name) && field_rejects_null(resolved, name, root, budget)
 }
 
 fn field_required(resolved: &Resolved<'_>, name: &str) -> bool {
@@ -492,15 +511,20 @@ fn field_required(resolved: &Resolved<'_>, name: &str) -> bool {
             .any(|alternatives| alternatives.iter().any(|alt| field_required(alt, name)))
 }
 
-fn field_rejects_null(resolved: &Resolved<'_>, name: &str, root: &Value) -> bool {
+fn field_rejects_null(
+    resolved: &Resolved<'_>,
+    name: &str,
+    root: &Value,
+    budget: &mut usize,
+) -> bool {
     resolved.maps.iter().any(|map| {
         map.get("properties")
             .and_then(|properties| properties.get(name))
-            .is_some_and(|property| !schema_allows_null(property, root))
+            .is_some_and(|property| !allows_null(property, root, 0, budget))
     }) || resolved.unions.iter().any(|alternatives| {
         alternatives
             .iter()
-            .all(|alt| field_rejects_null(alt, name, root))
+            .all(|alt| field_rejects_null(alt, name, root, budget))
     })
 }
 
@@ -541,8 +565,9 @@ fn child_schema<'a>(map: &'a Map<String, Value>, key: ChildKey<'_>) -> Option<&'
 }
 
 /// Flattens the schemas that apply to one value. Anything it cannot decide
-/// (an unresolvable reference, no matching union branch, an exhausted budget)
-/// clears `complete`, and the caller then leaves the value untouched.
+/// (an unresolvable reference, no matching union branch, an exhausted budget,
+/// a keyword the walk does not model) clears `complete`, and the caller then
+/// leaves the value untouched.
 struct Expansion<'a> {
     root: &'a Value,
     budget: usize,
@@ -583,15 +608,13 @@ impl<'a> Expansion<'a> {
             return;
         }
         self.budget -= 1;
-        let mut chain = chain;
-        let map = match resolve_ref(schema, self.root, &mut chain) {
-            Some(Value::Object(map)) => map,
-            Some(_) => return,
-            None => {
-                self.complete = false;
-                return;
-            }
+        let Value::Object(map) = schema else {
+            return;
         };
+        if UNMODELLED_KEYWORDS.iter().any(|key| map.contains_key(*key)) {
+            self.complete = false;
+            return;
+        }
         out.maps.push(map);
         if let Some(Value::Array(entries)) = map.get("allOf") {
             for entry in entries {
@@ -618,6 +641,11 @@ impl<'a> Expansion<'a> {
                 }
             }
         }
+        match ref_target(map, self.root, chain) {
+            Some(Some(target)) => self.schema(target, chain + 1, kind, value, out),
+            Some(None) => {}
+            None => self.complete = false,
+        }
     }
 
     /// Branches that may describe `value`: the right shape, and no
@@ -631,18 +659,23 @@ impl<'a> Expansion<'a> {
     ) -> Vec<&'a Value> {
         branches
             .iter()
-            .filter(|branch| {
-                let mut chain = chain;
-                match resolve_ref(branch, self.root, &mut chain) {
-                    Some(Value::Object(map)) => {
-                        branch_shape_matches(map, kind) && discriminators_match(map, value)
-                    }
-                    Some(Value::Bool(accepts_anything)) => *accepts_anything,
-                    Some(_) => false,
-                    None => true,
-                }
-            })
+            .filter(|branch| self.may_describe(branch, chain, kind, value))
             .collect()
+    }
+
+    fn may_describe(&self, branch: &Value, chain: usize, kind: ValueKind, value: &Value) -> bool {
+        let map = match branch {
+            Value::Object(map) => map,
+            Value::Bool(accepts_anything) => return *accepts_anything,
+            _ => return false,
+        };
+        if !branch_shape_matches(map, kind) || !discriminators_match(map, value) {
+            return false;
+        }
+        match ref_target(map, self.root, chain) {
+            Some(Some(target)) => self.may_describe(target, chain + 1, kind, value),
+            Some(None) | None => true,
+        }
     }
 }
 
@@ -660,6 +693,7 @@ fn discriminators_match(map: &Map<String, Value>, value: &Value) -> bool {
     };
     properties.iter().all(
         |(name, property)| match (discriminator(property), value.get(name)) {
+            (Some(_), Some(Value::Null)) => true,
             (Some(expected), Some(actual)) => expected == actual,
             _ => true,
         },
@@ -714,18 +748,12 @@ fn branch_kind(map: &Map<String, Value>) -> BranchKind<'_> {
         Some(Value::Array(types)) => types.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
-    if !types.is_empty() {
-        if types.iter().all(|t| *t == "null") {
-            return BranchKind::NullOnly;
-        }
-        return BranchKind::Typed(types);
-    }
-    if map.contains_key("properties") || map.contains_key("additionalProperties") {
-        BranchKind::Typed(vec!["object"])
-    } else if map.contains_key("items") {
-        BranchKind::Typed(vec!["array"])
-    } else {
+    if types.is_empty() {
         BranchKind::Unknown
+    } else if types.iter().all(|t| *t == "null") {
+        BranchKind::NullOnly
+    } else {
+        BranchKind::Typed(types)
     }
 }
 
@@ -1577,6 +1605,87 @@ mod tests {
             converted["properties"]["choice"],
             json!({ "enum": ["a", null] })
         );
+    }
+
+    #[test]
+    fn strip_injected_nulls_null_discriminator_does_not_exclude_a_branch() {
+        let schema = json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "const": "a" },
+                        "x": { "type": ["string", "null"] }
+                    }
+                },
+                { "type": "object", "properties": { "x": { "type": "string" } } }
+            ]
+        });
+        let mut value = json!({ "kind": null, "x": null });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!({ "kind": null, "x": null }));
+    }
+
+    #[test]
+    fn strip_injected_nulls_merges_ref_sibling_required() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "inner": { "$ref": "#/$defs/x", "required": ["note"] } },
+            "required": ["inner"],
+            "$defs": {
+                "x": {
+                    "type": "object",
+                    "properties": { "note": { "type": "string" } }
+                }
+            }
+        });
+        let mut value = json!({ "inner": { "note": null } });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!({ "inner": { "note": null } }));
+    }
+
+    #[test]
+    fn strip_injected_nulls_keeps_nulls_under_prefix_items() {
+        let element = json!({ "type": "object", "properties": { "a": { "type": "string" } } });
+        let schema = json!({ "type": "array", "prefixItems": [element], "items": element });
+        let mut value = json!([{ "a": null }, { "a": null }]);
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!([{ "a": null }, { "a": null }]));
+    }
+
+    #[test]
+    fn strip_injected_nulls_keeps_nulls_under_pattern_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" } },
+            "patternProperties": { "^a$": { "type": ["string", "null"] } }
+        });
+        let mut value = json!({ "a": null });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!({ "a": null }));
+    }
+
+    #[test]
+    fn strip_injected_nulls_treats_untyped_branches_as_any_kind() {
+        let schema = json!({
+            "oneOf": [
+                { "items": { "type": "string" } },
+                { "type": "object", "properties": { "a": { "type": "string" } } }
+            ]
+        });
+        let mut value = json!({ "a": null });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!({ "a": null }));
     }
 
     #[test]
