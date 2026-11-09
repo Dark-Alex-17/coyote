@@ -921,7 +921,7 @@ fn usage_probe_launch_steps_follow_the_order_of_launch() {
         "create_sandbox(",
         "copy_host_files(",
         "warn_if_mixin_drifted(",
-        "exec_run(",
+        "exec_coyote(",
     ];
     for pair in order.windows(2) {
         assert!(
@@ -1889,52 +1889,90 @@ fn usage_probe_other_pages_name_the_shipped_kits_by_their_dirs() {
 }
 
 #[test]
-fn usage_probe_unattended_page_runs_headless_through_sbx_run() {
-    let run: Vec<String> = string_literals(&fn_body(&src(&["sandbox", "mod.rs"]), "fn run_args("))
-        .into_iter()
-        .filter(|(_, after)| after.starts_with(".to_string()"))
-        .map(|(literal, _)| literal)
-        .collect();
-    assert_eq!(run, ["run", "--name"]);
+fn usage_probe_unattended_page_runs_headless_through_the_sandbox_flag() {
+    let sandbox = clap_long("sandbox");
+    assert!(
+        src(&["cli", "mod.rs"]).contains("\n    pub sandbox_name: Option<String>,"),
+        "the CLI declares sandbox_name, which clap spells --sandbox-name"
+    );
+    let sandbox_name = "--sandbox-name";
     let headless = clap_long("headless");
     let file = clap_short("file");
     let acp = clap_long("acp_server");
     assert_eq!(
-        (headless.as_str(), file.as_str(), acp.as_str()),
-        ("--headless", "-f", "--acp-server")
+        (
+            sandbox.as_str(),
+            sandbox_name,
+            headless.as_str(),
+            file.as_str(),
+            acp.as_str()
+        ),
+        (
+            "--sandbox",
+            "--sandbox-name",
+            "--headless",
+            "-f",
+            "--acp-server"
+        )
     );
-    let pty = fn_body(&src(&["sandbox", "live_tests.rs"]), "fn sbx_run_under_pty(");
+    let source = src(&["sandbox", "mod.rs"]);
+    let split = fn_body(&source, "pub fn split_sandbox_args(");
     assert!(
-        pty.contains("super::run_args(name)") && pty.contains("inner.push(\"--\")"),
-        "the live run hands agent args to coyote after `--`:\n{pty}"
+        split.contains(&format!("\"{sandbox}\"")) && split.contains(&format!("\"{sandbox_name}\"")),
+        "the host consumes {sandbox} and {sandbox_name} and forwards the rest:\n{split}"
+    );
+    let interactive = fn_body(&source, "fn is_interactive(");
+    assert!(
+        interactive.contains(&format!("\"{headless}\""))
+            && interactive.contains(&format!("\"{acp}\"")),
+        "{headless} and {acp} take the sbx exec path:\n{interactive}"
     );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Unattended-Mode.md"));
     let recipe = section(&page, "# Headless Coyote inside a sandbox");
-    let prefix = format!("sbx {} {} ", run[0], run[1]);
-    let run_lines: Vec<&str> = recipe
+    let prefix = format!("coyote {sandbox} {sandbox_name} ");
+    let launch_lines: Vec<&str> = recipe
         .lines()
         .filter(|line| line.starts_with(&prefix))
         .collect();
     assert!(
-        run_lines
+        launch_lines
             .iter()
-            .any(|line| line.contains(&format!(" -- {headless} {file} "))),
-        "the recipe runs `{prefix}<name> -- {headless} {file} <prompt file>`: {run_lines:?}"
+            .any(|line| line.contains(&format!(" {headless} {file} "))),
+        "the recipe runs `{prefix}<name> {headless} {file} <prompt file>`: {launch_lines:?}"
     );
     assert!(
-        run_lines
+        launch_lines
             .iter()
-            .any(|line| line.ends_with(&format!(" -- {acp}"))),
-        "the recipe runs `{prefix}<name> -- {acp}`: {run_lines:?}"
+            .any(|line| line.ends_with(&format!(" {acp}"))),
+        "the recipe runs `{prefix}<name> {acp}`: {launch_lines:?}"
     );
-    for line in page.lines().filter(|line| line.starts_with("sbx run")) {
-        assert!(
-            line.starts_with(&prefix),
-            "every sbx run command names the sandbox with {}: {line}",
-            run[1]
-        );
+    assert!(
+        !recipe.lines().any(|line| line.starts_with("sbx run")),
+        "the recipe launches through coyote, not a hand-written sbx run"
+    );
+}
+
+/// `--sandbox` takes no value, so a word right after it on any page is the
+/// retired positional sandbox name.
+#[test]
+fn usage_probe_no_page_passes_the_sandbox_name_positionally() {
+    let sandbox = clap_long("sandbox");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let needle = format!("coyote {sandbox} ");
+    for path in wiki_pages(&wiki) {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        for line in read(&path).lines() {
+            for (at, _) in line.match_indices(&needle) {
+                let next = line[at + needle.len()..].trim_start_matches('[');
+                assert!(
+                    next.starts_with('-'),
+                    "{file} passes a positional sandbox name: {line}"
+                );
+            }
+        }
     }
 }
 
