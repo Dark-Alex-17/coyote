@@ -53,8 +53,8 @@ use crate::supervisor::notification::NotificationQueue;
 use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
-    AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
+    AbortSignal, OutputSink, UserInterrupt, abortable_run_with_spinner, create_abort_signal,
+    edit_file, estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -6927,7 +6927,7 @@ impl RequestContext {
             bail!("Loaded skill '{name}' but failed to refresh tool scope: {e}");
         }
 
-        println!("✓ Loaded skill '{name}'.");
+        OutputSink::when_json(OutputSink::Stderr).println(format_args!("✓ Loaded skill '{name}'."));
         Ok(())
     }
 

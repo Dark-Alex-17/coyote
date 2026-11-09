@@ -448,6 +448,9 @@ async fn run(
         let name = &skills[0];
         paths::validate_skill_name(name)?;
         if !paths::has_skill(name) {
+            if JSON_OUTPUT.load(Ordering::SeqCst) {
+                bail!("Skill '{name}' is not installed");
+            }
             let app = Arc::clone(&ctx.app.config);
             ctx.upsert_skill(app.as_ref(), name)?;
             return Ok(());

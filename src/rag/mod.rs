@@ -607,7 +607,7 @@ impl Rag {
                     data.vectors = duck.read_all_vectors()?;
                 }
                 if data.vectors.is_empty() && !data.files.is_empty() {
-                    println!(
+                    OutputSink::when_json(OutputSink::Stderr).println(format_args!(
                         "{} RAG '{name}' lists {} indexed file(s), but its vector store \
                          '{}' holds no vectors, so every search will return nothing. A \
                          duckdb RAG is two files: bring the .duckdb sidecar along with \
@@ -615,7 +615,7 @@ impl Rag {
                         warning_text("WARNING:"),
                         data.files.len(),
                         db_path.display()
-                    );
+                    ));
                 }
                 // data.files is always populated for duckdb, so build_bm25() is the only
                 // path; there is no from-DuckDB fallback.

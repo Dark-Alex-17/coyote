@@ -332,12 +332,9 @@ pub async fn eval_tool_calls(
     for (idx, call) in calls.into_iter().enumerate() {
         if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
             let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", msg.trim());
-            println!(
-                "{}",
-                muted_warning_text(
-                    format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name).as_str()
-                )
-            );
+            OutputSink::when_json(OutputSink::Stderr).println(muted_warning_text(
+                format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name).as_str(),
+            ));
             indexed_results.push((idx, ToolResult::new(call, json!(dup_msg))));
         } else {
             to_execute.push((idx, call));
@@ -686,7 +683,8 @@ impl Functions {
             .context("failed to write merged mcp.json")?;
 
         if !added.is_empty() {
-            println!("  + new MCP servers: {}", added.join(", "));
+            OutputSink::when_json(OutputSink::Stderr)
+                .println(format_args!("  + new MCP servers: {}", added.join(", ")));
         }
 
         Ok(())
@@ -1548,10 +1546,11 @@ impl ToolCall {
             && ctx.current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            println!(
-                "{}",
-                format_call_log(cmd_name, &[json_data.to_string()], &json_data)
-            );
+            OutputSink::when_json(OutputSink::Suppressed).println(format_call_log(
+                cmd_name,
+                &[json_data.to_string()],
+                &json_data,
+            ));
         }
         let result = if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) {
             Self::search_mcp_tools(ctx, cmd_name, &json_data)
@@ -1657,7 +1656,8 @@ impl ToolCall {
             && current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            println!("{}", format_call_log(&cmd_name, &cmd_args, &json_data));
+            OutputSink::when_json(OutputSink::Suppressed)
+                .println(format_call_log(&cmd_name, &cmd_args, &json_data));
         }
 
         hooks::fire(
@@ -2716,10 +2716,11 @@ pub fn run_llm_function(
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
 
+    let relay = OutputSink::when_json(OutputSink::Stderr);
     let stdout_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stdout;
-        let mut out = io::stdout();
+        let mut out = relay.writer();
         let mut buf = Vec::new();
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {

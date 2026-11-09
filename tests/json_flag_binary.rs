@@ -14,6 +14,7 @@ use std::{env, process};
 use serde_json::{Value, json};
 
 const REPLY: &str = "**hello** from the stub";
+const TOOL: &str = "agent__list_sessions";
 
 struct TempDir(PathBuf);
 
@@ -42,11 +43,14 @@ impl Drop for TempDir {
 enum Behaviour {
     Answer,
     ServerError,
+    /// Calls `TOOL` until a request carries a tool result, then answers.
+    CallToolThenAnswer,
 }
 
-/// A loopback chat-completions server that answers every request the same
-/// way: `REPLY` as a plain or SSE completion (matching the request's
-/// `stream` field), or an HTTP 500. One connection per request.
+/// A loopback chat-completions server that answers each request by its
+/// `behaviour`: `REPLY` as a plain or SSE completion (matching the request's
+/// `stream` field), an HTTP 500, or a plain tool call. One connection per
+/// request.
 fn serve(behaviour: Behaviour) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -56,8 +60,11 @@ fn serve(behaviour: Behaviour) -> u16 {
             let Some(body) = read_request_body(&mut stream) else {
                 continue;
             };
-            let streaming = serde_json::from_str::<Value>(&body)
-                .is_ok_and(|request| request["stream"] == json!(true));
+            let request = serde_json::from_str::<Value>(&body).unwrap_or_default();
+            let streaming = request["stream"] == json!(true);
+            let has_tool_result = request["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"));
             let (status, content_type, payload) = match behaviour {
                 Behaviour::ServerError => (
                     "500 Internal Server Error",
@@ -65,8 +72,15 @@ fn serve(behaviour: Behaviour) -> u16 {
                     json!({ "error": { "message": "stub exploded", "type": "server_error" } })
                         .to_string(),
                 ),
-                Behaviour::Answer if streaming => ("200 OK", "text/event-stream", sse_completion()),
-                Behaviour::Answer => ("200 OK", "application/json", plain_completion()),
+                Behaviour::CallToolThenAnswer if !has_tool_result => {
+                    ("200 OK", "application/json", tool_call_completion())
+                }
+                Behaviour::Answer | Behaviour::CallToolThenAnswer if streaming => {
+                    ("200 OK", "text/event-stream", sse_completion())
+                }
+                Behaviour::Answer | Behaviour::CallToolThenAnswer => {
+                    ("200 OK", "application/json", plain_completion())
+                }
             };
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -124,6 +138,30 @@ fn plain_completion() -> String {
     .to_string()
 }
 
+fn tool_call_completion() -> String {
+    json!({
+        "id": "stub",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "stub-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": { "name": TOOL, "arguments": "{}" }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    })
+    .to_string()
+}
+
 fn sse_completion() -> String {
     let chunk = |delta: Value, finish: Value| {
         json!({
@@ -163,6 +201,7 @@ fn write_config(dir: &Path, port: u16, stream: bool) {
              \x20   models:\n\
              \x20     - name: stub-model\n\
              \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
              save: false\n\
              memory: false\n\
              stream: {stream}\n",
@@ -173,14 +212,15 @@ fn write_config(dir: &Path, port: u16, stream: bool) {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
-    run_with_stdin(dir, args, None)
+    run_with_stdin(dir, args, None, &[])
 }
 
-fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
+fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .args(args)
         .current_dir(dir)
+        .envs(envs.iter().copied())
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
         .env("HOME", &home)
@@ -434,7 +474,7 @@ fn a_stream_without_usage_reports_every_usage_field_as_null() {
 fn a_prompt_piped_on_stdin_is_enough() {
     let dir = TempDir::new("stdin");
     write_config(&dir.0, serve(Behaviour::Answer), false);
-    let output = run_with_stdin(&dir.0, &["--json"], Some("hi from stdin\n"));
+    let output = run_with_stdin(&dir.0, &["--json"], Some("hi from stdin\n"), &[]);
 
     assert!(output.status.success(), "{}", combined(&output));
     let report = the_only_object(&output);
@@ -517,4 +557,105 @@ fn stdout_printing_flags_are_rejected_alongside_json_before_anything_runs() {
         assert!(output.stdout.is_empty(), "{flag:?}\n{}", combined(&output));
     }
     assert!(!dir.0.join("COYOTE.md").exists(), "--init-instructions ran");
+}
+
+// ---- stray writers: tool calls, first-time setup, skills ----
+
+/// An agent allowed to spawn children, so `TOOL` is declared to the model.
+fn write_tool_agent(dir: &Path) {
+    let agent_dir = dir.join("agents").join("lister");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        "name: lister\n\
+         model: stub:stub-model\n\
+         instructions: You keep an eye on child sessions.\n\
+         can_spawn_agents: true\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_tool_call_log_never_reaches_stdout() {
+    let dir = TempDir::new("tool-call");
+    write_config(&dir.0, serve(Behaviour::CallToolThenAnswer), false);
+    write_tool_agent(&dir.0);
+    let show_tool_calls = [("COYOTE_SHOW_TOOL_CALLS", "true")];
+
+    let plain = run_with_stdin(&dir.0, &["-a", "lister", "hi"], None, &show_tool_calls);
+    assert!(plain.status.success(), "{}", combined(&plain));
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains(&format!("Call {TOOL}")),
+        "without --json the call log is on stdout:\n{}",
+        combined(&plain)
+    );
+
+    let output = run_with_stdin(
+        &dir.0,
+        &["--json", "-a", "lister", "hi"],
+        None,
+        &show_tool_calls,
+    );
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!(REPLY), "{report}");
+    assert_eq!(report["num_turns"], json!(2), "{report}");
+}
+
+#[test]
+fn an_unknown_rag_fails_before_the_run_without_setting_one_up() {
+    let dir = TempDir::new("new-rag");
+    write_config(&dir.0, serve(Behaviour::Answer), false);
+
+    let output = run(&dir.0, &["--json", "--rag", "fresh", "hi"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
+    assert!(output.stdout.is_empty(), "{}", combined(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Unknown RAG 'fresh'"),
+        "{}",
+        combined(&output)
+    );
+    assert!(!dir.0.join("rags").join("fresh.yaml").exists());
+}
+
+#[test]
+fn a_missing_skill_fails_on_stderr_without_creating_it() {
+    let dir = TempDir::new("missing-skill");
+    write_config(&dir.0, serve(Behaviour::Answer), false);
+
+    let output = run(&dir.0, &["--json", "--skill", "absent", "hi"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
+    assert!(output.stdout.is_empty(), "{}", combined(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Skill 'absent' is not installed"),
+        "{}",
+        combined(&output)
+    );
+    assert!(!dir.0.join("skills").join("absent").exists());
+}
+
+#[test]
+fn loading_an_installed_skill_leaves_stdout_to_the_object() {
+    let dir = TempDir::new("skill");
+    write_config(&dir.0, serve(Behaviour::Answer), false);
+    let skill_dir = dir.0.join("skills").join("helper");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\ndescription: Helps.\n---\nBe helpful.\n",
+    )
+    .unwrap();
+
+    let output = run(&dir.0, &["--json", "--skill", "helper", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(the_only_object(&output)["result"], json!(REPLY));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Loaded skill 'helper'"),
+        "{}",
+        combined(&output)
+    );
 }

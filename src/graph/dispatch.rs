@@ -6,7 +6,7 @@ use super::{
 };
 use crate::config::paths;
 use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
-use crate::utils::{AbortSignal, render_image_slots, strip_image_slots};
+use crate::utils::{AbortSignal, OutputSink, render_image_slots, strip_image_slots};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use log::info;
@@ -237,7 +237,7 @@ pub async fn run_graph_turn(
         None => route::classify(ctx, &graph, &block, &record_prompt, &abort, runner).await?,
     };
     ctx.set_last_graph_branch(branch, forced.is_some());
-    println!("{}", route::routing_line(branch));
+    OutputSink::when_json(OutputSink::Stderr).println(route::routing_line(branch));
     match branch {
         Branch::Run => {
             let previous_turns = previous_turns_for(ctx);
