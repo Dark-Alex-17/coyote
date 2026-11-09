@@ -16420,12 +16420,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
         }
 
-        /// A propagation node that refused, did not answer, or whose link closed under the
-        /// list request ends `.mesh sync` as an error carrying the fetch's own line; a sync
-        /// already running is a notice, not an error.
+        /// A propagation node that refused, brought no link up, did not answer, or whose
+        /// link closed under the list request ends `.mesh sync` as an error carrying the
+        /// fetch's own line; a sync already running is a notice, not an error.
         #[test]
         fn sync_ends_in_the_fetchs_own_error_for_a_node_that_refused_or_did_not_answer() {
             for err in [
+                FetchError::ListLinkTimeout {
+                    node: "9af2fd91".to_string(),
+                    after: std::time::Duration::from_secs(10),
+                    retry_every: None,
+                },
                 FetchError::ListUnanswered {
                     node: "9af2fd91".to_string(),
                     after: std::time::Duration::from_secs(60),

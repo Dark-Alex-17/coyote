@@ -135,12 +135,14 @@ pub(crate) const REQUIRED_DELIVERY_STAMP_COST: u32 = 0;
 type TransientId = [u8; 32];
 
 /// `path_requested` says the caller already sent a path request for the node during this
-/// fetch, so a link that finds no path fails without asking again.
+/// fetch, so a link that finds no path fails without asking again. `retry_every` is the
+/// automatic sync's interval, `None` while it is off, for the errors that name the retry.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchOptions {
     pub link_timeout: Duration,
     pub request_timeout: Duration,
     pub path_requested: bool,
+    pub retry_every: Option<Duration>,
 }
 
 impl Default for FetchOptions {
@@ -149,6 +151,7 @@ impl Default for FetchOptions {
             link_timeout: DEFAULT_LINK_TIMEOUT,
             request_timeout: FETCH_REQUEST_TIMEOUT,
             path_requested: false,
+            retry_every: None,
         }
     }
 }
@@ -167,6 +170,14 @@ pub(crate) enum FetchError {
     Cancelled,
     /// Link establishment, a send, a bounded wait or the link request failed.
     Link(RequestError),
+    /// No link to the node came up within `after`, so it was never asked for its list.
+    /// `retry_every` is the automatic sync's interval, `None` while it is off. The node may
+    /// be restarting, so unlike a peer's this says nothing of it having left the mesh.
+    ListLinkTimeout {
+        node: String,
+        after: Duration,
+        retry_every: Option<Duration>,
+    },
     /// Round 1, the request for the node's message list, reached the node whole on an
     /// active link and nothing of an answer came back within `after`. A node that does not
     /// allow this identity answers `ERROR_NO_ACCESS` rather than staying silent
@@ -237,7 +248,46 @@ impl fmt::Display for FetchError {
                 "This node's own mesh transport did not finish its part of the sync within {}, handing a request to the link or looking up a sender's key, so this says nothing about the propagation node; .mesh sync tries again",
                 seconds(*after)
             ),
+            Self::Link(RequestError::IdentifyTimeout { after, .. }) => write!(
+                f,
+                "This node could not prove its identity to the propagation node within {}, so the node was never asked for its messages; .mesh sync tries again",
+                seconds(*after)
+            ),
+            Self::Link(RequestError::ResponseIncomplete { after, .. }) => write!(
+                f,
+                "The propagation node started to answer, but the answer had not finished arriving within {}, so the way to it is slow or broke; .mesh sync tries again",
+                seconds(*after)
+            ),
+            Self::Link(RequestError::RequestIncomplete { after, .. }) => write!(
+                f,
+                "The request to the propagation node was too large for one packet, and its upload had not finished within {}, so the node never had all of it to answer; .mesh sync tries again",
+                seconds(*after)
+            ),
+            Self::Link(RequestError::ResponseOversize { max }) => write!(
+                f,
+                "The propagation node answered with more than the {max} bytes this sync allows, so the answer was dropped; if .mesh sync meets the same answer, the node is not keeping to the size it was asked for"
+            ),
             Self::Link(err) => write!(f, "{err}"),
+            Self::ListLinkTimeout {
+                node,
+                after,
+                retry_every,
+            } => {
+                write!(
+                    f,
+                    "Propagation node {node} did not bring a link up within {}; it may be restarting or out of reach. ",
+                    seconds(*after)
+                )?;
+                match retry_every {
+                    Some(every) => write!(
+                        f,
+                        "The automatic sync retries every {}, or run .mesh sync again",
+                        seconds(*every)
+                    )?,
+                    None => f.write_str("Run .mesh sync again")?,
+                }
+                f.write_str("; .mesh info shows when it announces again")
+            }
             Self::ListUnanswered { node, after } => write!(
                 f,
                 "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced",
@@ -345,9 +395,20 @@ impl FetchLock {
 }
 
 /// A link request failure as the fetch reports it: the two refusals the reference
-/// distinguishes (`LXMRouter.py:1508-1518`) become their own errors with their remedies.
-fn link_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
+/// distinguishes (`LXMRouter.py:1508-1518`) become their own errors with their remedies,
+/// as does a link that never came up, which names the node and when the sync retries.
+fn link_error(
+    err: RequestError,
+    node: &str,
+    identity_hash: &str,
+    retry_every: Option<Duration>,
+) -> FetchError {
     match err {
+        RequestError::LinkActivationTimeout { after, .. } => FetchError::ListLinkTimeout {
+            node: node.to_string(),
+            after,
+            retry_every,
+        },
         RequestError::Refused(RefusalCode::NoIdentity) => FetchError::NodeSawNoIdentity {
             node: node.to_string(),
         },
@@ -364,7 +425,12 @@ fn link_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError 
 /// the link closing under it, are their own errors, anything else is `link_error`'s. Logged
 /// here, since a refusal or a silence otherwise leaves the request's send as the last line
 /// of the fetch.
-fn round_one_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
+fn round_one_error(
+    err: RequestError,
+    node: &str,
+    identity_hash: &str,
+    retry_every: Option<Duration>,
+) -> FetchError {
     let err = match err {
         RequestError::Timeout { after, .. } => FetchError::ListUnanswered {
             node: node.to_string(),
@@ -373,7 +439,7 @@ fn round_one_error(err: RequestError, node: &str, identity_hash: &str) -> FetchE
         RequestError::LinkClosed => FetchError::ListLinkClosed {
             node: node.to_string(),
         },
-        other => link_error(other, node, identity_hash),
+        other => link_error(other, node, identity_hash, retry_every),
     };
     debug!(
         "Propagation fetch from {node}: round 1 ended without a list: {}",
@@ -385,8 +451,13 @@ fn round_one_error(err: RequestError, node: &str, identity_hash: &str) -> FetchE
 /// `link_error` for every failure that ends the fetch outside round 1, logged for the
 /// reason `round_one_error` logs: the request's send would otherwise be the fetch's last
 /// line.
-fn fetch_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
-    let err = link_error(err, node, identity_hash);
+fn fetch_error(
+    err: RequestError,
+    node: &str,
+    identity_hash: &str,
+    retry_every: Option<Duration>,
+) -> FetchError {
+    let err = link_error(err, node, identity_hash, retry_every);
     debug!(
         "Propagation fetch from {node}: ended on an error: {}",
         redact_hashes(&err.to_string())
@@ -1686,7 +1757,8 @@ pub(crate) async fn fetch(
     let node_hex = node.destination.address_hash.to_hex_string();
     let node_short = short(&node_hex);
     let identity_hex = identity.as_identity().address_hash.to_hex_string();
-    let failed = |err: RequestError| fetch_error(err, node_short, &identity_hex);
+    let failed =
+        |err: RequestError| fetch_error(err, node_short, &identity_hex, options.retry_every);
     let mut report = FetchReport::new(node_hex.clone());
 
     if let Some(cursor) = store.cursor() {
@@ -1724,7 +1796,7 @@ pub(crate) async fn fetch(
             list_request(),
             options.request_timeout,
         ),
-        |err| round_one_error(err, node_short, &identity_hex),
+        |err| round_one_error(err, node_short, &identity_hex, options.retry_every),
     )
     .await?;
     let ids = parse_listed_ids(listed)?;
@@ -1919,7 +1991,7 @@ mod tests {
     };
     use crate::mesh::knocks::KnockCache;
     use crate::mesh::message::{
-        OutboundPeer, PeerKind, PeerRouting, PeerSurface, peer_lxmf_message,
+        OutboundPeer, PeerKind, PeerRouting, PeerSurface, left_mesh_hint_when, peer_lxmf_message,
     };
     use crate::mesh::node::MeshSlot;
     use crate::mesh::peers::PeerSighting;
@@ -3436,8 +3508,14 @@ mod tests {
             RequestError::Refused(RefusalCode::NoIdentity),
             "node1",
             "id1",
+            None,
         );
-        let no_access = link_error(RequestError::Refused(RefusalCode::NoAccess), "node1", "id1");
+        let no_access = link_error(
+            RequestError::Refused(RefusalCode::NoAccess),
+            "node1",
+            "id1",
+            None,
+        );
         assert_eq!(
             no_identity,
             FetchError::NodeSawNoIdentity {
@@ -3456,11 +3534,16 @@ mod tests {
         assert!(no_access.to_string().contains("auth_required"));
         assert!(no_access.to_string().contains("id1"));
         assert_eq!(
-            link_error(RequestError::Refused(RefusalCode::Throttled), "n", "i"),
+            link_error(
+                RequestError::Refused(RefusalCode::Throttled),
+                "n",
+                "i",
+                None
+            ),
             FetchError::NodeRefused(RefusalCode::Throttled)
         );
         assert_eq!(
-            link_error(RequestError::LinkClosed, "n", "i"),
+            link_error(RequestError::LinkClosed, "n", "i", None),
             FetchError::Link(RequestError::LinkClosed)
         );
     }
@@ -3474,6 +3557,7 @@ mod tests {
             },
             "9af2fd91",
             "id1",
+            None,
         );
         assert_eq!(
             silent,
@@ -3487,14 +3571,14 @@ mod tests {
             "Propagation node 9af2fd91 did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced"
         );
         assert_eq!(
-            round_one_error(RequestError::Refused(RefusalCode::NoAccess), "n", "i"),
+            round_one_error(RequestError::Refused(RefusalCode::NoAccess), "n", "i", None),
             FetchError::NodeRefusedAccess {
                 node: "n".to_string(),
                 identity_hash: "i".to_string(),
             },
             "a refusal is the node answering, not its silence"
         );
-        let closed = round_one_error(RequestError::LinkClosed, "9af2fd91", "id1");
+        let closed = round_one_error(RequestError::LinkClosed, "9af2fd91", "id1", None);
         assert_eq!(
             closed,
             FetchError::ListLinkClosed {
@@ -3521,7 +3605,7 @@ mod tests {
             RequestError::LinkFailed("the relay hung up".to_string()),
         ] {
             assert_eq!(
-                round_one_error(not_silence.clone(), "n", "i"),
+                round_one_error(not_silence.clone(), "n", "i", None),
                 FetchError::Link(not_silence)
             );
         }
@@ -3540,6 +3624,115 @@ mod tests {
         );
         assert!(!text.contains("did not answer"), "{text}");
         assert_eq!(seconds(Duration::from_millis(1500)), "1.5 s");
+    }
+
+    #[test]
+    fn a_link_that_never_came_up_names_the_node_and_when_the_sync_retries() {
+        let never_linked = RequestError::LinkActivationTimeout {
+            path: GET_PATH.to_string(),
+            after: Duration::from_secs(10),
+            recently_seen: true,
+        };
+        let every = Some(Duration::from_secs(300));
+        let err = fetch_error(never_linked.clone(), "9af2fd91", "id1", every);
+        assert_eq!(
+            err,
+            FetchError::ListLinkTimeout {
+                node: "9af2fd91".to_string(),
+                after: Duration::from_secs(10),
+                retry_every: every,
+            }
+        );
+        assert_eq!(
+            round_one_error(never_linked.clone(), "9af2fd91", "id1", every),
+            err,
+            "a link that never came up reads the same wherever the fetch was"
+        );
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "Propagation node 9af2fd91 did not bring a link up within 10 s; it may be restarting or out of reach. The automatic sync retries every 300 s, or run .mesh sync again; .mesh info shows when it announces again"
+        );
+        assert!(!text.contains("No mesh link to the peer"), "{text}");
+        let farewell = left_mesh_hint_when(true).trim().trim_end_matches('.');
+        assert!(!farewell.is_empty());
+        assert!(!text.contains(farewell), "{text}");
+
+        let manual = fetch_error(never_linked, "9af2fd91", "id1", None).to_string();
+        assert_eq!(
+            manual,
+            "Propagation node 9af2fd91 did not bring a link up within 10 s; it may be restarting or out of reach. Run .mesh sync again; .mesh info shows when it announces again"
+        );
+        assert!(!manual.contains("automatic"), "{manual}");
+    }
+
+    #[test]
+    fn no_fetch_error_calls_the_propagation_node_a_peer() {
+        let after = Duration::from_secs(10);
+        let path = GET_PATH.to_string();
+        let mut failures = vec![
+            RequestError::Timeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::LinkActivationTimeout {
+                path: path.clone(),
+                after,
+                recently_seen: true,
+            },
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete {
+                path: path.clone(),
+                after,
+            },
+            RequestError::RequestIncomplete {
+                path: path.clone(),
+                after,
+            },
+            RequestError::LinkFailed("request not sent".to_string()),
+            RequestError::LinkNotOpened("no known path to destination 00".to_string()),
+            RequestError::LinkClosed,
+            RequestError::Oversize { len: 2, max: 1 },
+            RequestError::ResponseOversize { max: 1 },
+            RequestError::Decode("short".to_string()),
+            RequestError::Send("refused".to_string()),
+            RequestError::UnsupportedVersion {
+                found: None,
+                min: 1,
+                max: 1,
+            },
+            RequestError::NotRunning,
+            RequestError::Shutdown,
+        ];
+        failures.extend(
+            [
+                RefusalCode::NoIdentity,
+                RefusalCode::NoAccess,
+                RefusalCode::InvalidKey,
+                RefusalCode::InvalidData,
+                RefusalCode::InvalidStamp,
+                RefusalCode::Throttled,
+                RefusalCode::NotFound,
+                RefusalCode::Timeout,
+            ]
+            .map(RequestError::Refused),
+        );
+        for failure in failures {
+            for err in [
+                fetch_error(failure.clone(), "9af2fd91", "id1", None),
+                round_one_error(failure.clone(), "9af2fd91", "id1", None),
+            ] {
+                let text = err.to_string().to_lowercase();
+                assert!(!text.contains("peer"), "{failure:?}: {text}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -4291,6 +4484,7 @@ mod tests {
                     link_timeout: DEFAULT_LINK_TIMEOUT,
                     request_timeout,
                     path_requested: false,
+                    retry_every: None,
                 };
                 timeout(
                     FETCH_DEADLINE,

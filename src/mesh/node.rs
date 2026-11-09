@@ -769,6 +769,9 @@ pub(crate) struct MeshRuntime {
     /// Held for the length of one propagation fetch; a second caller is refused, never
     /// queued behind the first.
     fetching: Mutex<()>,
+    /// The automatic propagation sync's interval, `None` while it is off, which a fetch
+    /// that failed names as when it is tried again.
+    sync_every: Option<Duration>,
     /// The held messages this process left on the propagation node for another session
     /// of the identity, which later fetches neither ask for again nor name as read.
     left_for_sessions: parking_lot::Mutex<propagation_fetch::LeftIds>,
@@ -1051,6 +1054,7 @@ impl MeshRuntime {
             joined_at: SystemTime::now(),
             last_announce_at,
             fetching: Mutex::new(()),
+            sync_every: config.propagation_sync_every(),
             left_for_sessions: parking_lot::Mutex::default(),
             posting: Mutex::new(()),
             cancel: CancellationToken::new(),
@@ -1888,6 +1892,7 @@ impl MeshRuntime {
             &self.left_for_sessions,
             &FetchOptions {
                 path_requested: asked,
+                retry_every: self.sync_every,
                 ..FetchOptions::default()
             },
             cancel,

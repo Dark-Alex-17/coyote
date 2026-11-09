@@ -3,6 +3,7 @@
 //! bounded queue. The driver loop itself lives under `src/repl/`, where it may touch the
 //! session context; nothing here does.
 
+use crate::config::mesh_config::propagation_sync_every;
 use crate::mesh::notify::{NoticeText, Notification, Source};
 use crate::mesh::propagation_fetch::{
     ASKED_FOR_SOURCE, FetchError, FetchReport, MAX_WANTS_PER_FETCH,
@@ -40,8 +41,9 @@ pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 /// body or filled a page. The last case keeps this wait while fetches deliver something
 /// and doubles it from here while they do not.
 pub(crate) const PROPAGATION_SYNC_SHORT_RETRY: Duration = Duration::from_secs(15);
-/// How often the automatic sync logs that one propagation node stays silent to the list
-/// request. The prompt line is shown only on the first silence of a run.
+/// How often the automatic sync logs that one propagation node stays silent: no link up
+/// to it, or no answer to the list request. The prompt line is shown only on the first
+/// silence of a run.
 const SILENCE_LOG_PERIOD: Duration = Duration::from_secs(60 * 60);
 
 /// Who produced an event, which decides whether flood control applies. `Local` events
@@ -291,12 +293,11 @@ pub(crate) struct SyncSchedule {
 
 impl SyncSchedule {
     /// `interval_secs` of 0, or a node that does not announce, means fetch only on
-    /// `.mesh sync`: no request is accepted and no timer is armed. A fetch identifies
-    /// this node to the propagation node, which an `announce: false` operator chose not
-    /// to have happen on its own.
+    /// `.mesh sync`: no request is accepted and no timer is armed
+    /// (`propagation_sync_every`).
     pub(crate) fn new(interval_secs: u64, announce: bool) -> Self {
         Self {
-            interval: (announce && interval_secs > 0).then(|| Duration::from_secs(interval_secs)),
+            interval: propagation_sync_every(interval_secs, announce),
             due_at: None,
             in_flight: None,
             pending: false,
@@ -379,9 +380,10 @@ impl SyncSchedule {
     /// sender that never announces, cannot hold the short cadence. A fetch with nothing
     /// to come back for resets the backoff. Nothing is armed after `mesh_off`.
     ///
-    /// A node silent to the list request, or whose link closed while it was asked, is also
-    /// logged at INFO, at most once per node per `SILENCE_LOG_PERIOD`, so a node that stays
-    /// silent for days leaves a trace in the log without filling it.
+    /// A node that brought no link up, stayed silent to the list request, or whose link
+    /// closed while it was asked, is also logged at INFO, at most once per node per
+    /// `SILENCE_LOG_PERIOD`, so a node that stays silent for days leaves a trace in the log
+    /// without filling it.
     pub(crate) fn finished(
         &mut self,
         outcome: &Result<FetchReport, FetchError>,
@@ -427,13 +429,15 @@ impl SyncSchedule {
                 );
                 let silent = matches!(
                     err,
-                    FetchError::ListUnanswered { .. } | FetchError::ListLinkClosed { .. }
+                    FetchError::ListLinkTimeout { .. }
+                        | FetchError::ListUnanswered { .. }
+                        | FetchError::ListLinkClosed { .. }
                 );
                 if silent {
                     self.log_silence(&node, err, now);
                 }
-                // A silent node ends a fetch one of two ways from one try to the next, so the
-                // two count as the same failure for the prompt line.
+                // A silent node ends a fetch any of these ways from one try to the next, so
+                // they count as the same failure for the prompt line.
                 let key = if silent {
                     format!("silent {node}")
                 } else {
@@ -1426,8 +1430,20 @@ mod tests {
             after: Duration::from_secs(60),
         });
         let closed = Err(FetchError::ListLinkClosed { node: node.clone() });
+        let no_link = Err(FetchError::ListLinkTimeout {
+            node: node.clone(),
+            after: Duration::from_secs(10),
+            retry_every: Some(Duration::from_secs(60)),
+        });
         let mut said = 0;
-        for outcome in [&unanswered, &closed, &unanswered, &closed] {
+        for outcome in [
+            &no_link,
+            &unanswered,
+            &closed,
+            &no_link,
+            &unanswered,
+            &closed,
+        ] {
             schedule.started(NODE.to_string());
             said += usize::from(schedule.finished(outcome, now).is_some());
         }
@@ -1448,6 +1464,49 @@ mod tests {
             schedule.finished(&closed, now).is_some(),
             "and silence after it is news again"
         );
+    }
+
+    #[test]
+    fn a_node_that_brings_no_link_up_is_said_once_and_logged_once_per_node_per_hour() {
+        crate::testing::install_log_collector();
+        let node = "11a7e0ff".repeat(4);
+        let no_link = Err(FetchError::ListLinkTimeout {
+            node: short(&node).to_string(),
+            after: Duration::from_secs(10),
+            retry_every: Some(Duration::from_secs(60)),
+        });
+        let logged = || {
+            crate::testing::info_snapshot()
+                .iter()
+                .filter(|line| {
+                    line.starts_with(
+                        "Propagation sync from 11a7e0ff failed: Propagation node 11a7e0ff did not bring a link up",
+                    )
+                })
+                .count()
+        };
+        let start = Instant::now();
+        let mut schedule = SyncSchedule::new(60, true);
+
+        schedule.started(node.clone());
+        assert_eq!(
+            schedule.finished(&no_link, start).as_deref(),
+            Some(
+                "sync from 11a7e0ff failed: Propagation node 11a7e0ff did not bring a link up within 10 s; it may be restarting or out of reach. The automatic sync retries every 60 s, or run .mesh sync again; .mesh info shows when it announces again"
+            )
+        );
+        for minute in 1..60 {
+            schedule.started(node.clone());
+            assert_eq!(
+                schedule.finished(&no_link, start + Duration::from_secs(60 * minute)),
+                None,
+                "only the first try that brought no link up is said"
+            );
+        }
+        assert_eq!(logged(), 1, "logged once within the hour");
+        schedule.started(node.clone());
+        schedule.finished(&no_link, start + SILENCE_LOG_PERIOD);
+        assert_eq!(logged(), 2, "an hour on, it is logged again");
     }
 
     #[test]

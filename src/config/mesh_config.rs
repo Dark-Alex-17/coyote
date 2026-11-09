@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const DEFAULT_KNOCK_RETENTION_HOURS: u64 = 24;
 pub const DEFAULT_PEER_MAX_CONCURRENT: u32 = 1;
@@ -222,6 +223,13 @@ fn resolve_inbox_dir(configured: &Path, translate: impl Fn(&Path) -> Option<Path
     configured.to_path_buf()
 }
 
+/// `interval_secs` of 0, or a node that does not announce, turns the automatic
+/// propagation sync off: a fetch identifies this node to the propagation node, which an
+/// `announce: false` operator chose not to have happen on its own.
+pub(crate) fn propagation_sync_every(interval_secs: u64, announce: bool) -> Option<Duration> {
+    (announce && interval_secs > 0).then(|| Duration::from_secs(interval_secs))
+}
+
 impl Default for MeshConfig {
     fn default() -> Self {
         Self {
@@ -257,6 +265,11 @@ impl Default for MeshConfig {
 impl MeshConfig {
     pub fn interfaces(&self) -> &[MeshInterface] {
         &self.interfaces
+    }
+
+    /// How often the automatic propagation sync runs, `None` while it is off.
+    pub(crate) fn propagation_sync_every(&self) -> Option<Duration> {
+        propagation_sync_every(self.propagation_sync_interval_secs, self.announce)
     }
 
     /// Blank counts as unset and yields the built-in prompt.
@@ -1433,6 +1446,24 @@ mod tests {
             err,
             "mesh.peer_max_cost_usd_per_hour is -1, which is out of range; use 0 (no ceiling) or a positive amount"
         );
+    }
+
+    /// The automatic sync runs at the configured interval only while the node announces
+    /// and the interval is not 0.
+    #[test]
+    fn propagation_sync_runs_only_for_an_announcing_node_with_an_interval() {
+        let mut mesh = MeshConfig::default();
+        assert_eq!(
+            mesh.propagation_sync_every(),
+            Some(Duration::from_secs(300))
+        );
+        mesh.propagation_sync_interval_secs = 0;
+        assert_eq!(mesh.propagation_sync_every(), None);
+        mesh.propagation_sync_interval_secs = 45;
+        mesh.announce = false;
+        assert_eq!(mesh.propagation_sync_every(), None);
+        mesh.announce = true;
+        assert_eq!(mesh.propagation_sync_every(), Some(Duration::from_secs(45)));
     }
 
     /// The documented `0 = fetch only on .mesh sync` is a valid setting for an enabled
