@@ -114,12 +114,12 @@ pub(crate) fn log_discovery(kits: &[DiscoveredKit]) {
 
     let header = discovery_header(kits.len());
     info!("{header}");
-    println!("{header}");
+    eprintln!("{header}");
 
     for kit in kits {
         let line = discovery_line(kit);
         info!("{line}");
-        println!("{line}");
+        eprintln!("{line}");
     }
 }
 

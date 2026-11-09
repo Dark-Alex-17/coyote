@@ -25,6 +25,8 @@ const KITS_DIR: &str = "sbx-kits";
 const HANDLE: &str = "coyote";
 const STRAY_FILE: &str = "notes.yaml";
 const HOST_SBX_VERSION_LINE: &str = "sbx version v0.49.1 c5b19951af121b439800029695f88bf1139a0b0b";
+const SETUP_STDOUT: &str = "SETUP-STDOUT";
+const INNER_STDOUT: &str = "INNER-STDOUT";
 
 const VALID_MIXIN: &str = r#"# syntax=docker/sandbox-kit:3
 schemaVersion: "3"
@@ -103,7 +105,10 @@ fn write_dry_run_config(root: &Path) {
 
 /// An `sbx` that records every call, reports a current version, no
 /// registered secrets and no existing sandboxes, and succeeds at everything
-/// else.
+/// else. Setup calls print `SETUP-STDOUT <subcommand>` and the inner
+/// `exec -i` prints `INNER-STDOUT` on stdout, so tests can see where the
+/// binary routes each child's stdout. `secret set` appends its stdin to
+/// `secret-set-stdin` under the root.
 fn install_stub_sbx(root: &Path) -> PathBuf {
     install_stub_sbx_with(root, HOST_SBX_VERSION_LINE, &[])
 }
@@ -112,6 +117,7 @@ fn install_stub_sbx(root: &Path) -> PathBuf {
 /// lists `sandbox_rows` under the `NAME STATUS` header.
 fn install_stub_sbx_with(root: &Path, version_line: &str, sandbox_rows: &[&str]) -> PathBuf {
     let log = root.join("stub-sbx-calls");
+    let secret_stdin = root.join("secret-set-stdin");
     let stub = root.join("bin/sbx");
     let ls_lines = std::iter::once("NAME STATUS")
         .chain(sandbox_rows.iter().copied())
@@ -124,9 +130,13 @@ fn install_stub_sbx_with(root: &Path, version_line: &str, sandbox_rows: &[&str])
              printf '%s\\n' \"$*\" >> '{log}'\n\
              if [ \"$1\" = \"version\" ]; then printf '%s\\n' '{version_line}'; exit 0; fi\n\
              if [ \"$1\" = \"secret\" ] && [ \"$2\" = \"ls\" ]; then exit 0; fi\n\
+             if [ \"$1\" = \"secret\" ] && [ \"$2\" = \"set\" ]; then cat >> '{secret_stdin}'; fi\n\
              if [ \"$1\" = \"ls\" ]; then {ls_lines}exit 0; fi\n\
+             if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"-i\" ]; then echo '{INNER_STDOUT}'; exit 0; fi\n\
+             case \"$1\" in create|cp|exec|rm|secret) echo \"{SETUP_STDOUT} $1\";; esac\n\
              exit 0\n",
-            log = log.display()
+            log = log.display(),
+            secret_stdin = secret_stdin.display()
         ),
     )
     .unwrap();
@@ -149,6 +159,7 @@ fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &Pa
     command
         .args(args)
         .current_dir(cwd)
+        .env("PWD", cwd)
         .env("COYOTE_CONFIG_DIR", root.join("config"))
         .env("COYOTE_CACHE_DIR", root.join("cache"))
         .env("HOME", &home)
@@ -176,7 +187,7 @@ fn run_coyote_with_kit_override(root: &Path, kit: &Path) -> Output {
     run_coyote_in(
         root,
         root,
-        &["--sandbox", "probe"],
+        &["--sandbox", "--sandbox-name", "probe"],
         &[("COYOTE_SANDBOX_KIT", kit)],
     )
 }
@@ -187,6 +198,19 @@ fn stderr_of(output: &Output) -> String {
 
 fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn assert_stdout_routing(output: &Output, setup_subcommands: &[&str]) {
+    let stdout = stdout_of(output);
+    let stderr = stderr_of(output);
+    assert_eq!(stdout, format!("{INNER_STDOUT}\n"), "stderr:\n{stderr}");
+    for subcommand in setup_subcommands {
+        let marker = format!("{SETUP_STDOUT} {subcommand}");
+        assert!(
+            stderr.lines().any(|line| line == marker),
+            "{marker} missing from stderr:\n{stderr}"
+        );
+    }
 }
 
 fn kits_root(root: &Path) -> PathBuf {
@@ -207,6 +231,12 @@ fn stub_calls(log: &Path) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+/// The stub `sbx` runs without a terminal, so a launch ends in the headless
+/// `sbx exec` of the inner Coyote from the working directory.
+fn exec_call(cwd: &Path) -> String {
+    format!("exec -i -w {} probe coyote", cwd.display())
 }
 
 /// Every regular file under the kits cache root, relative to it.
@@ -256,7 +286,7 @@ fn read_hash(root: &Path) -> String {
 /// The stub log is reset first so repeated runs are judged one at a time.
 fn sandbox_bails_on_missing_config(label: &str, root: &Path, log: &Path) {
     let _ = fs::remove_file(log);
-    let output = run_coyote(root, &["--sandbox", "probe"]);
+    let output = run_coyote(root, &["--sandbox", "--sandbox-name", "probe"]);
     assert!(!output.status.success(), "{label}: expected a refusal");
     let stderr = stderr_of(&output);
     assert!(
@@ -391,7 +421,7 @@ fn usage_probe_sandbox_refuses_a_malformed_kit_before_creating_a_sandbox() {
     fs::create_dir_all(&bad).unwrap();
     fs::write(bad.join("other.yaml"), VALID_MIXIN).unwrap();
 
-    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe", "--fresh"]);
 
     assert!(!output.status.success(), "expected a refusal");
     let stderr = stderr_of(&output);
@@ -409,9 +439,9 @@ fn usage_probe_sandbox_refuses_a_malformed_kit_before_creating_a_sandbox() {
         "discovery runs after sbx has been asked for its sandboxes: {calls:?}"
     );
     assert!(
-        calls
-            .iter()
-            .all(|call| !call.starts_with("create ") && !call.starts_with("run ")),
+        calls.iter().all(|call| !call.starts_with("create ")
+            && !call.starts_with("run ")
+            && !call.starts_with("exec -i ")),
         "the refusal must land before any sandbox is created or run: {calls:?}"
     );
     // The base kit was still extracted: discovery runs after the kit cache
@@ -473,7 +503,12 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
     // A stray file beside the kit dirs is ignored too.
     fs::write(config.join("kits").join("README.md"), "about\n").unwrap();
 
-    let output = run_coyote_in(&root, &cwd, &["--sandbox", "probe", "--fresh"], &[]);
+    let output = run_coyote_in(
+        &root,
+        &cwd,
+        &["--sandbox", "--sandbox-name", "probe", "--fresh"],
+        &[],
+    );
 
     let stderr = stderr_of(&output);
     let stdout = stdout_of(&output);
@@ -511,15 +546,16 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
         "every discovered kit in root order, the base kit never among the --kit values: {calls:?}"
     );
     assert!(
-        calls.iter().any(|call| call == "run --name probe"),
+        calls.iter().any(|call| *call == exec_call(&cwd)),
         "{calls:?}"
     );
+    assert_stdout_routing(&output, &["create"]);
 
-    let lines: Vec<&str> = stdout.lines().collect();
+    let lines: Vec<&str> = stderr.lines().collect();
     let header = lines
         .iter()
         .position(|line| *line == "Applying 9 sbx kit(s):")
-        .unwrap_or_else(|| panic!("no discovery header in stdout:\n{stdout}"));
+        .unwrap_or_else(|| panic!("no discovery header in stderr:\n{stderr}"));
     let counts = "(adds: 1 install hook(s), 2 runtime domain(s), 1 install domain(s))";
     let expected = [
         format!("  config {counts}"),
@@ -535,7 +571,7 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
     assert_eq!(
         &lines[header + 1..header + 1 + expected.len()],
         &expected[..],
-        "{stdout}"
+        "{stderr}"
     );
 
     // No surface mentions the stray files: not stderr, not the log file.
@@ -574,7 +610,7 @@ fn sandbox_reattach_runs_without_discovery_when_the_sandbox_exists() {
     fs::create_dir_all(&bad).unwrap();
     fs::write(bad.join("other.yaml"), VALID_MIXIN).unwrap();
 
-    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe", "--fresh"]);
 
     let stderr = stderr_of(&output);
     let stdout = stdout_of(&output);
@@ -583,11 +619,9 @@ fn sandbox_reattach_runs_without_discovery_when_the_sandbox_exists() {
         "expected the re-attach to succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let calls = stub_calls(&log);
+    let exec = exec_call(&root);
     assert_eq!(
-        calls
-            .iter()
-            .filter(|call| *call == "run --name probe")
-            .count(),
+        calls.iter().filter(|call| **call == exec).count(),
         1,
         "{calls:?}"
     );
@@ -599,7 +633,7 @@ fn sandbox_reattach_runs_without_discovery_when_the_sandbox_exists() {
         !stderr.contains(&bad.display().to_string()),
         "the malformed kit was inspected:\n{stderr}"
     );
-    assert!(!stdout.contains("Applying"), "{stdout}");
+    assert!(!stderr.contains("Applying"), "{stderr}");
 }
 
 #[test]
@@ -613,7 +647,7 @@ fn sandbox_bails_on_an_old_sbx_before_listing_sandboxes() {
     let log = install_stub_sbx_with(&root, "sbx version: v0.44.9 deadbeef", &[]);
     write_dry_run_config(&root);
 
-    let output = run_coyote(&root, &["--sandbox", "probe"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe"]);
 
     assert!(!output.status.success(), "expected a refusal");
     let stderr = stderr_of(&output);
@@ -719,7 +753,7 @@ fn usage_probe_sandbox_kit_override_at_a_workload_kit_is_the_positional_create_a
     let output = run_coyote_in(
         &root,
         &root,
-        &["--sandbox", "probe", "--fresh"],
+        &["--sandbox", "--sandbox-name", "probe", "--fresh"],
         &[("COYOTE_SANDBOX_KIT", &workload)],
     );
 
@@ -748,7 +782,7 @@ fn usage_probe_sandbox_kit_override_at_a_workload_kit_is_the_positional_create_a
         "the agent token must not be an argv element: {create}"
     );
     assert!(
-        calls.iter().any(|call| call == "run --name probe"),
+        calls.iter().any(|call| *call == exec_call(&root)),
         "{calls:?}"
     );
     assert!(
@@ -785,7 +819,7 @@ fn usage_probe_sandbox_proceeds_when_sbx_version_exits_non_zero_despite_an_old_t
     make_stub_version_fail(&root, old, 2);
     write_dry_run_config(&root);
 
-    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe", "--fresh"]);
 
     let stderr = stderr_of(&output);
     let stdout = stdout_of(&output);
@@ -809,7 +843,7 @@ fn usage_probe_sandbox_proceeds_when_sbx_version_exits_non_zero_despite_an_old_t
     );
     assert_eq!(
         calls.last().map(String::as_str),
-        Some("run --name probe"),
+        Some(exec_call(&root).as_str()),
         "{calls:?}"
     );
     let log_text = fs::read_to_string(root.join("cache").join("coyote.log")).unwrap_or_default();
@@ -851,7 +885,7 @@ fn usage_probe_sandbox_proceeds_when_sbx_version_cannot_be_spawned() {
     let output = run_coyote_in(
         &root,
         &root,
-        &["--sandbox", "probe"],
+        &["--sandbox", "--sandbox-name", "probe"],
         &[("PATH", &stub_only_path)],
     );
 
@@ -879,7 +913,8 @@ fn usage_probe_sandbox_proceeds_when_sbx_version_cannot_be_spawned() {
 
 /// The plain first launch: no `--fresh`, nothing discoverable, no MCP
 /// config. The sandbox is created from the bare base kit as the positional
-/// argument, host files are copied in, and the run is the bare `run`.
+/// argument, host files are copied in, and the launch ends in one `exec`
+/// of the inner Coyote with nothing forwarded.
 #[test]
 fn usage_probe_sandbox_first_launch_without_fresh_creates_from_the_bare_base_kit() {
     if cfg!(windows) {
@@ -891,7 +926,7 @@ fn usage_probe_sandbox_first_launch_without_fresh_creates_from_the_bare_base_kit
     let log = install_stub_sbx(&root);
     write_dry_run_config(&root);
 
-    let output = run_coyote(&root, &["--sandbox", "probe"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe"]);
 
     let stderr = stderr_of(&output);
     let stdout = stdout_of(&output);
@@ -934,19 +969,97 @@ fn usage_probe_sandbox_first_launch_without_fresh_creates_from_the_bare_base_kit
     );
     assert_eq!(
         calls.last().map(String::as_str),
-        Some("run --name probe"),
+        Some(exec_call(&root).as_str()),
         "{calls:?}"
     );
     assert!(
-        calls.iter().filter(|call| call.starts_with("run ")).count() == 1,
+        calls
+            .iter()
+            .filter(|call| call.starts_with("exec -i "))
+            .count()
+            == 1,
         "{calls:?}"
     );
-    assert!(!stdout.contains("Applying"), "{stdout}");
+    assert!(!stderr.contains("Applying"), "{stderr}");
+    assert_stdout_routing(&output, &["create", "cp", "exec"]);
     assert_kit_matches_assets("first launch", &root);
 }
 
+#[test]
+fn usage_probe_sandbox_registers_a_vault_backed_llm_key_without_writing_stdout() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("vault-secret");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx_with(&root, HOST_SBX_VERSION_LINE, &["probe running"]);
+    write_dry_run_config(&root);
+    let config = root.join("config/config.yaml");
+    let vault_backed = fs::read_to_string(&config)
+        .unwrap()
+        .replace("api_key: 'unused'", "api_key: '{{llm_key}}'");
+    fs::write(&config, vault_backed).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("vault-pass"), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // The local vault provider keeps its file under $XDG_CONFIG_HOME, named
+    // after the running executable.
+    let xdg = root.join("xdg");
+    let envelope = gman::encrypt_string("test-password".to_string(), "sk-probe").unwrap();
+    fs::create_dir_all(xdg.join("coyote")).unwrap();
+    fs::write(
+        xdg.join("coyote/vault.yml"),
+        format!("llm_key: '{envelope}'\n"),
+    )
+    .unwrap();
+
+    let log_file = root.join("coyote.log");
+    let output = run_coyote_in(
+        &root,
+        &root,
+        &["--sandbox", "--sandbox-name", "probe"],
+        &[
+            ("XDG_CONFIG_HOME", &xdg),
+            ("COYOTE_LOG_PATH", &log_file),
+            ("COYOTE_LOG_LEVEL", Path::new("debug")),
+        ],
+    );
+
+    let stderr = stderr_of(&output);
+    assert!(
+        output.status.success(),
+        "expected the stubbed launch to succeed\nstdout:\n{}\nstderr:\n{stderr}",
+        stdout_of(&output)
+    );
+    let calls = stub_calls(&log);
+    assert!(
+        calls.iter().any(|call| call == "secret set openai"),
+        "{calls:?}"
+    );
+    assert_stdout_routing(&output, &["secret"]);
+    assert_eq!(
+        fs::read_to_string(root.join("secret-set-stdin")).unwrap(),
+        "sk-probe"
+    );
+    let log_text = fs::read_to_string(&log_file).unwrap();
+    assert!(
+        log_text.contains("sbx exec in sandbox 'probe'"),
+        "{log_text}"
+    );
+    for (stream, text) in [
+        ("stdout", stdout_of(&output)),
+        ("stderr", stderr),
+        ("log", log_text),
+    ] {
+        assert!(!text.contains("sk-probe"), "the key leaked to {stream}");
+    }
+}
+
 /// Without `--fresh`, re-attaching an existing sandbox is the common path:
-/// it still skips discovery and ends in a bare `run --name <n>`.
+/// it still skips discovery and ends in an `exec` of the inner Coyote.
 #[test]
 fn usage_probe_sandbox_reattach_without_fresh_skips_discovery_and_create() {
     if cfg!(windows) {
@@ -969,7 +1082,7 @@ fn usage_probe_sandbox_reattach_without_fresh_skips_discovery_and_create() {
     fs::write(bad.join("other.yaml"), VALID_MIXIN).unwrap();
     let reserved = write_kit(&kits, HANDLE, VALID_MIXIN);
 
-    let output = run_coyote(&root, &["--sandbox", "probe"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe"]);
 
     let stderr = stderr_of(&output);
     let stdout = stdout_of(&output);
@@ -980,13 +1093,13 @@ fn usage_probe_sandbox_reattach_without_fresh_skips_discovery_and_create() {
     let calls = stub_calls(&log);
     assert_eq!(
         calls.last().map(String::as_str),
-        Some("run --name probe"),
-        "re-attach must end in the bare run: {calls:?}"
+        Some(exec_call(&root).as_str()),
+        "re-attach must end in the inner Coyote exec: {calls:?}"
     );
     assert!(
         calls
             .iter()
-            .all(|call| !call.starts_with("create") && !call.starts_with("run --name probe ")),
+            .all(|call| !call.starts_with("create") && !call.starts_with("run ")),
         "{calls:?}"
     );
     for dir in [&bad, &reserved] {
@@ -1011,7 +1124,7 @@ fn usage_probe_sandbox_accepts_the_minimum_sbx_in_the_older_version_shape() {
     let log = install_stub_sbx_with(&root, "sbx version: v0.45.0 991967d", &[]);
     write_dry_run_config(&root);
 
-    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe", "--fresh"]);
 
     let stderr = stderr_of(&output);
     assert!(
@@ -1042,7 +1155,7 @@ fn usage_probe_sandbox_proceeds_when_the_sbx_version_is_unreadable() {
     let log = install_stub_sbx_with(&root, "sbx version: dev build 2026-10-20", &[]);
     write_dry_run_config(&root);
 
-    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe", "--fresh"]);
 
     let stderr = stderr_of(&output);
     assert!(
@@ -1058,7 +1171,7 @@ fn usage_probe_sandbox_proceeds_when_the_sbx_version_is_unreadable() {
     );
     assert!(calls.iter().any(|call| call == "ls"), "{calls:?}");
     assert!(
-        calls.iter().any(|call| call == "run --name probe"),
+        calls.iter().any(|call| *call == exec_call(&root)),
         "{calls:?}"
     );
 }
@@ -1076,7 +1189,7 @@ fn usage_probe_sandbox_refuses_an_old_sbx_before_looking_for_a_config() {
     let log = install_stub_sbx_with(&root, "sbx version v0.44.9 deadbeef", &[]);
     // No config written on purpose.
 
-    let output = run_coyote(&root, &["--sandbox", "probe"]);
+    let output = run_coyote(&root, &["--sandbox", "--sandbox-name", "probe"]);
 
     assert!(!output.status.success(), "expected a refusal");
     let stderr = stderr_of(&output);
