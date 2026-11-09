@@ -39,6 +39,7 @@ use crate::function::{
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::graph::route::Branch;
+use crate::graph::structured::NativeFormatState;
 use crate::mcp::{
     CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
@@ -579,6 +580,9 @@ pub struct RequestContext {
     /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
     pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
     pub in_graph_llm_node: bool,
+    /// Native structured-output state of the running graph llm node. Reset
+    /// per node run and never carried into forks or children.
+    pub(crate) native_format: NativeFormatState,
     /// Whether this context may write its session back to the session file.
     /// A fork never owns the session file; only the context that loaded or
     /// created the session writes it.
@@ -681,6 +685,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            native_format: NativeFormatState::default(),
             persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
@@ -771,6 +776,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            native_format: NativeFormatState::default(),
             persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
@@ -896,6 +902,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: self.active_node_mcp_tools.clone(),
             in_graph_llm_node: self.in_graph_llm_node,
+            native_format: NativeFormatState::default(),
             persists_session: false,
             graph_chat_fc_warned: self.graph_chat_fc_warned,
             last_graph_branch: self.last_graph_branch,
@@ -969,6 +976,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            native_format: NativeFormatState::default(),
             persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
@@ -12438,6 +12446,40 @@ mod tests {
             branch.in_graph_llm_node,
             "parallel map branches inside a node must keep the node's tool gating"
         );
+    }
+
+    fn rejected_native_format() -> NativeFormatState {
+        NativeFormatState {
+            rejected: true,
+            last_dialect: Some(crate::client::structured_output::SchemaDialect::Anthropic),
+            final_turn: None,
+        }
+    }
+
+    #[test]
+    fn fork_for_branch_starts_with_a_fresh_native_format_state() {
+        let mut ctx = create_test_ctx();
+        ctx.native_format = rejected_native_format();
+
+        let branch = ctx.fork_for_branch();
+
+        assert_eq!(branch.native_format, NativeFormatState::default());
+    }
+
+    #[test]
+    fn new_for_child_starts_with_a_fresh_native_format_state() {
+        let mut parent = create_test_ctx();
+        parent.native_format = rejected_native_format();
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+
+        assert_eq!(child.native_format, NativeFormatState::default());
     }
 
     #[test]

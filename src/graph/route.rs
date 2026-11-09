@@ -2,6 +2,7 @@ use super::llm::CompletionRunner;
 use super::structured;
 use super::transcript::truncate_from_front;
 use super::types::{Graph, SessionBlock};
+use crate::client::structured_output::StructuredOutputSpec;
 use crate::client::{Message, MessageContent, Model, ModelType};
 use crate::config::{Input, RequestContext, Role, RoleLike};
 use crate::utils::AbortSignal;
@@ -22,6 +23,8 @@ pub const ROUTE_SCHEMA: &str = r#"{"type":"object","properties":{"decision":{"ty
 
 pub const ROUTE_ROLE_NAME: &str = "__graph_route__";
 
+const ROUTE_SCHEMA_NAME: &str = "route_decision";
+
 const ROUTE_QUESTION: &str = "Is the user instructing the agent to perform its task (run) or asking about / discussing previous work (chat)? Answer with JSON matching the schema.";
 
 pub async fn classify(
@@ -40,6 +43,7 @@ pub async fn classify(
     // without the taken state.
     let saved_last_message = ctx.last_message.take();
     let saved_declared = std::mem::take(&mut ctx.declared_function_names);
+    ctx.native_format = Default::default();
     let outcome = decide(&input, ctx, abort, runner).await;
     ctx.last_message = saved_last_message;
     ctx.declared_function_names = saved_declared;
@@ -79,6 +83,10 @@ fn build_route_role(ctx: &RequestContext, block: &SessionBlock) -> Result<Role> 
     role.set_model(model);
     role.set_enabled_tools(Some(Vec::new()));
     role.set_enabled_mcp_servers(Some(Vec::new()));
+    role.set_structured_output(Some(StructuredOutputSpec {
+        name: ROUTE_SCHEMA_NAME.to_string(),
+        schema: serde_json::from_str(ROUTE_SCHEMA)?,
+    }));
     Ok(role)
 }
 
@@ -619,6 +627,45 @@ mod tests {
             "{err:#}"
         );
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn build_route_role_carries_the_route_decision_spec() {
+        let ctx = ctx_with_session();
+
+        let role = build_route_role(&ctx, &block(None)).unwrap();
+
+        assert_eq!(
+            role.structured_output(),
+            Some(&StructuredOutputSpec {
+                name: "route_decision".to_string(),
+                schema: serde_json::from_str(ROUTE_SCHEMA).unwrap(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_runs_with_a_fresh_native_format_state() {
+        let mut ctx = ctx_with_session();
+        ctx.native_format.rejected = true;
+        let mut rejected_during_call = Vec::new();
+        let mut runner = completion_runner(|_input, ctx, _abort| {
+            rejected_during_call.push(ctx.native_format.rejected);
+            boxed_completion(async { Ok((r#"{"decision":"run"}"#.to_string(), vec![])) })
+        });
+
+        let outcome = classify(
+            &mut ctx,
+            &graph(""),
+            &block(None),
+            "x",
+            &create_abort_signal(),
+            &mut runner,
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), Branch::Run);
+        assert_eq!(rejected_during_call, vec![false]);
     }
 
     #[test]

@@ -530,7 +530,6 @@ impl Input {
     /// the role's schema itself, or None when the caller must fall back.
     /// Gated on the client's model because that is the model
     /// `Client::chat_completions` passes to `prepare_completion_data`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-429
     pub fn native_structured_output(&self, client: &dyn Client) -> Option<SchemaDialect> {
         if self.role().structured_output().is_some() && client.model().supports_structured_output()
         {
@@ -540,7 +539,6 @@ impl Input {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-429
     pub fn without_structured_output(&self) -> Input {
         let mut input = self.clone();
         input.role.set_structured_output(None);

@@ -1,8 +1,10 @@
 use super::state::StateManager;
 use super::state_updates;
 use super::structured;
+use super::structured::with_native_format_fallback;
 use super::types::LlmNode;
 use super::{is_transient_error, wall_clock};
+use crate::client::structured_output::{StructuredOutputSpec, sanitize_schema_name};
 use crate::client::{Model, ModelType, call_chat_completions_streaming_quiet};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
@@ -143,6 +145,7 @@ async fn run(
     validate_tools_subset(&regular_tools, &mcp_servers, parent_ctx)?;
 
     let mut role = build_inline_role(
+        node_id,
         node,
         instructions.as_deref(),
         &regular_tools,
@@ -204,6 +207,7 @@ async fn run(
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(composed_role);
+    parent_ctx.native_format = Default::default();
     // Jobs are node-local: everything job__start registers while this node
     // runs is recorded here and reaped on every exit path below.
     let saved_job_scope = parent_ctx.node_job_scope.replace(Vec::new());
@@ -286,7 +290,22 @@ pub(crate) fn default_completion_runner()
     |input, ctx, abort| {
         Box::pin(async move {
             let client = input.create_client()?;
+            let dialect = input.native_structured_output(client.as_ref());
             ctx.before_chat_completion(input)?;
+            with_native_format_fallback(dialect, input, ctx, quiet_transport(abort)).await
+        })
+    }
+}
+
+/// One quiet streaming call per invocation, each with its own client, so
+/// the native-format fallback can repeat it with a different input.
+pub(crate) fn quiet_transport(
+    abort: AbortSignal,
+) -> impl for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send {
+    move |input, ctx| {
+        let abort = abort.clone();
+        Box::pin(async move {
+            let client = input.create_client()?;
             call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
         })
     }
@@ -458,6 +477,7 @@ async fn run_chat_loop(
 }
 
 fn build_inline_role(
+    node_id: &str,
     node: &LlmNode,
     instructions: Option<&str>,
     regular_tools: &[String],
@@ -483,6 +503,12 @@ fn build_inline_role(
     }
     if let Some(v) = &node.reasoning_effort {
         role.set_reasoning_effort(Some(v.clone()));
+    }
+    if let Some(schema) = &node.output_schema {
+        role.set_structured_output(Some(StructuredOutputSpec {
+            name: sanitize_schema_name(node_id),
+            schema: schema.clone(),
+        }));
     }
 
     if node.tools.as_deref().unwrap_or_default().is_empty() {
@@ -1936,5 +1962,192 @@ mod tests {
         assert!(attached.with_session());
         let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(attached).unwrap();
         assert!(checkpoint.is_some());
+    }
+
+    fn structured_model() -> Model {
+        let mut data = crate::client::ModelData::new("structured");
+        data.supports_function_calling = true;
+        data.supports_structured_output = true;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn openai_ctx() -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(crate::config::AppConfig {
+            clients: vec![crate::client::ClientConfig::OpenAIConfig(Default::default())],
+            ..crate::config::AppConfig::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    fn inline_role_for(node_id: &str, node: &LlmNode, ctx: &RequestContext) -> Role {
+        let (regular, mcp) = categorize_tools(node.tools.as_deref());
+        build_inline_role(node_id, node, None, &regular, &mcp, ctx).unwrap()
+    }
+
+    #[test]
+    fn build_inline_role_attaches_a_spec_named_after_the_node_for_every_schema_node() {
+        let ctx = plain_ctx();
+        let schema = json!({"type": "object", "properties": {"goal": {"type": "string"}}});
+        let mut no_tools = node_with_schema(None, schema.clone());
+        no_tools.tools = Some(vec![]);
+        let mut with_tools = node_with_schema(None, schema.clone());
+        with_tools.tools = Some(vec!["fs_cat".into(), "mcp:github".into()]);
+        let mut with_skills = node_with_schema(None, schema.clone());
+        with_skills.skills_enabled = Some(true);
+
+        for node in [no_tools, with_tools, with_skills] {
+            let role = inline_role_for("plan step.1", &node, &ctx);
+            let mut plain = node.clone();
+            plain.output_schema = None;
+            let baseline = inline_role_for("plan step.1", &plain, &ctx);
+
+            assert_eq!(
+                role.structured_output(),
+                Some(&StructuredOutputSpec {
+                    name: "plan_step_1".to_string(),
+                    schema: schema.clone(),
+                })
+            );
+            assert!(baseline.structured_output().is_none());
+            assert_eq!(role.enabled_tools(), baseline.enabled_tools());
+            assert_eq!(role.enabled_mcp_servers(), baseline.enabled_mcp_servers());
+        }
+    }
+
+    #[test]
+    fn node_without_output_schema_sends_the_same_request_as_before() {
+        let ctx = plain_ctx();
+        let node = node_with(None);
+        let model = structured_model();
+
+        let role = inline_role_for("plain", &node, &ctx);
+        let input = Input::from_str(&ctx, "user", Some(role)).unwrap();
+        let data = input.prepare_completion_data(&model, false).unwrap();
+        let baseline = input
+            .without_structured_output()
+            .prepare_completion_data(&model, false)
+            .unwrap();
+
+        assert!(input.role().structured_output().is_none());
+        assert!(data.structured_output.is_none());
+        assert_eq!(format!("{data:?}"), format!("{baseline:?}"));
+    }
+
+    /// A `tools: []` node under an agent still declares the agent's
+    /// teammate functions; the native format must leave them alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn schema_node_under_a_teammate_agent_keeps_its_functions() {
+        use crate::testing::TestConfigDirGuard;
+
+        let _guard = TestConfigDirGuard::new("llm-structured");
+        let name = format!(
+            "llm_structured_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = crate::config::paths::agent_data_dir(&name);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
+        let mut node = node_with_schema(None, json!({"type": "object"}));
+        node.tools = Some(vec![]);
+        let model = structured_model();
+
+        let role = inline_role_for("decide", &node, &ctx);
+        let input = Input::from_str(&ctx, "user", Some(role)).unwrap();
+        let data = input.prepare_completion_data(&model, false).unwrap();
+        let baseline = input
+            .without_structured_output()
+            .prepare_completion_data(&model, false)
+            .unwrap();
+
+        assert_eq!(
+            data.structured_output.map(|spec| spec.name),
+            Some("decide".to_string())
+        );
+        let functions = data.functions.unwrap_or_default();
+        assert!(
+            functions.iter().any(|f| f.name.starts_with("agent__")),
+            "{:?}",
+            functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            format!("{functions:?}"),
+            format!("{:?}", baseline.functions.unwrap_or_default())
+        );
+    }
+
+    /// Every request of a schema node, tool rounds included, carries the
+    /// node's spec, and the client gate and the request gate read the same
+    /// model.
+    #[tokio::test]
+    async fn schema_node_sends_its_spec_on_every_call_of_a_session_backed_run() {
+        use crate::config::Session;
+        use crate::function::ToolCall;
+
+        let node = node_with_schema(None, json!({"type": "object"}));
+        let mut state = manager_with(&[]);
+        let mut ctx = openai_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let mut session = Session::default();
+        session.set_model(structured_model());
+        ctx.session = Some(session);
+        ctx.native_format.rejected = true;
+        let abort = create_abort_signal();
+        let mut calls = Vec::new();
+
+        let out = run(
+            "summarise",
+            &node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|input, ctx, _abort| {
+                let client = input.create_client().unwrap();
+                let data = input
+                    .prepare_completion_data(client.model(), false)
+                    .unwrap();
+                calls.push((
+                    data.structured_output.map(|spec| spec.name),
+                    client.model().id() == input.role().model().id(),
+                    input.native_structured_output(client.as_ref()),
+                    ctx.native_format.rejected,
+                ));
+                let first = calls.len() == 1;
+                boxed_completion(async move {
+                    if first {
+                        let call = ToolCall::new("t".into(), json!({}), Some("id-0".into()));
+                        Ok((String::new(), vec![ToolResult::new(call, json!("ok"))]))
+                    } else {
+                        Ok((r#"{"done": true}"#.to_string(), vec![]))
+                    }
+                })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, r#"{"done": true}"#);
+        let expected = (
+            Some("summarise".to_string()),
+            true,
+            Some(crate::client::structured_output::SchemaDialect::OpenAiStrict),
+            false,
+        );
+        assert_eq!(calls, vec![expected.clone(), expected]);
     }
 }

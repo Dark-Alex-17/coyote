@@ -1,11 +1,18 @@
-use crate::client::call_chat_completions_streaming_quiet;
+use super::llm::{CompletionFuture, quiet_transport};
+use crate::client::ApiStatusError;
+use crate::client::structured_output::{SchemaDialect, StructuredOutputSpec};
 use crate::config::{Input, RequestContext, Role, RoleLike};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, bail};
+use log::warn;
 use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 const EXTRACTOR_ROLE_NAME: &str = "__structured_output__";
+
+const EXTRACTOR_SCHEMA_NAME: &str = "structured_output";
 
 const EXTRACTOR_ROLE_PROMPT: &str = "\
 Extract a JSON object from the user's input that strictly conforms to the provided JSON Schema.
@@ -19,6 +26,81 @@ Rules:
 - If a field cannot be determined from the input, use `null` (when allowed) or your best inferred value.
 - Do NOT invent fields not present in the schema.";
 
+/// Native structured-output bookkeeping for one node run. A rejection is
+/// sticky: once the provider refuses the format, later calls in the same
+/// run go out without it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct NativeFormatState {
+    pub rejected: bool,
+    pub last_dialect: Option<SchemaDialect>,
+    pub final_turn: Option<(String, SchemaDialect)>,
+}
+
+/// The extractor's model call, injectable so tests can fail the first
+/// attempt without a provider.
+type ExtractorTransport<'f> =
+    dyn for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send + 'f;
+
+/// Sends `input` with its native format when `dialect` is set and the run
+/// has not seen a rejection. A 400 or an undecodable response is taken as
+/// the provider refusing the format: the call is repeated once without it.
+/// Every other error propagates after the first call.
+pub(crate) async fn with_native_format_fallback<'a, T>(
+    dialect: Option<SchemaDialect>,
+    input: &'a Input,
+    ctx: &'a mut RequestContext,
+    mut call: impl for<'b> FnMut(
+        &'b Input,
+        &'b mut RequestContext,
+    ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'b>>,
+) -> Result<T> {
+    let dialect = if ctx.native_format.rejected {
+        None
+    } else {
+        dialect
+    };
+    let Some(dialect) = dialect else {
+        let result = if input.role().structured_output().is_some() {
+            let plain = input.without_structured_output();
+            call(&plain, ctx).await
+        } else {
+            call(input, ctx).await
+        };
+        ctx.native_format.last_dialect = None;
+        return result;
+    };
+
+    let err = match call(input, ctx).await {
+        Ok(out) => {
+            ctx.native_format.last_dialect = Some(dialect);
+            return Ok(out);
+        }
+        Err(err) => err,
+    };
+    let Some(reason) = format_rejection_reason(&err) else {
+        return Err(err);
+    };
+    warn!("provider rejected the native structured-output format ({reason}); retrying without it");
+    ctx.native_format.rejected = true;
+    let plain = input.without_structured_output();
+    let result = call(&plain, ctx).await;
+    ctx.native_format.last_dialect = None;
+    result
+}
+
+fn format_rejection_reason(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|cause| {
+        if let Some(api) = cause.downcast_ref::<ApiStatusError>() {
+            (api.status == 400).then(|| api.message.clone())
+        } else {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .filter(|e| e.is_decode())
+                .map(|_| format!("{err:#}"))
+        }
+    })
+}
+
 pub async fn extract(
     raw: &str,
     schema: &Value,
@@ -29,22 +111,44 @@ pub async fn extract(
         return Ok(parsed);
     }
 
-    extract_via_extractor(raw, schema, parent_ctx, abort, false).await
+    let mut transport = quiet_transport(abort.clone());
+    extract_via_extractor(raw, schema, parent_ctx, abort, &mut transport).await
 }
 
+/// Runs the extractor, repair pass included, on a fresh native-format state
+/// so a rejection seen by the first pass also holds for the repair pass,
+/// then hands the caller its own state back.
 async fn extract_via_extractor(
     raw: &str,
     schema: &Value,
     parent_ctx: &mut RequestContext,
     abort: &AbortSignal,
-    is_repair: bool,
+    transport: &mut ExtractorTransport<'_>,
 ) -> Result<Value> {
-    let role = build_extractor_role(parent_ctx);
+    let saved_native_format = std::mem::take(&mut parent_ctx.native_format);
+    let result = extract_with_repair(raw, schema, parent_ctx, abort, false, transport).await;
+    parent_ctx.native_format = saved_native_format;
+    result
+}
+
+async fn extract_with_repair(
+    raw: &str,
+    schema: &Value,
+    parent_ctx: &mut RequestContext,
+    abort: &AbortSignal,
+    is_repair: bool,
+    transport: &mut ExtractorTransport<'_>,
+) -> Result<Value> {
+    let mut role = build_extractor_role(parent_ctx);
+    role.set_structured_output(Some(StructuredOutputSpec {
+        name: EXTRACTOR_SCHEMA_NAME.to_string(),
+        schema: schema.clone(),
+    }));
     let prompt = build_extractor_prompt(raw, schema, is_repair);
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(role);
-    let result = run_one_shot(&prompt, parent_ctx, abort).await;
+    let result = run_one_shot(&prompt, parent_ctx, abort, transport).await;
     parent_ctx.role = saved_role;
 
     let output = result.context("Structured-output extractor LLM call failed")?;
@@ -56,8 +160,8 @@ async fn extract_via_extractor(
              Last response:\n{output}"
         ),
         None => {
-            Box::pin(extract_via_extractor(
-                &output, schema, parent_ctx, abort, true,
+            Box::pin(extract_with_repair(
+                &output, schema, parent_ctx, abort, true, transport,
             ))
             .await
         }
@@ -88,6 +192,7 @@ async fn run_one_shot(
     prompt: &str,
     ctx: &mut RequestContext,
     abort: &AbortSignal,
+    transport: &mut ExtractorTransport<'_>,
 ) -> Result<String> {
     if abort.aborted() {
         bail!("Aborted.");
@@ -96,9 +201,10 @@ async fn run_one_shot(
     let role_for_input = ctx.role.clone();
     let input = Input::from_str(ctx, prompt, role_for_input)?;
     let client = input.create_client()?;
+    let dialect = input.native_structured_output(client.as_ref());
     ctx.before_chat_completion(&input)?;
     let (output, tool_results) =
-        call_chat_completions_streaming_quiet(&input, client.as_ref(), ctx, abort.clone()).await?;
+        with_native_format_fallback(dialect, &input, ctx, transport).await?;
     ctx.after_chat_completion(app_cfg.as_ref(), &input, &output, &tool_results)?;
 
     Ok(output)
@@ -135,12 +241,319 @@ fn strip_code_fences(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::Model;
-    use crate::config::{AppState, WorkingMode};
+    use crate::client::{ClientConfig, Model, ModelData};
+    use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::graph::llm::test_support::boxed_completion;
+    use crate::testing::{install_log_collector, warn_snapshot};
+    use crate::utils::create_abort_signal;
     use serde_json::json;
 
     fn make_ctx() -> RequestContext {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    fn format_call<F>(f: F) -> F
+    where
+        F: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send,
+    {
+        f
+    }
+
+    fn answer_spec() -> StructuredOutputSpec {
+        StructuredOutputSpec {
+            name: "answer".to_string(),
+            schema: json!({"type": "object"}),
+        }
+    }
+
+    fn input_with_spec(ctx: &RequestContext) -> Input {
+        let mut role = Role::new("r", "");
+        role.set_structured_output(Some(answer_spec()));
+        Input::from_str(ctx, "hi", Some(role)).unwrap()
+    }
+
+    fn api_error(status: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(ApiStatusError {
+            status,
+            message: message.to_string(),
+        })
+        .context("Failed to call chat-completions api")
+    }
+
+    /// Runs the wrapper over a fake that fails its first call with
+    /// `first_err` (when given) and answers "ok" otherwise; returns the
+    /// result and the spec each call was sent with.
+    async fn run_wrapper(
+        dialect: Option<SchemaDialect>,
+        input: &Input,
+        ctx: &mut RequestContext,
+        first_err: Option<anyhow::Error>,
+    ) -> (Result<String>, Vec<Option<StructuredOutputSpec>>) {
+        let mut first_err = first_err;
+        let mut seen = Vec::new();
+        let result = with_native_format_fallback(
+            dialect,
+            input,
+            ctx,
+            format_call(|input, _ctx| {
+                seen.push(input.role().structured_output().cloned());
+                let outcome = match first_err.take() {
+                    Some(err) => Err(err),
+                    None => Ok(("ok".to_string(), vec![])),
+                };
+                boxed_completion(async move { outcome })
+            }),
+        )
+        .await
+        .map(|(output, _)| output);
+        (result, seen)
+    }
+
+    #[tokio::test]
+    async fn native_format_fallback_without_a_dialect_calls_once_without_the_format() {
+        let mut ctx = make_ctx();
+        let input = input_with_spec(&ctx);
+
+        let (result, seen) = run_wrapper(None, &input, &mut ctx, None).await;
+
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(seen, vec![None]);
+        assert_eq!(ctx.native_format, NativeFormatState::default());
+    }
+
+    #[tokio::test]
+    async fn native_format_fallback_records_the_dialect_on_success() {
+        let mut ctx = make_ctx();
+        let input = input_with_spec(&ctx);
+
+        let (result, seen) =
+            run_wrapper(Some(SchemaDialect::OpenAiStrict), &input, &mut ctx, None).await;
+
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(seen, vec![Some(answer_spec())]);
+        assert_eq!(
+            ctx.native_format.last_dialect,
+            Some(SchemaDialect::OpenAiStrict)
+        );
+        assert!(!ctx.native_format.rejected);
+    }
+
+    #[tokio::test]
+    async fn native_format_fallback_retries_once_without_the_format_on_a_400() {
+        install_log_collector();
+        let mut ctx = make_ctx();
+        let input = input_with_spec(&ctx);
+        let marker = "schema keyword unsupported 7f3a";
+
+        let (result, seen) = run_wrapper(
+            Some(SchemaDialect::OpenAiStrict),
+            &input,
+            &mut ctx,
+            Some(api_error(400, marker)),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(seen, vec![Some(answer_spec()), None]);
+        assert!(ctx.native_format.rejected);
+        assert_eq!(ctx.native_format.last_dialect, None);
+        let expected = format!(
+            "provider rejected the native structured-output format ({marker}); retrying without it"
+        );
+        assert!(
+            warn_snapshot().iter().any(|w| w == &expected),
+            "missing warning: {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_format_rejection_sticks_until_the_state_is_reset() {
+        let mut ctx = make_ctx();
+        let input = input_with_spec(&ctx);
+        let dialect = Some(SchemaDialect::OpenAiStrict);
+        run_wrapper(dialect, &input, &mut ctx, Some(api_error(400, "rejected")))
+            .await
+            .0
+            .unwrap();
+
+        let (_, sticky) = run_wrapper(dialect, &input, &mut ctx, None).await;
+        ctx.native_format = Default::default();
+        let (_, fresh) = run_wrapper(dialect, &input, &mut ctx, None).await;
+
+        assert_eq!(sticky, vec![None]);
+        assert_eq!(fresh, vec![Some(answer_spec())]);
+    }
+
+    #[tokio::test]
+    async fn native_format_fallback_propagates_other_statuses_after_one_call() {
+        for status in [500, 429] {
+            let mut ctx = make_ctx();
+            let input = input_with_spec(&ctx);
+
+            let (result, seen) = run_wrapper(
+                Some(SchemaDialect::OpenAiStrict),
+                &input,
+                &mut ctx,
+                Some(api_error(status, "busy")),
+            )
+            .await;
+
+            let err = result.expect_err("a non-400 status must propagate");
+            assert_eq!(
+                err.chain()
+                    .find_map(|c| c.downcast_ref::<ApiStatusError>())
+                    .map(|e| e.status),
+                Some(status)
+            );
+            assert_eq!(seen, vec![Some(answer_spec())], "status {status}");
+            assert!(!ctx.native_format.rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_format_fallback_retries_after_a_decode_error() {
+        let decode = reqwest::Response::from(http::Response::new("not json"))
+            .json::<Value>()
+            .await
+            .expect_err("a non-JSON body must fail to decode");
+        assert!(decode.is_decode());
+        let mut ctx = make_ctx();
+        let input = input_with_spec(&ctx);
+
+        let (result, seen) = run_wrapper(
+            Some(SchemaDialect::OpenAiStrict),
+            &input,
+            &mut ctx,
+            Some(anyhow::Error::new(decode).context("Failed to call chat-completions api")),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(seen, vec![Some(answer_spec()), None]);
+        assert!(ctx.native_format.rejected);
+    }
+
+    fn structured_ctx() -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            clients: vec![ClientConfig::OpenAIConfig(Default::default())],
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut data = ModelData::new("structured");
+        data.supports_structured_output = true;
+        let mut role = Role::new("parent", "");
+        role.set_model(Model::from_config("openai", &[data]).remove(0));
+        ctx.role = Some(role);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn extractor_retries_without_the_format_after_a_400_and_parses_the_reply() {
+        let mut ctx = structured_ctx();
+        let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let mut seen = Vec::new();
+        let mut transport = format_call(|input, _ctx| {
+            seen.push(input.role().structured_output().cloned());
+            let first = seen.len() == 1;
+            boxed_completion(async move {
+                if first {
+                    Err(api_error(400, "rejected"))
+                } else {
+                    Ok((r#"{"a": 1}"#.to_string(), vec![]))
+                }
+            })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &schema,
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"a": 1}));
+        let spec = StructuredOutputSpec {
+            name: "structured_output".to_string(),
+            schema,
+        };
+        assert_eq!(seen, vec![Some(spec), None]);
+    }
+
+    #[tokio::test]
+    async fn extractor_repair_pass_keeps_the_rejection_from_the_first_pass() {
+        let mut ctx = structured_ctx();
+        let schema = json!({"type": "object"});
+        let mut seen = Vec::new();
+        let mut transport = format_call(|input, _ctx| {
+            seen.push(input.role().structured_output().cloned());
+            let call = seen.len();
+            boxed_completion(async move {
+                match call {
+                    1 => Err(api_error(400, "rejected")),
+                    2 => Ok(("not json".to_string(), vec![])),
+                    _ => Ok((r#"{"a": 1}"#.to_string(), vec![])),
+                }
+            })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &schema,
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"a": 1}));
+        let spec = StructuredOutputSpec {
+            name: "structured_output".to_string(),
+            schema,
+        };
+        assert_eq!(seen, vec![Some(spec), None, None]);
+        assert_eq!(ctx.native_format, NativeFormatState::default());
+    }
+
+    #[tokio::test]
+    async fn extractor_restores_the_callers_native_format_state() {
+        let caller = NativeFormatState {
+            rejected: true,
+            last_dialect: None,
+            final_turn: None,
+        };
+        for succeeds in [true, false] {
+            let mut ctx = structured_ctx();
+            ctx.native_format = caller.clone();
+            let mut seen = Vec::new();
+            let mut transport = format_call(|_input, ctx| {
+                seen.push(ctx.native_format.clone());
+                boxed_completion(async move {
+                    if succeeds {
+                        Ok((r#"{"a": 1}"#.to_string(), vec![]))
+                    } else {
+                        Err(api_error(500, "down"))
+                    }
+                })
+            });
+
+            let result = extract_via_extractor(
+                "prose",
+                &json!({"type": "object"}),
+                &mut ctx,
+                &create_abort_signal(),
+                &mut transport,
+            )
+            .await;
+
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(seen, vec![NativeFormatState::default()]);
+            assert_eq!(ctx.native_format, caller, "succeeds {succeeds}");
+        }
     }
 
     #[test]
