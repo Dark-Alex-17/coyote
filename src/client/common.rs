@@ -1,7 +1,7 @@
 use super::*;
 
 use super::access_token::{distrust_access_token, get_access_token};
-use crate::config::{RenderMode, paths};
+use crate::config::{RenderMode, RunCallOutcome, paths};
 use crate::hooks::{self, HookEvent};
 use crate::{
     config::{AppConfig, Input, RequestContext},
@@ -634,6 +634,13 @@ fn llm_failed_extras(
     extras
 }
 
+fn succeeded_call<'a>(usage: Option<&'a TokenUsage>, model: &Model) -> RunCallOutcome<'a> {
+    RunCallOutcome::Succeeded {
+        usage,
+        cost: usage.and_then(|usage| usage.cost_usd(model)),
+    }
+}
+
 pub async fn call_chat_completions(
     input: &Input,
     print: bool,
@@ -678,6 +685,7 @@ pub async fn call_chat_completions(
                 thinking,
                 usage,
             } = ret;
+            ctx.record_run_call(succeeded_call(usage.as_ref(), client.model()));
             if !text.is_empty() {
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
@@ -690,6 +698,7 @@ pub async fn call_chat_completions(
             finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => {
+            ctx.record_run_call(RunCallOutcome::Failed);
             hooks::fire(
                 HookEvent::LlmRequestFailed,
                 ctx,
@@ -733,6 +742,12 @@ pub async fn call_chat_completions_streaming(
     // call's input tokens (reported in message_start), so abort and error
     // paths must still count toward the session totals.
     let (text, tool_calls, thinking, usage) = handler.take();
+    let succeeded = !aborted_ctrld && !aborted_ctrlc && render_ret.is_ok() && send_ret.is_ok();
+    ctx.record_run_call(if succeeded {
+        succeeded_call(usage.as_ref(), client.model())
+    } else {
+        RunCallOutcome::Failed
+    });
     ctx.record_token_usage(usage, client.model());
 
     if aborted_ctrld {
@@ -840,6 +855,7 @@ pub async fn call_chat_completions_streaming_quiet(
             ret = client.chat_completions(input.clone()) => match ret {
                 Ok(output) => output,
                 Err(err) => {
+                    ctx.record_run_call(RunCallOutcome::Failed);
                     hooks::fire(
                         HookEvent::LlmRequestFailed,
                         ctx,
@@ -850,6 +866,7 @@ pub async fn call_chat_completions_streaming_quiet(
                 }
             },
             _ = wait_abort_signal(&abort_signal) => {
+                ctx.record_run_call(RunCallOutcome::Failed);
                 hooks::fire(
                     HookEvent::LlmRequestFailed,
                     ctx,
@@ -865,8 +882,14 @@ pub async fn call_chat_completions_streaming_quiet(
             thinking,
             usage,
         } = output;
+        let aborted = abort_signal.aborted();
+        ctx.record_run_call(if aborted {
+            RunCallOutcome::Failed
+        } else {
+            succeeded_call(usage.as_ref(), client.model())
+        });
         ctx.record_token_usage(usage, client.model());
-        if abort_signal.aborted() {
+        if aborted {
             hooks::fire(
                 HookEvent::LlmRequestFailed,
                 ctx,
@@ -893,9 +916,15 @@ pub async fn call_chat_completions_streaming_quiet(
     let send_ret = client.chat_completions_streaming(input, &mut handler).await;
 
     let (text, tool_calls, thinking, usage) = handler.take();
+    let aborted = abort_signal.aborted();
+    ctx.record_run_call(if aborted || send_ret.is_err() {
+        RunCallOutcome::Failed
+    } else {
+        succeeded_call(usage.as_ref(), client.model())
+    });
     ctx.record_token_usage(usage, client.model());
 
-    if abort_signal.aborted() {
+    if aborted {
         hooks::fire(
             HookEvent::LlmRequestFailed,
             ctx,
@@ -1180,6 +1209,7 @@ mod tests {
     use super::*;
 
     use super::super::access_token::{is_rejected, set_access_token};
+    use crate::config::run_stats::{RunStats, RunStatsSnapshot};
     use crate::config::{AppState, WorkingMode};
     use anyhow::Error;
     use std::sync::Arc;
@@ -1470,6 +1500,7 @@ mod tests {
         stall_forever: bool,
         nonstream_replies: bool,
         streaming_calls: AtomicUsize,
+        usage: Option<TokenUsage>,
     }
 
     const PACED_DELTAS: usize = 10;
@@ -1532,7 +1563,7 @@ mod tests {
                 text: paced_text(),
                 tool_calls: vec![paced_tool_call()],
                 thinking: vec![paced_thinking()],
-                usage: None,
+                usage: self.usage.clone(),
             })
         }
 
@@ -1551,6 +1582,9 @@ mod tests {
             if self.stall_forever {
                 std::future::pending::<()>().await;
             }
+            if let Some(usage) = &self.usage {
+                handler.usage(usage.clone());
+            }
             handler.thinking_block(paced_thinking());
             handler.tool_call(paced_tool_call())
         }
@@ -1563,6 +1597,7 @@ mod tests {
             stall_forever,
             nonstream_replies: false,
             streaming_calls: AtomicUsize::new(0),
+            usage: None,
         }
     }
 
@@ -1801,6 +1836,219 @@ mod tests {
         ) -> Result<()> {
             Err(self.error())
         }
+    }
+
+    fn run_stats_ctx() -> (RequestContext, Arc<RunStats>) {
+        let mut ctx = quiet_ctx();
+        ctx.render_mode = RenderMode::Silent;
+        let stats = ctx.begin_run_stats();
+        (ctx, stats)
+    }
+
+    /// A paced client reporting `{in: 10, out: 5}` on a model priced at
+    /// $1/$2 per 1M tokens, so one succeeded call costs 0.00002.
+    fn reporting_client() -> PacedStreamClient {
+        let mut client = paced_client(false);
+        client.model = priced_model(Some(1.0), Some(2.0), None, None);
+        client.nonstream_replies = true;
+        client.usage = Some(TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            ..Default::default()
+        });
+        client
+    }
+
+    fn assert_one_succeeded_call(snapshot: &RunStatsSnapshot) {
+        assert_eq!(snapshot.model_calls, 1, "{snapshot:?}");
+        assert_eq!(snapshot.input_tokens, Some(10), "{snapshot:?}");
+        assert_eq!(snapshot.output_tokens, Some(5), "{snapshot:?}");
+        let cost = snapshot.total_cost_usd.expect("the call was priced");
+        assert!((cost - 0.00002).abs() < 1e-12, "{snapshot:?}");
+    }
+
+    fn assert_one_failed_call(snapshot: &RunStatsSnapshot) {
+        assert_eq!(
+            snapshot,
+            &RunStatsSnapshot {
+                model_calls: 1,
+                total_cost_usd: Some(0.0),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = reporting_client();
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = reporting_client();
+
+        call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_streaming_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = reporting_client();
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn quiet_no_stream_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        let mut data = ModelData::new("test");
+        data.no_stream = true;
+        data.input_price = Some(1.0);
+        data.output_price = Some(2.0);
+        client.model = Model::from_config("provider", &[data]).remove(0);
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 0);
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    /// A succeeded call that reports no usage still counts, and leaves the
+    /// run's cost unknown.
+    #[tokio::test]
+    async fn a_succeeded_call_without_usage_makes_the_run_cost_unknown() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        client.usage = None;
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.model_calls, 1);
+        assert_eq!(snapshot.input_tokens, None);
+        assert_eq!(snapshot.total_cost_usd, None);
+    }
+
+    #[tokio::test]
+    async fn plain_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(400);
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(400);
+
+        call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn quiet_streaming_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(400);
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn quiet_no_stream_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = FailingStatusClient::new(400);
+        client.model = no_stream_model();
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    /// An aborted stream is a failed call, so it adds nothing to the run's
+    /// usage and leaves its cost known.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_streaming_abort_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(true);
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
+            trigger.set_ctrlc();
+        });
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
     }
 
     fn llm_hooks_map(marker: &str) -> hooks::HooksMap {

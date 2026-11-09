@@ -3,6 +3,7 @@ use super::child_sessions::{self, ChildSessionRoot, RootFile};
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
+use super::run_stats::{RunCallOutcome, RunStats};
 use super::session::{
     AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
     KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget, labeled_session_names,
@@ -610,6 +611,9 @@ pub struct RequestContext {
     /// will run, consumed by `run_agent_for_graph`.
     pub peer_assignment: Option<(String, Arc<Inbox>)>,
     pub escalation_queue: Option<Arc<EscalationQueue>>,
+    /// Usage accumulator for the whole run, shared with every branch fork
+    /// and spawned child. `None` unless a caller began one on the root.
+    pub run_stats: Option<Arc<RunStats>>,
     pub notification_queue: Arc<NotificationQueue>,
     pub current_depth: usize,
     pub auto_continue_count: usize,
@@ -690,6 +694,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: None,
+            run_stats: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
@@ -779,6 +784,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: None,
+            run_stats: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
@@ -903,6 +909,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: self.escalation_queue.clone(),
+            run_stats: self.run_stats.clone(),
             notification_queue: self.notification_queue.clone(),
             current_depth: self.current_depth,
             auto_continue_count: 0,
@@ -975,6 +982,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: parent.escalation_queue.clone(),
+            run_stats: parent.run_stats.clone(),
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth,
             auto_continue_count: 0,
@@ -1049,6 +1057,20 @@ impl RequestContext {
         self.escalation_queue
             .get_or_insert_with(|| Arc::new(EscalationQueue::new()))
             .clone()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))] // TASK-431: remove once --json begins run stats
+    pub fn begin_run_stats(&mut self) -> Arc<RunStats> {
+        self.run_stats
+            .get_or_insert_with(|| Arc::new(RunStats::default()))
+            .clone()
+    }
+
+    /// Records one attempted model call on the run's accumulator, if any.
+    pub fn record_run_call(&self, outcome: RunCallOutcome) {
+        if let Some(stats) = &self.run_stats {
+            stats.record_outcome(outcome);
+        }
     }
 
     pub fn ensure_inbox(&mut self) -> Arc<Inbox> {
@@ -12122,6 +12144,65 @@ mod tests {
             "agent_test_1".to_string(),
         );
         assert_eq!(child.last_graph_branch, None);
+    }
+
+    #[test]
+    fn begin_run_stats_is_idempotent_on_the_root() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.run_stats.is_none());
+
+        let first = ctx.begin_run_stats();
+        let second = ctx.begin_run_stats();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn run_stats_are_shared_with_branch_forks_and_spawned_children() {
+        let mut parent = create_test_ctx();
+        let stats = parent.begin_run_stats();
+        let branch = parent.fork_for_branch();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+
+        assert!(Arc::ptr_eq(&stats, branch.run_stats.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&stats, child.run_stats.as_ref().unwrap()));
+
+        let usage = TokenUsage {
+            input_tokens: Some(1),
+            ..Default::default()
+        };
+        for ctx in [&parent, &branch, &child] {
+            ctx.record_run_call(RunCallOutcome::Succeeded {
+                usage: Some(&usage),
+                cost: Some(0.5),
+            });
+        }
+
+        let snapshot = parent.run_stats.as_ref().unwrap().snapshot();
+        assert_eq!(snapshot.model_calls, 3);
+        assert_eq!(snapshot.input_tokens, Some(3));
+        assert_eq!(snapshot.total_cost_usd, Some(1.5));
+    }
+
+    #[test]
+    fn record_run_call_without_run_stats_is_a_no_op() {
+        let ctx = create_test_ctx();
+
+        ctx.record_run_call(RunCallOutcome::Failed);
+        ctx.record_run_call(RunCallOutcome::Succeeded {
+            usage: None,
+            cost: None,
+        });
+
+        assert!(ctx.run_stats.is_none());
+        assert!(ctx.last_token_usage.is_none());
+        assert!(ctx.last_cost.is_none());
     }
 
     #[test]
