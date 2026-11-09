@@ -6452,7 +6452,7 @@ mod tests {
         let text = unannounced.to_string();
         assert_eq!(
             text,
-            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
+            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
         );
         assert!(
             !text.contains("since this node started") && !text.contains("sync"),

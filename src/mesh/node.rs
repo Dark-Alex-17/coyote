@@ -8,7 +8,7 @@ use crate::config::{ForkRekey, LivePrefix, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
-    announce_app_data,
+    RECONNECT_GREETINGS_PER_HOUR, announce_app_data,
 };
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
@@ -72,8 +72,8 @@ use crate::mesh::trust::{
     decode_name_hash, parse_hash,
 };
 use crate::mesh::{
-    PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, elapsed_text, hex_lower,
-    identity, mesh_cache_dir, parse_rfc3339,
+    PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, hex_lower, identity,
+    mesh_cache_dir, parse_rfc3339,
 };
 use crate::render::{QuotingError, error_notice};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
@@ -1930,23 +1930,15 @@ impl MeshRuntime {
         Ok(true)
     }
 
-    /// `announce_now` for a TCP client that reconnected: `Ok(None)` when the announce went
-    /// out, otherwise how long ago the announce the floor still holds for was sent.
-    async fn announce_after_reconnect(&self) -> Result<Option<Duration>> {
-        if self.announce_now().await? {
-            return Ok(None);
-        }
-        let last_announce = self.destination.lock().await.last_announce;
-        let age = last_announce.map(|at| at.elapsed()).unwrap_or_default();
-        Ok(Some(age))
-    }
-
-    /// Announces the current destination over a pending interface that has just connected,
-    /// once per interface, skipping the floor on `REANNOUNCE_FLOOR_SECS`: the peers behind
-    /// that relay have never heard this destination, and the next heartbeat is up to
-    /// `HEARTBEAT_PERIOD_SECS` away. Sends nothing when the node is configured not to
-    /// announce. Leaves `last_announce` untouched, so a connect neither delays the
-    /// heartbeat nor shortens the floor the heartbeat and the reconnect announce honour.
+    /// Greets an interface that has just connected with an announce of the current
+    /// destination, skipping the floor on `REANNOUNCE_FLOOR_SECS`: a pending interface's
+    /// first connect, whose relay has never heard this destination, and a TCP client's
+    /// reconnect, whose relay dropped every path it held for the closed socket and answers
+    /// path requests only from its own table. Either way the next heartbeat is up to
+    /// `HEARTBEAT_PERIOD_SECS` away. The caller bounds the reconnect greetings, see
+    /// `GreetingBudget`. Sends nothing when the node is configured not to announce. Leaves
+    /// `last_announce` untouched, so a greeting neither delays the heartbeat nor shortens
+    /// the floor the heartbeat honours.
     pub(crate) async fn announce_on_connect(&self) -> Result<()> {
         if !self.announce {
             return Ok(());
@@ -3320,6 +3312,51 @@ struct TcpWatch {
     /// `Connected` that does not raise it belongs to a stream already credited, by the
     /// seed at start or by a catch-up after a lag, and tells nothing.
     connect_count: u64,
+    /// The reconnects of the client greeted with an announce in the last hour.
+    greetings: GreetingBudget,
+}
+
+/// The reconnect greetings one TCP client has sent within the last hour, so a client that
+/// flaps stops greeting after `RECONNECT_GREETINGS_PER_HOUR` of them. Only reconnects take
+/// from it: a pending interface's first connect is greeted outside it. Holds at most that
+/// many instants, read against the `now` each call is given.
+#[derive(Debug, Default)]
+struct GreetingBudget {
+    greeted_at: VecDeque<Instant>,
+}
+
+impl GreetingBudget {
+    /// The window the budget counts greetings over.
+    const WINDOW: Duration = Duration::from_secs(3600);
+
+    /// Takes one greeting at `now` and returns `true`, or returns `false` and takes
+    /// nothing when the hour before `now` already holds `RECONNECT_GREETINGS_PER_HOUR`
+    /// greetings. A greeting stops counting a full hour after it was taken.
+    fn take(&mut self, now: Instant) -> bool {
+        while self
+            .greeted_at
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= Self::WINDOW)
+        {
+            self.greeted_at.pop_front();
+        }
+        if self.greeted_at.len() >= RECONNECT_GREETINGS_PER_HOUR {
+            return false;
+        }
+        self.greeted_at.push_back(now);
+        true
+    }
+}
+
+/// What became of the announce over a TCP client that reconnected, as its idle line tells.
+#[derive(Debug)]
+enum ReconnectGreeting {
+    Announced,
+    Failed(anyhow::Error),
+    /// The client used up `RECONNECT_GREETINGS_PER_HOUR`; nothing was sent.
+    PastCap,
+    /// The node is configured not to announce; nothing was sent.
+    NodeDoesNotAnnounce,
 }
 
 impl TcpWatch {
@@ -3343,6 +3380,7 @@ impl TcpWatch {
                 connect_count: status
                     .connected_streams()
                     .max(u64::from(*connected_at_start)),
+                greetings: GreetingBudget::default(),
             }),
             WatchedInterface::Local { .. } => None,
         }
@@ -3487,12 +3525,14 @@ fn reconcile_tcp_after_lag(
 /// user and announced over, so the line never waits on the announce. That announce skips
 /// the floor, as the peers behind that relay have never heard this destination. Each
 /// `Connected` after a drop, for a client that connected at start as for one that
-/// connected later, gets an announce through `announce_now`: the relay forgot every path
-/// it held through the closed socket, and the heartbeat is up to an hour away. That
-/// announce honours and resets the floor, so a relay that flaps cannot make this node
-/// announce more often than once per `REANNOUNCE_FLOOR_SECS`; the first connect of a
-/// relay that was down at start is the one announce without it. Every reconnect is told
-/// to the user with what became of its announce: sent, deferred to the heartbeat, failed,
+/// connected later, is greeted with an announce through `announce_on_connect` as well,
+/// whatever the floor says: the relay forgot every path it held through the closed socket
+/// and answers path requests only from its own table, so without it nobody reaches this
+/// node until the heartbeat, up to an hour away. Neither greeting moves the floor's
+/// reference or the heartbeat clock. A client's `GreetingBudget` bounds its reconnect
+/// greetings to `RECONNECT_GREETINGS_PER_HOUR`, so a relay that flaps stops drawing
+/// announces and the heartbeat carries the next one. Every reconnect is told to the user
+/// with what became of its announce: sent, left to the heartbeat past the cap, failed,
 /// or not sent at all by a node that does not announce. A `Connected` whose stream the
 /// client's count already credited, such as the connect at start the stream still held
 /// when the watcher began or an event still held after a lag, tells nothing. A drop is
@@ -3501,9 +3541,9 @@ fn reconcile_tcp_after_lag(
 /// rnsd's shared-instance client's state events drive its row, see
 /// `follow_local_event`. That client re-announces and redials
 /// by itself, so no line is printed and no announce sent for an rnsd. The watcher holds
-/// no peer-controlled state: a fixed list from the node's own config, two flags and a
-/// stream count per client and one dial failure for the rnsd. Ends when the node or its
-/// slot is gone.
+/// no peer-controlled state: a fixed list from the node's own config, two flags, a
+/// stream count and a greeting budget per client and one dial failure for the rnsd. Ends
+/// when the node or its slot is gone.
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -3552,8 +3592,12 @@ async fn watch_interfaces(
         // A TCP row only ever moves to `Connected` here; `Disconnected` and `Connecting`
         // are the local arm's, and the remedies worded for them assume that.
         for (hash, transition) in transitions {
-            let Some(TcpWatch { index, label, .. }) =
-                watches.iter().find(|watch| watch.hash == hash)
+            let Some(TcpWatch {
+                index,
+                label,
+                greetings,
+                ..
+            }) = watches.iter_mut().find(|watch| watch.hash == hash)
             else {
                 continue;
             };
@@ -3583,17 +3627,22 @@ async fn watch_interfaces(
                     }
                 }
                 Transition::Reconnect => {
-                    let announced = if runtime.announce {
-                        Some(tokio::select! {
+                    let greeting = if !runtime.announce {
+                        ReconnectGreeting::NodeDoesNotAnnounce
+                    } else if greetings.take(Instant::now()) {
+                        tokio::select! {
                             () = cancel.cancelled() => return,
-                            outcome = runtime.announce_after_reconnect() => outcome,
-                        })
+                            outcome = runtime.announce_on_connect() => match outcome {
+                                Ok(()) => ReconnectGreeting::Announced,
+                                Err(err) => ReconnectGreeting::Failed(err),
+                            },
+                        }
                     } else {
-                        None
+                        ReconnectGreeting::PastCap
                     };
-                    let line = reconnect_line(label, announced.as_ref());
-                    match &announced {
-                        Some(Err(err)) => warn!(
+                    let line = reconnect_line(label, &greeting);
+                    match &greeting {
+                        ReconnectGreeting::Failed(err) => warn!(
                             "Mesh interface {line} Cause: {}",
                             redact_hashes(&format!("{err:#}"))
                         ),
@@ -3611,20 +3660,18 @@ async fn watch_interfaces(
     }
 }
 
-/// The idle line for a relay that reconnected, by what became of the announce over it:
-/// `None` for a node that does not announce, else what `announce_after_reconnect`
-/// returned. A failure is told in plain words only; its cause goes to the log.
-fn reconnect_line(label: &str, announced: Option<&Result<Option<Duration>>>) -> String {
-    match announced {
-        Some(Ok(None)) => format!("{label} reconnected; announced"),
-        Some(Ok(Some(age))) => format!(
-            "{label} reconnected; this node announced {}, so it waits for the next heartbeat to announce again",
-            elapsed_text(*age)
+/// The idle line for a relay that reconnected, by what became of the announce over it.
+/// A failure is told in plain words only; its cause goes to the log.
+fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
+    match greeting {
+        ReconnectGreeting::Announced => format!("{label} reconnected; announced"),
+        ReconnectGreeting::PastCap => format!(
+            "{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now"
         ),
-        Some(Err(_)) => format!(
+        ReconnectGreeting::Failed(_) => format!(
             "{label} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log)."
         ),
-        None => format!(
+        ReconnectGreeting::NodeDoesNotAnnounce => format!(
             "{label} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
         ),
     }
@@ -12742,7 +12789,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
             )
         );
 
@@ -14017,10 +14064,6 @@ mod tests {
     fn private_label(port: u16) -> String {
         format!("private 127.0.0.1:{port}")
     }
-
-    /// How a reconnect line left to the heartbeat ends, after the age of the last announce.
-    #[cfg(unix)]
-    const DEFERRED_SUFFIX: &str = " ago, so it waits for the next heartbeat to announce again";
 
     #[cfg(unix)]
     fn states_of(runtime: &MeshRuntime) -> Vec<(String, InterfaceState)> {
@@ -16229,8 +16272,8 @@ mod tests {
         }
     }
 
-    /// The heartbeat and the reconnect announce both go through `announce_now`; once the
-    /// floor lets one through it moves the mirror like any other announce, a refused one
+    /// The heartbeat goes through `announce_now`; once the floor lets one through it
+    /// moves the mirror like any other announce, a refused one
     /// (the floor still holding) moves nothing, and a re-key neither clears the mirror
     /// nor restarts the join clock: the fork's announce is just the newest announce.
     #[cfg(unix)]
@@ -16715,6 +16758,10 @@ mod tests {
     #[cfg(unix)]
     impl RelayNode {
         async fn start(tag: &str, port: u16) -> Self {
+            Self::start_with(tag, port, NodeOptions::default()).await
+        }
+
+        async fn start_with(tag: &str, port: u16, options: NodeOptions) -> Self {
             let tmp = TempDir::new(tag);
             let mut session = Session::default();
             let runtime = MeshRuntime::start(
@@ -16722,7 +16769,7 @@ mod tests {
                 true,
                 &mut session,
                 mesh_paths(&tmp),
-                NodeOptions::default(),
+                options,
             )
             .await
             .unwrap();
@@ -16748,6 +16795,16 @@ mod tests {
         async fn expire_announce_floor(&self) {
             self.runtime.destination.lock().await.last_announce =
                 Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        }
+
+        /// The moment the floor counts from: the last announce that set it.
+        async fn floor_reference(&self) -> Instant {
+            self.runtime
+                .destination
+                .lock()
+                .await
+                .last_announce
+                .expect("the start announce sets the floor")
         }
     }
 
@@ -16810,45 +16867,45 @@ mod tests {
         .await;
     }
 
-    /// A reconnect inside the floor announces nothing and says so: the start announce was
-    /// seconds ago, so the line defers to the heartbeat and names the age.
+    /// A reconnect inside the floor is greeted all the same: the start announce was
+    /// seconds ago, but the restarted relay holds no path to either node and answers path
+    /// requests only from its own table. The greeting leaves the floor's reference where
+    /// the start announce put it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reconnect_inside_the_floor_defers_to_the_heartbeat() {
+    async fn a_reconnect_inside_the_floor_is_greeted_and_leaves_the_floor_alone() {
         install_log_collector();
         let (relay, a, b) = two_nodes_on_a_relay("node-relay-restart-floor").await;
         let port = relay.port;
         let label = private_label(port);
+        let floor_a = a.floor_reference().await;
+        let floor_b = b.floor_reference().await;
+        assert!(
+            floor_a.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS)
+                && floor_b.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS),
+            "the relay restarts inside the floor the start announces set"
+        );
         let before = debug_snapshot().len();
 
         relay.stop().await;
-        let relay = TransportRelay::start_on(port).await;
-        let prefix = format!(
-            "{} {label} reconnected; this node announced ",
-            Source::Mesh.prefix()
-        );
-        for node in [&a, &b] {
-            wait_until("the deferred reconnect line", || {
-                node.notifier.0.lock().iter().any(|rendered| {
-                    rendered
-                        .lines()
-                        .iter()
-                        .any(|line| line.starts_with(&prefix) && line.ends_with(DEFERRED_SUFFIX))
-                })
-            })
-            .await;
-        }
+        let (relay, mut announces) = TransportRelay::start_on_subscribed(port).await;
+        TransportRelay::heard_from_each(&mut announces, &[&a.hash, &b.hash]).await;
+        let line = format!("{label} reconnected; announced");
+        wait_for_mesh_line(&a.notifier, &line).await;
+        wait_for_mesh_line(&b.notifier, &line).await;
 
         sleep(WATCH_SETTLE * 3).await;
+        assert_eq!(announces_since(before, a.hash8()), 1, "one greeting from a");
+        assert_eq!(announces_since(before, b.hash8()), 1, "one greeting from b");
         assert_eq!(
-            announces_since(before, a.hash8()),
-            0,
-            "a stays inside the floor"
+            a.floor_reference().await,
+            floor_a,
+            "a's greeting leaves the floor's reference at its start announce"
         );
         assert_eq!(
-            announces_since(before, b.hash8()),
-            0,
-            "b stays inside the floor"
+            b.floor_reference().await,
+            floor_b,
+            "b's greeting leaves the floor's reference at its start announce"
         );
 
         assert!(a.slot.stop().await.unwrap());
@@ -16871,30 +16928,30 @@ mod tests {
             .collect()
     }
 
-    /// The first line starting with `prefix`, if any.
+    /// How many `[mesh]` lines the sink was handed that end with `text`.
     #[cfg(unix)]
-    fn line_starting_with(sink: &RecordingSink, prefix: &str) -> Option<String> {
+    fn lines_ending_with(sink: &RecordingSink, text: &str) -> usize {
         mesh_lines(sink)
-            .into_iter()
-            .find(|line| line.starts_with(prefix))
+            .iter()
+            .filter(|line| line.ends_with(text))
+            .count()
     }
 
-    /// A relay that goes away twice in a row. The first return announces (the start
-    /// announce had lapsed) and that announce resets the floor, so the second return,
-    /// seconds later, sends nothing and says the heartbeat will carry it, naming how long
-    /// ago the first one went out. Two returns, one announce: a relay that flaps cannot
-    /// make the node announce faster than the floor. Between a drop and the return nothing
-    /// is said and the interface still reads connected: the watcher reports returns, not
-    /// outages.
+    /// A relay that goes away five times in a row, every return inside the floor. Each of
+    /// the first four returns is greeted and none moves the floor's reference; the fifth
+    /// within the hour is past `RECONNECT_GREETINGS_PER_HOUR`, sends nothing and says the
+    /// heartbeat carries the announce. Between a drop and the return nothing is said and
+    /// the interface still reads connected: the watcher reports returns, not outages.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_relay_that_flaps_announces_once_per_floor_and_the_second_return_defers() {
+    async fn a_relay_that_flaps_is_greeted_four_times_an_hour_and_the_fifth_return_waits() {
         install_log_collector();
-        let (relay, a, b) = two_nodes_on_a_relay("node-relay-flap").await;
+        let (mut relay, a, b) = two_nodes_on_a_relay("node-relay-flap").await;
         let port = relay.port;
         let label = private_label(port);
-        a.expire_announce_floor().await;
-        b.expire_announce_floor().await;
+        let floor_a = a.floor_reference().await;
+        let floor_b = b.floor_reference().await;
+        let announced = format!("{label} reconnected; announced");
         let before = debug_snapshot().len();
 
         relay.stop().await;
@@ -16913,64 +16970,152 @@ mod tests {
             );
         }
 
-        let relay = TransportRelay::start_on(port).await;
-        let announced = format!("{label} reconnected; announced");
-        wait_for_mesh_line(&a.notifier, &announced).await;
-        wait_for_mesh_line(&b.notifier, &announced).await;
-        for node in [&a, &b] {
-            let last_announce = node
-                .runtime
-                .destination
-                .lock()
-                .await
-                .last_announce
-                .expect("the reconnect announce sets the floor");
-            assert!(
-                last_announce.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS),
-                "the reconnect announce resets the floor, unlike a first-connect announce"
-            );
+        for greeting in 1..=RECONNECT_GREETINGS_PER_HOUR {
+            let (restarted, mut announces) = TransportRelay::start_on_subscribed(port).await;
+            relay = restarted;
+            TransportRelay::heard_from_each(&mut announces, &[&a.hash, &b.hash]).await;
+            for node in [&a, &b] {
+                wait_until("the greeted reconnect line", || {
+                    lines_ending_with(&node.notifier, &announced) == greeting
+                })
+                .await;
+            }
+            // Stay connected past the client's stability window, so the next stop counts
+            // as a drop of a working connection rather than as a failed connect attempt.
+            sleep(Duration::from_millis(2500)).await;
+            relay.stop().await;
         }
-        // Stay connected past the client's stability window, so the next stop counts as a
-        // drop of a working connection rather than as a failed connect attempt.
-        sleep(Duration::from_millis(2500)).await;
 
-        relay.stop().await;
-        let relay = TransportRelay::start_on(port).await;
-        let prefix = format!(
-            "{} {label} reconnected; this node announced ",
-            Source::Mesh.prefix()
+        relay = TransportRelay::start_on(port).await;
+        let past_cap = format!(
+            "{label} reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now"
         );
-        for node in [&a, &b] {
-            wait_until("the deferred reconnect line", || {
-                line_starting_with(&node.notifier, &prefix).is_some()
-            })
-            .await;
-            let line = line_starting_with(&node.notifier, &prefix).unwrap();
-            let age = line
-                .strip_prefix(&prefix)
-                .and_then(|rest| rest.strip_suffix(DEFERRED_SUFFIX))
-                .unwrap_or_else(|| panic!("the line does not end in `{DEFERRED_SUFFIX}`: {line}"));
-            let secs: u64 = age
-                .strip_suffix('s')
-                .and_then(|n| n.parse().ok())
-                .unwrap_or_else(|| panic!("the age is seconds, as `12s`: {line}"));
-            assert!(
-                secs < REANNOUNCE_FLOOR_SECS,
-                "the age named is the first reconnect announce's, inside the floor: {line}"
-            );
-        }
+        wait_for_mesh_line(&a.notifier, &past_cap).await;
+        wait_for_mesh_line(&b.notifier, &past_cap).await;
 
         sleep(WATCH_SETTLE * 3).await;
-        assert_eq!(
-            announces_since(before, a.hash8()),
-            1,
-            "two returns, one announce from a"
+        for (node, floor, name) in [(&a, floor_a, "a"), (&b, floor_b, "b")] {
+            assert_eq!(
+                announces_since(before, node.hash8()),
+                RECONNECT_GREETINGS_PER_HOUR,
+                "five returns, four greetings from {name}"
+            );
+            assert_eq!(
+                lines_ending_with(&node.notifier, &announced),
+                RECONNECT_GREETINGS_PER_HOUR,
+                "four greeted reconnect lines from {name}: {:?}",
+                mesh_lines(&node.notifier)
+            );
+            assert_eq!(
+                node.floor_reference().await,
+                floor,
+                "no greeting moves {name}'s floor reference"
+            );
+        }
+
+        assert!(a.slot.stop().await.unwrap());
+        assert!(b.slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the nodes' tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// How soon after a relay restart two nodes on it must reach each other again.
+    #[cfg(unix)]
+    const RELAY_RESTART_REACH: Duration = Duration::from_secs(20);
+
+    /// Two nodes that trust each other on one relay, which restarts seconds after they
+    /// joined, inside the floor of their start announces. The restarted relay holds no
+    /// path to either and answers path requests only from its own table, so each node
+    /// greets it at once: the relay hears both destinations, each node hears the other's
+    /// greeting, and a status request each way goes through directly within seconds, with
+    /// neither peer ever marked as having no route.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_restart_inside_the_floor_leaves_both_nodes_reachable_within_seconds() {
+        use crate::mesh::test_support::wait_for_peer;
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let relay = TransportRelay::start().await;
+        let port = relay.port;
+        let label = private_label(port);
+        let mut announces = relay.announces().await;
+        let a = RelayNode::start_with("node-relay-restart-reach-a", port, short_connect()).await;
+        let b = RelayNode::start_with("node-relay-restart-reach-b", port, short_connect()).await;
+        TransportRelay::heard_from_each(&mut announces, &[&a.hash, &b.hash]).await;
+        wait_for_peer(&a.runtime, &b.hash).await;
+        wait_for_peer(&b.runtime, &a.hash).await;
+        for (truster, trusted) in [(&a, &b), (&b, &a)] {
+            truster
+                .runtime
+                .trust()
+                .trust_destination(
+                    truster.slot.as_ref(),
+                    &trusted.hash,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .expect("each node trusts the other");
+        }
+        // Stay connected past the client's stability window, so the stop counts as a drop
+        // of a working connection rather than as a failed connect attempt.
+        sleep(Duration::from_secs(2)).await;
+        let floor_a = a.floor_reference().await;
+        let floor_b = b.floor_reference().await;
+        assert!(
+            floor_a.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS)
+                && floor_b.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS),
+            "the relay restarts inside the floor the start announces set"
         );
-        assert_eq!(
-            announces_since(before, b.hash8()),
-            1,
-            "two returns, one announce from b"
+
+        relay.stop().await;
+        let restarted_at = SystemTime::now();
+        let (relay, mut announces) = TransportRelay::start_on_subscribed(port).await;
+        let reached = timeout(RELAY_RESTART_REACH, async {
+            TransportRelay::heard_from_each(&mut announces, &[&a.hash, &b.hash]).await;
+            let line = format!("{label} reconnected; announced");
+            wait_for_mesh_line(&a.notifier, &line).await;
+            wait_for_mesh_line(&b.notifier, &line).await;
+            for (hearer, heard) in [(&a, &b), (&b, &a)] {
+                wait_until("each node to hear the other's greeting", || {
+                    hearer
+                        .runtime
+                        .peers()
+                        .get(&heard.hash)
+                        .is_some_and(|peer| peer.last_seen >= restarted_at)
+                })
+                .await;
+            }
+            for (asker, answerer) in [(&a, &b), (&b, &a)] {
+                let desc = asker
+                    .runtime
+                    .resolve_destination(&answerer.hash)
+                    .await
+                    .expect("the answerer's destination resolves from its greeting");
+                asker
+                    .runtime
+                    .request_status(Route::unasked(desc))
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("the status request through the restarted relay failed: {err:?}")
+                    });
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the nodes did not reach each other within {RELAY_RESTART_REACH:?} of the relay restart"
         );
+        assert!(
+            !a.runtime.link_failed(&b.hash) && !b.runtime.link_failed(&a.hash),
+            "neither peer is marked as having no route"
+        );
+        assert_eq!(a.floor_reference().await, floor_a);
+        assert_eq!(b.floor_reference().await, floor_b);
 
         assert!(a.slot.stop().await.unwrap());
         assert!(b.slot.stop().await.unwrap());
@@ -17209,12 +17354,14 @@ mod tests {
         #[test]
         fn the_reconnect_no_answer_and_unlinked_sentences_are_ascii() {
             let label = "private 127.0.0.1:4242";
-            let failed: Result<Option<Duration>> = Err(anyhow!("the transport said no"));
             let reconnect_lines = [
-                reconnect_line(label, None),
-                reconnect_line(label, Some(&Ok(None))),
-                reconnect_line(label, Some(&Ok(Some(Duration::from_secs(12))))),
-                reconnect_line(label, Some(&failed)),
+                reconnect_line(label, &ReconnectGreeting::NodeDoesNotAnnounce),
+                reconnect_line(label, &ReconnectGreeting::Announced),
+                reconnect_line(label, &ReconnectGreeting::PastCap),
+                reconnect_line(
+                    label,
+                    &ReconnectGreeting::Failed(anyhow!("the transport said no")),
+                ),
             ];
             assert!(
                 !reconnect_lines[3].contains("the transport said no"),
@@ -17242,6 +17389,43 @@ mod tests {
                 assert!(sentence.is_ascii(), "{sentence}");
                 assert!(!sentence.contains(STATUS_PATH), "{sentence}");
             }
+        }
+
+        /// A greeted reconnect says so; past the cap the line says the relay came back
+        /// again, how often, that the heartbeat carries the announce within the hour, and
+        /// the commands that send one now.
+        #[test]
+        fn the_greeted_and_past_cap_reconnect_lines_read_in_full() {
+            let label = "private 127.0.0.1:4242";
+            assert_eq!(
+                reconnect_line(label, &ReconnectGreeting::Announced),
+                "private 127.0.0.1:4242 reconnected; announced"
+            );
+            assert_eq!(
+                reconnect_line(label, &ReconnectGreeting::PastCap),
+                "private 127.0.0.1:4242 reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now"
+            );
+        }
+
+        /// A client's first four reconnects within an hour are greeted and the fifth is
+        /// not; a refused reconnect takes nothing, so an hour after the first greeting one
+        /// more is greeted, and the next one an hour after the second.
+        #[test]
+        fn a_greeting_budget_greets_four_reconnects_an_hour() {
+            let start = Instant::now();
+            let at = |secs: u64| start + Duration::from_secs(secs);
+            let mut budget = GreetingBudget::default();
+            for (reconnect, secs) in [0, 60, 120, 180].into_iter().enumerate() {
+                assert!(budget.take(at(secs)), "reconnect {}", reconnect + 1);
+            }
+            assert!(!budget.take(at(600)), "the fifth reconnect within the hour");
+            assert!(!budget.take(at(3599)), "one second short of the hour");
+            assert!(budget.take(at(3600)), "an hour after the first greeting");
+            assert!(
+                !budget.take(at(3601)),
+                "the hour holds the second, third and fourth greetings and the one just taken"
+            );
+            assert!(budget.take(at(3660)), "an hour after the second greeting");
         }
     }
 

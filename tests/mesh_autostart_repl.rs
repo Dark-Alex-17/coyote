@@ -1733,7 +1733,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // The verb that line names asks the mesh for the unheard hash first; nothing on the
     // relay answers for it, so it is refused and writes nothing.
     let expected = format!(
-        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
         &dest[..8]
     );
     let out = trust_verb(
@@ -3206,7 +3206,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     // The verb that line names asks the mesh for the unheard hash first; nothing answers,
     // so the grant stands and no record is written.
     let expected = format!(
-        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
         &dest[..8]
     );
     let out = trust_verb(

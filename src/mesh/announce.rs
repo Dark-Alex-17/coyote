@@ -12,10 +12,22 @@ pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 64;
 /// This node's own floor between repeated announces of one destination: heartbeats are
 /// `HEARTBEAT_PERIOD_SECS` apart, and a manual announce is never sent sooner than this after the
 /// previous one. A newly registered destination, at start or after a re-key, announces at
-/// once, and a pending interface's first connect announces once; the transport sends on every
-/// interface, so a relay that already heard the start announce hears a fresh announce for a
-/// path it already holds and forwards it like any other; nothing dedups it.
+/// once. Two greetings are not held to the floor and never move its reference or the
+/// heartbeat clock: a pending interface's first connect announces once, and a TCP client
+/// that reconnects announces once per reconnect, up to `RECONNECT_GREETINGS_PER_HOUR`. A
+/// relay drops every path it held for the socket that closed and answers path requests only
+/// from its own table, so a node that reconnected without announcing would be unreachable,
+/// path requests included, until its next heartbeat. The transport sends on every interface,
+/// so a relay that already heard the start announce hears a fresh announce for a path it
+/// already holds and forwards it like any other; nothing dedups it.
 pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
+/// How many reconnects of one TCP client within an hour are greeted with an announce. A
+/// client that flaps more often than this stops greeting until an hour after its oldest
+/// counted greeting, and the heartbeat carries the announce; a relay's own rate limit would
+/// block those announces anyway. Four greetings and a heartbeat in one hour sit next to a
+/// downstream relay's grace of 5 (see `HEARTBEAT_SECS`), which the spec accepts: the
+/// violations they cost decay with the on-time heartbeats that follow.
+pub(crate) const RECONNECT_GREETINGS_PER_HOUR: usize = 4;
 /// How often a running node re-announces so peers can tell it is still there.
 /// An hour matches the Reticulum announce-rate default: a transport node rate-limits
 /// announces per destination (RNS 1.5.2 Interfaces/Interface.py:90-92, DEFAULT_AR_TARGET
@@ -238,6 +250,7 @@ mod tests {
         assert_eq!(ANNOUNCE_MAGIC.len(), 5);
         assert_eq!(MAX_DISPLAY_NAME_BYTES, 64);
         assert_eq!(REANNOUNCE_FLOOR_SECS, 300);
+        assert_eq!(RECONNECT_GREETINGS_PER_HOUR, 4);
         assert_eq!(HEARTBEAT_SECS, 3600);
         assert_eq!(HEARTBEAT_SLACK_SECS, 60);
         assert_eq!(HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS);

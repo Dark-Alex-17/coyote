@@ -10722,7 +10722,7 @@ mod tests {
                     &["docs/a.md".to_string()],
                     CommandPrefix::Slash
                 ),
-                "request 01234567 to fedcba98: pending; fedcba98 has no route (its last link failed and it has not announced since; last heard 3m ago); held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; /mesh inbox lists it)"
+                "request 01234567 to fedcba98: pending; fedcba98 has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard 3m ago); held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; /mesh inbox lists it)"
             );
         }
 
@@ -32143,7 +32143,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap();
                     assert!(
-                        out.contains("Tia has no route (its last link failed and it has not announced since; last heard "),
+                        out.contains("Tia has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard "),
                         "{out}"
                     );
                     assert!(
@@ -33336,7 +33336,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             unanswered_path_request(&unheard),
                             format!(
-                                "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+                                "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
                                 short(&unheard)
                             )
                         );

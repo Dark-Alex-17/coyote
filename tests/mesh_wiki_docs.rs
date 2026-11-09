@@ -3955,13 +3955,13 @@ fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemo
 }
 
 /// The two idle lines a relay restart prints, in the node's wording, are quoted in the
-/// Deployment page's Relay gotchas, with the example line and the floor's length; the
-/// Mesh and Commands pages carry the same two lines.
+/// Deployment page's Relay gotchas, with the example line and the word that the greeting
+/// goes out inside the floor too; the Mesh and Commands pages carry the same two lines.
 #[test]
 fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     let Some(wiki) = wiki_dir() else { return };
     let announced = "[mesh] <label> reconnected; announced";
-    let deferred = "[mesh] <label> reconnected; this node announced <age> ago, so it waits for the next heartbeat to announce again";
+    let past_cap = "[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now";
     let gotchas = flat(&section(
         "Mesh-Deployment.md",
         &read(wiki.join("Mesh-Deployment.md")),
@@ -3969,11 +3969,12 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     ));
     for needle in [
         announced,
-        deferred,
+        past_cap,
         "[mesh] private relay.example.com:4242 reconnected; announced",
         "forgets every path it held through the closed sockets",
+        "answers path requests only from its own table",
         "no `.mesh off`/`.mesh on` is needed",
-        "announced less than five minutes earlier",
+        "even when the node announced less than five minutes earlier",
     ] {
         assert!(
             gotchas.contains(needle),
@@ -3990,7 +3991,7 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
         ("Mesh.md's inbox section", &inbox),
         ("Mesh-Commands.md", &commands),
     ] {
-        for needle in [announced, deferred] {
+        for needle in [announced, past_cap] {
             assert!(
                 text.contains(needle),
                 "{label} does not quote the idle line {needle:?}"
@@ -4121,28 +4122,31 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     );
 }
 
-/// The relay-restart idle lines the wiki quotes are the node's own format strings, and the
-/// `five minutes` the pages give for the floor follows `REANNOUNCE_FLOOR_SECS`. The
-/// `<age>` placeholder stands for the node's `<n>s ago` style span, so the quoted deferred
-/// line reads `announced <age> ago` as the node's does. Runs without the wiki: the code
-/// half holds on its own.
+/// The relay-restart idle lines the wiki quotes are the node's own format strings, the
+/// `4` in the past-cap line follows `RECONNECT_GREETINGS_PER_HOUR` and the `five minutes`
+/// the pages give for the floor follows `REANNOUNCE_FLOOR_SECS`. Each page quotes the
+/// past-cap line next to the cap it stands for and says the greeting goes out inside the
+/// floor too. Runs without the wiki: the code half holds on its own.
 #[test]
-fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_minutes() {
+fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_cap_is_four_an_hour() {
     let node = read(repo_root().join("src/mesh/node.rs"));
     for format in [
         "\"{label} reconnected; announced\"",
-        "\"{label} reconnected; this node announced {}, so it waits for the next heartbeat to announce again\"",
+        "\"{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now\"",
     ] {
         assert!(
             node.contains(format),
             "src/mesh/node.rs no longer builds the idle line {format}; reword the wiki quotes and this pin with it"
         );
     }
-    let mesh = read(repo_root().join("src/mesh/mod.rs"));
     assert!(
-        mesh.contains("format!(\"{} ago\", span_text(elapsed))")
-            && mesh.contains("format!(\"{s}s\")"),
-        "the age in the deferred line is rendered as `<n>s ago`; the wiki's `<age> ago` follows it"
+        !node.contains("reconnected; this node announced"),
+        "src/mesh/node.rs still builds the reconnect line that left the announce to the heartbeat inside the floor"
+    );
+    assert_eq!(
+        const_u64("src/mesh/announce.rs", "RECONNECT_GREETINGS_PER_HOUR"),
+        4,
+        "the pages say `more than 4 times this hour`; reword them and this pin with it"
     );
     assert_eq!(
         const_u64("src/mesh/announce.rs", "REANNOUNCE_FLOOR_SECS") / 60,
@@ -4151,15 +4155,23 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_
     );
 
     let Some(wiki) = wiki_dir() else { return };
-    let deferred = "`[mesh] <label> reconnected; this node announced <age> ago, so it waits for the next heartbeat to announce again`";
+    let past_cap = "`[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within the hour, to announce; .mesh off then .mesh on announces now`";
     for page in ["Mesh.md", "Mesh-Commands.md", "Mesh-Deployment.md"] {
         let text = flat(&read(wiki.join(page)));
+        assert!(
+            !text.contains("reconnected; this node announced"),
+            "{page} still quotes the reconnect line that left the announce to the heartbeat inside the floor"
+        );
+        assert!(
+            text.contains("even when the node announced less than five minutes earlier"),
+            "{page} does not say the reconnect greeting goes out inside the floor too"
+        );
         let at = text
-            .find(deferred)
-            .unwrap_or_else(|| panic!("{page} does not quote the deferred line"));
+            .find(past_cap)
+            .unwrap_or_else(|| panic!("{page} does not quote the past-cap line"));
         // The qualifier sits in the same sentence, before or after the quote.
         let mut start = at.saturating_sub(160);
-        let mut end = (at + deferred.len() + 160).min(text.len());
+        let mut end = (at + past_cap.len() + 160).min(text.len());
         while !text.is_char_boundary(start) {
             start -= 1;
         }
@@ -4168,8 +4180,8 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_
         }
         let around = &text[start..end];
         assert!(
-            around.contains("announced less than five minutes earlier"),
-            "{page} quotes the deferred line without saying it is for a node that announced less than five minutes earlier: {around}"
+            around.contains("more than four reconnects within an hour"),
+            "{page} quotes the past-cap line without saying it is for a relay that reconnected more than four times within an hour: {around}"
         );
     }
 }
@@ -7270,8 +7282,7 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
         "; held at the propagation node, delivered to the session that asked when it syncs"
     );
     let status = string_literals(&method_body("src/mesh/message.rs", "status"));
-    let no_route =
-        " has no route (its last link failed and it has not announced since; last heard {})";
+    let no_route = " has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard {})";
     assert_eq!(status, [" left {}", no_route], "Departure::status moved");
     let see_back = const_str("src/repl/mesh.rs", "SEE_WHEN_IT_IS_BACK");
     assert_eq!(see_back, ".mesh peers shows when it announces again.");

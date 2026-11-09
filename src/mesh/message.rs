@@ -1664,7 +1664,7 @@ impl Departure {
         match self {
             Self::Left(at) => format!(" left {}", age_text(now, at)),
             Self::NoRoute { last_seen } => format!(
-                " has no route (its last link failed and it has not announced since; last heard {})",
+                " has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard {})",
                 age_text(now, last_seen)
             ),
         }
@@ -2661,7 +2661,7 @@ impl FirstContactMiss {
 
 pub(crate) fn unanswered_path_request(destination: &str) -> String {
     format!(
-        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
         short(destination),
         PATH_REQUEST_TIMEOUT.as_secs()
     )
@@ -2677,7 +2677,7 @@ pub(crate) fn answered_not_as_coyote(destination: &str) -> String {
 /// The cause part of `unreachable_head`, for a refusal that does not name the destination.
 pub(crate) fn unreachable_cause() -> String {
     format!(
-        "could not be reached: this node asked the network for a route to it and got no answer within {} s. The peer may be offline or on a network this node cannot reach.",
+        "could not be reached: this node asked the network for a route to it and got no answer within {} s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach.",
         PATH_REQUEST_TIMEOUT.as_secs()
     )
 }
