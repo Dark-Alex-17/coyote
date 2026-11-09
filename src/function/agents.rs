@@ -33,12 +33,12 @@ use indexmap::IndexMap;
 use log::{debug, warn};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::time;
 use tokio::time::Instant;
@@ -218,12 +218,25 @@ pub fn build_pending_tasks_guardrail_prompt(tasks: &[PendingTask]) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        sections.push(format!(
+        let mut section = format!(
             "Still running ({count}):\n{id_list}\n\nThese will be abandoned if your turn ends \
              now. You MUST reclaim each one before ending your turn. Do NOT emit a text-only \
              response expecting them to 'report back' — they will not.",
             count = running.len()
-        ));
+        );
+        let running_agents = running.iter().filter(|t| t.kind == TaskKind::Agent).count();
+        for (count, family, wait) in [
+            (running_agents, "agents", "agent__wait"),
+            (running.len() - running_agents, "jobs", "job__wait"),
+        ] {
+            if count >= 2 {
+                section.push_str(&format!(
+                    "\nTo block until the first of these {family} finishes, call `{wait}`, then \
+                     collect the ids it reports."
+                ));
+            }
+        }
+        sections.push(section);
     }
 
     if !finished.is_empty() {
@@ -419,7 +432,9 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                           wait primitive — it pauses your execution until the agent completes (or you are interrupted). \
                           Call this for every agent you spawned before ending your turn. Do NOT end your turn assuming \
                           agents will 'report back later' — they will not; they will be abandoned. If you no longer \
-                          need an agent's result, call `agent__cancel` instead.".to_string(),
+                          need an agent's result, call `agent__cancel` instead. When several agents are running \
+                          and you want whichever finishes first, call `agent__wait` instead, then collect the ids \
+                          it reports.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([(
@@ -431,6 +446,45 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                     },
                 )])),
                 required: Some(vec!["id".to_string()]),
+                ..Default::default()
+            },
+            agent: false,
+        },
+        FunctionDeclaration {
+            name: format!("{AGENT_FUNCTION_PREFIX}wait"),
+            description: "Block until ANY of the given agents (default: every agent you started) finishes, \
+                          or until `timeout_secs` elapses. Returns immediately if one is already finished. Does \
+                          NOT return or consume results: it lists the finished ids, each with the exact collect \
+                          command in `next_action`. Call it alone in a batch, then collect the reported ids. It \
+                          does not reclaim anything: you must still collect or cancel every agent before ending \
+                          your turn. Do not repeat an identical timed wait: that is flagged as a loop, so change \
+                          `timeout_secs` or do other work first.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([
+                    (
+                        "ids".to_string(),
+                        JsonSchema {
+                            type_value: Some("array".to_string()),
+                            description: Some("Agent ids to watch. Omit or pass an empty list to watch every \
+                                               agent you started".into()),
+                            items: Some(Box::new(JsonSchema {
+                                type_value: Some("string".to_string()),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "timeout_secs".to_string(),
+                        JsonSchema {
+                            type_value: Some("number".to_string()),
+                            description: Some("Stop waiting after this many seconds even if nothing finished \
+                                               (default: no timeout)".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
                 ..Default::default()
             },
             agent: false,
@@ -695,6 +749,7 @@ pub async fn handle_agent_tool(
         "spawn" => handle_spawn(ctx, args).await,
         "check" => handle_check(ctx, args).await,
         "collect" => handle_collect(ctx, args).await,
+        "wait" => handle_wait(ctx, args).await,
         "list_running" => handle_list_running(ctx),
         "list_sessions" => handle_list_sessions(ctx, args),
         "list_available" => handle_list_available(ctx),
@@ -2473,6 +2528,8 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
     let spawn_abort = child_abort.clone();
     let hook_abort = child_abort.clone();
     let spawn_notifications = Arc::clone(&ctx.notification_queue);
+    let succeeded: Arc<OnceLock<bool>> = Arc::default();
+    let spawn_succeeded = Arc::clone(&succeeded);
     let child_supervisor = child_ctx.supervisor.clone();
     let root = child_ctx.child_session_root.clone();
     let spawn_root = root.clone();
@@ -2526,6 +2583,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
                 AgentExitStatus::Completed => result_hooks.fire(None, interrupted),
                 AgentExitStatus::Failed(e) => result_hooks.fire(Some(e), interrupted),
             }
+            spawn_succeeded.get_or_init(|| success);
             notified.store(true, Ordering::SeqCst);
             spawn_notifications.push(agent_notification(
                 &agent_result.id,
@@ -2549,6 +2607,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
                     panic_hooks.fire(Some(&error), false);
                 }
                 if !notified.load(Ordering::SeqCst) {
+                    spawn_succeeded.get_or_init(|| false);
                     spawn_notifications.push(agent_notification(
                         &panic_agent_id,
                         &panic_agent_name,
@@ -2571,6 +2630,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         child_supervisor,
         session_id: session_id.clone(),
         child_session_root: root.clone(),
+        succeeded,
     };
 
     let registered = match ctx.supervisor.as_ref() {
@@ -2815,6 +2875,189 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             "message": format!("Agent '{id}' completed but could not be collected. It may have been collected by another call.")
         })),
     }
+}
+
+fn wait_ids_arg(args: &Value) -> Result<Vec<String>> {
+    let Some(ids) = args.get("ids").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let ids = ids
+        .as_array()
+        .ok_or_else(|| anyhow!("'ids' must be an array of strings"))?;
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id
+            .as_str()
+            .ok_or_else(|| anyhow!("'ids' must be an array of strings"))?;
+        if !out.iter().any(|seen| seen == id) {
+            out.push(id.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn wait_timeout_arg(args: &Value) -> Result<Option<Duration>> {
+    match args.get("timeout_secs").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        // A timeout too large for a Duration can never elapse: no deadline.
+        Some(value) => match value.as_f64() {
+            Some(secs) if secs >= 0.0 => Ok(Duration::try_from_secs_f64(secs).ok()),
+            _ => Err(anyhow!("'timeout_secs' must be a non-negative number")),
+        },
+    }
+}
+
+async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
+    let supervisor = ctx
+        .supervisor
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("No supervisor active"))?;
+    let requested = wait_ids_arg(args)?;
+    let timeout = wait_timeout_arg(args)?;
+
+    let owned: Vec<String> = pending_tasks(ctx)
+        .into_iter()
+        .filter(|t| t.kind == TaskKind::Agent)
+        .map(|t| t.id)
+        .collect();
+    let (watched, unknown): (Vec<String>, Vec<String>) = if requested.is_empty() {
+        (owned, Vec::new())
+    } else {
+        requested.into_iter().partition(|id| owned.contains(id))
+    };
+    let hint = unknown
+        .iter()
+        .filter(|id| is_job_task(Some(&supervisor), id))
+        .map(|id| {
+            job_id_teaching_error(id)["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+    let user_interrupts_here = ctx.user_interrupts_here();
+    let mut response = loop {
+        let mut unknown = unknown.clone();
+        let mut running = Vec::new();
+        let mut finished = Vec::new();
+        {
+            let sup = supervisor.read();
+            for id in &watched {
+                match sup.is_finished(id) {
+                    Some(true) => finished.push((
+                        id.clone(),
+                        sup.agent_name(id).unwrap_or_default().to_string(),
+                        sup.agent_succeeded(id),
+                    )),
+                    Some(false) => running.push(id.clone()),
+                    None => unknown.push(id.clone()),
+                }
+            }
+        }
+
+        if !finished.is_empty() {
+            let ids: HashSet<&str> = finished.iter().map(|(id, ..)| id.as_str()).collect();
+            let notified: HashMap<String, &'static str> = ctx
+                .notification_queue
+                .take_ids(&ids)
+                .into_iter()
+                .map(|n| (n.id, n.status))
+                .collect();
+            let ready: Vec<Value> = finished
+                .iter()
+                .map(|(id, name, succeeded)| {
+                    let outcome = match succeeded {
+                        Some(true) => "success",
+                        Some(false) => "failed",
+                        None => notified.get(id).copied().unwrap_or("finished"),
+                    };
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "outcome": outcome,
+                        "next_action": format!("agent__collect --id {id}"),
+                    })
+                })
+                .collect();
+            let id_list = finished
+                .iter()
+                .map(|(id, ..)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            break json!({
+                "status": "ready",
+                "ready": ready,
+                "running": running,
+                "unknown": unknown,
+                "message": format!("Finished: {id_list}. Collect each one now with the command in its `next_action`; wait did not consume any result."),
+            });
+        }
+
+        if running.is_empty() {
+            break json!({
+                "status": "none",
+                "ready": [],
+                "running": [],
+                "unknown": unknown,
+                "message": "Nothing to wait for: no watched id is an agent you started that is still registered.",
+            });
+        }
+
+        let interrupted = || {
+            json!({
+                "status": "interrupted",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "The wait was interrupted by the user; the watched agents are still running in the background. Wait again later, collect or cancel them, or continue with other work.",
+            })
+        };
+
+        if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
+            break interrupted();
+        }
+
+        if let Some(queue) = ctx.root_escalation_queue()
+            && queue.has_pending()
+        {
+            let summary = queue.pending_summary();
+            break json!({
+                "status": "pending",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "The watched agents are still running, but child agents have pending escalations that need your reply. Reply via agent__reply_escalation, then wait again.",
+                "pending_escalations": summary,
+            });
+        }
+
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break json!({
+                "status": "timeout",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "No watched agent finished before the timeout. Nothing is lost: every agent is still running and registered. Do other work, or wait again with a different timeout_secs (repeating an identical call is flagged as a loop).",
+            });
+        }
+
+        tokio::select! {
+            _ = time::sleep(Duration::from_millis(200)) => {}
+            _ = time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {}
+            _ = wait_user_interrupt(ctx.session_abort.as_ref()), if user_interrupts_here => {
+                break interrupted();
+            }
+            _ = latch_user_interrupt(ctx.session_abort.as_ref()), if !user_interrupts_here => {}
+        }
+    };
+    if !hint.is_empty() {
+        response["hint"] = json!(hint);
+    }
+    Ok(response)
 }
 
 fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
@@ -4082,6 +4325,38 @@ mod tests {
             InjectedPanic::AfterTheRun,
             cancel_a_panicked_child,
         );
+    }
+
+    #[test]
+    #[serial]
+    fn a_child_whose_run_panics_records_a_failed_outcome() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_outcome_panic");
+        write_graph_agent_with_hooks(&agent_name, "outcome_panic", false);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        with_panic_in_child_run(&agent_name, || {
+            run_async(async {
+                let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                    .await
+                    .unwrap();
+                assert_eq!(spawned["status"], "ok", "{spawned}");
+                let id = spawned["id"].as_str().unwrap().to_string();
+                let supervisor = ctx.supervisor.clone().unwrap();
+                time::timeout(Duration::from_secs(5), async {
+                    while supervisor.read().is_finished(&id) != Some(true) {
+                        time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the panicked child must finish");
+
+                assert_eq!(supervisor.read().agent_succeeded(&id), Some(false));
+
+                collect_a_panicked_child(&mut ctx, &id).await;
+            })
+        });
     }
 
     async fn collect_a_panicked_child(ctx: &mut RequestContext, id: &str) {
@@ -6456,11 +6731,19 @@ mod tests {
             .write()
             .take(&id)
             .expect("spawned agent must be registered");
-        handle
+        let succeeded = Arc::clone(&handle.succeeded);
+        let result = handle
             .join_handle
             .await
             .expect("spawn task must not panic")
-            .expect("spawn task must return an AgentResult")
+            .expect("spawn task must return an AgentResult");
+        assert_eq!(
+            succeeded.get().copied(),
+            Some(result.exit_status == AgentExitStatus::Completed),
+            "{:?}",
+            result.exit_status
+        );
+        result
     }
 
     /// A ctrl-c that lands after the child's run has returned `Ok` and
@@ -11351,6 +11634,7 @@ mod tests {
             child_supervisor: None,
             session_id: Some(sid.to_string()),
             child_session_root: Some(root),
+            succeeded: Default::default(),
         };
         ctx.supervisor
             .as_ref()
@@ -13618,6 +13902,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         }
     }
 
@@ -13630,11 +13915,20 @@ mod tests {
     }
 
     fn register_running_agent(ctx: &mut RequestContext, id: &str, name: &str) -> AbortSignal {
+        register_agent_running_for(ctx, id, name, Duration::from_secs(60))
+    }
+
+    fn register_agent_running_for(
+        ctx: &mut RequestContext,
+        id: &str,
+        name: &str,
+        run_for: Duration,
+    ) -> AbortSignal {
         let abort = create_abort_signal();
         let id_owned = id.to_string();
         let name_owned = name.to_string();
         let join_handle = tokio::spawn(async move {
-            time::sleep(Duration::from_secs(60)).await;
+            time::sleep(run_for).await;
             Ok(AgentResult {
                 id: id_owned,
                 agent_name: name_owned,
@@ -13653,6 +13947,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         };
         ctx.supervisor
             .as_ref()
@@ -14221,6 +14516,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15227,6 +15523,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15285,6 +15582,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15347,6 +15645,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15421,6 +15720,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15470,6 +15770,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15536,6 +15837,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -16583,6 +16885,7 @@ mod tests {
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             };
             ctx.supervisor
                 .as_ref()
@@ -17043,5 +17346,566 @@ mod tests {
         );
         assert!(hook_captures_named("probe_ctrlc_launch_completed").is_empty());
         assert!(hook_captures_named("probe_ctrlc_launch_failed").is_empty());
+    }
+
+    #[test]
+    fn handle_wait_reports_the_finished_agent_and_lists_the_running_one() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            register_fake_agent(&mut ctx, "a1", "explore");
+            wait_until_finished(&ctx, "a1");
+
+            let result = handle_wait(&mut ctx, &json!({})).await.unwrap();
+
+            assert_eq!(result["status"], "ready");
+            assert_eq!(
+                result["ready"],
+                json!([{
+                    "id": "a1",
+                    "name": "explore",
+                    "outcome": "finished",
+                    "next_action": "agent__collect --id a1",
+                }])
+            );
+            assert_eq!(result["running"], json!(["slow"]));
+            assert_eq!(result["unknown"], json!([]));
+        });
+    }
+
+    #[test]
+    fn handle_wait_blocks_until_a_running_agent_finishes() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort =
+                register_agent_running_for(&mut ctx, "a1", "explore", Duration::from_millis(300));
+            let started = Instant::now();
+
+            let result = time::timeout(Duration::from_secs(5), handle_wait(&mut ctx, &json!({})))
+                .await
+                .expect("wait must wake when the agent finishes")
+                .unwrap();
+
+            assert!(
+                started.elapsed() >= Duration::from_millis(200),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(result["status"], "ready");
+            assert_eq!(result["ready"][0]["id"], "a1");
+        });
+    }
+
+    #[test]
+    fn handle_wait_lists_every_finished_task() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            register_fake_agent(&mut ctx, "a1", "explore");
+            register_fake_agent(&mut ctx, "a2", "oracle");
+            wait_until_finished(&ctx, "a1");
+            wait_until_finished(&ctx, "a2");
+
+            let result = handle_wait(&mut ctx, &json!({})).await.unwrap();
+
+            let ready: Vec<&str> = result["ready"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ready, vec!["a1", "a2"]);
+        });
+    }
+
+    #[test]
+    fn handle_wait_returns_immediately_on_an_already_finished_task() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            register_fake_agent(&mut ctx, "a1", "explore");
+            wait_until_finished(&ctx, "a1");
+
+            let result = time::timeout(
+                Duration::from_millis(100),
+                handle_wait(&mut ctx, &json!({"ids": ["a1"]})),
+            )
+            .await
+            .expect("wait on a finished task must not sleep")
+            .unwrap();
+
+            assert_eq!(result["status"], "ready");
+            assert_eq!(result["ready"][0]["id"], "a1");
+        });
+    }
+
+    #[test]
+    fn handle_wait_does_not_consume_or_reset_the_guardrail() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            register_fake_agent(&mut ctx, "a1", "explore");
+            wait_until_finished(&ctx, "a1");
+            ctx.pending_tasks_guardrail_count = 2;
+
+            let result = handle_wait(&mut ctx, &json!({})).await.unwrap();
+
+            assert_eq!(result["status"], "ready");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_agent("a1"));
+            assert_eq!(ctx.pending_tasks_guardrail_count, 2);
+            let collected = handle_collect(&mut ctx, &json!({"id": "a1"}))
+                .await
+                .unwrap();
+            assert_eq!(collected["status"], "completed");
+            assert_eq!(collected["output"], "fake output");
+        });
+    }
+
+    #[test]
+    fn handle_wait_takes_only_the_ready_ids_notifications() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            register_fake_agent(&mut ctx, "a1", "explore");
+            wait_until_finished(&ctx, "a1");
+            ctx.notification_queue
+                .push(agent_notification("a1", "explore", false));
+            ctx.notification_queue
+                .push(agent_notification("other", "explore", true));
+
+            let result = handle_wait(&mut ctx, &json!({})).await.unwrap();
+
+            assert_eq!(result["ready"][0]["id"], "a1");
+            assert_eq!(result["ready"][0]["outcome"], "failed");
+            let left: Vec<String> = ctx
+                .notification_queue
+                .drain()
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
+            assert_eq!(left, vec!["other"]);
+        });
+    }
+
+    #[test]
+    fn handle_wait_times_out_and_keeps_the_running_handles() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_wait(&mut ctx, &json!({"timeout_secs": 1})),
+            )
+            .await
+            .expect("wait must honour timeout_secs")
+            .unwrap();
+
+            assert_eq!(result["status"], "timeout");
+            assert_eq!(result["running"], json!(["slow"]));
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Nothing is lost")
+            );
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("slow"),
+                Some(false)
+            );
+        });
+    }
+
+    #[test]
+    fn handle_wait_sends_a_job_id_to_unknown_and_teaches_job_tools() {
+        run_async(async {
+            let mut ctx = ctx_with_job_capable_supervisor();
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            register_fake_job(&mut ctx, "job_1");
+
+            let result = handle_wait(
+                &mut ctx,
+                &json!({"ids": ["slow", "job_1", "nope"], "timeout_secs": 0}),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result["status"], "timeout");
+            assert_eq!(result["running"], json!(["slow"]));
+            assert_eq!(result["unknown"], json!(["job_1", "nope"]));
+            let hint = result["hint"].as_str().unwrap();
+            assert!(
+                hint.contains("'job_1' is a background job, not an agent"),
+                "{hint}"
+            );
+            assert!(!hint.contains("nope"), "{hint}");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_job("job_1"));
+        });
+    }
+
+    #[test]
+    fn handle_wait_with_nothing_owned_returns_none() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let result = run_async(handle_wait(&mut ctx, &json!({}))).unwrap();
+
+        assert_eq!(result["status"], "none");
+    }
+
+    #[test]
+    fn handle_wait_without_supervisor_errors() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+
+        let err = run_async(handle_wait(&mut ctx, &json!({}))).unwrap_err();
+
+        assert!(err.to_string().contains("No supervisor active"));
+    }
+
+    #[test]
+    fn handle_wait_returns_pending_on_escalations() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            let queue = ctx.ensure_root_escalation_queue();
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            queue.submit(EscalationRequest {
+                id: "esc_1".into(),
+                from_agent_id: "a1".into(),
+                from_agent_name: "explore".into(),
+                question: "What do?".into(),
+                options: None,
+                reply_tx: tx,
+            });
+
+            let result = handle_wait(&mut ctx, &json!({})).await.unwrap();
+
+            assert_eq!(result["status"], "pending");
+            assert!(result["pending_escalations"].is_array());
+            assert_eq!(result["running"], json!(["slow"]));
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_agent("slow"));
+        });
+    }
+
+    #[test]
+    fn handle_wait_session_interrupt_returns_and_keeps_tasks() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            let session = create_abort_signal();
+            session.set_ctrlc();
+            ctx.session_abort = Some(session.clone());
+
+            let result = time::timeout(Duration::from_secs(2), handle_wait(&mut ctx, &json!({})))
+                .await
+                .expect("interrupted wait must return promptly")
+                .unwrap();
+
+            assert_eq!(result["status"], "interrupted");
+            assert_eq!(result["running"], json!(["slow"]));
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("still running")
+            );
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_agent("slow"));
+        });
+    }
+
+    #[test]
+    fn handle_wait_returns_interrupted_on_a_ctrlc_mid_wait() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            let session = create_abort_signal();
+            ctx.session_abort = Some(session.clone());
+            tokio::spawn(async move {
+                time::sleep(Duration::from_millis(50)).await;
+                session.set_ctrlc();
+            });
+
+            let result = time::timeout(Duration::from_secs(2), handle_wait(&mut ctx, &json!({})))
+                .await
+                .expect("a Ctrl-C mid-wait must end the wait promptly")
+                .unwrap();
+
+            assert_eq!(result["status"], "interrupted");
+            assert_eq!(result["running"], json!(["slow"]));
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_agent("slow"));
+        });
+    }
+
+    /// The bare-SIGINT arm a spawned child latches cannot be driven
+    /// hermetically, so this pins that the child's wait ends on its timeout.
+    #[test]
+    fn handle_wait_in_a_spawned_child_times_out_instead_of_interrupting() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            assert!(!ctx.user_interrupts_here());
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_wait(&mut ctx, &json!({"timeout_secs": 0.3})),
+            )
+            .await
+            .expect("the spawned child wait must honour timeout_secs")
+            .unwrap();
+
+            assert_eq!(result["status"], "timeout");
+            assert_eq!(result["running"], json!(["slow"]));
+        });
+    }
+
+    #[test]
+    fn dispatch_routes_wait() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let result = run_async(handle_agent_tool(&mut ctx, "agent__wait", &json!({}))).unwrap();
+
+        assert_eq!(result["status"], "none");
+    }
+
+    #[test]
+    fn wait_descriptions_name_only_their_own_family() {
+        let agent_decls = agent_function_declarations();
+        let job_decls = crate::function::jobs::job_function_declarations();
+        let description = |decls: &[FunctionDeclaration], name: &str| {
+            decls
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap()
+                .description
+                .clone()
+        };
+
+        let agent_collect = description(&agent_decls, "agent__collect");
+        assert!(agent_collect.contains("agent__wait"));
+        assert!(!agent_collect.contains("job__"));
+        let job_collect = description(&job_decls, "job__collect");
+        assert!(job_collect.contains("job__wait"));
+        assert!(!job_collect.contains("agent__"));
+        assert!(!description(&job_decls, "job__wait").contains("agent__"));
+        assert!(!description(&agent_decls, "agent__wait").contains("job__"));
+        assert!(!agent_collect.contains("agents or jobs"));
+    }
+
+    #[test]
+    fn wait_descriptions_carry_the_usage_contract_in_ascii() {
+        let agent_decls = agent_function_declarations();
+        let job_decls = crate::function::jobs::job_function_declarations();
+        for (decl, default) in [
+            (
+                agent_decls
+                    .iter()
+                    .find(|d| d.name == "agent__wait")
+                    .unwrap(),
+                "(default: every agent you started)",
+            ),
+            (
+                job_decls.iter().find(|d| d.name == "job__wait").unwrap(),
+                "(default: every job you started)",
+            ),
+        ] {
+            let description = &decl.description;
+            for clause in [
+                "Block until",
+                "Returns immediately",
+                "NOT return or consume",
+                "alone in a batch",
+                "does not reclaim",
+                default,
+            ] {
+                assert!(
+                    description.contains(clause),
+                    "{clause:?} missing: {description}"
+                );
+            }
+            assert!(description.is_ascii(), "{description}");
+            for (name, schema) in decl.parameters.properties.clone().unwrap() {
+                assert!(schema.description.unwrap().is_ascii(), "{name}");
+            }
+        }
+    }
+
+    fn register_failed_agent(ctx: &mut RequestContext, id: &str) {
+        let id_owned = id.to_string();
+        let join_handle = tokio::spawn(async move {
+            Ok(AgentResult {
+                id: id_owned,
+                agent_name: "explore".to_string(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Failed("boom".to_string()),
+                session_id: None,
+            })
+        });
+        let handle = AgentHandle {
+            id: id.to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: create_abort_signal(),
+            join_handle,
+            child_supervisor: None,
+            session_id: None,
+            child_session_root: None,
+            succeeded: Arc::new(OnceLock::from(false)),
+        };
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(handle)
+            .unwrap();
+    }
+
+    #[test]
+    fn handle_wait_reports_a_failed_agent_on_every_wait() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            register_failed_agent(&mut ctx, "a1");
+            ctx.notification_queue
+                .push(agent_notification("a1", "explore", false));
+            time::timeout(Duration::from_secs(5), async {
+                while !ctx
+                    .supervisor
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .is_finished("a1")
+                    .unwrap()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the failed agent must finish");
+
+            let first = handle_wait(&mut ctx, &json!({})).await.unwrap();
+            let second = handle_wait(&mut ctx, &json!({})).await.unwrap();
+
+            assert_eq!(first["ready"][0]["outcome"], "failed");
+            assert_eq!(second["ready"][0]["outcome"], "failed");
+            assert!(ctx.notification_queue.drain().is_empty());
+        });
+    }
+
+    #[test]
+    fn handle_wait_accepts_a_timeout_too_large_for_a_deadline() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            register_fake_agent(&mut ctx, "a1", "explore");
+            wait_until_finished(&ctx, "a1");
+
+            for timeout_secs in [1e19, 1e20] {
+                let result = handle_wait(&mut ctx, &json!({"timeout_secs": timeout_secs}))
+                    .await
+                    .unwrap();
+
+                assert_eq!(result["status"], "ready", "{timeout_secs}");
+                assert_eq!(result["ready"][0]["id"], "a1");
+            }
+        });
+    }
+
+    #[test]
+    fn handle_wait_treats_a_timeout_too_large_for_a_deadline_as_no_deadline() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+
+            for timeout_secs in [1e19, 1e20] {
+                let blocked = time::timeout(
+                    Duration::from_millis(300),
+                    handle_wait(&mut ctx, &json!({"timeout_secs": timeout_secs})),
+                )
+                .await;
+                assert!(blocked.is_err(), "{timeout_secs} must mean no deadline");
+            }
+        });
+    }
+
+    #[test]
+    fn handle_wait_with_zero_timeout_returns_at_once_and_keeps_the_handle() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+
+            let result = time::timeout(
+                Duration::from_millis(100),
+                handle_wait(&mut ctx, &json!({"timeout_secs": 0})),
+            )
+            .await
+            .expect("a zero timeout must not sleep")
+            .unwrap();
+
+            assert_eq!(result["status"], "timeout");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_agent("slow"));
+        });
+    }
+
+    #[test]
+    fn handle_wait_rejects_malformed_arguments() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        for args in [
+            json!({"ids": "a1"}),
+            json!({"ids": ["a1", 7]}),
+            json!({"timeout_secs": -1}),
+            json!({"timeout_secs": "soon"}),
+            json!({"timeout_secs": true}),
+        ] {
+            assert!(
+                run_async(handle_wait(&mut ctx, &args)).is_err(),
+                "{args} must be rejected"
+            );
+        }
+
+        let defaults = run_async(handle_wait(
+            &mut ctx,
+            &json!({"ids": null, "timeout_secs": null}),
+        ))
+        .unwrap();
+        assert_eq!(defaults["status"], "none");
+    }
+
+    #[test]
+    fn guardrail_prompt_suggests_a_family_wait_once_two_of_that_family_run() {
+        let task = |id: &str, kind| PendingTask {
+            id: id.into(),
+            kind,
+            finished: false,
+        };
+
+        let one = build_pending_tasks_guardrail_prompt(&[task("a1", TaskKind::Agent)]);
+        let agents = build_pending_tasks_guardrail_prompt(&[
+            task("a1", TaskKind::Agent),
+            task("a2", TaskKind::Agent),
+        ]);
+        let mixed = build_pending_tasks_guardrail_prompt(&[
+            task("a1", TaskKind::Agent),
+            task("job_1", TaskKind::Job),
+        ]);
+        let jobs = build_pending_tasks_guardrail_prompt(&[
+            task("job_1", TaskKind::Job),
+            task("job_2", TaskKind::Job),
+        ]);
+
+        let both = build_pending_tasks_guardrail_prompt(&[
+            task("a1", TaskKind::Agent),
+            task("a2", TaskKind::Agent),
+            task("job_1", TaskKind::Job),
+            task("job_2", TaskKind::Job),
+        ]);
+
+        assert!(!one.contains("agent__wait"));
+        assert!(agents.contains("agent__wait") && !agents.contains("job__wait"));
+        assert!(!mixed.contains("agent__wait") && !mixed.contains("job__wait"));
+        assert!(jobs.contains("job__wait") && !jobs.contains("agent__wait"));
+        assert!(both.contains("agent__wait") && both.contains("job__wait"));
+        let wait_line = agents
+            .lines()
+            .find(|line| line.contains("agent__wait"))
+            .unwrap();
+        assert!(wait_line.is_ascii(), "{wait_line}");
     }
 }

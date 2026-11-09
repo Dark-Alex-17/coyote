@@ -18,6 +18,7 @@ After spawning background agents:
 
 1. If you have **non-overlapping** work to do (work that doesn't depend on the delegated research), do it now.
 2. If you don't, **end your response.** Do not call `agent__collect` immediately — the agent is still running.
+   Exception: with several agents running and nothing else to do, you may call `agent__wait` alone, then collect the ids it reports; it consumes and reclaims nothing, so every agent still needs a collect or cancel.
 3. The system notifies you when the agent completes (`pending_escalations` or completion event).
 4. On notification, call `agent__collect` to retrieve results.
 

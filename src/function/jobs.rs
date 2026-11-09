@@ -1,4 +1,4 @@
-use super::agents::AGENT_FUNCTION_PREFIX;
+use super::agents::{self, AGENT_FUNCTION_PREFIX};
 use super::memory::MEMORY_FUNCTION_PREFIX;
 use super::mesh::MESH_FUNCTION_PREFIX;
 use super::rag_query::RAG_FUNCTION_PREFIX;
@@ -19,7 +19,7 @@ use crate::mcp::{
     MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
 };
 use crate::supervisor::notification::job_notification;
-use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
+use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, TaskKind};
 use crate::utils::fs::TempFileGuard;
 use crate::utils::{
     create_abort_signal, latch_user_interrupt, muted_warning_text, temp_file, wait_abort_signal,
@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -280,7 +280,8 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
                           `full_result: true` to skip the cap entirely (the session-wide tool-output limit still \
                           applies). Collecting is consume-once — decide first via `job__check`'s \
                           `output_bytes_captured`. For very large outputs, prefer having the command write to a \
-                          file and paging it with `fs_read`.".to_string(),
+                          file and paging it with `fs_read`. When several jobs are running and you want whichever \
+                          finishes first, call `job__wait` instead, then collect the ids it reports.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -310,6 +311,45 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
                     ),
                 ])),
                 required: Some(vec!["id".to_string()]),
+                ..Default::default()
+            },
+            agent: false,
+        },
+        FunctionDeclaration {
+            name: format!("{JOB_FUNCTION_PREFIX}wait"),
+            description: "Block until ANY of the given jobs (default: every job you started) finishes, \
+                          or until `timeout_secs` elapses. Returns immediately if one is already finished. Does \
+                          NOT return or consume results: it lists the finished ids, each with the exact collect \
+                          command in `next_action`. Call it alone in a batch, then collect the reported ids. It \
+                          does not reclaim anything: you must still collect or cancel every job before ending \
+                          your turn. Do not repeat an identical timed wait: that is flagged as a loop, so change \
+                          `timeout_secs` or do other work first.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([
+                    (
+                        "ids".to_string(),
+                        JsonSchema {
+                            type_value: Some("array".to_string()),
+                            description: Some("Job ids to watch. Omit or pass an empty list to watch every \
+                                               job you started".into()),
+                            items: Some(Box::new(JsonSchema {
+                                type_value: Some("string".to_string()),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "timeout_secs".to_string(),
+                        JsonSchema {
+                            type_value: Some("number".to_string()),
+                            description: Some("Stop waiting after this many seconds even if nothing finished \
+                                               (default: no timeout)".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
                 ..Default::default()
             },
             agent: false,
@@ -368,6 +408,7 @@ pub async fn handle_job_tool(
         "start" => handle_start(ctx, args).await,
         "check" => handle_check(ctx, args),
         "collect" => handle_collect(ctx, args).await,
+        "wait" => handle_wait(ctx, args).await,
         "cancel" => handle_cancel(ctx, args).await,
         "list" => handle_list(ctx),
         _ => bail!("Unknown job action: {action}"),
@@ -624,8 +665,9 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         "status": "ok",
         "job_id": job_id,
         "tool": tool,
-        "message": "Running in background. Check with job__check, block with job__collect, cancel with job__cancel. \
-                    You will receive a system_notifications entry on completion. Jobs do not survive coyote exiting.",
+        "message": "Running in background. Check with job__check, block with job__collect (or job__wait for whichever \
+                    of several jobs finishes first), cancel with job__cancel. You will receive a system_notifications \
+                    entry on completion. Jobs do not survive coyote exiting.",
     }))
 }
 
@@ -861,6 +903,180 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         response["result_truncated"] = json!(true);
     }
 
+    Ok(response)
+}
+
+fn wait_ids_arg(args: &Value) -> Result<Vec<String>> {
+    let Some(ids) = args.get("ids").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let ids = ids
+        .as_array()
+        .ok_or_else(|| anyhow!("'ids' must be an array of strings"))?;
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id
+            .as_str()
+            .ok_or_else(|| anyhow!("'ids' must be an array of strings"))?;
+        if !out.iter().any(|seen| seen == id) {
+            out.push(id.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn wait_timeout_arg(args: &Value) -> Result<Option<Duration>> {
+    match args.get("timeout_secs").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        // A timeout too large for a Duration can never elapse: no deadline.
+        Some(value) => match value.as_f64() {
+            Some(secs) if secs >= 0.0 => Ok(Duration::try_from_secs_f64(secs).ok()),
+            _ => Err(anyhow!("'timeout_secs' must be a non-negative number")),
+        },
+    }
+}
+
+async fn handle_wait(ctx: &RequestContext, args: &Value) -> Result<Value> {
+    let requested = wait_ids_arg(args)?;
+    let timeout = wait_timeout_arg(args)?;
+
+    let owned: Vec<String> = agents::pending_tasks(ctx)
+        .into_iter()
+        .filter(|t| t.kind == TaskKind::Job)
+        .map(|t| t.id)
+        .collect();
+    let (watched, unknown): (Vec<String>, Vec<String>) = if requested.is_empty() {
+        (owned, Vec::new())
+    } else {
+        requested.into_iter().partition(|id| owned.contains(id))
+    };
+    let hint = unknown
+        .iter()
+        .filter(|id| is_agent_task(ctx.supervisor.as_ref(), id))
+        .map(|id| {
+            job_miss_error(ctx.supervisor.as_ref(), id)["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let deadline = timeout.and_then(|t| time::Instant::now().checked_add(t));
+    let user_interrupts_here = ctx.user_interrupts_here();
+    let mut response = loop {
+        let mut unknown = unknown.clone();
+        let mut running = Vec::new();
+        let mut finished = Vec::new();
+        if let Some(supervisor) = ctx.supervisor.as_ref() {
+            let sup = supervisor.read();
+            for id in &watched {
+                match sup.job(id) {
+                    Some(job) if job.join_handle.is_finished() => finished.push((
+                        id.clone(),
+                        job.tool.clone(),
+                        job.state.lock().status,
+                        job.output_buf.lock().total_written(),
+                    )),
+                    Some(_) => running.push(id.clone()),
+                    None => unknown.push(id.clone()),
+                }
+            }
+        }
+
+        if !finished.is_empty() {
+            let ids: HashSet<&str> = finished.iter().map(|(id, ..)| id.as_str()).collect();
+            ctx.notification_queue.take_ids(&ids);
+            let ready: Vec<Value> = finished
+                .iter()
+                .map(|(id, tool, status, bytes)| {
+                    let outcome = match status {
+                        JobStatus::Completed => "success",
+                        JobStatus::Failed | JobStatus::Running => "failed",
+                    };
+                    json!({
+                        "id": id,
+                        "name": tool,
+                        "outcome": outcome,
+                        "next_action": format!("job__collect --id {id}"),
+                        "output_bytes_captured": bytes,
+                    })
+                })
+                .collect();
+            let id_list = finished
+                .iter()
+                .map(|(id, ..)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            break json!({
+                "status": "ready",
+                "ready": ready,
+                "running": running,
+                "unknown": unknown,
+                "message": format!("Finished: {id_list}. Collect each one now with the command in its `next_action`; wait did not consume any result."),
+            });
+        }
+
+        if running.is_empty() {
+            break json!({
+                "status": "none",
+                "ready": [],
+                "running": [],
+                "unknown": unknown,
+                "message": "Nothing to wait for: no watched id is a job you started that is still registered.",
+            });
+        }
+
+        let interrupted = || {
+            json!({
+                "status": "interrupted",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "The wait was interrupted by the user; the watched jobs are still running in the background. Wait again later, collect or cancel them, or continue with other work.",
+            })
+        };
+
+        if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
+            break interrupted();
+        }
+
+        if let Some(queue) = ctx.root_escalation_queue()
+            && queue.has_pending()
+        {
+            let summary = queue.pending_summary();
+            break json!({
+                "status": "pending",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "The watched jobs are still running, but child agents have pending escalations that need your reply. Reply via agent__reply_escalation, then wait again.",
+                "pending_escalations": summary,
+            });
+        }
+
+        if deadline.is_some_and(|d| time::Instant::now() >= d) {
+            break json!({
+                "status": "timeout",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "No watched job finished before the timeout. Nothing is lost: every job is still running and registered. Do other work, or wait again with a different timeout_secs (repeating an identical call is flagged as a loop).",
+            });
+        }
+
+        tokio::select! {
+            _ = time::sleep(Duration::from_millis(200)) => {}
+            _ = time::sleep_until(deadline.unwrap_or_else(time::Instant::now)), if deadline.is_some() => {}
+            _ = wait_user_interrupt(ctx.session_abort.as_ref()), if user_interrupts_here => {
+                break interrupted();
+            }
+            _ = latch_user_interrupt(ctx.session_abort.as_ref()), if !user_interrupts_here => {}
+        }
+    };
+    if !hint.is_empty() {
+        response["hint"] = json!(hint);
+    }
     Ok(response)
 }
 
@@ -1589,6 +1805,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(handle).unwrap();
@@ -1599,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn job_function_declarations_cover_all_five_actions() {
+    fn job_function_declarations_cover_all_six_actions() {
         let names: Vec<String> = job_function_declarations()
             .into_iter()
             .map(|d| d.name)
@@ -1611,6 +1828,7 @@ mod tests {
                 "job__start",
                 "job__check",
                 "job__collect",
+                "job__wait",
                 "job__cancel",
                 "job__list"
             ]
@@ -1849,6 +2067,23 @@ mod tests {
 
             let collected = handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
             assert_eq!(collected["status"], "completed");
+        });
+    }
+
+    #[test]
+    fn handle_start_message_teaches_job_wait() {
+        run_async(async {
+            let mut ctx = plain_ctx();
+            ctx.declared_function_names.insert("echo".into());
+
+            let started = handle_start(&mut ctx, &json!({"tool": "echo", "arguments": {}}))
+                .await
+                .unwrap();
+
+            let message = started["message"].as_str().unwrap();
+            assert!(message.contains("job__wait"), "{message}");
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+            handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
         });
     }
 
@@ -3857,5 +4092,393 @@ mod tests {
             snapshot.cmd_args
         );
         source.remove_dir();
+    }
+
+    fn register_job_running_for(
+        ctx: &RequestContext,
+        id: &str,
+        run_for: Duration,
+    ) -> Arc<Mutex<JobState>> {
+        let state = Arc::new(Mutex::new(JobState {
+            status: JobStatus::Running,
+            pgid: None,
+        }));
+        let task_state = Arc::clone(&state);
+        let join_handle = tokio::spawn(async move {
+            time::sleep(run_for).await;
+            task_state.lock().status = JobStatus::Completed;
+            Ok(JobResult {
+                output: json!("done"),
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(JobHandle {
+                id: id.to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state: Arc::clone(&state),
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            })
+            .unwrap();
+        state
+    }
+
+    async fn register_finished_job(ctx: &RequestContext, id: &str) -> Arc<Mutex<JobState>> {
+        let state = register_job_running_for(ctx, id, Duration::ZERO);
+        time::timeout(Duration::from_secs(5), async {
+            while !ctx
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .read()
+                .job(id)
+                .unwrap()
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the job must finish");
+        state
+    }
+
+    #[test]
+    fn handle_wait_reports_the_finished_job_and_lists_the_running_one() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+            register_finished_job(&ctx, "job_1").await;
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .read()
+                .job("job_1")
+                .unwrap()
+                .output_buf
+                .lock()
+                .push(b"hello");
+
+            let result = handle_wait(&ctx, &json!({})).await.unwrap();
+
+            assert_eq!(result["status"], "ready");
+            assert_eq!(
+                result["ready"],
+                json!([{
+                    "id": "job_1",
+                    "name": "execute_command",
+                    "outcome": "success",
+                    "next_action": "job__collect --id job_1",
+                    "output_bytes_captured": 5,
+                }])
+            );
+            assert_eq!(result["running"], json!(["job_slow"]));
+            assert_eq!(result["unknown"], json!([]));
+            assert!(result.get("hint").is_none());
+        });
+    }
+
+    #[test]
+    fn handle_wait_blocks_until_a_running_job_finishes() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            register_job_running_for(&ctx, "job_1", Duration::from_millis(300));
+            let started = Instant::now();
+
+            let result = time::timeout(Duration::from_secs(5), handle_wait(&ctx, &json!({})))
+                .await
+                .expect("wait must wake when the job finishes")
+                .unwrap();
+
+            assert!(
+                started.elapsed() >= Duration::from_millis(200),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(result["status"], "ready");
+            assert_eq!(result["ready"][0]["id"], "job_1");
+        });
+    }
+
+    #[test]
+    fn handle_wait_returns_immediately_and_leaves_the_job_to_collect() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            register_finished_job(&ctx, "job_1").await;
+
+            let result = time::timeout(
+                Duration::from_millis(100),
+                handle_wait(&ctx, &json!({"ids": ["job_1"]})),
+            )
+            .await
+            .expect("wait on a finished job must not sleep")
+            .unwrap();
+
+            assert_eq!(result["status"], "ready");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_job("job_1"));
+            let collected = handle_collect(&ctx, &json!({"id": "job_1"})).await.unwrap();
+            assert_eq!(collected["status"], "completed");
+            assert_eq!(collected["result"], "done");
+        });
+    }
+
+    #[test]
+    fn handle_wait_takes_only_the_ready_ids_notifications() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            register_finished_job(&ctx, "job_1").await;
+            ctx.notification_queue
+                .push(job_notification("job_1", "execute_command", true));
+            ctx.notification_queue
+                .push(job_notification("job_other", "execute_command", true));
+
+            handle_wait(&ctx, &json!({})).await.unwrap();
+
+            let left: Vec<String> = ctx
+                .notification_queue
+                .drain()
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
+            assert_eq!(left, vec!["job_other"]);
+        });
+    }
+
+    #[test]
+    fn handle_wait_reports_a_panicked_job_as_failed_like_collect() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            register_finished_job(&ctx, "job_failed")
+                .await
+                .lock()
+                .status = JobStatus::Failed;
+            register_finished_job(&ctx, "job_panicked")
+                .await
+                .lock()
+                .status = JobStatus::Running;
+
+            let result = handle_wait(&ctx, &json!({})).await.unwrap();
+
+            let outcomes: Vec<(&str, &str)> = result["ready"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| (r["id"].as_str().unwrap(), r["outcome"].as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                outcomes,
+                vec![("job_failed", "failed"), ("job_panicked", "failed")]
+            );
+        });
+    }
+
+    #[test]
+    fn handle_wait_honours_zero_normal_and_oversized_timeouts() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+
+            let zero = time::timeout(
+                Duration::from_millis(100),
+                handle_wait(&ctx, &json!({"timeout_secs": 0})),
+            )
+            .await
+            .expect("a zero timeout must not sleep")
+            .unwrap();
+            assert_eq!(zero["status"], "timeout");
+
+            let timed = time::timeout(
+                Duration::from_secs(5),
+                handle_wait(&ctx, &json!({"timeout_secs": 0.3})),
+            )
+            .await
+            .expect("wait must honour timeout_secs")
+            .unwrap();
+            assert_eq!(timed["status"], "timeout");
+            assert_eq!(timed["running"], json!(["job_slow"]));
+            assert!(
+                timed["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Nothing is lost")
+            );
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_job("job_slow"));
+
+            for timeout_secs in [1e19, 1e20] {
+                let blocked = time::timeout(
+                    Duration::from_millis(300),
+                    handle_wait(&ctx, &json!({"timeout_secs": timeout_secs})),
+                )
+                .await;
+                assert!(blocked.is_err(), "{timeout_secs} must mean no deadline");
+            }
+
+            register_finished_job(&ctx, "job_1").await;
+            for timeout_secs in [1e19, 1e20] {
+                let result = handle_wait(&ctx, &json!({"timeout_secs": timeout_secs}))
+                    .await
+                    .unwrap();
+                assert_eq!(result["status"], "ready", "{timeout_secs}");
+            }
+        });
+    }
+
+    #[test]
+    fn handle_wait_watches_only_this_nodes_jobs() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            register_finished_job(&ctx, "job_mine").await;
+            register_finished_job(&ctx, "job_other").await;
+            ctx.node_job_scope = Some(vec!["job_mine".to_string()]);
+
+            let all = handle_wait(&ctx, &json!({})).await.unwrap();
+            let named = handle_wait(&ctx, &json!({"ids": ["job_other"]}))
+                .await
+                .unwrap();
+
+            assert_eq!(all["ready"][0]["id"], "job_mine");
+            assert_eq!(all["ready"].as_array().unwrap().len(), 1);
+            assert_eq!(named["status"], "none");
+            assert_eq!(named["unknown"], json!(["job_other"]));
+        });
+    }
+
+    #[test]
+    fn handle_wait_returns_pending_on_escalations() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            ctx.ensure_root_escalation_queue().submit(
+                crate::supervisor::escalation::EscalationRequest {
+                    id: "esc_1".into(),
+                    from_agent_id: "a1".into(),
+                    from_agent_name: "explore".into(),
+                    question: "What do?".into(),
+                    options: None,
+                    reply_tx: tx,
+                },
+            );
+
+            let result = handle_wait(&ctx, &json!({})).await.unwrap();
+
+            assert_eq!(result["status"], "pending");
+            assert!(result["pending_escalations"].is_array());
+            assert_eq!(result["running"], json!(["job_slow"]));
+        });
+    }
+
+    #[test]
+    fn handle_wait_returns_interrupted_on_a_preset_or_mid_wait_ctrlc() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+            let session = create_abort_signal();
+            session.set_ctrlc();
+            ctx.session_abort = Some(session.clone());
+
+            let preset = time::timeout(Duration::from_secs(2), handle_wait(&ctx, &json!({})))
+                .await
+                .expect("an interrupted wait must return promptly")
+                .unwrap();
+            assert_eq!(preset["status"], "interrupted");
+            assert_eq!(preset["running"], json!(["job_slow"]));
+
+            session.reset();
+            let later = session.clone();
+            tokio::spawn(async move {
+                time::sleep(Duration::from_millis(50)).await;
+                later.set_ctrlc();
+            });
+            let mid = time::timeout(Duration::from_secs(2), handle_wait(&ctx, &json!({})))
+                .await
+                .expect("a Ctrl-C mid-wait must end the wait promptly")
+                .unwrap();
+            assert_eq!(mid["status"], "interrupted");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_job("job_slow"));
+        });
+    }
+
+    /// The bare-SIGINT arm a spawned child latches cannot be driven
+    /// hermetically, so this pins that the child's wait ends on its timeout.
+    #[test]
+    fn handle_wait_in_a_spawned_child_times_out_instead_of_interrupting() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            assert!(!ctx.user_interrupts_here());
+            register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_wait(&ctx, &json!({"timeout_secs": 0.3})),
+            )
+            .await
+            .expect("the spawned child wait must honour timeout_secs")
+            .unwrap();
+
+            assert_eq!(result["status"], "timeout");
+        });
+    }
+
+    #[test]
+    fn job_wait_sends_an_agent_id_to_unknown_and_teaches_agent_tools() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            register_finished_job(&ctx, "job_1").await;
+
+            let result = handle_job_tool(
+                &mut ctx,
+                "job__wait",
+                &json!({"ids": ["agent_explore_1", "job_1", "nope"]}),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result["status"], "ready");
+            assert_eq!(result["ready"][0]["id"], "job_1");
+            assert_eq!(result["unknown"], json!(["agent_explore_1", "nope"]));
+            let hint = result["hint"].as_str().unwrap();
+            assert!(
+                hint.contains("'agent_explore_1' is a spawned agent, not a background job"),
+                "{hint}"
+            );
+            assert!(!hint.contains("nope"), "{hint}");
+        });
+    }
+
+    #[test]
+    fn handle_wait_rejects_malformed_arguments_and_reports_none_without_a_supervisor() {
+        let ctx = ctx_with_job_supervisor(4);
+        for args in [
+            json!({"ids": "job_1"}),
+            json!({"ids": ["job_1", 7]}),
+            json!({"timeout_secs": -1}),
+            json!({"timeout_secs": "soon"}),
+            json!({"timeout_secs": true}),
+        ] {
+            assert!(
+                run_async(handle_wait(&ctx, &args)).is_err(),
+                "{args} must be rejected"
+            );
+        }
+
+        let unsupervised =
+            run_async(handle_wait(&plain_ctx(), &json!({"ids": ["job_1"]}))).unwrap();
+        assert_eq!(unsupervised["status"], "none");
+        assert_eq!(unsupervised["unknown"], json!(["job_1"]));
+        let none = run_async(handle_wait(&ctx, &json!({}))).unwrap();
+        assert_eq!(none["status"], "none");
     }
 }

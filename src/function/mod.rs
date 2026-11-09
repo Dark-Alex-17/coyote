@@ -3834,6 +3834,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(handle).unwrap();
@@ -4416,6 +4417,7 @@ mod tests {
         assert!(f.contains("agent__spawn"));
         assert!(f.contains("agent__check"));
         assert!(f.contains("agent__collect"));
+        assert!(f.contains("agent__wait"));
         assert!(f.contains("agent__list_running"));
         assert!(f.contains("agent__list_sessions"));
         assert!(f.contains("agent__list_available"));
@@ -4432,6 +4434,7 @@ mod tests {
         assert!(f.contains("job__start"));
         assert!(f.contains("job__check"));
         assert!(f.contains("job__collect"));
+        assert!(f.contains("job__wait"));
         assert!(f.contains("job__cancel"));
         assert!(f.contains("job__list"));
     }

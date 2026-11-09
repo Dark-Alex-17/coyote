@@ -4,6 +4,7 @@ use fmt::{Debug, Formatter};
 use log::debug;
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 
 /// Who vouches for an event when the queue is drained. `Supervisor` events name a handle
@@ -252,6 +253,15 @@ impl NotificationQueue {
             ));
         }
         notifications
+    }
+
+    pub fn take_ids(&self, ids: &HashSet<&str>) -> Vec<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let (taken, kept) = std::mem::take(&mut pending.notifications)
+            .into_iter()
+            .partition(|n| ids.contains(n.id.as_str()));
+        pending.notifications = kept;
+        taken
     }
 }
 
@@ -856,5 +866,22 @@ mod tests {
             drained[0].event, MESH_EVENTS_DROPPED_EVENT,
             "the count resets with the drain"
         );
+    }
+
+    #[test]
+    fn take_ids_removes_only_the_named_events() {
+        let queue = NotificationQueue::new();
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(agent_notification("agent_a", "explore", false));
+        queue.push(job_notification("job_2", "execute_command", true));
+
+        let taken = queue.take_ids(&HashSet::from(["job_1", "agent_a", "job_9"]));
+
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].id, "job_1");
+        assert_eq!(taken[1].id, "agent_a");
+        let rest = queue.drain();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, "job_2");
     }
 }

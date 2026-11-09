@@ -7181,6 +7181,7 @@ local_hello() {\n\
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             })
             .unwrap();
     }
@@ -11163,6 +11164,7 @@ local_hello() {\n\
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         })
         .unwrap();
         let supervisor = RwLock::new(sup);
@@ -11353,6 +11355,7 @@ local_hello() {\n\
                 child_supervisor: None,
                 session_id: None,
                 child_session_root: None,
+                succeeded: Default::default(),
             })
             .unwrap();
         abort
@@ -11589,6 +11592,7 @@ local_hello() {\n\
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         }
     }
 
@@ -12279,6 +12283,7 @@ local_hello() {\n\
                     child_supervisor: None,
                     session_id: None,
                     child_session_root: None,
+                    succeeded: Default::default(),
                 })
                 .unwrap();
             // The parent's own task is already finished, so the only live
@@ -12309,6 +12314,7 @@ local_hello() {\n\
                     child_supervisor: Some(Arc::new(RwLock::new(child_sup))),
                     session_id: None,
                     child_session_root: None,
+                    succeeded: Default::default(),
                 })
                 .unwrap();
             assert_eq!(
@@ -12607,6 +12613,7 @@ local_hello() {\n\
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         })
         .unwrap();
         (Arc::new(RwLock::new(sup)), child_signal)
