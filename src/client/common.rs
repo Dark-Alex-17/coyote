@@ -637,8 +637,26 @@ fn llm_failed_extras(
 fn succeeded_call<'a>(usage: Option<&'a TokenUsage>, model: &Model) -> RunCallOutcome<'a> {
     RunCallOutcome::Succeeded {
         usage,
-        cost: usage.and_then(|usage| usage.cost_usd(model)),
+        cost: usage.and_then(|usage| billed_cost_usd(usage, model)),
     }
+}
+
+/// The cost of one call for run accounting. Unlike [`TokenUsage::cost_usd`],
+/// which hides zero costs from display, a zero total is a known cost: only a
+/// nonzero token bucket without a price leaves the cost unknown.
+fn billed_cost_usd(usage: &TokenUsage, model: &Model) -> Option<f64> {
+    fn term(tokens: Option<u64>, price: Option<f64>) -> Option<f64> {
+        match tokens.unwrap_or(0) {
+            0 => Some(0.0),
+            tokens => Some(tokens as f64 * price? / 1_000_000.0),
+        }
+    }
+    Some(
+        term(usage.input_tokens, model.input_price())?
+            + term(usage.output_tokens, model.output_price())?
+            + term(usage.cache_read_input_tokens, model.cache_read_price())?
+            + term(usage.cache_creation_input_tokens, model.cache_write_price())?,
+    )
 }
 
 pub async fn call_chat_completions(
@@ -1209,8 +1227,8 @@ mod tests {
     use super::*;
 
     use super::super::access_token::{is_rejected, set_access_token};
-    use crate::config::run_stats::{RunStats, RunStatsSnapshot};
     use crate::config::{AppState, WorkingMode};
+    use crate::config::{RunStats, RunStatsSnapshot};
     use anyhow::Error;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1908,6 +1926,7 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
         assert_one_succeeded_call(&stats.snapshot());
     }
 
@@ -1968,6 +1987,111 @@ mod tests {
         assert_eq!(snapshot.model_calls, 1);
         assert_eq!(snapshot.input_tokens, None);
         assert_eq!(snapshot.total_cost_usd, None);
+    }
+
+    /// Reported but all-zero usage is a known cost of 0, even on a model
+    /// with no prices at all.
+    #[tokio::test]
+    async fn a_succeeded_call_with_all_zero_usage_keeps_the_run_cost_known() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        client.model = Model::default();
+        client.usage = Some(TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.model_calls, 1);
+        assert_eq!(snapshot.input_tokens, Some(0));
+        assert_eq!(snapshot.total_cost_usd, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn a_succeeded_call_with_unpriced_nonzero_usage_makes_the_run_cost_unknown() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        client.model = priced_model(Some(1.0), None, None, None);
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.model_calls, 1);
+        assert_eq!(snapshot.input_tokens, Some(10));
+        assert_eq!(snapshot.total_cost_usd, None);
+    }
+
+    #[test]
+    fn billed_cost_usd_is_zero_for_all_zero_or_empty_usage_whatever_the_price() {
+        let unpriced = priced_model(None, None, None, None);
+        let zero = TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+        };
+        assert_eq!(billed_cost_usd(&zero, &unpriced), Some(0.0));
+        assert_eq!(
+            billed_cost_usd(&TokenUsage::default(), &unpriced),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn billed_cost_usd_is_zero_for_a_free_model() {
+        let free = priced_model(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(billed_cost_usd(&usage, &free), Some(0.0));
+    }
+
+    #[test]
+    fn billed_cost_usd_is_unknown_when_a_nonzero_bucket_lacks_a_price() {
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            cache_read_input_tokens: Some(50),
+            ..Default::default()
+        };
+        let model = priced_model(Some(3.0), Some(15.0), None, Some(3.75));
+        assert_eq!(billed_cost_usd(&usage, &model), None);
+    }
+
+    #[test]
+    fn billed_cost_usd_matches_cost_usd_for_a_priced_nonzero_call() {
+        let usage = TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(500_000),
+            cache_creation_input_tokens: Some(200_000),
+            cache_read_input_tokens: Some(2_000_000),
+        };
+        let model = priced_model(Some(3.0), Some(15.0), Some(0.3), Some(3.75));
+        assert_eq!(billed_cost_usd(&usage, &model), usage.cost_usd(&model));
     }
 
     #[tokio::test]
@@ -2048,6 +2172,27 @@ mod tests {
             .await
             .unwrap_err();
 
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_abort_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(true);
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
+            trigger.set_ctrlc();
+        });
+
+        let err = call_chat_completions_streaming(&input, &client, &mut ctx, abort)
+            .await
+            .expect_err("an aborted stream must not succeed");
+
+        assert_eq!(err.to_string(), "Aborted.");
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
         assert_one_failed_call(&stats.snapshot());
     }
 

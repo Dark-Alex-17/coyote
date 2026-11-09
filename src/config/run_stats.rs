@@ -42,13 +42,12 @@ pub struct RunStatsSnapshot {
 impl RunStats {
     pub fn record_outcome(&self, outcome: RunCallOutcome) {
         match outcome {
-            RunCallOutcome::Succeeded { usage, cost } => self.record(usage, cost),
+            RunCallOutcome::Succeeded { usage, cost } => self.record_succeeded(usage, cost),
             RunCallOutcome::Failed => self.record_failed(),
         }
     }
 
-    /// Records one succeeded call.
-    pub fn record(&self, usage: Option<&TokenUsage>, cost: Option<f64>) {
+    fn record_succeeded(&self, usage: Option<&TokenUsage>, cost: Option<f64>) {
         let mut inner = self.inner.lock();
         inner.model_calls = inner.model_calls.saturating_add(1);
         match usage {
@@ -61,7 +60,7 @@ impl RunStats {
         }
     }
 
-    pub fn record_failed(&self) {
+    fn record_failed(&self) {
         let mut inner = self.inner.lock();
         inner.model_calls = inner.model_calls.saturating_add(1);
     }
@@ -93,6 +92,10 @@ mod tests {
         }
     }
 
+    fn succeed(stats: &RunStats, usage: Option<&TokenUsage>, cost: Option<f64>) {
+        stats.record_outcome(RunCallOutcome::Succeeded { usage, cost });
+    }
+
     #[test]
     fn empty_run_has_no_calls_usage_or_unknown_cost() {
         let snapshot = RunStats::default().snapshot();
@@ -108,8 +111,8 @@ mod tests {
     #[test]
     fn succeeded_calls_sum_per_field_and_cost() {
         let stats = RunStats::default();
-        stats.record(Some(&usage(10, 5, None)), Some(0.25));
-        stats.record(Some(&usage(3, 1, Some(2))), Some(0.5));
+        succeed(&stats, Some(&usage(10, 5, None)), Some(0.25));
+        succeed(&stats, Some(&usage(3, 1, Some(2))), Some(0.5));
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.model_calls, 2);
@@ -124,8 +127,8 @@ mod tests {
     #[test]
     fn a_succeeded_call_without_usage_makes_the_cost_unknown() {
         let stats = RunStats::default();
-        stats.record(Some(&usage(10, 5, None)), Some(0.25));
-        stats.record(None, None);
+        succeed(&stats, Some(&usage(10, 5, None)), Some(0.25));
+        succeed(&stats, None, None);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.model_calls, 2);
@@ -136,8 +139,8 @@ mod tests {
     #[test]
     fn a_succeeded_call_without_a_cost_makes_the_cost_unknown() {
         let stats = RunStats::default();
-        stats.record(Some(&usage(10, 5, None)), Some(0.25));
-        stats.record(Some(&usage(3, 1, None)), None);
+        succeed(&stats, Some(&usage(10, 5, None)), Some(0.25));
+        succeed(&stats, Some(&usage(3, 1, None)), None);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.model_calls, 2);
