@@ -12,8 +12,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.dont_write_bytecode = True
@@ -36,6 +38,7 @@ from _lib import raise_escalation as _raise_escalation  # noqa: E402
 
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 
+SUBTASK_FILES_SHOWN = 40     # files a per-subtask review prompt lists as the subtask's own
 GAUNTLET_LANES = ("code-review", "adversary", "security", "probe", "debris")
 RERUN_ONCE_LANES = ("adversary", "security", "probe")
 OPERATIONAL_RE = re.compile(
@@ -672,7 +675,7 @@ def next_subtask(state):
             return _start_final_review(state, u, len(subtasks))
         u["_next"] = "final_report"
         return u
-    s = subtasks[idx] if isinstance(subtasks[idx], dict) else {"title": "task", "outcome": str(subtasks[idx])}
+    s = _subtask_at(subtasks, idx)
     text = s.get("outcome", "")
     if len(subtasks) > 1:
         text = f"Subtask {idx + 1}/{len(subtasks)}: {s.get('title', '')}\n\n{text}"
@@ -693,13 +696,17 @@ def next_subtask(state):
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
         "scope_confirmed": False,
     })
+    root = state.get("git_root") or state.get("project_dir") or "."
+    head = git_out(root, "rev-parse", "HEAD", default="")
     if idx > 0:
         # Later subtasks diff against the tree the previous one left behind.
-        head = git_out(state.get("git_root") or state.get("project_dir") or ".", "rev-parse", "HEAD", default="")
         if head:
             u["base_sha"], u["debt_base"] = head, head
     else:
         u["run_base_sha"] = state.get("run_base_sha") or state.get("base_sha") or ""
+    # What the worktree held when the subtask started (uncommitted earlier subtasks included): the read-only check,
+    # the subtask's own file list and the strikeout restore compare against it.
+    u.update({"subtask_head": head, "subtask_tree": _worktree_tree(root), "subtask_started_at": int(time.time())})
     u["_next"] = "compose_brief" if state.get("intent") == "trivial" else "plan_research"
     snapshot(state, u, f"subtask {idx + 1}")
     return u
@@ -709,9 +716,11 @@ def _start_final_review(state, u, n):
     """After the last subtask, one review of the whole task's diff against the parent task's acceptance criteria."""
     base = state.get("run_base_sha") or state.get("base_sha") or ""
     u.update({
-        "final_review": True, "base_sha": base, "current_task": str(state.get("brief") or ""),
-        "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "lane_block_streak": {}, "debris_reruns": 0,
-        "round_heads": [], "gauntlet_lanes": {}, "strikeout_rounds": 0, "fix_instructions": "",
+        "final_review": True, "base_sha": base, "debt_base": base, "current_task": str(state.get("brief") or ""),
+        "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
+        "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False,
+        "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": {}, "expected_files": [],
+        "fix_instructions": "", "gauntlet_lanes": {}, "subtask_tree": "", "subtask_head": "",
     })
     ledger(state, u, f"subtasks: all {n} reviewed against their own criteria -> one whole-task review over "
                      f"{base or 'the worktree'}..HEAD against the parent task's acceptance criteria")
@@ -725,16 +734,27 @@ def _subtask_phase(state):
     return len(as_list(state.get("subtasks"))) > 1 and not truthy(state.get("final_review"))
 
 
-def _subtask_spec(state):
+def _subtask_at(subtasks, idx):
+    s = subtasks[idx] if 0 <= idx < len(subtasks) else {}
+    return s if isinstance(s, dict) else {"title": "task", "outcome": str(s)}
+
+
+def _subtask_spec(state, files=None):
     """The current subtask's own scope and acceptance criteria, as the per-subtask review checks them."""
     subtasks = as_list(state.get("subtasks"))
     idx = max(as_int(state.get("subtask_index")) - 1, 0)
-    s = subtasks[idx] if idx < len(subtasks) and isinstance(subtasks[idx], dict) else {}
+    s = _subtask_at(subtasks, idx)
     lines = [f"Subtask {idx + 1}/{len(subtasks)}: {s.get('title', '')}".rstrip(), "", f"Outcome: {s.get('outcome', '')}"]
     if s.get("constraints"):
         lines.append(f"Constraints: {s['constraints']}")
     ac = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
     lines += ["", "Acceptance criteria:"] + ([f"- {c}" for c in ac] or ["- the outcome above, as stated"])
+    lines += [f"AMENDED by the user: {a}" for a in as_list(s.get("amendments")) if str(a).strip()]
+    if files:
+        shown = files[:SUBTASK_FILES_SHOWN]
+        more = f" (and {len(files) - len(shown)} more)" if len(files) > len(shown) else ""
+        lines += ["", "Files this subtask changed (anything else in the diff is an earlier subtask's uncommitted work): "
+                      + ", ".join(shown) + more]
     lines += ["", f"Scope: this round reviews subtask {idx + 1} of {len(subtasks)} only, against its own criteria above. "
                   "Later subtasks deliver the rest of the parent task, and one final whole-task review checks every "
                   "parent acceptance criterion after the last subtask, so work that belongs to a later subtask is "
@@ -1504,7 +1524,15 @@ def apply_answer(state):
     elif kind == "plan_defect":
         # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a stop reply stops
         a = "stop" if stop else _answered(state, {"continue": ["continue", "treat"]}, "stop")
-        if a == "continue":
+        if a == "continue" and _subtask_phase(state):
+            # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
+            subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
+            cur = max(as_int(state.get("subtask_index")) - 1, 0)
+            subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [answer]
+            u["subtasks"] = subtasks
+            ledger(state, u, f"plan amendment (user) to subtask {cur + 1}: {answer}")
+            u["_next"] = "build_gauntlet_prompt"
+        elif a == "continue":
             u["spec_text"] = (state.get("spec_text") or "") + f"\n\nAMENDED by the user: {answer}"
             ledger(state, u, f"plan amendment (user): {answer}")
             u["_next"] = "build_gauntlet_prompt"
@@ -1935,6 +1963,14 @@ def strikeout(state):
     if dirty:
         code, out, err = git(root, "stash", "push", "-u", "-m", f"sisyphus-next strikeout {state.get('run_id', '')}")
         stash = out.strip() or err.strip()
+        start = state.get("subtask_tree") or ""
+        head = git_out(root, "rev-parse", "HEAD", default="")
+        if (code == 0 and start and head and head == state.get("subtask_head")
+                and start != git_out(root, "rev-parse", f"{head}^{{tree}}", default="")):
+            # the stash also took earlier subtasks' uncommitted work; put the worktree back to where this subtask began
+            rc, _, rerr = git(root, "restore", f"--source={start}", "--worktree", "--", ".")
+            ledger(state, u, "strikeout: worktree restored to the subtask's starting tree (earlier subtasks' work kept)"
+                   if rc == 0 else f"strikeout: could not restore the subtask's starting tree: {tail(rerr, 200)}")
     attempts = f"{STRIKE_LIMIT} consecutive failed fix attempts. Last error:\n{state.get('last_coder_error') or ''}"
     u["diagnosis"] = ((state.get("diagnosis") or "") + "\n\n" + attempts).strip()
     ledger(state, u, f"strikeout: stopped after {STRIKE_LIMIT} strikes; "
@@ -2056,27 +2092,96 @@ def review_gate(state):
         u["review_skipped_note"] = ("review cadence batch: no gauntlet / reviewer / observability pass on this task; "
                                     "the parent orchestrator runs the full panel over the batch")
         u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
-    elif state.get("intent") == "trivial" and len(as_list(state.get("changed_files"))) <= 1 and not truthy(state.get("has_spec")):
+    elif (state.get("intent") == "trivial" and len(as_list(state.get("changed_files"))) <= 1 and not truthy(state.get("has_spec"))
+          and not truthy(state.get("final_review"))):
         u["review_skipped_note"] = "review skipped: trivial single-file change with no spec (coder self_review is sufficient)"
         u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
-    elif _subtask_phase(state) and not _subtask_changed_code(state):
+    elif _subtask_phase(state) and (changed := _subtask_changes(state)) is not None and not changed["files"]:
         # a read-only or research subtask has nothing to conform; the final whole-task review still checks the parent
-        ledger(state, u, f"review: subtask {as_int(state.get('subtask_index'))} changed no code since "
-                         f"{state.get('base_sha')}; its conformance review is skipped (the whole-task review follows)")
+        n = as_int(state.get("subtask_index"))
+        if changed["pulled"]:
+            # HEAD moved only by commits that predate the subtask (a pull): they are the run's starting point, not its work
+            head = changed["head"]
+            if state.get("base_sha") == state.get("run_base_sha"):
+                u["run_base_sha"] = head
+            u["base_sha"] = u["debt_base"] = head
+            ledger(state, u, f"review: subtask {n} only pulled {changed['pulled']} existing commit(s); the run base moves to {head}")
+        ledger(state, u, f"review: subtask {n} changed no code outside the planning store; its conformance review is "
+                         "skipped (the whole-task review follows)")
         u["_next"] = "next_subtask"
     else:
         u["_next"] = "build_gauntlet_prompt"
     return u
 
 
-def _subtask_changed_code(state):
-    """Whether the subtask committed or left changes outside the planning store; unknown counts as changed."""
+def _plans_exclude(state, root):
+    """The pathspec that leaves the in-repo planning store out, or [] when there is none inside root."""
+    plans = os.path.join(state.get("project_dir") or root, "plans")
+    if os.path.isdir(plans):
+        try:
+            rel = os.path.relpath(os.path.realpath(plans), os.path.realpath(root))
+        except ValueError:
+            rel = ".."
+        if rel not in (".", "..") and not rel.startswith(".." + os.sep):
+            return [f":(exclude,literal){rel}"]
+    return []
+
+
+def _worktree_tree(root):
+    """The tree id of the worktree as it stands (untracked, non-ignored files included), or "" when git cannot say."""
+    index = git_out(root, "rev-parse", "--git-path", "index", default="")
+    if not index:
+        return ""
+    index = index if os.path.isabs(index) else os.path.join(root, index)
+    fd, tmp = tempfile.mkstemp(prefix="sx-index-")
+    os.close(fd)
+    try:
+        if os.path.isfile(index):
+            shutil.copyfile(index, tmp)
+        else:
+            os.unlink(tmp)
+        env = {**os.environ, "GIT_INDEX_FILE": tmp}
+        for args in (["add", "-A"], ["write-tree"]):
+            p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, env=env, timeout=120)
+            if p.returncode != 0:
+                return ""
+        return p.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _subtask_changes(state):
+    """The files the current subtask changed outside the planning store, by content against its starting tree.
+
+    Returns {"files", "pulled", "head"}, or None when git cannot say (the review then runs). A HEAD that moved only by
+    commits made before the subtask started, with the worktree matching HEAD on every changed path, is a pull:
+    "files" is then empty and "pulled" counts those commits.
+    """
     root = state.get("git_root") or state.get("project_dir") or "."
-    base = state.get("base_sha") or ""
+    start, start_head = state.get("subtask_tree") or "", state.get("subtask_head") or ""
+    now = _worktree_tree(root)
     head = git_out(root, "rev-parse", "HEAD", default="")
-    if not base or not head:
-        return True
-    return head != base or _code_tree_dirty(state, root)
+    if not start or not now or not head:
+        return None
+    spec = ["--", ".", *_plans_exclude(state, root)]
+    code, out, _ = git(root, "diff", "--name-only", "--no-renames", start, now, *spec)
+    if code != 0:
+        return None
+    files = [f for f in out.splitlines() if f.strip()]
+    result = {"files": files, "pulled": 0, "head": head}
+    if files and start_head and head != start_head:
+        moved = git_out(root, "diff", "--name-only", "--no-renames", start_head, head, default="").splitlines()
+        stray = git_out(root, "diff", "--name-only", "--no-renames", head, now, "--", *files, default="x")
+        stamps = git_out(root, "log", "--format=%ct", f"{start_head}..{head}", default="").split()
+        since = as_int(state.get("subtask_started_at"))
+        if (set(files) <= set(moved) and not stray and stamps and since
+                and git(root, "merge-base", "--is-ancestor", start_head, head)[0] == 0
+                and all(as_int(t) < since for t in stamps)):
+            result.update({"files": [], "pulled": len(stamps)})
+    return result
 
 
 def _posture(state):
@@ -2115,7 +2220,8 @@ def build_gauntlet_prompt(state):
              f"Diff: {diff}",
              f"Rigor: {state.get('quality_rigor') or 'production'}   Security posture: {_posture(state)}"]
     if _subtask_phase(state):
-        spec = _subtask_spec(state)
+        changed = _subtask_changes(state)
+        spec = _subtask_spec(state, (changed or {}).get("files"))
     else:
         spec = (state.get("spec_text") or "").strip()
         if spec and truthy(state.get("final_review")):

@@ -771,7 +771,7 @@ nodes:
   next_subtask:
     id: next_subtask
     type: script
-    description: Pop the next subtask (B3, list-bounded) or finish.
+    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish.
     script: scripts/next_subtask.py
     fallback: end_failure
 
@@ -1767,7 +1767,7 @@ nodes:
   review_gate:
     id: review_gate
     type: script
-    description: batch cadence skips the panel (the parent owns it); trivial one-file no-spec work skips with a note; else the gauntlet.
+    description: batch cadence skips the panel (the parent owns it); trivial one-file no-spec work skips with a note; a subtask that changed no code skips its conformance review; else the gauntlet. A skipped subtask goes on to the next one.
     script: scripts/review_gate.py
     fallback: end_failure
 
