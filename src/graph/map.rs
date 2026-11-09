@@ -2,6 +2,7 @@ use super::executor::{PeerRetireGuard, StepContext, StepResult, step};
 use super::logging::route_suffix;
 use super::state::{StateManager, is_lone_template};
 use super::types::{ConcurrencyCap, Graph, MapNode, Node, NodeType};
+use super::user_interaction::HeadlessAnswerGuard;
 use super::validator::branch_subgraph;
 use crate::config::{RenderMode, RequestContext};
 use crate::graph::type_name;
@@ -120,6 +121,7 @@ async fn run_map(
                 max_concurrency,
                 abort_signal: &abort,
                 branch_mode: true,
+                headless_answers: HeadlessAnswerGuard::default(),
             };
             let chain = ItemChain {
                 map_id: &map_id,
@@ -1141,6 +1143,7 @@ else:
             max_concurrency: 4,
             abort_signal: &abort,
             branch_mode: false,
+            headless_answers: HeadlessAnswerGuard::default(),
         };
         let items = json!(["a", "b", "c"]);
         let mut parent = StateManager::new(HashMap::from([("items".to_string(), items.clone())]));
@@ -1717,6 +1720,7 @@ nodes:
                 max_concurrency: 4,
                 abort_signal: &self.abort,
                 branch_mode: true,
+                headless_answers: HeadlessAnswerGuard::default(),
             };
             let subgraph = self.subgraph(entry);
             let chain = ItemChain {
