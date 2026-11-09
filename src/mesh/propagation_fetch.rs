@@ -1326,7 +1326,9 @@ impl SourceKeys for TransportKeys<'_> {
     /// file as they file any other. Every ask in one fetch shares the key-lookup deadline,
     /// so an ask that could not wait out a full path request with headroom is skipped
     /// rather than let the deadline expire and fail the whole fetch; that body defers
-    /// unasked instead.
+    /// unasked instead. The headroom check is what lets the wait carry the local label: the
+    /// path request has its own timeout well inside the deadline, so the deadline itself
+    /// only expires when this node runs late.
     async fn ask_for_source(&self, source: &AddressHash) -> Result<SourceAsk, RequestError> {
         let Some(destination) = self.destination_by_delivery.get(source) else {
             return Ok(SourceAsk::NotInTable);
@@ -4577,6 +4579,67 @@ mod tests {
                 ))),
                 "the silence is logged where the fetch's own lines are"
             );
+
+            fetcher.stop().await;
+            fake.stop().await;
+        }
+
+        /// A node that refuses this identity, then lets it in, as an operator adding it to
+        /// the allowed list does: the refusal records no sync, and the next fetch is one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_fetch_is_followed_by_a_sync_once_the_node_allows_the_identity() {
+            let fake = FakeNode::listen().await;
+            let fetcher = Fetcher::join(
+                &fake,
+                "fetch-net-refused-then-allowed",
+                TrustList::default(),
+            )
+            .await;
+            let node = short(&fake.hex()).to_string();
+
+            fake.script.reply_with([Value::from(0xf1u8)]);
+            assert_eq!(
+                fetcher.fetch().await.unwrap_err(),
+                FetchError::NodeRefusedAccess {
+                    node,
+                    identity_hash: identity_hex(&fetcher.identity()),
+                }
+            );
+            assert_eq!(fetcher.store().cursor(), None, "a refusal is not a sync");
+
+            fake.script.reply_with([Value::Array(vec![])]);
+            let report = fetcher.fetch().await.unwrap();
+            assert_eq!(report.listed, 0);
+            let cursor = fetcher
+                .store()
+                .cursor()
+                .cloned()
+                .expect("the allowed fetch is a sync");
+            assert_eq!(cursor.node, fake.hex());
+
+            fetcher.stop().await;
+            fake.stop().await;
+        }
+
+        /// Only round 1 reads as the node not answering: a node that lists a message and
+        /// then never serves it times out as a plain request timeout.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_silent_to_the_get_request_is_a_request_timeout_not_a_silent_list() {
+            let fake = FakeNode::listen().await;
+            let fetcher = Fetcher::join(&fake, "fetch-net-silent-get", TrustList::default()).await;
+            fake.script.reply_with([ids_value(&[id(1)])]);
+
+            let err = fetcher
+                .fetch_within(Duration::from_secs(2))
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(err, FetchError::Link(RequestError::Timeout { .. })),
+                "{err:?}"
+            );
+            assert_eq!(fake.script.seen().len(), 2, "the list and the get went out");
+            assert_eq!(fetcher.store().cursor(), None);
 
             fetcher.stop().await;
             fake.stop().await;

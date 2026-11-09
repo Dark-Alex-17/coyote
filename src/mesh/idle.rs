@@ -425,16 +425,24 @@ impl SyncSchedule {
                     short(&node),
                     redact_hashes(&err.to_string())
                 );
-                if matches!(
+                let silent = matches!(
                     err,
                     FetchError::ListUnanswered { .. } | FetchError::ListLinkClosed { .. }
-                ) {
+                );
+                if silent {
                     self.log_silence(&node, &text, now);
                 }
-                if self.last_failure.as_deref() == Some(text.as_str()) {
+                // A silent node ends a fetch one of two ways from one try to the next, so the
+                // two count as the same failure for the prompt line.
+                let key = if silent {
+                    format!("silent {node}")
+                } else {
+                    text.clone()
+                };
+                if self.last_failure.as_deref() == Some(key.as_str()) {
                     None
                 } else {
-                    self.last_failure = Some(text.clone());
+                    self.last_failure = Some(key);
                     Some(text)
                 }
             }
@@ -1401,6 +1409,40 @@ mod tests {
             logged(&node),
             2,
             "a failure that is not silence is not logged as one"
+        );
+    }
+
+    #[test]
+    fn a_silent_node_that_ends_its_fetches_both_ways_is_said_once() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(60, true);
+        let node = short(NODE).to_string();
+        let unanswered = Err(FetchError::ListUnanswered {
+            node: node.clone(),
+            after: Duration::from_secs(60),
+        });
+        let closed = Err(FetchError::ListLinkClosed { node: node.clone() });
+        let mut said = 0;
+        for outcome in [&unanswered, &closed, &unanswered, &closed] {
+            schedule.started(NODE.to_string());
+            said += usize::from(schedule.finished(outcome, now).is_some());
+        }
+        assert_eq!(
+            said, 1,
+            "one run of silence is one line, however each try ended"
+        );
+
+        schedule.started(NODE.to_string());
+        assert!(
+            schedule
+                .finished(&link_failure("the relay hung up"), now)
+                .is_some(),
+            "a failure that is not silence is news"
+        );
+        schedule.started(NODE.to_string());
+        assert!(
+            schedule.finished(&closed, now).is_some(),
+            "and silence after it is news again"
         );
     }
 
