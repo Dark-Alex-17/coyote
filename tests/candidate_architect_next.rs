@@ -3147,6 +3147,29 @@ fn marker_map_triples_match_the_live_prose_markers() {
     );
 }
 
+/// Every node that spawns a conformance reviewer (the gauntlet, or the
+/// adversary directly at micro scope) hands it the run's `debris_exclude`, so
+/// the adversary's debris lint and the gauntlet's debris lane exclude the
+/// same directories; the adversary declares the variable it receives.
+#[test]
+fn conformance_nodes_forward_debris_exclude_to_every_reviewer() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    for node in ["run_gauntlet", "run_adversary", "wave_gauntlet"] {
+        assert_eq!(
+            doc["nodes"][node]["inputs"]["debris_exclude"].as_str(),
+            Some("{{debris_exclude}}"),
+            "{node} must forward debris_exclude: {:?}",
+            doc["nodes"][node]
+        );
+    }
+    let vars = variable_list(&agents_dir().join("adversary").join("graph.yaml"));
+    assert!(
+        names_of(&vars).contains(&"debris_exclude"),
+        "the adversary declares debris_exclude"
+    );
+}
+
 /// The README's `build_lock` row names five agent nodes, the agent each runs,
 /// that each of those agents declares `build_lock` itself, and the engine
 /// paths and test pin that make inheritance a fact. All of them must exist as

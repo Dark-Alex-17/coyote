@@ -105,7 +105,8 @@ those rules are *structure*:
   argument of `agent__spawn`) or one directory name. Empty means none; a
   value that is neither a string nor a list of strings (`false`, `0`) is
   rejected rather than read as none, and any invalid value is a lint crash,
-  so it blocks.
+  so it blocks. The adversary lane receives the same value through its
+  `inputs:`, so its own debris lint leaves out the same directories.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
   with no `teammates:` flag — no cross-lane messaging, by construction.
 - **Failure fails closed, structurally** (`fallback:` routes + `PIPELINE-FAULT`
