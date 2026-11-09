@@ -412,11 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_format_fallback_retries_after_a_decode_error() {
-        let decode = reqwest::Response::from(http::Response::new("not json"))
-            .json::<Value>()
-            .await
-            .expect_err("a non-JSON body must fail to decode");
-        assert!(decode.is_decode());
+        let decode = decode_error().await;
         let mut ctx = make_ctx();
         let input = input_with_spec(&ctx);
 
@@ -431,6 +427,80 @@ mod tests {
         assert_eq!(result.unwrap(), "ok");
         assert_eq!(seen, vec![Some(answer_spec()), None]);
         assert!(ctx.native_format.rejected);
+    }
+
+    async fn decode_error() -> reqwest::Error {
+        let decode = reqwest::Response::from(http::Response::new("not json"))
+            .json::<Value>()
+            .await
+            .expect_err("a non-JSON body must fail to decode");
+        assert!(decode.is_decode());
+        decode
+    }
+
+    fn api_status(err: &anyhow::Error) -> Option<(u16, String)> {
+        err.chain()
+            .find_map(|c| c.downcast_ref::<ApiStatusError>())
+            .map(|e| (e.status, e.message.clone()))
+    }
+
+    #[tokio::test]
+    async fn inactive_without_dialect_propagates_400_after_one_call() {
+        let mut ctx = make_ctx();
+        let input = input_with_spec(&ctx);
+
+        let (result, seen) =
+            run_wrapper(None, &input, &mut ctx, Some(api_error(400, "bad request"))).await;
+
+        let err = result.expect_err("an inactive wrapper must not retry");
+        assert_eq!(api_status(&err), Some((400, "bad request".to_string())));
+        assert_eq!(seen, vec![None]);
+        assert!(!ctx.native_format.rejected);
+    }
+
+    #[tokio::test]
+    async fn inactive_when_rejected_propagates_400_after_one_call() {
+        let mut ctx = make_ctx();
+        ctx.native_format.rejected = true;
+        let input = input_with_spec(&ctx);
+
+        let (result, seen) = run_wrapper(
+            Some(SchemaDialect::OpenAiStrict),
+            &input,
+            &mut ctx,
+            Some(api_error(400, "bad request")),
+        )
+        .await;
+
+        let err = result.expect_err("an inactive wrapper must not retry");
+        assert_eq!(api_status(&err), Some((400, "bad request".to_string())));
+        assert_eq!(seen, vec![None]);
+        assert!(ctx.native_format.rejected);
+    }
+
+    #[tokio::test]
+    async fn inactive_without_dialect_propagates_decode_error_after_one_call() {
+        let decode = decode_error().await;
+        let mut ctx = make_ctx();
+        let input = input_with_spec(&ctx);
+
+        let (result, seen) = run_wrapper(
+            None,
+            &input,
+            &mut ctx,
+            Some(anyhow::Error::new(decode).context("Failed to call chat-completions api")),
+        )
+        .await;
+
+        let err = result.expect_err("an inactive wrapper must not retry");
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+                .any(reqwest::Error::is_decode),
+            "decode error missing from the chain: {err:#}"
+        );
+        assert_eq!(seen, vec![None]);
+        assert!(!ctx.native_format.rejected);
     }
 
     fn structured_ctx() -> RequestContext {

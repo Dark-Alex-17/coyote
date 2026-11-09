@@ -2028,10 +2028,103 @@ mod tests {
             .without_structured_output()
             .prepare_completion_data(&model, false)
             .unwrap();
+        let mut legacy_role = Role::new("llm_node", "");
+        legacy_role.set_model(ctx.current_model().clone());
+        legacy_role.set_enabled_tools(Some(vec![]));
+        legacy_role.set_enabled_mcp_servers(Some(vec![]));
+        let legacy = Input::from_str(&ctx, "user", Some(legacy_role))
+            .unwrap()
+            .prepare_completion_data(&model, false)
+            .unwrap();
 
         assert!(input.role().structured_output().is_none());
         assert!(data.structured_output.is_none());
         assert_eq!(format!("{data:?}"), format!("{baseline:?}"));
+        assert_eq!(format!("{data:?}"), format!("{legacy:?}"));
+    }
+
+    /// Runs a schema node and returns, for each call, the system and user
+    /// message texts the request carried and the spec on its role.
+    async fn hint_and_spec_per_call(
+        node: &LlmNode,
+    ) -> Vec<(Vec<String>, Vec<String>, Option<StructuredOutputSpec>)> {
+        let mut state = manager_with(&[]);
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+        let mut calls = Vec::new();
+
+        run(
+            "decide",
+            node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|input, _ctx, _abort| {
+                let messages = input.build_messages().unwrap();
+                let texts = |system: bool| {
+                    messages
+                        .iter()
+                        .filter(|m| m.role.is_system() == system)
+                        .map(|m| m.content.to_text())
+                        .collect::<Vec<_>>()
+                };
+                calls.push((
+                    texts(true),
+                    texts(false),
+                    input.role().structured_output().cloned(),
+                ));
+                boxed_completion(async { Ok((r#"{"done": true}"#.to_string(), vec![])) })
+            }),
+        )
+        .await
+        .unwrap();
+        calls
+    }
+
+    #[tokio::test]
+    async fn schema_hint_goes_into_instructions_alongside_native_format() {
+        let schema = json!({"type": "object", "properties": {"done": {"type": "boolean"}}});
+        let node = node_with_schema(None, schema.clone());
+        let hint = format_schema_hint(&schema);
+
+        let calls = hint_and_spec_per_call(&node).await;
+
+        let [(system, user, spec)] = calls.as_slice() else {
+            panic!("expected one call, got {calls:?}");
+        };
+        assert!(system.iter().any(|s| s.contains(&hint)), "{system:?}");
+        assert!(!user.iter().any(|s| s.contains(&hint)), "{user:?}");
+        assert_eq!(
+            spec.as_ref(),
+            Some(&StructuredOutputSpec {
+                name: "decide".to_string(),
+                schema,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_hint_goes_into_user_prompt_alongside_native_format() {
+        let schema = json!({"type": "object", "properties": {"done": {"type": "boolean"}}});
+        let mut node = node_with_schema(None, schema.clone());
+        node.instructions = None;
+        let hint = format_schema_hint(&schema);
+
+        let calls = hint_and_spec_per_call(&node).await;
+
+        let [(system, user, spec)] = calls.as_slice() else {
+            panic!("expected one call, got {calls:?}");
+        };
+        assert!(!system.iter().any(|s| s.contains(&hint)), "{system:?}");
+        assert!(user.iter().any(|s| s.contains(&hint)), "{user:?}");
+        assert_eq!(
+            spec.as_ref(),
+            Some(&StructuredOutputSpec {
+                name: "decide".to_string(),
+                schema,
+            })
+        );
     }
 
     /// A `tools: []` node under an agent still declares the agent's
