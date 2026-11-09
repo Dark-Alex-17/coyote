@@ -180,10 +180,14 @@ fn convert_node(node: &Value, dialect: SchemaDialect) -> Value {
 
     if is_object_schema(map) {
         // Closing an object that declares no properties would make the
-        // provider enforce `{}` and drop its data. Left open, a strict
-        // provider rejects the schema and the caller falls back to sending
-        // no format.
-        if map.contains_key("properties") {
+        // provider enforce `{}` and drop its data. Left open; providers that
+        // require closed objects reject the schema and the caller resends
+        // without the format.
+        if map
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| !properties.is_empty())
+        {
             out.entry("additionalProperties")
                 .or_insert(Value::Bool(false));
         }
@@ -1133,18 +1137,40 @@ mod tests {
 
     #[test]
     fn property_less_objects_stay_open() {
-        let top = json!({ "type": "object" });
-        let nested = json!({ "type": "array", "items": { "type": "object" } });
+        let open_objects = [
+            json!({ "type": "object" }),
+            json!({ "type": "object", "properties": {} }),
+        ];
 
-        for dialect in [SchemaDialect::OpenAiStrict, SchemaDialect::Anthropic] {
-            let top = convert_schema(&top, dialect);
-            let nested = convert_schema(&nested, dialect);
+        for object in open_objects {
+            let nested = json!({ "type": "array", "items": object.clone() });
+            for dialect in [SchemaDialect::OpenAiStrict, SchemaDialect::Anthropic] {
+                let top = convert_schema(&object, dialect);
+                let nested = convert_schema(&nested, dialect);
 
-            assert!(top.get("additionalProperties").is_none(), "{dialect:?}");
-            assert!(
-                nested["items"].get("additionalProperties").is_none(),
-                "{dialect:?}"
-            );
+                assert!(
+                    top.get("additionalProperties").is_none(),
+                    "{dialect:?} {object}"
+                );
+                assert!(
+                    nested["items"].get("additionalProperties").is_none(),
+                    "{dialect:?} {object}"
+                );
+                let expected_required = match dialect {
+                    SchemaDialect::OpenAiStrict => Some(&json!([])),
+                    _ => None,
+                };
+                assert_eq!(
+                    top.get("required"),
+                    expected_required,
+                    "{dialect:?} {object}"
+                );
+                assert_eq!(
+                    nested["items"].get("required"),
+                    expected_required,
+                    "{dialect:?} {object}"
+                );
+            }
         }
     }
 

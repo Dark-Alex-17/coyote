@@ -1932,7 +1932,8 @@ fn repl_transport<'a>(
 }
 
 /// The REPL runner over `transport`. A native-format rejection is retried
-/// once without the format; the before-hook still runs once per call.
+/// once without the format. The before-hook runs once per runner
+/// invocation and not again before that format-less retry.
 fn repl_completion_runner_with<T>(
     transport: T,
 ) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
