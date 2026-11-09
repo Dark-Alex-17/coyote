@@ -8863,8 +8863,10 @@ mod tests {
     /// Every direct keyboard read outside this module: crossterm's
     /// `read`/`poll`, `read_single_key`, `edit_file` (which hands the tty
     /// to `$EDITOR`), `run_command` and `wait_for_status` (a child on the
-    /// inherited tty), and inquire's prompt builders (nothing else under
-    /// `src/` constructs a `Text`, `Select` or the like).
+    /// inherited tty), inquire's prompt builders (nothing else under
+    /// `src/` constructs a `Text`, `Select` or the like), and the
+    /// `InquirePrompter` constructors, since a handler seating its own
+    /// terminal prompter bypasses the one on `ctx.prompter`.
     fn keyboard_readers() -> Vec<KeyboardReader> {
         fn at_word_start(line: &str, at: usize) -> bool {
             line[..at]
@@ -8872,7 +8874,7 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
         }
-        const NEEDLES: [&str; 12] = [
+        const NEEDLES: [&str; 14] = [
             "event::read(",
             "event::poll(",
             "read_single_key(",
@@ -8885,6 +8887,8 @@ mod tests {
             "MultiSelect::new(",
             "Text::new(",
             "Password::new(",
+            "InquirePrompter::default(",
+            "InquirePrompter::new(",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = root.join("src");
@@ -8944,6 +8948,7 @@ mod tests {
     fn every_direct_keyboard_reader_is_gated_or_accounted_for() {
         const BEFORE_UI: &str = "first-run config wizard; runs before any UI starts";
         const CLI_ONLY: &str = "a CLI flow (-e, --mcp); the process never reaches a UI";
+        const CLI_FLAGS: &str = "the CLI flag paths of main (--install, --update, --vault, ...); each returns before any UI starts";
         const REPL_PROMPTER: &str =
             "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
         const VIA_EDIT_GATE: &str = "calls edit_file, which lends the terminal under the TUI";
@@ -9005,9 +9010,16 @@ mod tests {
                 "edit_rag_docs",
                 VIA_EDIT_GATE,
             ),
+            (
+                "src/config/request_context.rs",
+                "default_prompter",
+                REPL_PROMPTER,
+            ),
+            ("src/main.rs", "async_main", CLI_FLAGS),
             ("src/main.rs", "shell_execute", CLI_ONLY),
             ("src/mcp/manage.rs", "handle_remove", CLI_ONLY),
             ("src/mcp/manage.rs", "handle_add", CLI_ONLY),
+            ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
             ("src/prompt/mod.rs", "select", REPL_PROMPTER),
             ("src/prompt/mod.rs", "input", REPL_PROMPTER),
             ("src/prompt/mod.rs", "password", REPL_PROMPTER),

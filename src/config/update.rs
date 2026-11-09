@@ -132,7 +132,9 @@ fn update_binary_at(
 
         if force {
             println!("--force specified; updating anyway.");
-        } else if menu_can_use_terminal() {
+        } else if crate::tui::active() || (menu_can_use_terminal() && io::stdin().is_terminal()) {
+            // The REPL's inquire confirm reads stdin as well as painting
+            // stdout, so a piped stdin is refused below, not inside the widget.
             let proceed = crate::prompt::confirm_with_help(
                 prompter,
                 "Update anyway?".to_string(),

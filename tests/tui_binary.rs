@@ -8118,7 +8118,13 @@ fn dot_uninstall_asks_in_the_confirm_modal_and_a_modified_file_in_the_select_mod
 /// pipes for stdout/stderr) and returns `(success, stdout+stderr)`,
 /// failing the test if it hangs on a prompt.
 fn run_ttyless(dir: &Path, args: &[&str], what: &str) -> (bool, String) {
-    let mut cmd = Command::new(built_binary());
+    run_ttyless_binary(built_binary(), dir, args, what)
+}
+
+/// [`run_ttyless`] for a copy of the binary living elsewhere (the
+/// self-update path classifies the install by where the executable is).
+fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) -> (bool, String) {
+    let mut cmd = Command::new(binary);
     base_env(&mut cmd, dir);
     common::pty::detached(&mut cmd)
         .env("COYOTE_UI", "repl")
@@ -8200,4 +8206,419 @@ fn a_tty_less_uninstall_without_yes_is_refused_and_keeps_the_bundle() {
         ok && !role.exists(),
         "`--uninstall --yes` with no terminal did not remove the bundle's files:\n{out}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A local file the bundle also ships, with different content: the
+// `Conflict at <path>` menu under the UI, in the plain REPL, and with no
+// terminal at all, next to the other no-tty refusals.
+// ---------------------------------------------------------------------------
+
+/// The content a bundle role is given locally before the install, so the
+/// install finds a conflict at every role the bundle ships.
+const LOCAL_ROLE_TEXT: &str =
+    "---\nmodel: dryrun:dry-model\n---\nYou are the LOCAL role, edited by hand.\n";
+
+/// Writes `LOCAL_ROLE_TEXT` under both role names `write_bundle_repo`
+/// ships for `name`, and returns the two paths (sorted, the order the
+/// install walks them in).
+fn write_conflicting_local_roles(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let roles = dir.join("roles");
+    fs::create_dir_all(&roles).unwrap();
+    let mut paths: Vec<PathBuf> = [format!("{name}-role.md"), format!("{name}-obsolete.md")]
+        .iter()
+        .map(|file| roles.join(file))
+        .collect();
+    paths.sort();
+    for path in &paths {
+        fs::write(path, LOCAL_ROLE_TEXT).unwrap();
+    }
+    paths
+}
+
+/// The bundle's own text for the role at `path`, read from the bundle
+/// repository so the test does not restate what `write_bundle_repo` wrote.
+fn bundle_text_for(repo: &Path, path: &Path) -> String {
+    fs::read_to_string(repo.join("roles").join(path.file_name().unwrap())).unwrap()
+}
+
+/// The `Conflict at <path>` Select menu rows, as the spec names them.
+const CONFLICT_ROWS: [&str; 5] = ["keep", "replace", "keep-all", "replace-all", "abort"];
+
+/// Which of `paths` the conflict modal painted in `modal` is about: the
+/// only one whose file name appears in the squeezed frame (the path may
+/// wrap); `modal` must be a frame painted before any conflict was
+/// answered, or the echoed answer names a second file.
+fn conflicting_file_named(modal: &str, paths: &[PathBuf]) -> PathBuf {
+    let flat = squeezed(modal);
+    let mut named = paths
+        .iter()
+        .filter(|path| flat.contains(path.file_name().unwrap().to_str().unwrap()));
+    let first = named
+        .next()
+        .unwrap_or_else(|| panic!("the conflict modal names none of {paths:?}:\n{modal}"));
+    assert!(
+        named.next().is_none(),
+        "the conflict modal names more than one file at once:\n{modal}"
+    );
+    first.clone()
+}
+
+/// The file of `paths` that is not `answered`: the one the next conflict
+/// question must be about.
+fn the_other_file(paths: &[PathBuf], answered: &Path) -> PathBuf {
+    paths
+        .iter()
+        .find(|path| path.as_path() != answered)
+        .unwrap()
+        .clone()
+}
+
+/// `.install <local bundle>` whose two roles already exist locally with
+/// other content, under the UI: each conflict is a closed Select modal
+/// (`Conflict at <path> (category: roles)`, rows keep / replace /
+/// keep-all / replace-all / abort, no custom row) and the digit answers
+/// flow back one by one: `1` keeps the first file (its local text
+/// stays), `2` replaces the second (the bundle's text lands), the report
+/// says `1 replaced, 1 kept`, the terminal is never released, and the UI
+/// keeps taking keys and leaves clean.
+#[test]
+#[serial]
+fn dot_install_with_conflicting_local_files_asks_each_in_a_closed_select_modal_and_the_digits_decide()
+ {
+    let dir = fresh_config_dir("install-file-conflict-tui");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-c3f";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let locals = write_conflicting_local_roles(&dir, name);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let install_at = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+
+    // First conflict: `1` keeps.
+    let first_modal = wait_for_the_modal(
+        &mut pty,
+        install_at,
+        ".install (first conflict)",
+        &[
+            "Conflictat",
+            "(category:roles)",
+            "keep-all",
+            "replace-all",
+            "abort",
+            "Enter=choose",
+        ],
+    );
+    let first_flat = squeezed(&first_modal);
+    for row in CONFLICT_ROWS {
+        assert!(
+            first_flat.contains(row),
+            "the conflict modal lacks the `{row}` row:\n{first_modal}"
+        );
+    }
+    assert!(
+        !first_flat.contains("Other(custom)"),
+        "the conflict select is closed but the modal offers a custom row:\n{first_modal}"
+    );
+    let kept = conflicting_file_named(&first_modal, &locals);
+    pty.read_for(HOTKEY_GAP);
+    let answered_first = pty.raw().len();
+    pty.send(b"1").unwrap();
+    // The next question differs from this one by a few cells; a resize
+    // forces the full repaint that puts it on the pty whole.
+    pty.read_for(Duration::from_millis(500));
+    pty.resize(61, 140).unwrap();
+
+    // Second conflict, about the other file: `2` replaces. The modal is
+    // looked for by that file's name, so a late repaint of the first
+    // question cannot stand in for it.
+    let replaced = the_other_file(&locals, &kept);
+    let replaced_name = replaced.file_name().unwrap().to_str().unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        answered_first,
+        ".install (second conflict)",
+        &[
+            "Conflictat",
+            replaced_name,
+            "(category:roles)",
+            "keep-all",
+            "replace-all",
+            "abort",
+        ],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"2").unwrap();
+
+    wait_for_squeezed(
+        &mut pty,
+        "Installed:0new,1replaced,1kept,0identical.",
+        "the install report after keep then replace",
+    );
+    pty.read_for(Duration::from_millis(500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    assert_eq!(
+        fs::read_to_string(&kept).ok().as_deref(),
+        Some(LOCAL_ROLE_TEXT),
+        "`1` (keep) on the conflict modal did not keep the local text of {}:\n{since}",
+        kept.display()
+    );
+    assert_eq!(
+        fs::read_to_string(&replaced).ok(),
+        Some(bundle_text_for(&repo, &replaced)),
+        "`2` (replace) on the conflict modal did not land the bundle's text in {}:\n{since}",
+        replaced.display()
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "a conflict question released the terminal:\n{since}"
+    );
+
+    assert_ui_alive_then_quit(&mut pty, "the conflicting install");
+}
+
+/// The same install in the plain REPL: the question is the inquire
+/// Select (its own `to move, enter to select` legend, no modal legend,
+/// no custom row), Enter on the highlighted `keep` keeps the first file,
+/// and the Down arrow then Enter picks `replace` for the second; the
+/// report and both files agree. `.exit` leaves the tty cooked.
+#[test]
+#[serial]
+fn dot_install_with_conflicting_local_files_in_the_plain_repl_asks_with_inquire() {
+    let dir = fresh_config_dir("install-file-conflict-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-c3r";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let locals = write_conflicting_local_roles(&dir, name);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.resize(60, 200).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let install_at = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    let first = pty
+        .wait_for_after("to move, enter to select", install_at, PTY_DEADLINE)
+        .expect("the first conflict was not asked with the inquire select");
+    pty.read_for(Duration::from_millis(300));
+    let first = format!(
+        "{first}{}",
+        strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]))
+    );
+    assert!(
+        first.contains("Conflict at") && first.contains("(category: roles)"),
+        "the inquire select does not carry the conflict question:\n{first}"
+    );
+    for row in CONFLICT_ROWS {
+        assert!(
+            first.contains(row),
+            "the inquire select lacks the `{row}` row:\n{first}"
+        );
+    }
+    assert!(
+        !first.contains("Other (custom)"),
+        "the closed conflict select offers a custom row in the plain REPL:\n{first}"
+    );
+    assert!(
+        !squeezed(&first).contains("Esc=cancel"),
+        "the plain REPL drew the UI's modal legend:\n{first}"
+    );
+    let kept = conflicting_file_named(&first, &locals);
+
+    // Enter keeps the highlighted first row; the second question is
+    // looked for by the other file's name.
+    let replaced = the_other_file(&locals, &kept);
+    let replaced_name = replaced.file_name().unwrap().to_str().unwrap();
+    let answered_first = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    pty.wait_for_after(replaced_name, answered_first, PTY_DEADLINE)
+        .expect("the second conflict was not asked after the first was kept");
+    pty.read_for(Duration::from_millis(300));
+    let second = strip_ansi(&String::from_utf8_lossy(&pty.raw()[answered_first..]));
+    assert!(
+        second.contains("to move, enter to select"),
+        "the second conflict is not an inquire select:\n{second}"
+    );
+    // Down, then Enter: `replace`.
+    pty.send(b"\x1b[B").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.wait_for_after(
+        "Installed: 0 new, 1 replaced, 1 kept, 0 identical.",
+        install_at,
+        PTY_DEADLINE,
+    )
+    .expect("the install report after keep then replace never printed");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    assert_eq!(
+        fs::read_to_string(&kept).ok().as_deref(),
+        Some(LOCAL_ROLE_TEXT),
+        "Enter on `keep` did not keep the local text of {}:\n{since}",
+        kept.display()
+    );
+    assert_eq!(
+        fs::read_to_string(&replaced).ok(),
+        Some(bundle_text_for(&repo, &replaced)),
+        "Down + Enter (`replace`) did not land the bundle's text in {}:\n{since}",
+        replaced.display()
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{since}"
+    );
+
+    // The install goes on to print its MCP merge summary; `.exit` waits
+    // for the prompt to come back so it is typed at the prompt, not
+    // into the drain of stale input.
+    pty.wait_for_after("dry-model)>", answered_first, PTY_DEADLINE)
+        .expect("the prompt did not come back after the install");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The one shape every no-tty refusal has: `Refusing to <action>
+/// non-interactively. Re-run in a terminal<remedy>`. Returns the action
+/// and the remedy, or `None` when no line of `out` has the shape.
+fn refusal_shape(out: &str) -> Option<(String, String)> {
+    const HEAD: &str = "Refusing to ";
+    const MIDDLE: &str = " non-interactively. Re-run in a terminal";
+    out.lines().find_map(|line| {
+        let line = line.trim_start_matches("Error: ");
+        let rest = line.strip_prefix(HEAD)?;
+        let at = rest.find(MIDDLE)?;
+        Some((
+            rest[..at].to_string(),
+            rest[at + MIDDLE.len()..].to_string(),
+        ))
+    })
+}
+
+/// With no terminal, the three menus that still refuse do so in one
+/// shape, each naming the flag that settles it: `--install` at a
+/// conflicting local file (`--install-force`, the file keeps its local
+/// text), `--update` on a Cargo install (`--force`), and `--uninstall`
+/// without `--yes` (`--yes`); all exit non-zero. `--add-secret` with no
+/// terminal is refused too, naming the missing tty, and writes no vault
+/// file.
+#[test]
+#[serial]
+fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
+    let dir = fresh_config_dir("ttyless-refusal-shape");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-c3h";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let locals = write_conflicting_local_roles(&dir, name);
+    let cargo_copy = cargo_installed_binary(&dir);
+
+    let mut shapes = Vec::new();
+    for (what, binary, args, flag) in [
+        (
+            "install at a conflicting file",
+            built_binary().to_path_buf(),
+            vec!["--install", repo.to_str().unwrap()],
+            "--install-force",
+        ),
+        (
+            "self-update of a Cargo install",
+            cargo_copy.clone(),
+            vec!["--update"],
+            "--force",
+        ),
+        (
+            "uninstall without --yes",
+            built_binary().to_path_buf(),
+            vec!["--uninstall", name],
+            "--yes",
+        ),
+    ] {
+        let (ok, out) = run_ttyless_binary(&binary, &dir, &args, what);
+        assert!(!ok, "{what}: a refused tty-less run exited 0:\n{out}");
+        let (action, remedy) = refusal_shape(&out).unwrap_or_else(|| {
+            panic!("{what}: the refusal is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{out}")
+        });
+        assert!(
+            remedy.contains(flag),
+            "{what}: the refusal's remedy does not name `{flag}`:\n{out}"
+        );
+        assert!(
+            !out.contains("Re-run in the plain REPL"),
+            "{what}: the refusal blames the UI, but no UI stood in the way:\n{out}"
+        );
+        shapes.push((what, action, remedy));
+    }
+    for path in &locals {
+        assert_eq!(
+            fs::read_to_string(path).ok().as_deref(),
+            Some(LOCAL_ROLE_TEXT),
+            "the refused tty-less install changed {}:\n{shapes:?}",
+            path.display()
+        );
+    }
+
+    let files_before = walk(&dir);
+    let (ok, out) = run_ttyless(&dir, &["--add-secret", "ttyless-secret-c3h"], "add-secret");
+    assert!(!ok, "a tty-less `--add-secret` exited 0:\n{out}");
+    let lower = out.to_lowercase();
+    assert!(
+        lower.contains("tty") || lower.contains("terminal"),
+        "the tty-less `--add-secret` refusal does not say what is missing:\n{out}"
+    );
+    let written = new_files_named(&dir, &files_before, "vault");
+    assert!(
+        written.is_empty(),
+        "the refused tty-less `--add-secret` still wrote {written:?}:\n{out}"
+    );
+}
+
+/// `--update` on a Cargo install with a terminal on stdout but stdin
+/// redirected from `/dev/null` (a pipeline feeding the command): the
+/// inquire confirm could paint but never read, so the update is refused
+/// in the shared shape naming `--force`, exits non-zero, and no widget
+/// error reaches the terminal.
+#[test]
+#[serial]
+fn update_with_a_tty_on_stdout_but_a_piped_stdin_is_refused_cleanly() {
+    let dir = fresh_config_dir("update-piped-stdin");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let cargo_copy = cargo_installed_binary(&dir);
+
+    let mut pty = spawn_binary_under(
+        &cargo_copy,
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --update",
+    );
+    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_ne!(exit_code(&plain), 0, "{plain}");
+    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
+        panic!("the piped-stdin update is not refused in the shared shape:\n{plain}")
+    });
+    assert_eq!(action, "update a Cargo install", "{plain}");
+    assert_eq!(remedy, " or pass --force.", "{plain}");
+    assert!(
+        !plain.contains("Update anyway?"),
+        "the confirm was asked with nothing to read it from:\n{plain}"
+    );
+    assert!(
+        !plain.to_lowercase().contains("raw mode") && !plain.contains("IO error"),
+        "the widget failed on the piped stdin instead of the refusal running first:\n{plain}"
+    );
+    assert_tty_restored(&plain);
 }
