@@ -1,43 +1,85 @@
 use super::state::StateManager;
 use super::types::{ApprovalNode, InputNode};
 use crate::config::RequestContext;
-use crate::function::user_interaction::{USER_FUNCTION_PREFIX, handle_user_tool};
+use crate::function::user_interaction::{
+    HEADLESS_GUIDANCE, USER_FUNCTION_PREFIX, emit_headless_default, handle_user_tool,
+    headless_without_acp,
+};
 use anyhow::{Context, Result, anyhow, bail};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const CHOICE_KEY: &str = "choice";
 const INPUT_KEY: &str = "input";
+const MAX_HEADLESS_ANSWERS_PER_NODE: usize = 25;
+const REPEATS_BEFORE_SECOND_OPTION: usize = 2;
+
+/// Counts headless auto-answers for one graph execution so a loop that keeps
+/// re-asking the same question eventually takes a different option, and a
+/// node that never stops asking fails the run. Clones share the counts, so
+/// frontier branches of one run count together; each map item chain gets
+/// its own guard and counts separately, and a child graph run starts fresh.
+#[derive(Clone, Default)]
+pub struct HeadlessAnswerGuard {
+    counts: Arc<Mutex<HeadlessAnswerCounts>>,
+}
+
+#[derive(Default)]
+struct HeadlessAnswerCounts {
+    per_question: HashMap<(String, String), usize>,
+    per_node: HashMap<String, usize>,
+}
+
+impl HeadlessAnswerGuard {
+    /// Counts one auto-answer against the node, failing once the node has
+    /// already been auto-answered the maximum number of times.
+    fn record_node(&self, node_id: &str) -> Result<()> {
+        let mut counts = self.counts.lock();
+        let node_total = counts.per_node.entry(node_id.to_string()).or_default();
+        if *node_total >= MAX_HEADLESS_ANSWERS_PER_NODE {
+            bail!("headless: node {node_id} auto-answered {MAX_HEADLESS_ANSWERS_PER_NODE} times");
+        }
+        *node_total += 1;
+        Ok(())
+    }
+
+    /// Returns how many times this node already auto-answered this exact
+    /// question, then counts the current ask.
+    fn record_question(&self, node_id: &str, question: &str) -> usize {
+        let mut counts = self.counts.lock();
+        let repeats = counts
+            .per_question
+            .entry((node_id.to_string(), question.to_string()))
+            .or_default();
+        let previous = *repeats;
+        *repeats += 1;
+        previous
+    }
+}
 
 pub struct ApprovalNodeExecutor;
 
 impl ApprovalNodeExecutor {
     pub async fn execute(
+        node_id: &str,
         node: &ApprovalNode,
         state_manager: &mut StateManager,
         ctx: &mut RequestContext,
+        guard: &HeadlessAnswerGuard,
     ) -> Result<String> {
         let question = state_manager
             .interpolate(&node.question)
             .context("Failed to interpolate approval question")?;
 
-        let response = handle_user_tool(
-            ctx,
-            &format!("{USER_FUNCTION_PREFIX}select"),
-            &json!({ "question": question, "options": node.options }),
-        )
-        .await
-        .context("user__select failed")?;
-
-        if let Some(err) = response.get("error").and_then(Value::as_str) {
-            bail!("Approval interaction failed: {err}");
-        }
-
-        let choice = response
-            .get("answer")
-            .and_then(Value::as_str)
-            .context("Approval response missing 'answer' field")?
-            .to_string();
+        let choice = if headless_without_acp() {
+            let choice = headless_approval_choice(node_id, node, &question, guard)?;
+            emit_headless_default(Some(node_id), "approval", Some(&choice));
+            choice
+        } else {
+            prompt_approval(node, &question, ctx).await?
+        };
 
         apply_state_updates_with_var(&node.state_updates, state_manager, CHOICE_KEY, &choice);
 
@@ -45,42 +87,69 @@ impl ApprovalNodeExecutor {
     }
 }
 
+async fn prompt_approval(
+    node: &ApprovalNode,
+    question: &str,
+    ctx: &mut RequestContext,
+) -> Result<String> {
+    let response = handle_user_tool(
+        ctx,
+        &format!("{USER_FUNCTION_PREFIX}select"),
+        &json!({ "question": question, "options": node.options }),
+    )
+    .await
+    .context("user__select failed")?;
+
+    if let Some(err) = response.get("error").and_then(Value::as_str) {
+        bail!("Approval interaction failed: {err}");
+    }
+
+    Ok(response
+        .get("answer")
+        .and_then(Value::as_str)
+        .context("Approval response missing 'answer' field")?
+        .to_string())
+}
+
+fn headless_approval_choice(
+    node_id: &str,
+    node: &ApprovalNode,
+    question: &str,
+    guard: &HeadlessAnswerGuard,
+) -> Result<String> {
+    let Some(first) = node.options.first() else {
+        bail!("headless: approval node {node_id} has no options to default to");
+    };
+    guard.record_node(node_id)?;
+    let repeats = guard.record_question(node_id, question);
+    let choice = if repeats >= REPEATS_BEFORE_SECOND_OPTION {
+        node.options.get(1).unwrap_or(first)
+    } else {
+        first
+    };
+    Ok(choice.clone())
+}
+
 pub struct InputNodeExecutor;
 
 impl InputNodeExecutor {
     pub async fn execute(
+        node_id: &str,
         node: &InputNode,
         node_next: Option<&str>,
         state_manager: &mut StateManager,
         ctx: &mut RequestContext,
+        guard: &HeadlessAnswerGuard,
     ) -> Result<String> {
         let question = build_input_question(node, state_manager)?;
 
-        let response = handle_user_tool(
-            ctx,
-            &format!("{USER_FUNCTION_PREFIX}input"),
-            &json!({ "question": question }),
-        )
-        .await
-        .context("user__input failed")?;
-
-        if let Some(err) = response.get("error").and_then(Value::as_str) {
-            bail!("Input interaction failed: {err}");
-        }
-
-        let raw = response
-            .get("answer")
-            .and_then(Value::as_str)
-            .context("Input response missing 'answer' field")?
-            .to_string();
-
-        let input_text = if raw.is_empty() {
-            node.default
-                .as_ref()
-                .map(|t| state_manager.interpolate_lenient(t))
-                .unwrap_or_default()
+        let input_text = if headless_without_acp() {
+            guard.record_node(node_id)?;
+            let text = headless_input_text(node, state_manager);
+            emit_headless_default(Some(node_id), "input", Some(&text));
+            text
         } else {
-            raw
+            prompt_input(node, &question, state_manager, ctx).await?
         };
 
         if let Some(expr) = &node.validation
@@ -99,6 +168,48 @@ impl InputNodeExecutor {
             .map(String::from)
             .ok_or_else(|| anyhow!("Input node has no `next` set"))
     }
+}
+
+async fn prompt_input(
+    node: &InputNode,
+    question: &str,
+    state_manager: &StateManager,
+    ctx: &mut RequestContext,
+) -> Result<String> {
+    let response = handle_user_tool(
+        ctx,
+        &format!("{USER_FUNCTION_PREFIX}input"),
+        &json!({ "question": question }),
+    )
+    .await
+    .context("user__input failed")?;
+
+    if let Some(err) = response.get("error").and_then(Value::as_str) {
+        bail!("Input interaction failed: {err}");
+    }
+
+    let raw = response
+        .get("answer")
+        .and_then(Value::as_str)
+        .context("Input response missing 'answer' field")?
+        .to_string();
+
+    Ok(if raw.is_empty() {
+        node.default
+            .as_ref()
+            .map(|t| state_manager.interpolate_lenient(t))
+            .unwrap_or_default()
+    } else {
+        raw
+    })
+}
+
+fn headless_input_text(node: &InputNode, state_manager: &StateManager) -> String {
+    node.default
+        .as_ref()
+        .map(|t| state_manager.interpolate_lenient(t))
+        .filter(|default| !default.is_empty())
+        .unwrap_or_else(|| HEADLESS_GUIDANCE.to_string())
 }
 
 fn build_input_question(node: &InputNode, state_manager: &StateManager) -> Result<String> {
@@ -201,7 +312,12 @@ fn validate_length(input: &str, expr: &str) -> Result<bool> {
 mod tests {
     use super::super::types::*;
     use super::*;
+    use crate::config::{AppState, WorkingMode};
+    use crate::function::user_interaction::HeadlessModeGuard;
+    use crate::function::user_interaction::headless_capture::take_captured_headless_lines;
+    use crate::supervisor::escalation::EscalationQueue;
     use serde_json::json;
+    use serial_test::serial;
 
     fn manager_with(pairs: &[(&str, Value)]) -> StateManager {
         let mut map = HashMap::new();
@@ -234,6 +350,367 @@ mod tests {
             validation: None,
             state_updates: None,
         }
+    }
+
+    fn test_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    fn capture_into(key: &str, var: &str) -> Option<HashMap<String, String>> {
+        Some(HashMap::from([(key.to_string(), format!("{{{{{var}}}}}"))]))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_approval_takes_first_option_and_routes_to_it() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let mut node = approval(
+            &["yes", "no"],
+            &[("yes", "deploy"), ("no", "cancel")],
+            "clarify",
+        );
+        node.state_updates = capture_into("decision", CHOICE_KEY);
+        let mut state = manager_with(&[]);
+
+        let next = ApprovalNodeExecutor::execute(
+            "gate",
+            &node,
+            &mut state,
+            &mut test_ctx(),
+            &HeadlessAnswerGuard::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(next, "deploy");
+        assert_eq!(state.state().get("decision"), Some(&json!("yes")));
+        assert_eq!(
+            take_captured_headless_lines(),
+            vec![r#"[headless-default] node=gate type=approval answer="yes""#]
+        );
+    }
+
+    #[test]
+    fn headless_guard_gives_distinct_questions_on_one_node_the_first_option() {
+        let node = approval(&["yes", "no"], &[], "clarify");
+        let guard = HeadlessAnswerGuard::default();
+
+        for i in 0..5 {
+            let choice =
+                headless_approval_choice("gate", &node, &format!("question {i}"), &guard).unwrap();
+            assert_eq!(choice, "yes", "question {i}");
+        }
+    }
+
+    #[test]
+    fn headless_guard_takes_second_option_from_third_repeat_of_a_question() {
+        let node = approval(&["yes", "no"], &[], "clarify");
+        let guard = HeadlessAnswerGuard::default();
+
+        let choices: Vec<String> = (0..4)
+            .map(|_| headless_approval_choice("gate", &node, "same?", &guard).unwrap())
+            .collect();
+
+        assert_eq!(choices, ["yes", "yes", "no", "no"]);
+    }
+
+    #[test]
+    fn headless_guard_keeps_the_only_option_on_repeats() {
+        let node = approval(&["ok"], &[], "clarify");
+        let guard = HeadlessAnswerGuard::default();
+
+        for _ in 0..3 {
+            assert_eq!(
+                headless_approval_choice("gate", &node, "same?", &guard).unwrap(),
+                "ok"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_guard_counts_start_at_zero_for_a_fresh_guard() {
+        let node = approval(&["yes", "no"], &[], "clarify");
+        let first_run = HeadlessAnswerGuard::default();
+        for _ in 0..3 {
+            headless_approval_choice("gate", &node, "same?", &first_run).unwrap();
+        }
+
+        let second_run = HeadlessAnswerGuard::default();
+
+        assert_eq!(
+            headless_approval_choice("gate", &node, "same?", &second_run).unwrap(),
+            "yes"
+        );
+    }
+
+    /// The backstop boundary: 25 auto-answers on one node succeed and the
+    /// 26th ask fails, whatever the questions were.
+    #[test]
+    fn headless_guard_fails_the_26th_auto_answer_on_one_node() {
+        let node = approval(&["yes", "no"], &[], "clarify");
+        let guard = HeadlessAnswerGuard::default();
+        for i in 0..25 {
+            headless_approval_choice("gate", &node, &format!("q{i}"), &guard).unwrap();
+        }
+
+        let err = headless_approval_choice("gate", &node, "q25", &guard).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "headless: node gate auto-answered 25 times"
+        );
+        assert_eq!(
+            headless_approval_choice("other", &node, "q0", &guard).unwrap(),
+            "yes"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_input_answers_count_toward_the_node_backstop() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let mut node = input("Name?");
+        node.default = Some("alice".into());
+        let guard = HeadlessAnswerGuard::default();
+        let mut state = manager_with(&[]);
+        for _ in 0..25 {
+            InputNodeExecutor::execute(
+                "ask",
+                &node,
+                Some("next"),
+                &mut state,
+                &mut test_ctx(),
+                &guard,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(take_captured_headless_lines().len(), 25);
+
+        let err = InputNodeExecutor::execute(
+            "ask",
+            &node,
+            Some("next"),
+            &mut state,
+            &mut test_ctx(),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "headless: node ask auto-answered 25 times");
+        assert!(take_captured_headless_lines().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_approval_backstop_writes_no_line_for_the_failed_ask() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let node = approval(&["yes", "no"], &[], "clarify");
+        let guard = HeadlessAnswerGuard::default();
+        let mut state = manager_with(&[]);
+        for _ in 0..25 {
+            ApprovalNodeExecutor::execute("gate", &node, &mut state, &mut test_ctx(), &guard)
+                .await
+                .unwrap();
+        }
+        assert_eq!(take_captured_headless_lines().len(), 25);
+
+        let err = ApprovalNodeExecutor::execute("gate", &node, &mut state, &mut test_ctx(), &guard)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "headless: node gate auto-answered 25 times"
+        );
+        assert!(take_captured_headless_lines().is_empty());
+    }
+
+    async fn run_headless_input(node: &InputNode, state: &mut StateManager) -> Result<String> {
+        InputNodeExecutor::execute(
+            "ask",
+            node,
+            Some("next"),
+            state,
+            &mut test_ctx(),
+            &HeadlessAnswerGuard::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_input_uses_the_interpolated_default() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let mut node = input("Name?");
+        node.default = Some("{{name}}".into());
+        node.state_updates = capture_into("answer", INPUT_KEY);
+        let mut state = manager_with(&[("name", json!("alice"))]);
+
+        let next = run_headless_input(&node, &mut state).await.unwrap();
+
+        assert_eq!(next, "next");
+        assert_eq!(state.state().get("answer"), Some(&json!("alice")));
+        assert_eq!(
+            take_captured_headless_lines(),
+            vec![r#"[headless-default] node=ask type=input answer="alice""#]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_input_without_a_default_uses_the_guidance_text() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        let mut node = input("Name?");
+        node.state_updates = capture_into("answer", INPUT_KEY);
+        let mut state = manager_with(&[]);
+
+        run_headless_input(&node, &mut state).await.unwrap();
+
+        assert_eq!(state.state().get("answer"), Some(&json!(HEADLESS_GUIDANCE)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_input_with_a_blank_default_uses_the_guidance_text() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        let mut node = input("Name?");
+        node.default = Some("{{missing}}".into());
+        node.state_updates = capture_into("answer", INPUT_KEY);
+        let mut state = manager_with(&[]);
+
+        run_headless_input(&node, &mut state).await.unwrap();
+
+        assert_eq!(state.state().get("answer"), Some(&json!(HEADLESS_GUIDANCE)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_input_still_runs_validation_on_the_chosen_text() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        let mut passing = input("Name?");
+        passing.default = Some("alice smith".into());
+        passing.validation = Some("len(input) > 5".into());
+        let mut failing = input("Name?");
+        failing.validation = Some("len(input) < 5".into());
+        let mut state = manager_with(&[]);
+
+        run_headless_input(&passing, &mut state).await.unwrap();
+        let err = run_headless_input(&failing, &mut state).await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Input failed validation 'len(input) < 5' (got {} chars)",
+                HEADLESS_GUIDANCE.chars().count()
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_headless_approval_still_asks_and_routes_on_the_human_answer() {
+        let _mode = HeadlessModeGuard::set(false, false);
+        take_captured_headless_lines();
+        let node = approval(
+            &["yes", "no"],
+            &[("yes", "deploy"), ("no", "cancel")],
+            "clarify",
+        );
+        let queue = Arc::new(EscalationQueue::new());
+        let mut ctx = test_ctx();
+        ctx.current_depth = 1;
+        ctx.escalation_queue = Some(Arc::clone(&queue));
+        let mut state = manager_with(&[]);
+
+        let guard = HeadlessAnswerGuard::default();
+        let ask = ApprovalNodeExecutor::execute("gate", &node, &mut state, &mut ctx, &guard);
+        let reply = async {
+            for _ in 0..1000 {
+                if let Some(entry) = queue.pending_summary().first() {
+                    let id = entry["escalation_id"].as_str().unwrap().to_string();
+                    let request = queue.take(&id).unwrap();
+                    let _ = request.reply_tx.send("no".to_string());
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("approval question must reach the escalation queue");
+        };
+        let (next, ()) = tokio::join!(ask, reply);
+
+        assert_eq!(next.unwrap(), "cancel");
+        assert!(take_captured_headless_lines().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_headless_input_still_asks_and_takes_the_default_on_an_empty_answer() {
+        let _mode = HeadlessModeGuard::set(false, false);
+        take_captured_headless_lines();
+        let mut node = input("Name?");
+        node.default = Some("{{name}}".into());
+        node.state_updates = capture_into("answer", INPUT_KEY);
+        let queue = Arc::new(EscalationQueue::new());
+        let mut ctx = test_ctx();
+        ctx.current_depth = 1;
+        ctx.escalation_queue = Some(Arc::clone(&queue));
+        let mut state = manager_with(&[("name", json!("alice"))]);
+
+        let guard = HeadlessAnswerGuard::default();
+        let ask =
+            InputNodeExecutor::execute("ask", &node, Some("next"), &mut state, &mut ctx, &guard);
+        let reply = async {
+            for _ in 0..1000 {
+                if let Some(entry) = queue.pending_summary().first() {
+                    let id = entry["escalation_id"].as_str().unwrap().to_string();
+                    let request = queue.take(&id).unwrap();
+                    assert_eq!(request.question, "[input] Name? [default: alice]");
+                    let _ = request.reply_tx.send(String::new());
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("input question must reach the escalation queue");
+        };
+        let (next, ()) = tokio::join!(ask, reply);
+
+        assert_eq!(next.unwrap(), "next");
+        assert_eq!(state.state().get("answer"), Some(&json!("alice")));
+        assert!(take_captured_headless_lines().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn acp_approval_still_fails_on_the_missing_answer_and_queues_permission() {
+        let _mode = HeadlessModeGuard::set(true, true);
+        take_captured_headless_lines();
+        let mut node = approval(&["yes", "no"], &[("yes", "deploy")], "clarify");
+        node.question = "acp approval unchanged-m3d".into();
+        let mut state = manager_with(&[]);
+
+        let err = ApprovalNodeExecutor::execute(
+            "gate",
+            &node,
+            &mut state,
+            &mut test_ctx(),
+            &HeadlessAnswerGuard::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Approval response missing 'answer' field");
+        let queued = crate::utils::drain_acp_permissions()
+            .into_iter()
+            .filter(|p| p["question"] == "acp approval unchanged-m3d")
+            .count();
+        assert_eq!(queued, 1);
+        assert!(take_captured_headless_lines().is_empty());
     }
 
     #[test]

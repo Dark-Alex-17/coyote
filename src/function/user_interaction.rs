@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 pub const USER_FUNCTION_PREFIX: &str = "user__";
+pub const HEADLESS_GUIDANCE: &str = "No human is available to answer. Go with the recommended option; if none is marked, use your best judgment.";
 
 const DEFAULT_ESCALATION_TIMEOUT_SECS: u64 = 0;
 const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
@@ -151,6 +152,7 @@ pub async fn handle_user_tool(
     }
 
     if HEADLESS.load(Ordering::SeqCst) {
+        emit_headless_default(None, &format!("{USER_FUNCTION_PREFIX}{action}"), None);
         return Ok(handle_headless(action, args));
     }
 
@@ -160,6 +162,70 @@ pub async fn handle_user_tool(
         handle_direct(action, args)
     } else {
         handle_escalated(ctx, action, args).await
+    }
+}
+
+/// True when no human can answer and no ACP client relays the question;
+/// ACP also sets `HEADLESS` but routes questions through permission requests.
+pub fn headless_without_acp() -> bool {
+    HEADLESS.load(Ordering::SeqCst) && !ACP_SERVER.load(Ordering::SeqCst)
+}
+
+pub fn headless_default_line(node: Option<&str>, kind: &str, answer: Option<&str>) -> String {
+    let answer = answer.map_or_else(
+        || Value::Null.to_string(),
+        |a| Value::String(a.to_string()).to_string(),
+    );
+    format!(
+        "[headless-default] node={} type={kind} answer={answer}",
+        node.unwrap_or("-")
+    )
+}
+
+pub(crate) fn emit_headless_default(node: Option<&str>, kind: &str, answer: Option<&str>) {
+    let line = headless_default_line(node, kind, answer);
+    eprintln!("{line}");
+    #[cfg(test)]
+    headless_capture::CAPTURED.lock().push(line);
+}
+
+#[cfg(test)]
+pub(crate) mod headless_capture {
+    pub(super) static CAPTURED: parking_lot::Mutex<Vec<String>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Drains every line emitted so far. Callers must be `#[serial]` and
+    /// drain once before acting so earlier tests' lines do not leak in.
+    pub(crate) fn take_captured_headless_lines() -> Vec<String> {
+        std::mem::take(&mut *CAPTURED.lock())
+    }
+}
+
+/// Sets the process-wide headless and ACP flags for a test and restores the
+/// previous values on drop. Tests holding one must be `#[serial]`, and so
+/// must any test that reaches `handle_user_tool` or an approval or input
+/// graph node, since those read the flags.
+#[cfg(test)]
+pub(crate) struct HeadlessModeGuard {
+    headless: bool,
+    acp: bool,
+}
+
+#[cfg(test)]
+impl HeadlessModeGuard {
+    pub(crate) fn set(headless: bool, acp: bool) -> Self {
+        Self {
+            headless: HEADLESS.swap(headless, Ordering::SeqCst),
+            acp: ACP_SERVER.swap(acp, Ordering::SeqCst),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeadlessModeGuard {
+    fn drop(&mut self) {
+        HEADLESS.store(self.headless, Ordering::SeqCst);
+        ACP_SERVER.store(self.acp, Ordering::SeqCst);
     }
 }
 
@@ -176,7 +242,7 @@ fn handle_headless(action: &str, args: &Value) -> Value {
         "action": action,
         "question": question,
         "options": options,
-        "guidance": "No human is present. Apply a sensible default or abort the task.",
+        "guidance": HEADLESS_GUIDANCE,
     })
 }
 
@@ -361,6 +427,7 @@ fn parse_options(args: &Value) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::headless_capture::take_captured_headless_lines;
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
     use crate::function::agents::handle_agent_tool;
@@ -389,6 +456,106 @@ mod tests {
         assert_eq!(v["needs_human"], true);
         assert_eq!(v["action"], "confirm");
         assert_eq!(v["options"], json!([]));
+    }
+
+    #[test]
+    fn headless_guidance_is_neutral_and_names_no_terminal_action() {
+        assert_eq!(
+            HEADLESS_GUIDANCE,
+            "No human is available to answer. Go with the recommended option; if none is marked, use your best judgment."
+        );
+        let lowered = HEADLESS_GUIDANCE.to_lowercase();
+        for word in ["abort", "stop", "cancel", "quit", "skip", "reject"] {
+            assert!(!lowered.contains(word), "guidance contains {word:?}");
+        }
+    }
+
+    #[test]
+    fn headless_default_line_for_prose_tools_has_no_node_and_null_answer() {
+        assert_eq!(
+            headless_default_line(None, "user__select", None),
+            "[headless-default] node=- type=user__select answer=null"
+        );
+    }
+
+    #[test]
+    fn headless_default_line_for_graph_nodes_json_quotes_the_answer() {
+        assert_eq!(
+            headless_default_line(Some("gate"), "approval", Some("yes")),
+            r#"[headless-default] node=gate type=approval answer="yes""#
+        );
+        assert_eq!(
+            headless_default_line(Some("ask"), "input", Some("say \"hi\"\nbye")),
+            r#"[headless-default] node=ask type=input answer="say \"hi\"\nbye""#
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_prose_question_still_returns_needs_human_without_answer() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let args = json!({ "question": "headless prose pick", "options": ["a", "b"] });
+
+        let result = handle_user_tool(&mut ctx, "user__select", &args)
+            .await
+            .unwrap();
+
+        assert_eq!(result, handle_headless("select", &args));
+        assert_eq!(result["guidance"], HEADLESS_GUIDANCE);
+        assert!(result.get("answer").is_none());
+        assert_eq!(
+            take_captured_headless_lines(),
+            vec!["[headless-default] node=- type=user__select answer=null"]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn headless_prose_question_logs_exactly_one_line_per_action() {
+        let _mode = HeadlessModeGuard::set(true, false);
+        take_captured_headless_lines();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let args = json!({ "question": "headless prose any", "options": ["a", "b"] });
+
+        for action in ["select", "confirm", "input", "checkbox"] {
+            handle_user_tool(&mut ctx, &format!("user__{action}"), &args)
+                .await
+                .unwrap();
+            assert_eq!(
+                take_captured_headless_lines(),
+                vec![format!(
+                    "[headless-default] node=- type=user__{action} answer=null"
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn acp_question_keeps_needs_human_result_and_queues_permission() {
+        let _mode = HeadlessModeGuard::set(true, true);
+        take_captured_headless_lines();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let question = "acp pick unchanged-q7v";
+        let args = json!({ "question": question, "options": ["a", "b"] });
+
+        let result = handle_user_tool(&mut ctx, "user__select", &args)
+            .await
+            .unwrap();
+
+        assert_eq!(result, handle_headless("select", &args));
+        assert!(result.get("answer").is_none());
+        let queued: Vec<Value> = crate::utils::drain_acp_permissions()
+            .into_iter()
+            .filter(|p| p["question"] == question)
+            .collect();
+        assert_eq!(
+            queued,
+            vec![json!({ "action": "select", "question": question, "options": ["a", "b"] })]
+        );
+        assert!(take_captured_headless_lines().is_empty());
     }
 
     #[test]
