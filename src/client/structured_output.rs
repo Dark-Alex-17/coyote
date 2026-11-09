@@ -179,8 +179,14 @@ fn convert_node(node: &Value, dialect: SchemaDialect) -> Value {
     }
 
     if is_object_schema(map) {
-        out.entry("additionalProperties")
-            .or_insert(Value::Bool(false));
+        // Closing an object that declares no properties would make the
+        // provider enforce `{}` and drop its data. Left open, a strict
+        // provider rejects the schema and the caller falls back to sending
+        // no format.
+        if map.contains_key("properties") {
+            out.entry("additionalProperties")
+                .or_insert(Value::Bool(false));
+        }
         if dialect == SchemaDialect::OpenAiStrict {
             make_strict_object(&mut out, map);
         }
@@ -1122,10 +1128,70 @@ mod tests {
     fn openai_strict_property_less_object_requires_nothing() {
         let converted = convert_schema(&json!({ "type": "object" }), SchemaDialect::OpenAiStrict);
 
-        assert_eq!(
-            converted,
-            json!({ "type": "object", "additionalProperties": false, "required": [] })
-        );
+        assert_eq!(converted, json!({ "type": "object", "required": [] }));
+    }
+
+    #[test]
+    fn property_less_objects_stay_open() {
+        let top = json!({ "type": "object" });
+        let nested = json!({ "type": "array", "items": { "type": "object" } });
+
+        for dialect in [SchemaDialect::OpenAiStrict, SchemaDialect::Anthropic] {
+            let top = convert_schema(&top, dialect);
+            let nested = convert_schema(&nested, dialect);
+
+            assert!(top.get("additionalProperties").is_none(), "{dialect:?}");
+            assert!(
+                nested["items"].get("additionalProperties").is_none(),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn objects_with_properties_are_closed() {
+        let schema = json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": { "a": { "type": "string" } }
+            }
+        });
+
+        for dialect in [SchemaDialect::OpenAiStrict, SchemaDialect::Anthropic] {
+            let converted = convert_schema(&schema, dialect);
+
+            assert_eq!(
+                converted["items"]["additionalProperties"],
+                json!(false),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_additional_properties_on_property_less_object_is_preserved() {
+        let schema = json!({ "type": "object", "additionalProperties": true });
+
+        for dialect in [SchemaDialect::OpenAiStrict, SchemaDialect::Anthropic] {
+            let converted = convert_schema(&schema, dialect);
+
+            assert_eq!(
+                converted["additionalProperties"],
+                json!(true),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_injected_nulls_keeps_nulls_inside_property_less_objects() {
+        let schema = json!({ "type": "array", "items": { "type": "object" } });
+        let mut value = json!([{ "note": null }]);
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!([{ "note": null }]));
     }
 
     #[test]

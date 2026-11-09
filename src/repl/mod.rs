@@ -26,6 +26,7 @@ use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pe
 use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
+use crate::graph::structured::with_native_format_fallback;
 use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
 use crate::supervisor::{Supervisor, TaskKind};
@@ -1905,7 +1906,44 @@ impl std::error::Error for PreflightError {
 fn repl_completion_runner()
 -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 {
-    |input, ctx, abort| {
+    repl_completion_runner_with(repl_transport)
+}
+
+/// Sends one request for `input` on the transport `select_transport` picks.
+fn repl_transport<'a>(
+    input: &'a Input,
+    ctx: &'a mut RequestContext,
+    abort: AbortSignal,
+) -> CompletionFuture<'a> {
+    Box::pin(async move {
+        let client = input.create_client()?;
+        match select_transport(input) {
+            Transport::Quiet => {
+                call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
+            }
+            Transport::Streaming => {
+                call_chat_completions_streaming(input, client.as_ref(), ctx, abort).await
+            }
+            Transport::Plain => {
+                call_chat_completions(input, true, false, client.as_ref(), ctx, abort).await
+            }
+        }
+    })
+}
+
+/// The REPL runner over `transport`. A native-format rejection is retried
+/// once without the format; the before-hook still runs once per call.
+fn repl_completion_runner_with<T>(
+    transport: T,
+) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+where
+    T: for<'b> FnMut(&'b Input, &'b mut RequestContext, AbortSignal) -> CompletionFuture<'b>
+        + Clone
+        + Send
+        + 'static,
+{
+    move |input, ctx, abort| {
+        let mut transport = transport.clone();
         Box::pin(async move {
             let client = input
                 .create_client()
@@ -1913,18 +1951,10 @@ fn repl_completion_runner()
             input
                 .guard_images()
                 .map_err(|err| anyhow::Error::new(PreflightError(err)))?;
+            let dialect = input.native_structured_output(client.as_ref());
             ctx.before_chat_completion(input)?;
-            match select_transport(input) {
-                Transport::Quiet => {
-                    call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
-                }
-                Transport::Streaming => {
-                    call_chat_completions_streaming(input, client.as_ref(), ctx, abort).await
-                }
-                Transport::Plain => {
-                    call_chat_completions(input, true, false, client.as_ref(), ctx, abort).await
-                }
-            }
+            with_native_format_fallback(dialect, input, ctx, |i, c| transport(i, c, abort.clone()))
+                .await
         })
     }
 }
@@ -5143,6 +5173,60 @@ local_hello() {\n\
                 assert!(matches!(select_transport(&other), Transport::Plain));
             }
         }
+    }
+
+    #[test]
+    fn classifier_retries_without_the_native_format_after_a_400() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            with_app_config(&mut ctx, |config| {
+                config.clients = vec![ClientConfig::OpenAIConfig(Default::default())];
+            });
+            let mut data = ModelData::new("structured");
+            data.supports_structured_output = true;
+            let mut session = Session::default();
+            session.set_model(Model::from_config("openai", &[data]).remove(0));
+            ctx.session = Some(session);
+            let graph: graph::Graph = serde_yaml::from_str(&format!(
+                "name: probe\n{SESSION_BLOCK}start: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+            ))
+            .unwrap();
+            let block = graph.session.clone().unwrap();
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let mut runner = repl_completion_runner_with(move |input: &Input, _ctx, _abort| {
+                let mut seen = recorded.lock();
+                seen.push(input.role().structured_output().cloned());
+                let first = seen.len() == 1;
+                boxed_completion(async move {
+                    if first {
+                        Err(anyhow::Error::new(crate::client::ApiStatusError {
+                            status: 400,
+                            message: "response_format rejected".into(),
+                        }))
+                    } else {
+                        Ok((r#"{"decision":"run"}"#.to_string(), vec![]))
+                    }
+                })
+            });
+
+            let branch = graph::route::classify(
+                &mut ctx,
+                &graph,
+                &block,
+                "go",
+                &create_abort_signal(),
+                &mut runner,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(branch, Branch::Run);
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].as_ref().unwrap().name, "route_decision");
+            assert!(seen[1].is_none());
+        });
     }
 
     #[test]
