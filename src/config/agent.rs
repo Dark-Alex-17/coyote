@@ -78,13 +78,14 @@ pub(crate) fn install_and_reconcile_agent_hooks(
     shipped: &[(String, String)],
     mode: InstallMode,
     sticky: &mut StickyMode,
+    prompter: &dyn Prompter,
 ) -> Result<()> {
     let dir = paths::agents_data_dir().join(agent).join("hooks");
     let mut written = BTreeSet::new();
     for (name, content) in shipped {
         let path = dir.join(name);
         if path.exists()
-            && !conflict::should_replace_existing(&path, content, "agents", mode, sticky)?
+            && !conflict::should_replace_existing(&path, content, "agents", mode, sticky, prompter)?
         {
             debug!(
                 "Agent hook file already exists, skipping: {}",
@@ -184,7 +185,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn install_builtin_agents(mode: InstallMode) -> Result<()> {
+    pub fn install_builtin_agents(mode: InstallMode, prompter: &dyn Prompter) -> Result<()> {
         info!(
             "Installing built-in agents in {}",
             paths::agents_data_dir().display()
@@ -208,6 +209,7 @@ impl Agent {
                     "agents",
                     mode,
                     &mut sticky,
+                    prompter,
                 )?
             {
                 debug!(
@@ -286,7 +288,11 @@ impl Agent {
         Ok(())
     }
 
-    pub fn install_builtin_agent_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
+    pub fn install_builtin_agent_hooks(
+        mode: InstallMode,
+        sticky: &mut StickyMode,
+        prompter: &dyn Prompter,
+    ) -> Result<()> {
         let mut shipped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for file in AgentAssets::iter() {
             let Some((agent, rest)) = file.as_ref().split_once('/') else {
@@ -304,7 +310,7 @@ impl Agent {
         }
 
         for (agent, files) in &shipped {
-            install_and_reconcile_agent_hooks(agent, files, mode, sticky)?;
+            install_and_reconcile_agent_hooks(agent, files, mode, sticky, prompter)?;
         }
 
         Ok(())
@@ -1622,6 +1628,7 @@ fn may_ask_human(interactive: bool, tty: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::conflict::prompt_script::Scripted;
     use crate::prompt::{PromptAnswer, ScriptedPrompter};
     use crate::testing::{self, AtomicFlagGuard};
     use crate::utils::{ACP_SERVER, HEADLESS};
@@ -2732,8 +2739,14 @@ nodes: {}
         // First conflict answered per-file, second by the sticky replace-all.
         let script = prompt_script::install(&["replace-all"]);
         let mut sticky = StickyMode::None;
-        install_and_reconcile_agent_hooks("probe", &shipped, InstallMode::Prompt, &mut sticky)
-            .unwrap();
+        install_and_reconcile_agent_hooks(
+            "probe",
+            &shipped,
+            InstallMode::Prompt,
+            &mut sticky,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "new content\n");
         assert_eq!(read_to_string(dir.join("b.sh")).unwrap(), "new content\n");
@@ -2750,8 +2763,14 @@ nodes: {}
         fs::write(dir.join("a.sh"), "local again").unwrap();
         let script = prompt_script::install(&[]);
         let mut sticky = StickyMode::KeepAll;
-        install_and_reconcile_agent_hooks("probe", &shipped, InstallMode::Prompt, &mut sticky)
-            .unwrap();
+        install_and_reconcile_agent_hooks(
+            "probe",
+            &shipped,
+            InstallMode::Prompt,
+            &mut sticky,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "local again");
         drop(script);
@@ -2768,6 +2787,7 @@ nodes: {}
             &fixture(&[("keep.sh", "v1\n"), ("drop.sh", "#!/bin/sh\n")]),
             InstallMode::Skip,
             &mut StickyMode::None,
+            &Scripted,
         )
         .unwrap();
         fs::write(dir.join("user.sh"), "user-owned").unwrap();
@@ -2777,6 +2797,7 @@ nodes: {}
             &fixture(&[("keep.sh", "v2\n"), ("added.sh", "#!/bin/sh\n")]),
             InstallMode::Force,
             &mut StickyMode::None,
+            &Scripted,
         )
         .unwrap();
 
@@ -2829,11 +2850,13 @@ nodes: {}
             &fixture(&[("stale.sh", "#!/bin/sh\n")]),
             InstallMode::Skip,
             &mut StickyMode::None,
+            &Scripted,
         )
         .unwrap();
         fs::write(dir.join("user.sh"), "user-owned").unwrap();
 
-        Agent::install_builtin_agent_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        Agent::install_builtin_agent_hooks(InstallMode::Skip, &mut StickyMode::None, &Scripted)
+            .unwrap();
 
         assert!(
             !dir.join("stale.sh").exists(),

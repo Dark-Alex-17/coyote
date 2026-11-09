@@ -1087,9 +1087,17 @@ pub async fn run_repl_command_with_prefix(
                 emit_pause_banner(ctx);
             }
             ".install" => match parse_repl_install(args) {
-                ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
+                ReplInstallDispatch::Builtins(category) => {
+                    config::install_assets(category, ctx.prompter.as_ref())?
+                }
                 ReplInstallDispatch::Unified(value) => {
-                    config::install_or_update_from_repl_args(value, ctx.command_prefix())?;
+                    config::install_or_update_from_repl_args(
+                        value,
+                        config::InstallIo {
+                            prefix: ctx.command_prefix(),
+                            prompter: ctx.prompter.as_ref(),
+                        },
+                    )?;
                 }
                 ReplInstallDispatch::Help => {
                     println!("{}", ctx.render_hints(&repl_install_help()))
@@ -1506,7 +1514,7 @@ pub async fn run_repl_command_with_prefix(
             },
             ".uninstall" => match parse_repl_uninstall(args) {
                 ReplUninstallDispatch::Run(name, assume_yes) => {
-                    config::uninstall_bundle(&name, assume_yes)?
+                    config::uninstall_bundle(&name, assume_yes, ctx.prompter.as_ref())?
                 }
                 ReplUninstallDispatch::Help => {
                     println!("{}", ctx.render_hints(&repl_uninstall_help()))

@@ -214,11 +214,11 @@ async fn async_main() -> Result<()> {
     let inspection_only =
         (readout_flag || vault_inspect || mcp_inspect) && cli.agent.is_none() && cli.role.is_none();
     if !inspection_only {
-        install_builtins()?;
+        install_builtins(&InquirePrompter::default())?;
     }
 
     if let Some(category) = cli.install_builtins {
-        return config::install_assets(category);
+        return config::install_assets(category, &InquirePrompter::default());
     }
 
     if let Some(value) = cli.install.as_deref() {
@@ -227,16 +227,19 @@ async fn async_main() -> Result<()> {
             cli.git_host.as_deref(),
             cli.filter,
             cli.install_force,
-            config::CommandPrefix::default(),
+            config::InstallIo {
+                prefix: config::CommandPrefix::default(),
+                prompter: &InquirePrompter::default(),
+            },
         );
     }
 
     if let Some(spec) = cli.update_bundle.as_deref() {
-        return config::update_bundle(spec, cli.yes);
+        return config::update_bundle(spec, cli.yes, &InquirePrompter::default());
     }
 
     if let Some(name) = cli.uninstall.as_deref() {
-        return config::uninstall_bundle(name, cli.yes);
+        return config::uninstall_bundle(name, cli.yes, &InquirePrompter::default());
     }
 
     if let Some(client_arg) = &cli.authenticate {

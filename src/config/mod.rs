@@ -48,6 +48,7 @@ pub use self::bundles::list_installed_bundles;
 pub use self::command_prefix::CommandPrefix;
 use self::conflict::{InstallMode, StickyMode};
 pub use self::input::Input;
+pub(crate) use self::install_remote::InstallIo;
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
     update_bundle,
@@ -94,6 +95,7 @@ use crate::client::{
 };
 use crate::function::{FunctionDeclaration, Functions};
 use crate::hooks::HooksMap;
+use crate::prompt::Prompter;
 use crate::rag::Rag;
 use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::utils::*;
@@ -450,14 +452,16 @@ impl Default for Config {
     }
 }
 
-pub fn install_builtins() -> Result<()> {
+/// Skip mode never reaches the prompter; it is threaded through because
+/// the installers share their conflict path with the prompting modes.
+pub fn install_builtins(prompter: &dyn Prompter) -> Result<()> {
     hooks::sweep_stale_payload_files();
     Functions::install_builtin_global_tools(false)?;
-    Agent::install_builtin_agents(InstallMode::Skip)?;
+    Agent::install_builtin_agents(InstallMode::Skip, prompter)?;
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
-    hooks::install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None)?;
-    Role::install_builtin_role_hooks(InstallMode::Skip, &mut StickyMode::None)?;
+    hooks::install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None, prompter)?;
+    Role::install_builtin_role_hooks(InstallMode::Skip, &mut StickyMode::None, prompter)?;
     Ok(())
 }
 
@@ -545,7 +549,7 @@ impl InstallFilter {
     }
 }
 
-pub fn install_assets(category: AssetCategory) -> Result<()> {
+pub fn install_assets(category: AssetCategory, prompter: &dyn Prompter) -> Result<()> {
     let (label, target) = match category {
         AssetCategory::Agents => ("agents", paths::agents_data_dir()),
         AssetCategory::Macros => ("macros", paths::macros_dir()),
@@ -555,21 +559,21 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
     };
 
-    if !confirm_asset_overwrite(category, label, &target)? {
+    if !confirm_asset_overwrite(category, label, &target, prompter)? {
         println!("Aborted. No files were changed.");
         return Ok(());
     }
 
     match category {
-        AssetCategory::Agents => Agent::install_builtin_agents(InstallMode::Force)?,
+        AssetCategory::Agents => Agent::install_builtin_agents(InstallMode::Force, prompter)?,
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
         AssetCategory::Hooks => {
             let mut sticky = StickyMode::None;
-            hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky)?;
-            Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky)?;
-            Agent::install_builtin_agent_hooks(InstallMode::Prompt, &mut sticky)?;
+            hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
+            Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
+            Agent::install_builtin_agent_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
         }
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
@@ -579,8 +583,13 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
     Ok(())
 }
 
-fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) -> Result<bool> {
-    if !*IS_STDOUT_TERMINAL {
+fn confirm_asset_overwrite(
+    category: AssetCategory,
+    label: &str,
+    target: &Path,
+    prompter: &dyn Prompter,
+) -> Result<bool> {
+    if !conflict::menu_can_use_terminal() {
         return Ok(true);
     }
     let body = match category {
@@ -607,10 +616,8 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
             target.display()
         ),
     };
-    let prompt = format!("{} {body}\nContinue? [y/N] ", warning_text("WARNING:"));
-    let answer = read_single_key(&['y', 'Y', 'n', 'N'], 'n', &prompt)?;
-
-    Ok(matches!(answer, 'y' | 'Y'))
+    println!("{} {body}", warning_text("WARNING:"));
+    crate::prompt::confirm(prompter, "Continue?".to_string(), false)
 }
 
 pub fn default_sessions_dir() -> PathBuf {
@@ -2066,12 +2073,14 @@ hooks:
         // Drives the exact three installers `install_assets(Hooks)` runs,
         // threading one sticky scope through all of them.
         let refresh = |sticky: &mut StickyMode| {
-            hooks::install_builtin_hooks(InstallMode::Prompt, sticky).unwrap();
+            hooks::install_builtin_hooks(InstallMode::Prompt, sticky, &prompt_script::Scripted)
+                .unwrap();
             role::install_and_reconcile_role_hooks(
                 &role_dir,
                 &shipped,
                 InstallMode::Prompt,
                 sticky,
+                &prompt_script::Scripted,
             )
             .unwrap();
             agent::install_and_reconcile_agent_hooks(
@@ -2079,6 +2088,7 @@ hooks:
                 &shipped,
                 InstallMode::Prompt,
                 sticky,
+                &prompt_script::Scripted,
             )
             .unwrap();
         };
@@ -2145,21 +2155,58 @@ hooks:
         use crate::config::conflict::prompt_script;
 
         let _guard = TestConfigDirGuard::new("install-builtins-startup");
-        install_builtins().unwrap();
+        install_builtins(&prompt_script::Scripted).unwrap();
         let notify = paths::hooks_dir().join("notify.sh");
         fs::write(&notify, "# local edit").unwrap();
 
         // A forced terminal with no scripted answers: any prompt would panic
         // and the counter would move.
         let script = prompt_script::install(&[]);
-        install_builtins().unwrap();
+        install_builtins(&prompt_script::Scripted).unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
         drop(script);
 
         let _script = prompt_script::install_non_interactive();
-        install_builtins().unwrap();
+        install_builtins(&prompt_script::Scripted).unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
+    }
+
+    /// Under the full-screen UI the overwrite warning is followed by a
+    /// Confirm through the prompter, defaulting to no, instead of a raw
+    /// keypress read.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_asset_overwrite_under_the_tui_asks_through_the_prompter() {
+        use crate::prompt::{PromptAction, PromptAnswer, ScriptedPrompter};
+
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+
+        let proceed = confirm_asset_overwrite(
+            AssetCategory::Macros,
+            "macros",
+            Path::new("/tmp/coyote-macros"),
+            &prompter,
+        )
+        .unwrap();
+
+        assert!(proceed);
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Continue?");
+        assert_eq!(requests[0].default, Some(json!(false)));
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let proceed = confirm_asset_overwrite(
+            AssetCategory::Hooks,
+            "hooks",
+            Path::new("/tmp/coyote-hooks"),
+            &prompter,
+        )
+        .unwrap();
+        assert!(!proceed);
     }
 }

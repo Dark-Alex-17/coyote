@@ -273,6 +273,20 @@ pub(crate) fn confirm(prompter: &dyn Prompter, question: String, default: bool) 
     ask(prompter, req).and_then(PromptAnswer::into_confirmed)
 }
 
+/// A select whose answer must be one of `options`.
+pub(crate) fn select_closed(
+    prompter: &dyn Prompter,
+    question: &str,
+    options: Vec<String>,
+) -> Result<String> {
+    let req = PromptRequest {
+        options,
+        closed: true,
+        ..PromptRequest::new(PromptAction::Select, question, Origin::detached())
+    };
+    ask(prompter, req).and_then(PromptAnswer::into_selected)
+}
+
 pub(crate) fn input(
     prompter: &dyn Prompter,
     question: &str,

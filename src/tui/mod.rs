@@ -8942,7 +8942,6 @@ mod tests {
         const CLI_ONLY: &str = "a CLI flow (-e, --mcp); the process never reaches a UI";
         const REPL_PROMPTER: &str =
             "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
-        const VIA_GATE: &str = "calls read_single_key, which refuses under the TUI";
         const VIA_EDIT_GATE: &str = "calls edit_file, which lends the terminal under the TUI";
         const VIA_RUN_GATE: &str = "calls run_command, which lends the terminal under the TUI";
         const REPL_PAINTER: &str =
@@ -8964,24 +8963,6 @@ mod tests {
             ("src/client/common.rs", "select_model", BEFORE_UI),
             ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
             ("src/client/macros.rs", "create_client_config", BEFORE_UI),
-            ("src/config/bundles.rs", "resolve_bundle_name", PROMPT_GATED),
-            ("src/config/conflict.rs", "select_choice", PROMPT_GATED),
-            (
-                "src/config/install_remote.rs",
-                "uninstall_bundle",
-                PROMPT_GATED,
-            ),
-            (
-                "src/config/install_remote.rs",
-                "select_uninstall_candidate",
-                PROMPT_GATED,
-            ),
-            (
-                "src/config/install_remote.rs",
-                "prompt_for_each_secret",
-                PROMPT_GATED,
-            ),
-            ("src/config/mod.rs", "confirm_asset_overwrite", VIA_GATE),
             ("src/config/mod.rs", "create_config_file", BEFORE_UI),
             ("src/config/mod.rs", "create_config_file_sandbox", BEFORE_UI),
             (
@@ -9047,6 +9028,7 @@ mod tests {
                 "run_loader_command",
                 LOADER_STDIN_CLOSED,
             ),
+            ("src/utils/input.rs", "read_single_key", CLI_ONLY),
         ];
         let readers = keyboard_readers();
         assert!(!readers.is_empty());
@@ -9100,11 +9082,6 @@ mod tests {
             mislabelled.join("\n")
         );
         assert!(
-            readers.iter().any(|r| r.file == "src/utils/input.rs"
-                && r.function == "read_single_key"
-                && r.gated)
-        );
-        assert!(
             readers
                 .iter()
                 .any(|r| r.file == "src/utils/command.rs" && r.function == "edit_file" && r.gated)
@@ -9135,31 +9112,6 @@ mod tests {
         assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));
         let cursor_sync = include_str!("../utils/cursor_sync.rs");
         assert!(fn_body(cursor_sync, "fn resync_stdout").contains("crate::tui::active()"));
-    }
-
-    /// A keyboard prompt asked while the UI owns the terminal is refused
-    /// outright: it comes back at once, on a thread that would otherwise
-    /// be stuck on a read of stdin that the event stream owns.
-    #[test]
-    #[serial]
-    fn read_single_key_refuses_under_the_tui_without_touching_stdin() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::utils::read_single_key(
-                &['y', 'n'],
-                'n',
-                "\x1b[33mWARNING:\x1b[0m risky\nContinue? [y/N] ",
-            ));
-        });
-        let answer = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the gate must answer without reading stdin");
-        let err = answer.unwrap_err().to_string();
-        assert_eq!(
-            err,
-            "Keyboard prompts are not available in the TUI yet; unanswered: Continue? [y/N]"
-        );
     }
 
     /// Registers a lender on its own thread that runs every job it is
@@ -9313,22 +9265,6 @@ mod tests {
             (
                 "src/utils/command.rs",
                 "bail!(\"Interactive prompts are not available in the TUI yet\")",
-            ),
-            (
-                "src/utils/input.rs",
-                "bail!(\"Keyboard prompts are not available in the TUI yet; unanswered: {question}\")",
-            ),
-            (
-                "src/config/install_remote.rs",
-                "return Ok(ObsoleteAction::Keep);",
-            ),
-            (
-                "src/config/install_remote.rs",
-                "conflict::rerun_hint() // TASK-388",
-            ),
-            (
-                "src/config/install_remote.rs",
-                "Ok((Vec::new(), missing.to_vec()))",
             ),
             ("src/tui/bottom_pane.rs", "\".uninstall\", \".update\"];"),
             (

@@ -8416,7 +8416,7 @@ mod tests {
             return;
         }
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents = paths::agents_data_dir();
         let shared = agents.join(".shared").join("debris.py");
@@ -22788,19 +22788,19 @@ mod tests {
     fn install_builtin_agents_force_overwrites_only_with_force() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         let file =
             first_file(&paths::agents_data_dir()).expect("bundled agents should be installed");
 
         write(&file, "SENTINEL").unwrap();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         assert_eq!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
             "non-force install must not overwrite an existing file"
         );
 
-        Agent::install_builtin_agents(InstallMode::Force).unwrap();
+        Agent::install_builtin_agents(InstallMode::Force, &ScriptedPrompter::refusing()).unwrap();
         assert_ne!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
@@ -22813,7 +22813,7 @@ mod tests {
     fn install_builtin_agents_removes_stale_definition_files() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install: coder used to ship
@@ -22834,7 +22834,7 @@ mod tests {
         create_dir_all(agents_dir.join("myagent")).unwrap();
         write(agents_dir.join("myagent").join("config.yaml"), "keep").unwrap();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(
             !agents_dir.join("coder").join("config.yaml").exists(),
@@ -22874,12 +22874,12 @@ mod tests {
     fn install_builtin_agents_removes_stale_graph_for_config_agent() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         write(agents_dir.join("architect").join("graph.yaml"), "stale").unwrap();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(
             !agents_dir.join("architect").join("graph.yaml").exists(),
@@ -22895,7 +22895,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install whose coder shipped a
@@ -22920,7 +22920,7 @@ mod tests {
         create_dir_all(&user_hooks).unwrap();
         write(user_hooks.join("mine.sh"), "keep").unwrap();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(
             !hooks_dir.join("old-hook.sh").exists(),
@@ -22990,7 +22990,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_task_queue_guidance() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         // 1. Architect instructions: the parallel-mode "Task-queue mirroring"
         //    section with all five HARD RULES. (The prose lives in
@@ -23060,7 +23060,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_review_incomplete_escalation() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         // Every anchor is a single-line prefix so re-wrapping cannot break
         // the pin; clauses that wrap differently per agent are split at the
@@ -23237,7 +23237,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_verification_commands_as_declared_variable() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         const VARIABLES_FORM: &str =
             "--variables {\"verification_commands\": \"[\\\"cargo test --all\\\"";
@@ -23431,7 +23431,7 @@ mod tests {
         }
 
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         for (name, expected) in [
             ("architect", 10),
@@ -23550,7 +23550,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let mut checked = Vec::new();
@@ -23708,7 +23708,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
         Functions::install_builtin_global_tools(false).unwrap();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let declared_names = |path: &Path| -> Vec<String> {
@@ -23854,7 +23854,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
         Functions::install_builtin_global_tools(false).unwrap();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let mut ctx = create_test_ctx();
@@ -24042,7 +24042,7 @@ mod tests {
             .collect();
 
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let mut checked = Vec::new();
         for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {

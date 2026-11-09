@@ -9,30 +9,46 @@ use crate::config::{
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
+use crate::prompt::{Prompter, select_closed};
 use crate::utils;
-use crate::utils::{IS_STDOUT_TERMINAL, ensure_prompts_available};
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{Confirm, Select};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::{fs, iter};
 
-#[cfg(test)]
-fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
-    install_remote_with_prefix(git_url, filter, force, CommandPrefix::default())
+/// How an install or update talks to its user: the prefix its hints are
+/// rendered with and the prompter its menus ask through.
+#[derive(Clone, Copy)]
+pub(crate) struct InstallIo<'a> {
+    pub(crate) prefix: CommandPrefix,
+    pub(crate) prompter: &'a dyn Prompter,
 }
 
-fn install_remote_with_prefix(
+#[cfg(test)]
+fn install_remote(
     git_url: &str,
     filter: Option<InstallFilter>,
     force: bool,
-    prefix: CommandPrefix,
+    prompter: &dyn Prompter,
+) -> Result<()> {
+    let io = InstallIo {
+        prefix: CommandPrefix::default(),
+        prompter,
+    };
+    install_remote_with_io(git_url, filter, force, io)
+}
+
+fn install_remote_with_io(
+    git_url: &str,
+    filter: Option<InstallFilter>,
+    force: bool,
+    io: InstallIo<'_>,
 ) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
     let temp = clone_to_temp(&url, reference.as_deref())?;
@@ -58,6 +74,7 @@ fn install_remote_with_prefix(
         layout.manifest.as_ref(),
         temp.head_sha(),
         false,
+        io.prompter,
     )?;
 
     let plan = plan_changes(&layout)?;
@@ -70,15 +87,23 @@ fn install_remote_with_prefix(
         } else {
             StickyMode::None
         };
-        apply_plan(&plan, sticky, &mut store, &bundle)?;
+        apply_plan(&plan, sticky, &mut store, &bundle, io.prompter)?;
     }
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
         let local = local_mcp.exists().then_some(local_mcp.as_path());
-        let report = merge_mcp_json(local, remote_mcp, local_mcp, force, &HashSet::new(), false)?;
+        let report = merge_mcp_json(
+            local,
+            remote_mcp,
+            local_mcp,
+            force,
+            &HashSet::new(),
+            false,
+            io.prompter,
+        )?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
-        handle_missing_secrets(&report.missing_secrets, prefix)?;
+        handle_missing_secrets(&report.missing_secrets, io)?;
     }
 
     Ok(())
@@ -233,7 +258,7 @@ pub fn install_or_update(
     git_host: Option<&str>,
     filter: Option<InstallFilter>,
     force: bool,
-    prefix: CommandPrefix,
+    io: InstallIo<'_>,
 ) -> Result<()> {
     if let Some(host) = git_host {
         if !is_repo_shorthand(value) {
@@ -245,7 +270,7 @@ pub fn install_or_update(
 
         let url = expand_repo_shorthand(value, Some(host))?;
         println!("Resolved '{value}' to '{url}'");
-        return install_remote_with_prefix(&url, filter, force, prefix);
+        return install_remote_with_io(&url, filter, force, io);
     }
 
     let store = BundleStore::load()?;
@@ -275,13 +300,13 @@ pub fn install_or_update(
             if filter.is_some() || force {
                 bail!("--filter/--install-force only apply to remote installs, not bundle updates");
             }
-            update_bundle_with_prefix(value, false, prefix)
+            update_bundle_with_io(value, false, io)
         }
-        InstallTarget::RemoteSource => install_remote_with_prefix(value, filter, force, prefix),
+        InstallTarget::RemoteSource => install_remote_with_io(value, filter, force, io),
         InstallTarget::Shorthand => {
             let url = expand_repo_shorthand(value, None)?;
             println!("Resolved '{value}' to '{url}'");
-            install_remote_with_prefix(&url, filter, force, prefix)
+            install_remote_with_io(&url, filter, force, io)
         }
         InstallTarget::Unknown => {
             let hint = "a remote source must be a git URL, an <owner>/<repo> shorthand \
@@ -300,8 +325,8 @@ pub fn install_or_update(
     }
 }
 
-pub fn install_or_update_from_repl_args(args: &str, prefix: CommandPrefix) -> Result<()> {
-    let command = prefix.render_hints(".install");
+pub fn install_or_update_from_repl_args(args: &str, io: InstallIo<'_>) -> Result<()> {
+    let command = io.prefix.render_hints(".install");
     let tokens = shell_words::split(args)
         .with_context(|| format!("failed to parse '{command}' args: {args}"))?;
 
@@ -318,17 +343,24 @@ pub fn install_or_update_from_repl_args(args: &str, prefix: CommandPrefix) -> Re
         parsed.git_host.as_deref(),
         parsed.filter,
         parsed.force,
-        prefix,
+        io,
     )
 }
 
 /// The whole remote is always processed, including categories a filtered
 /// install excluded, because filtered installs merge into a single record.
-pub fn update_bundle(spec: &str, assume_yes: bool) -> Result<()> {
-    update_bundle_with_prefix(spec, assume_yes, CommandPrefix::default())
+pub fn update_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -> Result<()> {
+    update_bundle_with_io(
+        spec,
+        assume_yes,
+        InstallIo {
+            prefix: CommandPrefix::default(),
+            prompter,
+        },
+    )
 }
 
-fn update_bundle_with_prefix(spec: &str, assume_yes: bool, prefix: CommandPrefix) -> Result<()> {
+fn update_bundle_with_io(spec: &str, assume_yes: bool, io: InstallIo<'_>) -> Result<()> {
     let (name, ref_override) = parse_url_with_ref(spec)?;
 
     let mut store = BundleStore::load()?;
@@ -374,6 +406,7 @@ fn update_bundle_with_prefix(spec: &str, assume_yes: bool, prefix: CommandPrefix
         layout.manifest.as_ref(),
         temp.head_sha(),
         true,
+        io.prompter,
     )?;
 
     let plan = plan_changes(&layout)?;
@@ -386,18 +419,26 @@ fn update_bundle_with_prefix(spec: &str, assume_yes: bool, prefix: CommandPrefix
         } else {
             StickyMode::None
         };
-        apply_plan(&plan, sticky, &mut store, &bundle)?;
+        apply_plan(&plan, sticky, &mut store, &bundle, io.prompter)?;
     }
 
-    handle_obsolete_files(&mut store, &bundle, &plan, assume_yes)?;
+    handle_obsolete_files(&mut store, &bundle, &plan, assume_yes, io.prompter)?;
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
         let local = local_mcp.exists().then_some(local_mcp.as_path());
         let auto_take = owned_unmodified_mcp_keys(&store, &bundle, local)?;
-        let report = merge_mcp_json(local, remote_mcp, local_mcp, false, &auto_take, assume_yes)?;
+        let report = merge_mcp_json(
+            local,
+            remote_mcp,
+            local_mcp,
+            false,
+            &auto_take,
+            assume_yes,
+            io.prompter,
+        )?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
-        handle_missing_secrets(&report.missing_secrets, prefix)?;
+        handle_missing_secrets(&report.missing_secrets, io)?;
     }
 
     let version = layout
@@ -492,6 +533,7 @@ fn handle_obsolete_files(
     bundle: &str,
     plan: &InstallPlan,
     assume_yes: bool,
+    prompter: &dyn Prompter,
 ) -> Result<()> {
     let planned: HashSet<String> = plan
         .files
@@ -529,7 +571,7 @@ fn handle_obsolete_files(
         let action = match (modified, agent_definition_conflict(&path, &planned)) {
             (false, _) => ObsoleteAction::Delete,
             (true, true) => ObsoleteAction::Backup,
-            (true, false) => resolve_obsolete(&path, &mut sticky)?,
+            (true, false) => resolve_obsolete(&path, &mut sticky, prompter)?,
         };
         apply_obsolete_action(store, bundle, &path, &full, &config_dir, action, modified)?;
     }
@@ -552,28 +594,28 @@ fn agent_definition_conflict(path: &str, planned: &HashSet<String>) -> bool {
     planned.contains(&format!("agents/{agent}/{counterpart}"))
 }
 
-fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<ObsoleteAction> {
+fn resolve_obsolete(
+    path: &str,
+    sticky: &mut Option<ObsoleteAction>,
+    prompter: &dyn Prompter,
+) -> Result<ObsoleteAction> {
     if let Some(action) = *sticky {
         return Ok(action);
     }
 
-    // Under the TUI stdout is a tty the menu cannot use; keeping the file
-    // matches the non-interactive answer rather than refusing after
-    // apply_plan has already written the update.
-    if !*IS_STDOUT_TERMINAL || crate::tui::active() {
-        return Ok(ObsoleteAction::Keep); // TASK-388
+    // Keeping is the non-interactive answer: apply_plan has already
+    // written the update, so refusing here would leave it half done.
+    if !conflict::menu_can_use_terminal() {
+        return Ok(ObsoleteAction::Keep);
     }
 
-    // The branch above already keeps under the UI; defence in depth.
-    ensure_prompts_available()?;
     let prompt = format!(
         "Obsolete file {path} is no longer shipped by the bundle and has local modifications"
     );
-    let choice = Select::new(&prompt, vec!["keep", "delete", "keep-all", "delete-all"])
-        .prompt()
+    let choice = select_closed(prompter, &prompt, keep_or_delete_options())
         .with_context(|| "failed to read obsolete-file choice")?;
 
-    match choice {
+    match choice.as_str() {
         "keep" => Ok(ObsoleteAction::Keep),
         "delete" => Ok(ObsoleteAction::Delete),
         "keep-all" => {
@@ -584,8 +626,14 @@ fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<O
             *sticky = Some(ObsoleteAction::Delete);
             Ok(ObsoleteAction::Delete)
         }
-        _ => unreachable!("inquire::Select returned an unexpected option"),
+        _ => bail!("'{choice}' is not one of the offered options"),
     }
+}
+
+fn keep_or_delete_options() -> Vec<String> {
+    ["keep", "delete", "keep-all", "delete-all"]
+        .map(str::to_string)
+        .to_vec()
 }
 
 fn apply_obsolete_action(
@@ -654,13 +702,13 @@ struct UninstallMcpSummary {
 }
 
 /// Kept and failed items stay in the record, so a re-run offers them again.
-pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
+pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -> Result<()> {
     let mut store = BundleStore::load()?;
     let name = match store.get(spec) {
         Some(_) => spec.to_string(),
         None => match store.find_by_source(spec) {
             Some((name, _)) => name.to_string(),
-            None => match select_uninstall_candidate(&store, spec)? {
+            None => match select_uninstall_candidate(&store, spec, prompter)? {
                 Some(name) => name,
                 None => {
                     let installed = store.bundle_names();
@@ -679,22 +727,20 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
     let record = store.get(&name).expect("resolved above").clone();
 
     if !assume_yes {
-        if !*IS_STDOUT_TERMINAL {
+        if !conflict::menu_can_use_terminal() {
             bail!(
                 "refusing to uninstall bundle '{name}' non-interactively; \
                  re-run with --yes to confirm"
             );
         }
-        ensure_prompts_available()?;
         println!(
             "Bundle '{name}' owns {} file(s) and {} mcp.json server(s).",
             record.files.len(),
             record.mcp_servers.len()
         );
-        let proceed = Confirm::new(&format!("Uninstall bundle '{name}'?"))
-            .with_default(false)
-            .prompt()
-            .with_context(|| "failed to read uninstall confirmation")?;
+        let proceed =
+            crate::prompt::confirm(prompter, format!("Uninstall bundle '{name}'?"), false)
+                .with_context(|| "failed to read uninstall confirmation")?;
         if !proceed {
             println!("Uninstall of '{name}' aborted; nothing was changed.");
             return Ok(());
@@ -707,6 +753,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         &record.files,
         &paths::config_dir(),
         assume_yes,
+        prompter,
     )?;
 
     if files.tools_seen {
@@ -722,6 +769,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         &record.mcp_servers,
         &paths::mcp_config_file(),
         assume_yes,
+        prompter,
     )?;
 
     let empty = store
@@ -770,7 +818,11 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
 
 /// Never auto-picks between multiple matches: ambiguity is resolved by an
 /// interactive prompt, and non-interactive runs bail even under --yes.
-fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<String>> {
+fn select_uninstall_candidate(
+    store: &BundleStore,
+    spec: &str,
+    prompter: &dyn Prompter,
+) -> Result<Option<String>> {
     if !is_repo_shorthand(spec) {
         return Ok(None);
     }
@@ -791,7 +843,7 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
                 .map(|(name, source)| format!("{name} ({source})"))
                 .collect();
 
-            if !*IS_STDOUT_TERMINAL {
+            if !conflict::menu_can_use_terminal() {
                 bail!(
                     "'{spec}' matches multiple installed bundles: {}; re-run with the \
                      exact bundle name or source URL",
@@ -799,18 +851,17 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
                 );
             }
 
-            ensure_prompts_available()?;
-            let picked = Select::new(
+            let picked = select_closed(
+                prompter,
                 &format!("Multiple bundles match '{spec}'; which one should be uninstalled?"),
                 described.clone(),
             )
-            .prompt()
             .with_context(|| "failed to read uninstall selection")?;
 
             let index = described
                 .iter()
                 .position(|option| option == &picked)
-                .expect("selection came from the presented options");
+                .with_context(|| format!("'{picked}' is not one of the offered options"))?;
 
             Ok(Some(candidates[index].0.clone()))
         }
@@ -854,6 +905,7 @@ fn uninstall_owned_files(
     files: &[FileRecord],
     config_dir: &Path,
     assume_yes: bool,
+    prompter: &dyn Prompter,
 ) -> Result<UninstallFileSummary> {
     let mut summary = UninstallFileSummary::default();
     let mut sticky: Option<ObsoleteAction> = None;
@@ -886,7 +938,7 @@ fn uninstall_owned_files(
         }
 
         let prompt = format!("File {} was modified locally after install", file.path);
-        let action = resolve_uninstall_action(&prompt, assume_yes, &mut sticky)?;
+        let action = resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter)?;
         apply_uninstall_file_action(
             store,
             bundle,
@@ -974,23 +1026,19 @@ fn resolve_uninstall_action(
     prompt: &str,
     assume_yes: bool,
     sticky: &mut Option<ObsoleteAction>,
+    prompter: &dyn Prompter,
 ) -> Result<ObsoleteAction> {
-    // Under the full-screen UI the menu cannot be shown; the file is kept
-    // like the non-interactive answer rather than refused mid-uninstall.
-    if assume_yes || !*IS_STDOUT_TERMINAL || crate::tui::active() {
-        return Ok(ObsoleteAction::Keep); // TASK-388
+    if assume_yes || !conflict::menu_can_use_terminal() {
+        return Ok(ObsoleteAction::Keep);
     }
 
     if let Some(action) = *sticky {
         return Ok(action);
     }
 
-    // The first branch already keeps under the UI; defence in depth.
-    ensure_prompts_available()?;
-    let choice = Select::new(prompt, vec!["keep", "delete", "keep-all", "delete-all"])
-        .prompt()
+    let choice = select_closed(prompter, prompt, keep_or_delete_options())
         .with_context(|| "failed to read uninstall choice")?;
-    match choice {
+    match choice.as_str() {
         "keep" => Ok(ObsoleteAction::Keep),
         "delete" => Ok(ObsoleteAction::Delete),
         "keep-all" => {
@@ -1001,7 +1049,7 @@ fn resolve_uninstall_action(
             *sticky = Some(ObsoleteAction::Delete);
             Ok(ObsoleteAction::Delete)
         }
-        _ => unreachable!("inquire::Select returned an unexpected option"),
+        _ => bail!("'{choice}' is not one of the offered options"),
     }
 }
 
@@ -1014,6 +1062,7 @@ fn uninstall_mcp_entries(
     servers: &[McpServerRecord],
     mcp_path: &Path,
     assume_yes: bool,
+    prompter: &dyn Prompter,
 ) -> Result<UninstallMcpSummary> {
     let mut summary = UninstallMcpSummary::default();
     if servers.is_empty() {
@@ -1078,7 +1127,7 @@ fn uninstall_mcp_entries(
                 "was modified locally after install"
             };
             let prompt = format!("MCP server '{key}' {reason}");
-            resolve_uninstall_action(&prompt, assume_yes, &mut sticky)?
+            resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter)?
         };
         match action {
             ObsoleteAction::Keep => {
@@ -1392,8 +1441,9 @@ fn register_bundle(
     manifest: Option<&BundleManifest>,
     commit: &str,
     preserve_versions: bool,
+    prompter: &dyn Prompter,
 ) -> Result<String> {
-    let resolved = store.resolve_bundle_name(url, manifest.map(|m| m.name.as_str()))?;
+    let resolved = store.resolve_bundle_name(url, manifest.map(|m| m.name.as_str()), prompter)?;
     let version = manifest
         .and_then(|m| m.version.clone())
         .unwrap_or_else(|| commit.chars().take(7).collect());
@@ -1934,6 +1984,7 @@ fn apply_plan(
     initial_mode: StickyMode,
     store: &mut BundleStore,
     bundle: &str,
+    prompter: &dyn Prompter,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport {
         new_count: 0,
@@ -1964,6 +2015,7 @@ fn apply_plan(
                 planned.top_category.label(),
                 &mut sticky,
                 NonInteractive::Bail,
+                prompter,
             )? {
                 ConflictAction::Keep => report.kept_count += 1,
                 ConflictAction::Replace => {
@@ -2088,6 +2140,7 @@ struct McpMergeReport {
     missing_secrets: Vec<String>,
 }
 
+#[derive(Debug)]
 enum McpConflictAction {
     KeepLocal,
     TakeRemote,
@@ -2101,6 +2154,7 @@ fn merge_mcp_json(
     force: bool,
     auto_take: &HashSet<String>,
     assume_yes: bool,
+    prompter: &dyn Prompter,
 ) -> Result<McpMergeReport> {
     let remote_content = fs::read_to_string(remote)
         .with_context(|| format!("failed to read remote mcp.json at {}", remote.display()))?;
@@ -2140,7 +2194,7 @@ fn merge_mcp_json(
             let action = if auto_take.contains(&name) {
                 McpConflictAction::TakeRemote
             } else {
-                resolve_mcp_conflict(&name, force, assume_yes)?
+                resolve_mcp_conflict(&name, force, assume_yes, prompter)?
             };
             match action {
                 McpConflictAction::KeepLocal => report.kept_local.push(name),
@@ -2208,27 +2262,28 @@ fn merge_mcp_json(
     Ok(report)
 }
 
-fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<McpConflictAction> {
+fn resolve_mcp_conflict(
+    name: &str,
+    force: bool,
+    assume_yes: bool,
+    prompter: &dyn Prompter,
+) -> Result<McpConflictAction> {
     if force {
         return Ok(McpConflictAction::TakeRemote);
     }
     if assume_yes {
         return Ok(McpConflictAction::KeepLocal);
     }
-    // The full-screen UI cannot show the menu either; the refusal names
-    // the same flags as the non-tty one and where else it can be answered.
-    if !*IS_STDOUT_TERMINAL || crate::tui::active() {
-        bail!(
-            "MCP server '{name}' already exists locally. Refusing to merge non-interactively. \
-             {}, with --install-force (installs), or with --yes (updates).",
-            conflict::rerun_hint() // TASK-388
-        );
+    if !conflict::menu_can_use_terminal() {
+        return Err(conflict::refuse_non_interactive(
+            format_args!("merge MCP server '{name}'"),
+            ", with --install-force (installs), or with --yes (updates).",
+        ));
     }
-    // The refusal above already covers the UI; defence in depth.
-    ensure_prompts_available()?;
     let rename_label = format!("rename remote as \"{name}-remote\"");
     let prompt = format!("Conflict on MCP server '{name}'");
-    let choice = Select::new(
+    let choice = select_closed(
+        prompter,
         &prompt,
         vec![
             "keep local".to_string(),
@@ -2237,7 +2292,6 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
             "abort merge".to_string(),
         ],
     )
-    .prompt()
     .with_context(|| "failed to read MCP conflict choice")?;
 
     if choice == "keep local" {
@@ -2249,7 +2303,7 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
     } else if choice == "abort merge" {
         bail!("Aborted MCP merge by user.")
     } else {
-        unreachable!("inquire::Select returned an unexpected option")
+        bail!("'{choice}' is not one of the offered options")
     }
 }
 
@@ -2313,55 +2367,58 @@ fn print_mcp_merge_report(report: &McpMergeReport) {
     }
 }
 
-fn handle_missing_secrets(missing: &[String], prefix: CommandPrefix) -> Result<()> {
+fn handle_missing_secrets(missing: &[String], io: InstallIo<'_>) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    let (added, deferred) = partition_missing_secrets(missing)?;
-    print_secret_summary(&added, &deferred, prefix);
+    let (added, deferred) = partition_missing_secrets(missing, io.prompter)?;
+    print_secret_summary(&added, &deferred, io.prefix);
     Ok(())
 }
 
-/// Offers each missing secret to the vault where a prompt can be read;
-/// without a tty, or under the TUI (whose stdout is a tty the prompt
-/// cannot use), every secret is deferred to the summary instead.
-fn partition_missing_secrets(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
-    if *IS_STDOUT_TERMINAL && !crate::tui::active() {
+/// Offers each missing secret to the vault where a question can be shown;
+/// otherwise every secret is deferred to the summary instead.
+fn partition_missing_secrets(
+    missing: &[String],
+    prompter: &dyn Prompter,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if conflict::menu_can_use_terminal() {
         println!(
             "\nThe merged mcp.json references {} secret(s) not yet in the vault.",
             missing.len()
         );
-        return prompt_for_each_secret(missing);
+        return prompt_for_each_secret(missing, prompter);
     }
-    Ok((Vec::new(), missing.to_vec())) // TASK-388
+    Ok((Vec::new(), missing.to_vec()))
 }
 
-fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
-    // `handle_missing_secrets` already defers everything under the UI;
-    // the check here is defence in depth for any other caller.
-    ensure_prompts_available()?;
+fn prompt_for_each_secret(
+    missing: &[String],
+    prompter: &dyn Prompter,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut vault = Vault::init_bare()?;
-    let prompter = crate::prompt::InquirePrompter::default();
     let mut password_file_ensured = false;
     let mut added = Vec::new();
     let mut deferred = Vec::new();
 
     for name in missing {
-        let proceed = Confirm::new(&format!("Add {{{{ {name} }}}} to vault now?"))
-            .with_default(false)
-            .prompt()
-            .with_context(|| format!("failed to read confirmation for secret '{name}'"))?;
+        let proceed = crate::prompt::confirm(
+            prompter,
+            format!("Add {{{{ {name} }}}} to vault now?"),
+            false,
+        )
+        .with_context(|| format!("failed to read confirmation for secret '{name}'"))?;
         if !proceed {
             deferred.push(name.clone());
             continue;
         }
         if !password_file_ensured {
-            create_vault_password_file(&mut vault, &prompter)
+            create_vault_password_file(&mut vault, prompter)
                 .context("Failed to initialize the vault password file")?;
             password_file_ensured = true;
         }
 
-        match vault.add_secret(name, &prompter) {
+        match vault.add_secret(name, prompter) {
             Ok(()) => added.push(name.clone()),
             Err(e) => {
                 eprintln!("Failed to add '{name}' to vault: {e:#}");
@@ -2403,11 +2460,21 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
     use crate::sandbox::SANDBOX_ENV_FLAG;
-    use crate::utils::get_env_name;
+    use crate::utils::{IS_STDOUT_TERMINAL, get_env_name};
     use serial_test::serial;
     use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn dot_io(prompter: &dyn Prompter) -> InstallIo<'_> {
+        InstallIo {
+            prefix: CommandPrefix::Dot,
+            prompter,
+        }
+    }
 
     #[test]
     fn safe_relative_path_accepts_plain_portable_components() {
@@ -3005,7 +3072,16 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        let report = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(report.added, vec!["alpha", "beta"]);
         assert!(report.kept_local.is_empty());
@@ -3035,6 +3111,7 @@ mod tests {
             true,
             &HashSet::new(),
             false,
+            &ScriptedPrompter::refusing(),
         )
         .unwrap();
 
@@ -3075,22 +3152,25 @@ mod tests {
             false,
             &HashSet::new(),
             false,
+            &ScriptedPrompter::refusing(),
         )
         .unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("Refusing to merge non-interactively. Re-run in a terminal"),
+            err.to_string().contains(
+                "Refusing to merge MCP server 'alpha' non-interactively. Re-run in a terminal"
+            ),
             "got: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Under the full-screen UI the same conflict is refused whatever
-    /// stdout is, and the way out it names is the plain REPL.
+    /// Under the full-screen UI the conflict is a closed select through
+    /// the prompter, whatever stdout is; "keep local" leaves the local
+    /// server in place.
     #[test]
     #[serial]
-    fn merge_conflict_under_the_tui_points_at_the_plain_repl() {
+    fn merge_conflict_under_the_tui_asks_through_the_prompter() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let dir = fresh_temp_dir("merge-tui-");
         let remote = dir.join("remote.json");
@@ -3100,25 +3180,34 @@ mod tests {
             r#"{"mcpServers": {"alpha": {"type": "stdio", "command": "LOCAL"}}}"#,
         );
         write_mcp(&remote, FIXTURE_REMOTE);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("keep local".into())]);
 
-        let err = merge_mcp_json(
+        let report = merge_mcp_json(
             Some(&target),
             &remote,
             &target,
             false,
             &HashSet::new(),
             false,
+            &prompter,
         )
-        .unwrap_err();
+        .unwrap();
 
-        let text = err.to_string();
-        assert!(
-            text.contains("Refusing to merge non-interactively. Re-run in the plain REPL"),
-            "got: {err}"
-        );
-        assert!(
-            text.contains("--install-force") && text.contains("--yes"),
-            "got: {err}"
+        assert_eq!(report.kept_local, vec!["alpha"]);
+        assert_eq!(report.added, vec!["beta"]);
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(requests[0].question, "Conflict on MCP server 'alpha'");
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            [
+                "keep local",
+                "take remote",
+                "rename remote as \"alpha-remote\"",
+                "abort merge",
+            ]
         );
         assert_eq!(
             fs::read_to_string(&target)
@@ -3132,14 +3221,69 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn resolve_mcp_conflict_with_no_human_is_refused() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        let err = resolve_mcp_conflict("alpha", false, false, &HeadlessPrompter).unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+    }
+
+    #[test]
+    #[serial]
+    fn merge_conflict_under_the_tui_rename_answer_keeps_both_servers() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = fresh_temp_dir("merge-tui-rename-");
+        let remote = dir.join("remote.json");
+        let target = dir.join("target.json");
+        write_mcp(
+            &target,
+            r#"{"mcpServers": {"alpha": {"type": "stdio", "command": "LOCAL"}}}"#,
+        );
+        write_mcp(&remote, FIXTURE_REMOTE);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected(
+            "rename remote as \"alpha-remote\"".into(),
+        )]);
+
+        let report = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            &prompter,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.renamed,
+            vec![("alpha".to_string(), "alpha-remote".to_string())]
+        );
+        let written = fs::read_to_string(&target).unwrap();
+        assert!(written.contains("LOCAL"), "got: {written}");
+        assert!(written.contains("alpha-remote"), "got: {written}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn merge_rejects_invalid_remote_server() {
         let dir = fresh_temp_dir("merge-invalid-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
         write_mcp(&remote, r#"{"mcpServers": {"broken": {"type": "stdio"}}}"#);
 
-        let err =
-            merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap_err();
+        let err = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("missing a \"command\" field"),
@@ -3166,7 +3310,16 @@ mod tests {
             r#"{"mcpServers": {"x": {"type":"stdio","command":"echo","env":{"K":"{{COYOTE_TEST_MERGE_SECRET}}"}}}}"#,
         );
 
-        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        let report = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(report.missing_secrets, vec!["COYOTE_TEST_MERGE_SECRET"]);
         let _ = fs::remove_dir_all(&dir);
@@ -3181,7 +3334,16 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let after_first = fs::read(&target).unwrap();
 
         let report = merge_mcp_json(
@@ -3191,6 +3353,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
+            &ScriptedPrompter::refusing(),
         )
         .unwrap();
         assert!(report.added.is_empty(), "got: {:?}", report.added);
@@ -3202,10 +3365,13 @@ mod tests {
 
     #[test]
     fn handle_missing_secrets_noop_on_empty_input() {
-        assert!(handle_missing_secrets(&[], CommandPrefix::Dot).is_ok());
+        assert!(handle_missing_secrets(&[], dot_io(&ScriptedPrompter::refusing())).is_ok());
     }
 
     #[test]
+    // The terminal check it relies on follows the UI flag, which the
+    // serial tests of this binary flip.
+    #[serial]
     fn handle_missing_secrets_defers_all_in_non_tty() {
         if *IS_STDOUT_TERMINAL {
             eprintln!(
@@ -3218,34 +3384,112 @@ mod tests {
             "COYOTE_TEST_STEP4_B".to_string(),
         ];
 
-        assert!(handle_missing_secrets(&missing, CommandPrefix::Dot).is_ok());
+        assert!(handle_missing_secrets(&missing, dot_io(&ScriptedPrompter::refusing())).is_ok());
     }
 
-    /// Under the TUI stdout is a tty, but the secret prompts cannot run
-    /// there: the merge still completes and every secret is deferred by
-    /// name instead of the install refusing after mcp.json was written.
+    /// Under the full-screen UI each missing secret is offered as a
+    /// Confirm through the prompter, defaulting to no; declining every
+    /// one defers them all and leaves the vault untouched.
     #[test]
     #[serial]
-    fn handle_missing_secrets_defers_all_under_the_tui() {
+    fn handle_missing_secrets_under_the_tui_asks_per_secret_through_the_prompter() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let guard = TestVaultConfigGuard::new("secrets-tui");
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
         let missing = vec!["TUI_SECRET_A".to_string(), "TUI_SECRET_B".to_string()];
+        let declined = || {
+            ScriptedPrompter::new(vec![
+                PromptAnswer::Confirmed(false),
+                PromptAnswer::Confirmed(false),
+            ])
+        };
+        let prompter = declined();
 
-        let (added, deferred) = partition_missing_secrets(&missing).unwrap();
+        let (added, deferred) = partition_missing_secrets(&missing, &prompter).unwrap();
 
         assert!(added.is_empty(), "got: {added:?}");
         assert_eq!(deferred, missing);
-        assert!(handle_missing_secrets(&missing, CommandPrefix::Dot).is_ok());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        for (request, name) in requests.iter().zip(&missing) {
+            assert_eq!(request.action, PromptAction::Confirm);
+            assert_eq!(
+                request.question,
+                format!("Add {{{{ {name} }}}} to vault now?")
+            );
+            assert_eq!(request.default, Some(serde_json::json!(false)));
+        }
+        assert!(
+            !password_file.exists(),
+            "declining every secret must not touch the vault"
+        );
+        assert!(handle_missing_secrets(&missing, dot_io(&declined())).is_ok());
     }
 
-    /// A modified obsolete file is kept under the TUI, the same answer the
-    /// non-interactive path gives, instead of refusing mid-update.
+    /// Under the full-screen UI a modified obsolete file is a closed
+    /// select through the prompter, and the sticky answers still stick.
     #[test]
     #[serial]
-    fn resolve_obsolete_keeps_under_the_tui() {
+    fn resolve_obsolete_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Selected("delete".into()),
+            PromptAnswer::Selected("keep-all".into()),
+        ]);
+
+        let action = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter).unwrap();
+        assert_eq!(action, ObsoleteAction::Delete);
+        assert_eq!(sticky, None);
+
+        let action = resolve_obsolete("macros/older.yaml", &mut sticky, &prompter).unwrap();
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(
+            requests[0].question,
+            "Obsolete file macros/old.yaml is no longer shipped by the bundle and has local modifications"
+        );
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            ["keep", "delete", "keep-all", "delete-all"]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_obsolete_with_no_human_is_refused() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let mut sticky = None;
 
-        let action = resolve_obsolete("macros/old.yaml", &mut sticky).unwrap();
+        let err = resolve_obsolete("macros/old.yaml", &mut sticky, &HeadlessPrompter).unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+        assert_eq!(sticky, None);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_obsolete_with_a_forced_non_tty_keeps_without_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install_non_interactive();
+        let mut sticky = None;
+
+        let action = resolve_obsolete(
+            "macros/old.yaml",
+            &mut sticky,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, None);
@@ -3649,7 +3893,13 @@ mod tests {
         );
         let sha = init_bundle_repo(&repo);
 
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("my-bundle").unwrap();
@@ -3703,7 +3953,13 @@ mod tests {
         let _guard = TestVaultConfigGuard::new("prov-hooks-dirs");
         let (src_root, repo) = hooks_fixture_bundle("prov-hooks-dirs-src-");
 
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let top = paths::hooks_dir().join("notify-me.sh");
         let role = paths::roles_dir().join("hooks/role-hook.sh");
@@ -3744,7 +4000,13 @@ mod tests {
         let _guard = TestVaultConfigGuard::new("prov-hooks-filter");
         let (src_root, repo) = hooks_fixture_bundle("prov-hooks-filter-src-");
 
-        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Hooks), false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            Some(InstallFilter::Hooks),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(paths::hooks_dir().join("notify-me.sh").is_file());
         assert!(!paths::roles_dir().join("hooks/role-hook.sh").exists());
@@ -3768,7 +4030,13 @@ mod tests {
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         let sha = init_bundle_repo(&repo);
 
-        install_remote(&format!("{}#{sha}", repo.display()), None, false).unwrap();
+        install_remote(
+            &format!("{}#{sha}", repo.display()),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("plain-bundle").unwrap();
@@ -3821,7 +4089,14 @@ mod tests {
             mcp_json: None,
         };
 
-        let err = apply_plan(&plan, StickyMode::None, &mut store, "aborty").unwrap_err();
+        let err = apply_plan(
+            &plan,
+            StickyMode::None,
+            &mut store,
+            "aborty",
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("Refusing to overwrite"),
@@ -3873,7 +4148,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::KeepAll, &mut store, "beta").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::KeepAll,
+            &mut store,
+            "beta",
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "alpha content");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -3906,8 +4188,20 @@ mod tests {
         );
         init_bundle_repo(&beta);
 
-        install_remote(alpha.to_str().unwrap(), None, false).unwrap();
-        install_remote(beta.to_str().unwrap(), None, true).unwrap();
+        install_remote(
+            alpha.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
+        install_remote(
+            beta.to_str().unwrap(),
+            None,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let alpha_record = store.get("alpha").unwrap();
@@ -3934,9 +4228,21 @@ mod tests {
         write_src(&repo, "skills/myskill/SKILL.md", "# skill\n");
         let first_sha = init_bundle_repo(&repo);
 
-        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Macros), false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            Some(InstallFilter::Macros),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let second_sha = commit_file(&repo, "extra.txt", "two");
-        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Skills), false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            Some(InstallFilter::Skills),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         assert_eq!(store.bundle_names(), vec!["combo"]);
@@ -3998,7 +4304,8 @@ mod tests {
         }
         let _guard = TestVaultConfigGuard::new("prov-builtin");
 
-        config::install_assets(config::AssetCategory::Macros).unwrap();
+        config::install_assets(config::AssetCategory::Macros, &ScriptedPrompter::refusing())
+            .unwrap();
 
         assert!(fs::read_dir(paths::macros_dir()).unwrap().next().is_some());
         assert!(!paths::installed_bundles_file().exists());
@@ -4023,7 +4330,7 @@ mod tests {
 
         // Capture outcomes before restoring the env var so a failed assertion
         // cannot leave the hooks-dir override pointing at a deleted temp dir.
-        let result = config::install_assets(AssetCategory::Hooks);
+        let result = config::install_assets(AssetCategory::Hooks, &ScriptedPrompter::refusing());
         let installed = (
             hooks_dir.join("notify.sh").is_file(),
             hooks_dir.join("log-events.sh").is_file(),
@@ -4059,10 +4366,16 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: refresh-bundle\n");
         write_src(&repo, "macros/hello.yaml", "v1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         commit_file(&repo, "macros/hello.yaml", "v2\n");
 
-        update_bundle("refresh-bundle", false).unwrap();
+        update_bundle("refresh-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let installed = paths::macros_dir().join("hello.yaml");
         assert_eq!(fs::read_to_string(&installed).unwrap(), "v2\n");
@@ -4091,18 +4404,24 @@ mod tests {
         write_src(&repo, "macros/edited.yaml", "v1\n");
         write_src(&repo, "macros/pristine.yaml", "v1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         fs::write(paths::macros_dir().join("edited.yaml"), "local\n").unwrap();
         commit_file(&repo, "macros/edited.yaml", "v2\n");
         commit_file(&repo, "macros/pristine.yaml", "v2\n");
 
-        let err = update_bundle("yes-bundle", false).unwrap_err();
+        let err = update_bundle("yes-bundle", false, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(
             format!("{err:#}").contains("Refusing to overwrite"),
             "err: {err:#}"
         );
 
-        update_bundle("yes-bundle", true).unwrap();
+        update_bundle("yes-bundle", true, &ScriptedPrompter::refusing()).unwrap();
 
         assert_eq!(
             fs::read_to_string(paths::macros_dir().join("edited.yaml")).unwrap(),
@@ -4135,14 +4454,20 @@ mod tests {
             r#"{"mcpServers": {"srv": {"type": "stdio", "command": "echo"}}}"#,
         );
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         commit_file(
             &repo,
             "functions/mcp.json",
             r#"{"mcpServers": {"srv": {"type": "stdio", "command": "printf"}}}"#,
         );
 
-        update_bundle("mcp-auto-bundle", false).unwrap();
+        update_bundle("mcp-auto-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let merged = fs::read_to_string(paths::mcp_config_file()).unwrap();
         assert!(merged.contains("printf"), "merged mcp.json: {merged}");
@@ -4185,7 +4510,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::KeepAll, &mut store, "omc").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::KeepAll,
+            &mut store,
+            "omc",
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "local edit");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4232,7 +4564,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::ReplaceAll, &mut store, "omc").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::ReplaceAll,
+            &mut store,
+            "omc",
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "upstream content");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4258,12 +4597,19 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: unowned-bundle\n");
         write_src(&repo, "macros/a.yaml", "a\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         commit_file(&repo, "macros/user.yaml", "upstream\n");
         fs::create_dir_all(paths::macros_dir()).unwrap();
         fs::write(paths::macros_dir().join("user.yaml"), "local\n").unwrap();
 
-        let err = update_bundle("unowned-bundle", false).unwrap_err();
+        let err =
+            update_bundle("unowned-bundle", false, &ScriptedPrompter::refusing()).unwrap_err();
 
         assert!(
             err.to_string().contains("Refusing to overwrite"),
@@ -4312,7 +4658,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::ReplaceAll, &mut store, "beta").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::ReplaceAll,
+            &mut store,
+            "beta",
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "beta content");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4333,11 +4686,17 @@ mod tests {
         write_src(&repo, "macros/keep.yaml", "k\n");
         write_src(&repo, "macros/gone.yaml", "g\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
         commit_file(&repo, "macros/keep.yaml", "k2\n");
 
-        update_bundle("obs-del", false).unwrap();
+        update_bundle("obs-del", false, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(!paths::macros_dir().join("gone.yaml").exists());
         let store = BundleStore::load().unwrap();
@@ -4363,12 +4722,18 @@ mod tests {
         write_src(&repo, "macros/keep.yaml", "k\n");
         write_src(&repo, "macros/gone.yaml", "g\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         fs::write(paths::macros_dir().join("gone.yaml"), "g-local\n").unwrap();
         fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
         commit_file(&repo, "macros/keep.yaml", "k2\n");
 
-        update_bundle("obs-keep", false).unwrap();
+        update_bundle("obs-keep", false, &ScriptedPrompter::refusing()).unwrap();
 
         assert_eq!(
             fs::read_to_string(paths::macros_dir().join("gone.yaml")).unwrap(),
@@ -4442,7 +4807,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(store.get("omc").unwrap().files.is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -4473,7 +4845,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(store.get("omc").unwrap().files.len(), 2);
         let _ = fs::remove_dir_all(&dir);
@@ -4506,7 +4885,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(!dst.exists());
         assert!(store.get("omc").unwrap().files.is_empty());
@@ -4546,7 +4932,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "local edits");
         assert_eq!(store.get("omc").unwrap().files.len(), 1);
@@ -4585,7 +4978,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(!dst.exists());
         assert_eq!(
@@ -4628,7 +5028,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(!dst.exists());
         assert!(!dir.join("agents/foo/config.yaml.bak").exists());
@@ -4680,7 +5087,13 @@ mod tests {
         );
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let installed_at = BundleStore::load()
             .unwrap()
             .get("meta-bundle")
@@ -4696,7 +5109,7 @@ mod tests {
              homepage: https://example.com/new\n",
         );
 
-        update_bundle("meta-bundle", false).unwrap();
+        update_bundle("meta-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("meta-bundle").unwrap();
@@ -4714,7 +5127,7 @@ mod tests {
     fn update_unknown_bundle_lists_installed_names() {
         let _guard = TestVaultConfigGuard::new("upd-unknown-name");
 
-        let err = update_bundle("nope", false).unwrap_err();
+        let err = update_bundle("nope", false, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let src_root = fresh_temp_dir("upd-unknown-src-");
@@ -4722,9 +5135,15 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: known-bundle\n");
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
-        let err = update_bundle("nope", false).unwrap_err();
+        let err = update_bundle("nope", false, &ScriptedPrompter::refusing()).unwrap_err();
 
         assert!(
             err.to_string().contains("installed bundles: known-bundle"),
@@ -4742,11 +5161,17 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: pin-bundle\n");
         write_src(&repo, "macros/one.yaml", "1\n");
         let pinned = init_bundle_repo(&repo);
-        install_remote(&format!("{}#{pinned}", repo.display()), None, false).unwrap();
+        install_remote(
+            &format!("{}#{pinned}", repo.display()),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let newer = commit_file(&repo, "macros/two.yaml", "2\n");
         assert_ne!(pinned, newer);
 
-        update_bundle("pin-bundle", false).unwrap();
+        update_bundle("pin-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("pin-bundle").unwrap();
@@ -4765,10 +5190,21 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: move-bundle\n");
         write_src(&repo, "macros/one.yaml", "1\n");
         let pinned = init_bundle_repo(&repo);
-        install_remote(&format!("{}#{pinned}", repo.display()), None, false).unwrap();
+        install_remote(
+            &format!("{}#{pinned}", repo.display()),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let newer = commit_file(&repo, "macros/two.yaml", "2\n");
 
-        update_bundle(&format!("move-bundle#{newer}"), false).unwrap();
+        update_bundle(
+            &format!("move-bundle#{newer}"),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("move-bundle").unwrap();
@@ -4846,7 +5282,14 @@ mod tests {
     fn install_or_update_redirects_categories_to_install_builtins() {
         let _guard = TestVaultConfigGuard::new("iou-category");
 
-        let err = install_or_update("agents", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "agents",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -4859,8 +5302,14 @@ mod tests {
     fn install_or_update_unknown_name_lists_installed_bundles() {
         let _guard = TestVaultConfigGuard::new("iou-unknown");
 
-        let err =
-            install_or_update("not-a-bundle", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "not-a-bundle",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let src_root = fresh_temp_dir("iou-unknown-src-");
@@ -4868,10 +5317,22 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: known-bundle\n");
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
-        let err =
-            install_or_update("not-a-bundle", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "not-a-bundle",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("no bundle named 'not-a-bundle'"),
@@ -4904,7 +5365,14 @@ mod tests {
             )
             .unwrap();
 
-        let err = install_or_update("agents", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "agents",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -4925,14 +5393,20 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: flag-bundle\n");
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let err = install_or_update(
             "flag-bundle",
             None,
             Some(InstallFilter::Macros),
             false,
-            CommandPrefix::Dot,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
         assert!(
@@ -4940,8 +5414,14 @@ mod tests {
             "got: {err}"
         );
 
-        let err =
-            install_or_update("flag-bundle", None, None, true, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "flag-bundle",
+            None,
+            None,
+            true,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("only apply to remote installs"),
             "got: {err}"
@@ -5008,7 +5488,7 @@ mod tests {
             Some("git.x.com"),
             None,
             false,
-            CommandPrefix::Dot,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
         assert!(
@@ -5021,7 +5501,7 @@ mod tests {
             Some("git.x.com"),
             None,
             false,
-            CommandPrefix::Dot,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
         assert!(
@@ -5080,9 +5560,15 @@ mod tests {
 
     #[test]
     fn repl_install_usage_follows_command_prefix() {
-        let err = install_or_update_from_repl_args("", CommandPrefix::Slash)
-            .unwrap_err()
-            .to_string();
+        let err = install_or_update_from_repl_args(
+            "",
+            InstallIo {
+                prefix: CommandPrefix::Slash,
+                prompter: &ScriptedPrompter::refusing(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("Usage: /install"), "got: {err}");
     }
 
@@ -5107,7 +5593,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        uninstall_bundle("someuser/omc", true).unwrap();
+        uninstall_bundle("someuser/omc", true, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         assert!(store.get("omc").is_none());
@@ -5135,7 +5621,8 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let err = uninstall_bundle("someuser/omc", true).unwrap_err();
+        let err =
+            uninstall_bundle("someuser/omc", true, &ScriptedPrompter::refusing()).unwrap_err();
 
         assert!(
             err.to_string()
@@ -5164,7 +5651,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        uninstall_bundle("someuser/omc", true).unwrap();
+        uninstall_bundle("someuser/omc", true, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         assert!(store.get("someuser/omc").is_none());
@@ -5204,7 +5691,7 @@ mod tests {
             .record_file("gone", owned_file_record("macros/hello.yaml", "hi\n"))
             .unwrap();
 
-        uninstall_bundle("gone", true).unwrap();
+        uninstall_bundle("gone", true, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(!dst.exists());
         assert!(
@@ -5232,7 +5719,7 @@ mod tests {
             )
             .unwrap();
 
-        uninstall_bundle("mods", true).unwrap();
+        uninstall_bundle("mods", true, &ScriptedPrompter::refusing()).unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "user edit\n");
         let store = BundleStore::load().unwrap();
@@ -5285,7 +5772,15 @@ mod tests {
             .unwrap();
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &dir,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(
             summary,
@@ -5312,7 +5807,15 @@ mod tests {
             .unwrap();
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &dir,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.deleted, 1);
         assert!(!dir.join("macros/owned.yaml").exists());
@@ -5362,7 +5865,15 @@ mod tests {
         }
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &dir,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         drop(restore);
 
         assert_eq!(summary.failed, 1);
@@ -5403,7 +5914,15 @@ mod tests {
             .unwrap();
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &config_dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &config_dir,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.failed, 2);
         assert_eq!(summary.deleted, 0);
@@ -5433,7 +5952,15 @@ mod tests {
         );
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.kept, vec!["srv"]);
         assert!(summary.removed.is_empty());
@@ -5474,7 +6001,15 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.removed, vec!["srv"]);
         assert!(summary.kept.is_empty());
@@ -5516,7 +6051,15 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.removed, vec!["srv"]);
         let raw = fs::read_to_string(&mcp).unwrap();
@@ -5562,7 +6105,15 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.removed, vec!["srv"]);
         assert_eq!(summary.secrets, vec!["OMC_ORG", "OMC_TOKEN"]);
@@ -5593,7 +6144,15 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.kept, vec!["srv"]);
         assert!(summary.removed.is_empty());
@@ -5624,7 +6183,15 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(summary.kept, vec!["srv"]);
         let written: McpServersConfig =
@@ -5639,20 +6206,25 @@ mod tests {
     fn uninstall_unknown_name_lists_installed_and_url_spelling_resolves() {
         let _guard = TestVaultConfigGuard::new("uninst-unknown");
 
-        let err = uninstall_bundle("nope", true).unwrap_err();
+        let err = uninstall_bundle("nope", true, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let mut store = BundleStore::load().unwrap();
         store
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
-        let err = uninstall_bundle("nope", true).unwrap_err();
+        let err = uninstall_bundle("nope", true, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(
             err.to_string().contains("installed bundles: omc"),
             "got: {err}"
         );
 
-        uninstall_bundle("git@github.com:x/omc.git", true).unwrap();
+        uninstall_bundle(
+            "git@github.com:x/omc.git",
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(BundleStore::load().unwrap().get("omc").is_none());
     }
@@ -5672,10 +6244,190 @@ mod tests {
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
 
-        let err = uninstall_bundle("omc", false).unwrap_err();
+        let err = uninstall_bundle("omc", false, &ScriptedPrompter::refusing()).unwrap_err();
 
         assert!(err.to_string().contains("--yes"), "got: {err}");
         assert!(BundleStore::load().unwrap().get("omc").is_some());
+    }
+
+    /// Under the full-screen UI the uninstall confirmation is a Confirm
+    /// through the prompter, defaulting to no.
+    #[test]
+    #[serial]
+    fn uninstall_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _guard = TestVaultConfigGuard::new("uninst-tui");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        drop(store);
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        uninstall_bundle("omc", false, &prompter).unwrap();
+        assert!(BundleStore::load().unwrap().get("omc").is_some());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Uninstall bundle 'omc'?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+        uninstall_bundle("omc", false, &prompter).unwrap();
+        assert!(BundleStore::load().unwrap().get("omc").is_none());
+    }
+
+    /// Under the full-screen UI an ambiguous shorthand is a closed select
+    /// over the described candidates, through the prompter.
+    #[test]
+    #[serial]
+    fn uninstall_candidate_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _guard = TestVaultConfigGuard::new("uninst-candidate-tui");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/someuser/omc"))
+            .unwrap();
+        store
+            .upsert_bundle(
+                "omc-fork",
+                test_metadata("https://git.somedomain.com/someuser/omc"),
+            )
+            .unwrap();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected(
+            "omc-fork (https://git.somedomain.com/someuser/omc)".into(),
+        )]);
+
+        let picked = select_uninstall_candidate(&store, "someuser/omc", &prompter).unwrap();
+
+        assert_eq!(picked.as_deref(), Some("omc-fork"));
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(
+            requests[0].question,
+            "Multiple bundles match 'someuser/omc'; which one should be uninstalled?"
+        );
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            [
+                "omc (https://github.com/someuser/omc)",
+                "omc-fork (https://git.somedomain.com/someuser/omc)",
+            ]
+        );
+
+        let err =
+            select_uninstall_candidate(&store, "someuser/omc", &HeadlessPrompter).unwrap_err();
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("other".into())]);
+        let err = select_uninstall_candidate(&store, "someuser/omc", &prompter).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'other' is not one of the offered options"),
+            "got: {err}"
+        );
+    }
+
+    /// Under the full-screen UI a locally modified file is a closed select
+    /// through the prompter; --yes still keeps it without asking.
+    #[test]
+    #[serial]
+    fn resolve_uninstall_action_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Selected("delete".into()),
+            PromptAnswer::Selected("delete-all".into()),
+        ]);
+
+        let action = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+        )
+        .unwrap();
+        assert_eq!(action, ObsoleteAction::Delete);
+        assert_eq!(sticky, None);
+
+        let action = resolve_uninstall_action(
+            "File macros/b.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+        )
+        .unwrap();
+        assert_eq!(action, ObsoleteAction::Delete);
+        assert_eq!(sticky, Some(ObsoleteAction::Delete));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(
+            requests[0].question,
+            "File macros/a.yaml was modified locally after install"
+        );
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            ["keep", "delete", "keep-all", "delete-all"]
+        );
+
+        let action = resolve_uninstall_action(
+            "File macros/c.yaml was modified locally after install",
+            true,
+            &mut None,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
+        assert_eq!(action, ObsoleteAction::Keep);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_uninstall_action_with_no_human_is_refused() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+
+        let err = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &HeadlessPrompter,
+        )
+        .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+        assert_eq!(sticky, None);
+    }
+
+    #[test]
+    #[serial]
+    fn select_uninstall_candidate_with_a_forced_non_tty_bails_without_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _guard = TestVaultConfigGuard::new("uninst-candidate-non-tty");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/someuser/omc"))
+            .unwrap();
+        store
+            .upsert_bundle(
+                "omc-fork",
+                test_metadata("https://git.somedomain.com/someuser/omc"),
+            )
+            .unwrap();
+
+        let err = select_uninstall_candidate(&store, "someuser/omc", &ScriptedPrompter::refusing())
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("matches multiple installed bundles"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -5691,7 +6443,16 @@ mod tests {
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
 
-        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        let report = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         record_mcp_merge(&mut store, "omc", &report).unwrap();
 
         let written: McpServersConfig =
