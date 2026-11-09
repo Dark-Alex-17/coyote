@@ -92,7 +92,7 @@ pub struct Cli {
             "mcp_get", "sync_models", "list_models", "list_roles", "list_agents", "list_rags",
             "list_macros", "list_skills", "build_tools", "list_sessions", "init_memory",
             "init_instructions", "info", "authenticate", "auth_mcp", "add_secret", "get_secret",
-            "update_secret", "delete_secret", "list_secrets",
+            "update_secret", "delete_secret", "list_secrets", "rebuild_rag",
         ]
     )]
     pub json: bool,
@@ -809,6 +809,7 @@ mod tests {
             &["--tail-logs"],
             &["--list-secrets"],
             &["--auth-mcp", "x"],
+            &["--rebuild-rag"],
         ];
         for rival in rivals {
             let mut args = vec!["coyote", "--json"];

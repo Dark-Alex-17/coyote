@@ -254,12 +254,7 @@ const KEYS: [&str; 9] = [
     "total_cost_usd",
 ];
 
-#[test]
-fn a_non_streamed_reply_is_the_only_stdout_and_skips_markdown() {
-    let output = json_run("plain", Behaviour::Answer, false, &["--json", "hi"]);
-
-    assert!(output.status.success(), "{}", combined(&output));
-    let report = the_only_object(&output);
+fn assert_keys_in_order(report: &Value) {
     let keys: Vec<&str> = report
         .as_object()
         .unwrap()
@@ -267,6 +262,15 @@ fn a_non_streamed_reply_is_the_only_stdout_and_skips_markdown() {
         .map(String::as_str)
         .collect();
     assert_eq!(keys, KEYS, "{report}");
+}
+
+#[test]
+fn a_non_streamed_reply_is_the_only_stdout_and_skips_markdown() {
+    let output = json_run("plain", Behaviour::Answer, false, &["--json", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_keys_in_order(&report);
     assert_eq!(report["result"], json!(REPLY), "{report}");
     assert_eq!(report["is_error"], json!(false), "{report}");
     assert_eq!(report["error"], Value::Null, "{report}");
@@ -324,7 +328,11 @@ fn a_setup_error_before_the_run_stays_plain() {
 
     assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
     assert!(output.stdout.is_empty(), "{}", combined(&output));
-    assert!(!output.stderr.is_empty(), "{}", combined(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no-such-agent"),
+        "{}",
+        combined(&output)
+    );
 }
 
 #[test]
@@ -333,6 +341,7 @@ fn a_failed_model_call_prints_the_error_wrapper_and_exits_1() {
 
     assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
     let report = the_only_object(&output);
+    assert_keys_in_order(&report);
     assert_eq!(report["is_error"], json!(true), "{report}");
     assert_eq!(report["result"], Value::Null, "{report}");
     let error = report["error"].as_str().unwrap_or_default();
@@ -341,7 +350,34 @@ fn a_failed_model_call_prints_the_error_wrapper_and_exits_1() {
     assert!(!output.stderr.is_empty(), "{}", combined(&output));
 }
 
-// ---- usage-probe additions (spec-first, TASK-431 D12 / R1-10) ----
+#[test]
+fn a_graph_agent_run_renders_no_reply_on_stdout() {
+    let dir = TempDir::new("graph");
+    write_config(&dir.0, serve(Behaviour::Answer), false);
+    let agent_dir = dir.0.join("agents").join("ask-graph");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: ask-graph\n\
+         version: \"1.0\"\n\
+         description: Asks the model once.\n\
+         initial_state: { reply: \"\" }\n\
+         start: ask\n\
+         nodes:\n\
+         \x20 ask: { type: llm, prompt: \"{{initial_prompt}}\", state_updates: { reply: \"{{output}}\" }, next: done }\n\
+         \x20 done: { type: end, output: \"{{reply}}\" }\n",
+    )
+    .unwrap();
+
+    let output = run(&dir.0, &["--json", "--agent", "ask-graph", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("from the stub"), "{}", combined(&output));
+    assert!(output.stdout.is_empty(), "{}", combined(&output)); // TASK-433: graph runs print the --json wrapper here
+}
+
+// ---- usage block, stdin and -f prompts, failed turns, rejected flags ----
 
 const USAGE_KEYS: [&str; 4] = [
     "input_tokens",
@@ -378,7 +414,7 @@ fn reported_token_counts_land_in_usage_and_unreported_ones_are_null() {
         Value::Null,
         "{report}"
     );
-    // The stub model has no pricing, so the cost cannot be computed (R1-10).
+    // The stub model has no pricing, so the cost cannot be computed.
     assert_eq!(report["total_cost_usd"], Value::Null, "{report}");
 }
 
@@ -430,13 +466,7 @@ fn a_failed_call_counts_as_a_turn_and_adds_no_usage() {
 
     assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
     let report = the_only_object(&output);
-    let keys: Vec<&str> = report
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(keys, KEYS, "{report}");
+    assert_keys_in_order(&report);
     assert!(report["num_turns"].as_u64().unwrap_or(0) >= 1, "{report}");
     assert_eq!(usage_keys(&report), USAGE_KEYS, "{report}");
     for key in USAGE_KEYS {
@@ -471,6 +501,7 @@ fn stdout_printing_flags_are_rejected_alongside_json_before_anything_runs() {
         &["--build-tools"],
         &["--completions", "bash"],
         &["--tail-logs"],
+        &["--rebuild-rag"],
     ];
     for flag in flags {
         let mut args = vec!["--json"];

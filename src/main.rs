@@ -46,7 +46,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
 use inquire::{Select, Text, set_global_render_config};
-use log::{LevelFilter, warn};
+use log::{LevelFilter, error, warn};
 use log4rs::append::console::{ConsoleAppender, Target};
 use log4rs::append::rolling_file::RollingFileAppender;
 use log4rs::append::rolling_file::policy::compound::CompoundPolicy;
@@ -713,7 +713,10 @@ async fn run(
                         elapsed,
                     ),
                 };
-                println!("{}", serde_json::to_string(&report)?);
+                match serde_json::to_string(&report) {
+                    Ok(line) => println!("{line}"),
+                    Err(err) => error!("Failed to serialize the --json report: {err}"),
+                }
             }
             result.map(|_| ())
         }
