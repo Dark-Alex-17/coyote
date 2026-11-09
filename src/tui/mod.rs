@@ -8792,8 +8792,6 @@ mod tests {
         file: String,
         function: String,
         gated: bool,
-        /// The body calls `ensure_prompts_available()` before its prompt.
-        prompt_gated: bool,
     }
 
     /// The name on a `fn` line, if the line declares one.
@@ -8908,18 +8906,8 @@ mod tests {
                 {
                     continue;
                 }
-                // The prompt gate counts only ahead of the first prompt
-                // builder in the body: a check after the question has
-                // been asked guards nothing.
-                let gate_at = body.find("ensure_prompts_available()");
-                let first_builder = NEEDLES[7..]
-                    .iter()
-                    .filter_map(|needle| body.find(needle))
-                    .min();
                 readers.push(KeyboardReader {
                     gated: body.contains("crate::tui::active()"),
-                    prompt_gated: gate_at
-                        .is_some_and(|gate| first_builder.is_none_or(|builder| gate < builder)),
                     file,
                     function,
                 });
@@ -8930,14 +8918,9 @@ mod tests {
 
     /// Every direct keyboard reader outside this module either checks the
     /// TUI flag or is listed here with the reason it stays REPL-only, so
-    /// a new reader cannot appear without a decision about the TUI. A
-    /// `PROMPT_GATED` row is only honoured when the fn body really calls
-    /// `ensure_prompts_available()`, and a body that does cannot hide
-    /// under another reason.
+    /// a new reader cannot appear without a decision about the TUI.
     #[test]
     fn every_direct_keyboard_reader_is_gated_or_accounted_for() {
-        const PROMPT_GATED: &str = "reachable from a REPL command; refuses through \
-            ensure_prompts_available, routing through ctx.prompter is owned debt";
         const BEFORE_UI: &str = "first-run config wizard; runs before any UI starts";
         const CLI_ONLY: &str = "a CLI flow (-e, --mcp); the process never reaches a UI";
         const REPL_PROMPTER: &str =
@@ -9001,9 +8984,7 @@ mod tests {
                 "edit_rag_docs",
                 VIA_EDIT_GATE,
             ),
-            ("src/config/update.rs", "run_self_update", PROMPT_GATED),
             ("src/main.rs", "shell_execute", CLI_ONLY),
-            ("src/main.rs", "resolve_oauth_client", PROMPT_GATED),
             ("src/mcp/manage.rs", "handle_remove", CLI_ONLY),
             ("src/mcp/manage.rs", "handle_add", CLI_ONLY),
             ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
@@ -9060,26 +9041,6 @@ mod tests {
             stale.is_empty(),
             "allowlist entries with no matching ungated reader:\n{}",
             stale.join("\n")
-        );
-        let mislabelled: Vec<String> = allowlist
-            .iter()
-            .filter_map(|(file, function, reason)| {
-                let reader = readers
-                    .iter()
-                    .find(|r| r.file == *file && r.function == *function)?;
-                (reader.prompt_gated != (*reason == PROMPT_GATED)).then(|| {
-                    if reader.prompt_gated {
-                        format!("{file}:{function} calls ensure_prompts_available but is listed as: {reason}")
-                    } else {
-                        format!("{file}:{function} is listed as prompt-gated but does not call ensure_prompts_available ahead of its first prompt")
-                    }
-                })
-            })
-            .collect();
-        assert!(
-            mislabelled.is_empty(),
-            "allowlist reasons that disagree with the fn body:\n{}",
-            mislabelled.join("\n")
         );
         assert!(
             readers
@@ -9261,17 +9222,10 @@ mod tests {
         ];
         // Each entry is a refusal or a parked test whose line carries the
         // id of the work that removes it.
-        let allowlisted: &[(&str, &str)] = &[
-            (
-                "src/utils/command.rs",
-                "bail!(\"Interactive prompts are not available in the TUI yet\")",
-            ),
-            ("src/tui/bottom_pane.rs", "\".uninstall\", \".update\"];"),
-            (
-                "tests/tui_binary.rs",
-                "the transcript is not yet printed on the normal screen when the UI leaves",
-            ),
-        ];
+        let allowlisted: &[(&str, &str)] = &[(
+            "tests/tui_binary.rs",
+            "the transcript is not yet printed on the normal screen when the UI leaves",
+        )];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
         for dir in ["src", "tests"] {

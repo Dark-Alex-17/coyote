@@ -40,7 +40,7 @@ use crate::config::{
 use crate::config::{memory, memory_migrate, paths};
 use crate::graph::llm::CompletionFuture;
 use crate::mcp::McpServersConfig;
-use crate::prompt::InquirePrompter;
+use crate::prompt::{InquirePrompter, Prompter};
 use crate::render::{prompt_theme, render_error};
 use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket};
 use crate::turn::{SilentSink, TurnDriver, TurnMode};
@@ -50,7 +50,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
-use inquire::{Select, Text, set_global_render_config};
+use inquire::{Text, set_global_render_config};
 use log::LevelFilter;
 use log4rs::append::console::{ConsoleAppender, Target};
 use log4rs::append::rolling_file::RollingFileAppender;
@@ -183,8 +183,11 @@ async fn async_main() -> Result<()> {
     if let Some(version) = &cli.update {
         let version = version.clone();
         let force = cli.force;
-        return tokio::task::spawn_blocking(move || config::run_self_update(version, force))
-            .await?;
+        let prompter = InquirePrompter::default();
+        return tokio::task::spawn_blocking(move || {
+            config::run_self_update(version, force, &prompter)
+        })
+        .await?;
     }
 
     if let Some(name) = &cli.sandbox {
@@ -245,9 +248,9 @@ async fn async_main() -> Result<()> {
     if let Some(client_arg) = &cli.authenticate {
         let cfg = Config::load_with_interpolation(true, false).await?;
         let app_config = AppConfig::from_config(cfg)?;
-        let (client_name, provider) =
-            resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
         let prompter = InquirePrompter::default();
+        let (client_name, provider) =
+            resolve_oauth_client(client_arg.as_deref(), &app_config.clients, &prompter)?;
         oauth::run_oauth_flow(&*provider, &client_name, &prompter).await?;
         return Ok(());
     }
@@ -987,6 +990,7 @@ fn init_console_logger(
 fn resolve_oauth_client(
     explicit: Option<&str>,
     clients: &[ClientConfig],
+    prompter: &dyn Prompter,
 ) -> Result<(String, Box<dyn OAuthProvider>)> {
     let find_by_name = |name: &str| -> Option<&ClientConfig> {
         clients.iter().find(|cc| {
@@ -1004,9 +1008,11 @@ fn resolve_oauth_client(
             0 => bail!("No OAuth-capable clients configured."),
             1 => find_by_name(&candidates[0]).unwrap(),
             _ => {
-                ensure_prompts_available()?;
-                let choice =
-                    Select::new("Select a client to authenticate:", candidates.clone()).prompt()?;
+                let choice = crate::prompt::select_closed(
+                    prompter,
+                    "Select a client to authenticate:",
+                    candidates.clone(),
+                )?;
                 find_by_name(&choice)
                     .ok_or_else(|| anyhow!("Selected client '{choice}' not found"))?
             }
@@ -1022,4 +1028,55 @@ fn resolve_oauth_client(
         })?;
 
     Ok((name, provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
+
+    fn oauth_client(name: &str) -> ClientConfig {
+        serde_yaml::from_str(&format!("type: claude\nname: {name}\nauth: oauth\n")).unwrap()
+    }
+
+    /// With more than one OAuth-capable client and none named, the pick is
+    /// a closed Select through the prompter.
+    #[test]
+    fn resolve_oauth_client_asks_which_client_through_the_prompter() {
+        let clients = [oauth_client("work"), oauth_client("home")];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("home".into())]);
+
+        let (name, _) = resolve_oauth_client(None, &clients, &prompter).unwrap();
+
+        assert_eq!(name, "home");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(requests[0].question, "Select a client to authenticate:");
+        assert!(requests[0].closed);
+        assert_eq!(requests[0].options, ["work", "home"]);
+    }
+
+    #[test]
+    fn resolve_oauth_client_with_no_human_is_refused() {
+        let clients = [oauth_client("work"), oauth_client("home")];
+
+        let err = resolve_oauth_client(None, &clients, &HeadlessPrompter)
+            .map(|(name, _)| name)
+            .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:?}");
+    }
+
+    #[test]
+    fn resolve_oauth_client_with_one_candidate_never_prompts() {
+        let clients = [oauth_client("work")];
+
+        let (name, _) =
+            resolve_oauth_client(None, &clients, &ScriptedPrompter::refusing()).unwrap();
+
+        assert_eq!(name, "work");
+    }
 }

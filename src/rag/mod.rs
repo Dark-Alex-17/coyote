@@ -15,11 +15,8 @@ use self::graph::{KnowledgeGraph, extract_entities};
 use self::provider::RagProvider;
 use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
 use crate::config::conflict::menu_can_use_terminal;
-use crate::events::Origin;
 use crate::hooks::RagSyncHooks;
-use crate::prompt::{
-    PromptAction, PromptAnswer, PromptRequest, Prompter, ask, confirm, input, reask,
-};
+use crate::prompt::{Prompter, confirm, input, reask, select_closed};
 use crate::sandbox::mcp_credentials;
 use crate::vault::{Vault, interpolate_secrets};
 
@@ -2006,16 +2003,6 @@ fn driver_auth_header(driver: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// A select whose answer must be one of `options`.
-fn select_closed(prompter: &dyn Prompter, question: &str, options: Vec<String>) -> Result<String> {
-    let req = PromptRequest {
-        options,
-        closed: true,
-        ..PromptRequest::new(PromptAction::Select, question, Origin::detached())
-    };
-    ask(prompter, req).and_then(PromptAnswer::into_selected)
-}
-
 /// Offers each option by its display line and hands back the value of
 /// the one chosen.
 fn select_option(
@@ -2506,7 +2493,9 @@ where
 mod tests {
     use super::*;
     use crate::hooks::{HookDef, HooksMap, test_sink};
-    use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
     use crate::sandbox::kit;
     use crate::testing::AtomicFlagGuard;
     use serial_test::serial;

@@ -11907,10 +11907,6 @@ mod tests {
         ctx.prompter = scripted.clone();
         let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
         assert!(
-            !err.to_string().contains("not available in the TUI"),
-            "{err}"
-        );
-        assert!(
             err.to_string()
                 .contains("is not one of the offered options"),
             "{err}"

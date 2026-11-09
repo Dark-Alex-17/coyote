@@ -1,12 +1,13 @@
-use crate::utils::{ensure_prompts_available, warning_text};
+use crate::config::conflict::menu_can_use_terminal;
+use crate::prompt::Prompter;
+use crate::utils::warning_text;
 use anyhow::{Context, Result, bail};
 use dunce::canonicalize;
-use inquire::Confirm;
 use is_terminal::IsTerminal;
 use self_update::Status;
 use self_update::backends::github::Update;
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{env, fs, io, process};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,11 +90,23 @@ fn is_dir_writable(dir: &Path) -> bool {
     }
 }
 
-pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
-    let target_tag = normalize_version(requested);
-
+pub fn run_self_update(
+    requested: Option<String>,
+    force: bool,
+    prompter: &dyn Prompter,
+) -> Result<()> {
     let exe_path = env::current_exe()
         .context("Could not determine the path of the running coyote executable")?;
+    update_binary_at(exe_path, requested, force, prompter)
+}
+
+fn update_binary_at(
+    exe_path: PathBuf,
+    requested: Option<String>,
+    force: bool,
+    prompter: &dyn Prompter,
+) -> Result<()> {
+    let target_tag = normalize_version(requested);
     let resolved = canonicalize(&exe_path).unwrap_or_else(|_| exe_path.clone());
     let source = classify_install_path(&resolved);
 
@@ -119,11 +132,8 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
 
         if force {
             println!("--force specified; updating anyway.");
-        } else if io::stdin().is_terminal() {
-            ensure_prompts_available()?;
-            let proceed = Confirm::new("Update anyway?")
-                .with_default(false)
-                .prompt()?;
+        } else if menu_can_use_terminal() {
+            let proceed = crate::prompt::confirm(prompter, "Update anyway?".to_string(), false)?;
             if !proceed {
                 println!("Update cancelled.");
                 return Ok(());
@@ -181,7 +191,13 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
+    use crate::testing::AtomicFlagGuard;
+    use serial_test::serial;
+
+    const CARGO_INSTALLED: &str = "/home/u/.cargo/bin/coyote";
 
     #[test]
     fn classify_cargo_install() {
@@ -254,5 +270,39 @@ mod tests {
             normalize_version(Some("  v0.4.0  ".to_string())),
             Some("v0.4.0".to_string())
         );
+    }
+
+    /// A package-managed install asks before updating in place; under the
+    /// full-screen UI the question is a Confirm through the prompter,
+    /// defaulting to no, and declining ends the update before any download.
+    #[test]
+    #[serial]
+    fn package_managed_update_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+
+        update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter).unwrap();
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Update anyway?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+    }
+
+    #[test]
+    #[serial]
+    fn package_managed_update_under_the_tui_with_no_human_is_refused() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        let err = update_binary_at(
+            PathBuf::from(CARGO_INSTALLED),
+            None,
+            false,
+            &HeadlessPrompter,
+        )
+        .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:?}");
     }
 }

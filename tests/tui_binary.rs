@@ -4070,28 +4070,23 @@ fn dot_info_lands_in_its_command_cell_under_cpu_load() {
 }
 
 // ---------------------------------------------------------------------
-// The one prompt gate in front of every keyboard prompt a command can
-// reach, the Input modal an agent variable raises instead, a confirm on
-// a screen too short for its question, the interrupted notice's plain
-// text, and concealed text in a reply.
+// The modals a command's questions become under the UI (a secret's
+// value, a new rag's embedding model, a package-managed update), the
+// Input modal an agent variable raises, a confirm on a screen too short
+// for its question, the interrupted notice's plain text, and concealed
+// text in a reply.
 // ---------------------------------------------------------------------
 
-/// The refusal every keyboard prompt a dot-command can reach is turned
-/// into under the UI.
-const PROMPT_REFUSAL: &str = "Interactive prompts are not available in the TUI yet";
-
-/// A dot-command flow that reaches a keyboard prompt in the REPL.
-struct GatedFlow {
+/// A dot-command flow whose question is a modal under the UI.
+struct ModalFlow {
     scenario: &'static str,
-    /// Commands sent before the gated one, each followed by a settle.
+    /// Commands sent before the asking one, each followed by a settle.
     prelude: &'static [&'static str],
     command: &'static str,
     /// Path fragments no new file outside the cache may carry afterwards.
     footprints: &'static [&'static str],
     /// Fixture written into the config dir before the UI starts.
     setup: Option<fn(&Path)>,
-    /// Where the binary under test lives; `None` runs the build's own.
-    binary: Option<fn(&Path) -> PathBuf>,
 }
 
 /// The dry-run config with two embedding models on the dry-run client, so
@@ -4127,154 +4122,9 @@ fn cargo_installed_binary(dir: &Path) -> PathBuf {
     copy
 }
 
-/// Drives one prompt-backed flow and checks it is refused through the
-/// gate: the refusal lands in a Command cell on its own (no key is sent
-/// after Enter, so a flow that waited on stdin would sit on `Working`),
-/// it lands promptly (a gate behind a network round trip or a download
-/// would not), nothing of the flow is written to the config dir, the
-/// terminal is never released, and the UI keeps taking keys and leaves
-/// clean on Ctrl+D.
-fn assert_refused_through_the_prompt_gate(flow: &GatedFlow) {
-    let dir = fresh_config_dir(flow.scenario);
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    if let Some(setup) = flow.setup {
-        setup(&dir);
-    }
-    let binary = flow
-        .binary
-        .map(|place| place(&dir))
-        .unwrap_or_else(|| built_binary().to_path_buf());
-    let binary_before = fs::metadata(&binary).unwrap();
-    let launched = dir.join("editor-launched");
-    let editor = recording_editor(&dir, &launched);
-    let config_before = fs::read_to_string(dir.join("config.yaml")).unwrap();
-    let mut pty = spawn_binary_under(
-        &binary,
-        &dir,
-        &[("EDITOR", &editor), ("VISUAL", &editor)],
-        WAIT_WRAPPER,
-        "/dev/tty",
-        "",
-    );
-
-    pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    for step in flow.prelude {
-        pty.send(format!("{step}\r").as_bytes()).unwrap();
-        pty.read_for(Duration::from_millis(800));
-    }
-    let files_before = walk(&dir);
-    let before = pty.raw().len();
-    let sent = std::time::Instant::now();
-    pty.send(format!("{}\r", flow.command).as_bytes()).unwrap();
-    let since = pty
-        .wait_for_after(PROMPT_REFUSAL, before, PTY_DEADLINE)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: `{}` was not refused with {PROMPT_REFUSAL:?}; the turn is waiting on a \
-                 keyboard prompt the UI cannot show, or went past the gate: {e:?}\n{}",
-                flow.scenario,
-                flow.command,
-                strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
-            )
-        });
-    let took = sent.elapsed();
-    assert!(
-        took < Duration::from_secs(10),
-        "{}: the refusal of `{}` took {took:?}; the gate did not run first:\n{since}",
-        flow.scenario,
-        flow.command
-    );
-    pty.read_for(Duration::from_millis(500));
-
-    for footprint in flow.footprints {
-        let written = new_files_named(&dir, &files_before, footprint);
-        assert!(
-            written.is_empty(),
-            "{}: the refused `{}` still wrote {written:?}:\n{since}",
-            flow.scenario,
-            flow.command
-        );
-    }
-    assert_eq!(
-        fs::read_to_string(dir.join("config.yaml")).unwrap(),
-        config_before,
-        "{}: the refused `{}` rewrote config.yaml:\n{since}",
-        flow.scenario,
-        flow.command
-    );
-    let binary_after = fs::metadata(&binary).unwrap();
-    assert!(
-        binary_after.len() == binary_before.len()
-            && binary_after.modified().unwrap() == binary_before.modified().unwrap(),
-        "{}: the refused `{}` touched the binary at {}",
-        flow.scenario,
-        flow.command,
-        binary.display()
-    );
-    assert!(
-        !launched.exists(),
-        "{}: the refused `{}` launched the editor:\n{since}",
-        flow.scenario,
-        flow.command
-    );
-    assert_eq!(
-        count(pty.raw(), LEAVE_ALT),
-        0,
-        "{}: the refused `{}` released the terminal:\n{since}",
-        flow.scenario,
-        flow.command
-    );
-
-    // The keys typed after the refusal reach the composer and submit
-    // as an ordinary dry-run turn: a prompt left reading stdin would
-    // have eaten them instead. Matched with the whitespace squeezed out:
-    // the composer may be painted over two frames, with the blank cells
-    // between the words skipped by cursor moves.
-    let typed_at = pty.raw().len();
-    pty.send(b"still live g4r").unwrap();
-    let typed_deadline = std::time::Instant::now() + PTY_DEADLINE;
-    loop {
-        pty.read_for(Duration::from_millis(200));
-        let since_typed = strip_ansi(&String::from_utf8_lossy(&pty.raw()[typed_at..]));
-        if squeezed(&since_typed).contains("stillliveg4r") {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < typed_deadline,
-            "{}: keys typed after the refused `{}` did not reach the composer:\n{since_typed}",
-            flow.scenario,
-            flow.command
-        );
-    }
-    pty.send(b"\r").unwrap();
-    pty.read_for(Duration::from_millis(800));
-    pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", typed_at, PTY_DEADLINE)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: `.info` after the refused `{}` never rendered: {e:?}",
-                flow.scenario, flow.command
-            )
-        });
-
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{}: {transcript}", flow.scenario);
-    assert_tty_restored(&transcript);
-    for footprint in flow.footprints {
-        let written = new_files_named(&dir, &files_before, footprint);
-        assert!(
-            written.is_empty(),
-            "{}: {written:?} appeared by the time the UI left:\n{transcript}",
-            flow.scenario
-        );
-    }
-}
-
 /// Waits for the modal `command` raises after `before`: every squeezed
-/// marker and the modal's `Esc = cancel` legend are on screen, no refusal
-/// was printed on the way, and the terminal was never released.
+/// marker and the modal's `Esc = cancel` legend are on screen and the
+/// terminal was never released.
 fn wait_for_the_modal(
     pty: &mut Pty,
     before: usize,
@@ -4285,10 +4135,6 @@ fn wait_for_the_modal(
     let modal = loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
-        assert!(
-            !since.contains(PROMPT_REFUSAL),
-            "`{command}` was refused instead of asked in the modal:\n{since}"
-        );
         let flat = squeezed(&since);
         if modal_markers.iter().all(|marker| flat.contains(marker)) && flat.contains("Esc=cancel") {
             break since;
@@ -4323,11 +4169,11 @@ fn esc_cancels_the_modal(pty: &mut Pty, command: &str) {
 }
 
 /// Drives one prompt-backed flow whose question is a modal under the UI:
-/// the modal showing the squeezed `modal_markers` comes up instead of a
-/// refusal, Esc cancels it, nothing of the flow is written to the config
-/// dir, the terminal is never released, and the UI keeps taking keys and
-/// leaves clean on Ctrl+D.
-fn assert_asks_in_the_modal_and_esc_cancels(flow: &GatedFlow, modal_markers: &[&str]) {
+/// the modal showing the squeezed `modal_markers` comes up, Esc cancels
+/// it, nothing of the flow is written to the config dir, the terminal is
+/// never released, and the UI keeps taking keys and leaves clean on
+/// Ctrl+D.
+fn assert_asks_in_the_modal_and_esc_cancels(flow: &ModalFlow, modal_markers: &[&str]) {
     let dir = fresh_config_dir(flow.scenario);
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
@@ -4451,13 +4297,12 @@ fn dot_save_role_on_a_temp_role_asks_for_the_name_in_the_modal() {
 #[serial]
 fn dot_vault_add_asks_for_the_value_in_the_password_modal() {
     assert_asks_in_the_modal_and_esc_cancels(
-        &GatedFlow {
+        &ModalFlow {
             scenario: "modal-vault-add",
             prelude: &[],
             command: ".vault add vault-secret-g4r",
             footprints: &["g4r", "vault"],
             setup: None,
-            binary: None,
         },
         &["Enterthesecretvalue:"],
     );
@@ -4470,33 +4315,97 @@ fn dot_vault_add_asks_for_the_value_in_the_password_modal() {
 #[serial]
 fn dot_rag_for_a_new_rag_asks_for_the_embedding_model_in_the_select_modal() {
     assert_asks_in_the_modal_and_esc_cancels(
-        &GatedFlow {
+        &ModalFlow {
             scenario: "modal-rag-create",
             prelude: &[],
             command: ".rag new-rag-g4r",
             footprints: &["g4r", "/rags/"],
             setup: Some(write_dry_run_config_with_embeddings),
-            binary: None,
         },
         &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
     );
 }
 
 /// `.update` on a Cargo-installed binary warns and asks `Update anyway?`
-/// in the REPL before it checks for or downloads anything; under the UI
-/// the gate refuses it right there, with no network round trip first and
-/// the binary untouched.
+/// before it checks for or downloads anything; under the UI the question
+/// is the Confirm modal (no raw tty prompt), `n` cancels the update with
+/// the binary untouched, no network round trip made and no write probe
+/// left behind, and the UI keeps taking keys and leaves clean.
 #[test]
 #[serial]
-fn dot_update_on_a_cargo_install_is_refused_through_the_prompt_gate() {
-    assert_refused_through_the_prompt_gate(&GatedFlow {
-        scenario: "gate-update",
-        prelude: &[],
-        command: ".update",
-        footprints: &["coyote-update-write-test"],
-        setup: None,
-        binary: Some(cargo_installed_binary),
-    });
+fn dot_update_on_a_cargo_install_asks_in_the_confirm_modal_and_n_cancels() {
+    let dir = fresh_config_dir("update-confirm-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let binary = cargo_installed_binary(&dir);
+    let binary_before = fs::metadata(&binary).unwrap();
+    let mut pty = spawn_binary_under(&binary, &dir, &[], WAIT_WRAPPER, "/dev/tty", "");
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    let sent = std::time::Instant::now();
+    pty.send(b".update\r").unwrap();
+    let modal = wait_for_the_modal(&mut pty, before, ".update", &["Updateanyway?", "y=yes"]);
+    let took = sent.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "the question took {took:?}; a network round trip came first:\n{modal}"
+    );
+    assert!(
+        !squeezed(&modal).contains("(y/N)"),
+        "`Update anyway?` was asked on the raw tty, not in the modal:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "Update cancelled.",
+        "the cancellation after `n` on the modal",
+    );
+    pty.read_for(Duration::from_millis(500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    // The command's output is a Command cell, painted once the command
+    // returns: the warning that preceded the question lands with the
+    // cancellation.
+    let flat = squeezed(&since);
+    assert!(
+        flat.contains("WARNING:") && flat.contains(&squeezed("appears to be installed via")),
+        "the Cargo-install warning was not printed with the cancellation:\n{since}"
+    );
+    let probes = new_files_named(&dir, &files_before, "coyote-update-write-test");
+    assert!(
+        probes.is_empty(),
+        "the cancelled update still probed for write access: {probes:?}:\n{since}"
+    );
+    let binary_after = fs::metadata(&binary).unwrap();
+    assert!(
+        binary_after.len() == binary_before.len()
+            && binary_after.modified().unwrap() == binary_before.modified().unwrap(),
+        "the cancelled update touched the binary at {}",
+        binary.display()
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the question released the terminal:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("`.info` after the cancelled update never rendered");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        new_files_named(&dir, &files_before, "coyote-update-write-test").is_empty(),
+        "a write probe appeared by the time the UI left:\n{transcript}"
+    );
 }
 
 /// An agent whose `username` variable has no default, so starting it asks
@@ -4524,8 +4433,8 @@ fn write_agent_needing_a_variable(dir: &Path, name: &str) {
 /// the value through the prompter, not on the raw tty: under the UI the
 /// question is the Input modal (name, description, `Enter = answer`),
 /// typing a value and Enter answers it, the agent comes up with that
-/// value, and no refusal, no raw prompt and no released terminal are
-/// seen on the way.
+/// value, and no raw prompt and no released terminal are seen on the
+/// way.
 #[test]
 #[serial]
 fn dot_agent_needing_a_variable_asks_in_the_input_modal_and_enter_answers_it() {
@@ -4543,10 +4452,6 @@ fn dot_agent_needing_a_variable_asks_in_the_input_modal_and_enter_answers_it() {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         let flat = squeezed(&since);
-        assert!(
-            !since.contains(PROMPT_REFUSAL),
-            "the agent's variable was refused instead of asked in the Input modal:\n{since}"
-        );
         if flat.contains("username(Yourusername)") && flat.contains("Enter=answer") {
             break since;
         }
@@ -5012,10 +4917,6 @@ fn open_session_after_a_turn(dir: &Path, name: &str) -> (Pty, FakeLlm) {
     loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
-        assert!(
-            !since.contains(PROMPT_REFUSAL),
-            "`.session` after a turn was refused instead of asking in the modal:\n{since}"
-        );
         if squeezed(&since).contains("incorporatesthelastquestionandanswer") {
             break;
         }
@@ -5163,37 +5064,47 @@ fn write_bundle_repo(dir: &Path, name: &str, secrets: &[&str]) -> PathBuf {
 }
 
 /// Pumps the pty until `marker` is on screen after `from` (whitespace
-/// squeezed), answering a yes/no modal with `y` if one comes up on the
-/// way (a question the UI can answer is asked in the modal; one it cannot
-/// is refused through the gate, which fails the wait). Returns the text
-/// since `from`.
-fn wait_for_marker_answering_confirms(
+/// squeezed), answering each modal on the way with the key paired with
+/// its squeezed question in `answers`, in whatever order they come up.
+/// A modal is looked for only after the previous answer, and each answer
+/// is followed by a resize: the next question may differ from the last
+/// by a few cells, and a full repaint is what puts it on the pty whole.
+/// Returns the text since `from`.
+fn wait_for_marker_answering_modals(
     pty: &mut Pty,
     from: usize,
     marker: &str,
+    answers: &[(&str, u8)],
     what: &str,
 ) -> String {
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    let mut answered = 0;
+    let mut pending: Vec<(&str, u8)> = answers.to_vec();
+    let mut answered_at = from;
+    let mut width = 140;
     loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
-        let squeezed_since = squeezed(&since);
-        assert!(
-            !since.contains(PROMPT_REFUSAL),
-            "{what}: refused through the prompt gate instead of completing:\n{since}"
-        );
-        if squeezed_since.contains(&squeezed(marker)) {
+        if squeezed(&since).contains(&squeezed(marker)) {
             return since;
         }
-        if squeezed_since.matches("y=yes").count() > answered {
-            answered += 1;
+        let recent = squeezed(&strip_ansi(&String::from_utf8_lossy(
+            &pty.raw()[answered_at..],
+        )));
+        if let Some(index) = pending
+            .iter()
+            .position(|(question, _)| recent.contains(question))
+        {
+            let (_, key) = pending.remove(index);
             pty.read_for(HOTKEY_GAP);
-            pty.send(b"y").unwrap();
+            pty.send(&[key]).unwrap();
+            pty.read_for(Duration::from_millis(500));
+            answered_at = pty.raw().len();
+            width = if width == 140 { 139 } else { 140 };
+            pty.resize(60, width).unwrap();
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "{what}: `{marker}` never appeared:\n{since}"
+            "{what}: `{marker}` never appeared (modals still unanswered: {pending:?}):\n{since}"
         );
     }
 }
@@ -5215,18 +5126,23 @@ fn config_files_mentioning(dir: &Path, needle: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The head of the notice an install prints once every missing secret
+/// has been added or deferred; the deferred names follow it.
+const DEFERRED_SECRETS_NOTICE: &str = "still required by your MCP servers";
+
 /// `.install <local bundle>` whose mcp.json references two secrets the
-/// vault does not hold: under the UI the install completes (no hidden
-/// `Add {{ X }} to vault now?` prompt, no refusal), names both secrets as
-/// deferred, leaves the merged mcp.json and the bundle record behind
-/// (nothing half-applied), adds no secret to the vault, and the UI keeps
-/// taking keys and leaves clean. Then `.install <bundle>` updates it from
-/// a source that gained a third secret and dropped a role the user had
-/// edited locally: the update completes, names the new secret, and keeps
-/// the edited file.
+/// vault does not hold: under the UI each `Add {{ X }} to vault now?` is
+/// a Confirm modal; declining both, the install completes, names both
+/// secrets as deferred, leaves the merged mcp.json and the bundle record
+/// behind (nothing half-applied), adds no secret to the vault, and the
+/// UI keeps taking keys and leaves clean. Then `.install <bundle>`
+/// updates it from a source that gained a third secret and dropped a
+/// role the user had edited locally: the obsolete file's fate is a Select
+/// modal (`keep` keeps it), the secrets are declined again, the update
+/// completes, names the new secret, and keeps the edited file.
 #[test]
 #[serial]
-fn dot_install_of_a_bundle_with_secrets_completes_with_every_secret_deferred() {
+fn dot_install_of_a_bundle_with_secrets_defers_every_secret_the_user_declines() {
     let dir = fresh_config_dir("install-bundle-secrets");
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![]);
@@ -5243,10 +5159,14 @@ fn dot_install_of_a_bundle_with_secrets_completes_with_every_secret_deferred() {
     let sent = std::time::Instant::now();
     pty.send(format!(".install {}\r", repo.display()).as_bytes())
         .unwrap();
-    let since = wait_for_marker_answering_confirms(
+    let since = wait_for_marker_answering_modals(
         &mut pty,
         install_at,
-        "BUNDLE_SECRET_B",
+        DEFERRED_SECRETS_NOTICE,
+        &[
+            ("Add{{BUNDLE_SECRET_A}}tovaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_B}}tovaultnow?", b'n'),
+        ],
         "`.install` of a bundle with secrets",
     );
     let took = sent.elapsed();
@@ -5259,8 +5179,8 @@ fn dot_install_of_a_bundle_with_secrets_completes_with_every_secret_deferred() {
         );
     }
     assert!(
-        !since_full.to_lowercase().contains("to vault now"),
-        "the install asked to add a secret to the vault under the UI:\n{since_full}"
+        squeezed(&since_full).matches("tovaultnow?").count() >= 2,
+        "the install did not ask about each secret in the modal:\n{since_full}"
     );
     assert!(
         !since_full.contains("exit="),
@@ -5325,17 +5245,26 @@ fn dot_install_of_a_bundle_with_secrets_completes_with_every_secret_deferred() {
 
     let update_at = pty.raw().len();
     pty.send(format!(".install {name}\r").as_bytes()).unwrap();
-    let since = wait_for_marker_answering_confirms(
+    // The repaints forced on the way re-emit the first install's notice,
+    // so the update is awaited by its own deferred list: B and C are
+    // adjacent rows only there.
+    let since = wait_for_marker_answering_modals(
         &mut pty,
         update_at,
-        "BUNDLE_SECRET_C",
+        "{{BUNDLE_SECRET_B}}{{BUNDLE_SECRET_C}}",
+        &[
+            ("Obsoletefile", b'1'),
+            ("Add{{BUNDLE_SECRET_A}}tovaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_B}}tovaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_C}}tovaultnow?", b'n'),
+        ],
         "`.install <bundle>` update with a new secret",
     );
     pty.read_for(Duration::from_millis(800));
     let since_full = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
     assert!(
-        !since_full.to_lowercase().contains("to vault now"),
-        "the update asked to add a secret to the vault under the UI:\n{since_full}"
+        squeezed(&since_full).contains("Add{{BUNDLE_SECRET_C}}tovaultnow?"),
+        "the update did not ask about the new secret in the modal:\n{since_full}"
     );
     assert!(
         !since_full.contains("exit="),
@@ -5668,10 +5597,6 @@ fn esc_on_the_incorporate_question_opens_no_session_and_the_next_n_seats_it_empt
     loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
-        assert!(
-            !since.contains(PROMPT_REFUSAL),
-            "`.session` after Esc was refused instead of asking again:\n{since}"
-        );
         if squeezed(&since).contains("incorporatesthelastquestionandanswer") {
             break;
         }
@@ -6153,8 +6078,8 @@ fn seed_rag_with_a_failing_document(dir: &Path, name: &str) -> (PathBuf, String)
 /// `.rebuild rag` over a document whose loader fails: in the REPL the
 /// sync asks whether to go on without it; under the UI there is no one to
 /// ask, so the load's warning row is followed by `Aborted` naming the
-/// plain REPL as the way to choose, not by the generic prompt refusal and
-/// not by a hidden `Continue?` the UI would sit on. The rag file is left
+/// plain REPL as the way to choose, not by a hidden `Continue?` the UI
+/// would sit on. The rag file is left
 /// exactly as it was, the terminal is never released, and the UI keeps
 /// taking keys and leaves clean.
 #[test]
@@ -6179,10 +6104,6 @@ fn dot_rebuild_rag_with_a_failing_document_aborts_naming_the_plain_repl() {
     let since = loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
-        assert!(
-            !since.contains(PROMPT_REFUSAL),
-            "the failed document was refused through the generic prompt gate instead of aborting the sync:\n{since}"
-        );
         assert!(
             !since.contains("Continue?"),
             "the `Some documents failed to load. Continue?` question was painted under the UI:\n{since}"
@@ -6271,19 +6192,20 @@ fn write_conflicting_local_mcp(dir: &Path) -> String {
     local.to_string()
 }
 
-const MCP_CONFLICT_REFUSAL: &str = "Refusing to merge non-interactively";
+const MCP_CONFLICT_REFUSAL: &str =
+    "Refusing to merge MCP server 'bundle-k7s-server' non-interactively";
 const REPL_HINT: &str = "Re-run in the plain REPL";
 const TERMINAL_HINT: &str = "Re-run in a terminal";
 
 /// `.install <local bundle>` whose `mcp.json` defines a server the local
-/// `mcp.json` already holds differently: the menu that resolves the
-/// conflict cannot be shown under the UI, so the merge is refused with a
-/// message naming the plain REPL (not "a terminal") and the flags that
-/// settle it, the local server definition is untouched, the UI keeps
+/// `mcp.json` already holds differently: under the UI the menu that
+/// resolves the conflict is the Select modal with the four choices,
+/// `1` keeps the local definition, the install completes without a
+/// refusal, the local server definition is untouched, the UI keeps
 /// taking keys and leaves clean.
 #[test]
 #[serial]
-fn dot_install_with_a_conflicting_mcp_server_is_refused_naming_the_plain_repl() {
+fn dot_install_with_a_conflicting_mcp_server_asks_in_the_select_modal_and_keep_local_keeps_it() {
     let dir = fresh_config_dir("install-mcp-conflict-tui");
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![]);
@@ -6299,81 +6221,92 @@ fn dot_install_with_a_conflicting_mcp_server_is_refused_naming_the_plain_repl() 
     let sent = std::time::Instant::now();
     pty.send(format!(".install {}\r", repo.display()).as_bytes())
         .unwrap();
-    let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    let since = loop {
-        pty.read_for(Duration::from_millis(200));
-        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
-        let squeezed_since = squeezed(&since);
-        assert!(
-            !since.contains(PROMPT_REFUSAL),
-            "the conflict was refused through the generic prompt gate, not the merge's own refusal:\n{since}"
-        );
-        assert!(
-            !squeezed_since.contains("ConflictonMCPserver"),
-            "the conflict menu was painted under the UI:\n{since}"
-        );
-        if squeezed_since.contains(&squeezed(MCP_CONFLICT_REFUSAL)) {
-            break since;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "`.install` with an MCP conflict was neither refused nor completed:\n{since}"
-        );
-    };
+    let modal = wait_for_the_modal(
+        &mut pty,
+        install_at,
+        ".install",
+        &[
+            "ConflictonMCPserver'bundle-k7s-server'",
+            "keeplocal",
+            "takeremote",
+            "bundle-k7s-server-remote",
+            "abortmerge",
+        ],
+    );
     let took = sent.elapsed();
     assert!(
         took < Duration::from_secs(10),
-        "the refusal took {took:?}; a hidden menu was waited on first:\n{since}"
+        "the menu took {took:?} to come up:\n{modal}"
     );
+    assert!(
+        !squeezed(&modal).contains(&squeezed(MCP_CONFLICT_REFUSAL)),
+        "the merge was refused instead of asked in the modal:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"1").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+        if squeezed(&since).contains("keptlocal:bundle-k7s-server") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`keep local` did not let the merge report the kept server:\n{since}"
+        );
+    }
     pty.read_for(Duration::from_millis(800));
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
     let squeezed_since = squeezed(&since);
     assert!(
-        squeezed_since.contains(&squeezed(REPL_HINT)),
-        "the refusal under the UI does not say {REPL_HINT:?}:\n{since}"
+        !squeezed_since.contains(&squeezed(MCP_CONFLICT_REFUSAL)),
+        "the merge was refused after the menu was answered:\n{since}"
     );
     assert!(
-        !squeezed_since.contains(&squeezed(TERMINAL_HINT)),
-        "the refusal under the UI says {TERMINAL_HINT:?}, but the UI is on a terminal:\n{since}"
-    );
-    assert!(
-        squeezed_since.contains("bundle-k7s-server"),
-        "the refusal does not name the conflicting server:\n{since}"
-    );
-    assert!(
-        squeezed_since.contains("--install-force"),
-        "the refusal does not name the flag that settles it:\n{since}"
+        !squeezed_since.contains(&squeezed(REPL_HINT))
+            && !squeezed_since.contains(&squeezed(TERMINAL_HINT)),
+        "the install under the UI points at another UI:\n{since}"
     );
     assert!(
         !since.contains("exit="),
-        "the refused install quit the UI:\n{since}"
+        "the install quit the UI:\n{since}"
     );
+    let installed_role = dir.join("roles").join("bundle-k7s-role.md");
+    assert!(
+        installed_role.exists(),
+        "the bundle's role was not installed at {}:\n{since}",
+        installed_role.display()
+    );
+    // The merge writes mcp.json back formatted; the server definition is
+    // what `keep local` keeps.
+    let local_before: serde_json::Value = serde_json::from_str(&local_before).unwrap();
+    let merged = |dir: &Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(dir.join("mcp.json")).unwrap()).unwrap()
+    };
     assert_eq!(
-        fs::read_to_string(dir.join("mcp.json")).unwrap(),
+        merged(&dir),
         local_before,
-        "the refused merge changed the local mcp.json:\n{since}"
+        "`keep local` changed the local mcp.json:\n{since}"
     );
     assert_eq!(
         count(pty.raw(), LEAVE_ALT),
         0,
-        "the refused install released the terminal:\n{since}"
+        "the conflict menu released the terminal:\n{since}"
     );
 
     let info_at = pty.raw().len();
     pty.send(b".info\r").unwrap();
     pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
-        .expect("`.info` after the refused install never rendered");
-    assert_eq!(
-        fake.served(),
-        0,
-        "a refused bundle install reached the model"
-    );
+        .expect("`.info` after the install never rendered");
+    assert_eq!(fake.served(), 0, "a bundle install reached the model");
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
     assert_eq!(
-        fs::read_to_string(dir.join("mcp.json")).unwrap(),
+        merged(&dir),
         local_before,
         "the local mcp.json changed by the time the UI left:\n{transcript}"
     );

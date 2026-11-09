@@ -1,8 +1,9 @@
-//! Black-box pins for the bottom pane's hidden verbs, history walk and
-//! rewind barriers: the verbs hidden until their prompts are routed stay
-//! out of the palette after the state warms up (a command ran, an agent
-//! was switched) under both prefixes while typing one in full still runs
-//! it; the history walk (Up/Down, Ctrl+R) never reopens the palette over
+//! Black-box pins for the bottom pane's formerly hidden verbs, history
+//! walk and rewind barriers: the verbs the palette once left out while
+//! their prompts refused under the UI are listed cold and after the
+//! state warms up (a command ran, an agent was switched) under both
+//! prefixes, and typing one in full still runs it; the history walk
+//! (Up/Down, Ctrl+R) never reopens the palette over
 //! the recalled line; `.macro enable` is not a rewind stop and a picker
 //! with nothing above the macro cannot crash; a backtick document
 //! command's grandchild dies on Esc while its shell still leads the
@@ -28,52 +29,16 @@ const PTY_DEADLINE: Duration = Duration::from_secs(20);
 const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 const REPAINT_SETTLE: Duration = Duration::from_millis(500);
 const MACRO_STOP_NOTICE: &str = "Rewind stops at the last macro turn";
-/// The verbs hidden from the palette until their prompt sites are
-/// routed, each paired with a typed head that narrows the palette to it
-/// (and to nothing else spelling it). The heads are hand-picked, so the
-/// verbs are checked against the palette's own list before they are used.
-const HIDDEN_HEADS: [(&str, &str); 5] = [
+/// The verbs the palette left out while their prompts still refused
+/// under the UI, each paired with a typed head that narrows the palette
+/// to it (and to nothing else spelling it).
+const FORMERLY_HIDDEN_HEADS: [(&str, &str); 5] = [
     ("ra", "rag"),
     ("va", "vault"),
     ("ins", "install"),
     ("unin", "uninstall"),
     ("upd", "update"),
 ];
-
-/// The verbs `HIDDEN_UNTIL_ROUTED` names, read from the palette's source
-/// the way the palette suite does: the binary has no library target to
-/// import the constant from.
-fn hidden_until_routed() -> Vec<String> {
-    let source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/bottom_pane.rs"))
-            .unwrap();
-    let start = source
-        .find("const HIDDEN_UNTIL_ROUTED")
-        .expect("the palette names its hidden verbs");
-    let list = &source[start..];
-    let list = &list[list.find('=').unwrap() + 1..];
-    let list = &list[list.find("&[").unwrap() + 2..];
-    let list = &list[..list.find(']').unwrap()];
-    list.split(',')
-        .map(|entry| entry.trim().trim_matches('"').to_string())
-        .filter(|entry| !entry.is_empty())
-        .collect()
-}
-
-/// Fails when `HIDDEN_HEADS` and the palette's list name different verbs.
-fn assert_hidden_heads_match_the_palette() {
-    let mut listed = hidden_until_routed();
-    listed.sort();
-    let mut heads: Vec<String> = HIDDEN_HEADS
-        .iter()
-        .map(|(_, verb)| format!(".{verb}"))
-        .collect();
-    heads.sort();
-    assert_eq!(
-        heads, listed,
-        "HIDDEN_HEADS drifted from the palette's HIDDEN_UNTIL_ROUTED"
-    );
-}
 
 struct TempDirGuard(PathBuf);
 
@@ -422,40 +387,52 @@ fn palette_frame_for(pty: &mut Pty, sigil: char, head: &str, toggle: &mut bool) 
     frame
 }
 
-/// Every hidden verb that shows up as `<sigil><verb>` anywhere in the
-/// frame painted for its head (the composer holds only the head, so any
-/// full spelling is a palette row), plus the positive control: `ses`
-/// must offer `<sigil>session` or the band was not read at all.
-fn hidden_verbs_shown(pty: &mut Pty, sigil: char, toggle: &mut bool, state: &str) -> Vec<String> {
+/// Every formerly hidden verb that does NOT show up as `<sigil><verb>`
+/// in the frame painted for its head (the composer holds only the head,
+/// so a full spelling is a palette row), plus the positive control:
+/// `ses` must offer `<sigil>session` or the band was not read at all.
+/// While an agent is active `.rag` is not a command at all (the REPL
+/// table gates it on no agent), so in that state its row must be absent
+/// and its absence is not a miss.
+fn formerly_hidden_verbs_missing(
+    pty: &mut Pty,
+    sigil: char,
+    toggle: &mut bool,
+    state: &str,
+    agent_active: bool,
+) -> Vec<String> {
     let control = palette_frame_for(pty, sigil, "ses", toggle);
     assert!(
         control.contains(&format!("{sigil}session")),
         "{state}: under `{sigil}` typing `{sigil}ses` offers no `{sigil}session` row; the band \
          was not read:\n{control}"
     );
-    let mut shown = Vec::new();
-    for (head, verb) in HIDDEN_HEADS {
+    let mut missing = Vec::new();
+    for (head, verb) in FORMERLY_HIDDEN_HEADS {
         let frame = palette_frame_for(pty, sigil, head, toggle);
         let spelled = format!("{sigil}{verb}");
-        if frame.contains(&spelled) {
-            shown.push(format!(
-                "{state}: `{sigil}{head}` offers {spelled}:\n{frame}"
+        let expected = !(agent_active && verb == "rag");
+        if frame.contains(&spelled) != expected {
+            missing.push(format!(
+                "{state}: `{sigil}{head}` {} {spelled}:\n{frame}",
+                if expected { "does not offer" } else { "offers" }
             ));
         }
     }
-    shown
+    missing
 }
 
 // ---------------------------------------------------------------------
-// Hidden verbs stay hidden once the palette state is rebuilt.
+// Formerly hidden verbs are listed in every palette state.
 // ---------------------------------------------------------------------
 
-/// Under `sigil` the five hidden verbs are absent from the palette on a
-/// cold start, after a command ran, after a dry-run exchange, and after
-/// an `.agent` switch rebuilt the palette's state; the `session` control
-/// row is offered in every state.
-fn assert_hidden_verbs_stay_hidden(prefix_yaml: &str, sigil: char, scenario: &str) {
-    assert_hidden_heads_match_the_palette();
+/// Under `sigil` the five formerly hidden verbs are offered by the
+/// palette on a cold start, after a command ran, after a dry-run
+/// exchange, and after an `.agent` switch rebuilt the palette's state;
+/// the `session` control row is offered in every state, and `.rag`,
+/// which the REPL table withholds while an agent is active, is absent
+/// from the agent state alone.
+fn assert_formerly_hidden_verbs_are_listed(prefix_yaml: &str, sigil: char, scenario: &str) {
     let dir = fresh_config_dir(scenario);
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir, prefix_yaml);
@@ -465,9 +442,15 @@ fn assert_hidden_verbs_stay_hidden(prefix_yaml: &str, sigil: char, scenario: &st
     pty.resize(60, 140).unwrap();
     pty.read_for(Duration::from_millis(500));
     let mut toggle = false;
-    let mut shown = Vec::new();
+    let mut missing = Vec::new();
 
-    shown.extend(hidden_verbs_shown(&mut pty, sigil, &mut toggle, "cold"));
+    missing.extend(formerly_hidden_verbs_missing(
+        &mut pty,
+        sigil,
+        &mut toggle,
+        "cold",
+        false,
+    ));
 
     let info_at = pty.raw().len();
     pty.send(format!("{sigil}info tools\r").as_bytes()).unwrap();
@@ -478,22 +461,24 @@ fn assert_hidden_verbs_stay_hidden(prefix_yaml: &str, sigil: char, scenario: &st
         "`info tools` running cold",
     );
     pty.read_for(Duration::from_millis(500));
-    shown.extend(hidden_verbs_shown(
+    missing.extend(formerly_hidden_verbs_missing(
         &mut pty,
         sigil,
         &mut toggle,
         "after a command ran",
+        false,
     ));
 
     let turn_at = pty.raw().len();
     pty.send(b"warm-up-q8w\r").unwrap();
     wait_for_squeezed_after(&mut pty, "> warm-up-q8w", turn_at, "the dry-run exchange");
     pty.read_for(Duration::from_millis(2000));
-    shown.extend(hidden_verbs_shown(
+    missing.extend(formerly_hidden_verbs_missing(
         &mut pty,
         sigil,
         &mut toggle,
         "after an exchange",
+        false,
     ));
 
     let agent_at = pty.raw().len();
@@ -501,44 +486,44 @@ fn assert_hidden_verbs_stay_hidden(prefix_yaml: &str, sigil: char, scenario: &st
         .unwrap();
     wait_for_squeezed_after(&mut pty, "plain-agent", agent_at, "the agent switch");
     pty.read_for(Duration::from_millis(1500));
-    shown.extend(hidden_verbs_shown(
+    missing.extend(formerly_hidden_verbs_missing(
         &mut pty,
         sigil,
         &mut toggle,
         "after an agent switch",
+        true,
     ));
 
     pty.read_for(HOTKEY_GAP);
     quit_clearing_any_draft(&mut pty);
     assert!(
-        shown.is_empty(),
-        "under `{sigil}` the palette offers hidden verbs in {} state(s):\n\n{}",
-        shown.len(),
-        shown.join("\n\n")
+        missing.is_empty(),
+        "under `{sigil}` the palette leaves out formerly hidden verbs in {} state(s):\n\n{}",
+        missing.len(),
+        missing.join("\n\n")
     );
 }
 
 #[test]
 #[serial]
-fn hidden_verbs_stay_out_of_the_palette_cold_and_warm_under_dot() {
-    assert_hidden_verbs_stay_hidden("", '.', "hidden-warm-dot");
+fn formerly_hidden_verbs_are_listed_in_the_palette_cold_and_warm_under_dot() {
+    assert_formerly_hidden_verbs_are_listed("", '.', "hidden-warm-dot");
 }
 
 #[test]
 #[serial]
-fn hidden_verbs_stay_out_of_the_palette_cold_and_warm_under_slash() {
-    assert_hidden_verbs_stay_hidden("command_prefix: slash\n", '/', "hidden-warm-slash");
+fn formerly_hidden_verbs_are_listed_in_the_palette_cold_and_warm_under_slash() {
+    assert_formerly_hidden_verbs_are_listed("command_prefix: slash\n", '/', "hidden-warm-slash");
 }
 
-/// A hidden verb typed in full still runs: `.rag`, `.vault` and
+/// A formerly hidden verb typed in full still runs: `.rag`, `.vault` and
 /// `.uninstall` under the TUI end in the command's own error or usage
 /// (`.rag` with no embedding model configured fails before it has
 /// anything to ask), never a hang or a crash, and the composer takes
-/// keys afterwards. The palette is simply not offering them; the command
-/// table still has them. (`.install`/`.update` reach the network.)
+/// keys afterwards. (`.install`/`.update` reach the network.)
 #[test]
 #[serial]
-fn a_hidden_verb_typed_in_full_still_runs_and_the_ui_survives() {
+fn a_formerly_hidden_verb_typed_in_full_still_runs_and_the_ui_survives() {
     let dir = fresh_config_dir("hidden-typed");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir, "");

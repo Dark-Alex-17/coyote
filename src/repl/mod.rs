@@ -838,7 +838,8 @@ pub async fn run_repl_command_with_prefix(
                     );
                 }
                 let clients = ctx.app.config.clients.clone();
-                let (client_name, provider) = resolve_oauth_client(Some(client.name()), &clients)?;
+                let (client_name, provider) =
+                    resolve_oauth_client(Some(client.name()), &clients, ctx.prompter.as_ref())?;
                 oauth::run_oauth_flow(&*provider, &client_name, ctx.prompter.as_ref()).await?;
             }
             ".mcp" => match args {
@@ -1116,7 +1117,11 @@ pub async fn run_repl_command_with_prefix(
                     bail!("Cannot perform this operation because you are in a macro")
                 }
                 let version = args.map(|s| s.trim().to_string());
-                task::spawn_blocking(move || config::run_self_update(version, false)).await??;
+                let prompter = Arc::clone(&ctx.prompter);
+                task::spawn_blocking(move || {
+                    config::run_self_update(version, false, prompter.as_ref())
+                })
+                .await??;
             }
             ".rag" => match split_first_arg(args) {
                 Some(("attach", rest)) => match rest {

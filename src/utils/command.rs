@@ -280,17 +280,6 @@ pub async fn run_loader_command(
     }
 }
 
-/// Whether an inquire prompt can take the terminal right now. Every REPL
-/// command that still asks on the raw tty checks this before it builds
-/// the prompt, so under the full-screen UI the refusal lands in the
-/// transcript instead of a question nobody can see.
-pub fn ensure_prompts_available() -> Result<()> {
-    if crate::tui::active() {
-        bail!("Interactive prompts are not available in the TUI yet"); // TASK-388
-    }
-    Ok(())
-}
-
 /// Opens `path` in `editor` and waits for it; under the TUI the editor
 /// gets the terminal lent to it. An editor that exits non-zero is
 /// reported, not failed on: the file may well have been written.
