@@ -923,9 +923,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0675
-    output_price: 0.225
-    cache_read_price: 0.0375
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8072,9 +8072,9 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.9483
-    output_price: 1.8966
-    cache_read_price: 0.079
+    input_price: 0.8973
+    output_price: 1.7946
+    cache_read_price: 0.0748
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
@@ -8502,7 +8502,7 @@
     type: chat
     max_input_tokens: 131072
     input_price: 0.08
-    output_price: 0.35
+    output_price: 0.45
     cache_read_price: 0.04
     max_output_tokens: 117964
     supports_vision: true
@@ -8517,9 +8517,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0675
-    output_price: 0.225
-    cache_read_price: 0.0375
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -8801,7 +8801,7 @@
     input_price: 1.25
     output_price: 4.25
     cache_read_price: 0.15
-    max_output_tokens: 943718
+    max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
   - name: meta/muse-wonder
@@ -8854,9 +8854,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9021,9 +9021,10 @@
   - name: mistralai/mistral-small-3.2-24b-instruct
     type: chat
     max_input_tokens: 256000
-    input_price: 0.075
-    output_price: 0.2
-    max_output_tokens: 16384
+    input_price: 0.1
+    output_price: 0.3
+    cache_read_price: 0.01
+    max_output_tokens: 26214
     supports_vision: true
     supports_function_calling: true
   - name: mistralai/mixtral-8x22b-instruct
@@ -10233,10 +10234,10 @@
   - name: openai/gpt-oss-20b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.03
-    output_price: 0.13
-    cache_read_price: 0.03
-    max_output_tokens: 117964
+    input_price: 0.018
+    output_price: 0.09
+    cache_read_price: 0.009
+    max_output_tokens: 32768
     supports_function_calling: true
   - name: openai/gpt-oss-20b:batch
     type: chat
@@ -11220,9 +11221,9 @@
   - name: z-ai/glm-4.5-air
     type: chat
     max_input_tokens: 131072
-    input_price: 0.13
-    output_price: 0.85
-    cache_read_price: 0.025
+    input_price: 0.2
+    output_price: 1.1
+    cache_read_price: 0.03
     max_output_tokens: 98304
     supports_function_calling: true
   - name: z-ai/glm-4.5v
@@ -11301,9 +11302,9 @@
   - name: z-ai/glm-5.2:batch
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.454
+    input_price: 0.623
     output_price: 1.271
-    cache_read_price: 0.153
+    cache_read_price: 0.21
     max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5.3
@@ -11464,7 +11465,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.1529
-    output_price: 9.7471
+    output_price: 10.1522
     cache_read_price: 0.15
     max_output_tokens: 943718
     supports_vision: true
@@ -11657,6 +11658,19 @@
     max_input_tokens: 131072
 - provider: deepinfra
   models:
+  - name: moonshotai/Kimi-K3.1-Pro
+    type: chat
+    max_input_tokens: 1048576
+    input_price: 2.0
+    output_price: 10.0
+    cache_read_price: 0.2
+    max_output_tokens: 943718
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - high
+    - max
   - name: deepseek-ai/DeepSeek-V4.1-Flash-1017
     type: chat
     max_input_tokens: 1048576
