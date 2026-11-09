@@ -393,8 +393,9 @@ pub struct ChatCompletionsData {
     /// Cache TTL for the system prompt and tool declarations (`"1h"`), or
     /// None for the provider default. Only the Anthropic clients read it.
     pub prompt_cache_ttl: Option<String>,
-    /// Set from the model's capability flag alone, so it can be Some for a
-    /// client with no native dialect. Such clients must drop it from the body.
+    /// Set from the role's spec when the model's capability flag allows it,
+    /// ignoring the client's dialect, so it can be Some for a client with no
+    /// native dialect. Such clients must drop it from the body.
     pub structured_output: Option<StructuredOutputSpec>,
 }
 
@@ -2723,17 +2724,23 @@ mod tests {
         );
     }
 
-    fn carries_native_structured_output(body: &Value) -> bool {
-        [
-            "/response_format",
-            "/text/format",
-            "/output_config/format",
-            "/generationConfig/responseJsonSchema",
-            "/outputConfig/textFormat",
-        ]
-        .iter()
-        .any(|pointer| body.pointer(pointer).is_some())
-    }
+    const NATIVE_FORMAT_POINTERS: [&str; 5] = [
+        "/response_format",
+        "/text/format",
+        "/output_config/format",
+        "/generationConfig/responseJsonSchema",
+        "/outputConfig/textFormat",
+    ];
+
+    /// Label, expected dialect, expected format pointer, the client's
+    /// reported dialect, and the request body it built.
+    type NativeFormatRow = (
+        &'static str,
+        Option<SchemaDialect>,
+        Option<&'static str>,
+        Option<SchemaDialect>,
+        Value,
+    );
 
     #[test]
     fn native_structured_output_is_sent_only_when_the_client_has_a_dialect() {
@@ -2753,11 +2760,11 @@ mod tests {
                 ..AppConfig::default()
             })
         };
-        let mut rows: Vec<(&str, Option<SchemaDialect>, Value)> = vec![];
+        let mut rows: Vec<NativeFormatRow> = vec![];
 
-        for (label, wire_api) in [
-            ("openai chat", WireApi::Chat),
-            ("openai responses", WireApi::Responses),
+        for (label, wire_api, pointer) in [
+            ("openai chat", WireApi::Chat, "/response_format"),
+            ("openai responses", WireApi::Responses, "/text/format"),
         ] {
             let config = openai::OpenAIConfig {
                 name: Some("so-openai".into()),
@@ -2779,6 +2786,8 @@ mod tests {
                 .unwrap();
             rows.push((
                 label,
+                Some(SchemaDialect::OpenAiStrict),
+                Some(pointer),
                 client.native_structured_output_dialect(),
                 request_data.body,
             ));
@@ -2798,32 +2807,46 @@ mod tests {
             azure_openai::prepare_chat_completions(&client, structured_output_data()).unwrap();
         rows.push((
             "azure",
+            Some(SchemaDialect::OpenAiStrict),
+            Some("/response_format"),
             client.native_structured_output_dialect(),
             request_data.body,
         ));
 
-        let client = OpenAICompatibleClient {
-            app_config: app_config(vec![]),
-            config: openai_compatible::OpenAICompatibleConfig {
-                name: Some("so-compat".into()),
-                api_base: Some("https://compat.example/v1".into()),
-                api_key: Some("sk-test".into()),
-                ..Default::default()
-            },
-            model: Model::new("so-compat", "gpt-test"),
-        };
-        let (request_data, _) = runtime
-            .block_on(openai_compatible::prepare_chat_completions(
-                &client,
-                &http,
-                structured_output_data(),
-            ))
-            .unwrap();
-        rows.push((
-            "openai-compatible",
-            client.native_structured_output_dialect(),
-            request_data.body,
-        ));
+        for (label, wire_api, pointer) in [
+            ("openai-compatible", None, "/response_format"),
+            (
+                "openai-compatible responses",
+                Some(WireApi::Responses),
+                "/text/format",
+            ),
+        ] {
+            let client = OpenAICompatibleClient {
+                app_config: app_config(vec![]),
+                config: openai_compatible::OpenAICompatibleConfig {
+                    name: Some("so-compat".into()),
+                    api_base: Some("https://compat.example/v1".into()),
+                    api_key: Some("sk-test".into()),
+                    wire_api,
+                    ..Default::default()
+                },
+                model: Model::new("so-compat", "gpt-test"),
+            };
+            let (request_data, _) = runtime
+                .block_on(openai_compatible::prepare_chat_completions(
+                    &client,
+                    &http,
+                    structured_output_data(),
+                ))
+                .unwrap();
+            rows.push((
+                label,
+                Some(SchemaDialect::OpenAiStrict),
+                Some(pointer),
+                client.native_structured_output_dialect(),
+                request_data.body,
+            ));
+        }
 
         let config = claude::ClaudeConfig {
             name: Some("so-claude".into()),
@@ -2844,6 +2867,8 @@ mod tests {
             .unwrap();
         rows.push((
             "claude",
+            Some(SchemaDialect::Anthropic),
+            Some("/output_config/format"),
             client.native_structured_output_dialect(),
             request_data.body,
         ));
@@ -2867,6 +2892,8 @@ mod tests {
             .unwrap();
         rows.push((
             "gemini",
+            Some(SchemaDialect::Gemini),
+            Some("/generationConfig/responseJsonSchema"),
             client.native_structured_output_dialect(),
             request_data.body,
         ));
@@ -2877,10 +2904,20 @@ mod tests {
             chrono::Utc::now().timestamp() + 3600,
             None,
         );
-        for (label, real_name) in [
-            ("vertex gemini", "gemini-2.5-pro"),
-            ("vertex claude", "claude-sonnet-4"),
-            ("vertex mistral", "mistral-large"),
+        for (label, real_name, expected_dialect, expected_pointer) in [
+            (
+                "vertex gemini",
+                "gemini-2.5-pro",
+                Some(SchemaDialect::Gemini),
+                Some("/generationConfig/responseJsonSchema"),
+            ),
+            (
+                "vertex claude",
+                "claude-sonnet-4",
+                Some(SchemaDialect::Anthropic),
+                Some("/output_config/format"),
+            ),
+            ("vertex mistral", "mistral-large", None, None),
         ] {
             let client = VertexAIClient {
                 app_config: app_config(vec![]),
@@ -2898,6 +2935,8 @@ mod tests {
                     .unwrap();
             rows.push((
                 label,
+                expected_dialect,
+                expected_pointer,
                 client.native_structured_output_dialect(),
                 request_data.body,
             ));
@@ -2920,7 +2959,13 @@ mod tests {
             .build()
             .unwrap();
         let body = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
-        rows.push(("bedrock", client.native_structured_output_dialect(), body));
+        rows.push((
+            "bedrock",
+            Some(SchemaDialect::Anthropic),
+            Some("/outputConfig/textFormat"),
+            client.native_structured_output_dialect(),
+            body,
+        ));
 
         let client = CohereClient {
             app_config: app_config(vec![]),
@@ -2935,15 +2980,22 @@ mod tests {
             cohere::prepare_chat_completions(&client, structured_output_data()).unwrap();
         rows.push((
             "cohere",
+            None,
+            None,
             client.native_structured_output_dialect(),
             request_data.body,
         ));
 
-        for (label, dialect, body) in rows {
+        for (label, expected_dialect, expected_pointer, dialect, body) in rows {
+            assert_eq!(dialect, expected_dialect, "{label}: dialect");
+            let present: Vec<&str> = NATIVE_FORMAT_POINTERS
+                .into_iter()
+                .filter(|pointer| body.pointer(pointer).is_some())
+                .collect();
             assert_eq!(
-                carries_native_structured_output(&body),
-                dialect.is_some(),
-                "{label}: dialect {dialect:?}, body {body}"
+                present,
+                Vec::from_iter(expected_pointer),
+                "{label}: format pointers, body {body}"
             );
         }
     }

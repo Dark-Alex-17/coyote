@@ -2856,6 +2856,10 @@ mod tests {
         let body = openai_build_responses_body(hello_data(false), &Model::new("openai", "gpt-test"));
 
         assert!(body.get("text").is_none(), "body: {body}");
+        assert_eq!(
+            body.to_string(),
+            r#"{"model":"gpt-test","input":[{"role":"user","content":"hello"}],"store":false,"include":["reasoning.encrypted_content"]}"#
+        );
     }
 }
 
