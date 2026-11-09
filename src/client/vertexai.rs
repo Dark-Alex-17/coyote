@@ -227,6 +227,12 @@ pub async fn gemini_chat_completions_streaming(
         let handle = |value: &str| -> Result<()> {
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
+            // Each chunk's `usageMetadata` is cumulative and the handler keeps
+            // the latest values, so chunks must never be summed.
+            if let Some(usage) = gemini_parse_usage(&data["usageMetadata"]) {
+                debug!("token-usage: {usage:?}");
+                handler.usage(usage);
+            }
             if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
                 for (i, part) in parts.iter().enumerate() {
                     if let Some(text) = part["text"].as_str() {
@@ -332,9 +338,41 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        usage: gemini_parse_usage(&data["usageMetadata"]),
         ..Default::default()
     };
     Ok(output)
+}
+
+/// `promptTokenCount` includes cached content, so cached tokens are
+/// subtracted to keep the buckets disjoint. Thinking tokens are billed as
+/// output but reported apart from `candidatesTokenCount`. Gemini has no
+/// cache-creation counter.
+pub fn gemini_parse_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+
+    let cached_tokens = usage["cachedContentTokenCount"].as_u64();
+    let input_tokens = usage["promptTokenCount"].as_u64().map(|v| {
+        v.saturating_add(usage["toolUsePromptTokenCount"].as_u64().unwrap_or(0))
+            .saturating_sub(cached_tokens.unwrap_or(0))
+    });
+    let output_tokens = match (
+        usage["candidatesTokenCount"].as_u64(),
+        usage["thoughtsTokenCount"].as_u64(),
+    ) {
+        (None, None) => None,
+        (candidates, thoughts) => {
+            Some(candidates.unwrap_or(0).saturating_add(thoughts.unwrap_or(0)))
+        }
+    };
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: cached_tokens,
+    })
 }
 
 pub fn gemini_build_chat_completions_body(
@@ -808,5 +846,151 @@ mod tests {
             ]),
             "body: {body}"
         );
+    }
+
+    #[test]
+    fn gemini_extract_parses_usage_metadata() {
+        let data = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "hi" }] } }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 30,
+                "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 5,
+                "toolUsePromptTokenCount": 4,
+            }
+        });
+
+        let usage = gemini_extract_chat_completions_text(&data)
+            .unwrap()
+            .usage
+            .unwrap();
+
+        assert_eq!(usage.input_tokens, Some(74));
+        assert_eq!(usage.output_tokens, Some(25));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn gemini_extract_usage_without_cached_content_has_no_cache_read() {
+        let data = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "hi" }] } }],
+            "usageMetadata": { "promptTokenCount": 100, "candidatesTokenCount": 20 }
+        });
+
+        let usage = gemini_extract_chat_completions_text(&data)
+            .unwrap()
+            .usage
+            .unwrap();
+
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn gemini_extract_without_usage_metadata_leaves_it_none() {
+        let data = json!({ "candidates": [{ "content": { "parts": [{ "text": "hi" }] } }] });
+
+        assert!(
+            gemini_extract_chat_completions_text(&data)
+                .unwrap()
+                .usage
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_keeps_the_last_cumulative_usage() {
+        let chunks = json!([
+            {
+                "candidates": [{ "content": { "parts": [{ "text": "a" }] } }],
+                "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 30, "candidatesTokenCount": 3, "toolUsePromptTokenCount": 4 }
+            },
+            {
+                "candidates": [{ "content": { "parts": [{ "text": "b" }] } }],
+                "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 30, "candidatesTokenCount": 10, "thoughtsTokenCount": 5, "toolUsePromptTokenCount": 4 }
+            },
+            {
+                "candidates": [{ "content": { "parts": [{ "text": "c" }] }, "finishReason": "STOP" }],
+                "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 30, "candidatesTokenCount": 20, "thoughtsTokenCount": 5, "toolUsePromptTokenCount": 4 }
+            }
+        ]);
+        let url =
+            super::super::openai::test_server::serve_once("application/json", chunks.to_string())
+                .await;
+        let builder = super::super::openai::test_server::client().post(url);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(sender, crate::utils::create_abort_signal());
+
+        gemini_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("vertexai", "gemini-test"),
+        )
+        .await
+        .unwrap();
+
+        let (text, _, _, usage) = handler.take();
+        assert_eq!(text, "abc");
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(74));
+        assert_eq!(usage.output_tokens, Some(25));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    fn mistral_client(name: &str) -> VertexAIClient {
+        set_access_token(
+            name,
+            "vertex-at".into(),
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+        VertexAIClient {
+            app_config: std::sync::Arc::new(crate::config::AppConfig::default()),
+            config: VertexAIConfig {
+                name: Some(name.into()),
+                project_id: Some("project".into()),
+                location: Some("us-central1".into()),
+                ..Default::default()
+            },
+            model: Model::new(name, "mistral-large"),
+        }
+    }
+
+    fn hello_data(stream: bool) -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream,
+            prompt_cache_ttl: None,
+        }
+    }
+
+    #[test]
+    fn mistral_bodies_omit_stream_options() {
+        let client = mistral_client("vertex-mistral-stream-usage-test");
+
+        for stream in [true, false] {
+            let request_data =
+                prepare_chat_completions(&client, hello_data(stream), &ModelCategory::Mistral)
+                    .unwrap();
+
+            assert!(
+                request_data.body.get("stream_options").is_none(),
+                "body: {}",
+                request_data.body
+            );
+            assert_eq!(request_data.body.get("stream").is_some(), stream);
+        }
     }
 }
