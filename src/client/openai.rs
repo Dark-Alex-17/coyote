@@ -371,9 +371,9 @@ pub async fn openai_chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-        // Usage arrives on its own final chunk with empty `choices`; every
-        // other chunk carries `"usage": null`. Moderation chunks also have
-        // empty `choices`, so the chunk is recognised by its usage object.
+        // Usage may arrive on any chunk (OpenAI/Azure send a trailing
+        // `choices: []` chunk; some compatible providers attach it to the
+        // finish chunk), so any usage object is consumed and `null` is skipped.
         if let Some(usage) = openai_parse_chat_usage(&data["usage"]) {
             debug!("token-usage: {usage:?}");
             handler.usage(usage);
@@ -1958,18 +1958,6 @@ mod tests {
     }
 
     fn prepare_with_stream(client: &OpenAIClient, stream: bool) -> Result<(RequestData, WireApi)> {
-        let data = ChatCompletionsData {
-            messages: vec![Message::new(
-                MessageRole::User,
-                MessageContent::Text("hello".to_string()),
-            )],
-            temperature: None,
-            top_p: None,
-            reasoning_effort: None,
-            functions: None,
-            stream,
-            prompt_cache_ttl: None,
-        };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1977,7 +1965,7 @@ mod tests {
             .block_on(prepare_chat_completions(
                 client,
                 &ReqwestClient::new(),
-                data,
+                hello_data(stream),
             ))
     }
 
@@ -2671,6 +2659,24 @@ mod tests {
         let (text, _, _, usage) = handler.take();
         assert_eq!(text, "Hi");
         assert!(usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_usage_on_the_finish_chunk_is_delivered() {
+        let handler = stream_chat(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"Hi"}}],"usage":null}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":" there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":7}}"#,
+            "[DONE]",
+        ])
+        .await;
+
+        let (text, _, _, usage) = handler.take();
+        assert_eq!(text, "Hi there");
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
     }
 
     fn stock_chat_client(name: &str) -> OpenAIClient {
