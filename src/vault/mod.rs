@@ -163,7 +163,7 @@ impl Vault {
                 .and_then(PromptAnswer::into_text)
                 .with_context(|| "unable to read secret from input")?;
             if value.is_empty() {
-                question = utils::reask("A response is required.", label);
+                question = crate::prompt::reask("A response is required.", label);
                 continue;
             }
             return Ok(value);

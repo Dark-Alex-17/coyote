@@ -48,7 +48,7 @@ use crate::prompt::{
     HeadlessPrompter, InquirePrompter, NeedsHuman, PromptAction, PromptAnswer, PromptMemory,
     PromptRequest, Prompter, human_present,
 };
-use crate::rag::Rag;
+use crate::rag::{Rag, RagInitRun};
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
@@ -57,8 +57,8 @@ use crate::turn::{StdoutSink, UiSink};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    ensure_prompts_available, estimate_token_length, fuzzy_filter, get_env_name, list_file_names,
-    now, render_prompt, temp_file,
+    estimate_token_length, fuzzy_filter, get_env_name, list_file_names, now, render_prompt,
+    temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -6440,6 +6440,7 @@ impl RequestContext {
             self.info_flag,
             agent_name,
             abort_signal.clone(),
+            Arc::clone(&self.prompter),
         )
         .await?;
         ensure_reasoning_effort_supported(&agent)?;
@@ -6701,6 +6702,7 @@ impl RequestContext {
             self.info_flag,
             name,
             abort_signal.clone(),
+            Arc::clone(&self.prompter),
         )
         .await?;
         ensure_reasoning_effort_supported(&agent)?;
@@ -7382,13 +7384,11 @@ impl RequestContext {
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
         let sync_hooks = RagSyncHooks::resolve(self);
+        let prompter = Arc::clone(&self.prompter);
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
-                // The init that follows asks on the terminal; refused
-                // before the previous temp rag is removed.
-                ensure_prompts_available()?;
                 if rag_path.exists() {
                     remove_file(&rag_path).with_context(|| {
                         format!("Failed to cleanup previous '{}' rag", super::TEMP_RAG_NAME)
@@ -7401,9 +7401,12 @@ impl RequestContext {
                             super::TEMP_RAG_NAME,
                             &rag_path,
                             &[],
-                            abort_signal.clone(),
                             false,
-                            sync_hooks,
+                            RagInitRun {
+                                abort_signal: abort_signal.clone(),
+                                sync_hooks,
+                                prompter: prompter.as_ref(),
+                            },
                         )
                         .await?,
                     ),
@@ -7420,6 +7423,7 @@ impl RequestContext {
                         let vault = vault.clone();
                         let rag_path = rag_path.clone();
                         let abort_signal = abort_signal.clone();
+                        let prompter = Arc::clone(&prompter);
                         async move {
                             if !rag_path.exists() {
                                 if working_mode.is_cmd() {
@@ -7430,9 +7434,12 @@ impl RequestContext {
                                     name,
                                     &rag_path,
                                     &[],
-                                    abort_signal.clone(),
                                     true,
-                                    sync_hooks,
+                                    RagInitRun {
+                                        abort_signal: abort_signal.clone(),
+                                        sync_hooks,
+                                        prompter: prompter.as_ref(),
+                                    },
                                 )
                                 .await
                             } else {
@@ -7461,7 +7468,7 @@ impl RequestContext {
         }
         let app = self.app.config.as_ref();
         let vault = self.app.vault.clone();
-        let rag = Rag::attach(app, &vault, name, &rag_path).await?;
+        let rag = Rag::attach(app, &vault, name, &rag_path, self.prompter.as_ref()).await?;
         let rag = Arc::new(rag);
         let key = RagKey::Named(name.to_string());
         self.rag_cache().insert(key.clone(), &rag);
@@ -11881,26 +11888,41 @@ mod tests {
         );
     }
 
-    /// `.rag` with no name rebuilds the temp rag through a run of
-    /// terminal questions; under the full-screen UI it is refused before
-    /// the previous temp rag is removed.
+    /// `.rag` with no name removes the previous temp rag and rebuilds it
+    /// through the wizard; under the full-screen UI the wizard's first
+    /// question, the embedding model, is a closed select through the
+    /// prompter.
     #[test]
     #[serial]
-    fn use_rag_under_the_tui_refuses_before_removing_the_temp_rag() {
+    fn use_rag_under_the_tui_asks_through_the_prompter() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
         ensure_parent_exists(&rag_path).unwrap();
         write(&rag_path, "driver: yaml\n").unwrap();
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let scripted = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Selected(
+            "not-an-offered-model".to_string(),
+        )]));
+        ctx.prompter = scripted.clone();
         let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
         assert!(
-            err.to_string().contains("not available in the TUI"),
+            !err.to_string().contains("not available in the TUI"),
             "{err}"
         );
         assert!(
-            rag_path.exists(),
-            "the refusal removed {}",
+            err.to_string()
+                .contains("is not one of the offered options"),
+            "{err}"
+        );
+        let [req] = scripted.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(req.question, "Select embedding model:");
+        assert!(req.closed);
+        assert!(!req.options.is_empty());
+        assert!(
+            !rag_path.exists(),
+            "the rebuild kept the previous temp rag at {}",
             rag_path.display()
         );
         assert!(ctx.rag.is_none());

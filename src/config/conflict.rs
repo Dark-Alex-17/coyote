@@ -120,6 +120,12 @@ fn is_interactive() -> bool {
     *IS_STDOUT_TERMINAL
 }
 
+/// Whether a question has somewhere to be shown: the full-screen UI's
+/// modal, or a terminal on stdout for an inquire widget.
+pub(crate) fn menu_can_use_terminal() -> bool {
+    crate::tui::active() || *IS_STDOUT_TERMINAL
+}
+
 /// Where a refused menu can be answered instead: the plain REPL when the
 /// full-screen UI is what stands in the way, a terminal otherwise.
 pub(crate) fn rerun_hint() -> &'static str {
@@ -283,6 +289,16 @@ mod tests {
             err.to_string().contains("not available in the TUI"),
             "{err}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn menu_can_use_terminal_is_true_under_the_tui_whatever_the_tty() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert!(menu_can_use_terminal());
+
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        assert_eq!(menu_can_use_terminal(), *IS_STDOUT_TERMINAL);
     }
 
     #[test]

@@ -531,9 +531,10 @@ fn hidden_verbs_stay_out_of_the_palette_cold_and_warm_under_slash() {
 }
 
 /// A hidden verb typed in full still runs: `.rag`, `.vault` and
-/// `.uninstall` under the TUI end in the TUI's refusal (or the command's
-/// own usage), never a hang or a crash, and the composer takes keys
-/// afterwards. The palette is simply not offering them; the command
+/// `.uninstall` under the TUI end in the command's own error or usage
+/// (`.rag` with no embedding model configured fails before it has
+/// anything to ask), never a hang or a crash, and the composer takes
+/// keys afterwards. The palette is simply not offering them; the command
 /// table still has them. (`.install`/`.update` reach the network.)
 #[test]
 #[serial]
@@ -547,14 +548,14 @@ fn a_hidden_verb_typed_in_full_still_runs_and_the_ui_survives() {
     pty.read_for(Duration::from_millis(500));
 
     for (verb, outcome) in [
-        ("rag", "Interactive prompts are not available"),
+        ("rag", "No available embedding model"),
         ("vault", "Usage: .vault"),
         ("uninstall", "Usage: .uninstall"),
     ] {
         let at = pty.raw().len();
         pty.send(format!(".{verb}\r").as_bytes()).unwrap();
         let started = Instant::now();
-        // The refusal is a command cell; wait for the command header to
+        // The outcome is a command cell; wait for the command header to
         // be committed, then for the composer to take keys again.
         pty.read_for(Duration::from_millis(1500));
         assert_composer_takes_keys(&mut pty, at, &format!("`.{verb}` typed in full"));
@@ -563,7 +564,7 @@ fn a_hidden_verb_typed_in_full_still_runs_and_the_ui_survives() {
             "`.{verb}` held the turn for {:?}",
             started.elapsed()
         );
-        // The command cell's header and its refusal or usage: the typed
+        // The command cell's header and its error or usage: the typed
         // line alone would also be echoed by the composer.
         let after = squeezed(&since(&pty, at));
         assert!(

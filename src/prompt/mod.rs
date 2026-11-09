@@ -265,6 +265,35 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
     Ok(answer)
 }
 
+pub(crate) fn confirm(prompter: &dyn Prompter, question: String, default: bool) -> Result<bool> {
+    let req = PromptRequest {
+        default: Some(json!(default)),
+        ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
+    };
+    ask(prompter, req).and_then(PromptAnswer::into_confirmed)
+}
+
+pub(crate) fn input(
+    prompter: &dyn Prompter,
+    question: &str,
+    default: Option<&str>,
+    help: Option<&str>,
+) -> Result<String> {
+    let req = PromptRequest {
+        default: default.map(|value| json!(value)),
+        help: help.map(str::to_string),
+        ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
+    };
+    ask(prompter, req).and_then(PromptAnswer::into_text)
+}
+
+/// The question asked again after a rejected answer. The label stays so
+/// the field keeps its name under the TUI, where the modal is all the
+/// user sees; the reason comes first so it is read before answering.
+pub(crate) fn reask(reason: &str, label: &str) -> String {
+    format!("{reason} {label}")
+}
+
 /// Draws the prompt as an inquire widget on the terminal.
 #[derive(Debug)]
 pub struct InquirePrompter {

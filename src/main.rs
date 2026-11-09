@@ -474,6 +474,7 @@ async fn run(
                 ctx.info_flag,
                 agent,
                 abort_signal.clone(),
+                Arc::clone(&ctx.prompter),
             )
             .await?;
             return Ok(());

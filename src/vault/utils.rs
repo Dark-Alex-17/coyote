@@ -1,6 +1,8 @@
 use crate::config::ensure_parent_exists;
 use crate::events::Origin;
-use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask};
+use crate::prompt::{
+    PromptAction, PromptAnswer, PromptRequest, Prompter, ask, confirm, input, reask,
+};
 use crate::sandbox::{SANDBOX_ENV_FLAG, sandbox_secret_env_var};
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,7 +16,6 @@ use gman::providers::local::LocalProvider;
 use gman::providers::one_password::OnePasswordProvider;
 use indoc::formatdoc;
 use log::debug;
-use serde_json::json;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,35 +43,6 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
             "A password file is required to utilize the Coyote vault. Please configure a password file in your config file and try again."
         ))
     }
-}
-
-fn confirm(prompter: &dyn Prompter, question: String, default: bool) -> Result<bool> {
-    let req = PromptRequest {
-        default: Some(json!(default)),
-        ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
-    };
-    ask(prompter, req).and_then(PromptAnswer::into_confirmed)
-}
-
-fn input(
-    prompter: &dyn Prompter,
-    question: &str,
-    default: Option<&str>,
-    help: Option<&str>,
-) -> Result<String> {
-    let req = PromptRequest {
-        default: default.map(|value| json!(value)),
-        help: help.map(str::to_string),
-        ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
-    };
-    ask(prompter, req).and_then(PromptAnswer::into_text)
-}
-
-/// The question asked again after a rejected answer. The label stays so
-/// the field keeps its name under the TUI, where the modal is all the
-/// user sees; the reason comes first so it is read before answering.
-pub(super) fn reask(reason: &str, label: &str) -> String {
-    format!("{reason} {label}")
 }
 
 /// Asks `label` until the answer is non-empty; an empty one is asked
@@ -568,6 +540,7 @@ mod tests {
     use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
     use crate::testing::AtomicFlagGuard;
     use anyhow::Error;
+    use serde_json::json;
     use serial_test::serial;
     use std::cell::RefCell;
 

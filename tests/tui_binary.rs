@@ -4272,6 +4272,131 @@ fn assert_refused_through_the_prompt_gate(flow: &GatedFlow) {
     }
 }
 
+/// Waits for the modal `command` raises after `before`: every squeezed
+/// marker and the modal's `Esc = cancel` legend are on screen, no refusal
+/// was printed on the way, and the terminal was never released.
+fn wait_for_the_modal(
+    pty: &mut Pty,
+    before: usize,
+    command: &str,
+    modal_markers: &[&str],
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let modal = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        assert!(
+            !since.contains(PROMPT_REFUSAL),
+            "`{command}` was refused instead of asked in the modal:\n{since}"
+        );
+        let flat = squeezed(&since);
+        if modal_markers.iter().all(|marker| flat.contains(marker)) && flat.contains("Esc=cancel") {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`{command}` did not raise the modal showing {modal_markers:?} within 10s:\n{since}"
+        );
+    };
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the question of `{command}` released the terminal:\n{modal}"
+    );
+    modal
+}
+
+/// Esc on the modal, then a repaint forced by a resize so the frame can
+/// be checked for the modal's legend being gone.
+fn esc_cancels_the_modal(pty: &mut Pty, command: &str) {
+    pty.read_for(HOTKEY_GAP);
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    pty.resize(60, 110).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(
+        !squeezed(&since).contains("Esc=cancel"),
+        "the modal of `{command}` is still up after Esc:\n{since}"
+    );
+}
+
+/// Drives one prompt-backed flow whose question is a modal under the UI:
+/// the modal showing the squeezed `modal_markers` comes up instead of a
+/// refusal, Esc cancels it, nothing of the flow is written to the config
+/// dir, the terminal is never released, and the UI keeps taking keys and
+/// leaves clean on Ctrl+D.
+fn assert_asks_in_the_modal_and_esc_cancels(flow: &GatedFlow, modal_markers: &[&str]) {
+    let dir = fresh_config_dir(flow.scenario);
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    if let Some(setup) = flow.setup {
+        setup(&dir);
+    }
+    let config_before = fs::read_to_string(dir.join("config.yaml")).unwrap();
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    for step in flow.prelude {
+        pty.send(format!("{step}\r").as_bytes()).unwrap();
+        pty.read_for(Duration::from_millis(800));
+    }
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(format!("{}\r", flow.command).as_bytes()).unwrap();
+    wait_for_the_modal(&mut pty, before, flow.command, modal_markers);
+    esc_cancels_the_modal(&mut pty, flow.command);
+
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in flow.footprints {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "{}: the cancelled `{}` still wrote {written:?}:\n{since}",
+            flow.scenario,
+            flow.command
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(dir.join("config.yaml")).unwrap(),
+        config_before,
+        "{}: the cancelled `{}` rewrote config.yaml:\n{since}",
+        flow.scenario,
+        flow.command
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "{}: the cancelled `{}` released the terminal:\n{since}",
+        flow.scenario,
+        flow.command
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: `.info` after the cancelled `{}` never rendered: {e:?}",
+                flow.scenario, flow.command
+            )
+        });
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{}: {transcript}", flow.scenario);
+    assert_tty_restored(&transcript);
+    for footprint in flow.footprints {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "{}: {written:?} appeared by the time the UI left:\n{transcript}",
+            flow.scenario
+        );
+    }
+}
+
 /// `.save role` on a temp role asks `Role name:` in a modal and writes the
 /// role file under that name.
 #[test]
@@ -4320,33 +4445,41 @@ fn dot_save_role_on_a_temp_role_asks_for_the_name_in_the_modal() {
     assert_tty_restored(&transcript);
 }
 
-/// `.vault add <name>` asks for the secret's value in the REPL.
+/// `.vault add <name>` asks for the secret's value; under the UI the
+/// question is the Password modal, and Esc leaves the vault untouched.
 #[test]
 #[serial]
-fn dot_vault_add_is_refused_through_the_prompt_gate() {
-    assert_refused_through_the_prompt_gate(&GatedFlow {
-        scenario: "gate-vault-add",
-        prelude: &[],
-        command: ".vault add vault-secret-g4r",
-        footprints: &["g4r", "vault"],
-        setup: None,
-        binary: None,
-    });
+fn dot_vault_add_asks_for_the_value_in_the_password_modal() {
+    assert_asks_in_the_modal_and_esc_cancels(
+        &GatedFlow {
+            scenario: "modal-vault-add",
+            prelude: &[],
+            command: ".vault add vault-secret-g4r",
+            footprints: &["g4r", "vault"],
+            setup: None,
+            binary: None,
+        },
+        &["Enterthesecretvalue:"],
+    );
 }
 
-/// `.rag <new-name>` asks which embedding model and documents to use in
-/// the REPL.
+/// `.rag <new-name>` asks which embedding model and documents to use;
+/// under the UI the first question is the Select modal listing the
+/// configured embedding models, and Esc leaves no rag behind.
 #[test]
 #[serial]
-fn dot_rag_for_a_new_rag_is_refused_through_the_prompt_gate() {
-    assert_refused_through_the_prompt_gate(&GatedFlow {
-        scenario: "gate-rag-create",
-        prelude: &[],
-        command: ".rag new-rag-g4r",
-        footprints: &["g4r", "/rags/"],
-        setup: Some(write_dry_run_config_with_embeddings),
-        binary: None,
-    });
+fn dot_rag_for_a_new_rag_asks_for_the_embedding_model_in_the_select_modal() {
+    assert_asks_in_the_modal_and_esc_cancels(
+        &GatedFlow {
+            scenario: "modal-rag-create",
+            prelude: &[],
+            command: ".rag new-rag-g4r",
+            footprints: &["g4r", "/rags/"],
+            setup: Some(write_dry_run_config_with_embeddings),
+            binary: None,
+        },
+        &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
+    );
 }
 
 /// `.update` on a Cargo-installed binary warns and asks `Update anyway?`
@@ -5551,70 +5684,52 @@ fn esc_on_the_incorporate_question_opens_no_session_and_the_next_n_seats_it_empt
     answer_and_expect_session(pty, b"n", name, true);
 }
 
-/// `.rag` with no name recreates the temporary rag in the REPL, removing
-/// the previous one and then asking which embedding model and documents
-/// to use; under the UI the gate refuses it before the removal, so a
-/// temp rag that already exists survives untouched, the terminal is never
-/// released, and the UI keeps taking keys and leaves clean.
+/// `.rag` with no name recreates the temporary rag, removing the previous
+/// one and then asking which embedding model and documents to use; under
+/// the UI the removal happens the same way and the embedding model is
+/// asked in the Select modal. Esc cancels it with no rag written in its
+/// place, the terminal is never released, and the UI keeps taking keys
+/// and leaves clean.
 #[test]
 #[serial]
-fn dot_rag_without_a_name_is_refused_before_the_temp_rag_is_removed() {
-    let dir = fresh_config_dir("gate-rag-temp");
+fn dot_rag_without_a_name_removes_the_temp_rag_and_asks_in_the_select_modal() {
+    let dir = fresh_config_dir("modal-rag-temp");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
     let rags = dir.join("rags");
     fs::create_dir_all(&rags).unwrap();
     let temp_rag = rags.join("temp.yaml");
-    let seeded = "embedding_model: dryrun:dry-embed-a\nchunk_size: 1000\nchunk_overlap: 50\ndocument_paths: []\nfiles: []\nmarker: temp-rag-survives-t3g\n";
+    let seeded = "embedding_model: dryrun:dry-embed-a\nchunk_size: 1000\nchunk_overlap: 50\ndocument_paths: []\nfiles: []\nmarker: temp-rag-seeded-t3g\n";
     fs::write(&temp_rag, seeded).unwrap();
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let before = pty.raw().len();
-    let sent = std::time::Instant::now();
     pty.send(b".rag\r").unwrap();
-    let since = pty
-        .wait_for_after(PROMPT_REFUSAL, before, PTY_DEADLINE)
-        .unwrap_or_else(|e| {
-            panic!(
-                "`.rag` was not refused with {PROMPT_REFUSAL:?}; the turn is waiting on a \
-                 keyboard prompt the UI cannot show, or went past the gate: {e:?}\n{}",
-                strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
-            )
-        });
-    let took = sent.elapsed();
-    assert!(
-        took < Duration::from_secs(10),
-        "the refusal of `.rag` took {took:?}; the gate did not run first:\n{since}"
+    let modal = wait_for_the_modal(
+        &mut pty,
+        before,
+        ".rag",
+        &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
     );
-    pty.read_for(Duration::from_millis(500));
     assert!(
-        temp_rag.exists(),
-        "the refused `.rag` removed the temp rag {}:\n{since}",
+        !temp_rag.exists(),
+        "`.rag` asked with the previous temp rag {} still in place:\n{modal}",
         temp_rag.display()
     );
-    assert_eq!(
-        fs::read_to_string(&temp_rag).unwrap(),
-        seeded,
-        "the refused `.rag` rewrote the temp rag:\n{since}"
-    );
-    assert_eq!(
-        count(pty.raw(), LEAVE_ALT),
-        0,
-        "the refused `.rag` released the terminal:\n{since}"
-    );
+    esc_cancels_the_modal(&mut pty, ".rag");
 
     let info_at = pty.raw().len();
     pty.send(b".info\r").unwrap();
     pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
-        .expect("`.info` after the refused `.rag` never rendered");
+        .expect("`.info` after the cancelled `.rag` never rendered");
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
     assert!(
-        temp_rag.exists(),
-        "the temp rag was gone by the time the UI left:\n{transcript}"
+        !temp_rag.exists(),
+        "a temp rag was written by the time the UI left:\n{transcript}"
     );
 }
 

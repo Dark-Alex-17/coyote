@@ -14,7 +14,7 @@ use crate::{
 
 use super::rag_cache::RagKey;
 use crate::config::builtin_manifest;
-use crate::config::conflict::{self, InstallMode, StickyMode};
+use crate::config::conflict::{self, InstallMode, StickyMode, menu_can_use_terminal};
 use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
@@ -27,7 +27,7 @@ use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
 use crate::prompt::{PromptAction, PromptRequest, Prompter, ask, human_present};
-use crate::rag::RagInitConfig;
+use crate::rag::{RagInitConfig, RagInitRun};
 use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
@@ -317,6 +317,7 @@ impl Agent {
         info_flag: bool,
         name: &str,
         abort_signal: AbortSignal,
+        prompter: Arc<dyn Prompter>,
     ) -> Result<Self> {
         let agent_data_dir = paths::agent_data_dir(name);
         let loaders = app.document_loaders.clone();
@@ -391,14 +392,16 @@ impl Agent {
             Some(rag)
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
-            if crate::tui::active() {
-                // The question has no modal of its own yet; the agent
-                // starts without its knowledge base rather than refusing.
-                eprintln!("The agent has documents attached; starting without RAG"); // TASK-388
-            } else if *IS_STDOUT_TERMINAL {
-                ans = Confirm::new("The agent has documents attached, init RAG?")
-                    .with_default(true)
-                    .prompt()?;
+            if menu_can_use_terminal() {
+                let req = PromptRequest {
+                    default: Some(json!(true)),
+                    ..PromptRequest::new(
+                        PromptAction::Confirm,
+                        "The agent has documents attached, init RAG?",
+                        Origin::detached(),
+                    )
+                };
+                ans = ask(prompter.as_ref(), req)?.into_confirmed()?;
             }
             if ans {
                 let document_paths =
@@ -408,6 +411,7 @@ impl Agent {
                 let rag_path_clone = rag_path.clone();
                 let abort = abort_signal.clone();
                 let sync_hooks = rag_sync_hooks.clone();
+                let prompter = Arc::clone(&prompter);
                 let rag = app_state
                     .rag_cache
                     .load_with(key, || async move {
@@ -416,9 +420,12 @@ impl Agent {
                             "rag",
                             &rag_path_clone,
                             &document_paths,
-                            abort,
                             true,
-                            sync_hooks,
+                            RagInitRun {
+                                abort_signal: abort,
+                                sync_hooks,
+                                prompter: prompter.as_ref(),
+                            },
                         )
                         .await
                     })
@@ -443,6 +450,7 @@ impl Agent {
                     info_flag,
                     abort_signal.clone(),
                     &rag_sync_hooks,
+                    &prompter,
                 )
                 .await?
             }
@@ -1368,6 +1376,7 @@ async fn init_graph_rags(
     info_flag: bool,
     abort_signal: AbortSignal,
     sync_hooks: &RagSyncHooks,
+    prompter: &Arc<dyn Prompter>,
 ) -> Result<HashMap<String, Arc<Rag>>> {
     let mut rags = HashMap::new();
     if info_flag {
@@ -1411,7 +1420,7 @@ async fn init_graph_rags(
                 && config.chunk_size.is_some()
                 && config.chunk_overlap.is_some();
             if !fully_specified {
-                if !*IS_STDOUT_TERMINAL {
+                if !menu_can_use_terminal() {
                     bail!(
                         "Agent '{agent_name}' requires RAG for rag node '{node_id}', but its \
                          knowledge base is not built and the node does not fully specify how \
@@ -1420,12 +1429,15 @@ async fn init_graph_rags(
                     );
                 }
 
-                ensure_prompts_available()?;
-                let ans = Confirm::new(&format!(
-                    "Initialize RAG knowledge base for rag node '{node_id}'?"
-                ))
-                .with_default(true)
-                .prompt()?;
+                let req = PromptRequest {
+                    default: Some(json!(true)),
+                    ..PromptRequest::new(
+                        PromptAction::Confirm,
+                        format!("Initialize RAG knowledge base for rag node '{node_id}'?"),
+                        Origin::detached(),
+                    )
+                };
+                let ans = ask(prompter.as_ref(), req)?.into_confirmed()?;
 
                 if !ans {
                     bail!(
@@ -1435,7 +1447,7 @@ async fn init_graph_rags(
                 }
 
                 if config.driver.is_none() {
-                    config.driver = Some(rag::select_rag_driver()?);
+                    config.driver = Some(rag::select_rag_driver(prompter.as_ref())?);
                 }
             }
 
@@ -1446,6 +1458,7 @@ async fn init_graph_rags(
             let name_clone = node_id.clone();
             let abort = abort_signal.clone();
             let sync_hooks = sync_hooks.clone();
+            let prompter = Arc::clone(prompter);
             app_state
                 .rag_cache
                 .load_with(key, || async move {
@@ -1455,8 +1468,11 @@ async fn init_graph_rags(
                         &path_clone,
                         &document_paths,
                         &config,
-                        abort,
-                        sync_hooks,
+                        RagInitRun {
+                            abort_signal: abort,
+                            sync_hooks,
+                            prompter: prompter.as_ref(),
+                        },
                     )
                     .await
                 })
@@ -2445,6 +2461,7 @@ nodes: {}
             false,
             name,
             create_abort_signal(),
+            Arc::new(ScriptedPrompter::refusing()),
         )
         .await
         .unwrap()
@@ -2607,6 +2624,90 @@ nodes: {}
                 "\n{DEFAULT_JOB_INSTRUCTIONS}{DEFAULT_TEAMMATE_INSTRUCTIONS}{DEFAULT_USER_INTERACTION_INSTRUCTIONS}"
             )
         );
+    }
+
+    /// Under the full-screen UI the RAG question is a confirm through
+    /// the prompter; declining it starts the agent without its
+    /// knowledge base.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn declining_the_rag_confirm_under_the_tui_starts_without_rag() {
+        let _guard = TestConfigDirGuard::new("agent-rag-confirm");
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let name = unique("rag_confirm");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_none());
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "The agent has documents attached, init RAG?");
+        assert_eq!(req.default, Some(json!(true)));
+    }
+
+    /// A graph's rag node whose knowledge base is not built asks the same
+    /// way; declining is fatal because the graph cannot run without it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn declining_a_rag_node_confirm_under_the_tui_fails_the_init() {
+        let _guard = TestConfigDirGuard::new("agent-rag-node-confirm");
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let name = unique("rag_node_confirm");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: lookup\nnodes:\n  lookup:\n    type: rag\n    documents: [notes.md]\n    next: done\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("rag node 'lookup' but its RAG was not initialized"),
+            "{err:#}"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(
+            req.question,
+            "Initialize RAG knowledge base for rag node 'lookup'?"
+        );
+        assert_eq!(req.default, Some(json!(true)));
     }
 
     fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {

@@ -8964,7 +8964,6 @@ mod tests {
             ("src/client/common.rs", "select_model", BEFORE_UI),
             ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
             ("src/client/macros.rs", "create_client_config", BEFORE_UI),
-            ("src/config/agent.rs", "init_graph_rags", PROMPT_GATED),
             ("src/config/bundles.rs", "resolve_bundle_name", PROMPT_GATED),
             ("src/config/conflict.rs", "select_choice", PROMPT_GATED),
             (
@@ -9032,19 +9031,6 @@ mod tests {
             ("src/prompt/mod.rs", "password", REPL_PROMPTER),
             ("src/prompt/mod.rs", "confirm", REPL_PROMPTER),
             ("src/prompt/mod.rs", "prompt", REPL_PROMPTER),
-            ("src/rag/mod.rs", "attach", PROMPT_GATED),
-            ("src/rag/mod.rs", "select_embedding_model", PROMPT_GATED),
-            ("src/rag/mod.rs", "select_rag_driver", PROMPT_GATED),
-            ("src/rag/mod.rs", "select_extractor_model", PROMPT_GATED),
-            ("src/rag/mod.rs", "set_chunk_size", PROMPT_GATED),
-            ("src/rag/mod.rs", "set_graph_hops", PROMPT_GATED),
-            ("src/rag/mod.rs", "set_chunk_overlay", PROMPT_GATED),
-            ("src/rag/mod.rs", "add_documents", PROMPT_GATED),
-            (
-                "src/rag/mod.rs",
-                "resolve_or_create_api_key_secret",
-                PROMPT_GATED,
-            ),
             ("src/repl/mod.rs", "handle_shell_passthrough", VIA_RUN_GATE),
             (
                 "src/utils/abort_signal.rs",
@@ -9331,10 +9317,6 @@ mod tests {
             (
                 "src/utils/input.rs",
                 "bail!(\"Keyboard prompts are not available in the TUI yet; unanswered: {question}\")",
-            ),
-            (
-                "src/config/agent.rs",
-                "eprintln!(\"The agent has documents attached; starting without RAG\");",
             ),
             (
                 "src/config/install_remote.rs",

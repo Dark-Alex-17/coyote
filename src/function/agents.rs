@@ -905,6 +905,7 @@ pub async fn run_agent_for_graph(
         info_flag,
         agent_name,
         child_abort.clone(),
+        Arc::clone(&parent_ctx.prompter),
     )
     .await?;
 
@@ -1501,6 +1502,7 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         info_flag,
         &agent_name,
         child_abort.clone(),
+        Arc::clone(&ctx.prompter),
     )
     .await?;
 
@@ -2808,6 +2810,7 @@ mod tests {
             false,
             &agent_name,
             create_abort_signal(),
+            Arc::clone(&ctx.prompter),
         ))
         .unwrap();
         ctx.agent = Some(agent);
