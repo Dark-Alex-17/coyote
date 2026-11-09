@@ -11,9 +11,11 @@ Status in this build: Coyote discovers propagation nodes from their announces (`
 `via: store_and_forward`). Held messages are fetched back automatically every `mesh.propagation_sync_interval_secs`
 seconds (default 300; `0` turns the automatic path off, including the join-time fetch) and once a propagation node is
 heard after the node joins; `.mesh sync` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
-node the same way. Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the
-first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`;
-`.mesh sync` is refused until then too); a held message whose sender has not announced since the restart is kept on
+node the same way. Coyote keeps the propagation nodes it has heard in `mesh/propagation-nodes.json` under its cache
+directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote
+that has never heard the node waits for the node's next announce (up to `announce_interval`, 61 minutes with the
+shipped `lxmd.config`; `.mesh sync` is refused until then too); a held message whose sender has not announced since
+the restart is kept on
 the node until it has been seen on three fetches and at least an hour (one peer heartbeat) has passed; then it is
 dropped. A Coyote node with `announce: false` never fetches on its own; `.mesh sync` does.
 
@@ -201,6 +203,12 @@ Deployment recipes and the trust model are in the wiki:
   discard script, if the node is reachable by strangers.
 - Upgrade by rebuilding with `--build-arg LXMF_VERSION=<version>` (and `RNS_VERSION` if needed) and starting the
   new image against the same volume; identity, config and held messages carry over.
+- The node announces every `announce_interval` minutes, 61 in the shipped `lxmd.config`, and not 60 or less: every
+  relay between this node and a Coyote rate-limits announces per destination (RNS `announce_rate_target` 3600 s,
+  `announce_rate_grace` 5, with a strict compare), so at an hour or less its announces are counted early often
+  enough that the relay stops forwarding them, and a Coyote that joins after that never hears the node.
+  `lxmd.config` is copied to `/data/lxmd/config` only on the first start: on a node set up from an earlier image,
+  set `announce_interval = 61` in `/data/lxmd/config` and restart the container (`docker restart coyote-pn`).
 - `reticulum.config` sets `enable_transport = Yes`, so the container also relays announces and paths between
   the team's Coyote nodes that dial it; `enable_node = yes` is what makes it store and forward for them. Sessions
   on one host reach each other through the host's local `rnsd` (`scripts/mesh-relay.sh --relay <node host>:4242`),

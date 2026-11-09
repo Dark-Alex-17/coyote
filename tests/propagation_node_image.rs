@@ -204,9 +204,19 @@ fn shipped_lxmd_config_enables_the_node_and_requires_auth() {
         .parse()
         .expect("announce_interval is minutes");
     assert!(
-        interval > 0 && interval <= 60,
-        "announce_interval should be short, got {interval}"
+        (61..=120).contains(&interval),
+        "announce_interval must stay over an hour, as a relay's announce rate check (3600 s, strict compare) stops forwarding a node announcing hourly or faster, and short enough that a late joiner hears the node soon; got {interval}"
     );
+    for reason in [
+        "announce_rate_target = 3600 s",
+        "announce_rate_grace = 5",
+        "strict compare",
+    ] {
+        assert!(
+            config.contains(reason),
+            "lxmd.config must say why the interval is 61 minutes ({reason:?})"
+        );
+    }
 }
 
 #[test]
@@ -680,9 +690,21 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
     );
     assert!(
         readme.contains(
-            "Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
+            "Coyote keeps the propagation nodes it has heard in `mesh/propagation-nodes.json` under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote that has never heard the node waits for the node's next announce (up to `announce_interval`, 61 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
         ),
-        "deployment README must say whose table is lost on restart and how long the first fetch can wait"
+        "deployment README must say the node table survives a restart and how long a first fetch can wait"
+    );
+    assert!(
+        readme.contains(
+            "`lxmd.config` is copied to `/data/lxmd/config` only on the first start: on a node set up from an earlier image, set `announce_interval = 61` in `/data/lxmd/config` and restart the container (`docker restart coyote-pn`)."
+        ),
+        "deployment README must tell an existing operator how to take the new announce interval"
+    );
+    assert!(
+        readme.contains(
+            "RNS `announce_rate_target` 3600 s, `announce_rate_grace` 5, with a strict compare"
+        ),
+        "deployment README must say why the interval is over an hour"
     );
     assert!(
         readme

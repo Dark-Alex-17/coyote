@@ -9932,3 +9932,48 @@ fn the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local()
         "the two-laptop walk still points a `private` entry at the loopback daemon:\n{prose}"
     );
 }
+
+/// The propagation-node section gives the shipped `announce_interval` as `lxmd.config`
+/// holds it, says why it is over an hour (a relay's announce rate check, strict compare),
+/// that the node table survives a restart, and how an existing node takes the new value.
+#[test]
+fn mesh_deployment_says_why_the_shipped_propagation_node_announces_every_61_minutes() {
+    let config = read(repo_root().join("deployment/propagation-node/lxmd.config"));
+    let interval = config
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("announce_interval = "))
+        .expect("lxmd.config sets announce_interval")
+        .trim()
+        .to_string();
+    assert_eq!(
+        interval, "61",
+        "the page says 61 minutes; reword it and this pin with the config"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Deployment.md"));
+    let text = flat(&section(
+        "Mesh-Deployment.md",
+        &page,
+        "## Propagation nodes",
+    ));
+    for needle in [
+        "The node table is kept across restarts (`propagation-nodes.json`)",
+        "(up to `announce_interval`, 61 minutes with the shipped `lxmd.config`)",
+        "The shipped node announces every 61 minutes, not every hour or more often.",
+        "(RNS `announce_rate_target` 3600 s, `announce_rate_grace` 5) with a strict compare",
+        "stops forwarding the node's announces, and a Coyote that joins after that never hears the node",
+        "`lxmd.config` is copied to `/data/lxmd/config` only on the first start, so on a node set up from an earlier image, set `announce_interval = 61` there and restart the container.",
+    ] {
+        assert!(
+            text.contains(needle),
+            "Mesh-Deployment.md's propagation-node section lacks {needle:?}"
+        );
+    }
+    for stale in ["30 minutes", "The node table is not kept across"] {
+        assert!(
+            !text.contains(stale),
+            "Mesh-Deployment.md's propagation-node section still says {stale:?}"
+        );
+    }
+}

@@ -120,6 +120,11 @@ function Get-InterfaceText {
     # brand-new Coyote identity's first announce. Off here, as on the repo's test relay.
     ingress_control = No
 '@
+  # The team relay is often the propagation node from deployment/propagation-node. Its
+  # lxmd.config announces every 61 minutes, not 60: this rnsd, like every transport node,
+  # rate-limits announces per destination (announce_rate_target 3600 s, grace 5, a strict
+  # compare) and stops forwarding a node that announces hourly or faster, so a session that
+  # joins later would never hear the node through it.
   if ($script:RelayHost) {
     $text += @"
 
