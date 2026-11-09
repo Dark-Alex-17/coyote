@@ -1,11 +1,3 @@
-#![cfg_attr( // TASK-436
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the provider request builders and graph structured-output path"
-    )
-)]
-
 use serde_json::{Map, Value, json};
 
 const MAX_SCHEMA_NAME_LEN: usize = 64;

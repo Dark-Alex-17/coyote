@@ -1,6 +1,6 @@
 use super::llm::{CompletionFuture, quiet_transport};
 use crate::client::ApiStatusError;
-use crate::client::structured_output::{SchemaDialect, StructuredOutputSpec};
+use crate::client::structured_output::{SchemaDialect, StructuredOutputSpec, strip_injected_nulls};
 use crate::config::{Input, RequestContext, Role, RoleLike};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, bail};
@@ -101,18 +101,29 @@ fn format_rejection_reason(err: &anyhow::Error) -> Option<String> {
     })
 }
 
+/// `producer_dialect` is the native format the model that wrote `raw` ran
+/// under; OpenAI strict mode forces optional properties into nullable
+/// required ones, so those injected nulls are stripped again.
 pub async fn extract(
     raw: &str,
     schema: &Value,
     parent_ctx: &mut RequestContext,
     abort: &AbortSignal,
+    producer_dialect: Option<SchemaDialect>,
 ) -> Result<Value> {
-    if let Some(parsed) = try_parse_json(raw) {
+    if let Some(mut parsed) = try_parse_json(raw) {
+        strip_nulls_for(producer_dialect, &mut parsed, schema);
         return Ok(parsed);
     }
 
     let mut transport = quiet_transport(abort.clone());
     extract_via_extractor(raw, schema, parent_ctx, abort, &mut transport).await
+}
+
+pub(crate) fn strip_nulls_for(dialect: Option<SchemaDialect>, value: &mut Value, schema: &Value) {
+    if dialect == Some(SchemaDialect::OpenAiStrict) {
+        strip_injected_nulls(value, schema);
+    }
 }
 
 /// Runs the extractor, repair pass included, on a fresh native-format state
@@ -150,11 +161,15 @@ async fn extract_with_repair(
     parent_ctx.role = Some(role);
     let result = run_one_shot(&prompt, parent_ctx, abort, transport).await;
     parent_ctx.role = saved_role;
+    let extractor_dialect = parent_ctx.native_format.last_dialect;
 
     let output = result.context("Structured-output extractor LLM call failed")?;
 
     match try_parse_json(&output) {
-        Some(value) => Ok(value),
+        Some(mut value) => {
+            strip_nulls_for(extractor_dialect, &mut value, schema);
+            Ok(value)
+        }
         None if is_repair => bail!(
             "Structured-output extractor failed to produce valid JSON after repair retry. \
              Last response:\n{output}"
@@ -210,7 +225,7 @@ async fn run_one_shot(
     Ok(output)
 }
 
-fn try_parse_json(raw: &str) -> Option<Value> {
+pub(crate) fn try_parse_json(raw: &str) -> Option<Value> {
     let cleaned = strip_code_fences(strip_thinking_blocks(raw.trim()));
     serde_json::from_str(cleaned).ok()
 }
@@ -624,6 +639,119 @@ mod tests {
             assert_eq!(seen, vec![NativeFormatState::default()]);
             assert_eq!(ctx.native_format, caller, "succeeds {succeeds}");
         }
+    }
+
+    fn groups_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "groups": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "domain": {"type": "string"},
+                            "files": {"type": "array", "items": {"type": "string"}},
+                            "rationale": {"type": "string"}
+                        },
+                        "required": ["domain", "files"]
+                    }
+                }
+            },
+            "required": ["groups"]
+        })
+    }
+
+    const GROUPS_WITH_NULL: &str = r#"{"groups":[{"domain":"a","files":[],"rationale":null}]}"#;
+
+    #[tokio::test]
+    async fn extract_strips_injected_nulls_for_an_openai_strict_producer() {
+        let mut ctx = make_ctx();
+
+        let value = extract(
+            GROUPS_WITH_NULL,
+            &groups_schema(),
+            &mut ctx,
+            &create_abort_signal(),
+            Some(SchemaDialect::OpenAiStrict),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"groups": [{"domain": "a", "files": []}]}));
+    }
+
+    #[tokio::test]
+    async fn extract_keeps_nulls_without_a_producer_dialect() {
+        let mut ctx = make_ctx();
+
+        let value = extract(
+            GROUPS_WITH_NULL,
+            &groups_schema(),
+            &mut ctx,
+            &create_abort_signal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({"groups": [{"domain": "a", "files": [], "rationale": null}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn extractor_strips_nulls_when_its_own_call_ran_openai_strict() {
+        let mut ctx = structured_ctx();
+        let mut transport = format_call(|_input, _ctx| {
+            boxed_completion(async { Ok((GROUPS_WITH_NULL.to_string(), vec![])) })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &groups_schema(),
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"groups": [{"domain": "a", "files": []}]}));
+    }
+
+    #[tokio::test]
+    async fn extractor_keeps_nulls_when_its_own_call_ran_without_the_format() {
+        let mut ctx = structured_ctx();
+        ctx.native_format.last_dialect = Some(SchemaDialect::OpenAiStrict);
+        let mut calls = 0;
+        let mut transport = format_call(|_input, _ctx| {
+            calls += 1;
+            let first = calls == 1;
+            boxed_completion(async move {
+                if first {
+                    Err(api_error(400, "rejected"))
+                } else {
+                    Ok((GROUPS_WITH_NULL.to_string(), vec![]))
+                }
+            })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &groups_schema(),
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({"groups": [{"domain": "a", "files": [], "rationale": null}]})
+        );
     }
 
     #[test]

@@ -59,8 +59,9 @@ async fn decide(
     let (raw, _) = runner(input, ctx, abort.clone())
         .await
         .context("Graph route classifier call failed")?;
+    let producer_dialect = ctx.native_format.last_dialect;
     let schema: Value = serde_json::from_str(ROUTE_SCHEMA)?;
-    let value = structured::extract(&raw, &schema, ctx, abort)
+    let value = structured::extract(&raw, &schema, ctx, abort, producer_dialect)
         .await
         .context("Graph route classifier could not read the decision")?;
     match value.get("decision").and_then(Value::as_str) {

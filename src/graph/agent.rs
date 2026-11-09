@@ -187,7 +187,7 @@ async fn attempt_and_extract(
         .clone()
         .unwrap_or_else(create_abort_signal);
     let output_value = match &node.output_schema {
-        Some(schema) => structured::extract(&raw, schema, parent_ctx, &abort)
+        Some(schema) => structured::extract(&raw, schema, parent_ctx, &abort, None)
             .await
             .with_context(|| {
                 format!(

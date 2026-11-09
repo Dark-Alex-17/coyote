@@ -65,15 +65,18 @@ async fn finish(
 ) -> Result<LlmExecutionOutcome> {
     let (output, failure_reason) = match result {
         Ok(raw) => match &node.output_schema {
-            Some(schema) => match structured::extract(&raw, schema, parent_ctx, abort).await {
-                Ok(value) => (value, None),
-                Err(e) => {
-                    warn!("llm node structured extraction failed: {e:#}");
-                    (
-                        Value::String(format!("LLM node structured-extraction failed: {e:#}")),
-                        Some(format!("structured-extraction failed: {e:#}")),
-                    )
-                }
+            Some(schema) => match parse_native_final_turn(parent_ctx, schema) {
+                Some(value) => (value, None),
+                None => match structured::extract(&raw, schema, parent_ctx, abort, None).await {
+                    Ok(value) => (value, None),
+                    Err(e) => {
+                        warn!("llm node structured extraction failed: {e:#}");
+                        (
+                            Value::String(format!("LLM node structured-extraction failed: {e:#}")),
+                            Some(format!("structured-extraction failed: {e:#}")),
+                        )
+                    }
+                },
             },
             None => (Value::String(raw), None),
         },
@@ -88,6 +91,15 @@ async fn finish(
 
     apply_state_updates_with_output(node, state_manager, &output);
     outcome_from(failure_reason.as_deref(), node.fallback.as_deref())
+}
+
+/// The final turn alone, when it ran under the native format, is the
+/// schema-constrained answer; earlier turns' prose is not part of it.
+fn parse_native_final_turn(ctx: &mut RequestContext, schema: &Value) -> Option<Value> {
+    let (text, dialect) = ctx.native_format.final_turn.take()?;
+    let mut value = structured::try_parse_json(&text)?;
+    structured::strip_nulls_for(Some(dialect), &mut value, schema);
+    Some(value)
 }
 
 fn outcome_from(
@@ -287,12 +299,25 @@ pub(crate) type CompletionRunner<'f> = dyn for<'a> FnMut(&'a Input, &'a mut Requ
 pub(crate) fn default_completion_runner()
 -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 {
-    |input, ctx, abort| {
+    completion_runner_with(quiet_transport)
+}
+
+/// The production runner over the transport `make_transport` builds for
+/// each call; tests pass a fake transport to drive the format fallback.
+fn completion_runner_with<T, F>(
+    make_transport: F,
+) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+where
+    F: Fn(AbortSignal) -> T + Send,
+    T: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send + 'static,
+{
+    move |input, ctx, abort| {
+        let transport = make_transport(abort);
         Box::pin(async move {
             let client = input.create_client()?;
             let dialect = input.native_structured_output(client.as_ref());
             ctx.before_chat_completion(input)?;
-            with_native_format_fallback(dialect, input, ctx, quiet_transport(abort)).await
+            with_native_format_fallback(dialect, input, ctx, transport).await
         })
     }
 }
@@ -400,6 +425,7 @@ async fn run_chat_loop(
     let role_for_input = ctx.role.clone();
     let mut input = Input::from_str(ctx, prompt, role_for_input)?;
     let mut accumulated = String::new();
+    ctx.native_format.final_turn = None;
 
     let mut turn: u32 = 0;
     loop {
@@ -407,6 +433,7 @@ async fn run_chat_loop(
             bail!("llm node aborted");
         }
         let (output, tool_results) = runner(&input, ctx, abort.clone()).await?;
+        let turn_dialect = ctx.native_format.last_dialect;
         // Defence in depth: the transport bails on abort itself; this closes
         // the window between its check and ours.
         if abort.aborted() {
@@ -439,13 +466,17 @@ async fn run_chat_loop(
                     warn!("llm node '{node_id}' returned an empty completion on turn {turn}");
                     bail!("empty completion: model returned no text and no tool calls");
                 }
-                GuardrailAction::NoAction => return Ok(accumulated),
+                GuardrailAction::NoAction => {
+                    ctx.native_format.final_turn = turn_dialect.map(|d| (output, d));
+                    return Ok(accumulated);
+                }
                 GuardrailAction::ForceTerminate(ids) => {
                     warn!(
                         "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
                         ids.len(),
                         ids
                     );
+                    ctx.native_format.final_turn = turn_dialect.map(|d| (output, d));
                     return Ok(accumulated);
                 }
                 GuardrailAction::Inject(prompt) => {
@@ -2242,5 +2273,140 @@ mod tests {
             false,
         );
         assert_eq!(calls, vec![expected.clone(), expected]);
+    }
+
+    fn done_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"done": {"type": "boolean"}, "note": {"type": "string"}},
+            "required": ["done"]
+        })
+    }
+
+    /// Runs a schema node whose first turn says some prose and calls a tool
+    /// and whose second turn answers with JSON, marking that turn native when
+    /// `final_dialect` is set; returns the outcome, the final state and the
+    /// number of model calls.
+    async fn run_two_turn_schema_node(
+        final_dialect: Option<crate::client::structured_output::SchemaDialect>,
+        updates: Option<HashMap<String, String>>,
+    ) -> (Result<LlmExecutionOutcome>, StateManager, u32) {
+        use crate::function::ToolCall;
+
+        let mut node = node_with_schema(updates, done_schema());
+        node.fallback = Some("fb".into());
+        let mut state = manager_with(&[]);
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+        let mut calls = 0u32;
+
+        let result = run(
+            "decide",
+            &node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, ctx, _abort| {
+                calls += 1;
+                if calls == 1 {
+                    ctx.native_format.last_dialect = None;
+                    boxed_completion(async {
+                        let call = ToolCall::new("t".into(), json!({}), Some("id-0".into()));
+                        Ok((
+                            "let me check".to_string(),
+                            vec![ToolResult::new(call, json!("ok"))],
+                        ))
+                    })
+                } else {
+                    ctx.native_format.last_dialect = final_dialect;
+                    boxed_completion(async {
+                        Ok((r#"{"done": true, "note": null}"#.to_string(), vec![]))
+                    })
+                }
+            }),
+        )
+        .await;
+        let outcome = finish(&node, &mut state, &mut ctx, result, &abort).await;
+        (outcome, state, calls)
+    }
+
+    #[tokio::test]
+    async fn native_final_turn_is_parsed_without_the_extractor() {
+        let (outcome, state, calls) = run_two_turn_schema_node(
+            Some(crate::client::structured_output::SchemaDialect::OpenAiStrict),
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(calls, 2);
+        assert_eq!(state.state().get("done"), Some(&json!(true)));
+        assert_eq!(state.state().get("note"), None);
+    }
+
+    #[tokio::test]
+    async fn final_turn_without_the_format_extracts_from_the_accumulated_text() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let (outcome, state, calls) = run_two_turn_schema_node(None, Some(u)).await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::FellBack("fb".into()));
+        assert_eq!(calls, 2);
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("captured failure text is a string")
+            .to_string();
+        assert!(
+            captured.contains("Structured-output extractor LLM call failed: "),
+            "{captured}"
+        );
+    }
+
+    fn transport_call<F>(f: F) -> F
+    where
+        F: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send,
+    {
+        f
+    }
+
+    #[tokio::test]
+    async fn completion_runner_retries_without_the_format_after_a_400() {
+        let mut ctx = openai_ctx();
+        let mut role = Role::new("r", "");
+        role.set_model(structured_model());
+        role.set_structured_output(Some(StructuredOutputSpec {
+            name: "answer".to_string(),
+            schema: json!({"type": "object"}),
+        }));
+        let input = Input::from_str(&ctx, "hi", Some(role)).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = completion_runner_with(|_abort| {
+            let seen = Arc::clone(&seen);
+            transport_call(move |input, _ctx| {
+                let has_spec = input.role().structured_output().is_some();
+                seen.lock().unwrap().push(has_spec);
+                boxed_completion(async move {
+                    if has_spec {
+                        Err(Error::new(crate::client::ApiStatusError {
+                            status: 400,
+                            message: "rejected".to_string(),
+                        }))
+                    } else {
+                        Ok(("ok".to_string(), vec![]))
+                    }
+                })
+            })
+        });
+
+        let (output, _) = runner(&input, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(output, "ok");
+        assert_eq!(*seen.lock().unwrap(), vec![true, false]);
+        assert!(ctx.native_format.rejected);
     }
 }
