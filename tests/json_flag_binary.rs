@@ -173,8 +173,12 @@ fn write_config(dir: &Path, port: u16, stream: bool) {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
+    run_with_stdin(dir, args, None)
+}
+
+fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
@@ -190,9 +194,20 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(text) = stdin {
+        let mut pipe = child.stdin.take().unwrap();
+        pipe.write_all(text.as_bytes()).unwrap();
+    }
+    child.wait_with_output().unwrap()
 }
 
 fn combined(output: &Output) -> String {
@@ -324,4 +339,151 @@ fn a_failed_model_call_prints_the_error_wrapper_and_exits_1() {
     assert!(!error.is_empty(), "{report}");
     assert_eq!(report["model"], json!("stub:stub-model"), "{report}");
     assert!(!output.stderr.is_empty(), "{}", combined(&output));
+}
+
+// ---- usage-probe additions (spec-first, TASK-431 D12 / R1-10) ----
+
+const USAGE_KEYS: [&str; 4] = [
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+];
+
+fn usage_keys(report: &Value) -> Vec<String> {
+    report["usage"]
+        .as_object()
+        .unwrap_or_else(|| panic!("usage must be an object: {report}"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn reported_token_counts_land_in_usage_and_unreported_ones_are_null() {
+    let output = json_run("usage", Behaviour::Answer, false, &["--json", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(usage_keys(&report), USAGE_KEYS, "{report}");
+    assert_eq!(report["usage"]["input_tokens"], json!(1), "{report}");
+    assert_eq!(report["usage"]["output_tokens"], json!(1), "{report}");
+    assert_eq!(
+        report["usage"]["cache_read_input_tokens"],
+        Value::Null,
+        "{report}"
+    );
+    assert_eq!(
+        report["usage"]["cache_creation_input_tokens"],
+        Value::Null,
+        "{report}"
+    );
+    // The stub model has no pricing, so the cost cannot be computed (R1-10).
+    assert_eq!(report["total_cost_usd"], Value::Null, "{report}");
+}
+
+#[test]
+fn a_stream_without_usage_reports_every_usage_field_as_null() {
+    let output = json_run("stream-usage", Behaviour::Answer, true, &["--json", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(usage_keys(&report), USAGE_KEYS, "{report}");
+    for key in USAGE_KEYS {
+        assert_eq!(report["usage"][key], Value::Null, "{key}: {report}");
+    }
+}
+
+#[test]
+fn a_prompt_piped_on_stdin_is_enough() {
+    let dir = TempDir::new("stdin");
+    write_config(&dir.0, serve(Behaviour::Answer), false);
+    let output = run_with_stdin(&dir.0, &["--json"], Some("hi from stdin\n"));
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!(REPLY), "{report}");
+    assert_eq!(report["is_error"], json!(false), "{report}");
+}
+
+#[test]
+fn a_file_alone_is_enough_of_a_prompt() {
+    let dir = TempDir::new("file");
+    write_config(&dir.0, serve(Behaviour::Answer), false);
+    let file = dir.0.join("prompt.txt");
+    fs::write(&file, "summarise me\n").unwrap();
+    let output = run(&dir.0, &["--json", "-f", file.to_str().unwrap()]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!(REPLY), "{report}");
+}
+
+#[test]
+fn a_failed_call_counts_as_a_turn_and_adds_no_usage() {
+    let output = json_run(
+        "500-usage",
+        Behaviour::ServerError,
+        false,
+        &["--json", "hi"],
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
+    let report = the_only_object(&output);
+    let keys: Vec<&str> = report
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, KEYS, "{report}");
+    assert!(report["num_turns"].as_u64().unwrap_or(0) >= 1, "{report}");
+    assert_eq!(usage_keys(&report), USAGE_KEYS, "{report}");
+    for key in USAGE_KEYS {
+        assert_eq!(report["usage"][key], Value::Null, "{key}: {report}");
+    }
+    assert_eq!(report["session_id"], Value::Null, "{report}");
+}
+
+#[test]
+fn stdout_printing_flags_are_rejected_alongside_json_before_anything_runs() {
+    let dir = TempDir::new("conflicts");
+    write_config(&dir.0, serve(Behaviour::Answer), false);
+    let flags: &[&[&str]] = &[
+        &["-e"],
+        &["-c"],
+        &["--dry-run"],
+        &["--raw-markdown"],
+        &["--macro", "x"],
+        &["--acp-server"],
+        &["--memory-migrate", "global"],
+        &["--list-models"],
+        &["--list-roles"],
+        &["--list-sessions"],
+        &["--list-agents"],
+        &["--list-rags"],
+        &["--list-macros"],
+        &["--list-skills"],
+        &["--info"],
+        &["--init-memory", "global"],
+        &["--init-instructions"],
+        &["--sync-models"],
+        &["--build-tools"],
+        &["--completions", "bash"],
+        &["--tail-logs"],
+    ];
+    for flag in flags {
+        let mut args = vec!["--json"];
+        args.extend_from_slice(flag);
+        args.push("hi");
+        let output = run(&dir.0, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flag:?}\n{}",
+            combined(&output)
+        );
+        assert!(output.stdout.is_empty(), "{flag:?}\n{}", combined(&output));
+    }
+    assert!(!dir.0.join("COYOTE.md").exists(), "--init-instructions ran");
 }
