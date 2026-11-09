@@ -23266,7 +23266,7 @@ mod tests {
             "structurally implies",
             "not as a DIVERGES finding",
             "never dropped",
-            "| adversary | `ADVERSARIAL_REVIEW: CONFORMS \\| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |",
+            "| adversary | `ADVERSARIAL_REVIEW: CONFORMS \\| DIVERGES` | DIVERGES (each numbered item under the report's `Complaints:` line becomes its own blocker, so a fix round can act on it: at most 8, each clipped to 600 characters, the rest folded into one line of their heads); own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |",
         ] {
             assert!(
                 gauntlet.contains(claim),
@@ -27431,7 +27431,7 @@ mod tests {
             "{report}"
         );
         assert!(
-            !report.contains("adversary: DIVERGES — the implementation does not conform"),
+            !report.contains("adversary: DIVERGES"),
             "a degraded run must not be reported as a DIVERGES finding: {report}"
         );
 
@@ -27474,7 +27474,7 @@ mod tests {
                 "{degraded:?} must render as a degraded lane: {report}"
             );
             assert!(
-                !report.contains("adversary: DIVERGES — the implementation does not conform"),
+                !report.contains("adversary: DIVERGES"),
                 "{degraded:?} must not be reported as a DIVERGES finding: {report}"
             );
         }
@@ -28622,10 +28622,7 @@ mod tests {
             report.contains("| adversary | BLOCKED | PIPELINE-FAULT (degraded lane) |"),
             "the real degraded header must render as a pipeline fault: {report}"
         );
-        assert!(
-            !report.contains("adversary: DIVERGES — the implementation does not conform"),
-            "{report}"
-        );
+        assert!(!report.contains("adversary: DIVERGES"), "{report}");
         let out = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("adversary", degraded));
         assert_eq!(
             out["retry_lanes"],
@@ -28722,10 +28719,7 @@ mod tests {
                 report.contains("| adversary | BLOCKED | PIPELINE-FAULT (degraded lane) |"),
                 "the real degraded header must render as a pipeline fault: {report}"
             );
-            assert!(
-                !report.contains("adversary: DIVERGES — the implementation does not conform"),
-                "{report}"
-            );
+            assert!(!report.contains("adversary: DIVERGES"), "{report}");
             let out =
                 run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("adversary", degraded));
             assert_eq!(

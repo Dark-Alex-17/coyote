@@ -1534,6 +1534,7 @@ nodes:
       {{adversary_prompt}}
     inputs:
       verification_commands: '{{verification_commands_json}}'
+      debris_exclude: '{{debris_exclude}}'
     timeout: 7200
     max_attempts: 1
     state_updates:

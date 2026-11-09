@@ -105,7 +105,8 @@ those rules are *structure*:
   argument of `agent__spawn`) or one directory name. Empty means none; a
   value that is neither a string nor a list of strings (`false`, `0`) is
   rejected rather than read as none, and any invalid value is a lint crash,
-  so it blocks.
+  so it blocks. The adversary lane receives the same value through its
+  `inputs:`, so its own debris lint leaves out the same directories.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
   with no `teammates:` flag — no cross-lane messaging, by construction.
 - **Failure fails closed, structurally** (`fallback:` routes + `PIPELINE-FAULT`
@@ -180,7 +181,7 @@ still appear under `## Blockers` and must be fixed as usual.
 | Lane | Sentinel | Blocks on |
 |------|----------|-----------|
 | code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault; own verdict reason opens with `review incomplete:` (incomplete review) |
-| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
+| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES (each numbered item under the report's `Complaints:` line becomes its own blocker, so a fix round can act on it: at most 8, each clipped to 600 characters, the rest folded into one line of their heads); own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; INCONCLUSIVE (environment note); missing sentinel |
 | debris | none -- `debris_lint.py` findings read directly from state | any non-ASCII-punctuation or planning-artefact hit on an added line; a crashed lint (PIPELINE-FAULT, `GAUNTLET_REVIEW_INCOMPLETE: debris`) |

@@ -421,6 +421,7 @@ nodes:
     inputs:
       verification_commands: '{{verification_commands}}'
       build_lock: '{{build_lock}}'
+      debris_exclude: '{{debris_exclude}}'
     prompt: |
       Adversarial plan-conformance review in {{project_dir}}.
 

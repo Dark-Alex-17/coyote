@@ -379,6 +379,25 @@ def raise_escalation(state, updates, esc):
     return updates
 
 
+# The engine's answer to a free-text question when no human is available (HEADLESS_GUIDANCE in
+# src/function/user_interaction.rs; a test there pins this copy to it).
+HEADLESS_GUIDANCE = "No human is available to answer. Go with the recommended option; if none is marked, use your best judgment."
+
+
+def headless_recommended(text, options):
+    """The recommended option's text when the reply is exactly the headless guidance; None otherwise or with none marked."""
+    if (text or "").strip() != HEADLESS_GUIDANCE:
+        return None
+    return next((o["text"] for o in options or [] if truthy(o.get("recommended"))), None)
+
+
+def review_fault(blocker):
+    """A gauntlet blocker that records a review fault, not a finding; an adversary complaint quoting the words is a finding."""
+    if blocker.startswith("adversary: DIVERGES"):
+        return False
+    return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
+
+
 def match_option(text, options):
     """Map a user reply to an option text: a 1-based number, exact, prefix, or 'recommended'."""
     text = (text or "").strip()

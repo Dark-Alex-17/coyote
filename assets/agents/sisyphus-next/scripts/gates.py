@@ -28,8 +28,8 @@ from _lib import (  # noqa: E402
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
-    escalation, git, git_out, harvest_anomalies, ledger, load_state, match_option,
-    note_script_error, now_iso, option, read_artifact, run_dir_for, snapshot,
+    escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
+    note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot,
     tail, truthy, var, write_artifact,
 )
 from _lib import raise_escalation as _raise_escalation  # noqa: E402
@@ -506,6 +506,19 @@ def route_intent(state):
     return u
 
 
+def _not_a_step_run(state):
+    """Why a plan_execution verdict cannot go to the step-runner, or "" when it can.
+
+    A delegated task brief names its task and plan files, which reads like a plan step, but it is implemented here;
+    and the step-runner fails at once without a step plans directory.
+    """
+    if truthy(state.get("delegated")):
+        return "a delegated task brief is implemented here, never handed to the step-runner"
+    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
+    steps = os.path.join(plans if os.path.isabs(plans) else os.path.join(state.get("project_dir") or ".", plans), "steps")
+    return "" if os.path.isdir(steps) else f"there is no step plans directory at {steps}"
+
+
 def _route_intent(state, u):
     intent = state.get("intent") or "ambiguous"
     sizing = state.get("sizing") or "simple"
@@ -530,6 +543,14 @@ def _route_intent(state, u):
         ledger(state, u, u["failure_reason"])
         u["_next"] = "end_blocked"
         return u
+
+    if intent == "plan_execution" and (why := _not_a_step_run(state)):
+        ledger(state, u, f"route: assess read the brief as plan_execution, but {why} -> the implementation path")
+        intent = u["intent"] = "implementation"
+        if sizing not in ("simple", "compound", "plan_shaped"):
+            # assess sizes implementations only; an unsized brief gets the compound breakdown, never one blind subtask
+            ledger(state, u, f"route: the reclassified brief carries no implementation size ({sizing!r}) -> compound")
+            sizing = u["sizing"] = "compound"
 
     questions = as_list(state.get("clarifying_questions"))
     if intent == "ambiguous" or (questions and intent not in ("exploration", "design_question")):
@@ -987,7 +1008,11 @@ def parse_answer(state):
     options = esc.get("options") or []
     kind = esc.get("kind", "")
     picker = truthy(as_dict(esc.get("data")).get("multiple_choice"))
-    if kind == "draft_confirm":
+    if headless := headless_recommended(text, options):
+        # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
+        choice = headless
+        ledger(state, u, f"headless: {kind}: no human available -> the recommended option: {tail(choice, 200)}")
+    elif kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
     elif kind in ("handoff_confirm", "handoff_path") and _typed_path(text, state):
@@ -2156,7 +2181,7 @@ def route_gauntlet(state):
     if verdict == "PASS":
         u["_next"] = "observability_gate"
     else:
-        real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
+        real = [b for b in blockers if not review_fault(b)]
         if real:
             u["gauntlet_blockers"] = real
             u["_next"] = "triage_findings"

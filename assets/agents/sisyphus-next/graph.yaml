@@ -528,6 +528,8 @@ nodes:
         ambiguous        unclear scope or multiple interpretations with a 2x+ effort
                          difference, or missing critical info - these MUST ask
         plan_execution   "execute step N", a handoff path, a plan repo step
+                         (plans/steps/NN-*.md); a brief that delegates a TASK
+                         with its task file is implementation
         plan_authoring   "write the plan", "draft steps" for a plan repo
 
       Size an implementation (sizing): simple = one coherent change (one PR);

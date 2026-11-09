@@ -11,6 +11,7 @@ sample of nodes, including the debt_scan shim's fail-open default.
 Usage: smoke_test.py   (exit 1 on any failure; prints one line per check)
 """
 
+import ast
 import json
 import os
 import re
@@ -171,7 +172,11 @@ u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"qu
 check("route_intent: ambiguous -> escalation clarify (round 1)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "clarify" and u["clarify_rounds"] == 1)
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "q"}], clarify_rounds=CLARIFY_MAX))
 check("route_intent: B1 clarify bound -> end_blocked", u["_next"] == "end_blocked")
-for intent, sizing, exp in [("exploration", "n/a", "research_answer"), ("plan_authoring", "n/a", "end_redirect"), ("plan_execution", "n/a", "run_step"),
+STEP_REPO = os.path.join(TMP, "step-repo")
+os.makedirs(os.path.join(STEP_REPO, "plans", "steps"))
+u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", project_dir=STEP_REPO, brief="Execute step 2 of the plan at plans"))
+check("route_intent: plan_execution with a step plans directory -> run_step", u["_next"] == "run_step" and "intent" not in u, u)
+for intent, sizing, exp in [("exploration", "n/a", "research_answer"), ("plan_authoring", "n/a", "end_redirect"),
                             ("implementation", "plan_shaped", "end_redirect"), ("implementation", "compound", "plan_subtasks"),
                             ("implementation", "simple", "next_subtask"), ("trivial", "simple", "next_subtask")]:
     u = gates.route_intent(base_state(intent=intent, sizing=sizing))
@@ -186,6 +191,40 @@ u = gates.route_intent(base_state(intent="implementation", resume_mode=True, res
 check("route_intent: re-entry git_ops -> git_ops", u["_next"] == "git_ops" and u["git_task"]["return_to"] == "final_report")
 u = gates.route_intent(base_state(intent="implementation", sizing="simple", anomalies=["stale plan downstream"]))
 check("A10: anomalies harvested into anomalies_log and reset", u["anomalies_log"] == ["assess: stale plan downstream"] and u["anomalies"] == [])
+
+# the parity pilot: architect-next's task delegation, read by assess as plan_execution, went to the step-runner,
+# which ended at once for want of plans/steps
+PILOT_BRIEF = (
+    f"## TASK\nImplement TASK-001 (Migration 0003: usage_records + overage_tiers) in the project at {REPO}. This is one "
+    "one-engineer-day slice of PLAN-usage-metering.\n\n## SOURCE OF TRUTH\n"
+    f"- Task file: {REPO}/plans/tasks/TASK-001-migration-0003-usage-metering/index.md (read its What / Steps / "
+    "Acceptance criteria - implement EXACTLY these, nothing more)\n"
+    f"- Plan: {REPO}/plans/PLAN-usage-metering.md\n\n## EXPECTED OUTCOME\nEvery acceptance criterion met; the work "
+    "committed and pushed to the EXISTING branch feat/PLAN-usage-metering.\n")
+pilot = gates.intake({"initial_prompt": PILOT_BRIEF, "project_dir": REPO})
+for label, over in (("the pilot's repo (no plans/steps)", {}), ("a repo that has plans/steps", {"project_dir": STEP_REPO})):
+    s = base_state(brief=PILOT_BRIEF, delegated=pilot["delegated"], top_level=pilot["top_level"],
+                   intent="plan_execution", sizing="simple", **over)
+    s.update(gates.route_intent(s))
+    check(f"route_intent: the pilot's delegated TASK brief read as plan_execution, {label} -> the implementation path, ledgered",
+          pilot["delegated"] is True and s["_next"] == "next_subtask" and s["intent"] == "implementation"
+          and s["subtasks"][0]["outcome"] == PILOT_BRIEF and any(d.startswith("route: assess read the brief as plan_execution, but a delegated")
+                                                               for d in s["decisions"]), (s.get("_next"), s.get("decisions")))
+u = gates.route_intent(base_state(intent="plan_execution", sizing="simple", brief="execute step 3"))
+check("route_intent: a top-level plan_execution without a step plans directory -> the implementation path, the missing dir named",
+      u["_next"] == "next_subtask" and u["intent"] == "implementation"
+      and any(f"no step plans directory at {os.path.join(REPO, 'plans', 'steps')}" in d for d in u["decisions"]), u.get("decisions"))
+u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", brief="execute step 3", plans_dir=os.path.join(STEP_REPO, "plans")))
+check("route_intent: an absolute plans_dir variable with steps -> run_step", u["_next"] == "run_step", u)
+u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", brief="execute the plan at plans/PLAN-x.md", top_level=True))
+check("route_intent: a reclassified brief assess left unsized ('n/a') -> the compound breakdown, never one blind subtask",
+      u["_next"] == "plan_subtasks" and u["intent"] == "implementation" and u["sizing"] == "compound"
+      and any("no implementation size ('n/a') -> compound" in d for d in u["decisions"]), u.get("decisions"))
+check("review_fault: the gate's fault blockers are faults; an adversary complaint quoting the words is a finding",
+      _lib.review_fault("adversary: PIPELINE-FAULT -- degraded run") and _lib.review_fault("security: review incomplete after 3 attempts")
+      and _lib.review_fault("code-review: the lane reported an internal PIPELINE-FAULT")
+      and not _lib.review_fault("adversary: DIVERGES -- complaint 1: logs PIPELINE-FAULT on a review incomplete reply")
+      and not _lib.review_fault("code-review: 2 CRITICAL finding(s) -- fix before claiming done"))
 
 # ---------------------------------------------------------------- subtasks (B2/B3)
 subs = [{"title": f"s{i}", "outcome": f"o{i}", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX)]
@@ -629,6 +668,50 @@ u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"qu
 check("choice: options with none recommended keep the typed prompt (ask_user), order kept",
       "multiple_choice" not in u["escalation"]["data"] and [o["text"] for o in u["escalation"]["options"]] == ["a", "b"]
       and gates.ask_dispatch(base_state(escalation=u["escalation"]))["_next"] == "ask_user")
+
+# the engine's headless answer to a free-text question resolves to the recommended option, never to its words
+HG = _lib.HEADLESS_GUIDANCE
+u2 = gates.parse_answer(base_state(escalation=u["escalation"], last_answer_text=HG))
+check("headless: guidance on a question with no recommended option -> today's path (interpret_reply), no option picked",
+      u2["_next"] == "interpret_reply" and "last_answer" not in u2, u2)
+u2 = gates.parse_answer(base_state(escalation=esc, last_answer_text=f" {HG}\n"))
+check("headless: guidance at the typed prompt -> the recommended option, never interpreted, ledgered",
+      u2["_next"] == "apply_answer" and u2["last_answer"] == "A" and any(d.startswith("headless: design_choice:") for d in u2["decisions"]), u2)
+FIVE = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("o1"), option("o2", True)] + [option(f"o{i}") for i in range(3, 6)]))
+u2 = gates.parse_answer(base_state(escalation=FIVE["escalation"], last_answer_text=HG))
+check("headless: guidance on a five-option typed prompt (ask_user) -> its recommended option",
+      gates.ask_dispatch(base_state(escalation=FIVE["escalation"]))["_next"] == "ask_user" and u2.get("last_answer") == "o2", u2)
+s2, u2 = chain(base_state(escalation=mce, last_answer_text=HG, oracle_retries=0), "parse_answer", "apply_answer")
+check("headless: guidance on a multiple-choice escalation -> the recommended 'Retry the consult' through apply_answer",
+      s2.get("last_answer") == "Retry the consult" and u2["_next"] != "end_aborted" and not s2.get("reply_accepts"), (s2.get("last_answer"), u2))
+u2 = gates.parse_answer(base_state(escalation=mce, last_answer_text=HG + " Abort."))
+check("headless: a reply that only contains the guidance is not the guidance -> interpret_reply", u2["_next"] == "interpret_reply", u2)
+hs_ = base_state(intent="ambiguous", clarify_rounds=0, clarifications="")
+for q, rec in (("Which module?", "billing"), ("Which endpoint?", "/v1/usage")):
+    hs_.update(clarifying_questions=[{"question": q, "options": [{"text": "other"}, {"text": rec, "recommended": True}]}])
+    hs_, _ = chain(hs_, "route_intent")
+    hs_, u2 = chain({**hs_, "last_answer_text": HG, "last_answer": ""}, "parse_answer", "apply_answer")
+    hs_.setdefault("clarifications", "")
+check("headless: two clarify questions in a row, each answered by the guidance -> each recommended option recorded",
+      "Q: Which module?\nA: billing" in (hs_.get("clarifications") or "") and "Q: Which endpoint?\nA: /v1/usage" in (hs_.get("clarifications") or "")
+      and u2.get("_next") == "assess", hs_.get("clarifications"))
+
+
+def _keyword_literals(path):
+    """Every literal an answer is matched on by substring: _answered word lists and `"w" in <answer>` tests."""
+    found = []
+    for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_answered" and len(node.args) > 1 and isinstance(node.args[1], ast.Dict):
+            found += [e.value for v in node.args[1].values for e in getattr(v, "elts", []) if isinstance(e, ast.Constant)]
+        elif (isinstance(node, ast.Compare) and isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+              and any(isinstance(op, ast.In) for op in node.ops) and "answer" in ast.unparse(node.comparators[0])):
+            found.append(node.left.value)
+    return found
+
+
+KW = _keyword_literals(os.path.join(HERE, "gates.py"))
+check("headless: no keyword apply_answer matches by substring occurs in the guidance, so it can never read as another option",
+      len(KW) > 10 and not [w for w in KW if w.lower() in HG.lower()], [w for w in KW if w.lower() in HG.lower()])
 five = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("o1"), option("o2", True)] + [option(f"o{i}") for i in range(3, 6)]))
 one = gates.raise_escalation(base_state(), {}, escalation("handoff_path", "q", [option("Abort the run", True)]))
 check("choice: more than 4 or fewer than 2 options keep the typed prompt (ask_user), nothing trimmed",

@@ -3618,6 +3618,172 @@ fn real_gauntlet_reply(
     (reply, gate)
 }
 
+/// The head of a real adversary DIVERGES report from the parity pilot (the
+/// `.coyote-project.json` stray-file complaint), em-dashes and all.
+const PILOT_ADVERSARY_DIVERGES: &str = "ADVERSARIAL_REVIEW: DIVERGES\n\
+    Criteria: 7/7 met, 0 partial, 0 unmet/diverged.\n\
+    Debris: clean (307 added line(s) scanned)\n\
+    Complaints:\n\
+    1. Scope drift / out-of-scope \u{2014} .coyote-project.json:1 \u{2014} The diff commits a new tool-cache file \
+    that wasn't planned and has nothing to do with webhook ingestion, idempotency or handler-failure handling. Its \
+    own fields show it is a machine-local artifact (\"_detected_by\":\"heuristic\", \
+    \"_cached_at\":\"2026-11-08T08:55:41-07:00\"). It also sets build, test and lint commands for the repo that \
+    nobody reviewed. \u{2014} Remove .coyote-project.json from the change. If the tool writes it again, add it to \
+    .gitignore.\n\
+    \n\
+    Non-blocking observations:\n\
+    No blocking issues beyond the stray file.\n\
+    \n\
+    Met criteria (evidence):\n\
+    - \"When a handler fails during Ingest, nothing about the event is recorded.\" \u{2014} Change: \
+    webhooks/dispatcher.go:65-84 now does the claim inside the handler's transaction.\n\
+    \n\
+    Verification runs:\n\
+    - [PASS] `go test ./...` \u{2014} exit 0, 2.0s\n";
+
+/// The pilot's first complaint as the fixer must receive it.
+const PILOT_COMPLAINT: &str = "Scope drift / out-of-scope \u{2014} .coyote-project.json:1 \u{2014} The diff commits a \
+    new tool-cache file that wasn't planned and has nothing to do with webhook ingestion, idempotency or \
+    handler-failure handling. Its own fields show it is a machine-local artifact (\"_detected_by\":\"heuristic\", \
+    \"_cached_at\":\"2026-11-08T08:55:41-07:00\"). It also sets build, test and lint commands for the repo that \
+    nobody reviewed. \u{2014} Remove .coyote-project.json from the change. If the tool writes it again, add it to \
+    .gitignore.";
+
+/// A DIVERGES verdict hands the fixer the adversary's numbered complaints:
+/// the real `verdict_gate.py` writes each as its own Blockers line,
+/// `route_gauntlet` parses them, `triage_route` keeps them as fix items and
+/// `compose_fix` puts them verbatim into the coder's fix instructions. Many
+/// complaints are capped and a runaway one is clipped; a report without a
+/// `Complaints:` block keeps the generic blocker.
+#[test]
+fn adversary_complaints_reach_the_coder_fix_prompt() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("adversary-complaints");
+    let gauntlet_state = |adversary: &str| {
+        json!({
+            "code_review_results": ["# Code review\n\n**Verdict: MERGE-READY**\n\n*Reviewed 1 files, found 0 critical, 0 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*\n"],
+            "adversary_results": [adversary],
+            "debris_findings": [],
+            "debris_summary": "clean (3 added lines)",
+            "lanes_summary": "code-review: always on\nadversary: spec present",
+        })
+    };
+    let (reply, _) = real_gauntlet_reply(&gauntlet_state(PILOT_ADVERSARY_DIVERGES), &scratch);
+    let blocker = format!("adversary: DIVERGES -- complaint 1: {PILOT_COMPLAINT}");
+    assert!(
+        reply.lines().any(|l| l == format!("- {blocker}")),
+        "the complaint is a Blockers line of its own:\n{reply}"
+    );
+    assert!(
+        reply
+            .lines()
+            .any(|l| l == "| adversary | BLOCKED | DIVERGES |"),
+        "{reply}"
+    );
+
+    let run_dir = scratch.0.join("runs").join("x");
+    let routed = gate_json(
+        "route_gauntlet",
+        &json!({"gauntlet_result": reply, "round_heads": [], "decisions": [], "run_dir": run_dir}),
+        &scratch,
+    );
+    assert_eq!(routed["_next"], json!("triage_findings"), "{routed}");
+    assert_eq!(routed["gauntlet_blockers"], json!([blocker]), "{routed}");
+    let triaged = gate_json(
+        "triage_route",
+        &json!({"gauntlet_blockers": routed["gauntlet_blockers"], "triage": [], "quality_rigor": "production",
+                "review_rounds": 0, "decisions": [], "run_dir": run_dir}),
+        &scratch,
+    );
+    assert_eq!(triaged["_next"], json!("compose_fix"), "{triaged}");
+    assert_eq!(triaged["fix_items"], json!([blocker]), "{triaged}");
+    let fix = gate_json(
+        "compose_fix",
+        &json!({"fix_source": "review", "fix_items": triaged["fix_items"], "decisions": [], "run_dir": run_dir}),
+        &scratch,
+    );
+    let instructions = fix["fix_instructions"].as_str().unwrap();
+    assert!(
+        instructions.lines().any(|l| l == format!("- {blocker}")),
+        "the coder's fix prompt carries the complaint verbatim:\n{instructions}"
+    );
+
+    let long = "x".repeat(900);
+    let mut many = String::from(
+        "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 2/4 met.\nDebris: clean (9 added line(s) scanned)\nComplaints:\n",
+    );
+    many.push_str("1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n");
+    many.push_str("2. Interface substitution -- api/h.go:20 --\n   the handler returns a map, not the struct\n");
+    many.push_str(&format!("3. Runaway {long}\n"));
+    many.push_str(
+        "4. The handler logs PIPELINE-FAULT on a review incomplete reply -- api/h.go:30\n",
+    );
+    for i in 5..=10 {
+        many.push_str(&format!("{i}. complaint number {i}\n"));
+    }
+    many.push_str("\nVerification runs:\n- [PASS] `true` -- exit 0\n");
+    let (reply, _) = real_gauntlet_reply(&gauntlet_state(&many), &scratch);
+    let lines: Vec<&str> = reply
+        .lines()
+        .filter(|l| l.starts_with("- adversary: DIVERGES"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        9,
+        "8 complaints and one line naming the rest:\n{reply}"
+    );
+    assert_eq!(
+        lines[0],
+        "- adversary: DIVERGES -- complaint 1: Acceptance criterion \"two\" -- Unmet -- api/h.go:10"
+    );
+    assert_eq!(
+        lines[1],
+        "- adversary: DIVERGES -- complaint 2: Interface substitution -- api/h.go:20 -- the handler returns a map, not the struct"
+    );
+    let runaway = lines[2].trim_start_matches("- adversary: DIVERGES -- complaint 3: ");
+    assert!(
+        runaway.len() == 600 && runaway.ends_with("...") && runaway.starts_with("Runaway xxx"),
+        "{runaway}"
+    );
+    assert_eq!(
+        lines[8],
+        "- adversary: DIVERGES -- 2 more complaint(s): complaint number 9; complaint number 10"
+    );
+    let routed = gate_json(
+        "route_gauntlet",
+        &json!({"gauntlet_result": reply, "round_heads": [], "decisions": [], "run_dir": run_dir}),
+        &scratch,
+    );
+    assert_eq!(routed["_next"], json!("triage_findings"), "{routed}");
+    assert_eq!(
+        routed["gauntlet_blockers"].as_array().map(Vec::len),
+        Some(9),
+        "a complaint quoting the fault words is still a finding: {routed}"
+    );
+    assert_eq!(
+        routed["gauntlet_blockers"][3],
+        json!(
+            "adversary: DIVERGES -- complaint 4: The handler logs PIPELINE-FAULT on a review incomplete reply -- api/h.go:30"
+        ),
+        "{routed}"
+    );
+
+    let (reply, _) = real_gauntlet_reply(
+        &gauntlet_state(
+            "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1 of 2 met\n- AC1: the endpoint returns 500\n",
+        ),
+        &scratch,
+    );
+    assert!(
+        reply.lines().any(
+            |l| l == "- adversary: DIVERGES -- the implementation does not conform to the plan"
+        ),
+        "{reply}"
+    );
+}
+
 /// The acceptance criterion end to end, with nothing pre-parsed: round 1 is
 /// composed cold (no re-review lines), the gauntlet's own `verdict_gate.py`
 /// renders the `| lane | status | detail |` report with all four status

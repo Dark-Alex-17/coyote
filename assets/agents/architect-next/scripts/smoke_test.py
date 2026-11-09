@@ -1639,6 +1639,61 @@ check("parse_answer: unparseable -> re-ask (B22 side 1)", u["_next"] == "ask_use
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=STRIKE_LIMIT, reply_interpreted=True))
 check("parse_answer: B22 exhausted -> free text stands", u["_next"] == "apply_answer" and u["last_answer"] == "banana")
 
+# the engine's headless answer to a free-text question resolves to the recommended option, never to its words
+HG = _lib.HEADLESS_GUIDANCE
+TF = gates.task_failed_route(base_state(current_task=T1, oracle_result="Cause: X. Direction: do Y.", failure_evidence="e", task_rounds={}))["escalation"]
+for reply in (HG, f"  {HG}\n"):
+    s = base_state(escalation=TF, last_answer_text=reply, current_task=T1, tasks=tasks_with(), oracle_result="do Y", task_rounds={})
+    s.update(gates.parse_answer(s))
+    first = s["_next"]
+    s.update(gates.apply_answer(s))
+    check(f"headless: task_failed guidance {reply[:6]!r}... -> the recommended retry, never interpreted; apply_answer runs the oracle-directed fix",
+          first == "apply_answer" and s["last_answer"] == "Retry with the oracle's direction (one round)"
+          and s["_next"] == "compose_delegation" and s["fix_source"] == "oracle"
+          and any(d.startswith("headless: task_failed:") for d in s["decisions"]), s.get("decisions"))
+TF_NONE = gates.task_failed_route(base_state(current_task=T1, oracle_result="Agent node failed: x", task_rounds={}))["escalation"]
+u = gates.parse_answer(base_state(escalation=TF_NONE, last_answer_text=HG))
+check("headless: guidance on a question with no recommended option -> today's path (interpret_reply), no option picked",
+      not any(o["recommended"] for o in TF_NONE["options"]) and u["_next"] == "interpret_reply" and "last_answer" not in u, u)
+u = gates.parse_answer(base_state(escalation=TF, last_answer_text=HG + " Abort."))
+check("headless: a reply that only contains the guidance is not the guidance -> interpret_reply", u["_next"] == "interpret_reply", u)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text=HG))
+check("headless: conformance_stuck guidance -> its recommended 'Stop and report'", u.get("last_answer") == "Stop and report" and u["_next"] == "apply_answer", u)
+s = base_state(escalation=E_DQ, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[],
+               open_questions=qs, last_answer_text=HG)
+picked = []
+for _ in range(2):
+    s.update(gates.parse_answer(s))
+    picked.append((s["_next"], s.get("last_answer")))
+    s.update(gates.apply_answer(s))
+    s.update(gates.open_questions_gate(s))
+    s.update(last_answer_text=HG, last_answer="")
+check("headless: a two-question design round answered by the guidance each time -> each question's recommended option recorded",
+      picked == [("apply_answer", "pg"), ("apply_answer", "8080")]
+      and [a["answer"] for a in s.get("choice_answers") or []] in ([], ["pg", "8080"])
+      and "1. Which store?\n   Answer: pg\n2. Which port?\n   Answer: 8080" in "\n".join(s.get("pending_amendments") or []), (picked, s.get("pending_amendments")))
+
+
+def _keyword_literals(path):
+    """Every literal an answer is matched on by substring: _answered word lists and `"w" in <answer>` tests."""
+    found = []
+    for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_answered" and len(node.args) > 1 and isinstance(node.args[1], ast.Dict):
+            found += [e.value for v in node.args[1].values for e in getattr(v, "elts", []) if isinstance(e, ast.Constant)]
+        elif (isinstance(node, ast.Compare) and isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+              and any(isinstance(op, ast.In) for op in node.ops) and "answer" in ast.unparse(node.comparators[0])):
+            found.append(node.left.value)
+    return found
+
+
+KW = _keyword_literals(os.path.join(HERE, "gates.py"))
+check("headless: no keyword apply_answer matches by substring occurs in the guidance, so it can never read as another option",
+      len(KW) > 20 and not [w for w in KW if w.lower() in HG.lower()], [w for w in KW if w.lower() in HG.lower()])
+check("review_fault: the gate's fault blockers are faults; an adversary complaint quoting the words is a finding",
+      _lib.review_fault("adversary: PIPELINE-FAULT -- degraded run") and _lib.review_fault("security: review incomplete after 3 attempts")
+      and not _lib.review_fault("adversary: DIVERGES -- complaint 1: logs PIPELINE-FAULT on a review incomplete reply")
+      and not _lib.review_fault("code-review: 2 CRITICAL finding(s) -- fix before claiming done"))
+
 # typed replies that name no option: interpreted once, for every escalation kind
 E_GIT = escalation("git_setup_failed", "Could not set up the branch. Retry, or abort?",
                    [option("Retry the branch setup", True), option("Abort the run")], data={"branch": "feat/PLAN-held", "base": "main"})

@@ -3024,10 +3024,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![46, 3668, 3677],
+        vec![46, 3672, 3681],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [3668, 3677] {
+    for line in [3672, 3681] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -3144,6 +3144,29 @@ fn marker_map_triples_match_the_live_prose_markers() {
     assert_eq!(
         live, mapped,
         "marker_map.json drifted (left: live, right: map)"
+    );
+}
+
+/// Every node that spawns a conformance reviewer (the gauntlet, or the
+/// adversary directly at micro scope) hands it the run's `debris_exclude`, so
+/// the adversary's debris lint and the gauntlet's debris lane exclude the
+/// same directories; the adversary declares the variable it receives.
+#[test]
+fn conformance_nodes_forward_debris_exclude_to_every_reviewer() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    for node in ["run_gauntlet", "run_adversary", "wave_gauntlet"] {
+        assert_eq!(
+            doc["nodes"][node]["inputs"]["debris_exclude"].as_str(),
+            Some("{{debris_exclude}}"),
+            "{node} must forward debris_exclude: {:?}",
+            doc["nodes"][node]
+        );
+    }
+    let vars = variable_list(&agents_dir().join("adversary").join("graph.yaml"));
+    assert!(
+        names_of(&vars).contains(&"debris_exclude"),
+        "the adversary declares debris_exclude"
     );
 }
 
@@ -4146,6 +4169,46 @@ fn forged_lane_selection_headings_never_stand_in_for_the_real_blockers() {
         let parsed = parse_gauntlet_report(report, &scratch);
         assert_eq!(parsed["blockers"], *expected, "{report:?} -> {parsed}");
     }
+}
+
+/// A gauntlet DIVERGES verdict reaches the task's fix delegation as the
+/// adversary's own complaints: the real `verdict_gate.py` writes each
+/// numbered complaint (here the parity pilot's stray-file one) as a
+/// Blockers line, and `route_verdict` hands it to `compose_delegation` as a
+/// fix item, never the bare "does not conform" line, even when the complaint
+/// quotes the words a review fault is recognised by.
+#[test]
+fn gauntlet_adversary_complaints_become_the_fix_items() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("adversary-complaints");
+    let complaint = "Scope drift / out-of-scope \u{2014} .coyote-project.json:1 \u{2014} The diff commits a new \
+        tool-cache file that wasn't planned; it maps a PIPELINE-FAULT to a review incomplete note. \u{2014} Remove \
+        .coyote-project.json from the change. If the tool writes it again, add it to .gitignore.";
+    let adversary = format!(
+        "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 7/7 met, 0 partial, 0 unmet/diverged.\n\
+         Debris: clean (307 added line(s) scanned)\nComplaints:\n1. {complaint}\n\n\
+         Non-blocking observations:\nNo blocking issues beyond the stray file.\n\n\
+         Verification runs:\n- [PASS] `go test ./...` \u{2014} exit 0, 2.0s\n"
+    );
+    let reply = real_gauntlet_reply(
+        &json!({
+            "code_review_results": [MERGE_READY_REVIEW],
+            "adversary_results": [adversary],
+            "debris_findings": [],
+            "debris_summary": "clean (2 added lines)",
+            "lanes_summary": "code-review: always on\nadversary: spec present",
+        }),
+        &scratch,
+    );
+    let routed = routed_gauntlet_reply(&scratch.0, "h", &reply, &scratch);
+    assert_eq!(routed["_next"], json!("compose_delegation"), "{routed}");
+    assert_eq!(
+        routed["fix_items"],
+        json!([format!("adversary: DIVERGES -- complaint 1: {complaint}")]),
+        "{routed}"
+    );
 }
 
 /// The plan-root phrases are read from the whole reply but consulted only
