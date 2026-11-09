@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 const MAX_SCHEMA_NAME_LEN: usize = 64;
 const DEFAULT_SCHEMA_NAME: &str = "output";
 const MAX_REF_DEPTH: usize = 32;
+const MAX_APPLICABLE_SCHEMAS: usize = 64;
 
 const OPENAI_STRICT_KEPT: &[&str] = &[
     "type",
@@ -262,6 +263,14 @@ fn make_nullable(schema: &mut Value) {
     let Value::Object(map) = schema else {
         return;
     };
+    match map.get("const").map(Value::is_null) {
+        Some(true) => return,
+        Some(false) => {
+            wrap_nullable(schema);
+            return;
+        }
+        None => {}
+    }
     if let Some(Value::Array(variants)) = map.get_mut("enum")
         && !variants.contains(&Value::Null)
     {
@@ -279,23 +288,35 @@ fn make_nullable(schema: &mut Value) {
             }
         }
         Some(_) => {}
-        None => {
-            if !has_null_branch(map, "anyOf") {
-                let inner = std::mem::take(schema);
-                *schema = json!({ "anyOf": [inner, { "type": "null" }] });
+        None => match map.get_mut("anyOf") {
+            Some(Value::Array(branches)) => {
+                if !has_null_branch(branches) {
+                    branches.push(json!({ "type": "null" }));
+                }
             }
-        }
+            _ => wrap_nullable(schema),
+        },
     }
 }
 
-fn has_null_branch(map: &Map<String, Value>, key: &str) -> bool {
-    map.get(key)
-        .and_then(Value::as_array)
-        .is_some_and(|branches| {
-            branches
-                .iter()
-                .any(|branch| branch.get("type").is_some_and(type_allows_null))
-        })
+fn wrap_nullable(schema: &mut Value) {
+    let inner = std::mem::take(schema);
+    *schema = json!({ "anyOf": [inner, { "type": "null" }] });
+}
+
+fn has_null_branch(branches: &[Value]) -> bool {
+    branches
+        .iter()
+        .any(|branch| branch.as_object().is_some_and(admits_null_directly))
+}
+
+fn admits_null_directly(map: &Map<String, Value>) -> bool {
+    map.get("type").is_some_and(type_allows_null)
+        || map
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|variants| variants.contains(&Value::Null))
+        || map.get("const").is_some_and(Value::is_null)
 }
 
 fn type_allows_null(t: &Value) -> bool {
@@ -340,13 +361,7 @@ fn allows_null(schema: &Value, root: &Value, depth: usize) -> bool {
         Value::Object(map) => map,
         _ => return true,
     };
-    if map.get("type").is_some_and(type_allows_null)
-        || map
-            .get("enum")
-            .and_then(Value::as_array)
-            .is_some_and(|variants| variants.contains(&Value::Null))
-        || map.get("const").is_some_and(Value::is_null)
-    {
+    if admits_null_directly(map) {
         return true;
     }
     let branch_allows_null = |key: &str| {
@@ -367,44 +382,182 @@ fn allows_null(schema: &Value, root: &Value, depth: usize) -> bool {
 }
 
 fn strip_node(value: &mut Value, schema: &Value, root: &Value, depth: usize) {
-    let mut depth = depth;
-    let Some(schema) = resolve_ref(schema, root, &mut depth) else {
+    let Some(kind) = ValueKind::of(value) else {
         return;
     };
+    let mut applicable = Vec::new();
+    collect_applicable(kind, schema, root, depth, &mut applicable);
     match value {
-        Value::Object(fields) => {
-            let Some(Value::Object(properties)) = schema.get("properties") else {
-                return;
-            };
-            let required = schema.as_object().map(required_names).unwrap_or_default();
-            fields.retain(|name, field| {
-                let Some(property) = properties.get(name) else {
-                    return true;
-                };
-                !(field.is_null()
-                    && !required.contains(&name.as_str())
-                    && !allows_null(property, root, depth))
-            });
-            for (name, field) in fields.iter_mut() {
-                if let Some(property) = properties.get(name) {
-                    strip_node(field, property, root, depth);
+        Value::Object(fields) => strip_object(fields, &applicable, root),
+        Value::Array(elements) => strip_array(elements, &applicable, root),
+        _ => {}
+    }
+}
+
+fn strip_object(fields: &mut Map<String, Value>, applicable: &[Applicable<'_>], root: &Value) {
+    let required: Vec<&str> = applicable
+        .iter()
+        .flat_map(|(map, _)| required_names(map))
+        .collect();
+    fields.retain(|name, field| {
+        !(field.is_null()
+            && !required.contains(&name.as_str())
+            && property_schemas(applicable, name)
+                .any(|(property, depth)| !allows_null(property, root, depth)))
+    });
+    for (name, field) in fields.iter_mut() {
+        for (map, depth) in applicable {
+            match map
+                .get("properties")
+                .and_then(|properties| properties.get(name))
+            {
+                Some(property) => strip_node(field, property, root, *depth),
+                None => {
+                    if let Some(extra @ Value::Object(_)) = map.get("additionalProperties") {
+                        strip_node(field, extra, root, *depth);
+                    }
                 }
             }
         }
-        Value::Array(elements) => match schema.get("items") {
+    }
+}
+
+fn strip_array(elements: &mut [Value], applicable: &[Applicable<'_>], root: &Value) {
+    for (map, depth) in applicable {
+        match map.get("items") {
             Some(Value::Array(tuple)) => {
                 for (element, item_schema) in elements.iter_mut().zip(tuple) {
-                    strip_node(element, item_schema, root, depth);
+                    strip_node(element, item_schema, root, *depth);
                 }
             }
             Some(item_schema) => {
                 for element in elements.iter_mut() {
-                    strip_node(element, item_schema, root, depth);
+                    strip_node(element, item_schema, root, *depth);
                 }
             }
             None => {}
-        },
-        _ => {}
+        }
+    }
+}
+
+fn property_schemas<'a>(
+    applicable: &'a [Applicable<'a>],
+    name: &'a str,
+) -> impl Iterator<Item = (&'a Value, usize)> {
+    applicable.iter().filter_map(move |(map, depth)| {
+        map.get("properties")
+            .and_then(|properties| properties.get(name))
+            .map(|property| (property, *depth))
+    })
+}
+
+type Applicable<'a> = (&'a Map<String, Value>, usize);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueKind {
+    Object,
+    Array,
+}
+
+impl ValueKind {
+    fn of(value: &Value) -> Option<Self> {
+        match value {
+            Value::Object(_) => Some(Self::Object),
+            Value::Array(_) => Some(Self::Array),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Array => "array",
+        }
+    }
+}
+
+/// Gathers every schema node that constrains a value of `kind`: the node itself,
+/// each `allOf` entry, and the first `anyOf`/`oneOf` branch whose shape matches.
+fn collect_applicable<'a>(
+    kind: ValueKind,
+    schema: &'a Value,
+    root: &'a Value,
+    depth: usize,
+    out: &mut Vec<Applicable<'a>>,
+) {
+    if out.len() >= MAX_APPLICABLE_SCHEMAS {
+        return;
+    }
+    let mut depth = depth;
+    let Some(Value::Object(map)) = resolve_ref(schema, root, &mut depth) else {
+        return;
+    };
+    out.push((map, depth));
+    if let Some(Value::Array(entries)) = map.get("allOf") {
+        for entry in entries {
+            collect_applicable(kind, entry, root, depth, out);
+        }
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = map.get(key)
+            && let Some(branch) = matching_branch(kind, branches, root, depth)
+        {
+            collect_applicable(kind, branch, root, depth, out);
+        }
+    }
+}
+
+fn matching_branch<'a>(
+    kind: ValueKind,
+    branches: &'a [Value],
+    root: &'a Value,
+    depth: usize,
+) -> Option<&'a Value> {
+    let mut fallback = None;
+    for branch in branches {
+        let mut branch_depth = depth;
+        let Some(Value::Object(map)) = resolve_ref(branch, root, &mut branch_depth) else {
+            continue;
+        };
+        match branch_kind(map) {
+            BranchKind::NullOnly => {}
+            BranchKind::Typed(kinds) if kinds.contains(&kind.name()) => return Some(branch),
+            BranchKind::Typed(_) => {}
+            BranchKind::Unknown => {
+                fallback.get_or_insert(branch);
+            }
+        }
+    }
+    fallback
+}
+
+enum BranchKind<'a> {
+    NullOnly,
+    Typed(Vec<&'a str>),
+    Unknown,
+}
+
+fn branch_kind(map: &Map<String, Value>) -> BranchKind<'_> {
+    if map.get("const").is_some_and(Value::is_null) {
+        return BranchKind::NullOnly;
+    }
+    let types: Vec<&str> = match map.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(types)) => types.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    if !types.is_empty() {
+        if types.iter().all(|t| *t == "null") {
+            return BranchKind::NullOnly;
+        }
+        return BranchKind::Typed(types);
+    }
+    if map.contains_key("properties") || map.contains_key("additionalProperties") {
+        BranchKind::Typed(vec!["object"])
+    } else if map.contains_key("items") {
+        BranchKind::Typed(vec!["array"])
+    } else {
+        BranchKind::Unknown
     }
 }
 
@@ -695,6 +848,108 @@ mod tests {
     }
 
     #[test]
+    fn openai_strict_wraps_optional_typed_const_in_any_of() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "fixed": { "type": "string", "const": "x" },
+                "fixed_null": { "const": null }
+            }
+        });
+
+        let converted = convert_schema(&schema, SchemaDialect::OpenAiStrict);
+        let properties = &converted["properties"];
+
+        assert_eq!(
+            properties["fixed"],
+            json!({ "anyOf": [{ "type": "string", "const": "x" }, { "type": "null" }] })
+        );
+        assert_eq!(properties["fixed_null"], json!({ "const": null }));
+    }
+
+    #[test]
+    fn openai_strict_appends_null_branch_to_existing_any_of() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "either": { "anyOf": [{ "type": "string" }, { "type": "integer" }] },
+                "const_null": { "anyOf": [{ "type": "string" }, { "const": null }] },
+                "enum_null": { "anyOf": [{ "type": "string" }, { "enum": [1, null] }] }
+            }
+        });
+
+        let converted = convert_schema(&schema, SchemaDialect::OpenAiStrict);
+        let properties = &converted["properties"];
+
+        assert_eq!(
+            properties["either"],
+            json!({ "anyOf": [{ "type": "string" }, { "type": "integer" }, { "type": "null" }] })
+        );
+        assert_eq!(
+            properties["const_null"],
+            json!({ "anyOf": [{ "type": "string" }, { "const": null }] })
+        );
+        assert_eq!(
+            properties["enum_null"],
+            json!({ "anyOf": [{ "type": "string" }, { "enum": [1, null] }] })
+        );
+    }
+
+    #[test]
+    fn one_of_beside_any_of_moves_into_description() {
+        let schema = json!({
+            "anyOf": [{ "type": "string" }],
+            "oneOf": [{ "type": "integer" }]
+        });
+
+        let converted = convert_schema(&schema, SchemaDialect::OpenAiStrict);
+
+        assert_eq!(
+            converted,
+            json!({
+                "anyOf": [{ "type": "string" }],
+                "description": "{oneOf: [{\"type\":\"integer\"}]}"
+            })
+        );
+    }
+
+    #[test]
+    fn empty_description_is_treated_as_absent() {
+        let schema = json!({ "type": "integer", "description": "", "minimum": 1 });
+
+        let converted = convert_schema(&schema, SchemaDialect::Anthropic);
+
+        assert_eq!(converted["description"], json!("{minimum: 1}"));
+    }
+
+    #[test]
+    fn openai_strict_property_less_object_requires_nothing() {
+        let converted = convert_schema(&json!({ "type": "object" }), SchemaDialect::OpenAiStrict);
+
+        assert_eq!(
+            converted,
+            json!({ "type": "object", "additionalProperties": false, "required": [] })
+        );
+    }
+
+    #[test]
+    fn schema_valued_additional_properties_is_converted() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": { "type": "string", "minLength": 1 }
+        });
+
+        for dialect in [SchemaDialect::OpenAiStrict, SchemaDialect::Anthropic] {
+            let converted = convert_schema(&schema, dialect);
+            assert_eq!(
+                converted["additionalProperties"],
+                json!({ "type": "string", "description": "{minLength: 1}" }),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sanitize_schema_name_replaces_invalid_characters() {
         assert_eq!(sanitize_schema_name("my node.v2"), "my_node_v2");
         assert_eq!(sanitize_schema_name("keep-this_1"), "keep-this_1");
@@ -792,6 +1047,174 @@ mod tests {
             "properties": { "inner": { "$ref": "#/$defs/x" } },
             "required": ["inner"],
             "$defs": {
+                "x": {
+                    "type": "object",
+                    "properties": { "note": { "type": "string" } }
+                }
+            }
+        });
+        let mut value = json!({ "inner": { "note": null } });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!({ "inner": {} }));
+    }
+
+    #[test]
+    fn strip_injected_nulls_follows_nullable_any_of_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "inner": { "anyOf": [{ "$ref": "#/$defs/x" }, { "type": "null" }] }
+            },
+            "$defs": {
+                "x": {
+                    "type": "object",
+                    "properties": { "note": { "type": "string" } }
+                }
+            }
+        });
+        let mut present = json!({ "inner": { "note": null } });
+        let mut absent = json!({ "inner": null });
+
+        strip_injected_nulls(&mut present, &schema);
+        strip_injected_nulls(&mut absent, &schema);
+
+        assert_eq!(present, json!({ "inner": {} }));
+        assert_eq!(absent, json!({ "inner": null }));
+    }
+
+    #[test]
+    fn strip_injected_nulls_picks_one_of_branch_by_shape() {
+        let schema = json!({
+            "oneOf": [
+                { "type": "array", "items": { "$ref": "#/$defs/x" } },
+                { "$ref": "#/$defs/x" }
+            ],
+            "$defs": {
+                "x": {
+                    "type": "object",
+                    "properties": { "note": { "type": "string" } }
+                }
+            }
+        });
+        let mut object = json!({ "note": null });
+        let mut array = json!([{ "note": null }, { "note": "kept" }]);
+
+        strip_injected_nulls(&mut object, &schema);
+        strip_injected_nulls(&mut array, &schema);
+
+        assert_eq!(object, json!({}));
+        assert_eq!(array, json!([{}, { "note": "kept" }]));
+    }
+
+    #[test]
+    fn strip_injected_nulls_merges_all_of_entries() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "required": ["a"]
+                },
+                { "$ref": "#/$defs/extra" }
+            ],
+            "$defs": {
+                "extra": {
+                    "type": "object",
+                    "properties": { "b": { "type": "string" } }
+                }
+            }
+        });
+        let mut value = json!({ "a": null, "b": null });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!({ "a": null }));
+    }
+
+    #[test]
+    fn strip_injected_nulls_applies_additional_properties_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "listed": { "type": "object" } },
+            "additionalProperties": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        let mut value = json!({
+            "listed": { "note": null },
+            "extra": { "note": null, "other": 1 }
+        });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(
+            value,
+            json!({ "listed": { "note": null }, "extra": { "other": 1 } })
+        );
+    }
+
+    #[test]
+    fn strip_injected_nulls_keeps_nulls_for_permissive_schemas() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "const_null": { "const": null },
+                "anything": true,
+                "unconstrained": {}
+            }
+        });
+        let mut value = json!({ "const_null": null, "anything": null, "unconstrained": null });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(
+            value,
+            json!({ "const_null": null, "anything": null, "unconstrained": null })
+        );
+    }
+
+    #[test]
+    fn strip_injected_nulls_walks_tuple_items() {
+        let schema = json!({
+            "type": "array",
+            "items": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "a": { "type": ["string", "null"] } } }
+            ]
+        });
+        let mut value = json!([{ "a": null }, { "a": null }]);
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!([{}, { "a": null }]));
+    }
+
+    #[test]
+    fn strip_injected_nulls_keeps_nulls_behind_non_local_refs() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "remote": { "$ref": "https://example.com/schema.json" },
+                "pointer": { "$ref": "#/properties/remote" }
+            }
+        });
+        let mut value = json!({ "remote": null, "pointer": null });
+
+        strip_injected_nulls(&mut value, &schema);
+
+        assert_eq!(value, json!({ "remote": null, "pointer": null }));
+    }
+
+    #[test]
+    fn strip_injected_nulls_follows_definitions_refs() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "inner": { "$ref": "#/definitions/x" } },
+            "required": ["inner"],
+            "definitions": {
                 "x": {
                     "type": "object",
                     "properties": { "note": { "type": "string" } }
