@@ -214,10 +214,17 @@ u = gates.route_intent(base_state(intent="plan_execution", sizing="simple", brie
 check("route_intent: a top-level plan_execution without a step plans directory -> the implementation path, the missing dir named",
       u["_next"] == "next_subtask" and u["intent"] == "implementation"
       and any(f"no step plans directory at {os.path.join(REPO, 'plans', 'steps')}" in d for d in u["decisions"]), u.get("decisions"))
-os.environ["LLM_AGENT_VAR_PLANS_DIR"] = os.path.join(STEP_REPO, "plans")
-u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", brief="execute step 3"))
-os.environ.pop("LLM_AGENT_VAR_PLANS_DIR")
+u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", brief="execute step 3", plans_dir=os.path.join(STEP_REPO, "plans")))
 check("route_intent: an absolute plans_dir variable with steps -> run_step", u["_next"] == "run_step", u)
+u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", brief="execute the plan at plans/PLAN-x.md", top_level=True))
+check("route_intent: a reclassified brief assess left unsized ('n/a') -> the compound breakdown, never one blind subtask",
+      u["_next"] == "plan_subtasks" and u["intent"] == "implementation" and u["sizing"] == "compound"
+      and any("no implementation size ('n/a') -> compound" in d for d in u["decisions"]), u.get("decisions"))
+check("review_fault: the gate's fault blockers are faults; an adversary complaint quoting the words is a finding",
+      _lib.review_fault("adversary: PIPELINE-FAULT -- degraded run") and _lib.review_fault("security: review incomplete after 3 attempts")
+      and _lib.review_fault("code-review: the lane reported an internal PIPELINE-FAULT")
+      and not _lib.review_fault("adversary: DIVERGES -- complaint 1: logs PIPELINE-FAULT on a review incomplete reply")
+      and not _lib.review_fault("code-review: 2 CRITICAL finding(s) -- fix before claiming done"))
 
 # ---------------------------------------------------------------- subtasks (B2/B3)
 subs = [{"title": f"s{i}", "outcome": f"o{i}", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX)]

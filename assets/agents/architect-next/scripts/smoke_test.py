@@ -1689,6 +1689,10 @@ def _keyword_literals(path):
 KW = _keyword_literals(os.path.join(HERE, "gates.py"))
 check("headless: no keyword apply_answer matches by substring occurs in the guidance, so it can never read as another option",
       len(KW) > 20 and not [w for w in KW if w.lower() in HG.lower()], [w for w in KW if w.lower() in HG.lower()])
+check("review_fault: the gate's fault blockers are faults; an adversary complaint quoting the words is a finding",
+      _lib.review_fault("adversary: PIPELINE-FAULT -- degraded run") and _lib.review_fault("security: review incomplete after 3 attempts")
+      and not _lib.review_fault("adversary: DIVERGES -- complaint 1: logs PIPELINE-FAULT on a review incomplete reply")
+      and not _lib.review_fault("code-review: 2 CRITICAL finding(s) -- fix before claiming done"))
 
 # typed replies that name no option: interpreted once, for every escalation kind
 E_GIT = escalation("git_setup_failed", "Could not set up the branch. Retry, or abort?",

@@ -391,6 +391,13 @@ def headless_recommended(text, options):
     return next((o["text"] for o in options or [] if truthy(o.get("recommended"))), None)
 
 
+def review_fault(blocker):
+    """A gauntlet blocker that records a review fault, not a finding; an adversary complaint quoting the words is a finding."""
+    if blocker.startswith("adversary: DIVERGES"):
+        return False
+    return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
+
+
 def match_option(text, options):
     """Map a user reply to an option text: a 1-based number, exact, prefix, or 'recommended'."""
     text = (text or "").strip()

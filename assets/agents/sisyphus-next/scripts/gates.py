@@ -29,7 +29,7 @@ from _lib import (  # noqa: E402
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
-    note_script_error, now_iso, option, read_artifact, run_dir_for, snapshot,
+    note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot,
     tail, truthy, var, write_artifact,
 )
 from _lib import raise_escalation as _raise_escalation  # noqa: E402
@@ -547,6 +547,10 @@ def _route_intent(state, u):
     if intent == "plan_execution" and (why := _not_a_step_run(state)):
         ledger(state, u, f"route: assess read the brief as plan_execution, but {why} -> the implementation path")
         intent = u["intent"] = "implementation"
+        if sizing not in ("simple", "compound", "plan_shaped"):
+            # assess sizes implementations only; an unsized brief gets the compound breakdown, never one blind subtask
+            ledger(state, u, f"route: the reclassified brief carries no implementation size ({sizing!r}) -> compound")
+            sizing = u["sizing"] = "compound"
 
     questions = as_list(state.get("clarifying_questions"))
     if intent == "ambiguous" or (questions and intent not in ("exploration", "design_question")):
@@ -2177,7 +2181,7 @@ def route_gauntlet(state):
     if verdict == "PASS":
         u["_next"] = "observability_gate"
     else:
-        real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
+        real = [b for b in blockers if not review_fault(b)]
         if real:
             u["gauntlet_blockers"] = real
             u["_next"] = "triage_findings"

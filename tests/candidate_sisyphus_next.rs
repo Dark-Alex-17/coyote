@@ -3717,7 +3717,10 @@ fn adversary_complaints_reach_the_coder_fix_prompt() {
     many.push_str("1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n");
     many.push_str("2. Interface substitution -- api/h.go:20 --\n   the handler returns a map, not the struct\n");
     many.push_str(&format!("3. Runaway {long}\n"));
-    for i in 4..=10 {
+    many.push_str(
+        "4. The handler logs PIPELINE-FAULT on a review incomplete reply -- api/h.go:30\n",
+    );
+    for i in 5..=10 {
         many.push_str(&format!("{i}. complaint number {i}\n"));
     }
     many.push_str("\nVerification runs:\n- [PASS] `true` -- exit 0\n");
@@ -3746,7 +3749,25 @@ fn adversary_complaints_reach_the_coder_fix_prompt() {
     );
     assert_eq!(
         lines[8],
-        "- adversary: DIVERGES -- 2 more complaint(s) in the adversary report below"
+        "- adversary: DIVERGES -- 2 more complaint(s): complaint number 9; complaint number 10"
+    );
+    let routed = gate_json(
+        "route_gauntlet",
+        &json!({"gauntlet_result": reply, "round_heads": [], "decisions": [], "run_dir": run_dir}),
+        &scratch,
+    );
+    assert_eq!(routed["_next"], json!("triage_findings"), "{routed}");
+    assert_eq!(
+        routed["gauntlet_blockers"].as_array().map(Vec::len),
+        Some(9),
+        "a complaint quoting the fault words is still a finding: {routed}"
+    );
+    assert_eq!(
+        routed["gauntlet_blockers"][3],
+        json!(
+            "adversary: DIVERGES -- complaint 4: The handler logs PIPELINE-FAULT on a review incomplete reply -- api/h.go:30"
+        ),
+        "{routed}"
     );
 
     let (reply, _) = real_gauntlet_reply(

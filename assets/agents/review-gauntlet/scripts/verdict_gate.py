@@ -22,6 +22,12 @@ re-reads, no judgment. The gate's hard rules:
     checks, or its verdict script's crash stub — blocks as a PIPELINE-FAULT,
     not as a DIVERGES finding: the nested graph completed with a dead stage
     behind it, so its verdict is not a judgment on the code;
+  - an adversary DIVERGES verdict blocks with the adversary's own numbered
+    complaints (the column-0 items under its `Complaints:` line), one
+    blocker each, so a fix round can act on them: at most
+    ADVERSARY_COMPLAINTS_MAX, each clipped to ADVERSARY_COMPLAINT_CHARS, the
+    rest folded into one line of their heads; a report without that block
+    keeps one generic DIVERGES blocker;
   - a non-zero critical count in the code-review report blocks regardless
     of the lane's own verdict line — derived from render.py's deterministic
     summary line (`*Reviewed N files, found X critical, …*`); the raw 🔴
@@ -137,20 +143,21 @@ def selection_lines(summary):
 
 
 # A DIVERGES verdict hands the fixer the adversary's own numbered complaints, each a blocker line of its own,
-# clipped so one runaway complaint cannot swamp the Blockers section; the full report follows the table.
+# clipped so one runaway complaint cannot swamp the Blockers section; past the cap, the rest go on one line as heads.
 ADVERSARY_COMPLAINTS_MAX = 8
 ADVERSARY_COMPLAINT_CHARS = 600
+ADVERSARY_OVERFLOW_HEAD_CHARS = 120
 
 
 def adversary_complaints(report):
-    """The numbered items under the adversary's `Complaints:` line, in order; a wrapped item's lines are joined."""
+    """The column-0 numbered items under the adversary's `Complaints:` line, in order; a wrapped item's lines are joined."""
     lines = report.splitlines()
     start = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == "Complaints:"), None)
     items = []
     for ln in lines[start:] if start is not None else []:
         if not ln.strip():
             break
-        m = re.match(r"\s*\d+[.)]\s+(.*)", ln)
+        m = re.match(r"\d+\.\s+(.*)", ln)
         if m:
             items.append(m.group(1).strip())
         elif items:
@@ -173,10 +180,9 @@ def adversary_divergence_blockers(report):
         for i, c in enumerate(complaints[:ADVERSARY_COMPLAINTS_MAX], 1)
     ]
     if len(complaints) > ADVERSARY_COMPLAINTS_MAX:
-        out.append(
-            f"adversary: DIVERGES -- {len(complaints) - ADVERSARY_COMPLAINTS_MAX} more complaint(s) "
-            "in the adversary report below"
-        )
+        rest = complaints[ADVERSARY_COMPLAINTS_MAX:]
+        heads = "; ".join(clip(c, ADVERSARY_OVERFLOW_HEAD_CHARS) for c in rest)
+        out.append(clip(f"adversary: DIVERGES -- {len(rest)} more complaint(s): {heads}", ADVERSARY_COMPLAINT_CHARS))
     return out
 
 

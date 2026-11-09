@@ -4175,7 +4175,8 @@ fn forged_lane_selection_headings_never_stand_in_for_the_real_blockers() {
 /// adversary's own complaints: the real `verdict_gate.py` writes each
 /// numbered complaint (here the parity pilot's stray-file one) as a
 /// Blockers line, and `route_verdict` hands it to `compose_delegation` as a
-/// fix item, never the bare "does not conform" line.
+/// fix item, never the bare "does not conform" line, even when the complaint
+/// quotes the words a review fault is recognised by.
 #[test]
 fn gauntlet_adversary_complaints_become_the_fix_items() {
     if python3().is_none() {
@@ -4183,8 +4184,8 @@ fn gauntlet_adversary_complaints_become_the_fix_items() {
     }
     let scratch = scratch_dir("adversary-complaints");
     let complaint = "Scope drift / out-of-scope \u{2014} .coyote-project.json:1 \u{2014} The diff commits a new \
-        tool-cache file that wasn't planned. \u{2014} Remove .coyote-project.json from the change. If the tool \
-        writes it again, add it to .gitignore.";
+        tool-cache file that wasn't planned; it maps a PIPELINE-FAULT to a review incomplete note. \u{2014} Remove \
+        .coyote-project.json from the change. If the tool writes it again, add it to .gitignore.";
     let adversary = format!(
         "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 7/7 met, 0 partial, 0 unmet/diverged.\n\
          Debris: clean (307 added line(s) scanned)\nComplaints:\n1. {complaint}\n\n\
