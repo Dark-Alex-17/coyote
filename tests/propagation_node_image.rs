@@ -690,7 +690,7 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
     );
     assert!(
         readme.contains(
-            "Coyote keeps the propagation nodes it has heard in `mesh/propagation-nodes.json` under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote that has never heard the node waits for the node's next announce (up to `announce_interval`, 61 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
+            "Coyote keeps the propagation nodes it heard within the last day in `mesh/propagation-nodes.json` under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote that has not heard the node within the last day waits for the node's next announce (up to `announce_interval`, 61 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
         ),
         "deployment README must say the node table survives a restart and how long a first fetch can wait"
     );

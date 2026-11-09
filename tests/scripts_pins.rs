@@ -1008,6 +1008,58 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
     }
 }
 
+/// Both relay scripts say, in the same words, why the shipped propagation node announces
+/// every 61 minutes, with the interval `lxmd.config` actually ships; the note is a script
+/// comment, so the config either script writes is unchanged by it.
+#[test]
+fn relay_scripts_say_why_the_propagation_node_announces_past_the_hour() {
+    let lxmd = read(
+        repo_root()
+            .join("deployment")
+            .join("propagation-node")
+            .join("lxmd.config"),
+    );
+    let interval = lxmd
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("announce_interval = "))
+        .expect("lxmd.config sets announce_interval")
+        .trim()
+        .to_string();
+    let note = [
+        "# The team relay is often the propagation node from deployment/propagation-node. Its"
+            .to_string(),
+        format!(
+            "# lxmd.config announces every {interval} minutes, not 60: this rnsd, like every transport node,"
+        ),
+        "# rate-limits announces per destination (announce_rate_target 3600 s, grace 5, a strict"
+            .to_string(),
+        "# compare) and stops forwarding a node that announces hourly or faster, so a session that"
+            .to_string(),
+        "# joins later would never hear the node through it.".to_string(),
+    ];
+    for name in RELAY_SCRIPTS {
+        let script = read(scripts_dir().join(name));
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == note[0])
+            .unwrap_or_else(|| panic!("{name} lacks the propagation-node announce note"));
+        assert_eq!(
+            lines[at..at + note.len()].to_vec(),
+            note.iter().map(String::as_str).collect::<Vec<_>>(),
+            "{name} carries the announce note in other words than its twin"
+        );
+        let teams_relay = lines
+            .iter()
+            .position(|line| line.contains("# Your team's relay"))
+            .unwrap_or_else(|| panic!("{name} lacks the Team Relay stanza"));
+        assert!(
+            at < teams_relay,
+            "{name}: the note sits before the Team Relay stanza, outside the text the script writes"
+        );
+    }
+}
+
 /// The comment above `ingress_control = No` is copied from the propagation-node config,
 /// so the two files explain the same setting in the same words; and the two relay
 /// scripts write the same config body and print the same firewall sentence, so a

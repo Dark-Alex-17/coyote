@@ -9958,7 +9958,8 @@ fn mesh_deployment_says_why_the_shipped_propagation_node_announces_every_61_minu
         "## Propagation nodes",
     ));
     for needle in [
-        "The node table is kept across restarts (`propagation-nodes.json`)",
+        "The node table keeps the nodes heard within the last day across restarts (`propagation-nodes.json`)",
+        "one that has not heard the node within the last day waits for its next announce",
         "(up to `announce_interval`, 61 minutes with the shipped `lxmd.config`)",
         "The shipped node announces every 61 minutes, not every hour or more often.",
         "(RNS `announce_rate_target` 3600 s, `announce_rate_grace` 5) with a strict compare",
