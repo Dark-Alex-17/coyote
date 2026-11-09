@@ -122,21 +122,21 @@ from the brief, never from a hard-coded toolchain):
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
 scripts/_lib.py:621:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
 scripts/gates.py:46:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:3673:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:3682:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:3695:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:3704:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1185:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:1588:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:2209:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:1207:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:1612:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:2233:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
 None of these runs a toolchain: `_lib.py:621` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:46` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:3673` and `:3682` are the English verb `make` in prompt prose, and
+lockfile names), `gates.py:3695` and `:3704` are the English verb `make` in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -199,9 +199,11 @@ bulleted blockers and the unbulleted debris lines, so a look-alike `## Blockers`
 lane-selection reasons never stands in for the real one.
 
 Every conformance reviewer (`run_gauntlet`, `wave_gauntlet` and the micro-mode `run_adversary`)
-receives `debris_exclude`: `verify_gate` sets it to `["plans"]` when the code repo carries a
-`plans/` directory, as sisyphus-next's intake does, so planning files are never linted as
-implementation debris; a value already in state is kept.
+receives `debris_exclude`: `verify_gate` lists the planning store (`plans_root`, so a custom
+`plans_dir` counts) and the code repo's `plans/` directory when they sit inside the git work
+tree, each relative to the repository top as the lint reads it, so planning files are never
+linted as implementation debris (sisyphus-next's intake rules the same for `plans/`); a value
+already in state is kept.
 
 Four reads take the full reply on purpose: `ADVERSARIAL_REVIEW:` (the direct micro-mode
 adversary lane, whose report has no gauntlet header; its complaints and its own debris
