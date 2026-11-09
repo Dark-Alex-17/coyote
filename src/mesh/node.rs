@@ -770,7 +770,8 @@ pub(crate) struct MeshRuntime {
     /// queued behind the first.
     fetching: Mutex<()>,
     /// The automatic propagation sync's interval, `None` while it is off, which a fetch
-    /// that failed names as when it is tried again.
+    /// that failed names as when it is tried again. Read from the same config, through
+    /// the same `propagation_sync_every`, as the idle driver's `SyncSchedule`.
     sync_every: Option<Duration>,
     /// The held messages this process left on the propagation node for another session
     /// of the identity, which later fetches neither ask for again nor name as read.
@@ -16189,6 +16190,27 @@ mod tests {
             metrics.num_alive_tasks() == 0
         })
         .await;
+    }
+
+    /// A propagation fetch names the automatic sync's interval from the node's own config,
+    /// and none while the automatic sync is off.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_names_the_configured_sync_interval_only_while_the_sync_runs() {
+        for (tag, interval_secs, announce, expected) in [
+            ("node-sync-every", 45, true, Some(Duration::from_secs(45))),
+            ("node-sync-every-manual", 0, true, None),
+            ("node-sync-every-silent", 45, false, None),
+        ] {
+            let started = started_runtime_with(tag, |config| {
+                config.propagation_sync_interval_secs = interval_secs;
+                config.announce = announce;
+            })
+            .await;
+            assert_eq!(started.runtime.sync_every, expected, "{tag}");
+            started.runtime.shutdown().await.unwrap();
+            started.relay_handle.abort();
+        }
     }
 
     /// `last_announce_at` is the moment of the node's last announce of any kind: set by

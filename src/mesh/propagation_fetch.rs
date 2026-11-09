@@ -250,12 +250,12 @@ impl fmt::Display for FetchError {
             ),
             Self::Link(RequestError::IdentifyTimeout { after, .. }) => write!(
                 f,
-                "This node could not prove its identity to the propagation node within {}, so the node was never asked for its messages; .mesh sync tries again",
+                "This node's own mesh transport did not send its identity proof to the propagation node within {}, so this says nothing about the propagation node, which was never asked for its messages; .mesh sync tries again",
                 seconds(*after)
             ),
             Self::Link(RequestError::ResponseIncomplete { after, .. }) => write!(
                 f,
-                "The propagation node started to answer, but the answer had not finished arriving within {}, so the way to it is slow or broke; .mesh sync tries again",
+                "The propagation node started to answer, but the answer had not finished arriving within {}, so the way to it is slow or was cut; .mesh sync tries again",
                 seconds(*after)
             ),
             Self::Link(RequestError::RequestIncomplete { after, .. }) => write!(
@@ -265,7 +265,7 @@ impl fmt::Display for FetchError {
             ),
             Self::Link(RequestError::ResponseOversize { max }) => write!(
                 f,
-                "The propagation node answered with more than the {max} bytes this sync allows, so the answer was dropped; if .mesh sync meets the same answer, the node is not keeping to the size it was asked for"
+                "The propagation node answered with more than the {max} bytes this sync allows, so the answer was dropped; run .mesh sync again, and if it fails the same way, tell the node's operator that it serves more than a sync asks for"
             ),
             Self::Link(err) => write!(f, "{err}"),
             Self::ListLinkTimeout {
@@ -3724,7 +3724,9 @@ mod tests {
             ]
             .map(RequestError::Refused),
         );
+        let mut covered = std::collections::BTreeSet::new();
         for failure in failures {
+            covered.insert(request_error_variant(&failure));
             for err in [
                 fetch_error(failure.clone(), "9af2fd91", "id1", None),
                 round_one_error(failure.clone(), "9af2fd91", "id1", None),
@@ -3733,6 +3735,66 @@ mod tests {
                 assert!(!text.contains("peer"), "{failure:?}: {text}");
             }
         }
+        assert_eq!(
+            covered.len(),
+            REQUEST_ERROR_VARIANTS,
+            "every RequestError variant is sampled"
+        );
+    }
+
+    const REQUEST_ERROR_VARIANTS: usize = 17;
+
+    /// No wildcard arm: a new `RequestError` variant fails to compile here until it is
+    /// numbered, `REQUEST_ERROR_VARIANTS` raised and a sample of it added to the sweep.
+    fn request_error_variant(err: &RequestError) -> usize {
+        match err {
+            RequestError::Timeout { .. } => 0,
+            RequestError::LinkActivationTimeout { .. } => 1,
+            RequestError::LocalTimeout { .. } => 2,
+            RequestError::IdentifyTimeout { .. } => 3,
+            RequestError::ResponseIncomplete { .. } => 4,
+            RequestError::RequestIncomplete { .. } => 5,
+            RequestError::LinkFailed(_) => 6,
+            RequestError::LinkNotOpened(_) => 7,
+            RequestError::LinkClosed => 8,
+            RequestError::Oversize { .. } => 9,
+            RequestError::ResponseOversize { .. } => 10,
+            RequestError::Decode(_) => 11,
+            RequestError::Send(_) => 12,
+            RequestError::Refused(_) => 13,
+            RequestError::UnsupportedVersion { .. } => 14,
+            RequestError::NotRunning => 15,
+            RequestError::Shutdown => 16,
+        }
+    }
+
+    #[test]
+    fn a_sync_that_failed_on_the_link_says_what_happened_why_and_what_to_run() {
+        let path = GET_PATH.to_string();
+        let after = Duration::from_secs(10);
+        let text = |err: RequestError| fetch_error(err, "9af2fd91", "id1", None).to_string();
+        assert_eq!(
+            text(RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after
+            }),
+            "This node's own mesh transport did not send its identity proof to the propagation node within 10 s, so this says nothing about the propagation node, which was never asked for its messages; .mesh sync tries again"
+        );
+        assert_eq!(
+            text(RequestError::ResponseIncomplete {
+                path: path.clone(),
+                after
+            }),
+            "The propagation node started to answer, but the answer had not finished arriving within 10 s, so the way to it is slow or was cut; .mesh sync tries again"
+        );
+        assert_eq!(
+            text(RequestError::RequestIncomplete { path, after }),
+            "The request to the propagation node was too large for one packet, and its upload had not finished within 10 s, so the node never had all of it to answer; .mesh sync tries again"
+        );
+        assert_eq!(
+            text(RequestError::ResponseOversize { max: 1024 }),
+            "The propagation node answered with more than the 1024 bytes this sync allows, so the answer was dropped; run .mesh sync again, and if it fails the same way, tell the node's operator that it serves more than a sync asks for"
+        );
     }
 
     #[tokio::test]
