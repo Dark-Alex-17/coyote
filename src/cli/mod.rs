@@ -45,20 +45,6 @@ pub enum McpScopeArg {
 {all-args}{after-help}
 ",
 	group(
-		ArgGroup::new("sbx-mode")
-			.args(["sandbox", "fresh"])
-			.multiple(true)
-			.conflicts_with_all([
-				"model", "temp_role", "role", "session", "agent", "rag", "rebuild_rag",
-				"macro_name", "execute", "code", "file", "no_stream", "no_memory",
-				"init_memory", "memory_migrate", "apply", "dry_run", "info", "build_tools", "install",
-				"install_builtins", "sync_models", "list_models", "list_roles",
-				"list_sessions", "list_agents", "list_rags", "list_macros",
-				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
-				"update", "update_bundle", "uninstall", "generate_models",
-			])
-	),
-	group(
 		ArgGroup::new("mcp-action")
 			.args(["mcp_add", "mcp_remove", "mcp_list", "mcp_get"])
 			.multiple(false)
@@ -391,9 +377,17 @@ pub struct Cli {
     #[arg(long, help_heading = "MCP Servers")]
     pub mcp_force: bool,
 
-    /// Launch Coyote inside a Docker sandbox (via `sbx`); name defaults to current directory basename
-    #[arg(long, value_name = "NAME", help_heading = "Sandbox")]
-    pub sandbox: Option<Option<String>>,
+    /// Launch Coyote inside a Docker sandbox (via `sbx`), forwarding every other argument to it
+    #[arg(long, help_heading = "Sandbox")]
+    pub sandbox: bool,
+    /// Name of the sandbox to create or re-attach; defaults to the current directory basename
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "sandbox",
+        help_heading = "Sandbox"
+    )]
+    pub sandbox_name: Option<String>,
     /// Start the sandbox with a clean slate. No copied config or tokens; LLM credentials injected via sbx proxy
     #[arg(long, requires = "sandbox", help_heading = "Sandbox")]
     pub fresh: bool,
@@ -715,7 +709,6 @@ mod tests {
         assert!(Cli::try_parse_from(["coyote", "--memory-migrate"]).is_err());
         assert!(Cli::try_parse_from(["coyote", "--memory-migrate", "both"]).is_err());
         assert!(Cli::try_parse_from(["coyote", "--init-memory", "all"]).is_err());
-        assert!(Cli::try_parse_from(["coyote", "--sandbox", "--memory-migrate", "all"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "coyote",
@@ -749,6 +742,10 @@ mod tests {
         const ALLOWED_WITH_MIGRATE: &[&str] = &[
             // The migration's own write switch.
             "apply",
+            // Sandbox flags are split off before clap parses; the rest is forwarded.
+            "sandbox",
+            "sandbox_name",
+            "fresh",
         ];
 
         let command = Cli::command();
@@ -1096,20 +1093,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_sandbox_flag_no_value() {
+    fn parse_sandbox_flag_takes_no_value() {
         let cli = parse(&["--sandbox"]);
-        assert_eq!(cli.sandbox, Some(None));
+        assert!(cli.sandbox);
+        assert_eq!(cli.sandbox_name, None);
+        assert!(Cli::try_parse_from(["coyote", "--sandbox=my-box"]).is_err());
     }
 
     #[test]
-    fn parse_sandbox_flag_with_name() {
-        let cli = parse(&["--sandbox", "my-box"]);
-        assert_eq!(cli.sandbox, Some(Some("my-box".to_string())));
+    fn parse_sandbox_name_flag() {
+        let cli = parse(&["--sandbox", "--sandbox-name", "my-box"]);
+        assert!(cli.sandbox);
+        assert_eq!(cli.sandbox_name.as_deref(), Some("my-box"));
     }
 
     #[test]
-    fn parse_sandbox_is_exclusive() {
-        assert!(Cli::try_parse_from(["coyote", "--sandbox", "--agent", "foo"]).is_err());
+    fn parse_sandbox_companions_require_sandbox() {
+        assert!(Cli::try_parse_from(["coyote", "--sandbox-name", "my-box"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--fresh"]).is_err());
+        assert!(parse(&["--sandbox", "--fresh"]).fresh);
+    }
+
+    #[test]
+    fn parse_sandbox_combines_with_other_flags() {
+        let cli = parse(&["--sandbox", "--agent", "foo", "do x"]);
+        assert!(cli.sandbox);
+        assert_eq!(cli.agent.as_deref(), Some("foo"));
     }
 
     #[test]

@@ -108,6 +108,7 @@ fn run_coyote(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_coyote"))
         .args(args)
         .current_dir(root)
+        .env("PWD", root)
         .env("COYOTE_CONFIG_DIR", root.join("config"))
         .env("COYOTE_CACHE_DIR", root.join("cache"))
         .env("HOME", &home)
@@ -150,7 +151,7 @@ fn hash_file(root: &Path) -> PathBuf {
 /// The stub log is reset first so repeated runs are judged one at a time.
 fn sandbox_bails_on_missing_config(label: &str, root: &Path, marker: &Path) {
     let _ = fs::remove_file(marker);
-    let output = run_coyote(root, &["--sandbox", "probe"]);
+    let output = run_coyote(root, &["--sandbox", "--sandbox-name", "probe"]);
     assert!(
         !output.status.success(),
         "{label}: expected a refusal, got {:?}\nstdout: {}",
@@ -354,8 +355,9 @@ fn sandbox_kit_override_pointing_nowhere_is_refused_before_any_extraction() {
     let missing = root.join("no-such-kit");
 
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["--sandbox", "probe"])
+        .args(["--sandbox", "--sandbox-name", "probe"])
         .current_dir(&root)
+        .env("PWD", &root)
         .env("COYOTE_CONFIG_DIR", root.join("config"))
         .env("COYOTE_CACHE_DIR", root.join("cache"))
         .env("HOME", root.join("home"))

@@ -59,6 +59,8 @@ use log4rs::append::rolling_file::policy::compound::trigger::size::SizeTrigger;
 use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use oauth::OAuthProvider;
+use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::{env, fs, process, sync::Arc};
@@ -97,7 +99,21 @@ async fn async_main() -> Result<()> {
     load_env_file()?;
     CompleteEnv::with_factory(Cli::command).complete();
     register_envoy_source();
+
+    let raw_args: Vec<OsString> = env::args_os().skip(1).collect();
+    if let Some(invocation) = sandbox::split_sandbox_args(&raw_args)? {
+        setup_logger(true)?;
+        let code = sandbox::launch(invocation)?;
+        if code != 0 {
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+            process::exit(code);
+        }
+        return Ok(());
+    }
+
     let cli = Cli::parse();
+    reject_unsplit_sandbox(&cli)?;
 
     if cli.dangerously_skip_permissions {
         unsafe {
@@ -178,10 +194,6 @@ async fn async_main() -> Result<()> {
         let force = cli.force;
         return tokio::task::spawn_blocking(move || config::run_self_update(version, force))
             .await?;
-    }
-
-    if let Some(name) = &cli.sandbox {
-        return sandbox::launch(name.clone(), cli.fresh);
     }
 
     if cli.list_bundles {
@@ -895,7 +907,19 @@ async fn create_input(
     Ok(input)
 }
 
-fn setup_logger(acp_mode: bool) -> Result<Option<PathBuf>> {
+/// `--sandbox` is split off before clap runs; reaching the parser with it set
+/// would run the request unsandboxed on the host.
+fn reject_unsplit_sandbox(cli: &Cli) -> Result<()> {
+    if cli.sandbox {
+        bail!(
+            "Internal error: --sandbox reached the host argument parser instead of being forwarded"
+        );
+    }
+
+    Ok(())
+}
+
+fn setup_logger(console_to_stderr: bool) -> Result<Option<PathBuf>> {
     let (log_level, log_path) = paths::log_config()?;
     if log_level == LevelFilter::Off {
         return Ok(None);
@@ -904,14 +928,20 @@ fn setup_logger(acp_mode: bool) -> Result<Option<PathBuf>> {
         "{d(%Y-%m-%d %H:%M:%S%.3f)(utc)} <{i}> [{l}] {f}:{L} - {m}{n}",
     ));
     let log_filter = env::var(get_env_name("log_filter")).ok();
+    let console_appender = |encoder: Box<PatternEncoder>| {
+        let mut builder = ConsoleAppender::builder().encoder(encoder);
+        if console_to_stderr {
+            builder = builder.target(Target::Stderr);
+        }
+        builder.build()
+    };
     match log_path.clone() {
         None => {
-            let mut builder = ConsoleAppender::builder().encoder(encoder);
-            if acp_mode {
-                builder = builder.target(Target::Stderr);
-            }
-            let console_appender = builder.build();
-            log4rs::init_config(init_console_logger(log_level, log_filter, console_appender))?;
+            log4rs::init_config(init_console_logger(
+                log_level,
+                log_filter,
+                console_appender(encoder),
+            ))?;
         }
         Some(path) => {
             ensure_parent_exists(&path)?;
@@ -934,14 +964,11 @@ fn setup_logger(acp_mode: bool) -> Result<Option<PathBuf>> {
                 Ok(appender) => {
                     log4rs::init_config(init_file_logger(log_level, log_filter, appender))?
                 }
-                Err(_) => {
-                    let console_appender = ConsoleAppender::builder().encoder(encoder).build();
-                    log4rs::init_config(init_console_logger(
-                        log_level,
-                        log_filter,
-                        console_appender,
-                    ))?
-                }
+                Err(_) => log4rs::init_config(init_console_logger(
+                    log_level,
+                    log_filter,
+                    console_appender(encoder),
+                ))?,
             };
         }
     }
@@ -1035,6 +1062,25 @@ fn resolve_oauth_client(
 mod tests {
     use super::*;
     use crate::client::{Model, ModelData};
+
+    #[test]
+    fn reject_unsplit_sandbox_refuses_a_parsed_sandbox_flag() {
+        let cli = Cli::try_parse_from(["coyote", "--sandbox"]).unwrap();
+
+        let err = reject_unsplit_sandbox(&cli).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Internal error: --sandbox reached the host argument parser instead of being forwarded"
+        );
+    }
+
+    #[test]
+    fn reject_unsplit_sandbox_allows_a_plain_invocation() {
+        let cli = Cli::try_parse_from(["coyote", "hi"]).unwrap();
+
+        reject_unsplit_sandbox(&cli).unwrap();
+    }
 
     #[tokio::test]
     async fn create_input_refuses_an_image_for_a_non_vision_model() {
