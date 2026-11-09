@@ -45,7 +45,7 @@ impl_client_trait!(
     dialect: Some(SchemaDialect::OpenAiStrict),
 );
 
-fn prepare_chat_completions(
+pub(super) fn prepare_chat_completions(
     self_: &AzureOpenAIClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {

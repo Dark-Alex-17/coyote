@@ -99,7 +99,7 @@ impl Client for OpenAICompatibleClient {
     }
 }
 
-async fn prepare_chat_completions(
+pub(super) async fn prepare_chat_completions(
     self_: &OpenAICompatibleClient,
     client: &ReqwestClient,
     data: ChatCompletionsData,

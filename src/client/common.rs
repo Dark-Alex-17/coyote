@@ -393,7 +393,8 @@ pub struct ChatCompletionsData {
     /// Cache TTL for the system prompt and tool declarations (`"1h"`), or
     /// None for the provider default. Only the Anthropic clients read it.
     pub prompt_cache_ttl: Option<String>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "no production reader yet"))] // TASK-428
+    /// Set from the model's capability flag alone, so it can be Some for a
+    /// client with no native dialect. Such clients must drop it from the body.
     pub structured_output: Option<StructuredOutputSpec>,
 }
 
@@ -2720,5 +2721,230 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer sk-test")
         );
+    }
+
+    fn carries_native_structured_output(body: &Value) -> bool {
+        [
+            "/response_format",
+            "/text/format",
+            "/output_config/format",
+            "/generationConfig/responseJsonSchema",
+            "/outputConfig/textFormat",
+        ]
+        .iter()
+        .any(|pointer| body.pointer(pointer).is_some())
+    }
+
+    #[test]
+    fn native_structured_output_is_sent_only_when_the_client_has_a_dialect() {
+        use super::super::{
+            azure_openai, bedrock, claude, cohere, gemini, openai, openai_compatible, vertexai,
+        };
+        use std::str::FromStr;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let http = ReqwestClient::new();
+        let app_config = |clients| {
+            Arc::new(AppConfig {
+                clients,
+                ..AppConfig::default()
+            })
+        };
+        let mut rows: Vec<(&str, Option<SchemaDialect>, Value)> = vec![];
+
+        for (label, wire_api) in [
+            ("openai chat", WireApi::Chat),
+            ("openai responses", WireApi::Responses),
+        ] {
+            let config = openai::OpenAIConfig {
+                name: Some("so-openai".into()),
+                api_key: Some("sk-test".into()),
+                wire_api: Some(wire_api),
+                ..Default::default()
+            };
+            let client = OpenAIClient {
+                app_config: app_config(vec![ClientConfig::OpenAIConfig(config.clone())]),
+                config,
+                model: Model::new("so-openai", "gpt-test"),
+            };
+            let (request_data, _) = runtime
+                .block_on(openai::prepare_chat_completions(
+                    &client,
+                    &http,
+                    structured_output_data(),
+                ))
+                .unwrap();
+            rows.push((
+                label,
+                client.native_structured_output_dialect(),
+                request_data.body,
+            ));
+        }
+
+        let client = AzureOpenAIClient {
+            app_config: app_config(vec![]),
+            config: azure_openai::AzureOpenAIConfig {
+                name: Some("so-azure".into()),
+                api_base: Some("https://resource.openai.azure.com".into()),
+                api_key: Some("azure-key".into()),
+                ..Default::default()
+            },
+            model: Model::new("so-azure", "gpt-test"),
+        };
+        let request_data =
+            azure_openai::prepare_chat_completions(&client, structured_output_data()).unwrap();
+        rows.push((
+            "azure",
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        let client = OpenAICompatibleClient {
+            app_config: app_config(vec![]),
+            config: openai_compatible::OpenAICompatibleConfig {
+                name: Some("so-compat".into()),
+                api_base: Some("https://compat.example/v1".into()),
+                api_key: Some("sk-test".into()),
+                ..Default::default()
+            },
+            model: Model::new("so-compat", "gpt-test"),
+        };
+        let (request_data, _) = runtime
+            .block_on(openai_compatible::prepare_chat_completions(
+                &client,
+                &http,
+                structured_output_data(),
+            ))
+            .unwrap();
+        rows.push((
+            "openai-compatible",
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        let config = claude::ClaudeConfig {
+            name: Some("so-claude".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        let client = ClaudeClient {
+            app_config: app_config(vec![ClientConfig::ClaudeConfig(config.clone())]),
+            config,
+            model: Model::new("so-claude", "claude-test"),
+        };
+        let request_data = runtime
+            .block_on(claude::prepare_chat_completions(
+                &client,
+                &http,
+                structured_output_data(),
+            ))
+            .unwrap();
+        rows.push((
+            "claude",
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        let config = gemini::GeminiConfig {
+            name: Some("so-gemini".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        let client = GeminiClient {
+            app_config: app_config(vec![ClientConfig::GeminiConfig(config.clone())]),
+            config,
+            model: Model::new("so-gemini", "gemini-test"),
+        };
+        let request_data = runtime
+            .block_on(gemini::prepare_chat_completions(
+                &client,
+                &http,
+                structured_output_data(),
+            ))
+            .unwrap();
+        rows.push((
+            "gemini",
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        set_access_token(
+            "so-vertex",
+            "vertex-at".into(),
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+        for (label, real_name) in [
+            ("vertex gemini", "gemini-2.5-pro"),
+            ("vertex claude", "claude-sonnet-4"),
+            ("vertex mistral", "mistral-large"),
+        ] {
+            let client = VertexAIClient {
+                app_config: app_config(vec![]),
+                config: vertexai::VertexAIConfig {
+                    name: Some("so-vertex".into()),
+                    project_id: Some("project".into()),
+                    location: Some("us-central1".into()),
+                    ..Default::default()
+                },
+                model: Model::new("so-vertex", real_name),
+            };
+            let category = vertexai::ModelCategory::from_str(real_name).unwrap();
+            let request_data =
+                vertexai::prepare_chat_completions(&client, structured_output_data(), &category)
+                    .unwrap();
+            rows.push((
+                label,
+                client.native_structured_output_dialect(),
+                request_data.body,
+            ));
+        }
+
+        let client = BedrockClient {
+            app_config: app_config(vec![]),
+            config: bedrock::BedrockConfig {
+                name: Some("so-bedrock".into()),
+                access_key_id: Some("AKIDEXAMPLE".into()),
+                secret_access_key: Some("secret".into()),
+                region: Some("us-east-1".into()),
+                ..Default::default()
+            },
+            model: Model::new("so-bedrock", "anthropic.claude-sonnet-4"),
+        };
+        let request = client
+            .chat_completions_builder(&http, structured_output_data())
+            .unwrap()
+            .build()
+            .unwrap();
+        let body = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        rows.push(("bedrock", client.native_structured_output_dialect(), body));
+
+        let client = CohereClient {
+            app_config: app_config(vec![]),
+            config: cohere::CohereConfig {
+                name: Some("so-cohere".into()),
+                api_key: Some("co-key".into()),
+                ..Default::default()
+            },
+            model: Model::new("so-cohere", "command-test"),
+        };
+        let request_data =
+            cohere::prepare_chat_completions(&client, structured_output_data()).unwrap();
+        rows.push((
+            "cohere",
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        for (label, dialect, body) in rows {
+            assert_eq!(
+                carries_native_structured_output(&body),
+                dialect.is_some(),
+                "{label}: dialect {dialect:?}, body {body}"
+            );
+        }
     }
 }

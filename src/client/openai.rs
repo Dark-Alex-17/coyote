@@ -1,7 +1,7 @@
 use super::access_token::{get_access_token, get_access_token_account_id};
 use super::oauth::{self, OAuthConfig, OAuthProvider};
 use super::openai_oauth::OpenAIOAuthProvider;
-use super::structured_output::SchemaDialect;
+use super::structured_output::{SchemaDialect, StructuredOutputSpec, convert_schema};
 use super::*;
 
 use crate::function::ToolResult;
@@ -122,7 +122,7 @@ pub fn resolve_wire_api(
     }
 }
 
-async fn prepare_chat_completions(
+pub(super) async fn prepare_chat_completions(
     self_: &OpenAIClient,
     client: &ReqwestClient,
     data: ChatCompletionsData,
@@ -489,7 +489,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         functions,
         stream,
         prompt_cache_ttl: _,
-        structured_output: _,
+        structured_output,
     } = data;
 
     let messages_len = messages.len();
@@ -624,6 +624,16 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                 })
             })
             .collect();
+    }
+    if let Some(StructuredOutputSpec { name, schema }) = structured_output {
+        body["response_format"] = json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": name,
+                "schema": convert_schema(&schema, SchemaDialect::OpenAiStrict),
+                "strict": true,
+            },
+        });
     }
     body
 }
@@ -773,7 +783,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
         functions,
         stream,
         prompt_cache_ttl: _,
-        structured_output: _,
+        structured_output,
     } = data;
 
     let messages_len = messages.len();
@@ -893,6 +903,14 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
                 tool
             })
             .collect();
+    }
+    if let Some(StructuredOutputSpec { name, schema }) = structured_output {
+        body["text"]["format"] = json!({
+            "type": "json_schema",
+            "name": name,
+            "schema": convert_schema(&schema, SchemaDialect::OpenAiStrict),
+            "strict": true,
+        });
     }
     body
 }
@@ -2778,6 +2796,66 @@ mod tests {
             "body: {}",
             request_data.body
         );
+    }
+
+    fn structured_output_schema() -> Value {
+        structured_output_data().structured_output.unwrap().schema
+    }
+
+    #[test]
+    fn chat_spec_writes_a_strict_json_schema_response_format() {
+        let body = openai_build_chat_completions_body(
+            structured_output_data(),
+            &Model::new("openai", "gpt-test"),
+        );
+
+        assert_eq!(
+            body["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": convert_schema(&structured_output_schema(), SchemaDialect::OpenAiStrict),
+                    "strict": true,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn chat_without_spec_body_is_unchanged() {
+        let body =
+            openai_build_chat_completions_body(hello_data(false), &Model::new("openai", "gpt-test"));
+
+        assert_eq!(
+            body.to_string(),
+            r#"{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}"#
+        );
+    }
+
+    #[test]
+    fn responses_spec_writes_text_format_without_a_json_schema_wrapper() {
+        let body =
+            openai_build_responses_body(structured_output_data(), &Model::new("openai", "gpt-test"));
+
+        assert_eq!(
+            body["text"],
+            json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": convert_schema(&structured_output_schema(), SchemaDialect::OpenAiStrict),
+                    "strict": true,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn responses_without_spec_has_no_text_key() {
+        let body = openai_build_responses_body(hello_data(false), &Model::new("openai", "gpt-test"));
+
+        assert!(body.get("text").is_none(), "body: {body}");
     }
 }
 

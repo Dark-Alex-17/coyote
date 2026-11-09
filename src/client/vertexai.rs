@@ -1,7 +1,7 @@
 use super::access_token::*;
 use super::claude::*;
 use super::openai::*;
-use super::structured_output::SchemaDialect;
+use super::structured_output::{SchemaDialect, StructuredOutputSpec, convert_schema};
 use super::*;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -101,7 +101,7 @@ impl Client for VertexAIClient {
     }
 }
 
-fn prepare_chat_completions(
+pub(super) fn prepare_chat_completions(
     self_: &VertexAIClient,
     data: ChatCompletionsData,
     model_category: &ModelCategory,
@@ -164,6 +164,8 @@ fn prepare_chat_completions(
             let mut body = openai_build_chat_completions_body(data, &self_.model);
             if let Some(body_obj) = body.as_object_mut() {
                 body_obj["model"] = strip_model_version(self_.model.real_name()).into();
+                // Vertex Mistral has no native structured-output dialect.
+                body_obj.remove("response_format");
             }
             body
         }
@@ -396,7 +398,7 @@ pub fn gemini_build_chat_completions_body(
         functions,
         stream: _,
         prompt_cache_ttl: _,
-        structured_output: _,
+        structured_output,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -524,6 +526,11 @@ pub fn gemini_build_chat_completions_body(
     if let Some(v) = reasoning_effort {
         body["generationConfig"]["thinking_config"] = json!({"thinking_level": v});
     }
+    if let Some(StructuredOutputSpec { schema, .. }) = structured_output {
+        body["generationConfig"]["responseMimeType"] = "application/json".into();
+        body["generationConfig"]["responseJsonSchema"] =
+            convert_schema(&schema, SchemaDialect::Gemini);
+    }
 
     if let Some(functions) = functions {
         // Gemini doesn't support functions with parameters that have empty properties, so we need to patch it.
@@ -547,7 +554,7 @@ pub fn gemini_build_chat_completions_body(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelCategory {
+pub(super) enum ModelCategory {
     Gemini,
     Claude,
     Mistral,
@@ -1029,5 +1036,107 @@ mod tests {
             );
             assert_eq!(request_data.body.get("stream").is_some(), stream);
         }
+    }
+
+    fn structured_output_schema() -> Value {
+        structured_output_data().structured_output.unwrap().schema
+    }
+
+    #[test]
+    fn gemini_spec_joins_existing_generation_config() {
+        let mut model = Model::new("vertexai", "gemini-test");
+        model.set_max_tokens(Some(256), true);
+        let mut data = structured_output_data();
+        data.temperature = Some(0.5);
+        data.top_p = Some(0.9);
+        data.reasoning_effort = Some("high".into());
+
+        let body = gemini_build_chat_completions_body(data, &model).unwrap();
+
+        assert_eq!(
+            body["generationConfig"],
+            json!({
+                "maxOutputTokens": 256,
+                "temperature": 0.5,
+                "topP": 0.9,
+                "thinking_config": { "thinking_level": "high" },
+                "responseMimeType": "application/json",
+                "responseJsonSchema": convert_schema(&structured_output_schema(), SchemaDialect::Gemini),
+            })
+        );
+    }
+
+    #[test]
+    fn gemini_without_spec_body_is_unchanged() {
+        let body = gemini_build_chat_completions_body(
+            hello_data(false),
+            &Model::new("vertexai", "gemini-test"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body.to_string(),
+            r#"{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":{}}"#
+        );
+    }
+
+    #[test]
+    fn vertex_gemini_body_carries_the_spec() {
+        let client = VertexAIClient {
+            model: Model::new("vertex-gemini-structured-test", "gemini-2.5-pro"),
+            ..mistral_client("vertex-gemini-structured-test")
+        };
+
+        let request_data =
+            prepare_chat_completions(&client, structured_output_data(), &ModelCategory::Gemini)
+                .unwrap();
+
+        assert_eq!(
+            request_data.body["generationConfig"]["responseJsonSchema"],
+            convert_schema(&structured_output_schema(), SchemaDialect::Gemini)
+        );
+        assert_eq!(
+            request_data.body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn vertex_claude_body_has_the_claude_output_config() {
+        let client = VertexAIClient {
+            model: Model::new("vertex-claude-structured-test", "claude-sonnet-4"),
+            ..mistral_client("vertex-claude-structured-test")
+        };
+        let mut data = structured_output_data();
+        data.reasoning_effort = Some("high".into());
+
+        let request_data =
+            prepare_chat_completions(&client, data, &ModelCategory::Claude).unwrap();
+
+        assert_eq!(
+            request_data.body["output_config"],
+            json!({
+                "effort": "high",
+                "format": {
+                    "type": "json_schema",
+                    "schema": convert_schema(&structured_output_schema(), SchemaDialect::Anthropic),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn mistral_body_drops_the_spec() {
+        let client = mistral_client("vertex-mistral-structured-test");
+
+        let request_data =
+            prepare_chat_completions(&client, structured_output_data(), &ModelCategory::Mistral)
+                .unwrap();
+
+        assert!(
+            request_data.body.get("response_format").is_none(),
+            "body: {}",
+            request_data.body
+        );
     }
 }

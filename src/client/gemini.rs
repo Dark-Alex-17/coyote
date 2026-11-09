@@ -88,7 +88,7 @@ impl Client for GeminiClient {
     }
 }
 
-async fn prepare_chat_completions(
+pub(super) async fn prepare_chat_completions(
     self_: &GeminiClient,
     client: &ReqwestClient,
     data: ChatCompletionsData,
