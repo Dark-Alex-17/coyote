@@ -33,12 +33,15 @@ Rules:
 pub(crate) struct NativeFormatState {
     pub rejected: bool,
     pub last_dialect: Option<SchemaDialect>,
+    /// The returning turn's own output and dialect when it ran under the
+    /// native format. `run_chat_loop` sets it and `llm::finish` takes it,
+    /// so it must survive `run()` returning.
     pub final_turn: Option<(String, SchemaDialect)>,
 }
 
 /// The extractor's model call, injectable so tests can fail the first
 /// attempt without a provider.
-type ExtractorTransport<'f> =
+pub(crate) type ExtractorTransport<'f> =
     dyn for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send + 'f;
 
 /// Sends `input` with its native format when `dialect` is set and the run
@@ -111,13 +114,32 @@ pub async fn extract(
     abort: &AbortSignal,
     producer_dialect: Option<SchemaDialect>,
 ) -> Result<Value> {
+    let mut transport = quiet_transport(abort.clone());
+    extract_with_transport(
+        raw,
+        schema,
+        parent_ctx,
+        abort,
+        producer_dialect,
+        &mut transport,
+    )
+    .await
+}
+
+pub(crate) async fn extract_with_transport(
+    raw: &str,
+    schema: &Value,
+    parent_ctx: &mut RequestContext,
+    abort: &AbortSignal,
+    producer_dialect: Option<SchemaDialect>,
+    transport: &mut ExtractorTransport<'_>,
+) -> Result<Value> {
     if let Some(mut parsed) = try_parse_json(raw) {
         strip_nulls_for(producer_dialect, &mut parsed, schema);
         return Ok(parsed);
     }
 
-    let mut transport = quiet_transport(abort.clone());
-    extract_via_extractor(raw, schema, parent_ctx, abort, &mut transport).await
+    extract_via_extractor(raw, schema, parent_ctx, abort, transport).await
 }
 
 pub(crate) fn strip_nulls_for(dialect: Option<SchemaDialect>, value: &mut Value, schema: &Value) {

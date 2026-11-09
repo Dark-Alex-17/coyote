@@ -1,10 +1,10 @@
 use super::state::StateManager;
 use super::state_updates;
 use super::structured;
-use super::structured::with_native_format_fallback;
+use super::structured::{ExtractorTransport, with_native_format_fallback};
 use super::types::LlmNode;
 use super::{is_transient_error, wall_clock};
-use crate::client::structured_output::{StructuredOutputSpec, sanitize_schema_name};
+use crate::client::structured_output::{SchemaDialect, StructuredOutputSpec, sanitize_schema_name};
 use crate::client::{Model, ModelType, call_chat_completions_streaming_quiet};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
@@ -17,7 +17,7 @@ use crate::function::skill::skill_function_declarations;
 use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Error, Result, anyhow, bail};
-use log::warn;
+use log::{debug, warn};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
@@ -63,11 +63,37 @@ async fn finish(
     result: Result<String>,
     abort: &AbortSignal,
 ) -> Result<LlmExecutionOutcome> {
+    let mut transport = quiet_transport(abort.clone());
+    finish_with(
+        node,
+        state_manager,
+        parent_ctx,
+        result,
+        abort,
+        &mut transport,
+    )
+    .await
+}
+
+async fn finish_with(
+    node: &LlmNode,
+    state_manager: &mut StateManager,
+    parent_ctx: &mut RequestContext,
+    result: Result<String>,
+    abort: &AbortSignal,
+    transport: &mut ExtractorTransport<'_>,
+) -> Result<LlmExecutionOutcome> {
+    let final_turn = parent_ctx.native_format.final_turn.take();
     let (output, failure_reason) = match result {
         Ok(raw) => match &node.output_schema {
-            Some(schema) => match parse_native_final_turn(parent_ctx, schema) {
+            Some(schema) => match final_turn.and_then(|turn| parse_native_final_turn(turn, schema))
+            {
                 Some(value) => (value, None),
-                None => match structured::extract(&raw, schema, parent_ctx, abort, None).await {
+                None => match structured::extract_with_transport(
+                    &raw, schema, parent_ctx, abort, None, transport,
+                )
+                .await
+                {
                     Ok(value) => (value, None),
                     Err(e) => {
                         warn!("llm node structured extraction failed: {e:#}");
@@ -95,9 +121,14 @@ async fn finish(
 
 /// The final turn alone, when it ran under the native format, is the
 /// schema-constrained answer; earlier turns' prose is not part of it.
-fn parse_native_final_turn(ctx: &mut RequestContext, schema: &Value) -> Option<Value> {
-    let (text, dialect) = ctx.native_format.final_turn.take()?;
-    let mut value = structured::try_parse_json(&text)?;
+fn parse_native_final_turn(
+    (text, dialect): (String, SchemaDialect),
+    schema: &Value,
+) -> Option<Value> {
+    let Some(mut value) = structured::try_parse_json(&text) else {
+        debug!("native {dialect:?} final turn is not JSON; extracting from the accumulated output");
+        return None;
+    };
     structured::strip_nulls_for(Some(dialect), &mut value, schema);
     Some(value)
 }
@@ -360,6 +391,14 @@ pub(crate) mod test_support {
     ) -> CompletionFuture<'a> {
         Box::pin(fut)
     }
+
+    /// The transport-side twin of `completion_runner`.
+    pub(crate) fn transport_call<F>(f: F) -> F
+    where
+        F: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send,
+    {
+        f
+    }
 }
 
 /// Applies the node's wall-clock bound around the whole retry loop.
@@ -420,12 +459,28 @@ async fn run_chat_loop(
     abort: &AbortSignal,
     runner: &mut CompletionRunner<'_>,
 ) -> Result<String> {
+    ctx.native_format.final_turn = None;
+    let result = run_chat_turns(node_id, node, prompt, ctx, abort, runner).await;
+    // Only a successful attempt's final turn may reach `finish`.
+    if result.is_err() {
+        ctx.native_format.final_turn = None;
+    }
+    result
+}
+
+async fn run_chat_turns(
+    node_id: &str,
+    node: &LlmNode,
+    prompt: &str,
+    ctx: &mut RequestContext,
+    abort: &AbortSignal,
+    runner: &mut CompletionRunner<'_>,
+) -> Result<String> {
     let abort = abort.clone();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
     let mut input = Input::from_str(ctx, prompt, role_for_input)?;
     let mut accumulated = String::new();
-    ctx.native_format.final_turn = None;
 
     let mut turn: u32 = 0;
     loop {
@@ -449,6 +504,7 @@ async fn run_chat_loop(
         }
 
         if tool_results.is_empty() {
+            ctx.native_format.final_turn = turn_dialect.map(|d| (output, d));
             // Whitespace-only output across every turn is a provider blip, not a
             // conclusion, unless the guardrail still has a reminder to deliver.
             let said_nothing = accumulated.trim().is_empty();
@@ -467,7 +523,6 @@ async fn run_chat_loop(
                     bail!("empty completion: model returned no text and no tool calls");
                 }
                 GuardrailAction::NoAction => {
-                    ctx.native_format.final_turn = turn_dialect.map(|d| (output, d));
                     return Ok(accumulated);
                 }
                 GuardrailAction::ForceTerminate(ids) => {
@@ -476,7 +531,6 @@ async fn run_chat_loop(
                         ids.len(),
                         ids
                     );
-                    ctx.native_format.final_turn = turn_dialect.map(|d| (output, d));
                     return Ok(accumulated);
                 }
                 GuardrailAction::Inject(prompt) => {
@@ -665,7 +719,7 @@ fn format_schema_hint(schema: &Value) -> String {
 mod tests {
     use super::super::state_updates::OUTPUT_KEY;
     use super::super::types::*;
-    use super::test_support::{boxed_completion, completion_runner};
+    use super::test_support::{boxed_completion, completion_runner, transport_call};
     use super::*;
     use crate::config::{Agent, AgentConfig, AppState, WorkingMode};
     use crate::utils::create_abort_signal;
@@ -2283,23 +2337,34 @@ mod tests {
         })
     }
 
+    /// An OpenAI ctx whose current model supports the native format, so an
+    /// extractor call gets past `create_client` to the transport.
+    fn extractor_ctx() -> RequestContext {
+        let mut ctx = openai_ctx();
+        let mut role = Role::new("parent", "");
+        role.set_model(structured_model());
+        ctx.role = Some(role);
+        ctx
+    }
+
     /// Runs a schema node whose first turn says some prose and calls a tool
     /// and whose second turn answers with JSON, marking that turn native when
-    /// `final_dialect` is set; returns the outcome, the final state and the
-    /// number of model calls.
+    /// `final_dialect` is set; returns the outcome, the final state, the
+    /// number of node model calls and the number of extractor calls.
     async fn run_two_turn_schema_node(
-        final_dialect: Option<crate::client::structured_output::SchemaDialect>,
-        updates: Option<HashMap<String, String>>,
-    ) -> (Result<LlmExecutionOutcome>, StateManager, u32) {
+        final_dialect: Option<SchemaDialect>,
+    ) -> (Result<LlmExecutionOutcome>, StateManager, u32, u32) {
         use crate::function::ToolCall;
 
-        let mut node = node_with_schema(updates, done_schema());
-        node.fallback = Some("fb".into());
+        let node = node_with_schema(None, done_schema());
         let mut state = manager_with(&[]);
-        let mut ctx = plain_ctx();
-        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let mut ctx = extractor_ctx();
+        let mut agent = Agent::test_new(AgentConfig::default());
+        agent.set_model(structured_model());
+        ctx.agent = Some(agent);
         let abort = create_abort_signal();
         let mut calls = 0u32;
+        let mut extractor_calls = 0u32;
 
         let result = run(
             "decide",
@@ -2327,49 +2392,99 @@ mod tests {
             }),
         )
         .await;
-        let outcome = finish(&node, &mut state, &mut ctx, result, &abort).await;
-        (outcome, state, calls)
+        let mut transport = transport_call(|_input, _ctx| {
+            extractor_calls += 1;
+            boxed_completion(async { Ok((r#"{"done": false}"#.to_string(), vec![])) })
+        });
+        let outcome =
+            finish_with(&node, &mut state, &mut ctx, result, &abort, &mut transport).await;
+        (outcome, state, calls, extractor_calls)
     }
 
     #[tokio::test]
     async fn native_final_turn_is_parsed_without_the_extractor() {
-        let (outcome, state, calls) = run_two_turn_schema_node(
-            Some(crate::client::structured_output::SchemaDialect::OpenAiStrict),
-            None,
-        )
-        .await;
+        let (outcome, state, calls, extractor_calls) =
+            run_two_turn_schema_node(Some(SchemaDialect::OpenAiStrict)).await;
 
         assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
         assert_eq!(calls, 2);
+        assert_eq!(extractor_calls, 0);
         assert_eq!(state.state().get("done"), Some(&json!(true)));
         assert_eq!(state.state().get("note"), None);
     }
 
     #[tokio::test]
-    async fn final_turn_without_the_format_extracts_from_the_accumulated_text() {
-        let mut u = HashMap::new();
-        u.insert("captured".into(), "{{output}}".into());
-        let (outcome, state, calls) = run_two_turn_schema_node(None, Some(u)).await;
+    async fn native_anthropic_final_turn_is_parsed_and_keeps_its_nulls() {
+        let (outcome, state, calls, extractor_calls) =
+            run_two_turn_schema_node(Some(SchemaDialect::Anthropic)).await;
 
-        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::FellBack("fb".into()));
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
         assert_eq!(calls, 2);
-        let captured = state
-            .state()
-            .get("captured")
-            .and_then(Value::as_str)
-            .expect("captured failure text is a string")
-            .to_string();
-        assert!(
-            captured.contains("Structured-output extractor LLM call failed: "),
-            "{captured}"
-        );
+        assert_eq!(extractor_calls, 0);
+        assert_eq!(state.state().get("done"), Some(&json!(true)));
+        assert_eq!(state.state().get("note"), Some(&Value::Null));
     }
 
-    fn transport_call<F>(f: F) -> F
-    where
-        F: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send,
-    {
-        f
+    #[tokio::test]
+    async fn final_turn_without_the_format_extracts_from_the_accumulated_text() {
+        let (outcome, state, calls, extractor_calls) = run_two_turn_schema_node(None).await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(calls, 2);
+        assert_eq!(extractor_calls, 1);
+        assert_eq!(state.state().get("done"), Some(&json!(false)));
+    }
+
+    /// An unparseable native final turn falls back to the accumulated text,
+    /// which was not written under the format, so its nulls stay.
+    #[tokio::test]
+    async fn unparseable_native_final_turn_falls_back_to_the_accumulated_text() {
+        let node = node_with_schema(None, done_schema());
+        let mut state = manager_with(&[]);
+        let mut ctx = extractor_ctx();
+        ctx.native_format.final_turn = Some(("not json".to_string(), SchemaDialect::OpenAiStrict));
+        let abort = create_abort_signal();
+        let mut extractor_calls = 0u32;
+        let mut transport = transport_call(|_input, _ctx| {
+            extractor_calls += 1;
+            boxed_completion(async { Ok((r#"{"done": false}"#.to_string(), vec![])) })
+        });
+
+        let outcome = finish_with(
+            &node,
+            &mut state,
+            &mut ctx,
+            Ok(r#"{"done": true, "note": null}"#.to_string()),
+            &abort,
+            &mut transport,
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(extractor_calls, 0);
+        assert_eq!(state.state().get("done"), Some(&json!(true)));
+        assert_eq!(state.state().get("note"), Some(&Value::Null));
+        assert_eq!(ctx.native_format.final_turn, None);
+    }
+
+    #[tokio::test]
+    async fn finish_without_a_schema_clears_the_final_turn() {
+        let node = node_with(None);
+        let mut state = manager_with(&[]);
+        let mut ctx = plain_ctx();
+        ctx.native_format.final_turn = Some(("{}".to_string(), SchemaDialect::OpenAiStrict));
+
+        finish(
+            &node,
+            &mut state,
+            &mut ctx,
+            Ok("{}".to_string()),
+            &create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.native_format.final_turn, None);
     }
 
     #[tokio::test]

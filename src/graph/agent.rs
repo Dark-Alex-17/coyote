@@ -864,6 +864,38 @@ mod tests {
         );
     }
 
+    /// The agent's own calls leave their dialect in the ctx, but its output
+    /// is the accumulated reply, so extraction keeps its nulls.
+    #[tokio::test]
+    async fn extraction_ignores_the_dialect_the_agent_calls_left_behind() {
+        use crate::client::structured_output::SchemaDialect;
+
+        let mut ctx = plain_ctx();
+        let mut node = retryable_node(1);
+        node.output_schema = Some(json!({
+            "type": "object",
+            "properties": {"done": {"type": "boolean"}, "note": {"type": "string"}},
+            "required": ["done"]
+        }));
+        let mut state = manager_with(&[]);
+
+        attempt_and_extract(
+            "test_node",
+            &node,
+            &mut state,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|ctx| {
+                ctx.native_format.last_dialect = Some(SchemaDialect::OpenAiStrict);
+                boxed_attempt(async move { Ok(r#"{"done": true, "note": null}"#.to_string()) })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.state().get("note"), Some(&Value::Null));
+    }
+
     /// Agent-node extraction runs on the session abort: a fired signal
     /// stops the extractor before it issues a request.
     #[tokio::test]
