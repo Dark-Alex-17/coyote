@@ -1729,7 +1729,8 @@ def verify_gate(state):
         arr.append(state["hygiene_lint_cmd"])
         cmds = json.dumps(arr)
     u["verification_commands_json"] = cmds
-    u["debris_exclude"] = state.get("debris_exclude") or ""
+    # the planning files a code repo carries are not implementation, as sisyphus-next's intake also rules
+    u["debris_exclude"] = state.get("debris_exclude") or ('["plans"]' if code and os.path.isdir(os.path.join(code, "plans")) else "")
     rl.append({"round": n, "head": head, "scope": scope, "started": now_iso()})
     u["round_log"] = rounds_log
     u["verify_unit"] = unit

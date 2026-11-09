@@ -1167,6 +1167,21 @@ check("verify_gate: standard -> gauntlet, forced adversary only (no consumer sur
       u["_next"] == "run_gauntlet" and "Forced lanes: adversary" in u["gauntlet_prompt"] and "probe" not in u["gauntlet_prompt"].split("Forced lanes:")[1].splitlines()[0]
       and f"Diff: {t1['base_sha']}..HEAD" in u["gauntlet_prompt"] and u["verification_commands_json"] == '["true"]' and u["round_log"][T1][0]["round"] == 1)
 ts_c = copy.deepcopy(TS1)
+# the debris lint of every conformance reviewer leaves out a code repo's plans/, as sisyphus-next's intake does
+CODE_PLANS = os.path.join(CODE, "plans")
+os.makedirs(CODE_PLANS, exist_ok=True)
+with_plans = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task"))
+micro = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task", task_granularity="micro"))
+given = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task", debris_exclude='["docs"]'))
+os.rename(CODE_PLANS, CODE_PLANS + ".aside")
+try:
+    no_plans = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task"))
+finally:
+    os.rename(CODE_PLANS + ".aside", CODE_PLANS)
+check("verify_gate: a code repo with plans/ -> debris_exclude [\"plans\"] for the gauntlet and the micro adversary; without -> none; a set value wins",
+      no_plans["debris_exclude"] == "" and with_plans["debris_exclude"] == '["plans"]'
+      and micro["_next"] == "run_adversary" and micro["debris_exclude"] == '["plans"]' and given["debris_exclude"] == '["docs"]',
+      (no_plans.get("debris_exclude"), with_plans.get("debris_exclude"), micro.get("debris_exclude"), given.get("debris_exclude")))
 u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=ts_c, current_task=T2, verify_scope="task", local_run_recipe="make run"))
 check("verify_gate: consumer-facing task + recipe -> probe lane forced + house note per fork",
       "probe" in u["gauntlet_prompt"] and ((gates.PROBE_HOUSE_NOTE in u["gauntlet_prompt"]) if gates.PROBE_HOUSE_NOTE else True))
