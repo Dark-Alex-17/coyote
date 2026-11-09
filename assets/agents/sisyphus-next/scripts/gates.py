@@ -28,7 +28,7 @@ from _lib import (  # noqa: E402
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
-    escalation, git, git_out, harvest_anomalies, ledger, load_state, match_option,
+    escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
     note_script_error, now_iso, option, read_artifact, run_dir_for, snapshot,
     tail, truthy, var, write_artifact,
 )
@@ -987,7 +987,11 @@ def parse_answer(state):
     options = esc.get("options") or []
     kind = esc.get("kind", "")
     picker = truthy(as_dict(esc.get("data")).get("multiple_choice"))
-    if kind == "draft_confirm":
+    if headless := headless_recommended(text, options):
+        # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
+        choice = headless
+        ledger(state, u, f"headless: {kind}: no human available -> the recommended option: {tail(choice, 200)}")
+    elif kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
     elif kind in ("handoff_confirm", "handoff_path") and _typed_path(text, state):

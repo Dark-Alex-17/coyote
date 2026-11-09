@@ -33,7 +33,7 @@ from _lib import (  # noqa: E402
     append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, emit,
     ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
-    match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section,
+    headless_recommended, match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section,
     raise_escalation, read_artifact, read_file, render_question, run_dir_for, save_tasks, set_frontmatter,
     set_task_status, sh, snapshot, tail, task_by_id, task_dir_for, task_section, today, truthy, var,
     write_artifact, write_file,
@@ -2793,7 +2793,11 @@ def parse_answer(state):
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
-    if esc.get("kind") == "draft_confirm":
+    if headless := headless_recommended(text, options):
+        # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
+        choice = headless
+        ledger(state, u, f"headless: {esc.get('kind')}: no human available -> the recommended option: {tail(choice, 200)}")
+    elif esc.get("kind") == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = match_option(text, options) or text
     elif esc.get("kind") == "seed_confirm" and _typed_doc_path(text):

@@ -11,6 +11,7 @@ sample of nodes, including the debt_scan shim's fail-open default.
 Usage: smoke_test.py   (exit 1 on any failure; prints one line per check)
 """
 
+import ast
 import json
 import os
 import re
@@ -629,6 +630,50 @@ u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"qu
 check("choice: options with none recommended keep the typed prompt (ask_user), order kept",
       "multiple_choice" not in u["escalation"]["data"] and [o["text"] for o in u["escalation"]["options"]] == ["a", "b"]
       and gates.ask_dispatch(base_state(escalation=u["escalation"]))["_next"] == "ask_user")
+
+# the engine's headless answer to a free-text question resolves to the recommended option, never to its words
+HG = _lib.HEADLESS_GUIDANCE
+u2 = gates.parse_answer(base_state(escalation=u["escalation"], last_answer_text=HG))
+check("headless: guidance on a question with no recommended option -> today's path (interpret_reply), no option picked",
+      u2["_next"] == "interpret_reply" and "last_answer" not in u2, u2)
+u2 = gates.parse_answer(base_state(escalation=esc, last_answer_text=f" {HG}\n"))
+check("headless: guidance at the typed prompt -> the recommended option, never interpreted, ledgered",
+      u2["_next"] == "apply_answer" and u2["last_answer"] == "A" and any(d.startswith("headless: design_choice:") for d in u2["decisions"]), u2)
+FIVE = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("o1"), option("o2", True)] + [option(f"o{i}") for i in range(3, 6)]))
+u2 = gates.parse_answer(base_state(escalation=FIVE["escalation"], last_answer_text=HG))
+check("headless: guidance on a five-option typed prompt (ask_user) -> its recommended option",
+      gates.ask_dispatch(base_state(escalation=FIVE["escalation"]))["_next"] == "ask_user" and u2.get("last_answer") == "o2", u2)
+s2, u2 = chain(base_state(escalation=mce, last_answer_text=HG, oracle_retries=0), "parse_answer", "apply_answer")
+check("headless: guidance on a multiple-choice escalation -> the recommended 'Retry the consult' through apply_answer",
+      s2.get("last_answer") == "Retry the consult" and u2["_next"] != "end_aborted" and not s2.get("reply_accepts"), (s2.get("last_answer"), u2))
+u2 = gates.parse_answer(base_state(escalation=mce, last_answer_text=HG + " Abort."))
+check("headless: a reply that only contains the guidance is not the guidance -> interpret_reply", u2["_next"] == "interpret_reply", u2)
+hs_ = base_state(intent="ambiguous", clarify_rounds=0, clarifications="")
+for q, rec in (("Which module?", "billing"), ("Which endpoint?", "/v1/usage")):
+    hs_.update(clarifying_questions=[{"question": q, "options": [{"text": "other"}, {"text": rec, "recommended": True}]}])
+    hs_, _ = chain(hs_, "route_intent")
+    hs_, u2 = chain({**hs_, "last_answer_text": HG, "last_answer": ""}, "parse_answer", "apply_answer")
+    hs_.setdefault("clarifications", "")
+check("headless: two clarify questions in a row, each answered by the guidance -> each recommended option recorded",
+      "Q: Which module?\nA: billing" in (hs_.get("clarifications") or "") and "Q: Which endpoint?\nA: /v1/usage" in (hs_.get("clarifications") or "")
+      and u2.get("_next") == "assess", hs_.get("clarifications"))
+
+
+def _keyword_literals(path):
+    """Every literal an answer is matched on by substring: _answered word lists and `"w" in <answer>` tests."""
+    found = []
+    for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_answered" and len(node.args) > 1 and isinstance(node.args[1], ast.Dict):
+            found += [e.value for v in node.args[1].values for e in getattr(v, "elts", []) if isinstance(e, ast.Constant)]
+        elif (isinstance(node, ast.Compare) and isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+              and any(isinstance(op, ast.In) for op in node.ops) and "answer" in ast.unparse(node.comparators[0])):
+            found.append(node.left.value)
+    return found
+
+
+KW = _keyword_literals(os.path.join(HERE, "gates.py"))
+check("headless: no keyword apply_answer matches by substring occurs in the guidance, so it can never read as another option",
+      len(KW) > 10 and not [w for w in KW if w.lower() in HG.lower()], [w for w in KW if w.lower() in HG.lower()])
 five = gates.raise_escalation(base_state(), {}, escalation("design_choice", "q", [option("o1"), option("o2", True)] + [option(f"o{i}") for i in range(3, 6)]))
 one = gates.raise_escalation(base_state(), {}, escalation("handoff_path", "q", [option("Abort the run", True)]))
 check("choice: more than 4 or fewer than 2 options keep the typed prompt (ask_user), nothing trimmed",
