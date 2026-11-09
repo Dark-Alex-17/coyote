@@ -2203,7 +2203,7 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     let repl = read(repo_root().join("src/repl/mesh.rs"));
     let no_route_marker = repl
         .split_once("const NO_ROUTE_STATE: &str =")
-        .and_then(|(_, rest)| rest.split_once(';'))
+        .and_then(|(_, rest)| rest.split_once(";\n"))
         .and_then(|(value, _)| string_literals(value).into_iter().next())
         .expect("src/repl/mesh.rs defines NO_ROUTE_STATE as one string literal");
     assert!(
