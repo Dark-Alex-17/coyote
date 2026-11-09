@@ -172,7 +172,11 @@ u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"qu
 check("route_intent: ambiguous -> escalation clarify (round 1)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "clarify" and u["clarify_rounds"] == 1)
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "q"}], clarify_rounds=CLARIFY_MAX))
 check("route_intent: B1 clarify bound -> end_blocked", u["_next"] == "end_blocked")
-for intent, sizing, exp in [("exploration", "n/a", "research_answer"), ("plan_authoring", "n/a", "end_redirect"), ("plan_execution", "n/a", "run_step"),
+STEP_REPO = os.path.join(TMP, "step-repo")
+os.makedirs(os.path.join(STEP_REPO, "plans", "steps"))
+u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", project_dir=STEP_REPO, brief="Execute step 2 of the plan at plans"))
+check("route_intent: plan_execution with a step plans directory -> run_step", u["_next"] == "run_step" and "intent" not in u, u)
+for intent, sizing, exp in [("exploration", "n/a", "research_answer"), ("plan_authoring", "n/a", "end_redirect"),
                             ("implementation", "plan_shaped", "end_redirect"), ("implementation", "compound", "plan_subtasks"),
                             ("implementation", "simple", "next_subtask"), ("trivial", "simple", "next_subtask")]:
     u = gates.route_intent(base_state(intent=intent, sizing=sizing))
@@ -187,6 +191,33 @@ u = gates.route_intent(base_state(intent="implementation", resume_mode=True, res
 check("route_intent: re-entry git_ops -> git_ops", u["_next"] == "git_ops" and u["git_task"]["return_to"] == "final_report")
 u = gates.route_intent(base_state(intent="implementation", sizing="simple", anomalies=["stale plan downstream"]))
 check("A10: anomalies harvested into anomalies_log and reset", u["anomalies_log"] == ["assess: stale plan downstream"] and u["anomalies"] == [])
+
+# the parity pilot: architect-next's task delegation, read by assess as plan_execution, went to the step-runner,
+# which ended at once for want of plans/steps
+PILOT_BRIEF = (
+    f"## TASK\nImplement TASK-001 (Migration 0003: usage_records + overage_tiers) in the project at {REPO}. This is one "
+    "one-engineer-day slice of PLAN-usage-metering.\n\n## SOURCE OF TRUTH\n"
+    f"- Task file: {REPO}/plans/tasks/TASK-001-migration-0003-usage-metering/index.md (read its What / Steps / "
+    "Acceptance criteria - implement EXACTLY these, nothing more)\n"
+    f"- Plan: {REPO}/plans/PLAN-usage-metering.md\n\n## EXPECTED OUTCOME\nEvery acceptance criterion met; the work "
+    "committed and pushed to the EXISTING branch feat/PLAN-usage-metering.\n")
+pilot = gates.intake({"initial_prompt": PILOT_BRIEF, "project_dir": REPO})
+for label, over in (("the pilot's repo (no plans/steps)", {}), ("a repo that has plans/steps", {"project_dir": STEP_REPO})):
+    s = base_state(brief=PILOT_BRIEF, delegated=pilot["delegated"], top_level=pilot["top_level"],
+                   intent="plan_execution", sizing="simple", **over)
+    s.update(gates.route_intent(s))
+    check(f"route_intent: the pilot's delegated TASK brief read as plan_execution, {label} -> the implementation path, ledgered",
+          pilot["delegated"] is True and s["_next"] == "next_subtask" and s["intent"] == "implementation"
+          and s["subtasks"][0]["outcome"] == PILOT_BRIEF and any(d.startswith("route: assess read the brief as plan_execution, but a delegated")
+                                                               for d in s["decisions"]), (s.get("_next"), s.get("decisions")))
+u = gates.route_intent(base_state(intent="plan_execution", sizing="simple", brief="execute step 3"))
+check("route_intent: a top-level plan_execution without a step plans directory -> the implementation path, the missing dir named",
+      u["_next"] == "next_subtask" and u["intent"] == "implementation"
+      and any(f"no step plans directory at {os.path.join(REPO, 'plans', 'steps')}" in d for d in u["decisions"]), u.get("decisions"))
+os.environ["LLM_AGENT_VAR_PLANS_DIR"] = os.path.join(STEP_REPO, "plans")
+u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", brief="execute step 3"))
+os.environ.pop("LLM_AGENT_VAR_PLANS_DIR")
+check("route_intent: an absolute plans_dir variable with steps -> run_step", u["_next"] == "run_step", u)
 
 # ---------------------------------------------------------------- subtasks (B2/B3)
 subs = [{"title": f"s{i}", "outcome": f"o{i}", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX)]

@@ -506,6 +506,19 @@ def route_intent(state):
     return u
 
 
+def _not_a_step_run(state):
+    """Why a plan_execution verdict cannot go to the step-runner, or "" when it can.
+
+    A delegated task brief names its task and plan files, which reads like a plan step, but it is implemented here;
+    and the step-runner fails at once without a step plans directory.
+    """
+    if truthy(state.get("delegated")):
+        return "a delegated task brief is implemented here, never handed to the step-runner"
+    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
+    steps = os.path.join(plans if os.path.isabs(plans) else os.path.join(state.get("project_dir") or ".", plans), "steps")
+    return "" if os.path.isdir(steps) else f"there is no step plans directory at {steps}"
+
+
 def _route_intent(state, u):
     intent = state.get("intent") or "ambiguous"
     sizing = state.get("sizing") or "simple"
@@ -530,6 +543,10 @@ def _route_intent(state, u):
         ledger(state, u, u["failure_reason"])
         u["_next"] = "end_blocked"
         return u
+
+    if intent == "plan_execution" and (why := _not_a_step_run(state)):
+        ledger(state, u, f"route: assess read the brief as plan_execution, but {why} -> the implementation path")
+        intent = u["intent"] = "implementation"
 
     questions = as_list(state.get("clarifying_questions"))
     if intent == "ambiguous" or (questions and intent not in ("exploration", "design_question")):
