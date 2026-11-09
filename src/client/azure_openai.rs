@@ -56,7 +56,9 @@ fn prepare_chat_completions(
         self_.model.real_name()
     );
 
-    let body = openai_build_chat_completions_body(data, &self_.model);
+    let stream = data.stream;
+    let mut body = openai_build_chat_completions_body(data, &self_.model);
+    openai_request_stream_usage(&mut body, stream);
 
     let mut request_data = RequestData::new(url, body);
 
@@ -82,4 +84,63 @@ fn prepare_embeddings(self_: &AzureOpenAIClient, data: &EmbeddingsData) -> Resul
     request_data.header("api-key", api_key);
 
     Ok(request_data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn make_client() -> AzureOpenAIClient {
+        AzureOpenAIClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: AzureOpenAIConfig {
+                name: Some("azure-test".into()),
+                api_base: Some("https://resource.openai.azure.com".into()),
+                api_key: Some("azure-key".into()),
+                ..Default::default()
+            },
+            model: Model::new("azure-test", "gpt-test"),
+        }
+    }
+
+    fn hello_data(stream: bool) -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream,
+            prompt_cache_ttl: None,
+        }
+    }
+
+    #[test]
+    fn streaming_chat_requests_usage() {
+        let client = make_client();
+
+        let request_data = prepare_chat_completions(&client, hello_data(true)).unwrap();
+
+        let mut expected = openai_build_chat_completions_body(hello_data(true), &client.model);
+        expected["stream_options"] = json!({ "include_usage": true });
+        assert_eq!(request_data.body, expected);
+    }
+
+    #[test]
+    fn non_streaming_chat_body_is_unchanged() {
+        let client = make_client();
+
+        let request_data = prepare_chat_completions(&client, hello_data(false)).unwrap();
+
+        assert_eq!(
+            request_data.body,
+            openai_build_chat_completions_body(hello_data(false), &client.model)
+        );
+    }
 }

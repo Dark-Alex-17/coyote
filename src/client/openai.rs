@@ -161,10 +161,16 @@ async fn prepare_chat_completions(
         }
     };
 
-    let body = match wire {
+    let stream = data.stream;
+    let mut body = match wire {
         WireApi::Responses => openai_build_responses_body(data, &self_.model),
         WireApi::Chat => openai_build_chat_completions_body(data, &self_.model),
     };
+    // Only api.openai.com is known to accept `stream_options`; a custom
+    // `api_base` may be a gateway that rejects unknown keys.
+    if wire == WireApi::Chat && stock_openai_without_api_base {
+        openai_request_stream_usage(&mut body, stream);
+    }
 
     let mut request_data = RequestData::new(url, body).wire(wire);
 
@@ -365,6 +371,13 @@ pub async fn openai_chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        // Usage arrives on its own final chunk with empty `choices`; every
+        // other chunk carries `"usage": null`. Moderation chunks also have
+        // empty `choices`, so the chunk is recognised by its usage object.
+        if let Some(usage) = openai_parse_chat_usage(&data["usage"]) {
+            debug!("token-usage: {usage:?}");
+            handler.usage(usage);
+        }
         if let Some(text) = data["choices"][0]["delta"]["content"]
             .as_str()
             .filter(|v| !v.is_empty())
@@ -609,6 +622,15 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     body
 }
 
+/// Asks a streaming Chat Completions request for the trailing usage chunk.
+/// Callers apply this after the shared builder and only for endpoints that
+/// accept `stream_options`.
+pub fn openai_request_stream_usage(body: &mut Value, stream: bool) {
+    if stream {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+}
+
 // Chat `role: tool` content is text-only, so a round's images travel in one
 // user message placed after its tool messages.
 fn openai_chat_tool_images_message(tool_results: &[ToolResult]) -> Option<Value> {
@@ -702,6 +724,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        usage: openai_parse_chat_usage(&data["usage"]),
         ..Default::default()
     };
     Ok(output)
@@ -713,6 +736,26 @@ fn normalize_function_id(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+/// `prompt_tokens` covers the whole prompt, including cached reads and cache
+/// writes, so both are subtracted to keep the buckets disjoint.
+fn openai_parse_chat_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+
+    let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+    let cache_write_tokens = usage["prompt_tokens_details"]["cache_write_tokens"].as_u64();
+    Some(TokenUsage {
+        input_tokens: usage["prompt_tokens"].as_u64().map(|v| {
+            v.saturating_sub(cached_tokens.unwrap_or(0))
+                .saturating_sub(cache_write_tokens.unwrap_or(0))
+        }),
+        output_tokens: usage["completion_tokens"].as_u64(),
+        cache_creation_input_tokens: cache_write_tokens,
+        cache_read_input_tokens: cached_tokens,
+    })
 }
 
 pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> Value {
@@ -2519,5 +2562,222 @@ mod tests {
         client.patch_request_data(&mut request_data);
 
         assert_eq!(request_data.body, body_before, "a chat-shaped model patch must not merge into a responses body");
+    }
+
+    fn hello_data(stream: bool) -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream,
+            prompt_cache_ttl: None,
+        }
+    }
+
+    #[test]
+    fn extract_chat_parses_usage_with_cached_reads() {
+        let data = json!({
+            "choices": [{ "message": { "content": "hi" } }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": { "cached_tokens": 30 },
+            }
+        });
+
+        let usage = openai_extract_chat_completions(&data).unwrap().usage.unwrap();
+
+        assert_eq!(usage.input_tokens, Some(70));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn extract_chat_subtracts_cache_writes_from_input() {
+        let data = json!({
+            "choices": [{ "message": { "content": "hi" } }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": { "cached_tokens": 30, "cache_write_tokens": 10 },
+            }
+        });
+
+        let usage = openai_extract_chat_completions(&data).unwrap().usage.unwrap();
+
+        assert_eq!(usage.input_tokens, Some(60));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, Some(10));
+    }
+
+    #[test]
+    fn extract_chat_without_usage_leaves_it_none() {
+        let data = json!({ "choices": [{ "message": { "content": "hi" } }] });
+
+        assert!(openai_extract_chat_completions(&data).unwrap().usage.is_none());
+    }
+
+    async fn stream_chat(events: &[&str]) -> SseHandler {
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let url = super::test_server::serve_once("text/event-stream", body).await;
+        let builder = super::test_server::client().post(url);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(sender, crate::utils::create_abort_signal());
+
+        openai_chat_completions_streaming(builder, &mut handler, &Model::new("openai", "gpt-test"))
+            .await
+            .unwrap();
+
+        handler
+    }
+
+    #[tokio::test]
+    async fn chat_stream_final_usage_chunk_delivers_usage() {
+        let handler = stream_chat(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""}}],"usage":null}"#,
+            r#"{"choices":[],"usage":null}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"Hi"}}],"usage":null}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":30}}}"#,
+            "[DONE]",
+        ])
+        .await;
+
+        let (text, _, _, usage) = handler.take();
+        assert_eq!(text, "Hi");
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(70));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_without_usage_chunk_yields_no_usage() {
+        let handler = stream_chat(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"choices":[],"usage":null}"#,
+            "[DONE]",
+        ])
+        .await;
+
+        let (text, _, _, usage) = handler.take();
+        assert_eq!(text, "Hi");
+        assert!(usage.is_none());
+    }
+
+    fn stock_chat_client(name: &str) -> OpenAIClient {
+        let config = api_key_config(name, Some(WireApi::Chat));
+        make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)])
+    }
+
+    #[test]
+    fn stock_openai_streaming_chat_requests_usage() {
+        let client = stock_chat_client("openai-stream-usage-test");
+
+        let (request_data, wire) = prepare_with_stream(&client, true).unwrap();
+
+        assert_eq!(wire, WireApi::Chat);
+        let mut expected =
+            openai_build_chat_completions_body(hello_data(true), &Model::new("openai", "gpt-test"));
+        expected["stream_options"] = json!({ "include_usage": true });
+        assert_eq!(request_data.body, expected);
+    }
+
+    #[test]
+    fn stock_openai_non_streaming_chat_body_is_unchanged() {
+        let client = stock_chat_client("openai-non-stream-usage-test");
+
+        let (request_data, _) = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data.body,
+            openai_build_chat_completions_body(hello_data(false), &Model::new("openai", "gpt-test"))
+        );
+    }
+
+    #[test]
+    fn custom_api_base_streaming_chat_omits_stream_options() {
+        let mut config = api_key_config("openai-stream-custom-base-test", None);
+        config.api_base = Some("https://gateway.example/v1".into());
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (request_data, wire) = prepare_with_stream(&client, true).unwrap();
+
+        assert_eq!(wire, WireApi::Chat);
+        assert_eq!(
+            request_data.body,
+            openai_build_chat_completions_body(hello_data(true), &Model::new("openai", "gpt-test"))
+        );
+    }
+
+    #[test]
+    fn responses_wire_streaming_omits_stream_options() {
+        let config = api_key_config("openai-stream-responses-usage-test", None);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (request_data, wire) = prepare_with_stream(&client, true).unwrap();
+
+        assert_eq!(wire, WireApi::Responses);
+        assert!(
+            request_data.body.get("stream_options").is_none(),
+            "body: {}",
+            request_data.body
+        );
+    }
+
+    #[test]
+    fn model_patch_can_remove_stream_options() {
+        let mut client = stock_chat_client("openai-stream-usage-patch-test");
+        let mut model_data = ModelData::new("gpt-test");
+        model_data.patch = Some(json!({ "body": { "stream_options": null } }));
+        client.model = Model::from_config("openai", &[model_data]).remove(0);
+
+        let (mut request_data, _) = prepare_with_stream(&client, true).unwrap();
+        assert!(request_data.body.get("stream_options").is_some());
+
+        client.patch_request_data(&mut request_data);
+
+        assert!(
+            request_data.body.get("stream_options").is_none(),
+            "body: {}",
+            request_data.body
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_server {
+    use reqwest::Client as ReqwestClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Serves one canned `200 OK` response on a loopback port and returns its URL.
+    pub async fn serve_once(content_type: &'static str, body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}/")
+    }
+
+    pub fn client() -> ReqwestClient {
+        ReqwestClient::builder().no_proxy().build().unwrap()
     }
 }
