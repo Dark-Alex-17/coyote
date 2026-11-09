@@ -14,7 +14,7 @@ mod splitter;
 use self::graph::{KnowledgeGraph, extract_entities};
 use self::provider::RagProvider;
 use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
-use crate::config::conflict::menu_can_use_terminal;
+use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::hooks::RagSyncHooks;
 use crate::prompt::{Prompter, confirm, input, reask, select_closed};
 use crate::sandbox::mcp_credentials;
@@ -167,7 +167,7 @@ impl Rag {
             bail!("Cannot build RAG knowledge base '{name}' with no documents");
         }
         println!("⚙ Initializing RAG...");
-        let mut data = Self::resolve_init_data(app, config, prompter)?;
+        let mut data = Self::resolve_init_data(app, name, config, prompter)?;
         data.driver = config.driver.clone().unwrap_or_else(|| "yaml".to_string());
         let mut rag = Self::create(app, name, save_path, data).await?;
         let loaders = app.document_loaders.clone();
@@ -199,6 +199,7 @@ impl Rag {
 
     fn resolve_init_data(
         app: &AppConfig,
+        name: &str,
         config: &RagInitConfig,
         prompter: &dyn Prompter,
     ) -> Result<RagData> {
@@ -213,10 +214,10 @@ impl Rag {
             }
             None => {
                 if !menu_can_use_terminal() {
-                    bail!(
-                        "RAG knowledge base needs an embedding model. Set `embedding_model` \
-                         on the rag node, or run the agent interactively once."
-                    );
+                    return Err(refuse_non_interactive(
+                        format_args!("choose an embedding model for RAG knowledge base '{name}'"),
+                        ". Set `embedding_model` on the rag node, or run the agent interactively once.",
+                    ));
                 }
                 let models = list_models(app, ModelType::Embedding);
                 if models.is_empty() {
@@ -235,10 +236,10 @@ impl Rag {
             }
             None => {
                 if !menu_can_use_terminal() {
-                    bail!(
-                        "RAG knowledge base needs a chunk_size. Set `chunk_size` on the \
-                         rag node, or run the agent interactively once."
-                    );
+                    return Err(refuse_non_interactive(
+                        format_args!("choose a chunk_size for RAG knowledge base '{name}'"),
+                        ". Set `chunk_size` on the rag node, or run the agent interactively once.",
+                    ));
                 }
                 set_chunk_size(&embedding_model, prompter)?
             }
@@ -250,10 +251,10 @@ impl Rag {
             }
             None => {
                 if !menu_can_use_terminal() {
-                    bail!(
-                        "RAG knowledge base needs a chunk_overlap. Set `chunk_overlap` on \
-                         the rag node, or run the agent interactively once."
-                    );
+                    return Err(refuse_non_interactive(
+                        format_args!("choose a chunk_overlap for RAG knowledge base '{name}'"),
+                        ". Set `chunk_overlap` on the rag node, or run the agent interactively once.",
+                    ));
                 }
                 set_chunk_overlay(chunk_size / 20, prompter)?
             }
@@ -303,7 +304,10 @@ impl Rag {
             prompter,
         } = run;
         if !menu_can_use_terminal() {
-            bail!("Failed to init rag in non-interactive mode");
+            return Err(refuse_non_interactive(
+                format_args!("initialize RAG knowledge base '{name}'"),
+                ".",
+            ));
         }
         println!("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app, prompter)?;
@@ -437,7 +441,10 @@ impl Rag {
         prompter: &dyn Prompter,
     ) -> Result<Self> {
         if !menu_can_use_terminal() {
-            bail!("Cannot run attach wizard in non-interactive mode");
+            return Err(refuse_non_interactive(
+                format_args!("run the attach wizard for RAG '{name}'"),
+                ".",
+            ));
         }
         // Checked before any prompt or secret is created, so a name that
         // collides with another RAG's kit is refused at once.
@@ -2104,8 +2111,8 @@ pub(crate) fn select_rag_driver(prompter: &dyn Prompter) -> Result<String> {
     #[cfg(not(target_env = "musl"))]
     {
         let options = vec![
-            "yaml   - portable, in-memory HNSW; usable from several Coyote processes at once (default)".to_string(),
-            "duckdb - persistent on-disk store; vectors and content survive restarts; HNSW approximate search.".to_string(),
+            "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)".to_string(), // debris-exempt: inquire label kept verbatim
+            "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.".to_string(), // debris-exempt: inquire label kept verbatim
         ];
         let sel = select_closed(prompter, "RAG storage driver:", options)?;
         if sel.starts_with("duckdb") {
@@ -3041,17 +3048,19 @@ mod tests {
         // Under musl the driver question is not asked at all.
         #[cfg(not(target_env = "musl"))]
         {
-            let driver = ScriptedPrompter::new(vec![PromptAnswer::Selected(
-                "duckdb - persistent on-disk store; vectors and content survive restarts; HNSW approximate search.".to_string(),
-            )]);
+            let yaml_row = "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)"; // debris-exempt: inquire label kept verbatim
+            let duckdb_row = "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search."; // debris-exempt: inquire label kept verbatim
+            let driver =
+                ScriptedPrompter::new(vec![PromptAnswer::Selected(duckdb_row.to_string())]);
             assert_eq!(select_rag_driver(&driver).unwrap(), "duckdb");
             let [req] = driver.requests().try_into().unwrap();
             assert_eq!(req.action, PromptAction::Select);
             assert_eq!(req.question, "RAG storage driver:");
             assert!(req.closed);
-            assert_eq!(req.options.len(), 2);
-            assert!(req.options[0].starts_with("yaml"), "{:?}", req.options);
-            assert!(req.options[1].starts_with("duckdb"), "{:?}", req.options);
+            assert_eq!(
+                req.options,
+                vec![yaml_row.to_string(), duckdb_row.to_string()]
+            );
         }
 
         let documents = ScriptedPrompter::new(vec![text("a.md; docs/ ;")]);
@@ -3314,6 +3323,39 @@ mod tests {
             let err = select_rag_driver(&HeadlessPrompter).unwrap_err();
             assert!(NeedsHuman::caused(&err), "{err:#}");
         }
+    }
+
+    /// Without a terminal the init wizard is refused up front, in the
+    /// shared refusal shape, before any question is asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn init_without_a_terminal_is_refused_before_any_prompt() {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let dir = TempDir::new("init-no-tty");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = Rag::init(
+            &AppConfig::default(),
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &[],
+            true,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks: RagSyncHooks::resolve(&rag_hooks_ctx("init-no-tty")),
+                prompter: &prompter,
+            },
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to initialize RAG knowledge base 'kb' non-interactively. Re-run in a terminal."
+        );
+        assert!(prompter.requests().is_empty());
     }
 
     /// A rejected answer is asked again with the reason in front of the

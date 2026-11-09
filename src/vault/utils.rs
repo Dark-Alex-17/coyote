@@ -1,11 +1,11 @@
 use crate::config::ensure_parent_exists;
 use crate::events::Origin;
 use crate::prompt::{
-    PromptAction, PromptAnswer, PromptRequest, Prompter, ask, confirm, input, reask,
+    PromptAction, PromptAnswer, PromptRequest, Prompter, ask, confirm, input, reask, select_closed,
 };
 use crate::sandbox::{SANDBOX_ENV_FLAG, sandbox_secret_env_var};
 use crate::vault::{SECRET_RE, Vault};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use gman::SecretError;
 use gman::providers::SupportedProvider;
 use gman::providers::aws_secrets_manager::AwsSecretsManagerProvider;
@@ -207,25 +207,21 @@ pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) ->
 }
 
 pub fn prompt_provider_choice(prompter: &dyn Prompter) -> Result<Option<SupportedProvider>> {
-    let req = PromptRequest {
-        options: [
-            "local - encrypted file on this machine",
-            "aws_secrets_manager - AWS Secrets Manager",
-            "gcp_secret_manager - Google Cloud Secret Manager",
-            "azure_key_vault - Azure Key Vault",
-            "gopass - gopass password manager (requires the `gopass` CLI)",
-            "one_password - 1Password (requires the `op` CLI)",
-        ]
-        .map(str::to_string)
-        .to_vec(),
-        closed: true,
-        ..PromptRequest::new(
-            PromptAction::Select,
-            "Which secrets provider would you like to use?",
-            Origin::detached(),
-        )
-    };
-    let choice = ask(prompter, req).and_then(PromptAnswer::into_selected)?;
+    let options = [
+        "local - encrypted file on this machine",
+        "aws_secrets_manager - AWS Secrets Manager",
+        "gcp_secret_manager - Google Cloud Secret Manager",
+        "azure_key_vault - Azure Key Vault",
+        "gopass - gopass password manager (requires the `gopass` CLI)",
+        "one_password - 1Password (requires the `op` CLI)",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    let choice = select_closed(
+        prompter,
+        "Which secrets provider would you like to use?",
+        options,
+    )?;
 
     if choice.starts_with("local") {
         return Ok(None);
@@ -242,7 +238,7 @@ pub fn prompt_provider_choice(prompter: &dyn Prompter) -> Result<Option<Supporte
     } else if choice.starts_with("one_password") {
         prompt_one_password_provider(prompter)?
     } else {
-        bail!("unexpected provider choice: {choice}");
+        unreachable!("select_closed only hands back an offered option");
     };
     preflight(&provider);
 
@@ -888,14 +884,17 @@ mod tests {
         );
     }
 
-    /// A choice outside the offered providers is an error that names
-    /// it, not a crash.
+    /// A choice outside the offered providers is rejected with the shared
+    /// closed-select message, not a crash.
     #[test]
     fn an_unknown_provider_choice_is_an_error() {
         let prompter =
             ScriptedPrompter::new(vec![PromptAnswer::Selected("vaultwarden".to_string())]);
         let err = prompt_provider_choice(&prompter).unwrap_err();
-        assert_eq!(err.to_string(), "unexpected provider choice: vaultwarden");
+        assert_eq!(
+            err.to_string(),
+            "'vaultwarden' is not one of the offered options"
+        );
     }
 
     /// A missing password file is created where the user says, with the

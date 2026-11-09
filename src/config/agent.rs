@@ -2671,6 +2671,42 @@ nodes: {}
         assert_eq!(req.default, Some(json!(true)));
     }
 
+    /// Without a terminal the RAG question is skipped rather than
+    /// refused: the agent starts without its knowledge base and nothing
+    /// is asked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn without_a_terminal_the_rag_question_is_skipped_and_the_agent_starts() {
+        let _guard = TestConfigDirGuard::new("agent-rag-no-tty");
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let name = unique("rag_no_tty");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_none());
+        assert!(prompter.requests().is_empty());
+    }
+
     /// A graph's rag node whose knowledge base is not built asks the same
     /// way; declining is fatal because the graph cannot run without it.
     #[tokio::test]

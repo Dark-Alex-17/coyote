@@ -728,10 +728,10 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -
 
     if !assume_yes {
         if !conflict::menu_can_use_terminal() {
-            bail!(
-                "refusing to uninstall bundle '{name}' non-interactively; \
-                 re-run with --yes to confirm"
-            );
+            return Err(conflict::refuse_non_interactive(
+                format_args!("uninstall bundle '{name}'"),
+                " or pass --yes to confirm.",
+            ));
         }
         let ownership = format!(
             "Bundle '{name}' owns {} file(s) and {} mcp.json server(s).",
@@ -6237,12 +6237,8 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_refuses_non_interactive_without_yes() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping uninstall_refuses_non_interactive_without_yes: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install_non_interactive();
         let _guard = TestVaultConfigGuard::new("uninst-non-tty");
         let mut store = BundleStore::load().unwrap();
         store
@@ -6251,7 +6247,15 @@ mod tests {
 
         let err = uninstall_bundle("omc", false, &ScriptedPrompter::refusing()).unwrap_err();
 
-        assert!(err.to_string().contains("--yes"), "got: {err}");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Refusing to uninstall bundle 'omc'"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("non-interactively. Re-run in a terminal or pass --yes to confirm."),
+            "got: {message}"
+        );
         assert!(BundleStore::load().unwrap().get("omc").is_some());
     }
 

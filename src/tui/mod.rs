@@ -9008,7 +9008,6 @@ mod tests {
             ("src/main.rs", "shell_execute", CLI_ONLY),
             ("src/mcp/manage.rs", "handle_remove", CLI_ONLY),
             ("src/mcp/manage.rs", "handle_add", CLI_ONLY),
-            ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
             ("src/prompt/mod.rs", "select", REPL_PROMPTER),
             ("src/prompt/mod.rs", "input", REPL_PROMPTER),
             ("src/prompt/mod.rs", "password", REPL_PROMPTER),

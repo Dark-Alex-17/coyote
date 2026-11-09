@@ -347,9 +347,8 @@ fn provision_secrets(cli: &Cli, vault: &Vault) -> Result<()> {
             continue;
         }
         eprintln!("Value references vault secret {{{{ {name} }}}} which is not stored yet.");
-        let ok = Confirm::new(&format!("Add '{name}' to the vault now?"))
-            .with_default(true)
-            .prompt()?;
+        let ok =
+            crate::prompt::confirm(&prompter, format!("Add '{name}' to the vault now?"), true)?;
         if !ok {
             bail!(
                 "Vault secret '{name}' is required by the config; aborting. \

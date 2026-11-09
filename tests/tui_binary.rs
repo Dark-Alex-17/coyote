@@ -7184,14 +7184,384 @@ fn dot_vault_add_in_the_plain_repl_asks_once_reasks_on_empty_and_stores_the_valu
     assert_tty_restored(&transcript);
 }
 
-/// The questions the RAG wizard asks after the embedding model, in the
-/// order they can come up; any of them on screen means the chosen model
-/// reached the wizard and it moved on.
-const RAG_WIZARD_FOLLOW_UPS: [&str; 5] = [
+// ---------------------------------------------------------------------------
+// Usage probe: `Agent::init`'s "init RAG?" question. An agent with
+// `documents:` attached asks whether to build its knowledge base when it
+// starts; under the UI the question is the Confirm modal, in the plain
+// REPL it is the inquire confirm it always was, and without a terminal
+// the agent starts without RAG, silently.
+
+/// The question `Agent::init` asks when the agent has documents attached,
+/// as the plain REPL has always worded it.
+const INIT_RAG_QUESTION: &str = "The agent has documents attached, init RAG?";
+
+/// The notice the UI used to print instead of asking, gone now that the
+/// question is a modal.
+const RETIRED_RAG_NOTICE: &str = "starting without RAG";
+
+/// An agent with one markdown document beside its config, so starting it
+/// asks whether to initialize its RAG.
+fn write_agent_with_documents(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("notes.md"),
+        "# Notes\n\nThe probe document for the agent's knowledge base.\n",
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!(
+            "name: {name}\n\
+             description: an agent with documents\n\
+             version: 0.1.0\n\
+             instructions: |\n\
+             \x20 You are an assistant with notes. Reply briefly.\n\
+             documents:\n\
+             \x20 - notes.md\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Starts the UI on an agent-with-documents config and sends `.agent
+/// <name>`; hands back the pty and the byte offset the command was sent
+/// at once the Confirm modal asking `init RAG?` is on screen.
+fn open_the_init_rag_modal(dir: &Path, name: &str) -> (Pty, usize) {
+    write_dry_run_config_with_embeddings(dir);
+    write_agent_with_documents(dir, name);
+    let mut pty = spawn_tui(dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(40, 120).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    let command = format!(".agent {name}");
+    pty.send(format!("{command}\r").as_bytes()).unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        before,
+        &command,
+        &[&squeezed(INIT_RAG_QUESTION), "y=yes"],
+    );
+    assert!(
+        !squeezed(&modal).contains("(Y/n)") && !squeezed(&modal).contains("(y/N)"),
+        "`init RAG?` was asked on the raw tty, not in the modal:\n{modal}"
+    );
+    assert!(
+        !modal.contains(RETIRED_RAG_NOTICE),
+        "the retired `{RETIRED_RAG_NOTICE}` notice was printed under the UI:\n{modal}"
+    );
+    (pty, before)
+}
+
+/// `.agent <name>` for an agent with documents asks `init RAG?` in the
+/// Confirm modal (no raw `(Y/n)` prompt, no retired notice, terminal
+/// never released); `n` starts the agent without RAG: `.info agent`
+/// renders for it, no rag is written, and the UI leaves clean on Ctrl+D.
+#[test]
+#[serial]
+fn dot_agent_with_documents_asks_init_rag_in_the_confirm_modal_and_n_starts_it_without_rag() {
+    let dir = fresh_config_dir("agent-init-rag-n");
+    let _guard = TempDirGuard(dir.clone());
+    let (mut pty, before) = open_the_init_rag_modal(&dir, "docs-agent-n7q");
+    let files_before = walk(&dir);
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    pty.read_for(Duration::from_millis(1500));
+
+    // The export runs to well over a hundred rows (the built-in tool
+    // guidance is appended to the instructions), so the window is made
+    // tall enough to show it whole.
+    pty.resize(300, 120).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let info_at = pty.raw().len();
+    pty.send(b".info agent\r").unwrap();
+    pty.wait_for_after("config_file", info_at, PTY_DEADLINE)
+        .expect("`.info agent` never rendered after `n` on the init RAG modal");
+    pty.read_for(Duration::from_millis(800));
+    let info = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+    let flat = squeezed(&info);
+    assert!(
+        flat.contains("name:docs-agent-n7q") && flat.contains("documents:-notes.md"),
+        "`.info agent` does not show the agent with its documents after `n`:\n{info}"
+    );
+    assert!(
+        !flat.contains("y=yes"),
+        "the Confirm modal is still up after `n`:\n{info}"
+    );
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "`n` on `init RAG?` still wrote a rag: {written:?}:\n{since}"
+    );
+    assert!(
+        !since.contains(RETIRED_RAG_NOTICE),
+        "the retired `{RETIRED_RAG_NOTICE}` notice was printed after `n`:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the `init RAG?` question released the terminal:\n{since}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `y` on the `init RAG?` modal flows back as the answer: the init goes
+/// on to the RAG wizard, whose first question (which embedding model) is
+/// the Select modal listing both configured models; Esc there cancels,
+/// the UI keeps taking keys and leaves clean.
+#[test]
+#[serial]
+fn dot_agent_with_documents_y_on_the_init_rag_modal_moves_on_to_the_embedding_select_modal() {
+    let dir = fresh_config_dir("agent-init-rag-y");
+    let _guard = TempDirGuard(dir.clone());
+    let (mut pty, before) = open_the_init_rag_modal(&dir, "docs-agent-y7q");
+
+    pty.read_for(HOTKEY_GAP);
+    let answered_at = pty.raw().len();
+    pty.send(b"y").unwrap();
+    let select = wait_for_the_modal(
+        &mut pty,
+        answered_at,
+        ".agent docs-agent-y7q (after y)",
+        &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
+    );
+    assert!(
+        !squeezed(&select).contains("(Y/n)"),
+        "the embedding question was asked on the raw tty:\n{select}"
+    );
+    esc_cancels_the_modal(&mut pty, ".agent docs-agent-y7q");
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("`.info` after the cancelled RAG wizard never rendered");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the RAG wizard released the terminal:\n{since}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `.agent <name>` in the plain REPL asks the same question with inquire
+/// (`(Y/n)` on the normal screen, no modal legend, no alternate screen):
+/// the prompter routing left the REPL's behaviour in place. `n` starts
+/// the agent without RAG and nothing is written.
+#[test]
+#[serial]
+fn dot_agent_with_documents_in_the_plain_repl_asks_init_rag_with_inquire() {
+    let dir = fresh_config_dir("agent-init-rag-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    write_agent_with_documents(&dir, "docs-agent-r7q");
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".agent docs-agent-r7q\r").unwrap();
+    let asked = pty
+        .wait_for_after(INIT_RAG_QUESTION, before, PTY_DEADLINE)
+        .expect("`.agent <name>` in the plain REPL did not ask `init RAG?`");
+    pty.read_for(Duration::from_millis(500));
+    let asked = format!(
+        "{asked}{}",
+        strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+    );
+    assert!(
+        asked.contains("(Y/n)"),
+        "the inquire confirm does not show its `(Y/n)` default:\n{asked}"
+    );
+    assert!(
+        !squeezed(&asked).contains("Esc=cancel") && !squeezed(&asked).contains("y=yes"),
+        "the plain REPL drew the modal legend instead of the inquire prompt:\n{asked}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{asked}"
+    );
+
+    let answered_at = pty.raw().len();
+    pty.send(b"n\r").unwrap();
+    pty.wait_for_after("docs-agent-r7q", answered_at, PTY_DEADLINE)
+        .expect("the agent prompt never came back after `n`");
+    pty.read_for(Duration::from_millis(500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "`n` on `init RAG?` in the plain REPL still wrote a rag: {written:?}:\n{since}"
+    );
+
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Without a terminal (`coyote --agent <name> --headless <prompt>` with
+/// stdin at /dev/null and stdout a file), the agent starts without RAG
+/// and says nothing about it: no question, no retired notice, the dry-run
+/// reply lands in the file, exit 0, no rag written and no alternate
+/// screen.
+#[test]
+#[serial]
+fn headless_agent_with_documents_starts_without_rag_silently() {
+    let dir = fresh_config_dir("agent-init-rag-headless");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    write_agent_with_documents(&dir, "docs-agent-h7q");
+    let files_before = walk(&dir);
+    let captured = dir.join("stdout.log");
+    let wrapper = format!(
+        "'{{coyote}}' --agent docs-agent-h7q --headless 'say hello-sentinel-h7q' <{{stdin}} >'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
+        captured.display()
+    );
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], &wrapper, "/dev/null");
+
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let file = String::from_utf8_lossy(&fs::read(&captured).unwrap_or_default()).to_string();
+    let everything = format!("{transcript}\n{file}");
+    assert_eq!(
+        exit_code(&transcript),
+        0,
+        "the headless agent run did not exit 0:\n{everything}"
+    );
+    assert!(
+        file.contains("hello-sentinel-h7q"),
+        "the headless run never reached the dry-run model:\n{everything}"
+    );
+    assert!(
+        !everything.contains(INIT_RAG_QUESTION),
+        "the headless run asked `init RAG?` without a terminal:\n{everything}"
+    );
+    assert!(
+        !everything.contains(RETIRED_RAG_NOTICE),
+        "the headless run printed the retired `{RETIRED_RAG_NOTICE}` notice:\n{everything}"
+    );
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "the headless run built a rag without asking: {written:?}:\n{everything}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "a headless run entered the alternate screen:\n{transcript}"
+    );
+    assert_tty_restored(&transcript);
+}
+
+/// A macro run with no terminal at all (`coyote --macro <name>` detached
+/// from any controlling tty, stdin at /dev/null, stdout and stderr
+/// pipes) reaching a rerouted question (`.vault add`, `.rag <new>`) is
+/// refused the way the plain REPL always refused it: the run ends on its
+/// own instead of hanging on a prompt, exits non-zero, says the input is
+/// not a terminal, writes nothing for the secret or the rag, and the
+/// macro does not go on to its next step.
+#[test]
+#[serial]
+fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
+    for (scenario, step, footprints) in [
+        (
+            "vault-add",
+            ".vault add probe-secret-m7q",
+            &["m7q", "vault.json", "vault.enc"][..],
+        ),
+        ("rag-create", ".rag probe-rag-m7q", &["m7q", "/rags/"][..]),
+    ] {
+        let dir = fresh_config_dir(&format!("ttyless-macro-{scenario}"));
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with_embeddings(&dir);
+        fs::create_dir_all(dir.join("macros")).unwrap();
+        fs::write(
+            dir.join("macros").join("asking.yaml"),
+            format!("isolated: false\nsteps:\n  - \"{step}\"\n  - \".info\"\n"),
+        )
+        .unwrap();
+        // Seed the built-in assets first so the file walk below sees only
+        // what the refused step leaves behind.
+        let mut seed = Command::new(built_binary());
+        base_env(&mut seed, &dir);
+        common::pty::detached(&mut seed)
+            .env("COYOTE_UI", "repl")
+            .arg("--info")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let files_before = walk(&dir);
+
+        let mut cmd = Command::new(built_binary());
+        base_env(&mut cmd, &dir);
+        common::pty::detached(&mut cmd)
+            .env("COYOTE_UI", "repl")
+            .args(["--macro", "asking"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let deadline = std::time::Instant::now() + PTY_DEADLINE;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("{scenario}: `--macro` with `{step}` and no terminal hung on its prompt");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let everything = format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        assert!(
+            !out.status.success(),
+            "{scenario}: a refused tty-less `{step}` exited 0:\n{everything}"
+        );
+        let lower = everything.to_lowercase();
+        assert!(
+            lower.contains("not a tty")
+                || lower.contains("terminal")
+                || lower.contains("human")
+                || lower.contains("interactive"),
+            "{scenario}: the refusal of `{step}` does not say what is missing:\n{everything}"
+        );
+        for footprint in footprints {
+            let written = new_files_named(&dir, &files_before, footprint);
+            assert!(
+                written.is_empty(),
+                "{scenario}: the refused `{step}` still wrote {written:?}:\n{everything}"
+            );
+        }
+        assert!(
+            !stdout.contains("log_path"),
+            "{scenario}: the macro went on to `.info` after the refused `{step}`:\n{everything}"
+        );
+    }
+}
+
+/// Any question the wizard can ask after the embedding model; one of
+/// them on screen means the chosen model reached the wizard and it
+/// moved on.
+const RAG_WIZARD_FOLLOW_UPS: [&str; 6] = [
     "RAGstoragedriver:",
     "Extractormodel",
     "Setchunksize:",
     "Setchunkoverlay:",
+    "Setgraphexpansionhops:",
     "Adddocuments:",
 ];
 
@@ -7207,7 +7577,6 @@ const RAG_WIZARD_FOLLOW_UPS: [&str; 5] = [
 fn dot_rag_wizard_moves_on_after_the_select_modal_and_the_chunk_size_input_shows_its_default() {
     let dir = fresh_config_dir("rag-wizard-answered");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
     write_dry_run_config_with_embeddings(&dir);
     let mut pty = spawn_tui(&dir, &[]);
 

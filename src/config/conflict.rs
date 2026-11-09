@@ -129,7 +129,9 @@ pub(crate) fn rerun_hint() -> &'static str {
 }
 
 /// The refusal for a question nothing can show; every site builds it
-/// here so the message has one shape.
+/// here so the message has one shape. `remedy` follows the re-run hint
+/// directly, so it begins with its own separator (" or pass --force.",
+/// ", with --yes (updates).") or is just a period.
 pub(crate) fn refuse_non_interactive(
     action: impl std::fmt::Display,
     remedy: impl std::fmt::Display,
