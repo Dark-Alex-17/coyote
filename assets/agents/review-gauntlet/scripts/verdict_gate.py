@@ -136,6 +136,50 @@ def selection_lines(summary):
     return ["- " + text for text in folded if text]
 
 
+# A DIVERGES verdict hands the fixer the adversary's own numbered complaints, each a blocker line of its own,
+# clipped so one runaway complaint cannot swamp the Blockers section; the full report follows the table.
+ADVERSARY_COMPLAINTS_MAX = 8
+ADVERSARY_COMPLAINT_CHARS = 600
+
+
+def adversary_complaints(report):
+    """The numbered items under the adversary's `Complaints:` line, in order; a wrapped item's lines are joined."""
+    lines = report.splitlines()
+    start = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == "Complaints:"), None)
+    items = []
+    for ln in lines[start:] if start is not None else []:
+        if not ln.strip():
+            break
+        m = re.match(r"\s*\d+[.)]\s+(.*)", ln)
+        if m:
+            items.append(m.group(1).strip())
+        elif items:
+            items[-1] += " " + ln.strip()
+        else:
+            break
+    return [one_line(c) for c in items if c.strip()]
+
+
+def clip(text, limit):
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def adversary_divergence_blockers(report):
+    complaints = adversary_complaints(report)
+    if not complaints:
+        return ["adversary: DIVERGES -- the implementation does not conform to the plan"]
+    out = [
+        f"adversary: DIVERGES -- complaint {i}: {clip(c, ADVERSARY_COMPLAINT_CHARS)}"
+        for i, c in enumerate(complaints[:ADVERSARY_COMPLAINTS_MAX], 1)
+    ]
+    if len(complaints) > ADVERSARY_COMPLAINTS_MAX:
+        out.append(
+            f"adversary: DIVERGES -- {len(complaints) - ADVERSARY_COMPLAINTS_MAX} more complaint(s) "
+            "in the adversary report below"
+        )
+    return out
+
+
 def main():
     if helper_import_error:
         raise helper_import_error
@@ -334,9 +378,7 @@ def main():
         elif m and m.group(1) == "CONFORMS":
             record("adversary", "GREEN", "CONFORMS")
         elif m:
-            blockers.append(
-                "adversary: DIVERGES — the implementation does not conform to the plan"
-            )
+            blockers.extend(adversary_divergence_blockers(adv))
             record("adversary", "BLOCKED", "DIVERGES")
         else:
             blockers.append(
