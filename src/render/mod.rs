@@ -169,9 +169,9 @@ mod tests {
         #[test]
         fn command_error_hints_follow_the_prefix() {
             let err = MeshVerbError::wrap(anyhow::anyhow!(
-                "No path to 1a2b3c4d is known; nothing was sent. `.mesh peers` lists what this node has heard from."
+                "No path to 1a2b3c4d is known; nothing was sent. `.mesh people list` lists what this node has heard from."
             )
-            .context("`.mesh message` failed"));
+            .context("`.mesh messaging send` failed"));
             for (prefix, sigil) in [
                 (CommandPrefix::Dot, '.'),
                 (CommandPrefix::Slash, '/'),
@@ -181,7 +181,7 @@ mod tests {
                 assert_eq!(
                     text,
                     format!(
-                        "Error: `{sigil}mesh message` failed\n\nCaused by:\n    No path to 1a2b3c4d is known; nothing was sent. `{sigil}mesh peers` lists what this node has heard from."
+                        "Error: `{sigil}mesh messaging send` failed\n\nCaused by:\n    No path to 1a2b3c4d is known; nothing was sent. `{sigil}mesh people list` lists what this node has heard from."
                     ),
                     "{prefix}"
                 );
@@ -193,7 +193,7 @@ mod tests {
                 NoticeText::default()
                     .frame("No share rule has the pattern `")
                     .peer(".vault")
-                    .frame("`; `.mesh shares` lists them."),
+                    .frame("`; `.mesh files list` lists them."),
             )
         }
 
@@ -202,7 +202,7 @@ mod tests {
             let text = command_error_text(&MeshVerbError::wrap(quoting()), CommandPrefix::Slash);
             assert!(
                 text.ends_with(
-                    "No share rule has the pattern `.vault`; `/mesh shares` lists them."
+                    "No share rule has the pattern `.vault`; `/mesh files list` lists them."
                 ),
                 "{text}"
             );
@@ -211,12 +211,15 @@ mod tests {
 
         #[test]
         fn a_quoting_error_under_context_keeps_its_quote_and_slashes_both_hints() {
-            let err = MeshVerbError::wrap(quoting().context("`.mesh unshare` failed"));
+            let err = MeshVerbError::wrap(quoting().context("`.mesh files unshare` failed"));
             let text = command_error_text(&err, CommandPrefix::Slash);
-            assert!(text.starts_with("Error: `/mesh unshare` failed"), "{text}");
+            assert!(
+                text.starts_with("Error: `/mesh files unshare` failed"),
+                "{text}"
+            );
             assert!(
                 text.ends_with(
-                    "No share rule has the pattern `.vault`; `/mesh shares` lists them."
+                    "No share rule has the pattern `.vault`; `/mesh files list` lists them."
                 ),
                 "{text}"
             );
@@ -228,7 +231,7 @@ mod tests {
             let inner = || {
                 anyhow::anyhow!("root cause")
                     .context("middle")
-                    .context("`.mesh trust` failed")
+                    .context("`.mesh access trust` failed")
             };
             let marked = MeshVerbError::wrap(inner());
             assert_eq!(pretty_error(&marked), pretty_error(&inner()));
@@ -265,9 +268,9 @@ mod tests {
             QuotingError::wrap(
                 NoticeText::default()
                     .frame("the share file says ")
-                    .peer(".mesh trust x"),
+                    .peer(".mesh access trust x"),
             )
-            .context("`.mesh grant` failed for .session")
+            .context("`.mesh files grant` failed for .session")
         }
 
         #[test]
@@ -275,7 +278,7 @@ mod tests {
             let err = chained();
             assert_eq!(
                 error_notice(&err).render(CommandPrefix::Dot),
-                "`.mesh grant` failed for .session: the share file says .mesh trust x"
+                "`.mesh files grant` failed for .session: the share file says .mesh access trust x"
             );
             assert_eq!(error_notice(&err).plain(), format!("{err:#}"));
         }
@@ -284,7 +287,7 @@ mod tests {
         fn under_slash_a_quoting_link_keeps_its_quote_and_a_plain_link_slashes() {
             assert_eq!(
                 error_notice(&chained()).render(CommandPrefix::Slash),
-                "`/mesh grant` failed for /session: the share file says .mesh trust x"
+                "`/mesh files grant` failed for /session: the share file says .mesh access trust x"
             );
         }
     }

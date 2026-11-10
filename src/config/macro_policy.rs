@@ -741,7 +741,10 @@ mod tests {
     fn disc_with_mesh_step(name: &str) -> DiscoveredMacro {
         DiscoveredMacro {
             definition: Ok(Macro {
-                steps: vec![".model x".to_string(), "  .mesh trust {{peer}}".to_string()],
+                steps: vec![
+                    ".model x".to_string(),
+                    "  .mesh access trust {{peer}}".to_string(),
+                ],
                 ..valid_macro()
             }),
             ..disc(name, MacroSource::Global)
@@ -753,7 +756,7 @@ mod tests {
             panic!("expected Invalid, got {state:?}");
         };
         assert!(reason.contains("step 2"), "{reason}");
-        assert!(reason.contains(".mesh trust {{peer}}"), "{reason}");
+        assert!(reason.contains(".mesh access trust {{peer}}"), "{reason}");
     }
 
     #[test]
@@ -942,7 +945,7 @@ mod tests {
             write_macro(
                 global,
                 "meshy",
-                "steps:\n  - \".model x\"\n  - \"  .mesh trust {{peer}}\"\n",
+                "steps:\n  - \".model x\"\n  - \"  .mesh access trust {{peer}}\"\n",
             );
 
             let discovered = discover_macros_in(&[(MacroSource::Global, global.to_path_buf())]);
@@ -974,7 +977,7 @@ mod tests {
             write_macro(
                 global,
                 "slashy",
-                "steps:\n  - \".model x\"\n  - \"/mesh trust {{peer}}\"\n",
+                "steps:\n  - \".model x\"\n  - \"/mesh access trust {{peer}}\"\n",
             );
             let discovered = || discover_macros_in(&[(MacroSource::Global, global.to_path_buf())]);
 
@@ -988,7 +991,7 @@ mod tests {
                     );
                 };
                 assert!(
-                    reason.contains("step 2 '/mesh trust {{peer}}'"),
+                    reason.contains("step 2 '/mesh access trust {{peer}}'"),
                     "{prefix}: {reason}"
                 );
                 assert!(

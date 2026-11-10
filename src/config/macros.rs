@@ -202,9 +202,9 @@ impl Macro {
     /// command, or `None` when no step is. A step counts when the REPL's
     /// own tokenizer would dispatch it to `.mesh` when the macro runs, so
     /// a `:::` multiline fence is unwrapped first: `.mesh`,
-    /// `  .mesh trust x`, `\t.mesh\tstatus` and `::: .mesh status :::` are
-    /// refused; `.meshy foo`, `echo .mesh`, `mesh trust`, `. mesh` and
-    /// `.MESH trust x` (dispatch is case-sensitive, so that is not a
+    /// `  .mesh access trust x`, `\t.mesh\tstatus` and `::: .mesh status :::` are
+    /// refused; `.meshy foo`, `echo .mesh`, `mesh access trust`, `. mesh` and
+    /// `.MESH access trust x` (dispatch is case-sensitive, so that is not a
     /// `.mesh` command at runtime either) are not. The macro runner
     /// dispatches steps under `prefix.with_dot()`, so under `slash` or
     /// `both` a `/mesh ...` step is refused too, while under `dot` it is
@@ -1367,10 +1367,10 @@ variables:
     fn forbidden_mesh_step_matches_only_a_leading_mesh_token() {
         let refused = [
             ".mesh",
-            "  .mesh trust {{peer}}",
-            "\t.mesh\ttrust x",
+            "  .mesh access trust {{peer}}",
+            "\t.mesh\taccess trust x",
             "\n.mesh status",
-            "::: .mesh trust abc :::",
+            "::: .mesh access trust abc :::",
             ":::\n.mesh status\n:::",
         ];
         for step in refused {
@@ -1387,8 +1387,8 @@ variables:
         }
 
         let accepted = [
-            ".MESH trust x",
-            "mesh trust",
+            ".MESH access trust x",
+            "mesh access trust",
             ". mesh",
             "{{cmd}} trust x",
             "::: echo .mesh :::",
@@ -1408,22 +1408,22 @@ variables:
 
     #[test]
     fn forbidden_mesh_step_reports_first_offender_by_one_based_index() {
-        let m = macro_with_steps(&[".model x", ".mesh trust a", ".mesh trust b"]);
+        let m = macro_with_steps(&[".model x", ".mesh access trust a", ".mesh access trust b"]);
 
         let reason = m.forbidden_mesh_step(CommandPrefix::Dot).unwrap();
 
-        assert!(reason.contains("step 2 '.mesh trust a'"), "{reason}");
+        assert!(reason.contains("step 2 '.mesh access trust a'"), "{reason}");
         assert!(!reason.contains("trust b"), "{reason}");
     }
 
     #[test]
     fn forbidden_mesh_step_reason_strips_ansi_escapes_from_step() {
-        let m = macro_with_steps(&[".mesh \u{1b}[31mtrust\u{1b}[0m x"]);
+        let m = macro_with_steps(&[".mesh access \u{1b}[31mtrust\u{1b}[0m x"]);
 
         let reason = m.forbidden_mesh_step(CommandPrefix::Dot).unwrap();
 
         assert!(!reason.contains('\u{1b}'), "{reason:?}");
-        assert!(reason.contains("step 1 '.mesh trust x'"), "{reason}");
+        assert!(reason.contains("step 1 '.mesh access trust x'"), "{reason}");
     }
 
     #[test]
@@ -1432,7 +1432,7 @@ variables:
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "mesh-macro",
-            "steps:\n  - \".model gpt-4o\"\n  - \".mesh trust abc\"\n  - \".set temperature 0.1\"\n",
+            "steps:\n  - \".model gpt-4o\"\n  - \".mesh access trust abc\"\n  - \".set temperature 0.1\"\n",
         );
         let path = paths::macros_dir().join("mesh-macro.yaml");
 
@@ -1442,7 +1442,7 @@ variables:
 
         assert!(err.contains("Failed to load macro 'mesh-macro'"), "{err}");
         assert!(err.contains(&path.display().to_string()), "{err}");
-        assert!(err.contains("step 2 '.mesh trust abc'"), "{err}");
+        assert!(err.contains("step 2 '.mesh access trust abc'"), "{err}");
         assert!(
             err.contains("literal `.mesh` steps are refused at load"),
             "{err}"
@@ -1466,17 +1466,17 @@ variables:
 
     #[test]
     fn forbidden_mesh_step_refuses_slash_mesh_only_when_the_runner_would_dispatch_it() {
-        let m = macro_with_steps(&[".model x", "/mesh trust x"]);
+        let m = macro_with_steps(&[".model x", "/mesh access trust x"]);
 
         for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
             let reason = m.forbidden_mesh_step(prefix);
             assert!(
                 reason.is_some(),
-                "{prefix}: `/mesh trust x` must be refused"
+                "{prefix}: `/mesh access trust x` must be refused"
             );
             let reason = reason.unwrap();
             assert!(
-                reason.contains("step 2 '/mesh trust x'"),
+                reason.contains("step 2 '/mesh access trust x'"),
                 "{prefix}: {reason}"
             );
             assert!(
@@ -1499,16 +1499,19 @@ variables:
     #[serial]
     fn load_refuses_slash_mesh_step_under_slash_and_loads_it_under_dot() {
         let _guard = TestConfigDirGuard::new("macros-tests");
-        write_macro_file("slash-mesh-macro", "steps:\n  - \"/mesh trust abc\"\n");
+        write_macro_file(
+            "slash-mesh-macro",
+            "steps:\n  - \"/mesh access trust abc\"\n",
+        );
 
         let err = Macro::load("slash-mesh-macro", false, CommandPrefix::Slash).unwrap_err();
         assert!(
-            err.to_string().contains("step 1 '/mesh trust abc'"),
+            err.to_string().contains("step 1 '/mesh access trust abc'"),
             "{err}"
         );
 
         let loaded = Macro::load("slash-mesh-macro", false, CommandPrefix::Dot).unwrap();
-        assert_eq!(loaded.steps, vec!["/mesh trust abc".to_string()]);
+        assert_eq!(loaded.steps, vec!["/mesh access trust abc".to_string()]);
     }
 
     #[test]
@@ -1567,7 +1570,7 @@ variables:
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "slash-mesh-live",
-            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \"/mesh trust abc\"\n",
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \"/mesh access trust abc\"\n",
         );
         let ctx_with = |prefix: CommandPrefix| {
             let mut ctx = test_ctx();
@@ -1594,7 +1597,7 @@ variables:
         ))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("step 2 '/mesh trust abc'"), "{err}");
+        assert!(err.contains("step 2 '/mesh access trust abc'"), "{err}");
         assert_eq!(
             ctx.app.config.temperature, None,
             "refusal at load must precede the first step"
@@ -1619,7 +1622,7 @@ variables:
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "mesh-live-macro",
-            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \".mesh trust abc\"\n",
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \".mesh access trust abc\"\n",
         );
         let mut ctx = test_ctx();
         ctx.session = Some(Session::default());
@@ -1632,7 +1635,7 @@ variables:
         ));
 
         let err = result.unwrap_err().to_string();
-        assert!(err.contains(".mesh trust abc"), "{err}");
+        assert!(err.contains(".mesh access trust abc"), "{err}");
         assert_eq!(
             ctx.session.as_ref().unwrap().temperature(),
             None,
@@ -1648,7 +1651,7 @@ variables:
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "mesh-iso-macro",
-            "steps:\n  - \".set temperature 0.9\"\n  - \".mesh trust abc\"\n",
+            "steps:\n  - \".set temperature 0.9\"\n  - \".mesh access trust abc\"\n",
         );
         let mut ctx = test_ctx();
         ctx.session = Some(Session::default());
@@ -1661,7 +1664,7 @@ variables:
         ));
 
         let err = result.unwrap_err().to_string();
-        assert!(err.contains(".mesh trust abc"), "{err}");
+        assert!(err.contains(".mesh access trust abc"), "{err}");
         assert!(!ctx.macro_flag);
         assert!(!ctx.macro_non_isolated);
     }
@@ -1672,12 +1675,12 @@ variables:
     /// sentence keeps the `.list macros` row and the load error from drifting apart.
     #[test]
     fn reason_is_the_exact_refusal_sentence() {
-        let m = macro_with_steps(&[".model x", "  .mesh trust {{peer}}"]);
+        let m = macro_with_steps(&[".model x", "  .mesh access trust {{peer}}"]);
 
         assert_eq!(
             m.forbidden_mesh_step(CommandPrefix::Dot).as_deref(),
             Some(
-                "step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest"
+                "step 2 '  .mesh access trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest"
             )
         );
     }
@@ -1694,9 +1697,9 @@ variables:
             "meshy",
             "isolated: false\n\
              variables:\n  - name: peer\n\
-             steps:\n  - \".set temperature 0.9\"\n  - \"  .mesh trust {{peer}}\"\n",
+             steps:\n  - \".set temperature 0.9\"\n  - \"  .mesh access trust {{peer}}\"\n",
         );
-        let expected = "Macro 'meshy' is invalid: step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest";
+        let expected = "Macro 'meshy' is invalid: step 2 '  .mesh access trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest";
 
         for line in [".macro meshy peer=abc", ".meshy peer=abc"] {
             let mut ctx = test_ctx();
@@ -1728,9 +1731,9 @@ variables:
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "live-switch",
-            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \"/mesh trust abc\"\n",
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \"/mesh access trust abc\"\n",
         );
-        let expected = "Macro 'live-switch' is invalid: step 2 '/mesh trust abc': literal `.mesh` steps are refused at load; the runtime guard covers the rest";
+        let expected = "Macro 'live-switch' is invalid: step 2 '/mesh access trust abc': literal `.mesh` steps are refused at load; the runtime guard covers the rest";
         let mut ctx = test_ctx();
         let mut app = (*ctx.app).clone();
         app.config = Arc::new(AppConfig {
@@ -1793,7 +1796,7 @@ variables:
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "mesh-vars",
-            "variables:\n  - name: peer\nsteps:\n  - \".mesh trust {{peer}}\"\n",
+            "variables:\n  - name: peer\nsteps:\n  - \".mesh access trust {{peer}}\"\n",
         );
         let mut ctx = test_ctx();
 
@@ -1806,7 +1809,10 @@ variables:
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("step 1 '.mesh trust {{peer}}'"), "{err}");
+        assert!(
+            err.contains("step 1 '.mesh access trust {{peer}}'"),
+            "{err}"
+        );
         assert!(err.contains("refused at load"), "{err}");
         assert!(!err.contains("Usage:"), "{err}");
     }

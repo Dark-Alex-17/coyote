@@ -6,18 +6,18 @@ node, which holds it until the recipient fetches it. Coyote is never a propagati
 builds one from the reference daemon, [`lxmd`](https://github.com/markqvist/LXMF#daemon-included), configured
 for a private team network.
 
-Status in this build: Coyote discovers propagation nodes from their announces (`.mesh info` lists them under
+Status in this build: Coyote discovers propagation nodes from their announces (`.mesh config show` lists them under
 `propagation_nodes`) and posts to the nearest one when a direct link fails (`mesh__send` reports
 `via: store_and_forward`). Held messages are fetched back automatically every `mesh.propagation_sync_interval_secs`
 seconds (default 300; `0` turns the automatic path off, including the join-time fetch) and once a propagation node is
-heard after the node joins; `.mesh sync` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
+heard after the node joins; `.mesh messaging sync` runs a fetch now. A `.mesh access ask` to an unreachable peer is parked on the
 node the same way. Coyote keeps the propagation nodes it heard within the last day in `mesh/propagation-nodes.json`
 under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an
 announce; a Coyote that has not heard the node within the last day waits for the node's next announce (up to
-`announce_interval`, 61 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too); a held
+`announce_interval`, 61 minutes with the shipped `lxmd.config`; `.mesh messaging sync` is refused until then too); a held
 message whose sender has not announced since the restart is kept on the node until it has been seen on three fetches
 and at least an hour (one peer heartbeat) has passed; then it is dropped. A Coyote node with `announce: false` never
-fetches on its own; `.mesh sync` does.
+fetches on its own; `.mesh messaging sync` does.
 
 ## Build and run
 
@@ -96,7 +96,7 @@ keeps only lines whose remaining bytes are exactly 32, so a trailing space, inli
 blank-padded line is silently dropped. The file is read once at start, so restart the container after editing it.
 
 The hash to list is a Coyote node's mesh **identity** hash: the `identity:` line printed by `.mesh on` and the
-`identity` row of `.mesh info`. It is not the destination hash. Example, with two placeholders:
+`identity` row of `.mesh config show`. It is not the destination hash. Example, with two placeholders:
 
 ```
 00000000000000000000000000000000
@@ -175,8 +175,8 @@ Only a session running without `rnsd` dials the node directly, with `{type: priv
 place of the `local` entry; the Docker image (from v0.10.4) has its own `rnsd` and reaches the node through
 `COYOTE_MESH_RELAY=<node host>:4242` instead.
 
-Once the node's announce is heard, `.mesh info` shows it under `propagation_nodes`. Selection is nearest by hops;
-pinning a specific node is not supported yet, and `.mesh info` prints that line itself.
+Once the node's announce is heard, `.mesh config show` shows it under `propagation_nodes`. Selection is nearest by hops;
+pinning a specific node is not supported yet, and `.mesh config show` prints that line itself.
 
 Deployment recipes and the trust model are in the wiki:
 [Mesh Deployment](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment) and

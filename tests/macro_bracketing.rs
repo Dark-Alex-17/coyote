@@ -347,7 +347,7 @@ fn literal_mesh_step_is_refused_at_load_and_closes_the_bracket() {
     let _cleanup = TempDirGuard(dir.clone());
     write_fixture(
         &dir,
-        "steps:\n  - \".set temperature 0.5\"\n  - \".mesh trust abc\"\n",
+        "steps:\n  - \".set temperature 0.5\"\n  - \".mesh access trust abc\"\n",
     );
 
     let output = run_coyote(&dir, &["--agent", "probe-macro", "--macro", "probe"]);
@@ -360,7 +360,7 @@ fn literal_mesh_step_is_refused_at_load_and_closes_the_bracket() {
         output.status
     );
     assert!(
-        stderr.contains(".mesh trust abc") && stderr.contains("step 2"),
+        stderr.contains(".mesh access trust abc") && stderr.contains("step 2"),
         "stderr: {stderr}"
     );
     assert!(stderr.contains("refused at load"), "stderr: {stderr}");
@@ -384,7 +384,7 @@ fn bare_macro_route_refuses_literal_mesh_step_before_the_first_step_runs() {
     let step_ran = step_yaml(&step_marker_command("STEP_RAN", &dir));
     write_fixture(
         &dir,
-        &format!("steps:\n{step_ran}  - \".mesh trust abc\"\n"),
+        &format!("steps:\n{step_ran}  - \".mesh access trust abc\"\n"),
     );
 
     let output = run_coyote(&dir, &["--macro", "probe"]);
@@ -405,7 +405,7 @@ fn bare_macro_route_refuses_literal_mesh_step_before_the_first_step_runs() {
         "refusal must name the file path\nstderr: {stderr}"
     );
     assert!(
-        stderr.contains("step 2 '.mesh trust abc'"),
+        stderr.contains("step 2 '.mesh access trust abc'"),
         "refusal must name the 1-based step index and text\nstderr: {stderr}"
     );
     assert!(

@@ -660,18 +660,18 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         "root README must not still say fetch-back is not yet wired up"
     );
     assert!(
-        root.contains("`.mesh sync`"),
-        "root README must name `.mesh sync` as the manual fetch verb"
+        root.contains("`.mesh messaging sync`"),
+        "root README must name `.mesh messaging sync` as the manual fetch verb"
     );
-    // A file verb named `fetch` may also appear here; only the sync sentence is checked.
+    // The file verb `files fetch` may also appear here; only the sync sentence is checked.
     for withdrawn in [
-        "on demand with `.mesh fetch`",
-        "(`.mesh fetch` still works)",
-        "fetch only on `.mesh fetch`",
+        "on demand with `.mesh files fetch`",
+        "(`.mesh files fetch` still works)",
+        "fetch only on `.mesh files fetch`",
     ] {
         assert!(
             !root.contains(withdrawn),
-            "root README must not name the withdrawn `.mesh fetch` verb as the manual fetch: {withdrawn}"
+            "root README must not name the file verb `.mesh files fetch` as the manual fetch: {withdrawn}"
         );
     }
     let readme = one_line(&read(deployment_dir().join("README.md")));
@@ -699,7 +699,7 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
     );
     assert!(
         readme.contains(&format!(
-            "Coyote keeps the propagation nodes it heard within the last day in `mesh/propagation-nodes.json` under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote that has not heard the node within the last day waits for the node's next announce (up to `announce_interval`, {interval} minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
+            "Coyote keeps the propagation nodes it heard within the last day in `mesh/propagation-nodes.json` under its cache directory, so a restarted Coyote can fetch from the node it used before without waiting for an announce; a Coyote that has not heard the node within the last day waits for the node's next announce (up to `announce_interval`, {interval} minutes with the shipped `lxmd.config`; `.mesh messaging sync` is refused until then too)"
         )),
         "deployment README must say the node table survives a restart and how long a first fetch can wait"
     );
@@ -716,8 +716,9 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         "deployment README must say why the interval is over an hour"
     );
     assert!(
-        readme
-            .contains("A `.mesh knock` to an unreachable peer is parked on the node the same way"),
+        readme.contains(
+            "A `.mesh access ask` to an unreachable peer is parked on the node the same way"
+        ),
         "deployment README must say a knock to an unreachable peer is held by the node too"
     );
     assert!(
@@ -730,19 +731,19 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         !readme.contains("Fetching held messages back is not yet triggered"),
         "deployment README must not still say fetch-back is not yet triggered"
     );
-    // A file verb named `fetch` may also appear here; only the sync sentences are checked.
+    // The file verb `files fetch` may also appear here; only the sync sentences are checked.
     assert!(
-        readme.contains("`.mesh sync` runs a fetch now"),
-        "deployment README must name `.mesh sync` as the manual fetch verb"
+        readme.contains("`.mesh messaging sync` runs a fetch now"),
+        "deployment README must name `.mesh messaging sync` as the manual fetch verb"
     );
     for withdrawn in [
-        "`.mesh fetch` runs a fetch now",
-        "`.mesh fetch` is refused",
-        "`.mesh fetch` does",
+        "`.mesh files fetch` runs a fetch now",
+        "`.mesh files fetch` is refused",
+        "`.mesh files fetch` does",
     ] {
         assert!(
             !readme.contains(withdrawn),
-            "deployment README must not name the withdrawn `.mesh fetch` verb as the manual fetch: {withdrawn}"
+            "deployment README must not name the file verb `.mesh files fetch` as the manual fetch: {withdrawn}"
         );
     }
 }

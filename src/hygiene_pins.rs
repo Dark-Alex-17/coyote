@@ -1362,22 +1362,6 @@ const UNDISPATCHED_MESH_PATHS: &[(&str, &str)] = &[
 /// rather than starting a path.
 const MESH_NAME_IN_PROSE: &[&str] = &["command"];
 
-/// Files that still spell `.mesh` paths from before the commands were grouped, each with
-/// the exact number of such paths its string literals hold. This list only ever shrinks:
-/// a count that goes up or down fails the pin, so a rewrite lowers the number by hand and
-/// a file comes off once it reaches zero. The list is empty once every file names the
-/// grouped paths, and `src/repl/mesh.rs` never belongs here.
-const STALE_MESH_PATH_FILES: &[(&str, usize)] = &[
-    ("src/config/macro_policy.rs", 5),
-    ("src/config/macros.rs", 28),
-    ("src/render/markdown.rs", 2),
-    ("src/render/mod.rs", 14),
-    ("tests/macro_bracketing.rs", 4),
-    ("tests/propagation_node_image.rs", 14),
-];
-
-const MESH_TABLE_FILE: &str = "src/repl/mesh.rs";
-
 fn is_mesh_group(word: &str) -> bool {
     crate::repl::mesh::GROUPS
         .iter()
@@ -1488,18 +1472,8 @@ fn mesh_table_dispatches_groups_their_verbs_and_top_level_verbs_only() {
 /// would answer with the unknown-command error.
 #[test]
 fn every_mesh_path_a_string_literal_spells_is_dispatched() {
-    assert!(
-        !STALE_MESH_PATH_FILES
-            .iter()
-            .any(|(file, _)| *file == MESH_TABLE_FILE),
-        "{MESH_TABLE_FILE} carries the table and may not hold a stale path"
-    );
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut hits = Vec::new();
-    let mut stale: BTreeMap<&str, usize> = STALE_MESH_PATH_FILES
-        .iter()
-        .map(|(file, _)| (*file, 0))
-        .collect();
     let mut allowed_seen = BTreeSet::new();
     for file in tracked_paths(root) {
         if !(file.starts_with("src/") || file.starts_with("tests/")) || !file.ends_with(".rs") {
@@ -1517,26 +1491,19 @@ fn every_mesh_path_a_string_literal_spells_is_dispatched() {
                     .find(|(listed, spelled)| *listed == file && *spelled == path)
                 {
                     allowed_seen.insert(*entry);
-                } else if let Some(count) = stale.get_mut(file.as_str()) {
-                    *count += 1;
                 } else {
                     hits.push(format!("{file}:{}: {sigil}mesh {path}", line + offset));
                 }
             }
         }
     }
-    let miscounted: Vec<String> = STALE_MESH_PATH_FILES
-        .iter()
-        .filter(|(file, listed)| *listed == 0 || stale[file] != *listed)
-        .map(|(file, listed)| format!("{file}: {} found, {listed} listed", stale[file]))
-        .collect();
     let unused: Vec<&(&str, &str)> = UNDISPATCHED_MESH_PATHS
         .iter()
         .filter(|entry| !allowed_seen.contains(*entry))
         .collect();
     assert!(
-        hits.is_empty() && miscounted.is_empty() && unused.is_empty(),
-        "{} path(s) the mesh command table does not dispatch:\n{}\nstale-path files whose count changed (lower the number, or drop a file at zero): {miscounted:?}\nallowed paths no literal spells: {unused:?}",
+        hits.is_empty() && unused.is_empty(),
+        "{} path(s) the mesh command table does not dispatch:\n{}\nallowed paths no literal spells: {unused:?}",
         hits.len(),
         hits.join("\n")
     );
