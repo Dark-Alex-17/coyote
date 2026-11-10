@@ -7525,8 +7525,11 @@ impl RequestContext {
             false,
             false,
             &self.app.config,
-            abort_signal,
-            RagSyncHooks::resolve(self),
+            RagInitRun {
+                abort_signal,
+                sync_hooks: RagSyncHooks::resolve(self),
+                prompter: self.prompter.as_ref(),
+            },
         )
         .await?;
         self.rag = Some(Arc::new(rag));
@@ -7562,8 +7565,11 @@ impl RequestContext {
             true,
             true,
             &self.app.config,
-            abort_signal,
-            RagSyncHooks::resolve(self),
+            RagInitRun {
+                abort_signal,
+                sync_hooks: RagSyncHooks::resolve(self),
+                prompter: self.prompter.as_ref(),
+            },
         )
         .await?;
         self.rag = Some(Arc::new(rag));

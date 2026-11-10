@@ -25,7 +25,6 @@ use bm25::{Language, SearchEngine, SearchEngineBuilder};
 use gman::SecretError;
 use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
-use inquire::Confirm;
 use parking_lot::RwLock;
 use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
@@ -136,9 +135,9 @@ pub struct GraphRagConfig {
     pub graph_hops: Option<usize>,
 }
 
-/// What the run lends a knowledge base build beyond its config: the
-/// signal that aborts it, the hooks it fires and the prompter for any
-/// setting left open.
+/// What the run lends a knowledge base build or refresh beyond its
+/// config: the signal that aborts it, the hooks it fires and the prompter
+/// for any setting left open.
 pub struct RagInitRun<'a> {
     pub abort_signal: AbortSignal,
     pub sync_hooks: RagSyncHooks,
@@ -174,7 +173,7 @@ impl Rag {
         let (spinner, spinner_rx) = Spinner::create("");
         sync_hooks.fire_started(&rag.name, &rag.path);
         let synced = abortable_run_with_spinner_rx(
-            rag.sync_documents(doc_paths, true, false, loaders, Some(spinner)),
+            rag.sync_documents(doc_paths, true, false, loaders, Some(spinner), prompter),
             spinner_rx,
             abort_signal,
             UserInterrupt::Owned,
@@ -351,7 +350,7 @@ impl Rag {
         let (spinner, spinner_rx) = Spinner::create("");
         sync_hooks.fire_started(&rag.name, &rag.path);
         let synced = abortable_run_with_spinner_rx(
-            rag.sync_documents(&paths, true, false, loaders, Some(spinner)),
+            rag.sync_documents(&paths, true, false, loaders, Some(spinner), prompter),
             spinner_rx,
             abort_signal,
             UserInterrupt::Owned,
@@ -663,9 +662,13 @@ impl Rag {
         refresh: bool,
         force_reingest: bool,
         app: &AppConfig,
-        abort_signal: AbortSignal,
-        sync_hooks: RagSyncHooks,
+        run: RagInitRun<'_>,
     ) -> Result<()> {
+        let RagInitRun {
+            abort_signal,
+            sync_hooks,
+            prompter,
+        } = run;
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         sync_hooks.fire_started(&self.name, &self.path);
@@ -676,6 +679,7 @@ impl Rag {
                 force_reingest,
                 loaders,
                 Some(spinner),
+                prompter,
             ),
             spinner_rx,
             abort_signal,
@@ -986,6 +990,7 @@ impl Rag {
         force_reingest: bool,
         loaders: HashMap<String, String>,
         spinner: Option<Spinner>,
+        prompter: &dyn Prompter,
     ) -> Result<()> {
         debug_assert!(
             !force_reingest || refresh,
@@ -1090,22 +1095,16 @@ impl Rag {
 
         if has_error {
             let mut aborted = true;
-            // The full-screen UI cannot ask whether to go on without the
-            // failed documents; the answer is the non-interactive one.
-            if *IS_STDOUT_TERMINAL && total > 0 && !crate::tui::active() {
-                let ans = Confirm::new("Some documents failed to load. Continue?")
-                    .with_default(false)
-                    .prompt()?;
+            if menu_can_use_terminal() && total > 0 {
+                let ans = confirm(
+                    prompter,
+                    "Some documents failed to load. Continue?".to_string(),
+                    false,
+                )?;
                 aborted = !ans;
             }
             if aborted {
-                if crate::tui::active() {
-                    bail!(
-                        "Aborted: some documents failed to load. {} to choose whether to continue without them.",
-                        crate::config::conflict::rerun_hint()
-                    );
-                }
-                bail!("Aborted");
+                bail!("Aborted: some documents failed to load");
             }
         }
 
@@ -2678,8 +2677,11 @@ mod tests {
             false,
             false,
             &AppConfig::default(),
-            create_abort_signal(),
-            sync_hooks,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks,
+                prompter: &ScriptedPrompter::refusing(),
+            },
         )
         .await
         .unwrap();
@@ -2725,8 +2727,11 @@ mod tests {
                 false,
                 false,
                 &AppConfig::default(),
-                create_abort_signal(),
-                sync_hooks,
+                RagInitRun {
+                    abort_signal: create_abort_signal(),
+                    sync_hooks,
+                    prompter: &ScriptedPrompter::refusing(),
+                },
             )
             .await;
 
@@ -3018,23 +3023,31 @@ mod tests {
         assert_eq!(sources, "- notes.txt");
     }
 
-    /// A sync with a document that fails to load asks whether to go on
-    /// without it in the REPL; under the full-screen UI there is no one to
-    /// ask, so the sync is aborted with the question's way out named and
-    /// no prompt is built.
-    #[tokio::test]
-    #[serial]
-    async fn a_failed_document_aborts_the_sync_under_the_tui_without_asking() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
-        let dir = TempDir::new("sync-tui-failed-doc");
+    /// A knowledge base whose only document is routed through a loader
+    /// that always fails, so every sync of it has a failed document.
+    fn rag_with_a_failing_document(
+        tag: &str,
+    ) -> (TempDir, Rag, Vec<String>, HashMap<String, String>) {
+        let dir = TempDir::new(tag);
         let doc = dir.path.join("doc.broken");
         std::fs::write(&doc, "body").unwrap();
-        let rag_path = dir.path.join("kb.yaml");
-        let mut rag = yaml_rag("kb", &rag_path, buildable_data());
+        let rag = yaml_rag("kb", &dir.path.join("kb.yaml"), buildable_data());
         let loaders = HashMap::from([("broken".to_string(), "false $1".to_string())]);
+        (dir, rag, vec![doc.display().to_string()], loaders)
+    }
+
+    /// A sync with a document that fails to load asks whether to go on
+    /// without it through the prompter, so the full-screen UI shows the
+    /// question in its modal; declining aborts the sync.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_document_under_the_tui_asks_whether_to_continue_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (_dir, mut rag, paths, loaders) = rag_with_a_failing_document("sync-tui-failed-doc");
+        let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
 
         let err = rag
-            .sync_documents(&[doc.display().to_string()], true, false, loaders, None)
+            .sync_documents(&paths, true, false, loaders, None, &declined)
             .await
             .unwrap_err();
 
@@ -3043,7 +3056,66 @@ mod tests {
             text.starts_with("Aborted: some documents failed to load"),
             "{text}"
         );
-        assert!(text.contains("Re-run in the plain REPL"), "{text}");
+        assert!(!text.contains("Re-run"), "{text}");
+        let [req] = declined.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Some documents failed to load. Continue?");
+        assert_eq!(req.default, Some(json!(false)));
+    }
+
+    /// Agreeing to go on without the failed document carries the sync past
+    /// the question; with nothing left to index it fails on the empty
+    /// corpus rather than on the failed document.
+    #[tokio::test]
+    #[serial]
+    async fn continuing_past_a_failed_document_under_the_tui_goes_on_with_the_rest() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (_dir, mut rag, paths, loaders) =
+            rag_with_a_failing_document("sync-tui-failed-doc-continue");
+        let accepted = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+
+        let err = rag
+            .sync_documents(&paths, true, false, loaders, None, &accepted)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "No RAG files");
+        assert_eq!(accepted.requests().len(), 1);
+    }
+
+    /// With no human attached the question cannot be answered, and the
+    /// sync fails with the typed refusal rather than a silent abort.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_document_under_the_tui_without_a_human_is_a_needs_human_refusal() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (_dir, mut rag, paths, loaders) =
+            rag_with_a_failing_document("sync-tui-failed-doc-headless");
+
+        let err = rag
+            .sync_documents(&paths, true, false, loaders, None, &HeadlessPrompter)
+            .await
+            .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err}");
+    }
+
+    /// Without a terminal or the full-screen UI there is nowhere to show
+    /// the question, so the sync aborts without asking.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_document_without_a_tty_aborts_the_sync_without_asking() {
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let (_dir, mut rag, paths, loaders) = rag_with_a_failing_document("sync-no-tty-failed-doc");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = rag
+            .sync_documents(&paths, true, false, loaders, None, &prompter)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Aborted: some documents failed to load");
+        assert!(prompter.requests().is_empty());
     }
 
     fn text(value: &str) -> PromptAnswer {
