@@ -402,7 +402,7 @@ impl Agent {
                 // to ask declines it instead of failing.
                 ans = match confirm(
                     prompter.as_ref(),
-                    "The agent has documents attached, init RAG?".to_string(),
+                    "The agent has documents attached, init RAG?",
                     true,
                 ) {
                     Ok(answer) => answer,
@@ -2761,7 +2761,7 @@ nodes: {}
     #[serial_test::serial]
     async fn a_headless_run_with_documents_starts_without_rag_instead_of_failing() {
         let _guard = TestConfigDirGuard::new("agent-rag-headless");
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _script = crate::config::conflict::prompt_script::install(&[]);
         let name = unique("rag_headless");
         let agent_dir = paths::agent_data_dir(&name);
         create_dir_all(&agent_dir).unwrap();

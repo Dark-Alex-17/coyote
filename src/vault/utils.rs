@@ -164,7 +164,7 @@ pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) ->
     } else {
         let ans = confirm(
             prompter,
-            "No password file configured. Do you want to create one now?".to_string(),
+            "No password file configured. Do you want to create one now?",
             true,
         )?;
 

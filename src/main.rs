@@ -1056,7 +1056,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_oauth_client_asks_which_client_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _script = crate::config::conflict::prompt_script::install(&[]);
         let clients = [oauth_client("work"), oauth_client("home")];
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("home".into())]);
 
@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_oauth_client_with_no_human_is_refused() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _script = crate::config::conflict::prompt_script::install(&[]);
         let clients = [oauth_client("work"), oauth_client("home")];
 
         let err = resolve_oauth_client(None, &clients, &HeadlessPrompter)

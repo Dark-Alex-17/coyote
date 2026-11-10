@@ -1098,11 +1098,7 @@ impl Rag {
         if has_error {
             let mut aborted = true;
             if menu_can_use_terminal() {
-                let ans = confirm(
-                    prompter,
-                    "Some documents failed to load. Continue?".to_string(),
-                    false,
-                )?;
+                let ans = confirm(prompter, "Some documents failed to load. Continue?", false)?;
                 aborted = !ans;
             }
             if aborted {
@@ -2062,11 +2058,7 @@ fn ask_qdrant_host(prompter: &dyn Prompter) -> Result<String> {
 /// The vault secret name for the instance's API key, or `None` when the
 /// instance needs no key.
 fn ask_api_key_secret_name(prompter: &dyn Prompter) -> Result<Option<String>> {
-    let needs_key = confirm(
-        prompter,
-        "Does this instance require an API key?".to_string(),
-        true,
-    )?;
+    let needs_key = confirm(prompter, "Does this instance require an API key?", true)?;
     if !needs_key {
         return Ok(None);
     }
@@ -2101,7 +2093,7 @@ fn confirm_empty_collection(prompter: &dyn Prompter, collection: &str) -> Result
     println!("⚠️  {warning}");
     let attach_anyway = confirm_with_help(
         prompter,
-        "Attach to this empty collection anyway?".to_string(),
+        "Attach to this empty collection anyway?",
         false,
         &warning,
     )?;

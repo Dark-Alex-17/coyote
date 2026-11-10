@@ -1249,7 +1249,7 @@ pub(crate) fn parse_request(
             help: None,
             // The answer is mapped back to the raw option by index, so a
             // custom answer could never reach the tool: the select is closed.
-            closed: !raw_options.is_empty(),
+            closed: action == PromptAction::Select && !raw_options.is_empty(),
         },
         raw_options,
     })
@@ -1711,6 +1711,21 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             .req;
 
         assert!(req.options.is_empty());
+        assert!(!req.closed);
+    }
+
+    /// `closed` is a select's property; a checkbox with options is not
+    /// a closed select.
+    #[test]
+    fn parse_request_leaves_a_checkbox_with_options_open() {
+        let line = r#"{"coyote_prompt": {"id": "p1", "action": "checkbox", "question": "q", "options": ["a", "b"]}}"#;
+
+        let req = parse_request(line.as_bytes(), "t", None, None, Origin::detached())
+            .unwrap()
+            .req;
+
+        assert_eq!(req.action, PromptAction::Checkbox);
+        assert_eq!(req.options, vec!["a", "b"]);
         assert!(!req.closed);
     }
 

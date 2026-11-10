@@ -8976,7 +8976,7 @@ mod tests {
     fn every_direct_keyboard_reader_is_gated_or_accounted_for() {
         const BEFORE_UI: &str = "first-run config wizard; runs before any UI starts";
         const CLI_ONLY: &str = "a CLI flow (-e, --mcp); the process never reaches a UI";
-        const CLI_FLAGS: &str = "the CLI flag paths of main (--install, --update, --vault, ...); each returns before any UI starts";
+        const CLI_FLAGS: &str = "the CLI flag paths of main (--install, --update, --vault, ...) and install_builtins (Skip mode, never prompts); each returns before any UI starts";
         const REPL_PROMPTER: &str =
             "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
         const VIA_EDIT_GATE: &str = "calls edit_file, which lends the terminal under the TUI";
@@ -9142,7 +9142,7 @@ mod tests {
     /// the terminal: no spinner polls the keyboard, no stale-input drain
     /// toggles raw mode under the event stream, and no cursor query waits
     /// for a reply the event stream would take. The inquire prompter's
-    /// drain also skips confirms, so `y<Enter>` typed ahead of a tool
+    /// drain also skips tool approvals, so `y<Enter>` typed ahead of a tool
     /// approval still answers it.
     #[test]
     fn every_other_stdin_reader_checks_the_tui_flag() {
@@ -9158,7 +9158,9 @@ mod tests {
         let prompt = include_str!("../prompt/mod.rs");
         let prompter = fn_body(prompt, "impl Prompter for InquirePrompter");
         assert!(prompter.contains("drain_stale_tty_input()"));
-        assert!(prompter.contains("if req.action != PromptAction::Confirm {"));
+        assert!(
+            prompter.contains("if !(req.action == PromptAction::Confirm && req.tool.is_some()) {")
+        );
     }
 
     /// Registers a lender on its own thread that runs every job it is

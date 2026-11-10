@@ -268,7 +268,11 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
     Ok(answer)
 }
 
-pub(crate) fn confirm(prompter: &dyn Prompter, question: String, default: bool) -> Result<bool> {
+pub(crate) fn confirm(
+    prompter: &dyn Prompter,
+    question: impl Into<String>,
+    default: bool,
+) -> Result<bool> {
     let req = PromptRequest {
         default: Some(json!(default)),
         ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
@@ -281,7 +285,7 @@ pub(crate) fn confirm(prompter: &dyn Prompter, question: String, default: bool) 
 /// rides along as the request's help and the modal shows it as well.
 pub(crate) fn confirm_with_help(
     prompter: &dyn Prompter,
-    question: String,
+    question: impl Into<String>,
     default: bool,
     help: &str,
 ) -> Result<bool> {
@@ -431,9 +435,9 @@ impl Default for InquirePrompter {
 
 impl Prompter for InquirePrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
-        // A confirm keeps its type-ahead: `y<Enter>` sent before a tool
-        // approval appears must still answer it.
-        if req.action != PromptAction::Confirm {
+        // A tool approval keeps its type-ahead: `y<Enter>` sent before it
+        // appears must still answer it. Every other prompt drains first.
+        if !(req.action == PromptAction::Confirm && req.tool.is_some()) {
             crate::utils::drain_stale_tty_input();
         }
         let answer = match req.action {
@@ -1086,15 +1090,7 @@ mod tests {
     #[serial]
     fn confirm_with_help_carries_the_printed_context_as_help() {
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
-        assert!(
-            confirm_with_help(
-                &prompter,
-                "Continue? pm-ch1".to_string(),
-                false,
-                "WARNING: body"
-            )
-            .unwrap()
-        );
+        assert!(confirm_with_help(&prompter, "Continue? pm-ch1", false, "WARNING: body").unwrap());
         let [req] = prompter.requests().try_into().unwrap();
         assert_eq!(req.action, PromptAction::Confirm);
         assert_eq!(req.question, "Continue? pm-ch1");

@@ -617,7 +617,7 @@ fn confirm_asset_overwrite(
         ),
     };
     println!("{} {body}", warning_text("WARNING:"));
-    crate::prompt::confirm_with_help(prompter, "Continue?".to_string(), false, &body)
+    crate::prompt::confirm_with_help(prompter, "Continue?", false, &body)
 }
 
 pub fn default_sessions_dir() -> PathBuf {

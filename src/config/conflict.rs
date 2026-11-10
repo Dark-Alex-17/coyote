@@ -350,27 +350,23 @@ mod tests {
     #[test]
     #[serial]
     fn menu_can_use_terminal_is_true_under_the_tui_whatever_the_tty() {
+        let _script = prompt_script::install_non_interactive();
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         assert!(menu_can_use_terminal());
 
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
-        assert_eq!(menu_can_use_terminal(), *IS_STDOUT_TERMINAL);
+        assert!(!menu_can_use_terminal());
     }
 
-    /// The refusal has one shape whether or not the full-screen UI is up:
-    /// every menu it can reach asks through the prompter, so the UI is
-    /// never what stands in the way.
+    /// The refusal has one shape; only the action and the remedy vary.
     #[test]
-    #[serial]
     fn the_refusal_names_the_action_and_where_to_re_run() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let err = refuse_non_interactive("overwrite local file", " or pass --force.");
         assert_eq!(
             err.to_string(),
             "Refusing to overwrite local file non-interactively. Re-run in a terminal or pass --force."
         );
 
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let err = refuse_non_interactive("pick a bundle", ".");
         assert_eq!(
             err.to_string(),
