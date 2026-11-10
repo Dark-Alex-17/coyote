@@ -26,7 +26,9 @@ use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
-use crate::prompt::{PromptAction, PromptRequest, Prompter, ask, human_present};
+use crate::prompt::{
+    NeedsHuman, PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present,
+};
 use crate::rag::{RagInitConfig, RagInitRun};
 use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
@@ -407,7 +409,13 @@ impl Agent {
                         Origin::detached(),
                     )
                 };
-                ans = ask(prompter.as_ref(), req)?.into_confirmed()?;
+                // The knowledge base is optional, so a run with no human
+                // to ask declines it instead of failing.
+                ans = match ask(prompter.as_ref(), req).and_then(PromptAnswer::into_confirmed) {
+                    Ok(answer) => answer,
+                    Err(e) if NeedsHuman::caused(&e) => false,
+                    Err(e) => return Err(e),
+                };
             }
             if ans {
                 let document_paths =
@@ -1629,7 +1637,7 @@ fn may_ask_human(interactive: bool, tty: bool) -> bool {
 mod tests {
     use super::*;
     use crate::config::conflict::prompt_script::Scripted;
-    use crate::prompt::{PromptAnswer, ScriptedPrompter};
+    use crate::prompt::{HeadlessPrompter, ScriptedPrompter};
     use crate::testing::{self, AtomicFlagGuard};
     use crate::utils::{ACP_SERVER, HEADLESS};
     use serial_test::serial;
@@ -2705,6 +2713,39 @@ nodes: {}
 
         assert!(agent.rag().is_none());
         assert!(prompter.requests().is_empty());
+    }
+
+    /// With no human attached the optional RAG question cannot be
+    /// answered; the agent starts without its knowledge base instead of
+    /// failing on the refusal.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_headless_run_with_documents_starts_without_rag_instead_of_failing() {
+        let _guard = TestConfigDirGuard::new("agent-rag-headless");
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let name = unique("rag_headless");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::new(HeadlessPrompter),
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_none());
     }
 
     /// A graph's rag node whose knowledge base is not built asks the same
