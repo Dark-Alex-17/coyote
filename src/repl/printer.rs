@@ -926,7 +926,8 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "envoy escalated to the human; {} asks: {kept}... is in the inbox (full text: .mesh messaging inbox)",
+                "envoy escalated to the human; {} / {} asks: {kept}... is in the inbox (full text: .mesh messaging inbox)",
+                "cd".repeat(4),
                 &instance[..8]
             )
         );
@@ -1000,7 +1001,7 @@ mod tests {
         assert_eq!(
             squeezed(&bodies(&rows, Source::Message.prefix()).join(" ")),
             squeezed(&format!(
-                "envoy escalated to the human; abababab asks: {}... is in the inbox (full text: .mesh messaging inbox)",
+                "envoy escalated to the human; cdcdcdcd / abababab asks: {}... is in the inbox (full text: .mesh messaging inbox)",
                 "q".repeat(160)
             ))
         );

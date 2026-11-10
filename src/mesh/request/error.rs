@@ -1,6 +1,6 @@
-use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::display_text;
 use crate::mesh::message::left_mesh_hint_when;
+use crate::mesh::people::WHO_MAX_CHARS;
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::short;
 
@@ -313,7 +313,7 @@ pub(crate) struct RemoteRefusal {
 }
 
 impl RemoteRefusal {
-    /// `display_name` is the peer's announced text as the table filed it.
+    /// `display_name` is how this node names the peer, `<user> / <session>`.
     pub(crate) fn new(
         destination: &str,
         display_name: Option<&str>,
@@ -321,7 +321,7 @@ impl RemoteRefusal {
     ) -> Self {
         Self {
             destination: destination.to_string(),
-            display_name: display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
+            display_name: display_name.and_then(|name| display_text(name, WHO_MAX_CHARS)),
             own_destination,
         }
     }

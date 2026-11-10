@@ -52,6 +52,7 @@ use crate::mesh::envoy_sessions::EnvoySessions;
 use crate::mesh::idle::plural;
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::pending::{InboundKind, InboundRecord};
+use crate::mesh::people::UNNAMED;
 use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{
     Decision, IdentityStanding, OverlayRecord, Rule, Tier, TrustRecord, Verdict, same_hash,
@@ -59,8 +60,8 @@ use crate::mesh::trust::{
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     AddressName, MeshPaths, MeshRuntime, MeshSlot, NameTarget, PeerRecord, age_text,
-    canonical_hash, capped_peer_text, display_text, owner_label, parse_rfc3339, redact_hashes,
-    rfc3339_utc, short,
+    canonical_hash, capped_peer_text, display_text, parse_rfc3339, peer_session_name,
+    redact_hashes, rfc3339_utc, short,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -405,15 +406,25 @@ enum TypedName {
 }
 
 impl DestinationCandidate {
-    /// Where the row sorts: your sessions, then your labels, then peers that announce a
-    /// name, then the rest.
+    /// Where the row sorts: your sessions, then the names you can type, then rows whose
+    /// user or session has a name, then the rest.
     fn group(&self) -> u8 {
-        match (&self.typed, &self.name) {
-            (Some(TypedName::Session(_)), _) => 0,
-            (Some(TypedName::Label(_)), _) => 1,
-            (None, Some(_)) => 2,
-            (None, None) => 3,
+        match &self.typed {
+            Some(TypedName::Session(_)) => 0,
+            Some(TypedName::Label(_)) => 1,
+            None if self.named() => 2,
+            None => 3,
         }
+    }
+
+    /// Whether the row's `<user> / <session>` carries a name rather than two short hashes.
+    fn named(&self) -> bool {
+        let user = match self.identity.as_str() {
+            "" => UNNAMED.to_string(),
+            identity => short(identity).to_ascii_lowercase(),
+        };
+        let fallback = format!("{user} / {}", short(&self.destination).to_ascii_lowercase());
+        self.name.as_deref().is_some_and(|name| name != fallback)
     }
 }
 
@@ -491,18 +502,12 @@ impl DestinationFilter {
     }
 }
 
-/// `{name or id8} . {dest8} . {trust} . {hops} hops . heard {age}`, a knocker's row ending
-/// ` . {intro}`; a record no cache has heard from has no hops and reads `heard never`. A
-/// deny without an identity falls back to the destination's own short hash for the name.
-/// A row with a name to type offers that name as its value and leads with it, one of
-/// your sessions marked `(you)` after it.
+/// `{user} / {session} . {dest8} . {trust} . {hops} hops . heard {age}`, a knocker's row
+/// ending ` . {intro}`; a record no cache has heard from has no hops and reads `heard
+/// never`. A row without a name falls back to the short hash of its identity, else of its
+/// destination. A row with a name to type offers that name as its value.
 fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>) {
-    let who = match &candidate.typed {
-        Some(TypedName::Session(session)) => Some(format!("{session} . (you)")),
-        Some(TypedName::Label(label)) => Some(label.clone()),
-        None => candidate.name.clone(),
-    }
-    .unwrap_or_else(|| {
+    let who = candidate.name.clone().unwrap_or_else(|| {
         let hash = if candidate.identity.is_empty() {
             &candidate.destination
         } else {
@@ -532,13 +537,13 @@ fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>)
 
 /// The name a row for `destination`, heard under `identity`, offers in place of its hash:
 /// your session running there when the row is under that session's identity, else the
-/// label `.mesh people list` shows for it. A name is offered only when it is
-/// one word that displays as spelled, is not itself a whole hash (which the verbs would
-/// take as given), is not a reserved word or flag the verbs would read as such (`clear`,
-/// anything starting `--`), and every name spelled the same stands for this destination,
-/// which is when the verbs resolve it here. Without `identity_labels` no name an identity label
-/// shares is offered: the `--peer` verbs read an identity label as the identity, a grant
-/// wider than the destination row it was picked from.
+/// session's own name; a user's name is never offered for one of their sessions. A name is
+/// offered only when it is one word that displays as spelled, is not itself a whole hash
+/// (which the verbs would take as given), is not a reserved word or flag the verbs would
+/// read as such (`clear`, anything starting `--`), and every name spelled the same stands
+/// for this destination, which is when the verbs resolve it here. Without
+/// `identity_labels` no name a user's name shares is offered: the `--peer` verbs read a
+/// user's name as the user, wider than the session row it was picked from.
 fn typed_name(
     names: &[AddressName],
     destination: &str,
@@ -557,8 +562,7 @@ fn typed_name(
                 .filter(|other| other.name.to_lowercase() == spelled)
                 .all(|other| {
                     other.target.destination() == Some(destination)
-                        && (identity_labels
-                            || !matches!(other.target, NameTarget::IdentityLabel { .. }))
+                        && (identity_labels || !matches!(other.target, NameTarget::User { .. }))
                 })
     };
     let session = names.iter().find(|name| {
@@ -570,7 +574,7 @@ fn typed_name(
     });
     match session {
         Some(session) => Some(TypedName::Session(session.name.clone())),
-        None => owner_label(names, destination)
+        None => peer_session_name(names, destination)
             .filter(|label| resolves_here(&label.name))
             .map(|label| TypedName::Label(label.name.clone())),
     }
@@ -740,6 +744,7 @@ fn collect_destination_rows(
     let (judged, rekeyed_verdicts) = verdicts.split_at(sightings.len());
     let mut rekeyed_verdicts = rekeyed_verdicts.iter();
     let names = runtime.address_names();
+    let namer = runtime.namer();
     let candidates: Vec<DestinationCandidate> = sightings
         .into_iter()
         .zip(sighted)
@@ -759,6 +764,8 @@ fn collect_destination_rows(
                 &candidate.identity,
                 filter.offers_identity_labels(),
             );
+            let identity = (!candidate.identity.is_empty()).then_some(candidate.identity.as_str());
+            candidate.name = Some(namer.who(identity, &candidate.destination).to_string());
             candidate
         })
         .filter(|candidate| filter.keep(candidate))
@@ -7287,8 +7294,7 @@ impl RequestContext {
         stamp: &str,
         question: &str,
     ) -> String {
-        let name =
-            crate::repl::mesh::name_at(self, &self.app.mesh.address_names(), destination, identity);
+        let name = self.app.mesh.who(identity, destination);
         let age = parse_rfc3339(stamp)
             .map(|then| age_text(now, then))
             .unwrap_or_default();
@@ -37300,9 +37306,9 @@ mod tests {
         fn label(name: &str, destination: &str) -> AddressName {
             AddressName {
                 name: name.to_string(),
-                target: NameTarget::DestinationLabel {
+                target: NameTarget::UserSession {
                     destination: destination.to_string(),
-                    identity: None,
+                    identity: hash(0x33),
                 },
             }
         }
@@ -37333,17 +37339,20 @@ mod tests {
             }
         }
 
-        /// Your sessions come first with their name as the value, then your labels, then
-        /// peers that announce a name, then the nameless, each group in the caches' order.
+        /// Your sessions come first with their name as the value, then the names you can
+        /// type, then rows whose user or session has a name, then the nameless, each group
+        /// in the caches' order; every row reads `<user> / <session>`.
         #[test]
         fn completion_rows_offer_sessions_then_labels_then_named_then_nameless() {
             let (temp, laptop, bea, bare) = (hash(0x11), hash(0x22), hash(0x33), hash(0x44));
             let names = vec![session("temp", &temp), label("maki-laptop", &laptop)];
+            let unnamed_bea = format!("{} / {}", short(&me()), short(&bea));
             let rows = ordered_rows(vec![
                 candidate(&bare, None, &names),
-                candidate(&bea, Some("Bea"), &names),
-                candidate(&laptop, Some("maki-laptop"), &names),
-                candidate(&temp, Some("Coyote"), &names),
+                candidate(&bea, Some(&unnamed_bea), &names),
+                candidate(&bea, Some("Bea / 33333333"), &names),
+                candidate(&laptop, Some("maki / maki-laptop"), &names),
+                candidate(&temp, Some("you / temp"), &names),
             ]);
             let described: Vec<String> = rows
                 .into_iter()
@@ -37352,11 +37361,12 @@ mod tests {
             assert_eq!(
                 described,
                 [
-                    "temp | temp . (you) . 11111111 . trusted . 1 hops . heard 3m ago".to_string(),
-                    "maki-laptop | maki-laptop . 22222222 . trusted . 1 hops . heard 3m ago"
+                    "temp | you / temp . 11111111 . trusted . 1 hops . heard 3m ago".to_string(),
+                    "maki-laptop | maki / maki-laptop . 22222222 . trusted . 1 hops . heard 3m ago"
                         .to_string(),
-                    format!("{bea} | Bea . 33333333 . trusted . 1 hops . heard 3m ago"),
+                    format!("{bea} | Bea / 33333333 . 33333333 . trusted . 1 hops . heard 3m ago"),
                     format!("{bare} | a1a1a1a1 . 44444444 . trusted . 1 hops . heard 3m ago"),
+                    format!("{bea} | {unnamed_bea} . 33333333 . trusted . 1 hops . heard 3m ago"),
                 ]
             );
         }
@@ -37399,21 +37409,20 @@ mod tests {
             assert_eq!(typed_name(&names, &temp, &hash(0xbb), true), None);
         }
 
-        /// An instance under both an identity label and a destination label offers the
-        /// destination label whichever the trust list holds first, as `.mesh people list` shows
-        /// it; where a verb reads an identity label as the identity, an identity label is
-        /// never a destination row's value.
+        /// A session offers its own name; a user's name is never a session row's value,
+        /// even for a user with one session, and where a verb reads a user's name as the
+        /// user a session name that user's name shares is not offered either.
         #[test]
-        fn the_destination_label_beats_the_identity_label_on_one_instance() {
+        fn the_session_name_beats_the_user_name_on_one_session() {
             let (laptop, maki) = (hash(0x22), hash(0x33));
-            let identity_label = |name: &str| AddressName {
+            let user = |name: &str| AddressName {
                 name: name.to_string(),
-                target: NameTarget::IdentityLabel {
+                target: NameTarget::User {
                     identity: maki.clone(),
-                    instances: vec![laptop.clone()],
+                    sessions: vec![laptop.clone()],
                 },
             };
-            let both = vec![identity_label("maki"), label("maki-laptop", &laptop)];
+            let both = vec![user("maki"), label("maki-laptop", &laptop)];
             for identity_labels in [true, false] {
                 assert_eq!(
                     typed_name(&both, &laptop, &maki, identity_labels),
@@ -37421,21 +37430,22 @@ mod tests {
                     "{identity_labels}"
                 );
             }
-            let only_identity = vec![identity_label("maki")];
+            let only_user = vec![user("maki")];
             assert_eq!(
-                typed_name(&only_identity, &laptop, &maki, true),
-                Some(TypedName::Label("maki".to_string()))
+                typed_name(&only_user, &laptop, &maki, true),
+                None,
+                "a user's name is never a session row's value, even with one session"
             );
-            assert_eq!(typed_name(&only_identity, &laptop, &maki, false), None);
+            assert_eq!(typed_name(&only_user, &laptop, &maki, false), None);
             assert_eq!(
                 typed_name(
-                    &[identity_label("maki-laptop"), label("maki-laptop", &laptop)],
+                    &[user("maki-laptop"), label("maki-laptop", &laptop)],
                     &laptop,
                     &maki,
                     false
                 ),
                 None,
-                "a destination label an identity label shares is read as the identity"
+                "a session name a user's name shares is read as the user"
             );
         }
 
@@ -37526,9 +37536,9 @@ mod tests {
         fn label(name: &str, destination: &str) -> AddressName {
             AddressName {
                 name: name.to_string(),
-                target: NameTarget::DestinationLabel {
+                target: NameTarget::UserSession {
                     destination: destination.to_string(),
-                    identity: None,
+                    identity: hash(0x33),
                 },
             }
         }
@@ -37991,6 +38001,7 @@ mod tests {
         let now = SystemTime::now();
         let provable = derived_sighting("rc-mesh-complete-tam", Some("Tam"));
         let trusted = provable.destination_hash.clone();
+        let tam_identity = provable.identity_hash.clone();
         let long_label = format!("Tam's desk {}", "l".repeat(DISPLAY_NAME_MAX_CHARS));
         let long_name = format!("Ann {}", "n".repeat(DISPLAY_NAME_MAX_CHARS));
         let named_peer = hex_lower(&[0xa1; 16]);
@@ -38039,7 +38050,7 @@ mod tests {
             )
             .unwrap();
         let peer_description = format!(
-            "{} . {} . untrusted . 2 hops . heard 2m ago",
+            "{} / {1} . {1} . untrusted . 2 hops . heard 2m ago",
             short(&named_identity),
             short(&named)
         );
@@ -38050,22 +38061,23 @@ mod tests {
                 (
                     trusted.clone(),
                     Some(format!(
-                        "{} . {} . trusted . 1 hops . heard 1m ago",
+                        "{} / {} . {} . trusted . 1 hops . heard 1m ago",
+                        short(&tam_identity),
                         &long_label[..DISPLAY_NAME_MAX_CHARS],
                         short(&trusted)
                     ))
                 ),
+                (named.clone(), Some(peer_description.clone())),
                 (
                     named_peer.clone(),
                     Some(format!(
-                        "{} . {} . untrusted . 3 hops . heard 10m ago",
-                        &long_name[..DISPLAY_NAME_MAX_CHARS],
+                        "{} / {1} . {1} . untrusted . 3 hops . heard 10m ago",
+                        short(&named_peer_identity),
                         short(&named_peer)
                     ))
                 ),
-                (named.clone(), Some(peer_description.clone())),
             ],
-            "peer rows read `{{label or name or id8}} . {{dest8}} . {{trust}} . N hops . heard {{age}}`, the named most recently seen first, then the nameless, the label and the name cut to the display cap"
+            "peer rows read `{{user}} / {{session}} . {{dest8}} . {{trust}} . N hops . heard {{age}}`, the named most recently seen first, then the nameless, a name cut to the display cap; an announced name is not a name"
         );
         let knock = ctx.repl_complete(".mesh", &["access", "ask", ""], "");
         assert_eq!(
@@ -38154,7 +38166,8 @@ mod tests {
         let kim_row = (
             kim.clone(),
             Some(format!(
-                "Kim . {} . untrusted . 1 hops . heard 5m ago . {}",
+                "{} / {1} . {1} . untrusted . 1 hops . heard 5m ago . {2}",
+                short(&hex_lower(&[0xde; 16])),
                 short(&kim),
                 &long_intro[..DISPLAY_NAME_MAX_CHARS]
             )),
@@ -38162,8 +38175,9 @@ mod tests {
         let bare_row = (
             bare.clone(),
             Some(format!(
-                "{} . {} . untrusted . 1 hops . heard 5m ago . let me in",
+                "{} / {} . {} . untrusted . 1 hops . heard 5m ago . let me in",
                 short(&bare_identity),
+                short(&bare),
                 short(&bare)
             )),
         );
@@ -38172,9 +38186,9 @@ mod tests {
             [
                 before[0].clone(),
                 before[1].clone(),
-                kim_row,
                 before[2].clone(),
                 bare_row,
+                kim_row,
             ],
             "`info` offers the named rows before the nameless ones, the peer table before the knockers within each, in the same shape, a knocker's row ending with the intro cut to the display cap, a destination with four cached knocks once with its newest age, and the shared destination not again"
         );
@@ -38486,22 +38500,25 @@ mod tests {
         assert_eq!(
             completion_description(&trust, &fixture.trusted_destination),
             format!(
-                "Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                "{} / Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                short(&fixture.trusted_peer_identity),
                 short(&fixture.trusted_destination)
             ),
-            "the record's label leads over the announced name"
+            "the session's name leads, under its user; the announced name is not a name"
         );
         assert_eq!(
             completion_description(&trust, &fixture.heard_destination),
             format!(
-                "Cal . {} . untrusted . 1 hops . heard 2m ago",
+                "{} / {1} . {1} . untrusted . 1 hops . heard 2m ago",
+                short(&fixture.heard_identity),
                 short(&fixture.heard_destination)
             )
         );
         assert_eq!(
             completion_description(&trust, &fixture.refused_destination),
             format!(
-                "Eve . {} . blocked (instance) . 1 hops . heard 4m ago",
+                "{} / {1} . {1} . blocked (instance) . 1 hops . heard 4m ago",
+                short(&fixture.refused_peer_identity),
                 short(&fixture.refused_destination)
             ),
             "a blocked instance is offered, since `trust` lifts the block, and says so"
@@ -38509,7 +38526,8 @@ mod tests {
         assert_eq!(
             completion_description(&trust, &fixture.provable_knock.destination_hash),
             format!(
-                "Kim . {} . untrusted . 1 hops . heard 5m ago . let me in",
+                "{} / {1} . {1} . untrusted . 1 hops . heard 5m ago . let me in",
+                short(&fixture.provable_knock.identity_hash),
                 short(&fixture.provable_knock.destination_hash)
             ),
             "a knocker is described in the same shape, its intro trailing"
@@ -38527,7 +38545,16 @@ mod tests {
                     &unproven_destination
                 ),
                 format!(
-                    "Gus . {} . untrusted . 1 hops . heard 6m ago",
+                    "{} / {1} . {1} . untrusted . 1 hops . heard 6m ago",
+                    short(
+                        &fixture
+                            .started
+                            .runtime
+                            .peers()
+                            .get(&unproven_destination)
+                            .unwrap()
+                            .identity_hash
+                    ),
                     short(&unproven_destination)
                 ),
                 "`{verb}` needs no proof and shows the peer row, without the knock's intro"
@@ -38570,7 +38597,8 @@ mod tests {
                 &fixture.blocked_knock.destination_hash
             ),
             format!(
-                "Dov . {} . blocked (identity) . 1 hops . heard 3m ago",
+                "{} / {1} . {1} . blocked (identity) . 1 hops . heard 3m ago",
+                short(&fixture.blocked_knock.identity_hash),
                 short(&fixture.blocked_knock.destination_hash)
             )
         );
@@ -38808,8 +38836,12 @@ mod tests {
         let info = fixture.complete(&["people", "info", ""]);
         assert_eq!(
             completion_description(&info, &known),
-            format!("Bea . {} . known . 1 hops . heard 7m ago", short(&known)),
-            "the announced name leads, there being no record to label it"
+            format!(
+                "{} / {1} . {1} . known . 1 hops . heard 7m ago",
+                short(&fixture.trusted_peer_identity),
+                short(&known)
+            ),
+            "a session with no name reads its short hash under its user"
         );
         for (group, verb) in [("access", "ask"), ("access", "block"), ("access", "trust")] {
             assert_eq!(
@@ -38907,7 +38939,8 @@ mod tests {
         assert_eq!(
             description,
             format!(
-                "Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                "{} / Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                short(&fixture.trusted_peer_identity),
                 short(&fixture.trusted_destination)
             ),
             "the same row `trust` and `info` show for the instance"
@@ -38959,7 +38992,8 @@ mod tests {
         assert_eq!(
             completion_description(&unheard, &fixture.trusted_destination),
             format!(
-                "Bea Lab . {} . trusted . heard never",
+                "{} / Bea Lab . {} . trusted . heard never",
+                short(&fixture.trusted_peer_identity),
                 short(&fixture.trusted_destination)
             ),
             "no hops and `heard never` for a record no cache has heard from"
@@ -39075,11 +39109,11 @@ mod tests {
                 fixture.trusted_destination.as_str(),
                 fixture.heard_destination.as_str(),
                 fixture.legacy_destination.as_str(),
-                fixture.provable_knock.destination_hash.as_str(),
                 fixture.legacy_knock.destination_hash.as_str(),
+                fixture.provable_knock.destination_hash.as_str(),
                 "--identity ",
             ],
-            "named rows before nameless ones, each heard peers newest first, then knockers newest first, less the blocked instance and the blocked identity's, then the flag"
+            "named rows before nameless ones, each group in the caches' order, less the blocked instance and the blocked identity's, then the flag; a knocker's announced name is not a name"
         );
         assert!(
             !destinations
@@ -39102,11 +39136,12 @@ mod tests {
         assert_eq!(
             completion_description(&destinations, &fixture.legacy_knock.destination_hash),
             format!(
-                "{} . {} . untrusted . 1 hops . heard 4m ago",
+                "{} / {} . {} . untrusted . 1 hops . heard 4m ago",
                 short(&fixture.legacy_knock.identity_hash),
+                short(&fixture.legacy_knock.destination_hash),
                 short(&fixture.legacy_knock.destination_hash)
             ),
-            "a knocker without a name is named by its identity's short hash, and one without an intro ends at the age"
+            "a knocker without a name is named by both short hashes, and one without an intro ends at the age"
         );
 
         let block = fixture.complete(&["access", "block", "--identity", ""]);
@@ -39191,18 +39226,19 @@ mod tests {
         assert_eq!(
             completion_description(&destinations, &fixture.refused_destination),
             format!(
-                "Eve . {} . blocked (instance) . 1 hops . heard 4m ago",
+                "{} / {1} . {1} . blocked (instance) . 1 hops . heard 4m ago",
+                short(&fixture.refused_peer_identity),
                 short(&fixture.refused_destination)
             )
         );
         assert_eq!(
             completion_description(&destinations, &unheard),
             format!(
-                "{} . {} . blocked (instance) . heard never",
+                "unnamed / {} . {} . blocked (instance) . heard never",
                 short(&unheard),
                 short(&unheard)
             ),
-            "with no identity to name it by, the destination's own short hash leads"
+            "with no identity to name it by, the user reads `unnamed` and the session its short hash"
         );
 
         let unblock = fixture.complete(&["access", "unblock", "--identity", ""]);
@@ -39289,10 +39325,11 @@ mod tests {
         assert_eq!(
             completion_description(&unblock_rows, &dest),
             format!(
-                "Bea . {} . blocked (instance) . 1 hops . heard 1m ago",
+                "{} / Bea Lab . {} . blocked (instance) . 1 hops . heard 1m ago",
+                short(&identity),
                 short(&dest)
             ),
-            "the block took the record, and a blocked row names no identity to find the kept session name under, so the announced name leads"
+            "the block took the record, and the session keeps the name the people section holds for it"
         );
         assert_eq!(
             completion_values(&fixture.complete(&["access", "unblock", "--identity", ""])),
@@ -39325,7 +39362,8 @@ mod tests {
         assert_eq!(
             completion_description(&fixture.complete(&["access", "block", ""]), &dest),
             format!(
-                "Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                "{} / Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                short(&identity),
                 short(&dest)
             ),
             "`block` offers the lifted instance again, under the session name the block left in place"
@@ -39375,7 +39413,7 @@ mod tests {
         for (args, kept, offers_identities) in [
             (
                 &["people", "info", ""][..],
-                vec![bea, cal, dov, eve, fay, dov_knock, kim, bare],
+                vec![bea, cal, dov, eve, fay, dov_knock, bare, kim],
                 false,
             ),
             (&["people", "status", ""], vec![bea], false),
@@ -39385,7 +39423,7 @@ mod tests {
             (&["access", "revoke", ""], vec![bea], false),
             (
                 &["access", "block", ""],
-                vec![bea, cal, fay, kim, bare],
+                vec![bea, cal, fay, bare, kim],
                 false,
             ),
             (&["access", "unblock", ""], vec![eve], false),
@@ -39480,7 +39518,8 @@ mod tests {
         }
 
         let row = format!(
-            "Quin . {} . untrusted . 2 hops . heard 10m ago . newest",
+            "{} / {1} . {1} . untrusted . 2 hops . heard 10m ago . newest",
+            short(&identity),
             short(&destination)
         );
         for (group, verb) in [("access", "trust"), ("people", "info"), ("access", "block")] {
@@ -39562,7 +39601,8 @@ mod tests {
             assert_eq!(
                 completion_description(&rows, &destination),
                 format!(
-                    "Rae . {} . untrusted . 2 hops . heard 10m ago",
+                    "{} / {1} . {1} . untrusted . 2 hops . heard 10m ago",
+                    short(&identity),
                     short(&destination)
                 ),
                 "`{verb}` reads the newest knock"
@@ -39666,7 +39706,8 @@ mod tests {
         assert_eq!(
             completion_description(&block, &fixture.heard_destination),
             format!(
-                "Cal . {} . trusted . 1 hops . heard 2m ago",
+                "{} / {1} . {1} . trusted . 1 hops . heard 2m ago",
+                short(&fixture.heard_identity),
                 short(&fixture.heard_destination)
             ),
             "the identity-covered instance reads trusted"
@@ -39726,7 +39767,8 @@ mod tests {
                 &fixture.trusted_destination
             ),
             format!(
-                "Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                "{} / Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                short(&fixture.trusted_peer_identity),
                 short(&fixture.trusted_destination)
             ),
             "`block` is the verb that stops serving the one instance, and shows the record"
@@ -39866,6 +39908,7 @@ mod tests {
             ..derived_sighting("rc-mesh-complete-2-ann", Some("Ann"))
         };
         let heard = ann.destination_hash.clone();
+        let ann_identity = ann.identity_hash.clone();
         started.runtime.peers().observe(ann, now);
         for (group, verb) in [("people", "status"), ("messaging", "send")] {
             assert_eq!(
@@ -39896,7 +39939,8 @@ mod tests {
             let description = peer.1.as_deref().unwrap();
             assert!(
                 description.starts_with(&format!(
-                    "Ann . {} . trusted . 3 hops . heard ",
+                    "{} / {1} . {1} . trusted . 3 hops . heard ",
+                    short(&ann_identity),
                     short(&heard)
                 )),
                 "{verb}: the one row shape, whatever the verb: {description}"
@@ -39985,14 +40029,14 @@ mod tests {
         assert_eq!(parts[0], "p1", "{p1}");
         assert_eq!(
             parts[1],
-            format!("{asker8} ({asker8})"),
-            "an unheard asker is named by its short destination: {p1}"
+            format!("efefefef / {asker8} ({asker8})"),
+            "an unheard asker is named by its short hashes: {p1}"
         );
         assert!(parts[2].ends_with("s ago"), "a relative age: {p1}");
         assert_eq!(parts[3], "\"may I read the plan?\"", "{p1}");
         let q1 = describe("q1");
         assert!(
-            q1.starts_with(&format!("q1 . Ann ({}) . ", short(&heard))),
+            q1.starts_with(&format!("q1 . abababab / {0} ({0}) . ", short(&heard))),
             "a heard peer is named: {q1}"
         );
         assert!(q1.ends_with(" . \"what now?\""), "{q1}");
@@ -40522,7 +40566,8 @@ mod tests {
         assert_eq!(
             completion_description(&rows, &fixture.trusted_destination),
             format!(
-                "Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                "{} / Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                short(&fixture.trusted_peer_identity),
                 short(&fixture.trusted_destination)
             ),
             "the destination half is the shared row"
@@ -41850,7 +41895,8 @@ mod tests {
             build_card(None, None, None, None, None, &caps, SystemTime::now())
         };
         let untagged = format!(
-            "Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+            "{} / Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+            short(&fixture.trusted_peer_identity),
             short(&trusted)
         );
         runtime
@@ -41862,7 +41908,11 @@ mod tests {
                 SystemTime::now(),
             )
             .unwrap();
-        let second_untagged = format!("Cal . {} . trusted . 1 hops . heard 2m ago", short(&second));
+        let second_untagged = format!(
+            "{} / {1} . {1} . trusted . 1 hops . heard 2m ago",
+            short(&fixture.heard_identity),
+            short(&second)
+        );
 
         let fresh = fixture.complete(&["files", "fetch", ""]);
         assert_eq!(

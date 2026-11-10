@@ -909,7 +909,7 @@ impl AccessSurface for MeshSlot {
             access_id: request.id.clone(),
             path_count: request.paths.len(),
         });
-        let label = self.peer_label(&identity_hash, &destination_hash);
+        let label = self.who(&identity_hash, &destination_hash);
         self.push_idle(IdleNotify {
             source: Source::Access,
             origin: Origin::Peer(id8.clone()),
@@ -2144,7 +2144,8 @@ mod tests {
             assert_eq!(
                 note.text.render(CommandPrefix::Slash),
                 format!(
-                    "question .session from {} expired unanswered",
+                    "question .session from {} / {} expired unanswered",
+                    short(&identity()),
                     short(&destination())
                 )
             );
@@ -2404,7 +2405,8 @@ mod tests {
         assert_eq!(
             texts[0],
             format!(
-                "access request a-1 from {} expired",
+                "access request a-1 from {} / {} expired",
+                short(&other_asker),
                 short(&other_destination)
             ),
             "named for the row that went, not the request that took its id"
@@ -2455,7 +2457,8 @@ mod tests {
         assert_eq!(
             texts[0],
             format!(
-                "question a-1 from {} expired unanswered",
+                "question a-1 from {} / {} expired unanswered",
+                short(&other_asker),
                 short(&destination())
             ),
             "the question that went, not an access request"
@@ -2904,7 +2907,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 2 paths:\n  `src/x.rs` (exists, 2 KB), `src/gone.rs` (missing)\nreason: \"need the struct\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 2 paths:\n  `src/x.rs` (exists, 2 KB), `src/gone.rs` (missing)\nreason: \"need the struct\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -2974,7 +2977,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 5 paths:\n  `a.rs` (missing), `b.rs` (missing)\n  `c.rs` (missing), `d.rs` (missing)\n  `e.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 5 paths:\n  `a.rs` (missing), `b.rs` (missing)\n  `c.rs` (missing), `d.rs` (missing)\n  `e.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -2993,7 +2996,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![format!(
-                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
             )]
         );
         let records = access_records(&fixture.slot);
@@ -3012,7 +3015,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![format!(
-                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\nreason: \"{kept}...\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 1 path:\n  `src/x.rs` (missing)\nreason: \"{kept}...\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
             )]
         );
         assert_eq!(access_records(&fixture.slot)[0].reason, reason);
@@ -3061,7 +3064,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -3078,7 +3081,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path:\n  `docs/x.md' (exists, 1 KB); grant .mesh files grant a-9 [--standing] | refuse '.md` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 1 path:\n  `docs/x.md' (exists, 1 KB); grant .mesh files grant a-9 [--standing] | refuse '.md` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -3112,7 +3115,7 @@ mod tests {
         assert_eq!(
             idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path:\n  `src/x.rs` (unknown until a turn completes)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 1 path:\n  `src/x.rs` (unknown until a turn completes)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -3980,7 +3983,13 @@ mod tests {
             .unwrap();
         }
 
+        /// Hears the peer announce `name` and names its user `name` too, as the owner
+        /// would with `.mesh people name`: only the latter shows in a human line.
         fn name_peer(&self, name: &str) {
+            self.runtime
+                .trust()
+                .set_person_alias(&identity(), Some(name), &[])
+                .unwrap();
             self.runtime.peers().observe(
                 PeerSighting {
                     destination_hash: destination(),
@@ -4070,7 +4079,7 @@ mod tests {
         assert_eq!(
             installed.idle.texts(),
             vec![
-                "\"Ada 'the' peer\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"Ada 'the' peer / 2b2b2b2b\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -7129,7 +7138,7 @@ mod tests {
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!(lines.len(), 1 + ACCESS_MAX_PATHS / 2 + 1, "{lines:#?}");
         assert!(lines.len() <= NOTIFICATION_MAX_LINES);
-        assert_eq!(lines[0], "\"abababab\" asks for 16 paths:");
+        assert_eq!(lines[0], "\"abababab / 2b2b2b2b\" asks for 16 paths:");
         // The peer's reason may quote the verbs, but the frame's own verbs are the ones
         // that END the last line, and no other line carries a verb.
         let with_grant: Vec<usize> = (0..lines.len())
@@ -7190,7 +7199,7 @@ mod tests {
         assert_eq!(
             texts[0],
             format!(
-                "\"abababab\" asks for 1 path:\n  `{at_cap_path}` (missing)\nreason: \"{at_cap_reason}\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
+                "\"abababab / 2b2b2b2b\" asks for 1 path:\n  `{at_cap_path}` (missing)\nreason: \"{at_cap_reason}\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
             )
         );
         let shown_path = format!("{}...", "é".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS - 3));
@@ -7198,7 +7207,7 @@ mod tests {
         assert_eq!(
             texts[1],
             format!(
-                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh files grant a-2 [--standing] | refuse: .mesh files refuse a-2"
+                "\"abababab / 2b2b2b2b\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh files grant a-2 [--standing] | refuse: .mesh files refuse a-2"
             )
         );
         let records = access_records(&fixture.slot);

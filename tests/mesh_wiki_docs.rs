@@ -341,7 +341,7 @@ fn every_command_row_in_the_wiki_table_matches_the_repl_commands_table() {
     let commands = repl_commands();
     assert_eq!(
         commands.len(),
-        36,
+        37,
         "parsed {} COMMANDS rows from src/repl/mesh.rs; if the table grew, update this count",
         commands.len()
     );
@@ -555,7 +555,7 @@ fn every_flag_a_mesh_sample_spells_is_in_that_commands_usage() {
     );
     let fixture = "prose `.mesh files request bob a.md --reasons \"x\"` and `.mesh files request bob a.md --reason \"x; --yes\"`\n\
          ```text\n\
-         > .mesh access trust bob --label ci; then .mesh off --force (or --macro)\n\
+         > .mesh access trust bob --yes; then .mesh off --force (or --macro)\n\
          ```\n";
     let (hits, flagged) = unknown_flag_hits("fixture", fixture, &commands);
     assert_eq!(
@@ -2215,14 +2215,15 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
 /// the `state` cell after the age; the stale marker is the one `row_state` formats with
 /// the heartbeat count and the age-out derived from the constants; the superseded marker
 /// names, as `<dest8>`, the destination of a NEWER row in the same sample under the same
-/// identity (and the same name) at another destination, while the stale row has no such
-/// successor and the live rows carry no marker. A sample that showed a superseded row
-/// with no successor in view, or marked a row still announcing, would teach the rule wrong.
+/// user hash at another destination (both read from the `hashes` column), while the stale
+/// row has no such successor and the live rows carry no marker. A sample that showed a
+/// superseded row with no successor in view, or marked a row still announcing, would teach
+/// the rule wrong.
 /// The no-route marker is `NO_ROUTE_STATE` as the code holds it, in place of stale on a
 /// row of any age, and a row with a successor in view is superseded instead.
 /// A key-changed row keeps its `state` cell free of the remedy: that is a plain line
-/// between the table and the `N peer(s)` line, led by the `dest` of a row in the table,
-/// and the three legend lines still close the sample.
+/// between the table and the `N users and M sessions` line, led by the session hash of a
+/// row in the table, and the three legend lines still close the sample.
 #[test]
 fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     let period = const_u64("src/mesh/announce.rs", "HEARTBEAT_PERIOD_SECS");
@@ -2316,17 +2317,17 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         .nth(1)
         .and_then(|block| block.split("\n```").next())
         .expect("the `.mesh people list` section opens with a text sample");
-    let header = mesh_table_header("render_peers", "name", 7);
+    let header = mesh_table_header("render_peers", "user", 7);
     assert_eq!(
         header,
         [
-            "name",
-            "dest",
-            "identity",
+            "user",
+            "session",
             "trust",
             "hops",
             "last seen",
-            "state"
+            "state",
+            "hashes"
         ],
         "render_peers heads the table differently; update the sample and this test"
     );
@@ -2334,7 +2335,7 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     assert_eq!(table[0], header, "the sample's header:\n{sample}");
     for cells in &table[1..] {
         assert!(
-            !cells[6].contains("key changed"),
+            !cells[5].contains("key changed"),
             "the key-changed remedy is a line under the table, not a state cell: {sample}"
         );
     }
@@ -2345,8 +2346,8 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         .collect();
     let count_at = footer
         .iter()
-        .position(|line| line.contains(" peer(s). "))
-        .unwrap_or_else(|| panic!("the sample has no `N peer(s)` line:\n{sample}"));
+        .position(|line| line.contains(" sessions. A name a peer advertised is its own text"))
+        .unwrap_or_else(|| panic!("the sample has no `N users and M sessions` line:\n{sample}"));
     assert_eq!(
         footer.len() - count_at,
         4,
@@ -2371,7 +2372,9 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
             "a key-changed line is led by a dest8: {line:?}"
         );
         assert!(
-            table[1..].iter().any(|cells| cells[1] == dest8),
+            table[1..]
+                .iter()
+                .any(|cells| cells[6].ends_with(&format!(" / {dest8}"))),
             "the key-changed line's dest8 {dest8} is a row of the sample:\n{sample}"
         );
     }
@@ -2404,21 +2407,22 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     struct Row<'a> {
         dest: &'a str,
         identity: &'a str,
-        name: &'a str,
         age: &'a str,
         marker: Option<&'a str>,
     }
     let rows: Vec<Row> = table[1..]
         .iter()
         .map(|cells| {
-            let age = cells[5]
+            let age = cells[4]
                 .strip_suffix(" ago")
                 .unwrap_or_else(|| panic!("the age column reads `<age> ago`: {cells:?}"));
-            let marker = Some(cells[6].as_str()).filter(|state| !state.is_empty());
+            let marker = Some(cells[5].as_str()).filter(|state| !state.is_empty());
+            let (identity, dest) = cells[6].split_once(" / ").unwrap_or_else(|| {
+                panic!("the hashes column reads `<user8> / <session8>`: {cells:?}")
+            });
             Row {
-                name: &cells[0],
-                dest: &cells[1],
-                identity: &cells[2],
+                dest,
+                identity,
                 age,
                 marker,
             }
@@ -2446,10 +2450,10 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     let may_be_live = |age: &str| age_secs(age) < stale_window;
     for row in &rows {
         let successor = rows.iter().find(|other| {
-            other.identity == row.identity
+            may_be_stale(row.age)
+                && other.identity == row.identity
                 && other.dest != row.dest
                 && age_secs(other.age) < age_secs(row.age)
-                && (other.name == row.name || row.name == "(no name)" || other.name == "(no name)")
         });
         match row.marker {
             Some(marker) if marker.starts_with("(superseded by ") => {
@@ -2531,23 +2535,30 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     );
 }
 
-/// The `.mesh people list` sample names your session and a labelled peer the way
-/// `own_session_name` and `labelled_name` format them, and the "Names instead of hashes"
-/// bullet quotes the `Did you mean` ending `unknown_name` prints.
+/// The `.mesh people list` sample names your running and your ended session and a named
+/// user's named session the way the code does (`you` and the session name, ` (ended)`
+/// after an ended one, `<user> / <session>` everywhere else a peer is named), and the
+/// "Names instead of hashes" bullet quotes the `Did you mean` ending `unknown_name` prints.
 #[test]
 fn the_mesh_pages_name_sessions_and_labels_as_the_code_formats_them() {
-    let own = string_literals(&fn_body("src/repl/mesh.rs", "own_session_name"));
-    assert_eq!(
-        own,
-        ["(you: {session})"],
-        "own_session_name's format changed"
-    );
-    let labelled = string_literals(&fn_body("src/repl/mesh.rs", "labelled_name"));
+    let people = read(repo_root().join("src/mesh/people.rs"));
     assert!(
-        labelled
-            .iter()
-            .any(|literal| literal == "{label} ({announced})"),
-        "labelled_name's format changed: {labelled:?}"
+        people.contains("pub(crate) const YOU: &str = \"you\";"),
+        "the user part of your own sessions is no longer `you`"
+    );
+    assert!(
+        people.contains("write!(f, \"{} / {}\", self.user, self.session)"),
+        "Who no longer reads `<user> / <session>`"
+    );
+    assert_eq!(
+        string_literals(&fn_body("src/repl/mesh.rs", "own_session_name")),
+        Vec::<String>::new(),
+        "own_session_name no longer builds its text from Who alone"
+    );
+    let repl = read(repo_root().join("src/repl/mesh.rs"));
+    assert!(
+        repl.contains("const ENDED_SESSION_MARK: &str = \" (ended)\";"),
+        "an ended session of yours is no longer marked ` (ended)`"
     );
     let unknown = string_literals(&fn_body("src/repl/mesh.rs", "unknown_name"));
     let ask = unknown
@@ -2568,19 +2579,20 @@ fn the_mesh_pages_name_sessions_and_labels_as_the_code_formats_them() {
         .nth(1)
         .and_then(|block| block.split("\n```").next())
         .expect("the `.mesh people list` section opens with a text sample");
-    let names: Vec<String> = boxed_table("the `.mesh people list` sample", sample)[1..]
+    let names: Vec<(String, String)> = boxed_table("the `.mesh people list` sample", sample)[1..]
         .iter()
-        .map(|cells| cells[0].clone())
+        .map(|cells| (cells[0].clone(), cells[1].clone()))
         .collect();
-    for cell in [
-        own[0].replace("{session}", "temp"),
-        "{label} ({announced})"
-            .replace("{label}", "maki-laptop")
-            .replace("{announced}", "maki"),
+    for (user, session) in [
+        ("you", "test-session-2"),
+        ("you", "temp (ended)"),
+        ("Coworker A", "review"),
     ] {
         assert!(
-            names.contains(&cell),
-            "the `.mesh people list` sample has no {cell:?} row: {names:?}"
+            names
+                .iter()
+                .any(|(at_user, at_session)| at_user == user && at_session == session),
+            "the `.mesh people list` sample has no {user} / {session} row: {names:?}"
         );
     }
     let bullet = page
@@ -6832,10 +6844,8 @@ fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
     }
     let header = fn_body("src/repl/mesh.rs", "inbox_header");
     assert!(
-        header.contains(" . from ")
-            && header.contains(" . thread ")
-            && header.contains("this node -> "),
-        "inbox_header does not build the dot-separated peer header and the `this node -> ` header:\n{header}"
+        header.contains(" . from ") && header.contains(" . thread ") && header.contains("you -> "),
+        "inbox_header does not build the dot-separated peer header and the `you -> ` header:\n{header}"
     );
     let drain = fn_body("src/repl/mesh.rs", "drain_inbox");
     assert!(
@@ -6935,13 +6945,13 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("this node -> ") && line.contains(" . answering ")),
+            .any(|line| line.starts_with("you -> ") && line.contains(" . answering ")),
         "the `.mesh messaging inbox` sample has no block this node sent:\n{sample}"
     );
     let own_block: Vec<&str> = lines
         .iter()
         .copied()
-        .skip_while(|line| !line.starts_with("this node -> "))
+        .skip_while(|line| !line.starts_with("you -> "))
         .take_while(|line| !line.is_empty())
         .collect();
     assert!(
@@ -6949,7 +6959,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
             && !own_block
                 .iter()
                 .any(|line| line.contains("answered, awaiting collect")),
-        "the sample's `this node -> ` block answers this node's own question:\n{sample}"
+        "the sample's `you -> ` block answers this node's own question:\n{sample}"
     );
     let headers = lines
         .iter()
@@ -6969,13 +6979,13 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
 
     let prose = flat(&inbox);
     for needle in [
-        "`from <name> (<dest8>)`",
+        "`from <user> / <session> (<dest8>)`",
         "`thread <id8>`",
         "`reply to <id8>`",
         "`answering <id8>`",
         "`from_self: true`",
         "marked when this node files them",
-        "`this node -> <peer> (<dest8>)`",
+        "`you -> <user> / <session> (<dest8>)`",
         "you typed the answer with `.mesh envoy answer`",
         "`from unknown ()`",
         "continuation rows hanging under the label",
@@ -7000,10 +7010,10 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     for (page, needle) in [
         ("Mesh-File-Sharing.md", "file: <name> (<size> B) -> <path>"),
         ("Mesh-Platform-Support.md", " . from "),
-        ("Mesh-Platform-Support.md", "this node -> "),
+        ("Mesh-Platform-Support.md", "you -> "),
         ("Mesh-Platform-Support.md", "answering <id8>"),
         ("Mesh-Deployment.md", " . from "),
-        ("Mesh-Deployment.md", "this node -> "),
+        ("Mesh-Deployment.md", "you -> "),
         ("Mesh-Deployment.md", "answering <id8>"),
     ] {
         assert!(
@@ -7350,14 +7360,14 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let prose = flat(&pending);
     let mut needles = vec![
         "`<title>: none`".to_string(),
-        "`<name> (<dest8>)`".to_string(),
-        "the short destination standing in for the name when this node has never heard one"
+        "`.mesh people list`".to_string(),
+        "the short hashes standing in for a user or session with no name"
             .to_string(),
-        "`<dest8> (<dest8>)`".to_string(),
-        "`<name> (<dest8>) asked <age> . expires in <span> . id <id8>`".to_string(),
-        "`-> <name> (<dest8>) <age> . <state> . id <id8>`".to_string(),
+        "`<user8> / <dest8> (<dest8>)`".to_string(),
+        "`<user> / <session> (<dest8>) asked <age> . expires in <span> . id <id8>`".to_string(),
+        "`-> <user> / <session> (<dest8>) <age> . <state> . id <id8>`".to_string(),
         "`. peer left <age>`".to_string(),
-        "`[mesh:reply] <name> is back; your question from <age> is still open; .mesh messaging sent lists it`"
+        "`[mesh:reply] <user> / <session> is back; your question from <age> is still open; .mesh messaging sent lists it`"
             .to_string(),
         "`your <n> questions, the oldest from <age>, are still open; .mesh messaging sent lists them`"
             .to_string(),
@@ -7629,7 +7639,9 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         &[
             "dismiss_all_row(",
             "&record.id,",
-            "&ctx.app.mesh.peer_name_at(&record.peer_destination),",
+            "&ctx.app",
+            ".mesh",
+            ".who(&record.peer_identity, &record.peer_destination),",
             "&record.peer_destination,",
             "&asked,",
         ],
@@ -7785,7 +7797,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         &method_body("src/mesh/node.rs", "dismiss_inbound"),
         &[
             "Err(decline_not_told(",
-            "&self.peer_name_at(&record.peer_destination),",
+            "&self.who(&record.peer_identity, &record.peer_destination),",
             "id,",
             "&err,",
         ],
@@ -8131,18 +8143,22 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
 }
 
 /// What a pending-lists header shows for a peer this node has never heard: the name slot
-/// is filled by `peer_name_at`, which falls back to the short destination, so the header
-/// reads `<dest8> (<dest8>)` (as the pty and REPL probes pin) and never `unknown`. The
+/// is filled by `Namer::who`, which falls back to the short hashes, so the header reads
+/// `<user8> / <dest8> (<dest8>)` (as the pty and REPL probes pin) and never `unknown`. The
 /// Commands page's pending-lists prose must describe that fallback, not a word the
 /// renderer cannot print for an unheard peer.
 #[test]
 fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() {
-    // The fallback is the renderer's contract: `peer_name_at` never hands back an empty
-    // name, so `question_header` prints the name slot as given.
-    let name_at = method_body("src/mesh/node.rs", "peer_name_at");
+    // The fallback is the renderer's contract: `Namer::who` never hands back an empty
+    // part, so `question_header` prints the name slot as given.
+    let people = read(repo_root().join("src/mesh/people.rs"));
     assert!(
-        name_at.contains("short(destination)"),
-        "peer_name_at no longer falls back to the short destination:\n{name_at}"
+        people.contains(".unwrap_or_else(|| short(identity).to_ascii_lowercase())"),
+        "Namer::user no longer falls back to the short user hash"
+    );
+    assert!(
+        people.contains(".unwrap_or_else(|| short(destination).to_ascii_lowercase())"),
+        "Namer::session no longer falls back to the short destination"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -8165,7 +8181,7 @@ fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() 
         );
     }
     assert!(
-        prose.contains("short destination") || prose.contains("`<dest8> (<dest8>)`"),
+        prose.contains("short destination") || prose.contains("`<user8> / <dest8> (<dest8>)`"),
         "the pending-lists prose does not say an unheard peer is shown by its short \
          destination:\n{prose}"
     );
@@ -8180,7 +8196,7 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     let asked_by = string_literals(&fn_body("src/repl/mesh.rs", "asked_by"));
     for needle in [
         "asked by {}",
-        "asked by (you, gone: {session})",
+        "asked by {} (ended)",
         "asked by another session",
     ] {
         assert!(
@@ -8209,9 +8225,9 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     );
     let prose = flat(&pending);
     for needle in [
-        "asked by (you: temp) . collect it from that session",
-        "`asked by (you: <session>)`",
-        "`asked by (you, gone: <session>)`",
+        "asked by you / temp . collect it from that session",
+        "`asked by you / <session>`",
+        "`asked by you / <session> (ended)`",
         "`asked by another session`",
         "`collect it from that session`",
         "`.session <session>` and `.mesh on`",

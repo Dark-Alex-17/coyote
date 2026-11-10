@@ -2876,7 +2876,6 @@ impl TrustStore {
 
 /// The people section: display names that no access decision, knock or dispatch reads.
 /// Writing a name needs no running mesh and fires no trust event.
-#[cfg_attr(not(test), expect(dead_code))] // called once the people commands and display land
 impl TrustStore {
     /// Every person's and session's winning name, judged against `own_sessions`, the
     /// local session names this node's owner runs under.
@@ -2945,7 +2944,11 @@ impl TrustStore {
         }
         self.commit(&mut state, file, TrustMutation::Names { identity })
     }
+}
 
+/// What a peer's status card says it and its user are called.
+#[cfg_attr(not(test), expect(dead_code))] // called once trusted status cards carry names
+impl TrustStore {
     /// Keeps what a status card from the session at `destination_hash` of `identity_hash`
     /// says it and its person are called, each cleaned first. Each replaces the one an
     /// earlier card gave, and a field the card left out clears it. An owner's alias is
@@ -3622,20 +3625,38 @@ fn migrate_labels(file: &mut TrustFile) {
 }
 
 impl TrustFile {
-    /// The owner's alias of the person, as the trust listings label an identity record.
+    /// The name the person goes by in the people section, as the trust listings label an
+    /// identity record, as it was stored; a name hidden because it collides labels nothing.
     fn person_label(&self, identity: &str) -> Option<String> {
-        self.people.get(identity)?.alias.clone()
+        let entry = self.people.get(identity)?;
+        let alias = People::new(&self.people, &[]).person(identity)?.clone();
+        stored_label(&alias, entry.alias.as_deref(), entry.advertised.as_deref())
     }
 
-    /// The owner's alias of the session, as the trust listings label a destination record.
+    /// The same for a session, as the trust listings label a destination record.
     fn session_label(&self, identity: &str, destination: &str) -> Option<String> {
-        self.people
-            .get(identity)?
-            .sessions
-            .get(destination)?
-            .alias
-            .clone()
+        let names = self.people.get(identity)?.sessions.get(destination)?;
+        let alias = People::new(&self.people, &[])
+            .session(identity, destination)?
+            .clone();
+        stored_label(&alias, names.alias.as_deref(), names.advertised.as_deref())
     }
+}
+
+/// The stored text of the name that won, when it is shown at all.
+fn stored_label(
+    alias: &people::Alias,
+    owner: Option<&str>,
+    advertised: Option<&str>,
+) -> Option<String> {
+    if !alias.displayable() {
+        return None;
+    }
+    match alias.source {
+        people::AliasSource::Owner => owner,
+        people::AliasSource::Advertised => advertised,
+    }
+    .map(str::to_string)
 }
 
 fn upsert_overlay(
@@ -3734,6 +3755,13 @@ fn resolve_destination(
         name_hash: knock.name_hash,
         last_seen: knock.last_seen,
     })
+}
+
+/// Whether a peer row's destination re-derives from its identity column and name hash,
+/// which is what makes the identity the row's own rather than a claim. Silent: a row that
+/// fails is just not counted.
+pub(crate) fn row_derives(record: &PeerRecord) -> bool {
+    verified_identity(record).is_ok()
 }
 
 /// The identity column is data a peer sent; the derivation is what makes it the peer's own.
@@ -13553,8 +13581,7 @@ mod tests {
 
         /// Two labels an older file kept that read the same become two owner aliases
         /// that collide: both are kept, and the people view marks both hidden. The trust
-        /// listing's own record label still shows the stored text until the display
-        /// reads the people view.
+        /// listing reads the people view, so a hidden name labels no record.
         #[test]
         fn colliding_migrated_labels_are_kept_but_hidden() {
             let tmp = TempDir::new("trust-people-migrate-collide");
@@ -13592,7 +13619,16 @@ mod tests {
                 AliasUse::Hidden,
                 "a name reading as an own session is hidden too"
             );
-            assert_eq!(record(&store, &a).label.as_deref(), Some("Sam"));
+            assert_eq!(
+                record(&store, &a).label,
+                None,
+                "the trust listing reads the people view, so a hidden name labels nothing"
+            );
+            assert_eq!(
+                record(&store, &c).label.as_deref(),
+                Some("Kim"),
+                "a shown name labels its record as stored"
+            );
 
             store.set_person_alias(&c, Some("Kit"), &[]).unwrap();
             let file: TrustFile =

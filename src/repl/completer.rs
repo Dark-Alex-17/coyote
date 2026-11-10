@@ -408,7 +408,7 @@ mod prefix_tests {
             assert!(verbs.contains(&"trust ".to_string()), "{prefix}: {verbs:?}");
             let mut people = values(prefix, "/mesh people ");
             people.sort();
-            assert_eq!(people, ["info ", "list ", "status "], "{prefix}");
+            assert_eq!(people, ["info ", "list ", "name ", "status "], "{prefix}");
             // The argument stage is reached through the slash token too.
             let args: Vec<String> = values(prefix, "/mesh status ")
                 .into_iter()

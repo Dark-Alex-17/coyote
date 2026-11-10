@@ -400,6 +400,15 @@ fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
 // under `test_support` are only exercised on unix.
 #[cfg(unix)]
 pub(crate) mod network {
+    /// How a refusal names a peer nobody named: its short user and session hashes.
+    fn unnamed_who(identity: &str, destination: &str) -> String {
+        format!(
+            "{} / {}",
+            &identity[..8].to_ascii_lowercase(),
+            &destination[..8].to_ascii_lowercase()
+        )
+    }
+
     use super::super::dispatch::{
         ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
         KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MAX_FETCH_RESPONSE_BYTES,
@@ -9252,14 +9261,21 @@ pub(crate) mod network {
             err,
             StatusError::NotTrustedByPeer(RemoteRefusal::new(
                 &b_instance,
-                Some("Bea"),
+                Some(&unnamed_who(
+                    &pair.responder.desc.identity.address_hash.to_hex_string(),
+                    &b_instance
+                )),
                 a_instance.clone(),
             ))
         );
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                "\"{}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                unnamed_who(
+                    &pair.responder.desc.identity.address_hash.to_hex_string(),
+                    &b_instance
+                ),
                 short(&b_instance)
             )),
             "{text}"
@@ -9306,7 +9322,11 @@ pub(crate) mod network {
         pair.responder
             .adapter
             .set_handler(Arc::new(Dispatcher::new(trust, Arc::new(LoggingKnockSink))));
-        let expected = RemoteRefusal::new(&b_instance, Some("Bea"), a_instance.clone());
+        let b_who = unnamed_who(
+            &pair.responder.desc.identity.address_hash.to_hex_string(),
+            &b_instance,
+        );
+        let expected = RemoteRefusal::new(&b_instance, Some(&b_who), a_instance.clone());
 
         let listed = pair
             .node_a
@@ -9327,7 +9347,7 @@ pub(crate) mod network {
             let text = err.to_string();
             assert!(
                 text.starts_with(&format!(
-                    "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                    "\"{b_who}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
                     short(&b_instance)
                 )),
                 "{text}"
@@ -9624,8 +9644,12 @@ pub(crate) mod network {
             assert_eq!(lines[0].origin, Origin::Peer(b_identity[..8].to_string()));
             assert_eq!(
                 lines[0].text.plain(),
-                format!("{} says: hello from B", &b_instance[..8]),
-                "B never announced a name, so its instance names it"
+                format!(
+                    "{} / {} says: hello from B",
+                    &b_identity[..8],
+                    &b_instance[..8]
+                ),
+                "nobody named B, so its user and session read as their short hashes"
             );
         }
         pair.stop_node_a().await;
@@ -11543,14 +11567,21 @@ pub(crate) mod network {
             err,
             SendError::NotTrustedByPeer(RemoteRefusal::new(
                 &b_instance,
-                Some("Bea"),
+                Some(&unnamed_who(
+                    &pair.responder.desc.identity.address_hash.to_hex_string(),
+                    &b_instance
+                )),
                 a_instance.clone(),
             ))
         );
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                "\"{}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                unnamed_who(
+                    &pair.responder.desc.identity.address_hash.to_hex_string(),
+                    &b_instance
+                ),
                 short(&b_instance)
             )),
             "{text}"
@@ -13994,14 +14025,21 @@ pub(crate) mod network {
             err,
             AccessError::NotTrustedByPeer(RemoteRefusal::new(
                 &b_instance,
-                Some("Bea"),
+                Some(&unnamed_who(
+                    &pair.responder.desc.identity.address_hash.to_hex_string(),
+                    &b_instance
+                )),
                 a_instance.clone(),
             ))
         );
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                "\"{}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                unnamed_who(
+                    &pair.responder.desc.identity.address_hash.to_hex_string(),
+                    &b_instance
+                ),
                 short(&b_instance)
             )),
             "{text}"

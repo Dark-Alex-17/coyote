@@ -596,7 +596,7 @@ impl EnvoyRunner {
                     )
                     .await
                 {
-                    Ok(prepared) => self.drive(drive, prepared, &message, &card).await,
+                    Ok(prepared) => self.drive(drive, prepared, &message).await,
                     Err(_) if cancel.is_cancelled() => (EnvoyOutcome::Interrupted, false),
                     Err(outcome) => (outcome, false),
                 };
@@ -645,7 +645,7 @@ impl EnvoyRunner {
 
     fn peer_card(&self, message: &PeerMessage) -> PeerCard {
         PeerCard {
-            who: self.app.load().mesh.peer_name(message),
+            who: self.app.load().mesh.announced_name(message),
             instance: short(&message.source_destination).to_string(),
             verb: message.kind.verb(),
             message_id: message.message_id.clone(),
@@ -799,7 +799,6 @@ impl EnvoyRunner {
         drive: &EnvoyDrive,
         prepared: Prepared,
         message: &PeerMessage,
-        card: &PeerCard,
     ) -> (EnvoyOutcome, bool) {
         let Prepared {
             ctx,
@@ -878,7 +877,7 @@ impl EnvoyRunner {
                             Duration::from_secs(timeout_secs).min(bound.remaining)
                         });
                         if let Err(err) = self
-                            .escalate(message, card, request, hold, &mut hold_until, bound)
+                            .escalate(message, request, hold, &mut hold_until, bound)
                             .await
                         {
                             break EnvoyOutcome::Failed(err);
@@ -954,7 +953,6 @@ impl EnvoyRunner {
     async fn escalate(
         &self,
         message: &PeerMessage,
-        card: &PeerCard,
         request: EscalationRequest,
         hold: Option<Duration>,
         hold_until: &mut Option<Pin<Box<Sleep>>>,
@@ -1015,7 +1013,7 @@ impl EnvoyRunner {
         app.mesh.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
-            text: escalation_line(&card.who, question, &message.message_id),
+            text: escalation_line(&app.mesh.sender(message), question, &message.message_id),
             model_note: None,
         });
         if let Some(hold) = hold {
@@ -1024,7 +1022,7 @@ impl EnvoyRunner {
         // The asker's correlation is one-shot: a second `escalated` reply to the same
         // question would be refused on the far side, so only the first is sent.
         if bound.first {
-            self.tell_peer_escalated(&app, message, card, bound).await;
+            self.tell_peer_escalated(&app, message, bound).await;
         }
         Ok(())
     }
@@ -1038,7 +1036,6 @@ impl EnvoyRunner {
         &self,
         app: &AppState,
         message: &PeerMessage,
-        card: &PeerCard,
         bound: NoticeBound<'_>,
     ) {
         let unsent = match (app.mesh.get(), escalated_notice(message)) {
@@ -1081,7 +1078,7 @@ impl EnvoyRunner {
             origin: Origin::Peer(short(&message.source_identity).to_string()),
             text: NoticeText::default()
                 .frame("the envoy could not tell ")
-                .peer(card.who.as_str())
+                .peer(app.mesh.sender(message))
                 .frame(format!(
                     " its question was escalated: {why}; `.mesh envoy questions` still lists it for you to answer"
                 )),
@@ -1244,7 +1241,7 @@ impl EnvoyRunner {
                 origin: Origin::Peer(short(&message.source_identity).to_string()),
                 text: NoticeText::default()
                     .frame("the envoy's reply to ")
-                    .peer(card.who.as_str())
+                    .peer(app.mesh.sender(&message))
                     .frame(format!(" could not be sent: {why}"))
                     .then(retry),
                 model_note: None,
@@ -4210,7 +4207,8 @@ mod tests {
         assert_eq!(record.peer_destination, hex_lower(&[0xab; 16]));
         assert!(record.envoy_question.contains("Should we merge?"));
         let other_dest8 = short(&hex_lower(&[0xee; 16])).to_string();
-        let expiry = format!("question msg-x from {other_dest8} expired unanswered");
+        let other_id8 = short(&hex_lower(&[0xef; 16])).to_string();
+        let expiry = format!("question msg-x from {other_id8} / {other_dest8} expired unanswered");
         let pushed = idle.pushed.lock();
         let expired_at = pushed
             .iter()
@@ -4589,9 +4587,10 @@ mod tests {
             "only the admitted ask is counted"
         );
         let a8 = short(&a_hex);
+        let a_dest8 = short(&a_destination);
         assert_eq!(
             idle.count(&format!(
-                "{a8}: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this peer are folded for the hour"
+                "{a8} / {a_dest8}: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this peer are folded for the hour"
             )),
             1,
             "{:?}",
@@ -4627,7 +4626,7 @@ mod tests {
         );
         assert_eq!(
             idle.count(&format!(
-                "{a8}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+                "{a8} / {a_dest8}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
             )),
             1,
             "{:?}",
@@ -6240,9 +6239,11 @@ mod tests {
             "a later refusal in the same hour earns no second reply"
         );
         assert_eq!(
-            idle.count(
-                "Stub: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
-            ),
+            idle.count(&format!(
+                "{} / {}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                short(&identity),
+                short(&to)
+            )),
             1,
             "{:?}",
             idle.texts()
@@ -6434,8 +6435,13 @@ mod tests {
                 .context("Failed to call chat-completions api")
         }
 
-        fn sender8() -> String {
-            short(&hex_lower(&[0xab; 16])).to_string()
+        /// How the lines name the test message's sender: `<user8> / <session8>`.
+        fn sender_who() -> String {
+            format!(
+                "{} / {}",
+                short(&hex_lower(&[0xcd; 16])),
+                short(&hex_lower(&[0xab; 16]))
+            )
         }
 
         fn runner_failing_with(
@@ -6513,7 +6519,7 @@ mod tests {
                 line,
                 &format!(
                     "envoy declined (provider refusal: cyber); {} asks: how do I scan a port? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
-                    sender8()
+                    sender_who()
                 )
             );
             assert!(!idle.has("envoy failed"), "{texts:?}");
@@ -6550,7 +6556,7 @@ mod tests {
                 failed[0],
                 &format!(
                     "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
-                    sender8()
+                    sender_who()
                 )
             );
             assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
@@ -6584,7 +6590,7 @@ mod tests {
                 line,
                 &format!(
                     "envoy failed: the provider sent a reply the envoy could not read; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
-                    sender8()
+                    sender_who()
                 )
             );
             assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");

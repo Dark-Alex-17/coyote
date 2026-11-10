@@ -42,12 +42,13 @@ use crate::mesh::message::{
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
-    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
+    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerRecord, PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
     Correlations, InboundKind, InboundRecord, InboundStore, OtherSessionAsk, PendingRecord,
     PendingStore, access_not_a_question, other_sessions_asked,
 };
+use crate::mesh::people::{Namer, Who, YOU};
 use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
@@ -68,8 +69,8 @@ use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
-    Decision, InstancePresence, KeyChangeOutcome, SELF_TRUST_LABEL, Tier, TrustStore,
-    decode_name_hash, parse_hash,
+    Decision, InstancePresence, KeyChangeOutcome, Tier, TrustStore, decode_name_hash, parse_hash,
+    row_derives,
 };
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, hex_lower, identity,
@@ -630,7 +631,9 @@ struct CurrentIds {
 }
 
 /// A name the human `.mesh` verbs take in place of a hash: one of your running sessions,
-/// or a label you gave a grant in the trust list. Peers never supply these.
+/// `you`, or a user's or session's name from the people section that is shown and
+/// addressable. A name only ever resolves to a hash here; nothing sent on the wire
+/// carries one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddressName {
     pub name: String,
@@ -644,56 +647,55 @@ pub(crate) enum NameTarget {
         destination: String,
         identity: String,
     },
-    /// The label of a destination grant.
-    DestinationLabel {
-        destination: String,
-        identity: Option<String>,
-    },
-    /// The label of an identity grant, with every instance of that identity the peer
-    /// table holds, in hash order.
-    IdentityLabel {
+    /// A user, with every session of theirs the peer table proves is theirs (the
+    /// destination re-derives from the identity and the announced name hash), in hash
+    /// order; for `you`, your running sessions.
+    User {
         identity: String,
-        instances: Vec<String>,
+        sessions: Vec<String>,
+    },
+    /// One session of another user, by the name it goes by.
+    UserSession {
+        destination: String,
+        identity: String,
     },
 }
 
 impl NameTarget {
-    /// The one destination the name stands for: an identity label only stands for one
-    /// when the peer table holds exactly one instance of the identity.
+    /// The one destination the name stands for: a user only stands for one when exactly
+    /// one of their sessions is known.
     pub(crate) fn destination(&self) -> Option<&str> {
         match self {
-            Self::Session { destination, .. } | Self::DestinationLabel { destination, .. } => {
+            Self::Session { destination, .. } | Self::UserSession { destination, .. } => {
                 Some(destination)
             }
-            Self::IdentityLabel { instances, .. } => match instances.as_slice() {
+            Self::User { sessions, .. } => match sessions.as_slice() {
                 [only] => Some(only),
                 _ => None,
             },
         }
     }
+
+    /// The identity the name belongs to.
+    pub(crate) fn identity(&self) -> &str {
+        match self {
+            Self::Session { identity, .. }
+            | Self::User { identity, .. }
+            | Self::UserSession { identity, .. } => identity,
+        }
+    }
 }
 
-/// The label you gave `destination` in the trust list: the one on its own grant, else
-/// the one on the grant of the identity the peer table hears it under. The grant this
-/// node gives its own identity carries a label you did not give, so it names nothing.
-pub(crate) fn owner_label<'a>(
+/// The name another user's session at `destination` can be typed as: the session's own
+/// name. A user's name is not offered for one of their sessions, since it stops naming
+/// one session once the user is heard from another.
+pub(crate) fn peer_session_name<'a>(
     names: &'a [AddressName],
     destination: &str,
 ) -> Option<&'a AddressName> {
-    let find = |own_grant: bool| {
-        names.iter().find(|name| match &name.target {
-            NameTarget::DestinationLabel {
-                destination: at, ..
-            } => own_grant && at == destination,
-            NameTarget::IdentityLabel { instances, .. } => {
-                !own_grant
-                    && name.name != SELF_TRUST_LABEL
-                    && instances.iter().any(|at| at == destination)
-            }
-            NameTarget::Session { .. } => false,
-        })
-    };
-    find(true).or_else(|| find(false))
+    names.iter().find(|name| {
+        matches!(&name.target, NameTarget::UserSession { destination: at, .. } if at == destination)
+    })
 }
 
 /// One in-process Reticulum node: a transport over the configured interfaces, one destination
@@ -1170,9 +1172,89 @@ impl MeshRuntime {
         instances::register(&self.cache_dir, &self.current_instance_id(), row.clone());
     }
 
+    /// What every human-facing line names peers from: the people section judged against
+    /// your running sessions' names, your identity and your sessions on this config dir
+    /// (the running ones over the gone ones the registry still keeps).
+    pub(crate) fn namer(&self) -> Namer {
+        let sessions = self.registered_sessions();
+        let running: Vec<&str> = sessions
+            .running
+            .values()
+            .map(|row| row.session.as_str())
+            .collect();
+        let people = self.trust().people(&running);
+        let mut own: HashMap<String, String> = sessions
+            .gone
+            .iter()
+            .map(|(destination, row)| (destination.clone(), row.session.clone()))
+            .collect();
+        own.extend(
+            sessions
+                .running
+                .iter()
+                .map(|(destination, row)| (destination.clone(), row.session.clone())),
+        );
+        Namer::new(people, Some(&self.fingerprint), own)
+    }
+
+    /// The identity the session at `destination` belongs to, for display: the one the
+    /// peer table hears it under when the destination re-derives from it, else the one its
+    /// trust record is bound to. A row's identity column is never taken on its word.
+    pub(crate) fn identity_at(&self, destination: &str) -> Option<String> {
+        self.peers()
+            .get(destination)
+            .filter(row_derives)
+            .map(|peer| peer.identity_hash)
+            .or_else(|| {
+                self.trust()
+                    .records()
+                    .into_iter()
+                    .find(|record| {
+                        record.tier == Tier::Destination
+                            && record.hash.eq_ignore_ascii_case(destination)
+                    })
+                    .and_then(|record| record.identity)
+            })
+    }
+
+    /// `<user> / <session>` for the session at `destination`.
+    pub(crate) fn who_at(&self, destination: &str) -> Who {
+        self.namer()
+            .who(self.identity_at(destination).as_deref(), destination)
+    }
+
+    /// Every session whose user is proven, as (identity, destination): your own sessions
+    /// on this config dir, the peer rows whose destination re-derives from the identity,
+    /// and the destination records the trust list bound to an identity when it trusted
+    /// them. What `<user>/<session>` picks a session from.
+    pub(crate) fn known_sessions(&self) -> Vec<(String, String)> {
+        let mut sessions: Vec<(String, String)> = self
+            .registered_sessions()
+            .running
+            .into_keys()
+            .map(|destination| (self.fingerprint.clone(), destination))
+            .collect();
+        sessions.extend(
+            self.peers()
+                .snapshot()
+                .into_iter()
+                .filter(row_derives)
+                .map(|peer| (peer.identity_hash, peer.destination_hash)),
+        );
+        sessions.extend(self.trust().records().into_iter().filter_map(|record| {
+            (record.tier == Tier::Destination)
+                .then_some(record.identity.map(|identity| (identity, record.hash)))
+                .flatten()
+        }));
+        sessions.sort_unstable();
+        sessions.dedup();
+        sessions
+    }
+
     /// Every name the human verbs resolve: your running sessions in destination order,
-    /// then the labelled grants in the trust list's order. An unnamed session and a blank
-    /// label name nothing.
+    /// `you`, then each user's and session's addressable name in hash order. An unnamed
+    /// session names nothing. A user's sessions are only the peer rows whose destination
+    /// re-derives from the identity, never a row's identity column on its word.
     pub(crate) fn address_names(&self) -> Vec<AddressName> {
         let mut sessions: Vec<(String, String)> = self
             .own_sessions()
@@ -1180,7 +1262,8 @@ impl MeshRuntime {
             .filter(|(_, session)| !session.trim().is_empty())
             .collect();
         sessions.sort_unstable();
-        let peers = self.peers().snapshot();
+        let mut own_destinations: Vec<String> = self.own_sessions().into_keys().collect();
+        own_destinations.sort_unstable();
         let mut names: Vec<AddressName> = sessions
             .into_iter()
             .map(|(destination, session)| AddressName {
@@ -1191,49 +1274,59 @@ impl MeshRuntime {
                 },
             })
             .collect();
-        for record in self.trust().records() {
-            let Some(label) = record.label.filter(|label| !label.trim().is_empty()) else {
-                continue;
-            };
-            let target = match record.tier {
-                Tier::Destination => NameTarget::DestinationLabel {
-                    destination: record.hash,
-                    identity: record.identity,
+        names.push(AddressName {
+            name: YOU.to_string(),
+            target: NameTarget::User {
+                identity: self.fingerprint.clone(),
+                sessions: own_destinations,
+            },
+        });
+        let peers: Vec<PeerRecord> = self
+            .peers()
+            .snapshot()
+            .into_iter()
+            .filter(row_derives)
+            .collect();
+        let namer = self.namer();
+        let mut people: Vec<(&str, Option<&str>, &str)> = namer
+            .people()
+            .addressable()
+            .filter(|(identity, _, _)| !namer.is_you(identity))
+            .collect();
+        people.sort_unstable_by_key(|(identity, destination, _)| (*identity, *destination));
+        for (identity, destination, name) in people {
+            let target = match destination {
+                Some(destination) => NameTarget::UserSession {
+                    destination: destination.to_string(),
+                    identity: identity.to_string(),
                 },
-                Tier::Identity => {
-                    let mut instances: Vec<String> = peers
+                None => {
+                    let mut sessions: Vec<String> = peers
                         .iter()
-                        .filter(|peer| peer.identity_hash == record.hash)
+                        .filter(|peer| peer.identity_hash.eq_ignore_ascii_case(identity))
                         .map(|peer| peer.destination_hash.clone())
                         .collect();
-                    instances.sort_unstable();
-                    instances.dedup();
-                    NameTarget::IdentityLabel {
-                        identity: record.hash,
-                        instances,
+                    sessions.sort_unstable();
+                    sessions.dedup();
+                    NameTarget::User {
+                        identity: identity.to_string(),
+                        sessions,
                     }
                 }
             };
             names.push(AddressName {
-                name: label,
+                name: name.to_string(),
                 target,
             });
         }
         names
     }
 
-    /// A peer's `NoAccess` as every request path reports it: the peer by the name the
-    /// table filed for `destination`, this node by its current destination.
+    /// A peer's `NoAccess` as every request path reports it: the peer as `<user> /
+    /// <session>`, as every other line names it, this node by its current destination.
     pub(crate) fn remote_refusal(&self, destination: &str) -> RemoteRefusal {
-        let display_name = self
-            .peers()
-            .get(destination)
-            .and_then(|peer| peer.display_name);
-        RemoteRefusal::new(
-            destination,
-            display_name.as_deref(),
-            self.current_destination_hash(),
-        )
+        let who = self.who_at(destination).to_string();
+        RemoteRefusal::new(destination, Some(&who), self.current_destination_hash())
     }
 
     /// A peer's silence after the link came up, with this node by the same current
@@ -4843,7 +4936,7 @@ impl MeshSlot {
     pub(crate) fn announce_expired(&self, expired: impl IntoIterator<Item = InboundRecord>) {
         for record in expired {
             let id8 = short(&record.id);
-            let name = self.peer_name_at(&record.peer_destination);
+            let name = self.who(&record.peer_identity, &record.peer_destination);
             let (what, outcome) = match record.kind {
                 InboundKind::Question => ("question", "expired unanswered"),
                 InboundKind::Access => ("access request", "expired"),
@@ -5158,11 +5251,12 @@ impl MeshSlot {
     /// person at the keyboard gets the folded notice rather than a line per message,
     /// which is what a flood would flood the terminal with.
     pub(crate) fn record_envoy_refusal(&self, original: PeerMessage, refusal: &PeerRefusal) {
-        let who = self.peer_label(&original.source_identity, &original.source_destination);
         let identity = original.source_identity.clone();
+        let destination = original.source_destination.clone();
         let via = original.via;
         self.deliver_to_inbox(original, false);
-        self.surface_refusal(&identity, refusal, &who, RefusalPath::Filed(via));
+        let who = || self.who(&identity, &destination);
+        self.surface_refusal(&identity, refusal, who, RefusalPath::Filed(via));
     }
 
     /// `record_envoy_refusal` plus the correlated reply that tells the peer why, sent
@@ -5265,18 +5359,30 @@ impl MeshSlot {
     /// Notes one refusal of `identity` for folding and prints what the fold says: the
     /// first refusal of each reason in the hour, and the counts of any window that has
     /// since rolled over.
-    fn surface_refusal(&self, identity: &str, refusal: &PeerRefusal, who: &str, path: RefusalPath) {
+    /// `who` names the peer and is asked for only when a line prints, so a flood the
+    /// fold keeps quiet never pays for naming its sender.
+    fn surface_refusal(
+        &self,
+        identity: &str,
+        refusal: &PeerRefusal,
+        who: impl FnOnce() -> String,
+        path: RefusalPath,
+    ) {
         let notice = self
             .limits
             .note_refusal(identity, refusal.reason, Instant::now());
-        self.push_peer_lines(identity, fold_lines(who, refusal.reason, path, &notice));
+        if notice.surface || !notice.reports.is_empty() {
+            self.push_peer_lines(identity, fold_lines(&who(), refusal.reason, path, &notice));
+        }
     }
 
     /// Prints the folded counts of a rolled-over window when a message from `identity`
     /// is admitted, so they surface even once the refusals have stopped.
-    fn surface_fold_reports(&self, identity: &str, who: &str) {
+    fn surface_fold_reports(&self, identity: &str, who: impl FnOnce() -> String) {
         let reports = self.limits.take_fold_reports(identity, Instant::now());
-        self.push_peer_lines(identity, fold_report_lines(who, &reports));
+        if !reports.is_empty() {
+            self.push_peer_lines(identity, fold_report_lines(&who(), &reports));
+        }
     }
 
     fn push_peer_lines(&self, identity: &str, lines: Vec<NoticeText>) {
@@ -5324,7 +5430,7 @@ impl MeshSlot {
             parts: Vec::new(),
             dropped_parts: 0,
         });
-        let who = self.peer_name(original);
+        let who = self.sender(original);
         let asked = match original.kind {
             PeerKind::Ask => "asked",
             _ => "said",
@@ -5380,7 +5486,7 @@ impl MeshSlot {
     ) {
         let text = NoticeText::default().frame(format!("{reason}; ")).then(
             original.summary_line_with_tail(
-                self.display_name_of(&original).as_deref(),
+                self.who_of(&original).as_deref(),
                 &format!(" is in the inbox{next}"),
             ),
         );
@@ -5401,10 +5507,8 @@ impl MeshSlot {
     /// `PeerMessage::new` cleaned it, the same one the idle line shows. The person at
     /// the keyboard gets one line saying the envoy escalated.
     pub(crate) fn record_envoy_escalated(&self, original: PeerMessage, id: &str) {
-        let summary = original.summary_line_with_tail(
-            self.display_name_of(&original).as_deref(),
-            " is in the inbox",
-        );
+        let summary =
+            original.summary_line_with_tail(self.who_of(&original).as_deref(), " is in the inbox");
         let id8 = short(&original.source_identity).to_string();
         let local_id = format!("peer:{}", short(&original.source_destination));
         let event = match original.kind {
@@ -5506,7 +5610,7 @@ impl MeshSlot {
         match sent {
             Ok(_) => Ok(()),
             Err(err) if matches!(store.get(id), Ok(Some(_))) => Err(decline_not_told(
-                &self.peer_name_at(&record.peer_destination),
+                &self.who(&record.peer_identity, &record.peer_destination),
                 id,
                 &err,
             )),
@@ -5806,21 +5910,52 @@ impl MeshSlot {
             .and_then(|peer| peer.display_name)
     }
 
-    fn display_name_of(&self, message: &PeerMessage) -> Option<String> {
-        self.display_name_at(&message.source_destination)
+    /// `sender` for the summary lines, `None` for a message that names no session, which
+    /// they then name by its short destination.
+    fn who_of(&self, message: &PeerMessage) -> Option<String> {
+        Some(self.sender(message)).filter(|who| !who.is_empty())
     }
 
-    /// The sender as `summary_line` names it: the peer table's display name, cleaned,
-    /// or the short hash of its instance.
-    pub(crate) fn peer_name(&self, message: &PeerMessage) -> String {
-        self.peer_name_at(&message.source_destination)
-    }
-
-    /// `peer_name` for any instance by its destination hash.
-    pub(crate) fn peer_name_at(&self, destination: &str) -> String {
+    /// The name the sender announces, cleaned, or the short hash of its session: what
+    /// the envoy's card about a message calls the peer.
+    pub(crate) fn announced_name(&self, message: &PeerMessage) -> String {
+        let destination = &message.source_destination;
         self.display_name_at(destination)
             .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
             .unwrap_or_else(|| short(destination).to_string())
+    }
+
+    /// `MeshRuntime::namer`; with the mesh off nothing is named, so every user and
+    /// session reads as its short hash.
+    pub(crate) fn namer(&self) -> Namer {
+        self.get()
+            .map(|runtime| runtime.namer())
+            .unwrap_or_default()
+    }
+
+    /// `<user> / <session>` for the session at `destination` of `identity`, as every
+    /// human-facing line names a peer.
+    /// `<user> / <session>` for the session at `destination` of `identity`; empty for a
+    /// message that names no session.
+    pub(crate) fn who(&self, identity: &str, destination: &str) -> String {
+        if destination.is_empty() {
+            return String::new();
+        }
+        self.namer().who(Some(identity), destination).to_string()
+    }
+
+    /// `who` for a message's sender; empty for a message with no source destination,
+    /// which names no session.
+    pub(crate) fn sender(&self, message: &PeerMessage) -> String {
+        self.who(&message.source_identity, &message.source_destination)
+    }
+
+    /// `who` for a session known only by its destination.
+    pub(crate) fn who_at(&self, destination: &str) -> String {
+        match self.get() {
+            Some(runtime) => runtime.who_at(destination).to_string(),
+            None => Namer::default().who(None, destination).to_string(),
+        }
     }
 
     /// `MeshRuntime::address_names`, empty while the mesh is off.
@@ -5845,15 +5980,6 @@ impl MeshSlot {
     /// `OWN_ENTRY_MARKS` filings are remembered.
     pub(crate) fn is_from_self(&self, message: &PeerMessage) -> bool {
         self.own_entries.lock().contains(message)
-    }
-
-    /// The sender as a refusal line names it, the same on every path a refusal takes:
-    /// the peer table's display name for its instance, cleaned, or the short hash of
-    /// its identity.
-    pub(crate) fn peer_label(&self, identity: &str, destination: &str) -> String {
-        self.display_name_at(destination)
-            .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
-            .unwrap_or_else(|| short(identity).to_string())
     }
 
     /// The inbox path: the message lands in the inbox, the model is told what arrived
@@ -5885,7 +6011,7 @@ impl MeshSlot {
     /// escalated reply has no answer to collect yet, so its note points at the inbox
     /// rather than at a `mesh__collect` that would block for its whole timeout.
     fn file_in_inbox(&self, message: PeerMessage, answered: bool) -> NoticeText {
-        let text = message.summary_line(self.display_name_of(&message).as_deref());
+        let text = message.summary_line(self.who_of(&message).as_deref());
         let local_id = format!("peer:{}", short(&message.source_destination));
         let (event, id, next_action) = match (answered, message.kind) {
             (true, _) if message.disposition == Some(Disposition::Escalated) => (
@@ -6362,14 +6488,14 @@ impl PeerSurface for MeshSlot {
             return Ok(());
         }
         let identity = request.source_identity;
-        let who = self.peer_label(identity, request.source_destination);
+        let who = || self.who(identity, request.source_destination);
         let now = Instant::now();
         let admitted = self
             .link_run_admissible(request, now)
             .and_then(|()| self.limits.admit_message(identity, now));
         match admitted {
             Ok(()) => {
-                self.surface_fold_reports(identity, &who);
+                self.surface_fold_reports(identity, who);
                 Ok(())
             }
             Err(refusal) => {
@@ -6377,7 +6503,7 @@ impl PeerSurface for MeshSlot {
                     PeerVia::Direct => RefusalPath::Link,
                     PeerVia::StoreAndForward => RefusalPath::Filed(PeerVia::StoreAndForward),
                 };
-                self.surface_refusal(identity, &refusal, &who, path);
+                self.surface_refusal(identity, &refusal, who, path);
                 if request.via == PeerVia::StoreAndForward
                     && request.in_reply_to.is_none()
                     && self.limits.claim_peer_reply(identity, refusal.reason, now)
@@ -6454,7 +6580,11 @@ impl PeerSurface for MeshSlot {
                     && record.peer_destination.eq_ignore_ascii_case(&destination)
             })
             .collect();
-        let Some(text) = return_line(&self.peer_name_at(&destination), &open, now) else {
+        let who = match open.first() {
+            Some(record) => self.who(&record.peer_identity, &destination),
+            None => self.who_at(&destination),
+        };
+        let Some(text) = return_line(&who, &open, now) else {
             return;
         };
         let id8 = open
@@ -7362,8 +7492,11 @@ mod tests {
         assert_eq!(pushed.len(), 1);
         let text = pushed[0].text.plain();
         assert!(
-            text.starts_with(&format!("{} is back; your question from ", short(&peer)))
-                && text.ends_with("s ago is still open; .mesh messaging sent lists it"),
+            text.starts_with(&format!(
+                "{} / {} is back; your question from ",
+                short(&hex_lower(&PEER_IDENTITY)),
+                short(&peer)
+            )) && text.ends_with("s ago is still open; .mesh messaging sent lists it"),
             "{text}"
         );
         assert_eq!(
@@ -7465,19 +7598,19 @@ mod tests {
         );
         assert_eq!(
             pushed[0].text.plain(),
-            format!("{dest8} says: words of m-1")
+            format!("cdcdcdcd / {dest8} says: words of m-1")
         );
         assert_eq!(
             pushed[1].text.plain(),
-            format!("{dest8} announces: words of b-1")
+            format!("cdcdcdcd / {dest8} announces: words of b-1")
         );
         assert_eq!(
             pushed[2].text.plain(),
-            format!("{dest8} asks: words of a-1")
+            format!("cdcdcdcd / {dest8} asks: words of a-1")
         );
         assert_eq!(
             pushed[3].text.plain(),
-            format!("{dest8} replies: words of r-1")
+            format!("cdcdcdcd / {dest8} replies: words of r-1")
         );
         drop(pushed);
         assert_eq!(
@@ -7784,7 +7917,7 @@ mod tests {
         );
         assert_eq!(
             pushed[1].text.plain(),
-            format!("{dest8} says: words of m-1")
+            format!("cdcdcdcd / {dest8} says: words of m-1")
         );
     }
 
@@ -8062,12 +8195,12 @@ mod tests {
         let id8 = &hex_lower(&PEER_IDENTITY)[..8];
         assert_eq!(
             pushed[0].text.plain(),
-            format!("{dest8} asks: words of a-1")
+            format!("{id8} / {dest8} asks: words of a-1")
         );
         assert_eq!(
             pushed[1].text.plain(),
             format!(
-                "{id8}: the envoy queue is full, filed in the inbox; further envoy_busy refusals from this peer are folded for the hour"
+                "{id8} / {dest8}: the envoy queue is full, filed in the inbox; further envoy_busy refusals from this peer are folded for the hour"
             )
         );
         for note in pushed.iter() {
@@ -8425,12 +8558,13 @@ mod tests {
         assert_eq!(envoy.job_ids().len(), 3);
         assert!(slot.peer_inbox().drain().0.is_empty());
         let a8 = &a.address_hash().to_hex_string()[..8];
+        let a_dest8 = short(&a_destination);
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 1, "{pushed:?}");
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "{a8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+                "{a8} / {a_dest8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
             )
         );
         assert_eq!(pushed[0].origin, Origin::Peer(a8.to_string()));
@@ -8829,16 +8963,19 @@ mod tests {
             texts,
             [
                 format!(
-                    "{}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
-                    short(&a)
+                    "{} / {}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    short(&a),
+                    short(&a_instance)
                 ),
                 format!(
-                    "{}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour",
-                    short(&b)
+                    "{} / {}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour",
+                    short(&b),
+                    short(&b_instance)
                 ),
                 format!(
-                    "{}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
-                    short(&c)
+                    "{} / {}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    short(&c),
+                    short(&c_instance)
                 ),
             ]
         );
@@ -9235,7 +9372,10 @@ mod tests {
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
             pushed[0].text.plain(),
-            format!("{dest8} asked: words of a-1; envoy replied: the envoy's answer")
+            format!(
+                "{} / {dest8} asked: words of a-1; envoy replied: the envoy's answer",
+                &hex_lower(&PEER_IDENTITY)[..8]
+            )
         );
         assert_eq!(pushed[0].source, Source::Message);
         assert_eq!(
@@ -9273,7 +9413,8 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "{} said: {}...; envoy replied: {}... (full text: .mesh messaging inbox)",
+                "{} / {} said: {}...; envoy replied: {}... (full text: .mesh messaging inbox)",
+                &hex_lower(&PEER_IDENTITY)[..8],
                 &hex_lower(&PEER_INSTANCE)[..8],
                 words('q', 6),
                 words('r', 6)
@@ -9304,7 +9445,8 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "{} asked: words of a-1; envoy replied: {}... (full text: .mesh messaging inbox)",
+                "{} / {} asked: words of a-1; envoy replied: {}... (full text: .mesh messaging inbox)",
+                &hex_lower(&PEER_IDENTITY)[..8],
                 &hex_lower(&PEER_INSTANCE)[..8],
                 "r".repeat(PEER_LINE_MAX_CHARS / 2)
             )
@@ -9537,7 +9679,7 @@ mod tests {
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
             pushed[0].text.plain(),
-            format!("envoy timed out; {dest8} says: words of m-1 is in the inbox")
+            format!("envoy timed out; cdcdcdcd / {dest8} says: words of m-1 is in the inbox")
         );
     }
 
@@ -9557,7 +9699,7 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "envoy timed out; {dest8} says: {}... is in the inbox (full text: .mesh messaging inbox)",
+                "envoy timed out; cdcdcdcd / {dest8} says: {}... is in the inbox (full text: .mesh messaging inbox)",
                 "q".repeat(PEER_LINE_MAX_CHARS)
             )
         );
@@ -9595,7 +9737,9 @@ mod tests {
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
             pushed[0].text.plain(),
-            format!("envoy escalated to the human; {dest8} asks: words of a-1 is in the inbox")
+            format!(
+                "envoy escalated to the human; cdcdcdcd / {dest8} asks: words of a-1 is in the inbox"
+            )
         );
     }
 
@@ -9614,7 +9758,7 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "envoy escalated to the human; {dest8} asks: {}... is in the inbox (full text: .mesh messaging inbox)",
+                "envoy escalated to the human; cdcdcdcd / {dest8} asks: {}... is in the inbox (full text: .mesh messaging inbox)",
                 "q".repeat(PEER_LINE_MAX_CHARS)
             )
         );
@@ -10144,8 +10288,11 @@ mod tests {
 
         let text = err.to_string();
         let dest8 = &record.peer_destination[..8];
+        let id8 = &record.peer_identity[..8];
         assert!(
-            text.starts_with(&format!("Could not tell {dest8} that you declined (")),
+            text.starts_with(&format!(
+                "Could not tell {id8} / {dest8} that you declined ("
+            )),
             "{text}"
         );
         assert!(
@@ -11559,7 +11706,7 @@ mod tests {
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
             pushed[0].text.plain(),
-            format!("{dest8} replies: words of r-1"),
+            format!("cdcdcdcd / {dest8} replies: words of r-1"),
             "the asker's notice is the reply's summary line"
         );
         assert_eq!(
@@ -15477,7 +15624,11 @@ mod tests {
                 !idle.pushed.lock().is_empty()
             })
             .await;
-            let name = pair.slot_a.peer_name_at(&to_b);
+            let name = pair.slot_a.who_at(&to_b);
+            assert_eq!(
+                name,
+                format!("{} / {}", short(&pair.b.runtime.fingerprint), short(&to_b))
+            );
             {
                 let pushed = idle.pushed.lock();
                 assert_eq!(pushed.len(), 1);
@@ -15558,7 +15709,7 @@ mod tests {
             assert_eq!(pair.left_at_on_a(), None, "B's request lifted the mark");
             let back = back_lines(&idle);
             assert_eq!(back.len(), 1, "{back:?}");
-            let name = pair.slot_a.peer_name_at(&to_b);
+            let name = pair.slot_a.who_at(&to_b);
             assert!(
                 back[0].starts_with(&format!("{name} is back; your question from ")),
                 "{back:?}"
@@ -18768,20 +18919,14 @@ mod tests {
     #[cfg(unix)]
     mod name_addressing_tests {
         use super::*;
-        use crate::mesh::trust::TrustOptions;
+        use crate::mesh::trust::IdentityStanding;
 
-        fn labelled(label: &str) -> TrustOptions {
-            TrustOptions {
-                label: Some(label.to_string()),
-                note: None,
-            }
-        }
-
-        /// Your named sessions come first in destination order, then each label in the
-        /// trust list's order; an identity label carries every instance the peer table
-        /// holds of it, and an unnamed session or a blank label names nothing.
+        /// Your named sessions come first in destination order, then `you`, then each
+        /// user's and session's name; a user carries every session the peer table proves
+        /// is theirs, never a row whose identity column does not derive its destination,
+        /// and an unnamed session names nothing. Naming a user grants nothing.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn address_names_lists_sessions_then_labels_with_their_instances() {
+        async fn address_names_lists_sessions_then_users_with_their_proven_sessions() {
             let started = started_runtime("node-address-names").await;
             let runtime = started.runtime.clone();
             let slot = Arc::new(MeshSlot::default());
@@ -18824,29 +18969,43 @@ mod tests {
                 );
                 heard.push(instance);
             }
+            let forged = hex_lower(&[0x44; 16]);
+            runtime.peers().observe(
+                PeerSighting {
+                    destination_hash: forged.clone(),
+                    identity_hash: identities[1].clone(),
+                    name_hash: hex_lower(&[9; NAME_HASH_LEN]),
+                    public_key: None,
+                    display_name: None,
+                    protocol_version: MESH_PROTOCOL_VERSION,
+                    hops: 1,
+                },
+                now,
+            );
             let trust = runtime.trust();
-            for (identity, label) in identities
+            for (identity, name) in identities
                 .iter()
                 .zip(["none-heard", "one-heard", "two-heard"])
             {
-                trust
-                    .trust_identity(slot.as_ref(), identity, labelled(label), now)
-                    .unwrap();
+                trust.set_person_alias(identity, Some(name), &[]).unwrap();
             }
             trust
-                .trust_destination(slot.as_ref(), &heard[0], labelled("laptop"), now)
+                .set_session_alias(&identities[1], &heard[0], Some("laptop"), &[])
                 .unwrap();
-            trust
-                .trust_destination(slot.as_ref(), &heard[1], labelled("  "), now)
-                .unwrap();
+            assert_eq!(
+                trust.identity_standing(&identities[0]),
+                IdentityStanding::Unknown,
+                "a name grants nothing"
+            );
 
             let names = runtime.address_names();
             let temp_at = names.iter().position(|name| name.name == "temp").unwrap();
-            let first_label = names
+            let first_user = names
                 .iter()
                 .position(|name| !matches!(name.target, NameTarget::Session { .. }))
                 .unwrap();
-            assert!(temp_at < first_label, "sessions come first: {names:?}");
+            assert!(temp_at < first_user, "sessions come first: {names:?}");
+            assert_eq!(names[first_user].name, YOU, "{names:?}");
             assert_eq!(
                 names[temp_at].target,
                 NameTarget::Session {
@@ -18858,22 +19017,33 @@ mod tests {
                 !names.iter().any(|name| name.name.trim().is_empty()),
                 "{names:?}"
             );
-            let instances_of = |label: &str| match &names
+            let sessions_of = |user: &str| match &names
                 .iter()
-                .find(|name| name.name == label)
-                .unwrap_or_else(|| panic!("{label} is missing: {names:?}"))
+                .find(|name| name.name == user)
+                .unwrap_or_else(|| panic!("{user} is missing: {names:?}"))
                 .target
             {
-                NameTarget::IdentityLabel { instances, .. } => instances.clone(),
-                other => panic!("{label} is {other:?}"),
+                NameTarget::User { sessions, .. } => sessions.clone(),
+                other => panic!("{user} is {other:?}"),
             };
-            assert!(instances_of("none-heard").is_empty());
-            assert_eq!(instances_of("one-heard"), [heard[0].clone()]);
+            assert!(sessions_of("none-heard").is_empty());
+            assert_eq!(
+                sessions_of("one-heard"),
+                [heard[0].clone()],
+                "a row whose identity column does not derive its destination is not theirs"
+            );
             let mut two = vec![heard[1].clone(), heard[2].clone()];
             two.sort_unstable();
-            assert_eq!(instances_of("two-heard"), two);
+            assert_eq!(sessions_of("two-heard"), two);
             let laptop = names.iter().find(|name| name.name == "laptop").unwrap();
-            assert_eq!(laptop.target.destination(), Some(heard[0].as_str()));
+            assert_eq!(
+                laptop.target,
+                NameTarget::UserSession {
+                    destination: heard[0].clone(),
+                    identity: identities[1].clone(),
+                }
+            );
+            assert_eq!(runtime.who_at(&heard[0]).to_string(), "one-heard / laptop");
             assert!(slot.stop().await.unwrap());
             started.relay_handle.abort();
         }
@@ -19523,8 +19693,8 @@ mod tests {
                     .map(|note| note.text.plain())
                     .collect::<Vec<_>>(),
                 [
-                    format!("access request stale-a from {dest8} expired"),
-                    format!("question stale-q from {dest8} expired unanswered"),
+                    format!("access request stale-a from {id8} / {dest8} expired"),
+                    format!("question stale-q from {id8} / {dest8} expired unanswered"),
                 ]
             );
             for note in pushed.iter() {
@@ -19587,13 +19757,16 @@ mod tests {
         settle().await;
 
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
         assert_eq!(
             idle.pushed
                 .lock()
                 .iter()
                 .map(|note| note.text.plain())
                 .collect::<Vec<_>>(),
-            [format!("question stale-q from {dest8} expired unanswered")]
+            [format!(
+                "question stale-q from {id8} / {dest8} expired unanswered"
+            )]
         );
         assert!(store.get("stale-q").unwrap().is_none());
         assert!(store.get("fresh").unwrap().is_some());
@@ -20427,6 +20600,7 @@ mod tests {
         .unwrap();
 
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
         assert_eq!(
             idle.pushed
                 .lock()
@@ -20434,8 +20608,8 @@ mod tests {
                 .map(|note| note.text.plain())
                 .collect::<Vec<_>>(),
             [
-                format!("question stale-q from {dest8} expired unanswered"),
-                format!("question fresh from {dest8} expired unanswered"),
+                format!("question stale-q from {id8} / {dest8} expired unanswered"),
+                format!("question fresh from {id8} / {dest8} expired unanswered"),
             ],
             "the sweep's line first, then the displaced twin's, each once"
         );

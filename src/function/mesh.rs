@@ -8708,8 +8708,9 @@ mod tests {
             let d8 = short(&to).to_string();
             live.stub.know_identity(runtime.fingerprint());
 
+            let i8 = short(&live.stub.identity_hex()).to_string();
             let refusal = format!(
-                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)"
+                "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)"
             );
             let next_action = format!(
                 "Nothing on this node unblocks it: ask the person at {d8} to run .mesh access trust {own}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh access requests on their side)."
@@ -8766,8 +8767,8 @@ mod tests {
             assert!(row.get("status").is_none(), "{peers}");
             assert!(!peers.to_string().contains("0xf1"), "{peers}");
 
-            // The name on the line is the peer's own text, cleaned: a name carrying an
-            // escape, a newline and a bell still yields one line with none of them.
+            // The line names the peer as this node does, never by the text it announces: a
+            // name carrying an escape, a newline and a bell leaves no trace on the line.
             let filed = runtime.peers().get(&to).unwrap();
             runtime.peers().observe(
                 PeerSighting {
@@ -8799,7 +8800,11 @@ mod tests {
             .await
             .unwrap();
             let message = hostile["message"].as_str().unwrap();
-            assert!(message.starts_with("\"Stub"), "{message:?}");
+            assert!(
+                message.starts_with(&format!("\"{i8} / {d8}\"")),
+                "{message:?}"
+            );
+            assert!(!message.contains("Evil"), "{message:?}");
             assert!(
                 message.contains(&format!(
                     "\" ({d8}) refused the request: it has not trusted this instance ({own})."
@@ -8873,8 +8878,9 @@ mod tests {
                     .unwrap();
             }
             let cee_d8 = short(&cee.destination_hex()).to_string();
+            let cee_i8 = short(&cee.identity_hex()).to_string();
             let refusal = format!(
-                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
+                "\"{cee_i8} / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
             );
             let next_action = format!(
                 "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh access trust {own}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh access requests on their side)."

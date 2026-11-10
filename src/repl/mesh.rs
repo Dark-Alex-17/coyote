@@ -35,6 +35,7 @@ use crate::mesh::pending::{
     PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingRecord, PendingState, access_not_a_question,
     question_not_an_access_request,
 };
+use crate::mesh::people::{AliasSource, Namer, Who, YOU};
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
     MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
@@ -55,8 +56,7 @@ use crate::mesh::{
     MeshPaths, MeshRuntime, NameTarget, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER,
     PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
     canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
-    loopback_endpoint, owner_label, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
-    short, span_text,
+    loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::render::{QuotingError, error_notice};
 use crate::repl::printer::terminal_width;
@@ -133,24 +133,30 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "people",
         "list",
         ".mesh people list",
-        "List the nodes heard on the mesh",
+        "List the users and sessions you have heard, you first",
+    ),
+    (
+        "people",
+        "name",
+        ".mesh people name <user>[/<session>] \"name\" | <user>[/<session>] --clear",
+        "Give a user or one of their sessions the name you call them, or clear it",
     ),
     (
         "people",
         "info",
-        ".mesh people info <destination>",
-        "Show what this node knows of one peer",
+        ".mesh people info <who>",
+        "Show what you know of one user or session, with its hashes",
     ),
     (
         "people",
         "status",
-        ".mesh people status <destination>",
-        "Fetch a trusted peer's status card",
+        ".mesh people status <session>",
+        "Fetch a trusted session's status card",
     ),
     (
         "access",
         "trust",
-        ".mesh access trust <destination> [--yes] [--label \"text\"] | --identity <identity> [--yes] [--label \"text\"]",
+        ".mesh access trust <destination> [--yes] | --identity <identity> [--yes]",
         "Trust one instance, or every instance of an identity",
     ),
     (
@@ -398,6 +404,7 @@ pub(crate) async fn run(
             }
         },
         ("people", "list") => peers(ctx).await,
+        ("people", "name") => people_name(ctx, rest),
         ("people", "info") => info(ctx, &abort_signal, rest).await,
         ("people", "status") => peer_status(ctx, &abort_signal, rest).await,
         ("access", "trust") => trust(ctx, &abort_signal, rest).await,
@@ -663,24 +670,18 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
     let mut records = runtime.peers().snapshot();
     records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
     let sessions = runtime.registered_sessions();
-    let names = runtime.address_names();
+    let namer = runtime.namer();
     let mut facts = Vec::with_capacity(records.len());
     for peer in &records {
         let is_you = same_hash(&peer.identity_hash, runtime.fingerprint());
-        let own_session = is_you
-            .then(|| sessions.running.get(&peer.destination_hash))
-            .flatten()
-            .map(|row| row.session.clone());
-        let own_gone =
-            is_you && own_session.is_none() && sessions.gone.contains_key(&peer.destination_hash);
+        let own_gone = is_you
+            && !sessions.running.contains_key(&peer.destination_hash)
+            && sessions.gone.contains_key(&peer.destination_hash);
         facts.push(HeardFacts {
             no_route: own_gone
                 || runtime.link_failed(&peer.destination_hash)
                 || !runtime.path_known(&peer.destination_hash).await,
-            is_you,
-            own_session,
             own_gone,
-            label: owner_label(&names, &peer.destination_hash).map(|label| label.name.clone()),
         });
     }
     let trust = runtime.trust();
@@ -722,7 +723,7 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
         |record| unheard_label(&trust, record),
         |identity| grants_all(&trust, identity),
     ));
-    out_path_text(&render_peers(&rows, now).render(live_prefix()));
+    out_path_text(&render_peers(&rows, &namer, now).render(live_prefix()));
     Ok(())
 }
 
@@ -815,13 +816,201 @@ fn show_config(ctx: &RequestContext) {
     out_path_text(&NoticeText::from(render_info_table(rows)).render(live_prefix()));
 }
 
+/// What `.mesh people name` and `.mesh people info` act on: a user, or one session of
+/// theirs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeopleSubject {
+    User(String),
+    Session {
+        identity: String,
+        destination: String,
+    },
+}
+
+/// The user or session `token` addresses: `<user>/<session>` and a session's name or hash
+/// name a session, a user's name or hash names the user. A hash names a session when you
+/// know a session there, else a user when you know that user.
+fn people_subject(
+    ctx: &RequestContext,
+    runtime: &MeshRuntime,
+    token: &str,
+) -> Result<PeopleSubject> {
+    if token.contains('/') {
+        let destination = destination_hash(ctx, token)?;
+        let identity = identity_hash(ctx, token)?;
+        return Ok(PeopleSubject::Session {
+            identity,
+            destination,
+        });
+    }
+    let hash = peer_hash(ctx, token)?;
+    let sessions = runtime.known_sessions();
+    let session_of = sessions
+        .iter()
+        .find(|(_, destination)| same_hash(destination, &hash))
+        .map(|(identity, _)| identity.clone());
+    if let Some(identity) = session_of {
+        return Ok(PeopleSubject::Session {
+            identity,
+            destination: hash,
+        });
+    }
+    let known_user = sessions
+        .iter()
+        .any(|(identity, _)| same_hash(identity, &hash))
+        || runtime
+            .trust()
+            .records()
+            .iter()
+            .any(|record| record.tier == Tier::Identity && same_hash(&record.hash, &hash))
+        || runtime.trust().people(&[]).person(&hash).is_some();
+    if known_user {
+        return Ok(PeopleSubject::User(hash));
+    }
+    Err(QuotingError::wrap(
+        NoticeText::default().frame("'").peer(token).frame(
+            "' is not a user or session you have heard of, so there is nothing to name yet. `.mesh people list` lists the users and sessions you know.",
+        ),
+    ))
+}
+
+/// `.mesh people name <who> "name"` gives a user, or one session of theirs, the name you
+/// call them; `--clear` takes it back. The name stays in the people section of your trust
+/// list on this computer: no access decision reads it and nothing sent carries it.
+fn people_name(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let usage = || NoticeText::from(render_verb_help("people", "name")).render(live_prefix());
+    let Some(rest) = rest else {
+        out_path_text(&usage());
+        return Ok(());
+    };
+    let tokens = split_tokens(rest);
+    let [who, value] = tokens.as_slice() else {
+        bail!(
+            "`.mesh people name` takes who to name and one name; quote a name with spaces in it. {}",
+            usage()
+        );
+    };
+    let alias = (value != "--clear").then_some(value.as_str());
+    let runtime = live(ctx)?;
+    let subject = people_subject(ctx, &runtime, who)?;
+    let (identity, destination) = match &subject {
+        PeopleSubject::User(identity) => (identity.as_str(), None),
+        PeopleSubject::Session {
+            identity,
+            destination,
+        } => (identity.as_str(), Some(destination.as_str())),
+    };
+    if same_hash(identity, runtime.fingerprint()) {
+        bail!(
+            "That is you: your own sessions go by their session names, and you are always `you`; nothing was changed."
+        );
+    }
+    let before = runtime.namer();
+    let shown = |namer: &Namer| match destination {
+        None => namer.user(Some(identity)),
+        Some(destination) => namer.who(Some(identity), destination).to_string(),
+    };
+    let was = shown(&before);
+    let own: Vec<String> = runtime.own_sessions().into_values().collect();
+    let own: Vec<&str> = own.iter().map(String::as_str).collect();
+    let store = runtime.trust();
+    match destination {
+        None => store.set_person_alias(identity, alias, &own)?,
+        Some(destination) => store.set_session_alias(identity, destination, alias, &own)?,
+    }
+    let now = shown(&runtime.namer());
+    let hash = short(destination.unwrap_or(identity));
+    let text = match alias {
+        Some(alias) => NoticeText::default()
+            .peer(was)
+            .frame(" is now ")
+            .peer(now)
+            .frame("; type `")
+            .peer(alias)
+            .frame(format!(
+                "` in place of its hash ({hash}). The name stays on this computer and is never sent to anyone."
+            )),
+        None => NoticeText::default()
+            .frame(format!("Cleared the name you gave {hash}; it shows as "))
+            .peer(now)
+            .frame("."),
+    };
+    out_path_text(&text.render(live_prefix()));
+    Ok(())
+}
+
+/// `.mesh people info <user>`: the user's name and where it comes from, their hash in full,
+/// and every session of theirs you know, each as `<user> / <session>` with its hash, trust
+/// and when it was last heard.
+fn render_user_detail(runtime: &MeshRuntime, identity: &str, now: SystemTime) -> NoticeText {
+    let namer = runtime.namer();
+    let user = namer.user(Some(identity));
+    let source = match namer.people().person(identity) {
+        _ if namer.is_you(identity) => "you".to_string(),
+        Some(alias) if alias.displayable() => match alias.source {
+            AliasSource::Owner => "the name you gave".to_string(),
+            AliasSource::Advertised => "the name they advertise".to_string(),
+        },
+        _ => format!(
+            "no name; `.mesh people name {} \"name\"` gives one",
+            short(identity)
+        ),
+    };
+    let mut lines = vec![
+        NoticeText::from("user: ")
+            .peer(user)
+            .frame(format!(" ({source})")),
+        format!("user hash: {identity}").into(),
+    ];
+    let store = runtime.trust();
+    let standing = store.identity_standing(identity);
+    let peers = runtime.peers();
+    let sessions: Vec<String> = runtime
+        .known_sessions()
+        .into_iter()
+        .filter(|(at, _)| same_hash(at, identity))
+        .map(|(_, destination)| destination)
+        .collect();
+    if sessions.is_empty() {
+        lines.push("sessions: none heard yet".into());
+    } else {
+        lines.push("sessions:".into());
+    }
+    for destination in &sessions {
+        let trust = trust_label(store.authorize(identity, destination), standing);
+        let heard = peers
+            .get(destination)
+            .map(|peer| format!("last seen {}", age_text(now, peer.last_seen)))
+            .unwrap_or_else(|| "not heard this run".to_string());
+        lines.push(
+            NoticeText::from("  ")
+                .peer(namer.who(Some(identity), destination).to_string())
+                .frame(format!(" . {destination} . {trust} . {heard}")),
+        );
+    }
+    lines.push(
+        "A name a user advertised is their own text; `.mesh people info <user>/<session>` shows one session in full."
+            .into(),
+    );
+    joined_text(lines, "\n")
+}
+
 async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_path_text(&NoticeText::from(render_verb_help("people", "info")).render(live_prefix()));
         return Ok(());
     };
     let runtime = live(ctx)?;
-    let destination = destination_hash(ctx, rest.trim())?;
+    let token = rest.trim();
+    if !token.contains('/')
+        && let Ok(PeopleSubject::User(identity)) = people_subject(ctx, &runtime, token)
+    {
+        out_path_text(
+            &render_user_detail(&runtime, &identity, SystemTime::now()).render(live_prefix()),
+        );
+        return Ok(());
+    }
+    let destination = destination_hash(ctx, token)?;
     let now = SystemTime::now();
     let mut peer = runtime.peers().get(&destination);
     let knock = match runtime.knock_gate().cache().list(now) {
@@ -865,7 +1054,22 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
         store.identity_standing(&identity),
     );
     out_path_text(
-        &render_peer_detail(&destination, peer.as_ref(), successor, &knock, trust, now)
+        &NoticeText::from("who: ")
+            .peer(
+                runtime
+                    .namer()
+                    .who(Some(&identity), &destination)
+                    .to_string(),
+            )
+            .frame("\n")
+            .then(render_peer_detail(
+                &destination,
+                peer.as_ref(),
+                successor,
+                &knock,
+                trust,
+                now,
+            ))
             .render(live_prefix()),
     );
     if matches!(knock, KnockLookup::Unreadable) {
@@ -1085,10 +1289,10 @@ fn drain_inbox(ctx: &RequestContext) -> Result<()> {
             EnvelopePayload::Peer(message) => {
                 let sender = if ctx.app.mesh.is_from_self(&message) {
                     InboxSender::ThisNode {
-                        answered: ctx.app.mesh.peer_name_at(&message.destination),
+                        answered: ctx.app.mesh.who_at(&message.destination),
                     }
                 } else {
-                    InboxSender::Peer(ctx.app.mesh.peer_name(&message))
+                    InboxSender::Peer(ctx.app.mesh.sender(&message))
                 };
                 Some(InboxRow {
                     sender,
@@ -1291,7 +1495,9 @@ fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
     let runtime = live(ctx)?;
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
-    let names = ctx.app.mesh.address_names();
+    let namer = runtime.namer();
+    let name_at =
+        |destination: &str, identity: &str| namer.who(Some(identity), destination).to_string();
     let peers = runtime.peers();
     let left_at = |destination: &str| peers.get(destination).and_then(|peer| peer.left_at);
     let mut asked: Vec<QuestionRow> = ctx
@@ -1304,8 +1510,6 @@ fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
             QuestionRow::outbound(
                 &correlation.record,
                 name_at(
-                    ctx,
-                    &names,
                     &correlation.record.peer_destination,
                     &correlation.record.peer_identity,
                 ),
@@ -1324,7 +1528,7 @@ fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
                 let record = &ask.record;
                 QuestionRow::other_session(
                     record,
-                    name_at(ctx, &names, &record.peer_destination, &record.peer_identity),
+                    name_at(&record.peer_destination, &record.peer_identity),
                     asker.as_ref(),
                 )
                 .waiting_on(record, left_at(&record.peer_destination))
@@ -1346,7 +1550,7 @@ fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
     };
     let (mut access, mut escalated) = (Vec::new(), Vec::new());
     for record in &inbound {
-        let name = name_at(ctx, &names, &record.peer_destination, &record.peer_identity);
+        let name = name_at(&record.peer_destination, &record.peer_identity);
         match record.kind {
             InboundKind::Access => access.push(QuestionRow::access(record, name, now)),
             InboundKind::Question => escalated.push(QuestionRow::inbound(record, name, now)),
@@ -1410,12 +1614,10 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
             if attach.is_some() {
                 ctx.app.mesh.refuse_held_by_envoy(id)?;
             }
-            let name = name_at(
-                ctx,
-                &ctx.app.mesh.address_names(),
-                &record.peer_destination,
-                &record.peer_identity,
-            );
+            let name = ctx
+                .app
+                .mesh
+                .who(&record.peer_identity, &record.peer_destination);
             (
                 QuestionRow::inbound(&record, name, now),
                 Answering::Peer(record.peer_destination),
@@ -1425,11 +1627,9 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
             if wanted != AnswerRoute::Outbound {
                 return Err(asked_not_escalated(id));
             }
-            let name = name_at(
-                ctx,
-                &ctx.app.mesh.address_names(),
-                &correlation.record.peer_destination,
+            let name = ctx.app.mesh.who(
                 &correlation.record.peer_identity,
+                &correlation.record.peer_destination,
             );
             (
                 QuestionRow::outbound(&correlation.record, name),
@@ -1606,12 +1806,10 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     let record = open_escalated_question(ctx, id, now)?;
     let id = &record.id;
     ctx.app.mesh.refuse_dismiss_held_by_envoy(id)?;
-    let name = name_at(
-        ctx,
-        &ctx.app.mesh.address_names(),
-        &record.peer_destination,
-        &record.peer_identity,
-    );
+    let name = ctx
+        .app
+        .mesh
+        .who(&record.peer_identity, &record.peer_destination);
     out_path_text(
         &render_question_block(
             &QuestionRow::inbound(&record, name.clone(), now),
@@ -1687,7 +1885,9 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
             };
             dismiss_all_row(
                 &record.id,
-                &ctx.app.mesh.peer_name_at(&record.peer_destination),
+                &ctx.app
+                    .mesh
+                    .who(&record.peer_identity, &record.peer_destination),
                 &record.peer_destination,
                 &asked,
             )
@@ -1986,14 +2186,8 @@ async fn message(
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let trust = runtime.trust();
-    let name = given_name(
-        &runtime.address_names(),
-        &destination,
-        &peer.identity_hash,
-        Some(runtime.fingerprint()),
-        peer.display_name.as_deref(),
-    )
-    .unwrap_or_else(|| name_label(peer.display_name.as_deref()));
+    let who = runtime.namer().who(Some(&peer.identity_hash), &destination);
+    let name = who.to_string();
     out_path_text(
         &send_confirmation(
             &name,
@@ -2026,21 +2220,28 @@ async fn message(
         .await
         .map_err(quoted_send_failure)?;
     out_path_text(
-        &sent_line(&outcome, &destination, &name, SystemTime::now()).render(live_prefix()),
+        &sent_line(&outcome, &destination, &name, &who.user, SystemTime::now())
+            .render(live_prefix()),
     );
     Ok(())
 }
 
 /// The line `.mesh messaging send` ends with: where the message went, or, for a peer that had
-/// gone, that the propagation node holds it and for whom. `name` is how the peer goes by
-/// here, quoted as it stands.
-fn sent_line(outcome: &SendOutcome, destination: &str, name: &str, now: SystemTime) -> NoticeText {
+/// gone, that the propagation node holds it and for whom. `name` is how the session goes by
+/// here and `user` how its user does, each quoted as it stands.
+fn sent_line(
+    outcome: &SendOutcome,
+    destination: &str,
+    name: &str,
+    user: &str,
+    now: SystemTime,
+) -> NoticeText {
     let head = format!("Sent {} to {}", short(&outcome.id), short(destination));
     match outcome.departed {
         Some(departed) => NoticeText::from(format!("{head}: "))
             .peer(name)
             .frame(format!("{}{HELD_FOR_DEPARTED}", departed.status(now)))
-            .peer(name)
+            .peer(user)
             .frame(format!("{HELD_FOR_DEPARTED_END}. {SEE_WHEN_IT_IS_BACK}")),
         None => NoticeText::from(format!("{head} (via {}).", via_text(outcome.via))),
     }
@@ -2708,7 +2909,13 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let out = OutboundPeer::new(PeerKind::Bulletin, outgoing.text, None, None, None)?;
     let outcome = runtime.broadcast(&out).await?;
-    out_path_text(&render_broadcast(&outcome).render(live_prefix()));
+    let namer = runtime.namer();
+    let who = |destination: &str| {
+        namer
+            .who(runtime.identity_at(destination).as_deref(), destination)
+            .to_string()
+    };
+    out_path_text(&render_broadcast(&outcome, who).render(live_prefix()));
     Ok(())
 }
 
@@ -2781,14 +2988,10 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         bail!(refusal);
     }
     let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
-    let name = given_name(
-        &runtime.address_names(),
-        &destination,
-        &peer.identity_hash,
-        Some(runtime.fingerprint()),
-        peer.display_name.as_deref(),
-    )
-    .unwrap_or_else(|| name_label(peer.display_name.as_deref()));
+    let name = runtime
+        .namer()
+        .who(Some(&peer.identity_hash), &destination)
+        .to_string();
     out_path_text(
         &knock_confirmation(
             &name,
@@ -3939,7 +4142,6 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         "trust",
         &[
             "--yes",
-            "--label",
             "--identity",
             "--older-than",
             "--dry-run",
@@ -3954,7 +4156,7 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let mesh = &*ctx.app.mesh;
     let now = SystemTime::now();
     match arg {
-        TrustArg::Destination { target, label, yes } => {
+        TrustArg::Destination { target, yes } => {
             let destination = destination_hash(ctx, &target)?;
             if let Some(runtime) = mesh.get()
                 && runtime.peers().get(&destination).is_none()
@@ -3980,12 +4182,8 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 out_text(NOTHING_CHANGED);
                 return Ok(());
             }
-            let outcome = store.trust_destination(
-                mesh,
-                &destination,
-                TrustOptions { label, note: None },
-                now,
-            )?;
+            let outcome =
+                store.trust_destination(mesh, &destination, TrustOptions::default(), now)?;
             reset_knock_surfacing(ctx, &outcome.identity_hash);
             let mut lines = vec![trusted_destination_line(&store, &outcome)];
             if outcome.deny_lifted {
@@ -3999,18 +4197,10 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             );
             out_text(&lines.join("\n"));
         }
-        TrustArg::Identity { target, label, yes } => {
+        TrustArg::Identity { target, yes } => {
             let identity = identity_hash(ctx, &target)?;
             let own_identity = live(ctx)?.fingerprint() == identity;
-            if own_identity
-                && grants_all(&store, &identity)
-                && (label.is_none()
-                    || store.records().iter().any(|record| {
-                        record.tier == Tier::Identity
-                            && record.hash == identity
-                            && record.label == label
-                    }))
-            {
+            if own_identity && grants_all(&store, &identity) {
                 out_text(&format!(
                     "{OWN_IDENTITY_TRUSTED} It is already trusted for every instance, so nothing was changed; .mesh access revoke --identity {identity} takes the grant back."
                 ));
@@ -4032,8 +4222,7 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 out_text(NOTHING_CHANGED);
                 return Ok(());
             }
-            let change =
-                store.trust_identity(mesh, &identity, TrustOptions { label, note: None }, now)?;
+            let change = store.trust_identity(mesh, &identity, TrustOptions::default(), now)?;
             reset_knock_surfacing(ctx, &identity);
             let mut lines = vec![format!(
                 "Trusted identity {}, all destinations - {}.",
@@ -6636,27 +6825,24 @@ enum HashKind {
 impl HashKind {
     fn noun(self) -> &'static str {
         match self {
-            HashKind::Destination => "destination",
-            HashKind::Identity => "identity",
-            HashKind::Peer => "peer",
+            HashKind::Destination => "session",
+            HashKind::Identity => "user",
+            HashKind::Peer => "user or session",
             HashKind::Message => "pending id",
         }
     }
 
     fn plural(self) -> &'static str {
         match self {
-            HashKind::Destination => "destinations",
-            HashKind::Identity => "identities",
-            HashKind::Peer => "peers",
+            HashKind::Destination => "sessions",
+            HashKind::Identity => "users",
+            HashKind::Peer => "users or sessions",
             HashKind::Message => "pending ids",
         }
     }
 
     fn article(self) -> &'static str {
-        match self {
-            HashKind::Identity => "an",
-            HashKind::Destination | HashKind::Peer | HashKind::Message => "a",
-        }
+        "a"
     }
 
     /// The verbs whose output the user is expected to read the hash off, as a clause
@@ -6714,7 +6900,7 @@ where
     match matches.len() {
         1 => Ok(matches.remove(0)),
         0 => bail!(
-            "{} {token} has not been heard from: no {noun} this node knows starts with it. Give the whole hash, or check what {}.",
+            "{} {token} has not been heard from: no {noun} you know starts with it. Give the whole hash, or check what {}.",
             title_case(noun),
             kind.listing()
         ),
@@ -6958,11 +7144,12 @@ fn known_hashes(ctx: &RequestContext, kind: HashKind) -> Vec<String> {
     known
 }
 
-/// The hash `token` names for a verb: a whole hash as given, else one of your session
-/// names or trust labels spelled exactly (case aside), else `resolve_hash` over what the
-/// node knows of `kind` and what `also_known` adds. A name therefore beats a hex prefix
-/// it happens to look like. The stores are read only once a whole hash has been ruled
-/// out, and the prefix candidates only once no name matched.
+/// The hash `token` names for a verb: a whole hash as given, else `<user>/<session>`,
+/// else a user's or session's name spelled exactly (case aside), else `resolve_hash` over
+/// what the node knows of `kind` and what `also_known` adds. A name therefore beats a hex
+/// prefix it happens to look like. The stores are read only once a whole hash has been
+/// ruled out, and the prefix candidates only once no name matched. Only a hash comes
+/// out, so a name never reaches the wire.
 fn resolve_known(
     ctx: &RequestContext,
     token: &str,
@@ -6973,6 +7160,15 @@ fn resolve_known(
         return Ok(hash);
     }
     let names = ctx.app.mesh.address_names();
+    if let Some((user, session)) = token.split_once('/') {
+        let sessions = ctx
+            .app
+            .mesh
+            .get()
+            .map(|runtime| runtime.known_sessions())
+            .unwrap_or_default();
+        return resolve_path(user, session, kind, &names, &sessions).map_err(QuotingError::wrap);
+    }
     if let Some(resolved) = resolve_name(token, kind, &names) {
         return resolved;
     }
@@ -6981,6 +7177,11 @@ fn resolve_known(
     {
         return Err(QuotingError::wrap(refusal));
     }
+    if kind == HashKind::Destination
+        && let Some(resolved) = resolve_user_prefix(ctx, token, &names)
+    {
+        return resolved;
+    }
     resolve_hash(
         token,
         kind,
@@ -6988,6 +7189,50 @@ fn resolve_known(
             .flatten()
             .chain(std::iter::once_with(also_known).flatten()),
     )
+}
+
+/// A session wanted and `token` a prefix of no session's hash but of exactly one user's,
+/// as `.mesh people list` shows an unnamed user: that user's one session, or the refusal
+/// listing their sessions, as for a user's name. `None` leaves `token` to the hash rules.
+fn resolve_user_prefix(
+    ctx: &RequestContext,
+    token: &str,
+    names: &[AddressName],
+) -> Option<Result<String>> {
+    if !is_hash_prefix(token) {
+        return None;
+    }
+    let prefix = token.to_ascii_lowercase();
+    if known_hashes(ctx, HashKind::Destination)
+        .iter()
+        .any(|hash| hash.starts_with(&prefix))
+    {
+        return None;
+    }
+    let sessions = ctx.app.mesh.get()?.known_sessions();
+    let mut users: Vec<&str> = sessions
+        .iter()
+        .filter(|(identity, _)| identity.starts_with(&prefix))
+        .map(|(identity, _)| identity.as_str())
+        .collect();
+    users.sort_unstable();
+    users.dedup();
+    let [identity] = users.as_slice() else {
+        return None;
+    };
+    let theirs: Vec<String> = sessions
+        .iter()
+        .filter(|(at, _)| at == identity)
+        .map(|(_, destination)| destination.clone())
+        .collect();
+    Some(match theirs.as_slice() {
+        [one] => Ok(one.clone()),
+        _ => Err(QuotingError::wrap(unpicked_user(
+            &user_label(names, identity),
+            &theirs,
+            names,
+        ))),
+    })
 }
 
 fn destination_hash(ctx: &RequestContext, token: &str) -> Result<String> {
@@ -7003,21 +7248,21 @@ fn peer_hash(ctx: &RequestContext, token: &str) -> Result<String> {
     resolve_known(ctx, token, HashKind::Peer, Vec::new)
 }
 
-/// Whether a name can stand for a `kind` argument. Sessions and destination labels name
-/// instances, so an identity is only ever named by the label of an identity grant.
+/// Whether a name can stand for a `kind` argument. A session's name names that session,
+/// so a user is only ever named by a user's name.
 fn name_applies(kind: HashKind, target: &NameTarget) -> bool {
     match kind {
         HashKind::Destination | HashKind::Peer => true,
-        HashKind::Identity => matches!(target, NameTarget::IdentityLabel { .. }),
+        HashKind::Identity => matches!(target, NameTarget::User { .. }),
         HashKind::Message => false,
     }
 }
 
-/// The hash a name gives a `kind` argument; `None` for an identity label that does not
-/// pick one instance when a destination is wanted.
+/// The hash a name gives a `kind` argument; `None` for a user whose name does not pick
+/// one session when a session is wanted.
 fn named_hash(kind: HashKind, target: &NameTarget) -> Option<String> {
     match (kind, target) {
-        (HashKind::Peer | HashKind::Identity, NameTarget::IdentityLabel { identity, .. }) => {
+        (HashKind::Peer | HashKind::Identity, NameTarget::User { identity, .. }) => {
             Some(identity.clone())
         }
         _ => target.destination().map(str::to_string),
@@ -7042,7 +7287,7 @@ fn resolve_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<Re
         .filter(|name| name_applies(kind, &name.target))
         .collect();
     if usable.is_empty() {
-        return Some(Err(QuotingError::wrap(not_an_identity(token, &matches))));
+        return Some(Err(QuotingError::wrap(not_a_user(token, &matches, names))));
     }
     let hashes: Vec<Option<String>> = usable
         .iter()
@@ -7057,168 +7302,384 @@ fn resolve_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<Re
         [
             AddressName {
                 name,
-                target:
-                    NameTarget::IdentityLabel {
-                        identity,
-                        instances,
-                    },
+                target: NameTarget::User { sessions, .. },
             },
-        ] => unpicked_identity_label(name, identity, instances),
-        _ => ambiguous_name(token, kind, &usable),
+        ] => unpicked_user(name, sessions, names),
+        _ => ambiguous_name(token, kind, &usable, names),
     };
     Some(Err(QuotingError::wrap(refusal)))
 }
 
+/// What a user's own name or, failing that, short hash reads as in a refusal.
+fn user_label(names: &[AddressName], identity: &str) -> String {
+    names
+        .iter()
+        .find(|name| {
+            matches!(&name.target, NameTarget::User { identity: at, .. } if same_hash(at, identity))
+        })
+        .map(|name| name.name.clone())
+        .unwrap_or_else(|| short(identity).to_string())
+}
+
+/// What a session's name or, failing that, short hash reads as in a refusal.
+fn session_label(names: &[AddressName], destination: &str) -> String {
+    names
+        .iter()
+        .find(|name| {
+            matches!(
+                &name.target,
+                NameTarget::Session { destination: at, .. }
+                    | NameTarget::UserSession { destination: at, .. }
+                    if same_hash(at, destination)
+            )
+        })
+        .map(|name| name.name.clone())
+        .unwrap_or_else(|| short(destination).to_string())
+}
+
+/// `<user>/<session>` as it can be typed back: each part a name when it has one, else a
+/// short hash.
+fn typed_path(names: &[AddressName], identity: &str, destination: &str) -> String {
+    format!(
+        "{}/{}",
+        user_label(names, identity),
+        session_label(names, destination)
+    )
+}
+
+/// The hash `<user>/<session>` names: the user by name or hash prefix, then one of their
+/// sessions (`sessions` pairs each known session's identity with its destination) by name
+/// or hash prefix. A `kind` that wants a user gets the session's user.
+fn resolve_path(
+    user: &str,
+    session: &str,
+    kind: HashKind,
+    names: &[AddressName],
+    sessions: &[(String, String)],
+) -> std::result::Result<String, NoticeText> {
+    let typed = format!("{user}/{session}");
+    let spelled = user.to_lowercase();
+    let named: Vec<&str> = names
+        .iter()
+        .filter(|name| {
+            name.name.to_lowercase() == spelled && matches!(name.target, NameTarget::User { .. })
+        })
+        .map(|name| name.target.identity())
+        .collect();
+    let identity = match named.as_slice() {
+        [one] => one.to_string(),
+        _ => {
+            let prefix = user.to_ascii_lowercase();
+            let mut identities: Vec<&str> = sessions
+                .iter()
+                .map(|(identity, _)| identity.as_str())
+                .filter(|identity| is_hash_prefix(user) && identity.starts_with(&prefix))
+                .collect();
+            identities.sort_unstable();
+            identities.dedup();
+            match (canonical_hash(user), identities.as_slice()) {
+                (Some(whole), _) => whole,
+                (None, [one]) => one.to_string(),
+                (None, []) => return Err(no_such_user(&typed, user)),
+                (None, many) => {
+                    let shorts: Vec<String> =
+                        many.iter().map(|hash| short(hash).to_string()).collect();
+                    return Err(NoticeText::default().frame("'").peer(typed).frame(format!(
+                        "' names more than one user: {}. Give more characters of the user's hash.",
+                        join_and(&shorts)
+                    )));
+                }
+            }
+        }
+    };
+    if kind == HashKind::Identity {
+        return Ok(identity);
+    }
+    let mut theirs: Vec<&str> = sessions
+        .iter()
+        .filter(|(at, _)| same_hash(at, &identity))
+        .map(|(_, destination)| destination.as_str())
+        .collect();
+    theirs.sort_unstable();
+    theirs.dedup();
+    let spelled = session.to_lowercase();
+    let mut named: Vec<&str> = names
+        .iter()
+        .filter(|name| {
+            name.name.to_lowercase() == spelled
+                && matches!(
+                    name.target,
+                    NameTarget::Session { .. } | NameTarget::UserSession { .. }
+                )
+                && same_hash(name.target.identity(), &identity)
+        })
+        .filter_map(|name| name.target.destination())
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    if let [one] = named.as_slice() {
+        return Ok(one.to_string());
+    }
+    if let Some(whole) = canonical_hash(session) {
+        // A whole hash still has to be one of this user's sessions, so a name typed
+        // before it never borrows another user's session.
+        return match theirs.iter().find(|at| same_hash(at, &whole)) {
+            Some(_) => Ok(whole),
+            None => Err(no_such_session(&typed, user, &identity, &theirs, names)),
+        };
+    }
+    let prefix = session.to_ascii_lowercase();
+    let matched: Vec<&str> = match named.as_slice() {
+        [] if is_hash_prefix(session) => theirs
+            .iter()
+            .copied()
+            .filter(|destination| destination.starts_with(&prefix))
+            .collect(),
+        _ => named,
+    };
+    match matched.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => Err(no_such_session(&typed, user, &identity, &theirs, names)),
+        many => {
+            let listed = join_and_text(
+                many.iter()
+                    .map(|destination| quoted_path(user, short(destination)))
+                    .collect(),
+            );
+            Err(NoticeText::default()
+                .frame("'")
+                .peer(typed)
+                .frame("' names more than one session: ")
+                .then(listed)
+                .frame(". Type the one you mean in its place."))
+        }
+    }
+}
+
+fn no_such_user(typed: &str, user: &str) -> NoticeText {
+    NoticeText::default()
+        .frame("'")
+        .peer(typed)
+        .frame("' names no user you know: no user is called '")
+        .peer(user)
+        .frame(format!(
+            "' and no user's hash starts with it. `.mesh people list` lists the users and sessions you can name, and `.mesh people name <user> \"name\"` names one; a hash needs {HASH_PREFIX_MIN_CHARS} or more characters."
+        ))
+}
+
+fn no_such_session(
+    typed: &str,
+    user: &str,
+    identity: &str,
+    theirs: &[&str],
+    names: &[AddressName],
+) -> NoticeText {
+    let head = NoticeText::default()
+        .frame("'")
+        .peer(typed)
+        .frame("' names no session: ");
+    if theirs.is_empty() {
+        return head.frame(format!(
+            "you have heard no session of this user ({}) yet. Wait until one announces (`.mesh people list` lists it then), or type a session hash in its place.",
+            short(identity)
+        ));
+    }
+    let listed = join_and_text(
+        theirs
+            .iter()
+            .map(|destination| quoted_path(user, &session_label(names, destination)))
+            .collect(),
+    );
+    head.frame("the sessions you know of this user are ")
+        .then(listed)
+        .frame(". Type one of those in its place.")
+}
+
+/// `` `<user>/<session>` `` with the path a peer run, as it is typed back.
+fn quoted_path(user: &str, session: &str) -> NoticeText {
+    NoticeText::default()
+        .frame("`")
+        .peer(format!("{user}/{session}"))
+        .frame("`")
+}
+
 /// One name as a refusal lists it, with the hash a reader can type in its place.
-fn describe_name(name: &AddressName, kind: HashKind) -> NoticeText {
+fn describe_name(name: &AddressName, kind: HashKind, names: &[AddressName]) -> NoticeText {
     let text = NoticeText::default();
     match &name.target {
         NameTarget::Session { destination, .. } => text
             .frame("your session `")
             .peer(name.name.as_str())
             .frame(format!("` at {}", short(destination))),
-        NameTarget::DestinationLabel { destination, .. } => text
-            .frame("the trust label `")
-            .peer(name.name.as_str())
-            .frame(format!("` on destination {}", short(destination))),
-        NameTarget::IdentityLabel {
+        NameTarget::UserSession {
+            destination,
             identity,
-            instances,
-        } => {
+        } => text
+            .frame("the session `")
+            .peer(typed_path(names, identity, destination))
+            .frame(format!("` at {}", short(destination))),
+        NameTarget::User { identity, sessions } => {
             let text = text
-                .frame("the trust label `")
+                .frame("the user `")
                 .peer(name.name.as_str())
-                .frame(format!("` on identity {}", short(identity)));
+                .frame(format!("` ({})", short(identity)));
             if kind != HashKind::Destination {
                 return text;
             }
-            match instances.as_slice() {
-                [] => text.frame(", not heard yet"),
+            match sessions.as_slice() {
+                [] => text.frame(", no session heard yet"),
                 heard => {
                     let shorts: Vec<String> =
                         heard.iter().map(|hash| short(hash).to_string()).collect();
-                    text.frame(format!(", heard at {}", join_and(&shorts)))
+                    text.frame(format!(", with sessions at {}", join_and(&shorts)))
                 }
             }
         }
     }
 }
 
-fn joined_names(names: &[&AddressName], kind: HashKind) -> NoticeText {
-    names
+fn joined_names(matched: &[&AddressName], kind: HashKind, names: &[AddressName]) -> NoticeText {
+    matched
         .iter()
         .enumerate()
         .fold(NoticeText::default(), |text, (at, name)| {
             let text = match at {
                 0 => text,
-                _ if at + 1 == names.len() => text.frame(" and "),
+                _ if at + 1 == matched.len() => text.frame(" and "),
                 _ => text.frame(", "),
             };
-            text.then(describe_name(name, kind))
+            text.then(describe_name(name, kind, names))
         })
 }
 
-/// Two or more names spelled `token` that give different hashes.
-fn ambiguous_name(token: &str, kind: HashKind, names: &[&AddressName]) -> NoticeText {
+/// Two or more names spelled `token` that give different hashes: your session and
+/// another user's, or sessions of two users.
+fn ambiguous_name(
+    token: &str,
+    kind: HashKind,
+    matched: &[&AddressName],
+    names: &[AddressName],
+) -> NoticeText {
     let text = NoticeText::default()
         .frame("'")
         .peer(token)
         .frame(format!("' names more than one {}: ", kind.noun()))
-        .then(joined_names(names, kind));
-    let example = names
+        .then(joined_names(matched, kind, names));
+    let example = matched
         .iter()
         .find_map(|name| named_hash(kind, &name.target))
         .map(|hash| format!(", e.g. {}", short(&hash)))
         .unwrap_or_default();
     text.frame(format!(
-        ". Type the hash of the one you mean in its place{example}; the 8 characters shown are enough."
+        ". Type `<user>/<session>` or the hash of the one you mean in its place{example}; the 8 characters shown are enough."
     ))
 }
 
-/// An identity label wanted as a destination when the peer table holds no instance of
-/// the identity, or more than one.
-fn unpicked_identity_label(name: &str, identity: &str, instances: &[String]) -> NoticeText {
+/// A user named where one session is wanted, when none of their sessions is known or
+/// more than one is.
+fn unpicked_user(name: &str, sessions: &[String], names: &[AddressName]) -> NoticeText {
     let head = NoticeText::default()
-        .frame("The trust label `")
+        .frame("`")
         .peer(name)
-        .frame(format!("` is on identity {}", short(identity)));
-    if instances.is_empty() {
-        return head.frame(", and this node has heard no instance of it, so there is no destination to use yet. Wait until it announces (`.mesh people list` lists it then), or type a destination hash in its place.");
+        .frame("` is a user");
+    if sessions.is_empty() {
+        return head.frame(", and you have heard no session of theirs, so there is no session to use yet. Wait until one announces (`.mesh people list` lists it then), or type a session hash in its place.");
     }
-    let shorts: Vec<String> = instances
+    let paths: Vec<NoticeText> = sessions
         .iter()
-        .map(|hash| short(hash).to_string())
-        .collect();
-    head.frame(format!(
-        ", which runs {} instances this node has heard: {}. Type the one you mean in its place, or give each its own name with `.mesh access trust <destination> --label <name>`.",
-        instances.len(),
-        join_and(&shorts)
-    ))
-}
-
-/// Names spelled `token` that only stand for instances, given where an identity is wanted.
-fn not_an_identity(token: &str, names: &[&AddressName]) -> NoticeText {
-    let mut identities: Vec<String> = names
-        .iter()
-        .filter_map(|name| match &name.target {
-            NameTarget::Session { identity, .. } => Some(identity.clone()),
-            NameTarget::DestinationLabel { identity, .. } => identity.clone(),
-            NameTarget::IdentityLabel { identity, .. } => Some(identity.clone()),
+        .map(|destination| {
+            NoticeText::default()
+                .frame("`")
+                .peer(format!("{name}/{}", session_label(names, destination)))
+                .frame(format!("` ({})", short(destination)))
         })
         .collect();
-    identities.sort_unstable();
-    identities.dedup();
+    let count = paths.len();
+    let listed = paths
+        .into_iter()
+        .enumerate()
+        .fold(NoticeText::default(), |text, (at, path)| {
+            let text = match at {
+                0 => text,
+                _ if at + 1 == count => text.frame(" and "),
+                _ => text.frame(", "),
+            };
+            text.then(path)
+        });
+    head.frame(format!(" with {count} sessions you have heard: "))
+        .then(listed)
+        .frame(". Type the one you mean in its place; `.mesh people name <user>/<session> \"name\"` names a session.")
+}
+
+/// Names spelled `token` that only stand for sessions, given where a user is wanted.
+fn not_a_user(token: &str, matched: &[&AddressName], names: &[AddressName]) -> NoticeText {
+    let mut users: Vec<String> = matched
+        .iter()
+        .map(|name| user_label(names, name.target.identity()))
+        .collect();
+    users.sort_unstable();
+    users.dedup();
     let text = NoticeText::default()
         .frame("'")
         .peer(token)
         .frame("' is ")
-        .then(joined_names(names, HashKind::Identity))
-        .frame(", which names a running instance, not an identity; ");
-    match identities.as_slice() {
-        [] => text.frame(
-            "run `.mesh people list` to see its identity hash, then type that hash in its place.",
-        ),
-        [one] => text.frame(format!("type its identity hash {one} in its place.")),
-        many => text.frame(format!(
-            "type one of the identity hashes {} in its place.",
-            many.join(", ")
-        )),
+        .then(joined_names(matched, HashKind::Identity, names))
+        .frame(", which names a session, not a user; type its user ");
+    let quoted = |text: NoticeText, user: &str| text.frame("`").peer(user).frame("`");
+    match users.as_slice() {
+        [one] => quoted(text, one).frame(" in its place."),
+        many => {
+            let mut text = text.frame("(one of ");
+            for (at, user) in many.iter().enumerate() {
+                if at > 0 {
+                    text = text.frame(", ");
+                }
+                text = quoted(text, user);
+            }
+            text.frame(") in its place.")
+        }
     }
 }
 
 /// The refusal for a token that is neither a hash nor one of the names `kind` takes,
 /// listing those names and the closest one; `None` when there are none to list, which
 /// leaves the hash rules' own wording. Only one-word names are listed, as only those
-/// can be typed where one token is read.
+/// can be typed where one token is read. Another user's session is listed as
+/// `<user>/<session>`, which is how it is typed when its name alone is not unique.
 fn unknown_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<NoticeText> {
-    let mut sessions: Vec<&str> = Vec::new();
-    let mut labels: Vec<&str> = Vec::new();
-    for name in names
-        .iter()
-        .filter(|name| name_applies(kind, &name.target) && !name.name.contains(char::is_whitespace))
-    {
-        let list = match name.target {
-            NameTarget::Session { .. } => &mut sessions,
-            NameTarget::DestinationLabel { .. } | NameTarget::IdentityLabel { .. } => &mut labels,
+    let mut sessions: Vec<String> = Vec::new();
+    let mut users: Vec<String> = Vec::new();
+    let mut theirs: Vec<String> = Vec::new();
+    let mut spelled: Vec<String> = Vec::new();
+    for name in names.iter().filter(|name| {
+        name_applies(kind, &name.target)
+            && name.name != YOU
+            && !name.name.contains(char::is_whitespace)
+    }) {
+        let (list, shown) = match &name.target {
+            NameTarget::Session { .. } => (&mut sessions, name.name.clone()),
+            NameTarget::User { .. } => (&mut users, name.name.clone()),
+            NameTarget::UserSession {
+                destination,
+                identity,
+            } => (&mut theirs, typed_path(names, identity, destination)),
         };
-        if !list.contains(&name.name.as_str()) {
-            list.push(&name.name);
+        if !spelled.contains(&name.name) {
+            spelled.push(name.name.clone());
+        }
+        if !list.contains(&shown) {
+            list.push(shown);
         }
     }
-    if sessions.is_empty() && labels.is_empty() {
+    if spelled.is_empty() {
         return None;
     }
     let noun = kind.noun();
     let article = kind.article();
-    let named = if sessions.is_empty() {
-        "trust labels"
-    } else {
-        "sessions or trust labels"
-    };
     let mut text = NoticeText::default().frame("'").peer(token).frame(format!(
-        "' is not {article} {noun} hash, and none of your {named} is called that."
+        "' is not {article} {noun} hash, and no user or session you know is called that."
     ));
-    if let Some(closest) = closest_name(token, sessions.iter().chain(&labels).copied()) {
+    if let Some(closest) = closest_name(token, spelled.iter().map(String::as_str)) {
         text = text
             .frame(" Did you mean `")
             .peer(closest)
@@ -7226,7 +7687,8 @@ fn unknown_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<No
     }
     for (heading, list) in [
         ("Your sessions: ", &sessions),
-        ("Your trust labels: ", &labels),
+        ("Users: ", &users),
+        ("Their sessions: ", &theirs),
     ] {
         if list.is_empty() {
             continue;
@@ -7236,7 +7698,7 @@ fn unknown_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<No
             if at > 0 {
                 text = text.frame(", ");
             }
-            text = text.frame("`").peer(*name).frame("`");
+            text = text.frame("`").peer(name.as_str()).frame("`");
         }
         text = text.frame(".");
     }
@@ -7280,7 +7742,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod name_addressing_tests {
-    use super::tests::{peer, table_rows};
+    use super::tests::{peer, table_header, table_rows};
     use super::*;
     use crate::render::{MeshVerbError, command_error_text};
 
@@ -7300,22 +7762,22 @@ mod name_addressing_tests {
         }
     }
 
-    fn destination_label(name: &str, destination: &str) -> AddressName {
+    fn user_session(name: &str, destination: &str) -> AddressName {
         AddressName {
             name: name.to_string(),
-            target: NameTarget::DestinationLabel {
+            target: NameTarget::UserSession {
                 destination: destination.to_string(),
-                identity: Some(MAKI.to_string()),
+                identity: MAKI.to_string(),
             },
         }
     }
 
-    fn identity_label(name: &str, instances: &[&str]) -> AddressName {
+    fn user(name: &str, sessions: &[&str]) -> AddressName {
         AddressName {
             name: name.to_string(),
-            target: NameTarget::IdentityLabel {
+            target: NameTarget::User {
                 identity: MAKI.to_string(),
-                instances: instances.iter().map(|hash| hash.to_string()).collect(),
+                sessions: sessions.iter().map(|hash| hash.to_string()).collect(),
             },
         }
     }
@@ -7323,8 +7785,8 @@ mod name_addressing_tests {
     fn names() -> Vec<AddressName> {
         vec![
             session("temp", TEMP),
-            destination_label("maki-laptop", LAPTOP),
-            identity_label("maki", &[LAPTOP]),
+            user_session("laptop", LAPTOP),
+            user("maki", &[LAPTOP]),
         ]
     }
 
@@ -7341,101 +7803,117 @@ mod name_addressing_tests {
             .to_string()
     }
 
-    /// Your session name and your labels give their destination, spelled in any case.
+    /// Your session's name and another user's session's name give that session, and a
+    /// user with one session heard gives that session, spelled in any case.
     #[test]
-    fn a_session_name_or_a_label_gives_its_destination() {
+    fn a_session_name_or_a_user_with_one_session_gives_the_session() {
         let names = names();
         assert_eq!(resolved("temp", HashKind::Destination, &names), TEMP);
         assert_eq!(resolved("TEMP", HashKind::Destination, &names), TEMP);
-        assert_eq!(
-            resolved("maki-laptop", HashKind::Destination, &names),
-            LAPTOP
-        );
-        assert_eq!(resolved("maki-laptop", HashKind::Peer, &names), LAPTOP);
+        assert_eq!(resolved("laptop", HashKind::Destination, &names), LAPTOP);
+        assert_eq!(resolved("Laptop", HashKind::Peer, &names), LAPTOP);
         assert_eq!(
             resolved("maki", HashKind::Destination, &names),
             LAPTOP,
-            "an identity label with one heard instance gives that instance"
+            "a user with one session heard gives that session"
         );
     }
 
-    /// An identity is named only by an identity label; the peer form takes it as the
-    /// identity, and an instance name is refused with the identity hash to type.
+    /// A user is named only by a user's name; the peer form takes it as the user, and a
+    /// session's name is refused with its user to type.
     #[test]
-    fn an_identity_is_named_only_by_an_identity_label() {
+    fn a_user_is_named_only_by_a_users_name() {
         let names = names();
         assert_eq!(resolved("maki", HashKind::Identity, &names), MAKI);
         assert_eq!(resolved("maki", HashKind::Peer, &names), MAKI);
+        let text = refusal("laptop", HashKind::Identity, &names);
+        assert!(text.contains("names a session, not a user"), "{text}");
+        assert!(
+            text.ends_with("type its user `maki` in its place."),
+            "{text}"
+        );
         let text = refusal("temp", HashKind::Identity, &names);
-        assert!(text.contains("not an identity"), "{text}");
-        assert!(text.contains(&format!("identity hash {ME}")), "{text}");
+        assert!(
+            text.ends_with(&format!("type its user `{}` in its place.", short(ME))),
+            "{text}"
+        );
     }
 
-    /// A name two targets share is refused with both, and an identity label over two
-    /// heard instances is refused with each instance and how to name it.
+    /// A name your session and another user's session share is refused with both, and a
+    /// user with several sessions is refused with each session as `<user>/<session>`.
     #[test]
     fn an_ambiguous_name_is_refused_with_the_candidates() {
-        let names = vec![session("maki", TEMP), destination_label("Maki", LAPTOP)];
-        let text = refusal("maki", HashKind::Destination, &names);
-        assert!(text.contains("names more than one destination"), "{text}");
+        let names = vec![session("review", TEMP), user_session("Review", LAPTOP)];
+        let text = refusal("review", HashKind::Destination, &names);
+        assert!(text.contains("names more than one session"), "{text}");
         assert!(
             text.contains(short(TEMP)) && text.contains(short(LAPTOP)),
             "{text}"
         );
-        assert!(text.contains("Type the hash of the one you mean"), "{text}");
-
-        let names = vec![identity_label("maki", &[LAPTOP, MAKI_DESK])];
-        let text = refusal("maki", HashKind::Destination, &names);
-        assert!(text.contains("runs 2 instances"), "{text}");
-        assert!(text.contains(short(MAKI_DESK)), "{text}");
         assert!(
-            text.contains("`.mesh access trust <destination> --label <name>`"),
+            text.contains("Type `<user>/<session>` or the hash of the one you mean"),
             "{text}"
         );
 
-        let names = vec![identity_label("maki", &[])];
+        let names = vec![
+            user("maki", &[LAPTOP, MAKI_DESK]),
+            user_session("laptop", LAPTOP),
+        ];
         let text = refusal("maki", HashKind::Destination, &names);
-        assert!(text.contains("heard no instance"), "{text}");
+        assert!(
+            text.starts_with("`maki` is a user with 2 sessions you have heard: "),
+            "{text}"
+        );
+        assert!(text.contains("`maki/laptop` (22222222)"), "{text}");
+        assert!(text.contains("`maki/44444444` (44444444)"), "{text}");
+        assert!(
+            text.contains("`.mesh people name <user>/<session> \"name\"`"),
+            "{text}"
+        );
+        assert_eq!(
+            resolved("maki", HashKind::Peer, &names),
+            MAKI,
+            "a user's reach needs no one session"
+        );
+
+        let names = vec![user("maki", &[])];
+        let text = refusal("maki", HashKind::Destination, &names);
+        assert!(text.contains("heard no session of theirs"), "{text}");
     }
 
     /// Each refusal a name meets says what was typed, why it does not serve, and the
     /// exact thing to type next.
     #[test]
     fn a_refused_name_gives_what_why_and_the_next_command() {
-        let names = vec![session("maki", TEMP), destination_label("Maki", LAPTOP)];
-        let text = refusal("maki", HashKind::Destination, &names);
+        let names = vec![
+            session("review", TEMP),
+            user_session("Review", LAPTOP),
+            user("maki", &[LAPTOP]),
+        ];
+        let text = refusal("review", HashKind::Destination, &names);
         assert!(
-            text.starts_with("'maki' names more than one destination: "),
+            text.starts_with("'review' names more than one session: "),
             "{text}"
         );
-        assert!(text.contains("your session `maki` at 11111111"), "{text}");
+        assert!(text.contains("your session `review` at 11111111"), "{text}");
         assert!(
-            text.contains("Type the hash of the one you mean in its place, e.g. 11111111;"),
-            "{text}"
-        );
-
-        let names = vec![AddressName {
-            name: "desk".to_string(),
-            target: NameTarget::DestinationLabel {
-                destination: MAKI_DESK.to_string(),
-                identity: None,
-            },
-        }];
-        let text = refusal("desk", HashKind::Identity, &names);
-        assert!(
-            text.starts_with("'desk' is the trust label `desk`"),
+            text.contains("the session `maki/Review` at 22222222"),
             "{text}"
         );
         assert!(
-            text.contains("names a running instance, not an identity"),
-            "{text}"
-        );
-        assert!(
-            text.ends_with(
-                "run `.mesh people list` to see its identity hash, then type that hash in its place."
+            text.contains(
+                "Type `<user>/<session>` or the hash of the one you mean in its place, e.g. 11111111;"
             ),
             "{text}"
         );
+
+        let names = vec![user_session("desk", MAKI_DESK)];
+        let text = refusal("desk", HashKind::Identity, &names);
+        assert!(
+            text.starts_with(&format!("'desk' is the session `{}/desk`", short(MAKI))),
+            "{text}"
+        );
+        assert!(text.contains("names a session, not a user"), "{text}");
 
         let refused = QuotingError::followed_by(
             QuotingError::wrap(
@@ -7444,12 +7922,9 @@ mod name_addressing_tests {
             quote_status_tail(".info"),
         );
         let text = command_error_text(&MeshVerbError::wrap(refused), CommandPrefix::Slash);
+        assert!(text.contains("'working' is not a session hash"), "{text}");
         assert!(
-            text.contains("'working' is not a destination hash"),
-            "{text}"
-        );
-        assert!(
-            text.contains("none of your sessions or trust labels is called that"),
+            text.contains("no user or session you know is called that"),
             "{text}"
         );
         assert!(
@@ -7459,7 +7934,7 @@ mod name_addressing_tests {
     }
 
     /// A token no name is spelled as is left to the hash rules, so whole hashes and
-    /// prefixes still resolve; a label that looks like a prefix is taken as the label.
+    /// prefixes still resolve.
     #[test]
     fn hashes_and_prefixes_still_resolve() {
         let names = names();
@@ -7469,29 +7944,34 @@ mod name_addressing_tests {
             resolve_hash(&LAPTOP[..8], HashKind::Destination, [LAPTOP.to_string()]).unwrap(),
             LAPTOP
         );
-        let names = vec![destination_label("33333333", LAPTOP)];
-        assert_eq!(resolved("33333333", HashKind::Destination, &names), LAPTOP);
     }
 
-    /// An unknown name says so, lists your sessions and labels and offers the closest.
+    /// An unknown name says so, lists your sessions, the users and their sessions, and
+    /// offers the closest; `you` is never listed.
     #[test]
     fn an_unknown_name_lists_the_names_with_a_did_you_mean() {
-        let names = names();
+        let mut names = names();
+        names.push(AddressName {
+            name: YOU.to_string(),
+            target: NameTarget::User {
+                identity: ME.to_string(),
+                sessions: vec![TEMP.to_string()],
+            },
+        });
         let text = unknown_name("tmep", HashKind::Destination, &names)
             .unwrap()
             .plain();
         assert!(
             text.starts_with(
-                "'tmep' is not a destination hash, and none of your sessions or trust labels is called that."
+                "'tmep' is not a session hash, and no user or session you know is called that."
             ),
             "{text}"
         );
         assert!(text.contains("Did you mean `temp`?"), "{text}");
         assert!(text.contains("Your sessions: `temp`."), "{text}");
-        assert!(
-            text.contains("Your trust labels: `maki-laptop`, `maki`."),
-            "{text}"
-        );
+        assert!(text.contains("Users: `maki`."), "{text}");
+        assert!(text.contains("Their sessions: `maki/laptop`."), "{text}");
+        assert!(!text.contains("`you`"), "{text}");
 
         let text = unknown_name("zebra-crossing", HashKind::Destination, &names)
             .unwrap()
@@ -7502,19 +7982,141 @@ mod name_addressing_tests {
             .unwrap()
             .plain();
         assert!(text.contains("Did you mean `maki`?"), "{text}");
-        assert!(
-            !text.contains("temp"),
-            "an identity takes no session: {text}"
-        );
+        assert!(!text.contains("temp"), "a user takes no session: {text}");
         assert!(unknown_name("tmep", HashKind::Destination, &[]).is_none());
         assert!(
             unknown_name(
                 "tmep",
                 HashKind::Destination,
-                &[destination_label("this node", LAPTOP)]
+                &[user_session("two words", LAPTOP)]
             )
             .is_none(),
             "a name of two words is not listed as one to type"
+        );
+    }
+
+    /// The sessions `<user>/<session>` picks from: two of maki's, one unnamed, and one of
+    /// another user's that shares a session name.
+    fn path_world() -> (Vec<AddressName>, Vec<(String, String)>) {
+        let bea = "66666666666666666666666666666666";
+        let bea_review = "77777777777777777777777777777777";
+        let names = vec![
+            session("temp", TEMP),
+            AddressName {
+                name: YOU.to_string(),
+                target: NameTarget::User {
+                    identity: ME.to_string(),
+                    sessions: vec![TEMP.to_string()],
+                },
+            },
+            user("maki", &[LAPTOP, MAKI_DESK]),
+            user_session("review", LAPTOP),
+            AddressName {
+                name: "bea".to_string(),
+                target: NameTarget::User {
+                    identity: bea.to_string(),
+                    sessions: vec![bea_review.to_string()],
+                },
+            },
+            AddressName {
+                name: "review".to_string(),
+                target: NameTarget::UserSession {
+                    destination: bea_review.to_string(),
+                    identity: bea.to_string(),
+                },
+            },
+        ];
+        let sessions = vec![
+            (ME.to_string(), TEMP.to_string()),
+            (MAKI.to_string(), LAPTOP.to_string()),
+            (MAKI.to_string(), MAKI_DESK.to_string()),
+            (bea.to_string(), bea_review.to_string()),
+        ];
+        (names, sessions)
+    }
+
+    /// `<user>/<session>` takes each part by name or by hash prefix, a user's own session
+    /// name only among that user's sessions, and a user kind gets the session's user.
+    #[test]
+    fn a_user_slash_session_address_picks_one_of_that_users_sessions() {
+        let (names, sessions) = path_world();
+        let path = |user: &str, session: &str, kind: HashKind| {
+            resolve_path(user, session, kind, &names, &sessions)
+        };
+        assert_eq!(
+            path("maki", "review", HashKind::Destination).unwrap(),
+            LAPTOP
+        );
+        assert_eq!(path("MAKI", "Review", HashKind::Peer).unwrap(), LAPTOP);
+        assert_eq!(
+            path("bea", "review", HashKind::Destination).unwrap(),
+            "77777777777777777777777777777777",
+            "a session name another user shares picks the named user's"
+        );
+        assert_eq!(
+            path("maki", &MAKI_DESK[..8], HashKind::Destination).unwrap(),
+            MAKI_DESK
+        );
+        assert_eq!(
+            path(&MAKI[..8], "review", HashKind::Destination).unwrap(),
+            LAPTOP,
+            "an unnamed user is typed by hash prefix"
+        );
+        assert_eq!(path("you", "temp", HashKind::Destination).unwrap(), TEMP);
+        assert_eq!(path("maki", "review", HashKind::Identity).unwrap(), MAKI);
+
+        let text = path("maki", "temp", HashKind::Destination)
+            .unwrap_err()
+            .plain();
+        assert_eq!(
+            text,
+            "'maki/temp' names no session: the sessions you know of this user are `maki/review` and `maki/44444444`. Type one of those in its place."
+        );
+        let text = path("kim", "review", HashKind::Destination)
+            .unwrap_err()
+            .plain();
+        assert!(
+            text.starts_with("'kim/review' names no user you know: no user is called 'kim'"),
+            "{text}"
+        );
+        let text = path("maki", "4444", HashKind::Destination)
+            .unwrap_err()
+            .plain();
+        assert!(text.starts_with("'maki/4444' names no session"), "{text}");
+        assert_eq!(
+            path("maki", MAKI_DESK, HashKind::Destination).unwrap(),
+            MAKI_DESK,
+            "a whole hash of one of the user's sessions is taken"
+        );
+        let text = path("maki", TEMP, HashKind::Destination)
+            .unwrap_err()
+            .plain();
+        assert!(
+            text.starts_with(&format!("'maki/{TEMP}' names no session")),
+            "a whole hash of another user's session never passes as this user's: {text}"
+        );
+        let text = path("maki", "temp", HashKind::Destination)
+            .unwrap_err()
+            .render(CommandPrefix::Slash);
+        assert!(
+            text.contains("`maki/review`"),
+            "the listed paths are typed back as they stand, under any prefix: {text}"
+        );
+    }
+
+    /// A bare session name two users share is refused with both, each as the
+    /// `<user>/<session>` that picks it.
+    #[test]
+    fn a_session_name_two_users_share_is_refused_with_both_paths() {
+        let (names, _) = path_world();
+        let text = refusal("review", HashKind::Destination, &names);
+        assert!(
+            text.contains("the session `maki/review` at 22222222"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the session `bea/review` at 77777777"),
+            "{text}"
         );
     }
 
@@ -7526,99 +8128,172 @@ mod name_addressing_tests {
         assert_eq!(edit_distance("", "abc"), 3);
     }
 
-    /// A labelled peer is named by its own grant's label first, else its identity's,
-    /// with the announced name after it, in `.mesh people list` and the pending lists (`.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests`) alike.
-    #[test]
-    fn a_labelled_peer_shows_the_label_then_its_announced_name() {
-        let names = names();
-        assert_eq!(
-            owner_label(&names, LAPTOP).map(|label| label.name.as_str()),
-            Some("maki-laptop")
-        );
-        assert_eq!(
-            owner_label(&[identity_label("maki", &[LAPTOP])], LAPTOP)
-                .map(|label| label.name.as_str()),
-            Some("maki")
-        );
-        assert_eq!(owner_label(&names, TEMP), None, "a session is not a label");
-        assert_eq!(
-            labelled_name("maki-laptop", Some("maki")),
-            "maki-laptop (maki)"
-        );
-        assert_eq!(labelled_name("maki-laptop", None), "maki-laptop");
-
-        let now = SystemTime::now();
-        let facts = HeardFacts {
-            label: Some("maki-laptop".to_string()),
-            ..HeardFacts::default()
+    /// A namer over maki, named `Maki` by you and advertising `Makiko`, with the session
+    /// at LAPTOP you named `laptop` and the one at MAKI_DESK advertising `desk`; your
+    /// session `temp` runs at TEMP.
+    fn namer() -> Namer {
+        use crate::mesh::people::{People, PersonEntry, SessionNames};
+        let mut entries = BTreeMap::new();
+        let mut maki = PersonEntry {
+            alias: Some("Maki".to_string()),
+            advertised: Some("Makiko".to_string()),
+            ..PersonEntry::default()
         };
-        let rows = vec![PeerRow::Heard(
-            peer(Some("maki"), 5, now),
-            "trusted",
-            None,
-            facts,
-        )];
-        let text = render_peers(&rows, now).plain();
-        assert_eq!(table_rows(&text)[0][0], "maki-laptop (maki)", "{text}");
+        maki.sessions.insert(
+            LAPTOP.to_string(),
+            SessionNames {
+                alias: Some("laptop".to_string()),
+                advertised: Some("temp-laptop".to_string()),
+            },
+        );
+        maki.sessions.insert(
+            MAKI_DESK.to_string(),
+            SessionNames {
+                alias: None,
+                advertised: Some("desk".to_string()),
+            },
+        );
+        entries.insert(MAKI.to_string(), maki);
+        entries.insert(
+            ME.to_string(),
+            PersonEntry {
+                alias: Some("Me".to_string()),
+                ..PersonEntry::default()
+            },
+        );
+        let own = [(TEMP.to_string(), "temp".to_string())]
+            .into_iter()
+            .collect();
+        Namer::new(People::new(&entries, &["temp"]), Some(ME), own)
+    }
+
+    /// Every line names a peer `<user> / <session>`: the user is `you`, else the name you
+    /// gave, else the one they advertise, else the short hash; the session is one of your
+    /// own sessions' names, else the name you gave it, else the one it advertises, else
+    /// the short hash.
+    #[test]
+    fn a_peer_reads_user_slash_session_by_the_naming_precedence() {
+        let namer = namer();
+        let who = |identity: Option<&str>, destination: &str| {
+            namer.who(identity, destination).to_string()
+        };
+        assert_eq!(who(Some(MAKI), LAPTOP), "Maki / laptop", "your names win");
+        assert_eq!(
+            who(Some(MAKI), MAKI_DESK),
+            "Maki / desk",
+            "else the advertised one"
+        );
+        assert_eq!(
+            who(Some(MAKI), TEMP),
+            format!("Maki / {}", short(TEMP)),
+            "a destination of yours under another user is not your session"
+        );
+        assert_eq!(who(Some(ME), TEMP), "you / temp", "you are always you");
+        assert_eq!(
+            who(None, TEMP),
+            "you / temp",
+            "your own session needs no identity"
+        );
+        assert_eq!(
+            who(Some(ME), MAKI_DESK),
+            format!("you / {}", short(MAKI_DESK)),
+            "another session of yours not running here"
+        );
+        let stranger = "88888888888888888888888888888888";
+        assert_eq!(
+            who(Some(stranger), "99999999999999999999999999999999"),
+            "88888888 / 99999999"
+        );
+        assert_eq!(
+            who(None, "99999999999999999999999999999999"),
+            "unnamed / 99999999"
+        );
+        assert_eq!(
+            Namer::default().who(Some(MAKI), LAPTOP).to_string(),
+            "33333333 / 22222222",
+            "with the mesh off nothing is named"
+        );
+    }
+
+    /// The people list names each row by user and session, groups rows by user with you
+    /// first, and keeps both short hashes in its last column.
+    #[test]
+    fn the_people_list_groups_rows_by_user_with_you_first() {
+        let now = SystemTime::now();
+        let row = |identity: &str, destination: &str, seen: u64| {
+            PeerRow::Heard(
+                PeerRecord {
+                    identity_hash: identity.to_string(),
+                    destination_hash: destination.to_string(),
+                    ..peer(None, seen, now)
+                },
+                "trusted",
+                None,
+                HeardFacts::default(),
+            )
+        };
+        let rows = vec![
+            row(MAKI, LAPTOP, 5),
+            row(
+                "88888888888888888888888888888888",
+                "99999999999999999999999999999999",
+                6,
+            ),
+            row(ME, TEMP, 7),
+            row(MAKI, MAKI_DESK, 8),
+        ];
+        let text = render_peers(&rows, &namer(), now).plain();
+        let cells: Vec<(String, String, String)> = table_rows(&text)
+            .into_iter()
+            .map(|row| (row[0].clone(), row[1].clone(), row[6].clone()))
+            .collect();
+        assert_eq!(
+            cells,
+            [
+                ("you".into(), "temp".into(), "55555555 / 11111111".into()),
+                ("Maki".into(), "laptop".into(), "33333333 / 22222222".into()),
+                ("Maki".into(), "desk".into(), "33333333 / 44444444".into()),
+                (
+                    "88888888".into(),
+                    "99999999".into(),
+                    "88888888 / 99999999".into()
+                ),
+            ],
+            "{text}"
+        );
+        assert_eq!(
+            table_header(&text),
+            [
+                "user",
+                "session",
+                "trust",
+                "hops",
+                "last seen",
+                "state",
+                "hashes"
+            ]
+        );
+        assert!(text.contains("\n3 users and 4 sessions. "), "{text}");
         assert!(text.contains(NAME_ADDRESSING_LINE), "{text}");
     }
 
-    /// `.mesh envoy questions`, `.mesh messaging sent`, `.mesh envoy answer` and `.mesh messaging send` name your session and your
-    /// labelled peer as `.mesh people list` does, and leave an instance you did not name to
-    /// the verb. A row heard at one of your sessions' destinations under an identity
-    /// that is not this node's is not your session.
-    #[test]
-    fn the_name_you_gave_an_instance_reads_as_in_peers() {
-        let names = names();
-        let own = Some(ME);
-        assert_eq!(
-            given_name(&names, TEMP, ME, own, Some("Coyote")).as_deref(),
-            Some("(you: temp)")
-        );
-        assert_eq!(given_name(&names, TEMP, MAKI, own, Some("Coyote")), None);
-        assert_eq!(
-            given_name(&names, LAPTOP, MAKI, own, Some("maki")).as_deref(),
-            Some("maki-laptop (maki)")
-        );
-        assert_eq!(given_name(&names, MAKI_DESK, MAKI, own, Some("desk")), None);
-    }
-
-    /// An instance under this node's own identity that no running session serves is
-    /// `(you)` before any label, the identity's `this node` grant included, as
-    /// `.mesh people list` names it; with the mesh off no identity is this node's.
-    #[test]
-    fn an_instance_under_your_own_identity_is_you_before_any_label() {
-        let own_grant = AddressName {
-            name: SELF_TRUST_LABEL.to_string(),
-            target: NameTarget::IdentityLabel {
-                identity: ME.to_string(),
-                instances: vec![MAKI_DESK.to_string()],
-            },
-        };
-        let names = vec![destination_label("desk", MAKI_DESK), own_grant.clone()];
-        assert_eq!(
-            given_name(&names, MAKI_DESK, ME, Some(ME), Some("Coyote")).as_deref(),
-            Some("(you)")
-        );
-        assert_eq!(
-            given_name(&names, MAKI_DESK, ME, None, Some("Coyote")).as_deref(),
-            Some("desk (Coyote)")
-        );
-        assert_eq!(
-            owner_label(&[own_grant], MAKI_DESK),
-            None,
-            "the self-trust grant is not a label you gave"
-        );
-    }
-
-    /// A label is quoted as you spelled it in a `.mesh envoy questions` entry and a `.mesh envoy answer`
+    /// A name is quoted as you spelled it in a `.mesh envoy questions` entry and a `.mesh envoy answer`
     /// block under any command prefix, while this node's own hints follow the prefix.
     #[test]
     fn a_label_is_quoted_verbatim_in_pending_and_the_question_block() {
-        let names = vec![destination_label(".info", LAPTOP)];
+        use crate::mesh::people::{People, PersonEntry};
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            MAKI.to_string(),
+            PersonEntry {
+                alias: Some(".info".to_string()),
+                ..PersonEntry::default()
+            },
+        );
+        let namer = Namer::new(People::new(&entries, &[]), Some(ME), Default::default());
         let row = QuestionRow {
             state: "awaiting your answer",
-            name: given_name(&names, LAPTOP, MAKI, Some(ME), Some("maki")).unwrap(),
+            name: namer.who(Some(MAKI), LAPTOP).to_string(),
             destination: LAPTOP.to_string(),
             when_label: "asked",
             when: None,
@@ -7632,7 +8307,7 @@ mod name_addressing_tests {
         };
         let now = SystemTime::now();
         let pending = render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, false);
-        let entry = "  1. .info (maki) (22222222) asked at an unknown time . id p1";
+        let entry = "  1. .info / 22222222 (22222222) asked at an unknown time . id p1";
         assert_eq!(pending.render(CommandPrefix::Dot), pending.plain());
         assert!(pending.plain().contains(entry), "{pending}");
         let slash = pending.render(CommandPrefix::Slash);
@@ -7641,7 +8316,7 @@ mod name_addressing_tests {
 
         let block = render_question_block(&row, now, 80, true).render(CommandPrefix::Slash);
         assert!(
-            block.contains("awaiting your answer . .info (maki) (22222222) . asked"),
+            block.contains("awaiting your answer . .info / 22222222 (22222222) . asked"),
             "{block}"
         );
         assert!(block.contains("answer: /mesh envoy answer p1"), "{block}");
@@ -7708,7 +8383,7 @@ fn asked_elsewhere(ctx: &RequestContext, id: &str, now: SystemTime) -> Option<an
             .frame("."),
         Some(InstanceSession::Gone(session)) => head
             .frame(" was asked by ")
-            .peer(format!("(you, gone: {session})"))
+            .peer(format!("{}{ENDED_SESSION_MARK}", own_session_name(session)))
             .frame(", which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session ")
             .peer(session.as_str())
             .frame("` and `.mesh on`, then ")
@@ -7766,16 +8441,8 @@ fn record_label(record: &TrustRecord) -> String {
 
 #[derive(Debug)]
 enum TrustArg {
-    Destination {
-        target: String,
-        label: Option<String>,
-        yes: bool,
-    },
-    Identity {
-        target: String,
-        label: Option<String>,
-        yes: bool,
-    },
+    Destination { target: String, yes: bool },
+    Identity { target: String, yes: bool },
 }
 
 /// `None` when no target was named: the caller prints the usage.
@@ -7795,7 +8462,6 @@ fn classify_trust(args: MutationArgs) -> Result<Option<TrustArg>> {
         }
         return Ok(Some(TrustArg::Identity {
             target: identity,
-            label: args.label,
             yes: args.yes,
         }));
     }
@@ -7805,7 +8471,6 @@ fn classify_trust(args: MutationArgs) -> Result<Option<TrustArg>> {
         .next()
         .map(|target| TrustArg::Destination {
             target,
-            label: args.label,
             yes: args.yes,
         }))
 }
@@ -7984,7 +8649,6 @@ struct MutationArgs {
     dry_run: bool,
     stale: bool,
     identity: Option<String>,
-    label: Option<String>,
     note: Option<String>,
     intro: Option<String>,
     older_than: Option<Duration>,
@@ -8035,7 +8699,6 @@ fn parse_mutation_args(
             "--dry-run" => args.dry_run = true,
             "--stale" => args.stale = true,
             "--identity" => args.identity = Some(value()?),
-            "--label" => args.label = Some(value()?),
             "--note" => args.note = Some(value()?),
             "--intro" => args.intro = Some(value()?),
             "--older-than" => args.older_than = Some(parse_duration_text(&value()?)?),
@@ -9093,95 +9756,38 @@ enum PeerRow {
     MarkedOnly(TrustRecord, &'static str, KeyChangeMark),
 }
 
-/// What this node knows about a heard row beyond its record: whether it has no route, as
-/// a row the transport holds no path to (from the cached path table alone), one whose
-/// last link failed or one of your sessions that has gone reads; whether it announces
-/// this node's own identity, as another session on the same config dir does, with the
-/// session's name when the instance registry lists the row's destination as running here
-/// or whether the registry keeps it as gone; and the trust label you gave it.
+/// What you know about a heard row beyond its record: whether it has no route, as a row
+/// the transport holds no path to (from the cached path table alone), one whose last link
+/// failed or one of your sessions that has ended reads; and whether it is one of your own
+/// sessions that the instance registry keeps as ended. Its user and session names come
+/// from the `Namer` the table is rendered with.
 #[derive(Debug, Default, Clone)]
 struct HeardFacts {
     no_route: bool,
-    is_you: bool,
-    own_session: Option<String>,
     own_gone: bool,
-    label: Option<String>,
 }
 
-/// How `.mesh people list` and the pending lists name an instance that is one of your own running
-/// sessions.
+/// How the pending lists name one of your own sessions.
 fn own_session_name(session: &str) -> String {
-    format!("(you: {session})")
+    Who {
+        user: YOU.to_string(),
+        session: session.to_string(),
+    }
+    .to_string()
 }
 
 /// Who asked a question another session on this cache dir is waiting on: the running
-/// session by name, an ended one marked gone, or no name once its registry row is gone.
+/// session by name, an ended one marked ended, or no name once its registry row is gone.
 fn asked_by(asker: Option<&InstanceSession>) -> String {
     match asker {
         Some(InstanceSession::Running(session)) => {
             format!("asked by {}", own_session_name(session))
         }
-        Some(InstanceSession::Gone(session)) => format!("asked by (you, gone: {session})"),
+        Some(InstanceSession::Gone(session)) => {
+            format!("asked by {} (ended)", own_session_name(session))
+        }
         None => "asked by another session".to_string(),
     }
-}
-
-/// How `.mesh people list` and the pending lists name a peer you labelled: the label, then the
-/// name the peer announces, if any, in parentheses.
-fn labelled_name(label: &str, display_name: Option<&str>) -> String {
-    let label = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap_or_else(|| label.to_string());
-    match display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)) {
-        Some(announced) => format!("{label} ({announced})"),
-        None => label,
-    }
-}
-
-/// The name you gave the instance at `destination`, heard under `identity`, `announced`
-/// being the name it gives itself: one of your sessions when the identity is this node's
-/// (`own_identity`, `None` while the mesh is off), else `(you)` for any other instance
-/// under it, else your label with that name after it; `None` for an instance you have
-/// not named, which each verb then names its own way.
-fn given_name(
-    names: &[AddressName],
-    destination: &str,
-    identity: &str,
-    own_identity: Option<&str>,
-    announced: Option<&str>,
-) -> Option<String> {
-    let session = names.iter().find(|name| {
-        matches!(
-            &name.target,
-            NameTarget::Session { destination: at, identity: own }
-                if at == destination && same_hash(own, identity)
-        )
-    });
-    match session {
-        Some(session) => Some(own_session_name(&session.name)),
-        None if own_identity.is_some_and(|own| same_hash(identity, own)) => {
-            Some("(you)".to_string())
-        }
-        None => owner_label(names, destination).map(|label| labelled_name(&label.name, announced)),
-    }
-}
-
-/// How the pending lists and `.mesh envoy answer` name the peer at `destination`: `given_name`,
-/// else the name the peer table holds, else its short hash.
-pub(crate) fn name_at(
-    ctx: &RequestContext,
-    names: &[AddressName],
-    destination: &str,
-    identity: &str,
-) -> String {
-    let mesh = &ctx.app.mesh;
-    let runtime = mesh.get();
-    given_name(
-        names,
-        destination,
-        identity,
-        runtime.as_ref().map(|runtime| runtime.fingerprint()),
-        mesh.display_name_at(destination).as_deref(),
-    )
-    .unwrap_or_else(|| mesh.peer_name_at(destination))
 }
 
 /// A trust record's key-change mark with, when the peer table has heard it, the destination
@@ -9236,12 +9842,15 @@ fn unheard_rows(
         .collect()
 }
 
-/// The table is quoted as it stands, since its name cells hold peer names and your own
-/// labels and session names and no cell carries a hint; the lines under it follow the
-/// prefix.
-fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
+/// The table is quoted as it stands, since its name cells hold names peers advertised and
+/// your own names and no cell carries a hint; the lines under it follow the prefix. Rows
+/// are grouped by user: you first, then the users with a name in name order, then the
+/// rest; within a user the rows keep the order they came in (newest heard first). Every
+/// row reads `<user>`, `<session>` as `namer` names them, with both short hashes last.
+fn render_peers(rows: &[PeerRow], namer: &Namer, now: SystemTime) -> NoticeText {
     if rows.is_empty() {
-        return "No peers heard yet. Nodes appear here as their announces arrive.".into();
+        return "No users or sessions heard yet. Sessions appear here as their announces arrive."
+            .into();
     }
     let heard: Vec<&PeerRecord> = rows
         .iter()
@@ -9251,20 +9860,21 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
         })
         .collect();
     let mut table = mesh_table(&[
-        "name",
-        "dest",
-        "identity",
+        "user",
+        "session",
         "trust",
         "hops",
         "last seen",
         "state",
+        "hashes",
     ]);
-    if let Some(hops) = table.column_mut(4) {
+    if let Some(hops) = table.column_mut(3) {
         hops.set_cell_alignment(comfy_table::CellAlignment::Right);
     }
     let mut key_changes = Vec::new();
+    let mut built: Vec<(Option<String>, Who, [String; 5])> = Vec::with_capacity(rows.len());
     for row in rows {
-        let cells = match row {
+        let (identity, destination, cells) = match row {
             PeerRow::Heard(peer, trust, key_changed, facts) => {
                 let successor = peer.successor_in(heard.iter().copied(), now);
                 if let Some(mark) = key_changed {
@@ -9283,66 +9893,105 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
                     None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),
                     _ => row_state(peer, successor, now),
                 };
-                let name = match &facts.own_session {
-                    Some(session) => own_session_name(session),
-                    None if facts.own_gone => GONE_SESSION_NAME.to_string(),
-                    None if facts.is_you => "(you)".to_string(),
-                    None => match &facts.label {
-                        Some(label) => labelled_name(label, peer.display_name.as_deref()),
-                        None => name_label(peer.display_name.as_deref()),
-                    },
-                };
                 let state = [marker, peer.compatibility_line()];
-                [
-                    name,
-                    short(&peer.destination_hash).to_string(),
-                    short(&peer.identity_hash).to_string(),
-                    trust.to_string(),
-                    peer.hops.to_string(),
-                    age_text(now, peer.last_seen),
-                    state.into_iter().flatten().collect::<Vec<_>>().join("\n"),
-                ]
+                let state: Vec<String> = state.into_iter().flatten().collect();
+                (
+                    Some(peer.identity_hash.clone()),
+                    &peer.destination_hash,
+                    [
+                        trust.to_string(),
+                        peer.hops.to_string(),
+                        age_text(now, peer.last_seen),
+                        state.join("\n"),
+                        String::new(),
+                    ],
+                )
             }
             PeerRow::DenyOnly(record, key_changed) => {
                 let bound = record.identity.as_deref().unwrap_or("-");
                 if let Some(mark) = key_changed {
                     key_changes.push(key_change_footer_line(mark, bound, &record.hash, now));
                 }
-                [
-                    "-".to_string(),
-                    short(&record.hash).to_string(),
-                    short(bound).to_string(),
-                    deny_only_label().to_string(),
-                    "-".to_string(),
-                    "never".to_string(),
-                    String::new(),
-                ]
+                (
+                    record.identity.clone(),
+                    &record.hash,
+                    [
+                        deny_only_label().to_string(),
+                        "-".to_string(),
+                        "never".to_string(),
+                        String::new(),
+                        String::new(),
+                    ],
+                )
             }
             PeerRow::MarkedOnly(record, trust, mark) => {
                 let bound = record.identity.as_deref().unwrap_or("-");
                 key_changes.push(key_change_footer_line(mark, bound, &record.hash, now));
-                let label = record
-                    .label
-                    .as_deref()
-                    .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
-                    .unwrap_or_else(|| "(not heard)".to_string());
-                [
-                    label,
-                    short(&record.hash).to_string(),
-                    short(bound).to_string(),
-                    trust.to_string(),
-                    "-".to_string(),
-                    age_text(now, record.last_seen_at),
-                    String::new(),
-                ]
+                (
+                    record.identity.clone(),
+                    &record.hash,
+                    [
+                        trust.to_string(),
+                        "-".to_string(),
+                        age_text(now, record.last_seen_at),
+                        NOT_HEARD_STATE.to_string(),
+                        String::new(),
+                    ],
+                )
             }
         };
-        table.add_row(cells);
+        let mut who = namer.who(identity.as_deref(), destination);
+        if matches!(row, PeerRow::Heard(.., facts) if facts.own_gone) {
+            who.session.push_str(ENDED_SESSION_MARK);
+        }
+        let mut cells = cells;
+        cells[4] = format!(
+            "{} / {}",
+            identity.as_deref().map_or("-", short),
+            short(destination)
+        );
+        built.push((identity, who, cells));
+    }
+    let mut first_seen: Vec<&str> = Vec::new();
+    for (_, who, _) in &built {
+        if !first_seen.contains(&who.user.as_str()) {
+            first_seen.push(&who.user);
+        }
+    }
+    let group = |identity: &Option<String>, who: &Who| {
+        let named = identity.as_deref().is_some_and(|identity| {
+            namer
+                .people()
+                .person(identity)
+                .is_some_and(|alias| alias.displayable())
+        });
+        let rank = match identity.as_deref() {
+            Some(identity) if namer.is_you(identity) => 0,
+            _ if named => 1,
+            _ => 2,
+        };
+        let order = if rank == 1 {
+            who.user.to_lowercase()
+        } else {
+            String::new()
+        };
+        let at = first_seen.iter().position(|user| *user == who.user);
+        (rank, order, at)
+    };
+    let mut order: Vec<usize> = (0..built.len()).collect();
+    order.sort_by_key(|&at| group(&built[at].0, &built[at].1));
+    let users = first_seen.len();
+    for at in order {
+        let (_, who, cells) = &built[at];
+        let mut row = vec![who.user.clone(), who.session.clone()];
+        row.extend(cells.iter().cloned());
+        table.add_row(row);
     }
     let mut lines = key_changes;
     lines.push(format!(
-        "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
-        rows.len()
+        "{} and {}. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
+        plural(users, "user", "users"),
+        plural(rows.len(), "session", "sessions")
     ));
     lines.push(NAME_ADDRESSING_LINE.to_string());
     lines.push(trust_legend().to_string());
@@ -9353,7 +10002,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
 }
 
 /// The `.mesh people list` line under the count that teaches typing a name in place of a hash.
-const NAME_ADDRESSING_LINE: &str = "Type a session name or a trust label in place of a hash, as in `.mesh people status <name>` or `.mesh messaging send <name> <text>`; give an instance a label with `.mesh access trust <dest> --label <name>`.";
+const NAME_ADDRESSING_LINE: &str = "Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh people name <user>/<session> \"name\"` one of their sessions.";
 
 #[cfg(test)]
 mod peers_route_tests {
@@ -9362,14 +10011,15 @@ mod peers_route_tests {
 
     const NO_PATH: HeardFacts = HeardFacts {
         no_route: true,
-        is_you: false,
-        own_session: None,
         own_gone: false,
-        label: None,
     };
 
     fn heard(peer: PeerRecord, facts: HeardFacts) -> PeerRow {
         PeerRow::Heard(peer, "trusted", None, facts)
+    }
+
+    fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
+        super::render_peers(rows, &Namer::default(), now)
     }
 
     fn at(destination_byte: &str, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
@@ -9392,11 +10042,11 @@ mod peers_route_tests {
         let text = render_peers(&rows, now).plain();
 
         let cells = table_rows(&text);
-        assert_eq!(cells[0][6], NO_ROUTE_STATE, "{text}");
-        assert_eq!(cells[1][6], "", "{text}");
+        assert_eq!(cells[0][5], NO_ROUTE_STATE, "{text}");
+        assert_eq!(cells[1][5], "", "{text}");
         assert!(
             peers_legend().contains(
-                "no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"
+                "no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"
             ),
             "{text}"
         );
@@ -9412,7 +10062,7 @@ mod peers_route_tests {
 
         let text = render_peers(&rows, now).plain();
 
-        assert_eq!(table_rows(&text)[0][6], NO_ROUTE_STATE, "{text}");
+        assert_eq!(table_rows(&text)[0][5], NO_ROUTE_STATE, "{text}");
         assert!(!text.contains("(stale:"), "{text}");
     }
 
@@ -9427,7 +10077,7 @@ mod peers_route_tests {
 
         let text = render_peers(&rows, now).plain();
 
-        let state = &table_rows(&text)[1][6];
+        let state = &table_rows(&text)[1][5];
         assert!(state.starts_with("(superseded by 11111111"), "{text}");
         assert!(!state.contains("no route"), "{text}");
     }
@@ -9458,20 +10108,20 @@ mod peers_route_tests {
 
         let cells = table_rows(&text);
         assert_eq!(
-            cells[0][6], "(left 3s ago: it said it was leaving the mesh)",
+            cells[0][5], "(left 3s ago: it said it was leaving the mesh)",
             "{text}"
         );
         assert_eq!(
-            cells[1][6], "(left 2h ago: it said it was leaving the mesh)",
+            cells[1][5], "(left 2h ago: it said it was leaving the mesh)",
             "{text}"
         );
         assert_eq!(
-            cells[2][6], "(left 1m ago: it said it was leaving the mesh)",
+            cells[2][5], "(left 1m ago: it said it was leaving the mesh)",
             "{text}"
         );
         assert!(
             peers_legend().contains(
-                "left = the instance said it was leaving the mesh, until it announces again or is heard over a link"
+                "left = the session said it was leaving the mesh, until it announces again or is heard over a link"
             ),
             "{text}"
         );
@@ -9485,7 +10135,7 @@ mod peers_route_tests {
         ];
         let text = render_peers(&superseded, now).plain();
         assert!(
-            table_rows(&text)[1][6].starts_with("(superseded by 44444444"),
+            table_rows(&text)[1][5].starts_with("(superseded by 44444444"),
             "{text}"
         );
 
@@ -9493,14 +10143,12 @@ mod peers_route_tests {
             left(at("66", 5, now), 1),
             HeardFacts {
                 no_route: true,
-                is_you: true,
                 own_gone: true,
-                ..HeardFacts::default()
             },
         )];
         let text = render_peers(&own_gone, now).plain();
         assert_eq!(
-            table_rows(&text)[0][6],
+            table_rows(&text)[0][5],
             NO_ROUTE_STATE,
             "a session of yours that has ended reads no route, farewell or not: {text}"
         );
@@ -9512,32 +10160,47 @@ mod peers_you_tests {
     use super::tests::{peer, table_rows};
     use super::*;
 
-    /// A row announcing this node's own identity is named `(you)` over its display name or
-    /// `(no name)`, and the legend says what that means.
+    /// Your identity, as `peer` hears every row by default, with your session `temp`
+    /// running at 1212... and your session `laptop` ended at abab....
+    fn namer() -> Namer {
+        let own = [
+            ("12".repeat(16), "temp".to_string()),
+            ("ab".repeat(16), "laptop".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        Namer::new(Default::default(), Some(&"cd".repeat(16)), own)
+    }
+
+    /// A row announcing your own identity reads `you` whatever name it announces, with
+    /// its session name when it is one of yours here, else its short hash, and the legend
+    /// says what that means.
     #[test]
     fn a_row_of_the_own_identity_is_named_you() {
         let now = SystemTime::now();
-        let you = HeardFacts {
-            no_route: false,
-            is_you: true,
-            own_session: None,
-            own_gone: false,
-            label: None,
-        };
         let rows = vec![
-            PeerRow::Heard(peer(Some("Laptop"), 5, now), "trusted", None, you.clone()),
             PeerRow::Heard(
                 PeerRecord {
                     destination_hash: "12".repeat(16),
-                    ..peer(None, 5, now)
+                    ..peer(Some("Laptop"), 5, now)
                 },
                 "trusted",
                 None,
-                you,
+                HeardFacts::default(),
             ),
             PeerRow::Heard(
                 PeerRecord {
                     destination_hash: "34".repeat(16),
+                    ..peer(None, 5, now)
+                },
+                "trusted",
+                None,
+                HeardFacts::default(),
+            ),
+            PeerRow::Heard(
+                PeerRecord {
+                    destination_hash: "56".repeat(16),
+                    identity_hash: "ef".repeat(16),
                     ..peer(Some("Ann"), 5, now)
                 },
                 "trusted",
@@ -9546,23 +10209,31 @@ mod peers_you_tests {
             ),
         ];
 
-        let text = render_peers(&rows, now).plain();
+        let text = render_peers(&rows, &namer(), now).plain();
 
-        let names: Vec<String> = table_rows(&text)
+        let names: Vec<(String, String)> = table_rows(&text)
             .into_iter()
-            .map(|row| row[0].clone())
+            .map(|row| (row[0].clone(), row[1].clone()))
             .collect();
-        assert_eq!(names, ["(you)", "(you)", "Ann"], "{text}");
+        assert_eq!(
+            names,
+            [
+                ("you".to_string(), "temp".to_string()),
+                ("you".to_string(), "34343434".to_string()),
+                ("efefefef".to_string(), "56565656".to_string()),
+            ],
+            "an announced name is not a user's name: {text}"
+        );
         assert!(
-            peers_legend().contains("(you) = another session of yours on this config dir"),
+            peers_legend().contains("you = your own sessions on this config dir"),
             "{text}"
         );
     }
 
-    /// A session of yours the registry keeps as gone is named `(you, gone)` and reads
+    /// A session of yours the registry keeps as ended reads its name and `(ended)` with
     /// `no route`; a running one keeps its name, and the legend says what both mean.
     #[test]
-    fn a_gone_session_of_yours_is_named_you_gone_with_no_route() {
+    fn an_ended_session_of_yours_is_marked_ended_with_no_route() {
         let now = SystemTime::now();
         let rows = vec![
             PeerRow::Heard(
@@ -9571,9 +10242,7 @@ mod peers_you_tests {
                 None,
                 HeardFacts {
                     no_route: true,
-                    is_you: true,
                     own_gone: true,
-                    ..HeardFacts::default()
                 },
             ),
             PeerRow::Heard(
@@ -9583,28 +10252,34 @@ mod peers_you_tests {
                 },
                 "trusted",
                 None,
-                HeardFacts {
-                    is_you: true,
-                    own_session: Some("temp".to_string()),
-                    ..HeardFacts::default()
-                },
+                HeardFacts::default(),
             ),
         ];
 
-        let text = render_peers(&rows, now).plain();
+        let text = render_peers(&rows, &namer(), now).plain();
 
         let cells = table_rows(&text);
-        assert_eq!(cells[0][0], "(you, gone)", "{text}");
-        assert_eq!(cells[0][6], NO_ROUTE_STATE, "{text}");
-        assert_eq!(cells[1][0], "(you: temp)", "{text}");
-        assert_eq!(cells[1][6], "", "{text}");
+        assert_eq!(
+            (cells[0][0].as_str(), cells[0][1].as_str()),
+            ("you", "laptop (ended)"),
+            "{text}"
+        );
+        assert_eq!(cells[0][5], NO_ROUTE_STATE, "{text}");
+        assert_eq!(
+            (cells[1][0].as_str(), cells[1][1].as_str()),
+            ("you", "temp"),
+            "{text}"
+        );
+        assert_eq!(cells[1][5], "", "{text}");
         let legend = peers_legend();
         assert!(
-            legend.contains("(you, gone) = your session on this computer that has ended"),
+            legend.contains(
+                "you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped"
+            ),
             "{legend}"
         );
         assert!(
-            legend.contains("no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"),
+            legend.contains("no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"),
             "{legend}"
         );
     }
@@ -9619,7 +10294,7 @@ mod peers_you_tests {
 fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime) -> Option<String> {
     if let Some(successor) = successor {
         return Some(format!(
-            "(superseded by {}: same identity announced a new instance)",
+            "(superseded by {}: same user announced a new session)",
             short(&successor.destination_hash)
         ));
     }
@@ -9651,9 +10326,12 @@ fn left_state(now: SystemTime, left_at: SystemTime) -> String {
     )
 }
 
-/// How `.mesh people list` names a session of yours on this computer that has stopped or whose
-/// process has gone, while the instance registry still keeps its tombstone.
-const GONE_SESSION_NAME: &str = "(you, gone)";
+/// What `.mesh people list` puts after a session of yours on this computer that has
+/// stopped or whose process has gone, while the instance registry still keeps its row.
+const ENDED_SESSION_MARK: &str = " (ended)";
+
+/// The `state` of a marked trust record no heard row announces from.
+const NOT_HEARD_STATE: &str = "(not heard)";
 
 /// The standing of a deny-only record: a block with no heard peer to judge is the
 /// `DestinationDenied` verdict whatever the identity's standing.
@@ -9675,7 +10353,7 @@ fn trust_legend() -> &'static str {
 /// The last line of a non-empty `.mesh people list`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this user moved to the session named; left = the session said it was leaving the mesh, until it announces again or is heard over a link; no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped; a user or session shows the name you gave it, else the one it advertised, else its short hash; user = a person or an installation, which can run several sessions",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -10248,9 +10926,9 @@ fn indented_rows(label: &str, text: &str, width: usize) -> Vec<String> {
 
 /// A block's first line, dot-separated: for a peer's message its kind, sender, route,
 /// arrival time and thread, plus the id it answers when that is not the thread root;
-/// for a message this node sent, the peer it answered and the id of what it answered.
-/// A sender without a name is `unknown`; `peer_name_at` falls back to the short
-/// destination, so an empty name means there was no destination either.
+/// for a message you sent, the session it answered and the id of what it answered. The
+/// sender reads `<user> / <session>`, then its session's short hash; an empty name means
+/// there was no destination either and reads `unknown`.
 fn inbox_header(row: &InboxRow) -> String {
     let message = &row.message;
     let via = via_text(message.via);
@@ -10276,7 +10954,7 @@ fn inbox_header(row: &InboxRow) -> String {
         InboxSender::ThisNode { answered } => {
             let id = short(message.in_reply_to.as_deref().unwrap_or(message.thread()));
             format!(
-                "this node -> {answered} ({}) . {via} . {time} . answering {id}",
+                "you -> {answered} ({}) . {via} . {time} . answering {id}",
                 short(&message.destination),
             )
         }
@@ -10306,8 +10984,8 @@ fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'stati
 struct QuestionRow {
     /// `awaiting your answer`, `access request`, or an outbound state word.
     state: &'static str,
-    /// The peer's resolved name (`peer_name_at`), falling back to its short destination,
-    /// so a never-heard peer reads `<dest8> (<dest8>)` in the header.
+    /// The peer as `<user> / <session>`, its short hashes standing in for any part with
+    /// no name, so a never-named peer reads `<user8> / <dest8> (<dest8>)` in the header.
     name: String,
     destination: String,
     /// `asked` for a peer's question or access request, `sent` for one this node asked.
@@ -10733,7 +11411,9 @@ fn pending_entry(
 
 /// The peers' names and their owners' remedies are quoted as they stand; the counts and
 /// this node's own hints follow the prefix.
-fn render_broadcast(outcome: &BroadcastOutcome) -> NoticeText {
+/// The `.mesh messaging broadcast` report: one row per recipient, named by `who` from its
+/// destination as every other line names a session, then the tally.
+fn render_broadcast(outcome: &BroadcastOutcome, who: impl Fn(&str) -> String) -> NoticeText {
     if outcome.recipients.is_empty() {
         return "No trusted peer has a known path right now; nothing was sent. `.mesh people list` lists what this node has heard from.".into();
     }
@@ -10761,7 +11441,7 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> NoticeText {
         };
         report = report
             .frame("  ")
-            .peer(name_label(recipient.display_name.as_deref()))
+            .peer(who(&recipient.destination))
             .frame(format!(" ({}): ", short(&recipient.destination)))
             .then(status)
             .frame("\n");
@@ -10818,10 +11498,13 @@ mod broadcast_row_tests {
             ],
         };
 
-        let text = render_broadcast(&outcome).plain();
+        let text = render_broadcast(&outcome, |destination| {
+            format!("cdcdcdcd / {}", short(destination))
+        })
+        .plain();
 
         let expected = format!(
-            "  (no name) (aaaaaaaa): delivered\n  (no name) (bbbbbbbb): throttled, not stored: bbbbbbbb refused it: busy. Try again in a minute.\n  (no name) (cccccccc): not stored: The message could not be sent: slow. Try again in a minute\nBulletin {}: 1 delivered, 0 store-and-forward, 0 unreachable, 0 refused, 1 throttled, 1 to retry.",
+            "  cdcdcdcd / aaaaaaaa (aaaaaaaa): delivered\n  cdcdcdcd / bbbbbbbb (bbbbbbbb): throttled, not stored: bbbbbbbb refused it: busy. Try again in a minute.\n  cdcdcdcd / cccccccc (cccccccc): not stored: The message could not be sent: slow. Try again in a minute\nBulletin {}: 1 delivered, 0 store-and-forward, 0 unreachable, 0 refused, 1 throttled, 1 to retry.",
             short(&"b1".repeat(16))
         );
         assert_eq!(text, expected);
@@ -10884,6 +11567,12 @@ mod tests {
         }
     }
 
+    /// `.mesh people list` as it renders with the mesh off: nothing is named, so every
+    /// user and session reads as its short hash.
+    fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
+        super::render_peers(rows, &Namer::default(), now)
+    }
+
     pub(super) fn peer(name: Option<&str>, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
         PeerRecord {
             destination_hash: "ab".repeat(16),
@@ -10913,7 +11602,7 @@ mod tests {
     }
 
     /// The header cells of the first table in `text`.
-    fn table_header(text: &str) -> Vec<String> {
+    pub(super) fn table_header(text: &str) -> Vec<String> {
         text.lines()
             .find(|line| line.contains('│'))
             .map(table_cells)
@@ -11106,22 +11795,36 @@ mod tests {
                 PeerVia::StoreAndForward,
                 Some(Departure::Left(now - Duration::from_secs(2 * 3600))),
             );
-            let line = sent_line(&left, DEST, ".bob", now);
+            let line = sent_line(&left, DEST, ".bob / review", ".bob", now);
             assert_eq!(
                 line.plain(),
-                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. .mesh people list shows when it announces again."
+                "Sent 01234567 to fedcba98: .bob / review left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. .mesh people list shows when it announces again."
             );
             assert_eq!(
                 line.render(CommandPrefix::Slash),
-                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. /mesh people list shows when it announces again.",
+                "Sent 01234567 to fedcba98: .bob / review left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. /mesh people list shows when it announces again.",
                 "the name is quoted as it stands under any prefix; the hint follows it"
             );
             assert_eq!(
-                sent_line(&sent(PeerVia::StoreAndForward, None), DEST, "bob", now).plain(),
+                sent_line(
+                    &sent(PeerVia::StoreAndForward, None),
+                    DEST,
+                    "bob / review",
+                    "bob",
+                    now
+                )
+                .plain(),
                 "Sent 01234567 to fedcba98 (via store-and-forward)."
             );
             assert_eq!(
-                sent_line(&sent(PeerVia::Direct, None), DEST, "bob", now).plain(),
+                sent_line(
+                    &sent(PeerVia::Direct, None),
+                    DEST,
+                    "bob / review",
+                    "bob",
+                    now
+                )
+                .plain(),
                 "Sent 01234567 to fedcba98 (via direct)."
             );
         }
@@ -11416,7 +12119,7 @@ mod tests {
         assert!(status.starts_with("Usage: .mesh status"), "{status}");
         let status = render_verb_help("people", "status");
         assert!(
-            status.starts_with("Usage: .mesh people status <destination>"),
+            status.starts_with("Usage: .mesh people status <session>"),
             "{status}"
         );
         assert_eq!(render_verb_help("", "nope"), render_help());
@@ -11602,7 +12305,6 @@ mod tests {
 
     const TRUST_FLAGS: &[&str] = &[
         "--yes",
-        "--label",
         "--identity",
         "--older-than",
         "--dry-run",
@@ -11623,14 +12325,19 @@ mod tests {
         assert!(err.contains("Unexpected '--bogus'"), "{err}");
         assert!(err.contains(&render_verb_help("access", "trust")), "{err}");
 
-        let err = parse_mutation_args(&format!("{hash} --label"), "access", "trust", TRUST_FLAGS)
+        let err = parse_mutation_args(
+            &format!("{hash} --identity"),
+            "access",
+            "trust",
+            TRUST_FLAGS,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("'--identity' needs a value"), "{err}");
+        let err = parse_mutation_args("--identity --yes", "access", "trust", TRUST_FLAGS)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("'--label' needs a value"), "{err}");
-        let err = parse_mutation_args("--label --yes", "access", "trust", TRUST_FLAGS)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("'--label' needs a value"), "{err}");
+        assert!(err.contains("'--identity' needs a value"), "{err}");
 
         let err = parse_mutation_args(&format!("{hash} {hash}"), "access", "trust", TRUST_FLAGS)
             .unwrap_err()
@@ -11693,14 +12400,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unexpected '--dry-run'"), "{err}");
-        match trust_arg(&format!("--identity {hash} --label x --yes")).unwrap() {
-            Some(TrustArg::Identity { target, label, yes }) => {
+        match trust_arg(&format!("--identity {hash} --yes")).unwrap() {
+            Some(TrustArg::Identity { target, yes }) => {
                 assert_eq!(target, hash);
-                assert_eq!(label.as_deref(), Some("x"));
                 assert!(yes);
             }
             _ => panic!("--identity is the identity shape"),
         }
+        let err = trust_arg(&format!("--identity {hash} --label x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unexpected '--label'"), "{err}");
         assert!(matches!(
             untrust_arg("--stale --older-than 12h --confirm prune-2").unwrap(),
             Some(UntrustArg::Stale {
@@ -11831,7 +12541,7 @@ mod tests {
         assert_eq!(
             err("01234567", HashKind::Destination),
             format!(
-                "'01234567' matches 2 known destinations: {}..., {}...; give more characters.",
+                "'01234567' matches 2 known sessions: {}..., {}...; give more characters.",
                 &alpha[..17],
                 &beta[..17]
             )
@@ -11839,35 +12549,35 @@ mod tests {
         assert_eq!(
             err("0123456789ABCDEF", HashKind::Identity),
             format!(
-                "'0123456789ABCDEF' matches 2 known identities: {}..., {}...; give more characters.",
+                "'0123456789ABCDEF' matches 2 known users: {}..., {}...; give more characters.",
                 &alpha[..17],
                 &beta[..17]
             )
         );
         assert_eq!(
             err("deadbeef", HashKind::Destination),
-            "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh people list` lists."
+            "Session deadbeef has not been heard from: no session you know starts with it. Give the whole hash, or check what `.mesh people list` lists."
         );
         assert_eq!(
             err("deadbeef00", HashKind::Identity),
-            "Identity deadbeef00 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh access requests` and `.mesh people list` list."
+            "User deadbeef00 has not been heard from: no user you know starts with it. Give the whole hash, or check what `.mesh access requests` and `.mesh people list` list."
         );
         assert_eq!(
             err("fedcba9", HashKind::Destination),
-            "'fedcba9' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
+            "'fedcba9' is not a session hash: expected a session hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
         );
         assert_eq!(
             err("fedcba9x", HashKind::Identity),
-            "'fedcba9x' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
+            "'fedcba9x' is not a user hash: expected a user hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
         );
         assert_eq!(
             err("bob", HashKind::Peer),
-            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
+            "'bob' is not a user or session hash: expected a user or session hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
         );
         assert_eq!(
             err(&format!("{gamma}0"), HashKind::Destination),
             format!(
-                "'{gamma}0' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
+                "'{gamma}0' is not a session hash: expected a session hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
             ),
             "33 characters is not a prefix of anything"
         );
@@ -11875,7 +12585,7 @@ mod tests {
             resolve_hash("fedcba98", HashKind::Destination, Vec::new())
                 .unwrap_err()
                 .to_string(),
-            "Destination fedcba98 has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh people list` lists.",
+            "Session fedcba98 has not been heard from: no session you know starts with it. Give the whole hash, or check what `.mesh people list` lists.",
             "nothing is known while the mesh is off"
         );
     }
@@ -12415,7 +13125,7 @@ mod tests {
         assert!(
             render_peers(&[], now)
                 .plain()
-                .starts_with("No peers heard yet")
+                .starts_with("No users or sessions heard yet")
         );
         let old = PeerRecord {
             destination_hash: "ef".repeat(16),
@@ -12442,38 +13152,45 @@ mod tests {
         assert_eq!(
             table_header(&text),
             [
-                "name",
-                "dest",
-                "identity",
+                "user",
+                "session",
                 "trust",
                 "hops",
                 "last seen",
-                "state"
+                "state",
+                "hashes"
             ],
             "{text}"
         );
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 3, "{text}");
-        assert_eq!(rows[0][0], "Ann", "{text}");
-        assert_eq!(rows[0][3], "trusted", "{text}");
-        assert_eq!(rows[0][5], "5s ago", "{text}");
-        assert_eq!(rows[0][6], "", "a current row has no state: {text}");
-        let stale = "(stale: no announce for 2 heartbeats; forgotten after about 3 h)";
-        assert_eq!(rows[1][3], "blocked (instance)", "{text}");
-        assert_eq!(rows[1][5], "2h ago", "{text}");
         assert_eq!(
-            rows[1][6],
+            rows[0][0], "cdcdcdcd",
+            "an announced name is not a user's: {text}"
+        );
+        assert_eq!(rows[0][2], "trusted", "{text}");
+        assert_eq!(rows[0][4], "5s ago", "{text}");
+        assert_eq!(rows[0][5], "", "a current row has no state: {text}");
+        assert_eq!(rows[0][6], "cdcdcdcd / abababab", "{text}");
+        let stale = "(stale: no announce for 2 heartbeats; forgotten after about 3 h)";
+        assert_eq!(rows[2][2], "blocked (instance)", "{text}");
+        assert_eq!(rows[2][4], "2h ago", "{text}");
+        assert_eq!(
+            rows[2][5],
             format!("{stale}\nincompatible: speaks protocol 9, this Coyote supports 1..=1"),
             "the state cell carries the marker, then the compatibility line: {text}"
         );
-        assert_eq!(rows[2][0], "(no name)", "{text}");
+        assert_eq!(
+            rows[1][0], "cdcdcdcd",
+            "rows of one user are grouped: {text}"
+        );
         assert_eq!(
             table_footer(&text),
             [
-                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
+                "2 users and 3 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
                 NAME_ADDRESSING_LINE,
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block <destination>; blocked (identity) = .mesh access block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this user moved to the session named; left = the session said it was leaving the mesh, until it announces again or is heard over a link; no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped; a user or session shows the name you gave it, else the one it advertised, else its short hash; user = a person or an installation, which can run several sessions",
             ],
             "{text}"
         );
@@ -12530,13 +13247,7 @@ mod tests {
                 row(Some("laptop"), "2c3d4e5f", "8b9c0d1e", 1, 3),
                 "trusted",
                 None,
-                HeardFacts {
-                    no_route: false,
-                    is_you: true,
-                    own_session: None,
-                    own_gone: false,
-                    label: None,
-                },
+                HeardFacts::default(),
             ),
             PeerRow::Heard(
                 row(Some("laptop"), "6a7b8c9d", "8b9c0d1e", 1, 300),
@@ -12544,10 +13255,7 @@ mod tests {
                 None,
                 HeardFacts {
                     no_route: true,
-                    is_you: true,
-                    own_session: None,
                     own_gone: true,
-                    label: None,
                 },
             ),
             PeerRow::Heard(
@@ -12570,10 +13278,7 @@ mod tests {
                 None,
                 HeardFacts {
                     no_route: true,
-                    is_you: false,
-                    own_session: None,
                     own_gone: false,
-                    label: None,
                 },
             ),
             PeerRow::Heard(
@@ -12595,29 +13300,78 @@ mod tests {
                 HeardFacts::default(),
             ),
         ];
-        assert_eq!(render_peers(&rows, now).plain(), PEERS_SNAPSHOT);
+        assert_eq!(
+            super::render_peers(&rows, &snapshot_namer(), now).plain(),
+            PEERS_SNAPSHOT.replace(
+                "{row separator}",
+                &row_separator(&[12, 16, 11, 6, 11, 177, 21])
+            )
+        );
     }
 
-    const PEERS_SNAPSHOT: &str = r#"┌─────────────┬──────────┬──────────┬───────────┬──────┬───────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ name        ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                           │
-╞═════════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
-│ (you)       ┆ 2c3d4e5f ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                                                                                 │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (you, gone) ┆ 6a7b8c9d ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ alice       ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                                                                                 │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob         ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob         ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                                                                                                                │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (no name)   ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                │
-└─────────────┴──────────┴──────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+    /// The dashed line the table draws between rows, for columns of these widths.
+    fn row_separator(widths: &[usize]) -> String {
+        let cells: Vec<String> = widths
+            .iter()
+            .map(|width| "\u{254C}".repeat(*width))
+            .collect();
+        format!("\u{251C}{}\u{2524}", cells.join("\u{253C}"))
+    }
+
+    /// The owner `8b9c0d1e`, whose session `temp` has ended; `9f8e7d6c`, named
+    /// `Coworker A` by the owner, whose session advertises `review`; `4a5b6c7d`, who
+    /// advertises `Bob`; and `0c1d2e3f`, with no name.
+    fn snapshot_namer() -> Namer {
+        use crate::mesh::people::{People, PersonEntry, SessionNames};
+        let mut entries = BTreeMap::new();
+        let mut coworker = PersonEntry {
+            alias: Some("Coworker A".to_string()),
+            ..PersonEntry::default()
+        };
+        coworker.sessions.insert(
+            "1a2b3c4d".repeat(4),
+            SessionNames {
+                alias: None,
+                advertised: Some("review".to_string()),
+            },
+        );
+        entries.insert("9f8e7d6c".repeat(4), coworker);
+        entries.insert(
+            "4a5b6c7d".repeat(4),
+            PersonEntry {
+                advertised: Some("Bob".to_string()),
+                ..PersonEntry::default()
+            },
+        );
+        let own = [
+            ("6a7b8c9d".repeat(4), "temp".to_string()),
+            ("2c3d4e5f".repeat(4), "test-session-2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        Namer::new(People::new(&entries, &[]), Some(&"8b9c0d1e".repeat(4)), own)
+    }
+
+    const PEERS_SNAPSHOT: &str = r#"┌────────────┬────────────────┬───────────┬──────┬───────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────┐
+│ user       ┆ session        ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                           ┆ hashes              │
+╞════════════╪════════════════╪═══════════╪══════╪═══════════╪═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╪═════════════════════╡
+│ you        ┆ test-session-2 ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                                                                                 ┆ 8b9c0d1e / 2c3d4e5f │
+{row separator}
+│ you        ┆ temp (ended)   ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) ┆ 8b9c0d1e / 6a7b8c9d │
+{row separator}
+│ Bob        ┆ 7c8d9e0f       ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) ┆ 4a5b6c7d / 7c8d9e0f │
+{row separator}
+│ Bob        ┆ 3b4c5d6e       ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same user announced a new session)                                                                                                                     ┆ 4a5b6c7d / 3b4c5d6e │
+{row separator}
+│ Coworker A ┆ review         ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                                                                                 ┆ 9f8e7d6c / 1a2b3c4d │
+{row separator}
+│ 0c1d2e3f   ┆ 5e6f7a8b       ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                ┆ 0c1d2e3f / 5e6f7a8b │
+└────────────┴────────────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────┘
 1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh access trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh access block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh access revoke 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
-6 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.
-Type a session name or a trust label in place of a hash, as in `.mesh people status <name>` or `.mesh messaging send <name> <text>`; give an instance a label with `.mesh access trust <dest> --label <name>`.
+4 users and 6 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.
+Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> "name"` names a user and `.mesh people name <user>/<session> "name"` one of their sessions.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block <destination>; blocked (identity) = .mesh access block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this user moved to the session named; left = the session said it was leaving the mesh, until it announces again or is heard over a link; no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped; a user or session shows the name you gave it, else the one it advertised, else its short hash; user = a person or an installation, which can run several sessions"#;
 
     /// The whole `.mesh access requests` text for two cached knocks and one identity's dropped knocks.
     #[test]
@@ -12973,7 +13727,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let text = render_peers(&[PeerRow::DenyOnly(record, None)], SystemTime::now()).plain();
         let row = &table_rows(&text)[0];
         assert_eq!(deny_only_label(), "blocked (instance)");
-        assert_eq!(row[3], deny_only_label(), "{text}");
+        assert_eq!(row[2], deny_only_label(), "{text}");
         let found: Vec<&&str> = TRUST_LABELS
             .iter()
             .filter(|label| row.iter().any(|cell| cell.contains(*label)))
@@ -12994,7 +13748,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             destination_hash: destination.repeat(16),
             ..peer(name, seen_secs_ago, now)
         };
-        let superseded = "(superseded by 12121212: same identity announced a new instance)";
+        let superseded = "(superseded by 12121212: same user announced a new session)";
 
         let live = at("ef", Some("Bob"), 40);
         let new = at("12", Some("Bob"), 5);
@@ -13006,12 +13760,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(
-            (rows[0][5].as_str(), rows[0][6].as_str()),
+            (rows[0][4].as_str(), rows[0][5].as_str()),
             ("5s ago", ""),
             "the successor carries no marker: {text}"
         );
         assert_eq!(
-            (rows[1][5].as_str(), rows[1][6].as_str()),
+            (rows[1][4].as_str(), rows[1][5].as_str()),
             ("40s ago", ""),
             "two live sessions under one identity: neither is superseded: {text}"
         );
@@ -13024,7 +13778,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(
-            (rows[1][5].as_str(), rows[1][6].as_str()),
+            (rows[1][4].as_str(), rows[1][5].as_str()),
             ("2h ago", superseded),
             "superseded wins over stale: {text}"
         );
@@ -13048,7 +13802,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         ];
         let text = render_peers(&rows, now).plain();
         assert!(
-            table_rows(&text)[1][6] == superseded,
+            table_rows(&text)[1][5] == superseded,
             "a nameless successor still supersedes: {text}"
         );
 
@@ -13167,21 +13921,22 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
-        assert_eq!(rows[1][0], "-", "{text}");
+        assert_eq!(rows[1][0], crate::mesh::people::UNNAMED, "{text}");
         assert_eq!(rows[1][1], "77".repeat(4), "{text}");
-        assert_eq!(rows[1][3], "blocked (instance)", "{text}");
-        assert_eq!(rows[1][5], "never", "{text}");
+        assert_eq!(rows[1][2], "blocked (instance)", "{text}");
+        assert_eq!(rows[1][4], "never", "{text}");
+        assert_eq!(rows[1][6], format!("- / {}", "77".repeat(4)), "{text}");
         assert!(!rows[1].concat().contains("trusted"), "{text}");
         assert_eq!(rows[2][1], "88".repeat(4), "{text}");
         assert_eq!(
-            rows[2][2],
-            "99".repeat(4),
+            rows[2][6],
+            format!("{} / {}", "99".repeat(4), "88".repeat(4)),
             "a deny bound to an identity shows it: {text}"
         );
         assert_eq!(
             table_footer(&text),
             [
-                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
+                "3 users and 3 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
                 NAME_ADDRESSING_LINE,
                 trust_legend(),
                 peers_legend().as_str(),
@@ -13260,8 +14015,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "one plain line per marked row, in row order: {text}"
         );
         let dest8 = "ab".repeat(4);
-        assert_eq!(rows[0][0], "Ann", "{text}");
-        assert_eq!(rows[0][6], "", "the mark leaves the state cell: {text}");
+        assert_eq!(rows[0][0], "cd".repeat(4), "{text}");
+        assert_eq!(rows[0][5], "", "the mark leaves the state cell: {text}");
         let ann = &marks[0];
         assert!(
             ann.starts_with(&format!(
@@ -13291,8 +14046,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             )),
             "{text}"
         );
-        assert_eq!(rows[1][0], "Bob", "{text}");
-        assert_eq!(rows[1][6], "", "{text}");
+        assert_eq!(rows[1][0], "cd".repeat(4), "{text}");
+        assert_eq!(rows[1][5], "", "{text}");
         let bob = &marks[1];
         assert!(bob.starts_with(&format!("{dest8} key changed: ")), "{text}");
         assert!(
@@ -13310,10 +14065,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             )),
             "a mark without a heard new destination still says what to do, and a denied row's lift is unblock: {text}"
         );
-        assert_eq!(rows[2][0], "Cy", "{text}");
-        assert_eq!(rows[2][6], "", "an unmarked row has an empty state: {text}");
-        assert_eq!(rows[3][0], "Dee", "{text}");
-        assert_eq!(rows[3][6], "", "{text}");
+        assert_eq!(rows[2][0], "cd".repeat(4), "{text}");
+        assert_eq!(rows[2][5], "", "an unmarked row has an empty state: {text}");
+        assert_eq!(rows[3][0], "cd".repeat(4), "{text}");
+        assert_eq!(rows[3][5], "", "{text}");
         let dee = &marks[2];
         assert!(dee.starts_with(&format!("{dest8} key changed: ")), "{text}");
         assert!(
@@ -13334,7 +14089,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             7,
             "three mark lines, then the count, the name line and the two legend lines: {text}"
         );
-        assert!(footer[3].starts_with("4 peer(s)."), "{text}");
+        assert!(footer[3].starts_with("1 user and 4 sessions."), "{text}");
     }
 
     #[test]
@@ -13378,16 +14133,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
-        assert_eq!(rows[1][0], "Tia", "{text}");
+        assert_eq!(rows[1][0], "88".repeat(4), "{text}");
         assert_eq!(rows[1][1], "77".repeat(4), "{text}");
-        assert_eq!(rows[1][2], "88".repeat(4), "{text}");
-        assert_eq!(rows[1][3], "trusted", "{text}");
         assert_eq!(
-            (rows[1][4].as_str(), rows[1][5].as_str()),
+            rows[1][6],
+            format!("{} / {}", "88".repeat(4), "77".repeat(4)),
+            "{text}"
+        );
+        assert_eq!(rows[1][2], "trusted", "{text}");
+        assert_eq!(
+            (rows[1][3].as_str(), rows[1][4].as_str()),
             ("-", "2h ago"),
             "no hops for a row nobody heard: {text}"
         );
-        assert_eq!(rows[1][6], "", "{text}");
+        assert_eq!(rows[1][5], NOT_HEARD_STATE, "{text}");
         let marks = key_change_lines(&text);
         assert_eq!(marks.len(), 2, "{text}");
         assert!(
@@ -13406,8 +14165,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             )),
             "the exits name the heard successor, the full seen identity and the full old hash: {text}"
         );
-        assert_eq!(rows[2][0], "(not heard)", "{text}");
-        assert_eq!(rows[2][6], "", "{text}");
+        assert_eq!(rows[2][1], "66".repeat(4), "{text}");
+        assert_eq!(rows[2][5], NOT_HEARD_STATE, "{text}");
         assert!(marks[1].starts_with("66666666 key changed: "), "{text}");
         assert!(
             marks[1].contains(&format!(
@@ -13415,7 +14174,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             )),
             "a mark whose successor is not heard still says what to do: {text}"
         );
-        assert!(table_footer(&text)[2].starts_with("3 peer(s)."), "{text}");
+        assert!(
+            table_footer(&text)[2].starts_with("2 users and 3 sessions."),
+            "{text}"
+        );
 
         let heard_again = vec![old_destination.clone()];
         assert!(
@@ -13465,12 +14227,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][1], "77".repeat(4), "{text}");
-        assert_eq!(rows[0][3], "blocked (identity)", "{text}");
+        assert_eq!(rows[0][2], "blocked (identity)", "{text}");
         assert!(
             !rows[0].concat().contains("trusted"),
             "the row is labelled by the store's verdict, not by the record's existence: {text}"
         );
-        assert_eq!(rows[0][6], "", "{text}");
+        assert_eq!(rows[0][5], NOT_HEARD_STATE, "{text}");
         assert!(
             key_change_line_of(&text).starts_with("77777777 key changed: "),
             "{text}"
@@ -13479,22 +14241,31 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
     #[test]
     fn a_marked_records_label_is_sanitised_like_any_peer_name() {
+        use crate::mesh::people::{People, PersonEntry};
         let now = SystemTime::now();
         let label = "Tia\u{1b}[31m\nX";
         let mut record = deny_record(&"77".repeat(16), Some(&"88".repeat(16)));
         record.denied = false;
-        record.label = Some(label.to_string());
         record.key_changed = Some(KeyChange {
             seen_identity: "99".repeat(16),
             at: now - Duration::from_secs(60),
         });
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "88".repeat(16),
+            PersonEntry {
+                advertised: Some(label.to_string()),
+                ..PersonEntry::default()
+            },
+        );
+        let namer = Namer::new(People::new(&entries, &[]), None, Default::default());
 
         let rows = unheard_rows(vec![record], &[], &[], |_| "trusted", |_| false);
-        let text = render_peers(&rows, now).plain();
+        let text = super::render_peers(&rows, &namer, now).plain();
 
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text:?}");
-        let shown = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap();
+        let shown = display_text(label, crate::mesh::card::NAME_MAX_CHARS).unwrap();
         assert_eq!(rows[0][0], shown, "{text:?}");
         assert!(!text.contains('\u{1b}'), "{text:?}");
         assert!(!text.contains("[31m"), "{text:?}");
@@ -13546,10 +14317,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let text = render_peers(&rows, now).plain();
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
-        assert_eq!(rows[0][0], "-", "{text}");
-        assert_eq!(rows[0][3], "blocked (instance)", "{text}");
+        assert_eq!(
+            rows[0][0],
+            "88".repeat(4),
+            "the user the deny is bound to: {text}"
+        );
+        assert_eq!(rows[0][2], "blocked (instance)", "{text}");
         assert!(!rows[0].concat().contains("trusted"), "{text}");
-        assert_eq!(rows[0][6], "", "{text}");
+        assert_eq!(rows[0][5], "", "{text}");
         let mark = key_change_line_of(&text);
         assert!(
             mark.starts_with(&format!(
@@ -13568,7 +14343,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             )),
             "a block is lifted by unblocking the old destination, heard or not, and erased with the identity: {text}"
         );
-        assert!(table_footer(&text)[1].starts_with("1 peer(s)."), "{text}");
+        assert!(
+            table_footer(&text)[1].starts_with("1 user and 1 session."),
+            "{text}"
+        );
     }
 
     /// A marked row of every kind puts its remedy under the table, led by its own `dest`,
@@ -13614,7 +14392,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             );
         }
         assert!(
-            rows[0][6].starts_with("(stale:") && rows[0][6].contains("\nincompatible:"),
+            rows[0][5].starts_with("(stale:") && rows[0][5].contains("\nincompatible:"),
             "{text}"
         );
         assert_eq!(
@@ -13627,7 +14405,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         let footer = table_footer(&text);
         assert_eq!(footer.len(), 7, "{text}");
-        assert!(footer[3].starts_with("4 peer(s)."), "{text}");
+        assert!(footer[3].starts_with("3 users and 4 sessions."), "{text}");
         assert_eq!(footer[4], NAME_ADDRESSING_LINE, "{text}");
         assert_eq!(footer[5], trust_legend(), "{text}");
         assert_eq!(footer[6], peers_legend(), "{text}");
@@ -14141,7 +14919,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             text,
             format!(
-                "this node -> Bob ({}) . direct . 14:15 UTC . answering {}\n  merged it for you",
+                "you -> Bob ({}) . direct . 14:15 UTC . answering {}\n  merged it for you",
                 "01".repeat(4),
                 "77".repeat(4)
             ),
@@ -14579,7 +15357,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             let blocks: Vec<&str> = text.split("\n\n").collect();
             assert_eq!(blocks.len(), 2, "{text}");
-            assert!(blocks[0].starts_with("this node -> Bob ("), "{text}");
+            assert!(blocks[0].starts_with("you -> Bob ("), "{text}");
             assert_eq!(indented_lines(blocks[0]), ["a follow-up"], "{text}");
             assert_eq!(
                 blocks[1],
@@ -14977,8 +15755,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     }
 
     /// The block for each kind of question `.mesh envoy answer` and `.mesh messaging follow-up` print, rendered plain: header,
-    /// body, envoy row, footer. A never-heard peer carries its short destination as its
-    /// name and so reads `<dest8> (<dest8>)`, a stamp that does not parse reads as an
+    /// body, envoy row, footer. A peer the test names by its short destination alone
+    /// reads `<dest8> (<dest8>)`, a stamp that does not parse reads as an
     /// unknown time, and a filled `expires_in` lands at the end of the header.
     #[test]
     fn question_block_renders_outbound_and_inbound_rows() {
@@ -16017,6 +16795,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
     }
 
+    /// How the broadcast tests name every recipient: one user's session at `ab..`, as the
+    /// namer would once the user is named `Ann`.
+    fn ann(destination: &str) -> String {
+        format!("Ann / {}", short(destination))
+    }
+
     #[test]
     fn broadcast_report_lists_each_recipient_and_totals_them() {
         let nobody = BroadcastOutcome {
@@ -16024,7 +16808,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             recipients: vec![],
         };
         assert!(
-            render_broadcast(&nobody)
+            render_broadcast(&nobody, ann)
                 .plain()
                 .starts_with("No trusted peer has a known path")
         );
@@ -16057,11 +16841,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 ),
             ],
         };
-        let text = render_broadcast(&outcome).plain();
+        let text = render_broadcast(&outcome, ann).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 7, "{text}");
-        assert_eq!(lines[0], format!("  Ann ({}): delivered", "ab".repeat(4)));
-        assert!(lines[1].starts_with("  (no name) "), "{text}");
+        assert_eq!(
+            lines[0],
+            format!("  Ann / {0} ({0}): delivered", "ab".repeat(4))
+        );
+        assert!(
+            lines
+                .iter()
+                .take(6)
+                .all(|line| line.starts_with("  Ann / abababab (abababab): ")),
+            "every row is named by the namer, never by the name the peer announces: {text}"
+        );
         assert!(lines[1].ends_with("store-and-forward"), "{text}");
         assert!(lines[2].ends_with("unreachable: no path"), "{text}");
         assert!(lines[3].ends_with("refused: no access"), "{text}");
@@ -16069,7 +16862,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         // `refused:` prefix in front of a line that already opens with the peer's name.
         assert!(
             lines[5].starts_with(&format!(
-                "  Bea (abababab): \"Bea\" (abababab) refused the request: it has not trusted this instance ({}).",
+                "  Ann / abababab (abababab): \"Bea\" (abababab) refused the request: it has not trusted this instance ({}).",
                 "0a".repeat(16)
             )),
             "{text}"
@@ -16106,10 +16899,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ),
                 ],
             };
-            let text = render_broadcast(&outcome).render(CommandPrefix::Slash);
+            let text = render_broadcast(&outcome, |_: &str| ".info Bea / .session".to_string())
+                .render(CommandPrefix::Slash);
             let lines: Vec<&str> = text.lines().collect();
             assert!(
-                lines[0].starts_with(&format!("  .info Bea (abababab): {refusal}")),
+                lines[0].starts_with(&format!("  .info Bea / .session (abababab): {refusal}")),
                 "{text}"
             );
             assert!(
@@ -16117,7 +16911,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "{text}"
             );
             assert!(
-                lines[1].starts_with(&format!("  .session (abababab): {no_answer}")),
+                lines[1].starts_with(&format!("  .info Bea / .session (abababab): {no_answer}")),
                 "{text}"
             );
             let nobody = BroadcastOutcome {
@@ -16125,7 +16919,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 recipients: vec![],
             };
             assert!(
-                render_broadcast(&nobody)
+                render_broadcast(&nobody, |_: &str| String::new())
                     .render(CommandPrefix::Slash)
                     .contains("`/mesh people list` lists"),
             );
@@ -17680,8 +18474,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             );
             assert!(
                 blocks[1].starts_with(&format!(
-                    "reply . from {0} ({0}) . direct . ",
-                    "ab".repeat(4)
+                    "reply . from {1} / {0} ({0}) . direct . ",
+                    "ab".repeat(4),
+                    "cd".repeat(4)
                 )),
                 "{out}"
             );
@@ -19068,7 +19863,29 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// Puts a heard peer in `runtime`'s peer table, last seen `at`, and returns its
             /// (destination, identity); nothing is trusted.
+            /// Hears a peer announcing `name` and names its user `name`, as the owner would
+            /// with `.mesh people name`: the announced name alone names nobody in a human
+            /// line. A name another user already has is refused there, so that peer stays
+            /// unnamed here too. Returns the peer's destination and identity.
             fn heard_peer(runtime: &MeshRuntime, name: &str, at: SystemTime) -> (String, String) {
+                let (destination, identity) = heard_unnamed_peer(runtime, name, at);
+                if let Err(err) = runtime.trust().set_person_alias(&identity, Some(name), &[]) {
+                    assert!(
+                        err.to_string()
+                            .starts_with("Another person or session already has that name"),
+                        "{err}"
+                    );
+                }
+                (destination, identity)
+            }
+
+            /// `heard_peer` without the name: the peer only announces `name`, which no
+            /// human line shows, and the people section holds nothing for it.
+            fn heard_unnamed_peer(
+                runtime: &MeshRuntime,
+                name: &str,
+                at: SystemTime,
+            ) -> (String, String) {
                 let (destination, identity, name_hash) = announced_peer();
                 runtime.peers().observe(
                     PeerSighting {
@@ -19444,7 +20261,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         last_seen,
                         format!(
-                            "last seen: 2h ago (superseded by {}: same identity announced a new instance)",
+                            "last seen: 2h ago (superseded by {}: same user announced a new session)",
                             short(&new_dest)
                         ),
                         "{out}"
@@ -19500,12 +20317,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let rows = table_rows(&out);
                         let row = |destination: &str| {
                             rows.iter()
-                                .find(|row| row[1] == short(destination))
+                                .find(|row| row[6].ends_with(&format!(" / {}", short(destination))))
                                 .unwrap_or_else(|| panic!("no row for {destination} in {out}"))
                         };
                         assert_eq!(row(&unrouted)[0], "Tia", "{out}");
-                        assert!(row(&unrouted)[6].starts_with("(no route:"), "{out}");
-                        assert_eq!(row(&other_session)[0], "(you)", "{out}");
+                        assert!(row(&unrouted)[5].starts_with("(no route:"), "{out}");
+                        assert_eq!(row(&other_session)[0], YOU, "{out}");
                         assert!(out.contains("no route = "), "{out}");
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
@@ -19575,13 +20392,25 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let rows = table_rows(&out);
                         let row = |destination: &str| {
                             rows.iter()
-                                .find(|row| row[1] == short(destination))
+                                .find(|row| row[6].ends_with(&format!(" / {}", short(destination))))
                                 .unwrap_or_else(|| panic!("no row for {destination} in {out}"))
                         };
-                        assert_eq!(row(&temp_dest)[0], "(you: temp)", "{out}");
-                        assert_eq!(row(&gone_session)[0], "(you)", "{out}");
+                        assert_eq!(
+                            (row(&temp_dest)[0].as_str(), row(&temp_dest)[1].as_str()),
+                            (YOU, "temp"),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            (
+                                row(&gone_session)[0].as_str(),
+                                row(&gone_session)[1].as_str()
+                            ),
+                            (YOU, short(&gone_session))
+                        );
                         assert!(
-                            out.contains("(you: <session>) = your session of that name"),
+                            out.contains(
+                                "you = your own sessions on this config dir, by session name"
+                            ),
                             "{out}"
                         );
 
@@ -19609,7 +20438,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                             .unwrap();
                         let out = pending_out(&mut ctx, ".").await.unwrap();
-                        assert!(out.contains("(you: temp)"), "{out}");
+                        assert!(out.contains("you / temp"), "{out}");
                         assert!(!out.contains("Laptop"), "{out}");
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
@@ -19676,11 +20505,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let rows = table_rows(&out);
                         let row = rows
                             .iter()
-                            .find(|row| row[1] == short(&temp_dest))
+                            .find(|row| row[6].ends_with(&format!(" / {}", short(&temp_dest))))
                             .unwrap_or_else(|| panic!("no row for {temp_dest} in {out}"));
-                        assert_eq!(row[0], "(you, gone)", "{out}");
-                        assert_eq!(row[6], NO_ROUTE_STATE, "{out}");
-                        assert!(out.contains("(you, gone) = "), "{out}");
+                        assert_eq!(
+                            (row[0].as_str(), row[1].as_str()),
+                            (YOU, "temp (ended)"),
+                            "{out}"
+                        );
+                        assert_eq!(row[5], NO_ROUTE_STATE, "{out}");
+                        assert!(out.contains("(ended) once it has stopped"), "{out}");
 
                         let result =
                             handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
@@ -19731,7 +20564,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let out = pending_out(&mut ctx, ".").await.unwrap();
                         assert!(
                             out.contains(
-                                "asked by (you, gone: temp) . collect it from that session"
+                                "asked by you / temp (ended) . collect it from that session"
                             ),
                             "{out}"
                         );
@@ -19807,8 +20640,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert!(out.contains("Asked by this node (3)"), "{out}");
                         for line in [
-                            "asked by (you: temp) . collect it from that session",
-                            "asked by (you, gone: old) . collect it from that session",
+                            "asked by you / temp . collect it from that session",
+                            "asked by you / old (ended) . collect it from that session",
                             "asked by another session . collect it from that session",
                         ] {
                             assert!(out.contains(line), "no {line:?} in {out}");
@@ -19817,7 +20650,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert!(out.contains(&format!(". id {id}")), "no {id} in {out}");
                         }
 
-                        let running = "Question q-temp-0001 was asked by (you: temp), not this session, and only the session that asked it can collect the reply or follow up: run `.mesh messaging follow-up q-temp-0001 \"<text>\"` in session temp.";
+                        let running = "Question q-temp-0001 was asked by you / temp, not this session, and only the session that asked it can collect the reply or follow up: run `.mesh messaging follow-up q-temp-0001 \"<text>\"` in session temp.";
                         for verb in [
                             ".mesh envoy answer q-temp-0001 \"main\"",
                             ".mesh envoy dismiss q-temp-0001",
@@ -19831,7 +20664,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .to_string();
                         assert_eq!(
                             gone,
-                            "Question q-gone-0001 was asked by (you, gone: old), which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session old` and `.mesh on`, then run `.mesh messaging follow-up q-gone-0001 \"<text>\"` in session old."
+                            "Question q-gone-0001 was asked by you / old (ended), which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session old` and `.mesh on`, then run `.mesh messaging follow-up q-gone-0001 \"<text>\"` in session old."
                         );
                         let by_prefix = out_of(&mut ctx, ".mesh envoy answer q-lost-0 \"main\"")
                             .await
@@ -19892,11 +20725,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let rows = table_rows(&out);
                             let row = |destination: &str| {
                                 rows.iter()
-                                    .find(|row| row[1] == short(destination))
+                                    .find(|row| {
+                                        row[6].ends_with(&format!(" / {}", short(destination)))
+                                    })
                                     .unwrap_or_else(|| panic!("no row for {destination} in {out}"))
                             };
-                            assert_eq!(row(&temp_dest)[0], "Forged", "{out}");
-                            assert_eq!(row(&gone_session)[0], "(you)", "{out}");
+                            assert_eq!(row(&temp_dest)[0], short(&forger), "{out}");
+                            assert_eq!(row(&gone_session)[0], YOU, "{out}");
 
                             let now = SystemTime::now();
                             let store = ctx
@@ -19929,9 +20764,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     .unwrap();
                             }
                             let out = pending_out(&mut ctx, ".").await.unwrap();
-                            assert!(!out.contains("(you: temp)"), "{out}");
-                            assert!(out.contains("Forged"), "{out}");
-                            assert!(out.contains("(you)"), "{out}");
+                            assert!(!out.contains("you / temp"), "{out}");
+                            assert!(out.contains(&format!("{} / ", short(&forger))), "{out}");
+                            assert!(
+                                out.contains(&format!("{YOU} / {}", short(&gone_session))),
+                                "{out}"
+                            );
                             assert!(!out.contains(&format!("{SELF_TRUST_LABEL} (")), "{out}");
 
                             assert!(ctx.app.mesh.stop().await.unwrap());
@@ -20079,8 +20917,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let row = |text: &str, destination: &str| -> (String, String) {
                         table_rows(text)
                             .into_iter()
-                            .find(|row| row[1] == short(destination))
-                            .map(|row| (row[5].clone(), row[6].clone()))
+                            .find(|row| row[6].ends_with(&format!(" / {}", short(destination))))
+                            .map(|row| (row[4].clone(), row[5].clone()))
                             .unwrap_or_else(|| panic!("{destination} missing from {text}"))
                     };
                     assert_eq!(
@@ -20103,7 +20941,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         (
                             "2h ago".to_string(),
                             format!(
-                                "(superseded by {}: same identity announced a new instance)",
+                                "(superseded by {}: same user announced a new session)",
                                 short(&newer)
                             )
                         ),
@@ -20118,7 +20956,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(footer.len(), 4, "{first}");
                     assert_eq!(
                         footer[0],
-                        "5 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
+                        "4 users and 5 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
                         "{first}"
                     );
                     assert_eq!(
@@ -20231,12 +21069,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let blocks: Vec<&str> = out.split("\n\n").collect();
                     assert_eq!(blocks.len(), 2, "{out}");
                     let peer8 = short(&peer);
+                    let tia = format!("{} / {peer8}", short(&hex_lower(&[0xcd; 16])));
                     assert!(
-                        blocks[0].starts_with(&format!("message . from Tia ({peer8}) . direct . ")),
+                        blocks[0]
+                            .starts_with(&format!("message . from {tia} ({peer8}) . direct . ")),
                         "{out}"
                     );
                     let own_header = blocks[1].lines().next().unwrap();
-                    let prefix = format!("this node -> Tia ({peer8}) . direct . ");
+                    // The fixture's peer row does not derive its destination from the
+                    // identity it claims, so the reply's recipient is named by hash alone.
+                    let prefix = format!("you -> unnamed / {peer8} ({peer8}) . direct . ");
                     let suffix = format!(" UTC . answering {}", short(&"m1".repeat(16)));
                     assert!(own_header.starts_with(&prefix), "{out}");
                     assert!(own_header.ends_with(&suffix), "{out}");
@@ -20298,14 +21140,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let blocks: Vec<&str> = out.split("\n\n").collect();
                     assert_eq!(blocks.len(), 2, "{out}");
                     let peer8 = short(&peer);
+                    let cd = short(&hex_lower(&[0xcd; 16])).to_string();
                     assert!(
-                        blocks[0].starts_with(&format!("ask . from {peer8} ({peer8}) . direct . ")),
+                        blocks[0].starts_with(&format!(
+                            "ask . from {cd} / {peer8} ({peer8}) . direct . "
+                        )),
                         "{out}"
                     );
                     let own_header = blocks[1].lines().next().unwrap();
                     assert!(
-                        own_header
-                            .starts_with(&format!("this node -> {peer8} ({peer8}) . direct . ")),
+                        own_header.starts_with(&format!(
+                            "you -> unnamed / {peer8} ({peer8}) . direct . "
+                        )),
                         "{out}"
                     );
                     assert!(
@@ -20362,13 +21208,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let blocks: Vec<&str> = out.split("\n\n").collect();
                     assert_eq!(blocks.len(), 2, "{out}");
                     let peer8 = short(&peer);
+                    let cd = short(&hex_lower(&[0xcd; 16])).to_string();
                     assert!(
-                        blocks[0].starts_with(&format!("ask . from {peer8} ({peer8}) . direct . ")),
+                        blocks[0].starts_with(&format!(
+                            "ask . from {cd} / {peer8} ({peer8}) . direct . "
+                        )),
                         "{out}"
                     );
                     assert!(
-                        blocks[1]
-                            .starts_with(&format!("this node -> {peer8} ({peer8}) . direct . ")),
+                        blocks[1].starts_with(&format!(
+                            "you -> unnamed / {peer8} ({peer8}) . direct . "
+                        )),
                         "{out}"
                     );
                     assert_eq!(blocks[1].lines().nth(1), Some("  yes, green"), "{out}");
@@ -21950,11 +22800,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let unheard = table_rows(&out)
                         .into_iter()
-                        .find(|row| row[0] == "(not heard)")
+                        .find(|row| row[5] == NOT_HEARD_STATE)
                         .unwrap_or_else(|| panic!("no unheard row in {out}"));
-                    assert_eq!(unheard[1], short(&old_dest), "{out}");
-                    assert_eq!(unheard[2], short(&old_identity), "{out}");
-                    assert_eq!(unheard[6], "", "{out}");
+                    assert_eq!(unheard[0], "Tia", "the record keeps its user's name: {out}");
+                    assert_eq!(
+                        unheard[6],
+                        format!("{} / {}", short(&old_identity), short(&old_dest)),
+                        "{out}"
+                    );
                     let marker = key_change_line_of(&out);
                     assert!(
                         marker.starts_with(&format!("{} key changed:", short(&old_dest))),
@@ -22019,11 +22872,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let rows: Vec<Vec<String>> = table_rows(&out)
                         .into_iter()
-                        .filter(|row| row[1] == short(&old_dest))
+                        .filter(|row| row[6].ends_with(&format!(" / {}", short(&old_dest))))
                         .collect();
                     assert_eq!(rows.len(), 1, "one row for the denied record: {out}");
-                    assert_eq!(rows[0][3], "blocked (instance)", "{out}");
-                    assert_eq!(rows[0][6], "", "{out}");
+                    assert_eq!(rows[0][2], "blocked (instance)", "{out}");
+                    assert_eq!(rows[0][5], "", "{out}");
                     let marker = key_change_line_of(&out);
                     assert!(
                         marker.starts_with(&format!("{} key changed:", short(&old_dest))),
@@ -24180,12 +25033,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
                     let inbound_header = format!(
-                        "awaiting your answer . {} ({}) . asked ",
+                        "awaiting your answer . {} / {} ({}) . asked ",
+                        short(&"ef".repeat(16)),
                         short(&asker_peer),
                         short(&asker_peer)
                     );
                     let outbound_header = format!(
-                        "open . {} ({}) . sent ",
+                        "open . {} / {} ({}) . sent ",
+                        short(&"cd".repeat(16)),
                         short(&asked_peer),
                         short(&asked_peer)
                     );
@@ -24364,12 +25219,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
                     let inbound_header = format!(
-                        "awaiting your answer . {} ({}) . asked ",
+                        "awaiting your answer . {} / {} ({}) . asked ",
+                        short(&"ef".repeat(16)),
                         short(&asker_peer),
                         short(&asker_peer)
                     );
                     let outbound_header = format!(
-                        "open . {} ({}) . sent ",
+                        "open . {} / {} ({}) . sent ",
+                        short(&"cd".repeat(16)),
                         short(&asked_peer),
                         short(&asked_peer)
                     );
@@ -24553,7 +25410,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let header = out[access_title + 1];
                     assert!(
                         header.starts_with(&format!(
-                            "  1. {} ({}) asked ",
+                            "  1. {} / {} ({}) asked ",
+                            short(&"ef".repeat(16)),
                             short(&asker_peer),
                             short(&asker_peer)
                         )),
@@ -24985,8 +25843,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh access trust {a_instance} (or .mesh access unblock {a_instance} if it blocked this instance). (This node does trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
-                            d8 = short(&b_hex)
+                            "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh access trust {a_instance} (or .mesh access unblock {a_instance} if it blocked this instance). (This node does trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
+                            d8 = short(&b_hex),
+                            i8 = short(&pair.responder.desc.identity.address_hash.to_hex_string())
                         )
                     );
                     let out = stdout_lines();
@@ -25431,7 +26290,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                     assert!(
                         out.contains(&format!(
-                            "This sends your text to Tia ({}, trust: trusted)",
+                            "This sends your text to Tia / {0} ({0}, trust: trusted)",
                             short(&destination)
                         )),
                         "{out}"
@@ -25487,7 +26346,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .map(|err| err.to_string())
                         .unwrap_or_default();
                     assert!(
-                        !err.contains("is not a peer hash") && !err.contains("has not been heard"),
+                        !err.contains("is not a user or session hash")
+                            && !err.contains("has not been heard"),
                         "{err}"
                     );
 
@@ -25524,7 +26384,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "'{dest8}' matches 3 known destinations: {}...; give more characters.",
+                            "'{dest8}' matches 3 known sessions: {}...; give more characters.",
                             shown.join("..., ")
                         )
                     );
@@ -25540,7 +26400,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .to_string();
                     assert_eq!(
                         err,
-                        "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh people list` lists."
+                        "Session deadbeef has not been heard from: no session you know starts with it. Give the whole hash, or check what `.mesh people list` lists."
                     );
                     let err = run(&mut ctx, &format!(".mesh access ask {}", &dest8[..7]))
                         .await
@@ -25549,7 +26409,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "'{}' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters).",
+                            "'{}' is not a session hash, and no user or session you know is called that. Users: `Tia`. A name is spelled whole; otherwise give a session hash or a unique prefix of one `.mesh people list` lists (8 or more characters).",
                             &dest8[..7]
                         )
                     );
@@ -25559,7 +26419,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .to_string();
                     assert_eq!(
                         err,
-                        "'nothex00' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
+                        "'nothex00' is not a user hash, and no user or session you know is called that. Users: `Tia`. A name is spelled whole; otherwise give a user hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -25703,6 +26563,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     peers.observe(sighting(0x33, 0x34, "Dee"), now);
                     peers.observe(sighting(0x44, 0x45, "Bob"), now);
                     let trust = started.runtime.trust();
+                    trust
+                        .set_person_alias(
+                            &announced.desc.identity.address_hash.to_hex_string(),
+                            Some("Tia"),
+                            &[],
+                        )
+                        .unwrap();
                     let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
                     trust
                         .trust_destination(slot, &trusted, TrustOptions::default(), now)
@@ -25946,7 +26813,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains("is not a destination hash"), "{err}");
+                    assert!(err.contains("is not a session hash"), "{err}");
 
                     let long = "x".repeat(KNOCK_INTRO_MAX_CHARS + 1);
                     let err = run(
@@ -26006,7 +26873,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .await
                     .unwrap();
                     let out = stdout_lines();
-                    let notice = index_of(&out, "This knocks on Tia (");
+                    let notice = index_of(&out, "This knocks on Tia / ");
                     assert!(out[notice].contains("with intro \"hello\""), "{out:?}");
                     assert!(
                         out[notice].ends_with(
@@ -26246,15 +27113,29 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     drop(declined);
 
                     let _script = prompt_script::install(&[true]);
-                    let out = out_of(
+                    let err = refusal(
                         &mut ctx,
                         &format!(".mesh access trust {dest} --label \"Tia box\""),
                     )
-                    .await
-                    .unwrap();
+                    .await;
+                    assert!(err.starts_with("Unexpected '--label'."), "{err}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest}"))
+                        .await
+                        .unwrap();
                     assert!(out.contains("added"), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
+                    let named = out_of(
+                        &mut ctx,
+                        &format!(".mesh people name Tia/{} \"Tia box\"", short(&dest)),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        named.starts_with(&format!("Tia / {} is now Tia / Tia box;", short(&dest))),
+                        "{named}"
+                    );
                     assert!(
                         trust.records().iter().any(|record| record.hash == dest
                             && record.label.as_deref() == Some("Tia box")),
@@ -26938,11 +27819,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             &format!(".mesh access block --identity nothex{flag}"),
                         )
                         .await;
-                        assert!(err.contains("is not an identity hash"), "{err}");
+                        assert!(err.contains("is not a user hash"), "{err}");
                         for verb in ["access revoke", "access block"] {
                             let err =
                                 refusal(&mut ctx, &format!(".mesh {verb} nothex{flag}")).await;
-                            assert!(err.contains("is not a destination hash"), "{verb}: {err}");
+                            assert!(err.contains("is not a session hash"), "{verb}: {err}");
                         }
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -28099,7 +28980,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let memory = started.runtime.memory();
-                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    let (dest, id) = heard_unnamed_peer(&started.runtime, "Tia", SystemTime::now());
                     let token = format!("forget-{}", short(&id));
                     let rows = |ctx: &RequestContext| -> Vec<String> {
                         ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
@@ -28199,9 +29080,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     let token = format!("forget-{}", short(&id));
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
+                        .await
+                        .unwrap();
                     out_of(
                         &mut ctx,
-                        &format!(".mesh access trust {dest} --yes --label \"Tia's desk\""),
+                        &format!(".mesh people name Tia/{} \"Tia's desk\"", short(&dest)),
                     )
                     .await
                     .unwrap();
@@ -28278,7 +29162,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let memory = started.runtime.memory();
-                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    let (dest, id) = heard_unnamed_peer(&started.runtime, "Tia", SystemTime::now());
                     let token = format!("forget-{}", short(&id));
                     let rows = |ctx: &RequestContext| -> Vec<String> {
                         ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
@@ -28590,7 +29474,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .count()
                     };
 
-                    let (dest, id) = heard_peer(&started.runtime, "Tia", now);
+                    let (dest, id) = heard_unnamed_peer(&started.runtime, "Tia", now);
                     out_of(
                         &mut ctx,
                         &format!(".mesh access trust --identity {id} --yes"),
@@ -30530,9 +31414,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
+                        .await
+                        .unwrap();
                     out_of(
                         &mut ctx,
-                        &format!(".mesh access trust {dest} --yes --label \"Tia's desk\""),
+                        &format!(".mesh people name Tia/{} \"Tia's desk\"", short(&dest)),
                     )
                     .await
                     .unwrap();
@@ -30797,9 +31684,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
+                        .await
+                        .unwrap();
                     out_of(
                         &mut ctx,
-                        &format!(".mesh access trust {dest} --yes --label \"Tia's desk\""),
+                        &format!(".mesh people name Tia/{} \"Tia's desk\"", short(&dest)),
                     )
                     .await
                     .unwrap();
@@ -30826,7 +31716,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(
                         offered_as(&offers(&ctx, "block"), &dest).is_some_and(|text| text
                             .starts_with(&format!(
-                                "Tia's desk . {} . trusted . 1 hops . heard ",
+                                "Tia / Tia's desk . {} . trusted . 1 hops . heard ",
                                 short(&dest)
                             ))),
                         "{:?}",
@@ -30880,7 +31770,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(
                         offered_as(&offers(&ctx, "block"), &dest).is_some_and(|text| text
                             .starts_with(&format!(
-                                "Tia's desk . {} . trusted . 1 hops . heard ",
+                                "Tia / Tia's desk . {} . trusted . 1 hops . heard ",
                                 short(&dest)
                             ))),
                         "the session's name outlived the block, so it leads the lifted record again: {:?}",
@@ -31008,7 +31898,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         table_rows(&out)
                             .into_iter()
                             .find(|row| row[0] == "Tia")
-                            .map(|row| row[3].clone())
+                            .map(|row| row[2].clone())
                             .unwrap_or_else(|| panic!("no Tia row in {out}"))
                     }
                     assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
@@ -31269,7 +32159,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .into_iter()
                         .find(|row| row[0] == "Tia")
                         .unwrap_or_else(|| panic!("no Tia row in {out}"));
-                    assert_eq!(row[3], "trusted", "{row:?}");
+                    assert_eq!(row[2], "trusted", "{row:?}");
                     assert!(offers(&ctx, &["access", "revoke", ""]).contains(&dest));
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -31559,8 +32449,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// The untrust line names the peer whose record goes. When the peer table's row
             /// for the destination has since been re-bound to another identity (a key change
             /// the record does not follow), that row proves nothing about the record's
-            /// identity and may not lend it a display name: the line falls back to the
-            /// identity's short hash.
+            /// identity and may not lend it a name: the line still names the record's own
+            /// user, never the user the row now announces.
             #[test]
             #[serial]
             fn untrust_line_never_borrows_a_name_from_a_peer_row_bound_to_another_identity() {
@@ -31619,6 +32509,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         },
                         SystemTime::now(),
                     );
+                    trust
+                        .set_person_alias(&other, Some("Mallory"), &[])
+                        .unwrap();
                     assert_eq!(
                         started.runtime.peers().get(&dest).unwrap().identity_hash,
                         other
@@ -31638,13 +32531,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out.lines().last().unwrap(),
                         format!(
-                            "Untrusted {i8} ({d8}): its destination record is gone; the identity {i8} stays known. {tail}",
+                            "Untrusted Tia ({d8}): its destination record is gone; the identity {i8} stays known. {tail}",
                             d8 = short(&dest),
                             i8 = short(&id)
                         ),
                         "{out}"
                     );
-                    assert!(!out.contains("Mallory") && !out.contains("Tia"), "{out}");
+                    assert!(!out.contains("Mallory"), "{out}");
                     // The record went by its own identity, not the re-bound row's.
                     assert!(
                         !trust.records().iter().any(|record| record.hash == dest),
@@ -32308,7 +33201,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines();
                     assert!(
                         out.iter()
-                            .any(|line| line.starts_with("This knocks on Tia (")),
+                            .any(|line| line.starts_with("This knocks on Tia / ")),
                         "the notice precedes the consent question: {out:?}"
                     );
                     assert!(
@@ -32377,7 +33270,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .await
                     .unwrap();
                     let out = stdout_lines();
-                    let notice = index_of(&out, "This knocks on Tia (");
+                    let notice = index_of(&out, "This knocks on Tia / ");
                     assert!(out[notice].contains(&at_bound), "{out:?}");
                     index_of(&out, "Nothing was sent.");
                     assert_eq!(
@@ -32507,7 +33400,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
 
                     let out = stdout_lines();
-                    let notice = index_of(&out, "This knocks on Tia again (");
+                    let notice = index_of(
+                        &out,
+                        &format!("This knocks on Tia again / {} (", short(&new_dest)),
+                    );
                     assert!(out[notice].contains("trust: untrusted"), "{out:?}");
                     assert!(
                         !out.iter().any(|line| line.contains(KNOCK_REFUSAL_TAIL)),
@@ -32545,6 +33441,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     stub.know_identity(started.runtime.fingerprint());
                     stub.announce(Some("Tia")).await;
+                    started
+                        .runtime
+                        .trust()
+                        .set_person_alias(&stub.identity_hex(), Some("Tia"), &[])
+                        .unwrap();
                     let peer = stub.destination_hex();
                     let peers = started.runtime.peers();
                     stub.wait_to_be_filed(&peers, &peer).await;
@@ -32557,7 +33458,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .unwrap();
 
                     let out = stdout_lines();
-                    let notice = index_of(&out, "This knocks on Tia (");
+                    let notice = index_of(&out, "This knocks on Tia / ");
                     assert!(out[notice].contains("trust: untrusted"), "{out:?}");
                     let knocking = index_of(&out, &format!("Knocking on {}", short(&peer)));
                     assert_eq!(
@@ -32606,6 +33507,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(runtime.clone()).unwrap();
                     stub.know_identity(runtime.fingerprint());
                     stub.announce(Some("Tia")).await;
+                    runtime
+                        .trust()
+                        .set_person_alias(&stub.identity_hex(), Some("Tia"), &[])
+                        .unwrap();
                     let peer = stub.destination_hex();
                     stub.wait_to_be_filed(&runtime.peers(), &peer).await;
                     assert!(runtime.path_known(&peer).await);
@@ -32613,7 +33518,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let listed = |out: &str| -> Vec<String> {
                         table_rows(out)
                             .into_iter()
-                            .find(|row| row[1] == short(&peer))
+                            .find(|row| row[6].ends_with(&format!(" / {}", short(&peer))))
                             .unwrap_or_else(|| panic!("no row for {peer} in {out}"))
                     };
                     let reachable = |result: &serde_json::Value| {
@@ -32627,7 +33532,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
 
                     let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
-                    assert_eq!(listed(&out)[6], NO_ROUTE_STATE, "{out}");
+                    assert_eq!(listed(&out)[5], NO_ROUTE_STATE, "{out}");
                     let result = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
                         .await
                         .unwrap();
@@ -32653,7 +33558,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
-                    assert_eq!(listed(&out)[6], "", "{out}");
+                    assert_eq!(listed(&out)[5], "", "{out}");
                     let result = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
                         .await
                         .unwrap();
@@ -32690,6 +33595,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(runtime.clone()).unwrap();
                     stub.know_identity(runtime.fingerprint());
                     stub.announce(Some("Tia")).await;
+                    runtime
+                        .trust()
+                        .set_person_alias(&stub.identity_hex(), Some("Tia"), &[])
+                        .unwrap();
                     let peer = stub.destination_hex();
                     stub.wait_to_be_filed(&runtime.peers(), &peer).await;
                     out_of(&mut ctx, &format!(".mesh access trust {peer} --yes"))
@@ -32850,6 +33759,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 ctx.app.mesh.install(runtime.clone()).unwrap();
                 stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
                 stub.announce(Some("Tia")).await;
+                runtime
+                    .trust()
+                    .set_person_alias(&stub.identity_hex(), Some("Tia"), &[])
+                    .unwrap();
                 let peer = stub.destination_hex();
                 stub.wait_to_be_filed(&runtime.peers(), &peer).await;
                 out_of(&mut ctx, &format!(".mesh access trust {peer} --yes"))
@@ -32892,10 +33805,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     // The farewell cannot be dated before the peer's last announce, so the
                     // age reads in seconds: the sentence is matched around it.
-                    let held = |text: &str, name: &str| {
+                    // `name` leads the sentence; `user` is whose sessions take the message.
+                    let held_for = |text: &str, name: &str, user: &str| {
                         let head = format!("{name} left ");
                         let tail = format!(
-                            "s ago; held at the propagation node, delivered to any of {name}'s sessions when one syncs"
+                            "s ago; held at the propagation node, delivered to any of {user}'s sessions when one syncs"
                         );
                         let Some(start) = text.find(&head) else {
                             return false;
@@ -32904,6 +33818,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let digits = rest.chars().take_while(char::is_ascii_digit).count();
                         digits > 0 && rest[digits..].starts_with(&tail)
                     };
+                    let held = |text: &str, name: &str| held_for(text, name, name);
                     // Each send is timed on its own: handing it to the propagation node
                     // takes a link of its own, but none may sit out a path request.
                     let mut timings = Vec::new();
@@ -32917,7 +33832,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .unwrap();
                     timings.push((".mesh messaging send", started_at.elapsed()));
                     assert!(out.contains(&format!(" to {}: ", short(&peer))), "{out}");
-                    assert!(held(&out, "Tia"), "{out}");
+                    assert!(
+                        held_for(&out, &format!("Tia / {}", short(&peer)), "Tia"),
+                        "{out}"
+                    );
                     assert!(out.contains("'s sessions when one syncs."), "{out}");
                     assert!(!out.contains(&route_request_line(&peer)), "{out}");
                     pn.next_received().await;
@@ -33079,7 +33997,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .await
                     .unwrap();
                     assert!(
-                        out.contains("Tia has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard "),
+                        out.contains(&format!(
+                            "Tia / {} has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard ",
+                            short(&peer)
+                        )),
                         "{out}"
                     );
                     assert!(
@@ -33151,6 +34072,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.set_idle(idle.clone());
                     stub.know_identity(runtime.fingerprint());
                     stub.announce(Some("Tia")).await;
+                    runtime
+                        .trust()
+                        .set_person_alias(&stub.identity_hex(), Some("Tia"), &[])
+                        .unwrap();
                     let peer = stub.destination_hex();
                     stub.wait_to_be_filed(&runtime.peers(), &peer).await;
                     assert!(runtime.peers().mark_left(&peer, SystemTime::now()));
@@ -33189,7 +34114,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let lines = idle.0.lock().clone();
                     assert_eq!(
                         lines,
-                        ["Tia is back; your question from 2d ago is still open; .mesh messaging sent lists it".to_string()],
+                        [format!(
+                            "Tia / {} is back; your question from 2d ago is still open; .mesh messaging sent lists it",
+                            short(&peer)
+                        )],
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -33276,6 +34204,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     stub.know_identity(started.runtime.fingerprint());
                     stub.announce(Some("Tia")).await;
+                    started
+                        .runtime
+                        .trust()
+                        .set_person_alias(&stub.identity_hex(), Some("Tia"), &[])
+                        .unwrap();
                     let peer = stub.destination_hex();
                     let peers = started.runtime.peers();
                     stub.wait_to_be_filed(&peers, &peer).await;
@@ -33299,7 +34232,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(row.contains(" trusted "), "{row}");
 
                     let refusal = format!(
-                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)"
+                        "\"Tia / {d8}\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)"
                     );
                     let before = stdout_lines().len();
                     let err = run(
@@ -33311,7 +34244,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .to_string();
                     assert_eq!(err, refusal);
                     let out = stdout_lines()[before..].to_vec();
-                    let notice = index_of(&out, "This sends your text to Tia (");
+                    let notice = index_of(&out, "This sends your text to Tia / ");
                     assert!(out[notice].contains("trust: trusted"), "{out:?}");
                     assert!(
                         !out.iter().any(|line| line.starts_with("Sent ")),
@@ -33521,6 +34454,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         stub.announce(Some(name)).await;
                         let destination = stub.destination_hex();
                         stub.wait_to_be_filed(&peers, &destination).await;
+                        started
+                            .runtime
+                            .trust()
+                            .set_person_alias(&stub.identity_hex(), Some(name), &[])
+                            .unwrap();
                         out_of(&mut ctx, &format!(".mesh access trust {destination} --yes"))
                             .await
                             .unwrap();
@@ -33534,11 +34472,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let lines: Vec<&str> = out.lines().collect();
                     assert!(
-                        lines.contains(&format!("  Bea ({bea_d8}): delivered").as_str()),
+                        lines.contains(&format!("  Bea / {bea_d8} ({bea_d8}): delivered").as_str()),
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
+                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(
@@ -34677,7 +35615,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     .unwrap_err();
                                 let text = command_error_text(&err, live.load());
                                 assert!(
-                                    text.contains("'.vault' is not a destination hash"),
+                                    text.contains("'.vault' is not a session hash"),
                                     "{prefix} {verb}: {text}"
                                 );
                                 assert!(
@@ -35472,7 +36410,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .into_iter()
                         .find(|row| row[0] == "Tia")
                         .unwrap_or_else(|| panic!("no Tia row in {peers}"));
-                    assert_eq!(tia[3], "blocked (instance)", "{tia:?}");
+                    assert_eq!(tia[2], "blocked (instance)", "{tia:?}");
 
                     for line in [
                         format!(".mesh access block --identity {id} --yes"),
@@ -35553,6 +36491,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             TrustOptions::default(),
                             SystemTime::now(),
                         )
+                        .unwrap();
+                    // The owner calls the stub's user `Stub`, as `.mesh people name`
+                    // would, so every line names it `Stub / <dest8>`.
+                    runtime
+                        .trust()
+                        .set_person_alias(&stub.identity_hex(), Some("Stub"), &[])
                         .unwrap();
                     let root = TempDir::new(&format!("{tag}-root"));
                     publish_root(&ctx, &root.path);
@@ -36929,7 +37873,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files allow docs/** --peer bob").await,
-                            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
+                            "'bob' is not a user or session hash: expected a user or session hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
                         );
                         assert!(!fx.locations.global.exists());
 
@@ -38360,7 +39304,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ".mesh files allow 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
                             "takes a file pattern, not a peer",
                         ),
-                        (".mesh files allow x --peer bob", "'bob' is not a peer hash"),
+                        (
+                            ".mesh files allow x --peer bob",
+                            "'bob' is not a user or session hash",
+                        ),
                         (".mesh files deny docs/", "`docs/` names a directory"),
                         (".mesh files unshare docs/", "`docs/` names a directory"),
                         (".mesh files allow *.pem --force", "`*.pem` is a pattern"),
@@ -39084,7 +40031,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     publish_root(&ctx, &root.path);
                     let err = err_of(&mut ctx, ".mesh files list --peer bob");
                     assert!(err.contains("'bob'"), "{err}");
-                    assert!(err.contains("peer hash"), "{err}");
+                    assert!(err.contains("user or session hash"), "{err}");
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
@@ -45279,7 +46226,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .await
                             .unwrap();
 
-                        assert!(out.contains("Dismissed 320b8f7b; Stub hears"), "{out}");
+                        assert!(
+                            out.contains(&format!(
+                                "Dismissed 320b8f7b; Stub / {} hears",
+                                fx.dest()
+                            )),
+                            "{out}"
+                        );
                         let seen = fx.stub.seen();
                         assert_eq!(seen.len(), 1, "{seen:?}");
                         assert_eq!(seen[0].in_reply_to.as_deref(), Some(FIRST));
@@ -45643,8 +46596,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-one").await;
                         fx.file("p1", InboundKind::Question, &[]);
                         fx.file("p2", InboundKind::Question, &[]);
-                        let header_head =
-                            format!("awaiting your answer . Stub ({}) . asked ", fx.dest());
+                        let header_head = format!(
+                            "awaiting your answer . Stub / {0} ({0}) . asked ",
+                            fx.dest()
+                        );
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss p1").await.unwrap();
 
@@ -45658,8 +46613,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "  answer: .mesh envoy answer p1 \"<text>\"".to_string(),
                                 telling(&fx),
                                 String::new(),
-                                "Dismissed p1; Stub hears that the human declined to answer. .mesh envoy questions shows what is still open."
-                                    .to_string(),
+                                format!(
+                                    "Dismissed p1; Stub / {} hears that the human declined to answer. .mesh envoy questions shows what is still open.",
+                                    fx.dest()
+                                ),
                             ],
                             "{out}"
                         );
@@ -45682,7 +46639,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             [
                                 "  which one?",
                                 "  answer: .mesh envoy answer p2 \"<text>\"",
-                                "Dismissed p2 without telling Stub. .mesh envoy questions shows what is still open.",
+                                format!(
+                                    "Dismissed p2 without telling Stub / {}. .mesh envoy questions shows what is still open.",
+                                    fx.dest()
+                                )
+                                .as_str(),
                             ],
                             "{out}"
                         );
@@ -45793,7 +46754,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
                         ask_stub(&fx, "q1");
                         let dest = fx.dest();
-                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+                        let row =
+                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
 
                         let script = prompt_script::install(&[]);
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --dry-run")
@@ -45873,7 +46835,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
                         ask_stub(&fx, "q1");
                         let dest = fx.dest();
-                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+                        let row =
+                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
@@ -45955,7 +46918,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
                         let dest = fx.dest();
-                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+                        let row =
+                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
@@ -46008,7 +46972,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             with_ages_zeroed(&out),
                             [
-                                format!("  {id} . Stub ({dest8}) . asked 0s ago"),
+                                format!("  {id} . Stub / {dest8} ({dest8}) . asked 0s ago"),
                                 format!(
                                     "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss {id}."
                                 ),
@@ -46034,7 +46998,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             lines.last().copied(),
                             Some(
-                                "Dismissed 7c9d2e1f without telling Stub. .mesh envoy questions shows what is still open."
+                                format!(
+                                    "Dismissed 7c9d2e1f without telling Stub / {}. .mesh envoy questions shows what is still open.",
+                                    fx.dest()
+                                )
+                                .as_str()
                             ),
                             "{out}"
                         );
@@ -46084,6 +47052,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p1", InboundKind::Question, &[]);
                         let dest8 = fx.dest();
                         let stranger8 = short(&stranger);
+                        let stranger_who =
+                            format!("{} / {stranger8}", short(&hex_lower(&[0xcd; 16])));
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
@@ -46091,10 +47061,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(lines.len(), 6, "{out}");
-                        assert_eq!(lines[0], format!("  p1 . Stub ({dest8}) . asked 0s ago"));
+                        assert_eq!(
+                            lines[0],
+                            format!("  p1 . Stub / {dest8} ({dest8}) . asked 0s ago")
+                        );
                         assert_eq!(
                             lines[1],
-                            format!("  s1 . {stranger8} ({stranger8}) . asked 0s ago")
+                            format!("  s1 . {stranger_who} ({stranger8}) . asked 0s ago")
                         );
                         assert_eq!(
                             lines[2],
@@ -46103,7 +47076,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(lines[3], "");
                         assert!(
                             lines[4].starts_with(&format!(
-                                "Could not tell {stranger8} that you declined ("
+                                "Could not tell {stranger_who} that you declined ("
                             )) && lines[4].ends_with(
                                 "); s1 stays pending. Retry, or remove it without a message with .mesh envoy dismiss s1 --silent."
                             ),
@@ -46136,6 +47109,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-put-back-fails").await;
                         let stranger = hex_lower(&[0xab; 16]);
                         let stranger8 = short(&stranger).to_string();
+                        let stranger_who =
+                            format!("{} / {stranger8}", short(&hex_lower(&[0xcd; 16])));
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         let plant = |id: &str| {
                             let record = InboundRecord {
@@ -46170,7 +47145,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(lines.len(), 5, "{out}");
                         assert_eq!(
                             lines[0],
-                            format!("  w1 . {stranger8} ({stranger8}) . asked 0s ago")
+                            format!("  w1 . {stranger_who} ({stranger8}) . asked 0s ago")
                         );
                         assert_eq!(
                             lines[1],
@@ -46254,13 +47229,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                             .unwrap();
                         let stranger8 = short(&stranger);
+                        let stranger_who =
+                            format!("{} / {stranger8}", short(&hex_lower(&[0xcd; 16])));
                         let before = stdout_lines().len();
 
                         let err = refusal(&mut fx.ctx, ".mesh envoy dismiss s1").await;
 
                         assert!(
                             err.starts_with(&format!(
-                                "Could not tell {stranger8} that you declined ("
+                                "Could not tell {stranger_who} that you declined ("
                             )) && err.ends_with(
                                 "); s1 stays pending. Retry, or remove it without a message with .mesh envoy dismiss s1 --silent."
                             ),
@@ -46271,7 +47248,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let block: Vec<&str> = printed[0].lines().collect();
                         assert!(
                             block[0].starts_with(&format!(
-                                "awaiting your answer . {stranger8} ({stranger8}) . asked "
+                                "awaiting your answer . {stranger_who} ({stranger8}) . asked "
                             )) && block[0].ends_with(" . id s1 . expires in 6d"),
                             "{printed:?}"
                         );
@@ -46345,6 +47322,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
                         let dest8 = fx.dest();
                         let stranger8 = short(&stranger);
+                        let stranger_who =
+                            format!("{} / {stranger8}", short(&hex_lower(&[0xcd; 16])));
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
@@ -46355,16 +47334,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             &lines[..5],
                             [
-                                format!("  p2 . Stub ({dest8}) . asked 0s ago"),
-                                format!("  s1 . {stranger8} ({stranger8}) . asked 0s ago"),
-                                format!("  p1 . Stub ({dest8}) . asked 0s ago"),
+                                format!("  p2 . Stub / {dest8} ({dest8}) . asked 0s ago"),
+                                format!("  s1 . {stranger_who} ({stranger8}) . asked 0s ago"),
+                                format!("  p1 . Stub / {dest8} ({dest8}) . asked 0s ago"),
                                 "Telling 3 askers that you declined over the mesh...".to_string(),
                                 String::new(),
                             ]
                         );
                         assert!(
                             lines[5].starts_with(&format!(
-                                "Could not tell {stranger8} that you declined ("
+                                "Could not tell {stranger_who} that you declined ("
                             )),
                             "{out}"
                         );
@@ -46415,7 +47394,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(lines.len(), 3, "{out}");
-                        assert_eq!(lines[0], format!("  p1 . Stub ({dest8}) . asked 0s ago"));
+                        assert_eq!(
+                            lines[0],
+                            format!("  p1 . Stub / {dest8} ({dest8}) . asked 0s ago")
+                        );
                         assert!(
                             lines[1].starts_with("Failed to write '")
                                 && lines[1].contains("Permission denied"),
@@ -46577,8 +47559,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             *idle.0.lock(),
                             [
-                                "access request old-a from Stub expired",
-                                "question old-q from Stub expired unanswered",
+                                format!("access request old-a from Stub / {} expired", fx.dest()),
+                                format!(
+                                    "question old-q from Stub / {} expired unanswered",
+                                    fx.dest()
+                                ),
                             ]
                         );
                         assert!(
@@ -46697,10 +47682,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                             expected_idle.push(match kind {
                                 InboundKind::Question => {
-                                    format!("question {id} from Stub expired unanswered")
+                                    format!(
+                                        "question {id} from Stub / {} expired unanswered",
+                                        fx.dest()
+                                    )
                                 }
                                 InboundKind::Access => {
-                                    format!("access request {id} from Stub expired")
+                                    format!("access request {id} from Stub / {} expired", fx.dest())
                                 }
                             });
                             assert_eq!(
@@ -46734,7 +47722,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         assert!(
                             out.ends_with(
-                                "Dismissed p1 without telling Stub. .mesh envoy questions shows what is still open."
+                                &format!(
+                                    "Dismissed p1 without telling Stub / {}. .mesh envoy questions shows what is still open.",
+                                    fx.dest()
+                                )
                             ),
                             "{out}"
                         );
@@ -46786,8 +47777,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(blocks.len(), 1, "the own copy is the only entry: {out}");
                         let lines: Vec<&str> = blocks[0].lines().collect();
                         assert!(
-                            lines[0]
-                                .starts_with(&format!("this node -> Stub ({dest8}) . direct . ")),
+                            lines[0].starts_with(&format!(
+                                "you -> Stub / {dest8} ({dest8}) . direct . "
+                            )),
                             "{out}"
                         );
                         assert!(lines[0].ends_with(" UTC . answering p1"), "{out}");
@@ -46838,8 +47830,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(blocks.len(), 1, "the own copy is the only entry: {out}");
                         let lines: Vec<&str> = blocks[0].lines().collect();
                         assert!(
-                            lines[0]
-                                .starts_with(&format!("this node -> Stub ({dest8}) . direct . ")),
+                            lines[0].starts_with(&format!(
+                                "you -> Stub / {dest8} ({dest8}) . direct . "
+                            )),
                             "{out}"
                         );
                         assert!(lines[0].ends_with(" UTC . answering p1"), "{out}");
@@ -46912,8 +47905,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-singular-race").await;
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         let dest = fx.dest();
-                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
-                        let header_head = format!("awaiting your answer . Stub ({dest}) . asked ");
+                        let row =
+                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
+                        let header_head =
+                            format!("awaiting your answer . Stub / {dest} ({dest}) . asked ");
                         let race = |id: &str| {
                             format!(
                                 "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
@@ -47198,7 +48193,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             *idle.0.lock(),
-                            ["question gone from Stub expired unanswered"],
+                            [format!(
+                                "question gone from Stub / {} expired unanswered",
+                                fx.dest()
+                            )],
                             "a row PENDING_TTL old or more is expired"
                         );
                         let edge_row = out
@@ -47225,7 +48223,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         assert!(
                             out.ends_with(
-                                "Dismissed old-q without telling Stub. .mesh envoy questions shows what is still open."
+                                &format!(
+                                    "Dismissed old-q without telling Stub / {}. .mesh envoy questions shows what is still open.",
+                                    fx.dest()
+                                )
                             ),
                             "{out}"
                         );
@@ -47286,8 +48287,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-race-before-node").await;
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         let dest = fx.dest();
-                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
-                        let header_head = format!("awaiting your answer . Stub ({dest}) . asked ");
+                        let row =
+                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
+                        let header_head =
+                            format!("awaiting your answer . Stub / {dest} ({dest}) . asked ");
                         let race = |id: &str| {
                             format!(
                                 "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
@@ -47529,8 +48532,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             lines,
                             [
-                                "access request old-a from Stub expired".to_string(),
-                                "question old-q from Stub expired unanswered".to_string(),
+                                format!("access request old-a from Stub / {} expired", fx.dest()),
+                                format!(
+                                    "question old-q from Stub / {} expired unanswered",
+                                    fx.dest()
+                                ),
                             ],
                             "the first sweep that could write announced each row once"
                         );
@@ -47628,7 +48634,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .unwrap_or_else(|| panic!("no disposition row in {block:?}\n{out}"))
                                 .to_string()
                         };
-                        let own_head = format!("this node -> Stub ({dest8}) . direct . ");
+                        let own_head = format!("you -> Stub / {dest8} ({dest8}) . direct . ");
                         let mut peer_rows: Vec<String> = Vec::new();
                         let mut own_rows: Vec<String> = Vec::new();
                         for block in &blocks {
@@ -47636,11 +48642,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 own_rows.push(disposition_row(block));
                             } else {
                                 assert!(
-                                    block
-                                        .lines()
-                                        .next()
-                                        .unwrap_or_default()
-                                        .contains(&format!("from Stub ({dest8}) . direct . ")),
+                                    block.lines().next().unwrap_or_default().contains(&format!(
+                                        "from Stub / {dest8} ({dest8}) . direct . "
+                                    )),
                                     "{block:?}\n{out}"
                                 );
                                 peer_rows.push(disposition_row(block));
@@ -47746,6 +48750,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-all-stayed-full-id").await;
                         let stranger = hex_lower(&[0xab; 16]);
                         let stranger8 = short(&stranger).to_string();
+                        let stranger_who =
+                            format!("{} / {stranger8}", short(&hex_lower(&[0xcd; 16])));
                         let stayed_id = "5a6b7c8d9e0f1a2b5a6b7c8d9e0f1a2b";
                         let told_id = "1f2e3d4c5b6a79881f2e3d4c5b6a7988";
                         let now = SystemTime::now();
@@ -47784,17 +48790,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(lines.len(), 6, "{out}");
                         assert_eq!(
                             lines[0],
-                            format!("  {told_id} . Stub ({dest8}) . asked 0s ago"),
+                            format!("  {told_id} . Stub / {dest8} ({dest8}) . asked 0s ago"),
                             "the rows carry the full id: {out}"
                         );
                         assert_eq!(
                             lines[1],
-                            format!("  {stayed_id} . {stranger8} ({stranger8}) . asked 0s ago"),
+                            format!("  {stayed_id} . {stranger_who} ({stranger8}) . asked 0s ago"),
                             "{out}"
                         );
                         assert!(
                             lines[4].starts_with(&format!(
-                                "Could not tell {stranger8} that you declined ("
+                                "Could not tell {stranger_who} that you declined ("
                             )) && lines[4].ends_with(&format!(
                                 "); {stayed8} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {stayed_id} --silent."
                             )),
@@ -47841,7 +48847,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             out.lines().last(),
                             Some(
                                 format!(
-                                    "Dismissed {stayed8} without telling {stranger8}. .mesh envoy questions shows what is still open."
+                                    "Dismissed {stayed8} without telling {stranger_who}. .mesh envoy questions shows what is still open."
                                 )
                                 .as_str()
                             ),
@@ -47870,7 +48876,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(
                             lines[0],
-                            format!("  {kept_id} . Stub ({dest8}) . asked 0s ago"),
+                            format!("  {kept_id} . Stub / {dest8} ({dest8}) . asked 0s ago"),
                             "{out}"
                         );
                         assert!(
@@ -47953,7 +48959,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let err = refusal(&mut fx.ctx, &format!(".mesh envoy dismiss {id}")).await;
 
                         assert!(
-                            err.starts_with("Could not tell Stub that you declined (")
+                            err.starts_with(&format!(
+                                "Could not tell Stub / {} that you declined (",
+                                fx.dest()
+                            ))
                                 && err.contains("not trusted for messaging")
                                 && err.ends_with(&format!(
                                     "); {id8} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {id} --silent."
@@ -47964,7 +48973,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(printed.len(), 3, "{printed:?}");
                         assert!(
                             printed[0].lines().next().unwrap().starts_with(&format!(
-                                "awaiting your answer . Stub ({dest8}) . asked "
+                                "awaiting your answer . Stub / {dest8} ({dest8}) . asked "
                             )),
                             "{printed:?}"
                         );
@@ -47997,7 +49006,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             out.lines().last(),
                             Some(
                                 format!(
-                                    "Dismissed {id8} without telling Stub. .mesh envoy questions shows what is still open."
+                                    "Dismissed {id8} without telling Stub / {}. .mesh envoy questions shows what is still open.",
+                                    fx.dest()
                                 )
                                 .as_str()
                             ),
@@ -48037,7 +49047,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             out.lines().last(),
                             Some(
                                 format!(
-                                    "Dismissed {id8}; Stub hears that {HUMAN_DECLINED}. .mesh envoy questions shows what is still open."
+                                    "Dismissed {id8}; Stub / {} hears that {HUMAN_DECLINED}. .mesh envoy questions shows what is still open.",
+                                    fx.dest()
                                 )
                                 .as_str()
                             ),
@@ -48109,8 +49120,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "old-q is planted and unswept"
                         );
                         let dest = fx.dest();
-                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
-                        let expiry = "question old-q from Stub expired unanswered".to_string();
+                        let row =
+                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
+                        let expiry = format!(
+                            "question old-q from Stub / {} expired unanswered",
+                            fx.dest()
+                        );
 
                         // The single form refuses `--dry-run` outright: nothing listed,
                         // nothing taken, nothing sent; the fresh row is untouched.
@@ -48187,7 +49202,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             *idle.0.lock(),
                             [
                                 expiry,
-                                "question old-r from Stub expired unanswered".to_string(),
+                                format!(
+                                    "question old-r from Stub / {} expired unanswered",
+                                    fx.dest()
+                                ),
                                 format!("you declined {dest}'s question"),
                             ],
                             "the expiry line comes before the dismissal's own line"
@@ -48320,7 +49338,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(lines.len(), 3, "{out}");
                         assert!(
-                            lines[0].starts_with("This sends your text to Stub ("),
+                            lines[0].starts_with("This sends your text to Stub / "),
                             "{out}"
                         );
                         assert_eq!(lines[1], "Attaching `docs/notes.md` (9 bytes) inline.");
@@ -48910,7 +49928,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let header = out.lines().next().unwrap_or_default();
                         assert!(
                             header.starts_with(&format!(
-                                "awaiting your answer . Stub ({}) . asked ",
+                                "awaiting your answer . Stub / {0} ({0}) . asked ",
                                 fx.dest()
                             )),
                             "the heard peer is named in the header: {out}"
@@ -51354,7 +52372,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ),
                             (
                                 ".mesh files fetch stub docs/a.md".to_string(),
-                                "'stub' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
+                                "'stub' is not a session hash, and no user or session you know is called that. Users: `Uma`. A name is spelled whole; otherwise give a session hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
                                     .to_string(),
                             ),
                             (
@@ -52430,7 +53448,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let err = err_of(&mut ctx, ".mesh envoy memory forget 00000000 --yes");
                 assert_eq!(
                     err,
-                    "Identity 00000000 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh access requests` and `.mesh people list` list."
+                    "User 00000000 has not been heard from: no user you know starts with it. Give the whole hash, or check what `.mesh access requests` and `.mesh people list` list."
                 );
                 let out = run_async(out_of(
                     &mut ctx,
@@ -52564,7 +53582,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 );
                 assert_eq!(
                     err_of(&mut ctx, ".mesh envoy memory forget nope"),
-                    "'nope' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
+                    "'nope' is not a user hash: expected a user hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
                 );
                 assert_eq!(
                     err_of(

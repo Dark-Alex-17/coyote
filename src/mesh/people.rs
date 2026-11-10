@@ -9,19 +9,30 @@
 //! Two names that read the same (ignoring case) would make an address ambiguous, so a name
 //! that collides is kept but neither shown nor accepted as an address. An owner's alias
 //! only gives way to another owner's alias; an advertised name gives way to any name.
-#![cfg_attr(not(test), expect(dead_code))] // read once the people commands and display land
 
 use crate::mesh::announce::is_control_or_invisible;
 use crate::mesh::card::NAME_MAX_CHARS;
 use crate::mesh::display_text;
+use crate::mesh::request::short;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+
+/// The user part of a peer nothing names: the identity behind its session is not known.
+pub(crate) const UNNAMED: &str = "unnamed";
+
+/// The user part of every one of this node's owner's own sessions.
+pub(crate) const YOU: &str = "you";
 
 /// The two names `you` and `unnamed` stand for this node's owner and for a person with no
 /// name, so neither can be anyone's name.
-const RESERVED_NAMES: [&str; 2] = ["you", "unnamed"];
+const RESERVED_NAMES: [&str; 2] = [YOU, UNNAMED];
+
+/// The longest `<user> / <session>`: two names at their cap and the separator between
+/// them.
+pub(crate) const WHO_MAX_CHARS: usize = 2 * NAME_MAX_CHARS + 3;
 
 /// A run of this many hex digits or more reads as a hash prefix, which an address takes.
 const HASH_LIKE_MIN_CHARS: usize = 8;
@@ -297,6 +308,141 @@ impl People {
             destination: destination.to_ascii_lowercase(),
         })
     }
+
+    /// Every name that may be typed as an address, with the identity it names and, for a
+    /// session's name, the destination of that session, in no particular order.
+    pub(crate) fn addressable(&self) -> impl Iterator<Item = (&str, Option<&str>, &str)> {
+        self.names
+            .iter()
+            .filter(|(_, alias)| alias.addressable())
+            .map(|(subject, alias)| match subject {
+                Subject::Person(identity) => (identity.as_str(), None, alias.text.as_str()),
+                Subject::Session {
+                    identity,
+                    destination,
+                } => (
+                    identity.as_str(),
+                    Some(destination.as_str()),
+                    alias.text.as_str(),
+                ),
+            })
+    }
+}
+
+/// What every human-facing line calls a peer: the user, then the session, as
+/// `<user> / <session>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Who {
+    pub(crate) user: String,
+    pub(crate) session: String,
+}
+
+impl fmt::Display for Who {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} / {}", self.user, self.session)
+    }
+}
+
+/// Chooses the name of a user and of a session from what this node holds, read once so a
+/// listing names every row from the same facts. The user is `you` for this node's own
+/// identity, else the owner's alias, else the advertised one, else the short identity
+/// hash; the session is the name one of your own sessions runs under, else the owner's
+/// alias of the session, else the advertised one, else the short destination hash. A
+/// hidden name falls through to the short hash, and a hidden owner's alias never lets the
+/// advertised name through. An empty identity counts as none.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Namer {
+    people: People,
+    own_identity: Option<String>,
+    /// Your sessions on this config dir by the destination each serves.
+    own_sessions: HashMap<String, String>,
+}
+
+impl Namer {
+    pub(crate) fn new(
+        people: People,
+        own_identity: Option<&str>,
+        own_sessions: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            people,
+            own_identity: own_identity.map(str::to_ascii_lowercase),
+            own_sessions: own_sessions
+                .into_iter()
+                .map(|(destination, session)| (destination.to_ascii_lowercase(), session))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn people(&self) -> &People {
+        &self.people
+    }
+
+    /// Whether `identity` is this node's own.
+    pub(crate) fn is_you(&self, identity: &str) -> bool {
+        self.own_identity
+            .as_deref()
+            .is_some_and(|own| own.eq_ignore_ascii_case(identity))
+    }
+
+    /// The name one of your own sessions runs under at `destination`, cleaned for display.
+    pub(crate) fn own_session(&self, destination: &str) -> Option<String> {
+        self.own_sessions
+            .get(&destination.to_ascii_lowercase())
+            .and_then(|session| clean_advertised(session))
+    }
+
+    /// The identity `identity` stands for, or this node's own when only one of your own
+    /// sessions' destinations is known. A blank identity is no identity.
+    fn identity_for<'a>(&'a self, identity: Option<&'a str>, destination: &str) -> Option<&'a str> {
+        identity
+            .filter(|identity| !identity.trim().is_empty())
+            .or_else(|| {
+                self.own_sessions
+                    .contains_key(&destination.to_ascii_lowercase())
+                    .then_some(self.own_identity.as_deref())
+                    .flatten()
+            })
+    }
+
+    /// The user part: `unnamed` when no identity is known.
+    pub(crate) fn user(&self, identity: Option<&str>) -> String {
+        let Some(identity) = identity.filter(|identity| !identity.trim().is_empty()) else {
+            return UNNAMED.to_string();
+        };
+        if self.is_you(identity) {
+            return YOU.to_string();
+        }
+        self.people
+            .person(identity)
+            .filter(|alias| alias.displayable())
+            .map(|alias| alias.text.clone())
+            .unwrap_or_else(|| short(identity).to_ascii_lowercase())
+    }
+
+    /// The session part for the session at `destination` of `identity`.
+    pub(crate) fn session(&self, identity: Option<&str>, destination: &str) -> String {
+        let identity = self.identity_for(identity, destination);
+        let own = identity.is_none_or(|identity| self.is_you(identity));
+        if own && let Some(session) = self.own_session(destination) {
+            return session;
+        }
+        identity
+            .and_then(|identity| self.people.session(identity, destination))
+            .filter(|alias| alias.displayable())
+            .map(|alias| alias.text.clone())
+            .unwrap_or_else(|| short(destination).to_ascii_lowercase())
+    }
+
+    /// `<user> / <session>` for the session at `destination`, heard under `identity` when
+    /// it is known.
+    pub(crate) fn who(&self, identity: Option<&str>, destination: &str) -> Who {
+        let identity = self.identity_for(identity, destination);
+        Who {
+            user: self.user(identity),
+            session: self.session(identity, destination),
+        }
+    }
 }
 
 /// The owner's alias shadows the advertised name even when it is itself hidden, so a card
@@ -448,6 +594,67 @@ mod tests {
         entry
     }
 
+    /// Each step of the display fallback: the user is `you` for this node, else the
+    /// owner's alias, else the advertised name, else the short identity hash, and
+    /// `unnamed` with no identity at all (an empty one counts as none); the session is
+    /// your own session's name, else the owner's alias, else the advertised name, else the
+    /// short destination hash.
+    #[test]
+    fn the_namer_falls_back_one_step_at_a_time() {
+        let (me, owner, advertised, bare) = (hash(1), hash(2), hash(3), hash(4));
+        let (own_dest, owned, told, plain) = (hash(11), hash(12), hash(13), hash(14));
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            owner.clone(),
+            with_session(
+                person(Some("Alex"), Some("Al")),
+                &owned,
+                Some("laptop"),
+                Some("lap"),
+            ),
+        );
+        entries.insert(
+            advertised.clone(),
+            with_session(person(None, Some("Bea")), &told, None, Some("desk")),
+        );
+        let own_sessions = HashMap::from([(own_dest.clone(), "temp".to_string())]);
+        let namer = Namer::new(People::new(&entries, &["temp"]), Some(&me), own_sessions);
+
+        assert_eq!(namer.who(Some(&me), &own_dest).to_string(), "you / temp");
+        assert_eq!(
+            namer.who(None, &own_dest).to_string(),
+            "you / temp",
+            "your own session is yours whatever identity the caller knows"
+        );
+        assert_eq!(
+            namer.who(Some(&owner), &owned).to_string(),
+            "Alex / laptop",
+            "the owner's alias wins over the advertised one, for the user and the session"
+        );
+        assert_eq!(
+            namer.who(Some(&advertised), &told).to_string(),
+            "Bea / desk"
+        );
+        assert_eq!(
+            namer.who(Some(&bare), &plain).to_string(),
+            format!("{} / {}", short(&bare), short(&plain))
+        );
+        assert_eq!(
+            namer.who(None, &plain).to_string(),
+            format!("{UNNAMED} / {}", short(&plain))
+        );
+        assert_eq!(
+            namer.who(Some(""), &plain).to_string(),
+            format!("{UNNAMED} / {}", short(&plain)),
+            "an empty identity is no identity"
+        );
+        assert_eq!(
+            namer.who(Some(&owner), &plain).to_string(),
+            format!("Alex / {}", short(&plain)),
+            "a session with no name of its own reads its short hash under its user's name"
+        );
+    }
+
     #[test]
     fn the_naming_rules_refuse_each_shape_and_pass_ordinary_names() {
         let refused: [(&str, NameRule); 11] = [
@@ -576,6 +783,17 @@ mod tests {
         assert_eq!(hidden.status, AliasUse::Hidden);
         assert!(!hidden.displayable() && !hidden.addressable());
         assert!(people.person(&c).unwrap().addressable());
+        let typed: Vec<&str> = people.addressable().map(|(_, _, name)| name).collect();
+        assert!(
+            typed.contains(&"Sam") && typed.contains(&"Kim") && !typed.contains(&"sam"),
+            "the hidden name is never one the verbs take: {typed:?}"
+        );
+        let namer = Namer::new(people, None, HashMap::new());
+        assert_eq!(
+            namer.user(Some(&b)),
+            short(&b),
+            "the hidden name is never shown either"
+        );
     }
 
     #[test]

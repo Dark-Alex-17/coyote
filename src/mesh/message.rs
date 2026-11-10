@@ -16,6 +16,7 @@ use crate::mesh::node::MeshRuntime;
 use crate::mesh::notify::NoticeText;
 use crate::mesh::peers::PeerRecord;
 use crate::mesh::pending::sibling_owner;
+use crate::mesh::people::WHO_MAX_CHARS;
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{HoldPolicy, InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
@@ -389,11 +390,11 @@ impl PeerMessage {
         self.disposition.unwrap_or_default()
     }
 
-    /// `"<name or dest8> says|asks|replies|announces: <words>"`, one terminal line, with
-    /// `(full text: .mesh messaging inbox)` after it when the words were cut. The display name is
-    /// the peer table's, cleaned again here since it is peer text too; without one the
-    /// sender is named by the short hash of its instance. The name and the words are the
-    /// peer's runs; the rest is frame.
+    /// `"<user> / <session> says|asks|replies|announces: <words>"`, one terminal line,
+    /// with `(full text: .mesh messaging inbox)` after it when the words were cut. The
+    /// name is cleaned again here since a name a peer advertised is peer text too;
+    /// without one the sender is named by the short hash of its session. The name and the
+    /// words are the peer's runs; the rest is frame.
     pub(crate) fn summary_line(&self, display_name: Option<&str>) -> NoticeText {
         self.summary_line_with_tail(display_name, "")
     }
@@ -405,7 +406,7 @@ impl PeerMessage {
         display_name: Option<&str>,
         tail: &str,
     ) -> NoticeText {
-        let who = match display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)) {
+        let who = match display_name.and_then(|name| display_text(name, WHO_MAX_CHARS)) {
             Some(name) => NoticeText::default().peer(name),
             None => NoticeText::default().frame(short(&self.source_destination)),
         };
@@ -8038,7 +8039,11 @@ mod tests {
                 display_name: Some("Cee".to_string()),
                 outcome: RecipientOutcome::NotTrustedByPeer(RemoteRefusal::new(
                     &cee.destination_hex(),
-                    Some("Cee"),
+                    Some(&format!(
+                        "{} / {}",
+                        short(&cee.identity_hex()),
+                        short(&cee.destination_hex())
+                    )),
                     own,
                 )),
             },
