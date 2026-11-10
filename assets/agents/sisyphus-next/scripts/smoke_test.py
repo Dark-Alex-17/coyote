@@ -2668,9 +2668,15 @@ before = open(os.path.join(UNC, "usage.go")).read()
 us_strike = dict(us, last_coder_error="boom")
 upd = gates.strikeout(us_strike)
 after = open(os.path.join(UNC, "usage.go")).read() if os.path.exists(os.path.join(UNC, "usage.go")) else "(stashed away)"
-check("subtasks: a strikeout stashes the failed attempt but keeps earlier subtasks' uncommitted work in the worktree",
+saved = (upd.get("strikeout_stash") or "").split()
+ref_ok = len(saved) > 1 and subprocess.run(["git", "-C", UNC, "rev-parse", saved[0]], capture_output=True, text=True).stdout.strip() == saved[1]
+check("subtasks: a strikeout saves the failed attempt as a commit and keeps earlier subtasks' uncommitted work in the worktree",
       after == "package usage\n" and before != after and not os.path.exists(os.path.join(UNC, "exhausted.go"))
-      and upd.get("strikeout_stash") and any("restored to the subtask's starting tree" in d for d in upd["decisions"]), (after, upd.get("decisions")))
+      and ref_ok and any("earlier subtasks' uncommitted work kept" in d for d in upd["decisions"]), (after, upd.get("decisions")))
+recover = subprocess.run(["sh", "-c", f"git diff {us['subtask_tree']} {saved[1]} | git apply"], cwd=UNC, capture_output=True, text=True) if ref_ok else None
+check("subtasks: the saved failed attempt re-applies cleanly on top of the restored worktree (no stash-pop conflict)",
+      recover is not None and recover.returncode == 0 and open(os.path.join(UNC, "usage.go")).read() == before
+      and os.path.exists(os.path.join(UNC, "exhausted.go")), recover and recover.stderr)
 
 # a pull in the read-only first subtask moves HEAD by commits the run did not author
 PULL = os.path.join(TMP, "pull-repo")
@@ -2694,6 +2700,14 @@ old = {"GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z", "GIT_AUTHOR_DATE": "2026-01
 pull_git("commit", "-q", "-m", "upstream work", env=old)
 UPSTREAM = pull_git("rev-parse", "HEAD")
 pull_git("checkout", "-q", "-")
+ps0 = base_state(project_dir=PULL, git_root=PULL, base_sha=PULL_BASE, head_sha=PULL_BASE, intent="implementation",
+                 subtasks=SUBS7[:2], subtask_index=0, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={})
+sub_step(ps0, "next_subtask")
+pull_git("merge", "-q", "--ff-only", UPSTREAM)
+check("subtasks: without an upstream branch a HEAD move is never taken for a pull (backdated own commits stay reviewed)",
+      gates.review_gate(ps0)["_next"] == "build_gauntlet_prompt")
+pull_git("reset", "-q", "--hard", PULL_BASE)
+pull_git("branch", "-q", "--set-upstream-to=upstream")
 ps = base_state(project_dir=PULL, git_root=PULL, base_sha=PULL_BASE, head_sha=PULL_BASE, intent="implementation",
                 subtasks=SUBS7[:2], subtask_index=0, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={})
 sub_step(ps, "next_subtask")
@@ -2701,7 +2715,7 @@ pull_git("merge", "-q", "--ff-only", UPSTREAM)
 sub_step(ps, "review_gate")
 check("subtasks: confirm3's 'read-only apart from git pull' - a fast-forward pull is no code change, and the run base moves past it",
       ps.get("_next") == "next_subtask" and ps.get("run_base_sha") == UPSTREAM
-      and any("only pulled 1 existing commit" in d for d in ps["decisions"]), (ps.get("_next"), ps.get("run_base_sha")))
+      and any("only pulled 1 upstream commit" in d for d in ps["decisions"]), (ps.get("_next"), ps.get("run_base_sha")))
 open(os.path.join(PULL, "c.go"), "w").write("package a // own\n")
 pull_git("add", ".")
 pull_git("commit", "-q", "-m", "own work")
@@ -2709,6 +2723,31 @@ ps2 = base_state(project_dir=PULL, git_root=PULL, base_sha=UPSTREAM, subtask_hea
                  subtask_started_at=int(time.time()) - 3600, subtasks=SUBS7[:2], subtask_index=1, intent="implementation")
 check("subtasks: a commit made during the subtask is its own work, never taken for a pull",
       gates.review_gate(ps2)["_next"] == "build_gauntlet_prompt")
+OWN = pull_git("rev-parse", "HEAD")
+pull_git("checkout", "-q", "upstream")
+open(os.path.join(PULL, "d.go"), "w").write("package a // more upstream\n")
+pull_git("add", ".")
+pull_git("commit", "-q", "-m", "more upstream", env=old)
+pull_git("merge", "-q", "--no-edit", OWN, env=old)
+UP2 = pull_git("rev-parse", "HEAD")
+pull_git("checkout", "-q", "-")
+ps3 = base_state(project_dir=PULL, git_root=PULL, base_sha=OWN, run_base_sha=UPSTREAM, subtask_head=OWN,
+                 subtask_tree=pull_git("rev-parse", "HEAD^{tree}"), subtask_started_at=int(time.time()) - 60,
+                 subtasks=SUBS7[:2], subtask_index=2, intent="implementation")
+pull_git("merge", "-q", "--ff-only", UP2)
+u3 = gates.review_gate(ps3)
+check("subtasks: a pull after an earlier subtask changed code skips the review but keeps the run base (earlier work starts before it)",
+      u3["_next"] == "next_subtask" and "run_base_sha" not in u3 and u3.get("base_sha") == UP2
+      and any("stay in the whole-task diff" in d for d in u3["decisions"]), u3)
+prior = {"base_sha": "b1", "run_base_sha": "b0", "final_review": False, "subtask_tree": "t1", "subtask_head": "h1",
+         "subtask_started_at": 123, "run_must_not_do": ["Do NOT edit src/x.go"], "subtasks": SUBS7, "subtask_index": 1}
+RID = "20990101T000000-cafef00d"
+os.makedirs(os.path.join(os.environ["SISYPHUS_RUNS_ROOT"], RID), exist_ok=True)
+open(os.path.join(os.environ["SISYPHUS_RUNS_ROOT"], RID, "state.json"), "w").write(json.dumps(prior))
+re_ = gates.intake({"initial_prompt": f"continue\nSisyphus run id: {RID}", "project_dir": REPO})
+check("subtasks: a re-entry carries the subtask snapshot keys, so a resumed read-only subtask still skips its review",
+      all(re_.get(k) == prior[k] for k in ("subtask_tree", "subtask_head", "subtask_started_at", "run_base_sha", "run_must_not_do")),
+      {k: re_.get(k) for k in prior})
 
 # a plan amendment made during a subtask amends that subtask's criterion
 am = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, subtasks=SUBS7, subtask_index=2, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={},
@@ -2726,6 +2765,25 @@ check("subtasks: a plan_defect amendment during a subtask reaches that subtask's
 bs = base_state(subtasks=SUBS7, subtask_index=2, review_cadence="batch")
 check("subtasks: batch cadence -> each subtask on to the next one, the final review to whetstone",
       gates.review_gate(bs)["_next"] == "next_subtask" and gates.review_gate(dict(bs, final_review=True))["_next"] == "whetstone_gate")
+fs = base_state(project_dir=UNC, git_root=UNC, base_sha=UNC_BASE, run_base_sha=UNC_BASE, brief="Implement the usage package",
+                spec_text=PARENT_AC, subtasks=[dict(SUBS7[0]), dict(SUBS7[1], amendments=["vet shadowing is accepted"]), SUBS7[2]],
+                subtask_index=3, round_heads=[], gauntlet_lanes={}, intent="implementation",
+                run_must_not_do=["Do NOT edit src/teammate.go (serialize: owner)"],
+                coder_brief={"task": "Subtask 3/3", "must_not_do_extra": ["Do NOT touch the CLI"], "skill_nudges": ["code-review"]})
+sub_step(fs, "next_subtask")
+fprompt = gates.render_coder_prompt(dict(fs, fix_instructions="- fix PARENT-AC-2", fix_round=1)).get("coder_prompt", "")
+check("subtasks: the final review's fix coder gets a whole-task brief with every scope guard, never a degraded one",
+      "degraded" not in fprompt and "Do NOT edit src/teammate.go (serialize: owner)" in fprompt and "Do NOT touch the CLI" in fprompt
+      and "Whole-task fix scope" in fprompt and "Implement the usage package" in fprompt
+      and "Acceptance criteria (verbatim):" in fprompt, fprompt[:800])
+fgp = gates.build_gauntlet_prompt(fs)["gauntlet_prompt"]
+check("subtasks: the final review lists the user's subtask amendments as settled rulings, the parent criteria unchanged",
+      "- subtask 2: vet shadowing is accepted" in fgp and PARENT_AC in fgp, fgp)
+open(os.path.join(UNC, "fix-attempt.go"), "w").write("package usage // broken\n")
+fu = gates.strikeout(dict(fs, last_coder_error="boom"))
+check("subtasks: a final-review strikeout undoes only the fix attempt, every subtask's uncommitted work kept",
+      not os.path.exists(os.path.join(UNC, "fix-attempt.go")) and os.path.exists(os.path.join(UNC, "usage.go"))
+      and os.path.exists(os.path.join(UNC, "exhausted.go")) and "refs/sisyphus-next/strikeout/" in (fu.get("strikeout_stash") or ""), fu.get("decisions"))
 
 single = base_state(subtasks=[{"title": "task", "outcome": "x", "acceptance_criteria": []}], subtask_index=1, spec_text=PARENT_AC,
                     round_heads=[], gauntlet_lanes={})

@@ -184,6 +184,11 @@ initial_state:
   subtask_index: 0
   run_base_sha: ''
   final_review: false
+  subtask_tree: ''
+  subtask_head: ''
+  subtask_started_at: null
+  subtask_changed_files: null
+  run_must_not_do: []
   current_task: ''
   task_number: 0
   # --- sizing verdict (plan-shaped work asked, not refused) ---

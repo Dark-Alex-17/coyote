@@ -99,7 +99,7 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:1931:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/gates.py:1962:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
 scripts/smoke_test.py:2456:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
 scripts/smoke_test.py:2457:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
@@ -281,23 +281,31 @@ turns the key rows red.
 ## Per-subtask review and the final whole-task review
 
 A compound run works through its sealed subtasks one at a time. Each subtask's review round
-checks that subtask's own outcome, constraints and acceptance criteria over the diff it made
-(`build_gauntlet_prompt` writes them as the `Plan / acceptance criteria:` block, with a scope
-line saying later subtasks deliver the rest), and the coder sees the parent task's criteria as
-context only. `next_subtask` records the worktree's tree when a subtask starts
-(`subtask_tree`, uncommitted earlier work included), and the change check compares content
-against it, the planning store left out: a subtask that changed nothing (a read-only or research
-step) skips its conformance review, so it is never failed for having no implementation. A HEAD
-that moved only by commits made before the subtask started, the worktree matching it, is a pull:
-no change, and the run base moves past it. When nothing commits between subtasks the review's
-`Diff:` also carries earlier subtasks' work, so the prompt names the files this subtask changed.
-A strikeout restores the subtask's starting tree after stashing, keeping earlier subtasks'
-uncommitted work, and a plan amendment made during a subtask amends that subtask's criteria. A passed or accepted subtask round goes to
+checks that subtask's own outcome, constraints, acceptance criteria and any amendment the user
+made to them (`build_gauntlet_prompt` writes them as the `Plan / acceptance criteria:` block,
+with a scope line saying later subtasks deliver the rest), and the coder sees the parent task's
+criteria as context only.
+
+`next_subtask` records the worktree's tree when a subtask starts (`subtask_tree`, uncommitted
+earlier work included; re-entry carries it), and the change check compares content against it,
+the planning store left out. A subtask that changed nothing (a read-only or research step)
+skips its conformance review, so it is never failed for having no implementation. A HEAD that
+moved only by commits that are on the upstream branch and were made before the subtask started,
+the worktree matching it, is a pull: no change. The run base moves past such a pull only while
+no earlier subtask has changed code; after that the pulled commits stay in the whole-task diff.
+When nothing commits between subtasks the review's `Diff:` also carries earlier subtasks' work,
+so the prompt names the files this subtask changed.
+
+A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
+attempt as a commit under `refs/sisyphus-next/strikeout/` and puts back only the paths it
+changed; elsewhere it stashes as before. A passed or accepted subtask round goes to
 `next_subtask`, never to the publish tail. After the last subtask `next_subtask` starts one
 final whole-task review (`final_review`, the diff from `run_base_sha`, the parent task's
-`spec_text`, fresh round counters) through `review_gate`; only that review goes on to the
-observability pass and publishing, so every parent acceptance criterion is still enforced.
-A single-subtask run is reviewed against the task's criteria once, as before.
+`spec_text` with the subtask amendments listed as settled rulings, fresh round budgets, and a
+whole-task coder brief carrying every scope guard the subtasks collected) through
+`review_gate`; only that review goes on to the observability pass and publishing, so every
+parent acceptance criterion is still enforced. A single-subtask run is reviewed against the
+task's criteria once, as before.
 
 ## Verify
 

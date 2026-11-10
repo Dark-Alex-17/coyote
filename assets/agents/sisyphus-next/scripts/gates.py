@@ -267,7 +267,8 @@ def intake(state):
         u["run_id"] = run_id
         u["run_dir"] = ensure_run_dir(run_id)
         u["resume_mode"] = True
-        for k in ("base_sha", "debt_base", "run_base_sha", "final_review", "subtasks", "subtask_index", "current_task", "fix_round",
+        for k in ("base_sha", "debt_base", "run_base_sha", "final_review", "subtask_tree", "subtask_head", "subtask_started_at",
+                  "run_must_not_do", "subtasks", "subtask_index", "current_task", "fix_round",
                   "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
                   "skipped_reviews", "debt_left_behind", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
@@ -686,6 +687,7 @@ def next_subtask(state):
             text += "\n\nAcceptance criteria:\n" + "\n".join(f"- {c}" for c in ac)
     if idx == 0 and (state.get("architecture_proposal") or "").strip():
         text += "\n\nArchitecture-reviewer proposal (adopt only if confirmed below):\n" + tail(state["architecture_proposal"], 4000)
+    u["run_must_not_do"] = _scope_guards(state)
     u.update({
         "current_task": text, "task_number": idx + 1, "subtask_index": idx + 1,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
@@ -715,18 +717,47 @@ def next_subtask(state):
 def _start_final_review(state, u, n):
     """After the last subtask, one review of the whole task's diff against the parent task's acceptance criteria."""
     base = state.get("run_base_sha") or state.get("base_sha") or ""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    task = str(state.get("brief") or "")
+    guards = _scope_guards(state)
+    brief = {"task": task, "must_not_do_extra": guards,
+             "skill_nudges": as_list(as_dict(state.get("coder_brief")).get("skill_nudges")),
+             "context_block": (f"Whole-task fix scope: the final review of all {n} subtasks, over the diff from the run base "
+                               f"{base or '(worktree)'}. Every subtask is done; fix only what the review findings name.")}
     u.update({
-        "final_review": True, "base_sha": base, "debt_base": base, "current_task": str(state.get("brief") or ""),
+        "final_review": True, "base_sha": base, "debt_base": base, "current_task": task,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
         "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False,
-        "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": {}, "expected_files": [],
-        "fix_instructions": "", "gauntlet_lanes": {}, "subtask_tree": "", "subtask_head": "",
+        "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": brief, "expected_files": [],
+        "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
+        # a strikeout in the final review's fix rounds resets to the tree all subtasks left, never past it
+        "subtask_tree": _worktree_tree(root), "subtask_head": git_out(root, "rev-parse", "HEAD", default=""),
+        "subtask_started_at": int(time.time()),
     })
     ledger(state, u, f"subtasks: all {n} reviewed against their own criteria -> one whole-task review over "
                      f"{base or 'the worktree'}..HEAD against the parent task's acceptance criteria")
     snapshot(state, u, "final whole-task review")
     u["_next"] = "review_gate"
     return u
+
+
+def _scope_guards(state):
+    """The run's MUST NOT DO additions so far (scope-breach serialization and the like), the current brief's included."""
+    out = []
+    for g in as_list(state.get("run_must_not_do")) + as_list(as_dict(state.get("coder_brief")).get("must_not_do_extra")):
+        if isinstance(g, str) and g.strip() and g not in out:
+            out.append(g)
+    return out
+
+
+def _subtask_amendments(state):
+    """Every user amendment made to a subtask's criteria, as settled rulings for the final review."""
+    lines = []
+    for i, s in enumerate(as_list(state.get("subtasks")), 1):
+        for a in as_list(_subtask_at([s], 0).get("amendments")):
+            if str(a).strip():
+                lines.append(f"subtask {i}: {a}")
+    return lines
 
 
 def _subtask_phase(state):
@@ -1960,17 +1991,15 @@ def strikeout(state):
     root = state.get("git_root") or state.get("project_dir") or "."
     dirty = git_out(root, "status", "--porcelain")
     stash = ""
-    if dirty:
+    start = state.get("subtask_tree") or ""
+    head = git_out(root, "rev-parse", "HEAD", default="")
+    if dirty and start and head and head == state.get("subtask_head") \
+            and start != git_out(root, "rev-parse", f"{head}^{{tree}}", default=""):
+        # the worktree also holds earlier subtasks' uncommitted work: save the failed attempt, undo only its paths
+        stash = _save_failed_attempt(state, u, root, start, head)
+    elif dirty:
         code, out, err = git(root, "stash", "push", "-u", "-m", f"sisyphus-next strikeout {state.get('run_id', '')}")
         stash = out.strip() or err.strip()
-        start = state.get("subtask_tree") or ""
-        head = git_out(root, "rev-parse", "HEAD", default="")
-        if (code == 0 and start and head and head == state.get("subtask_head")
-                and start != git_out(root, "rev-parse", f"{head}^{{tree}}", default="")):
-            # the stash also took earlier subtasks' uncommitted work; put the worktree back to where this subtask began
-            rc, _, rerr = git(root, "restore", f"--source={start}", "--worktree", "--", ".")
-            ledger(state, u, "strikeout: worktree restored to the subtask's starting tree (earlier subtasks' work kept)"
-                   if rc == 0 else f"strikeout: could not restore the subtask's starting tree: {tail(rerr, 200)}")
     attempts = f"{STRIKE_LIMIT} consecutive failed fix attempts. Last error:\n{state.get('last_coder_error') or ''}"
     u["diagnosis"] = ((state.get("diagnosis") or "") + "\n\n" + attempts).strip()
     ledger(state, u, f"strikeout: stopped after {STRIKE_LIMIT} strikes; "
@@ -1978,6 +2007,39 @@ def strikeout(state):
     u["strikeout_stash"] = stash
     snapshot(state, u, "strikeout")
     return u
+
+
+def _save_failed_attempt(state, u, root, start, head):
+    """Record the worktree as a commit under refs/sisyphus-next/strikeout/, then put back the paths changed since `start`."""
+    now = _worktree_tree(root)
+    if not now:
+        return ""
+    env = {"GIT_AUTHOR_NAME": "sisyphus-next", "GIT_AUTHOR_EMAIL": "sisyphus-next@localhost",
+           "GIT_COMMITTER_NAME": "sisyphus-next", "GIT_COMMITTER_EMAIL": "sisyphus-next@localhost"}
+    try:
+        p = subprocess.run(["git", "-C", root, "commit-tree", "--no-gpg-sign", now, "-p", head, "-m",
+                            f"sisyphus-next strikeout {state.get('run_id', '')}: the failed attempt"],
+                           capture_output=True, text=True, env={**os.environ, **env}, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    sha = p.stdout.strip() if p.returncode == 0 else ""
+    if not sha:
+        return ""
+    ref = f"refs/sisyphus-next/strikeout/{state.get('run_id') or 'run'}-{as_int(state.get('subtask_index'))}"
+    git(root, "update-ref", ref, sha)
+    paths = git_out(root, "diff", "--name-only", "--no-renames", start, now, "--", ".", *_plans_exclude(state, root),
+                    default="").splitlines()
+    kept = [x for x in paths if git(root, "cat-file", "-e", f"{start}:{x}")[0] == 0]
+    for x in set(paths) - set(kept):
+        try:
+            os.unlink(os.path.join(root, x))
+        except OSError:
+            pass
+    rc = git(root, "restore", f"--source={start}", "--worktree", "--", *kept)[0] if kept else 0
+    ledger(state, u, f"strikeout: the failed attempt is saved as {ref} ({sha[:12]}); {len(paths)} path(s) put back to the "
+                     f"subtask's starting tree, earlier subtasks' uncommitted work kept"
+                     + ("" if rc == 0 else " (the restore failed; see the saved commit)"))
+    return f"{ref} {sha} (recover with: git diff {start} {sha} | git apply)"
 
 
 def strikeout_route(state):
@@ -2096,22 +2158,34 @@ def review_gate(state):
           and not truthy(state.get("final_review"))):
         u["review_skipped_note"] = "review skipped: trivial single-file change with no spec (coder self_review is sufficient)"
         u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
-    elif _subtask_phase(state) and (changed := _subtask_changes(state)) is not None and not changed["files"]:
+    elif _subtask_phase(state) and (changed := _subtask_changes(state)) is not None and not _cache_files(u, changed):
         # a read-only or research subtask has nothing to conform; the final whole-task review still checks the parent
         n = as_int(state.get("subtask_index"))
         if changed["pulled"]:
             # HEAD moved only by commits that predate the subtask (a pull): they are the run's starting point, not its work
             head = changed["head"]
-            if state.get("base_sha") == state.get("run_base_sha"):
-                u["run_base_sha"] = head
             u["base_sha"] = u["debt_base"] = head
-            ledger(state, u, f"review: subtask {n} only pulled {changed['pulled']} existing commit(s); the run base moves to {head}")
+            if state.get("base_sha") == state.get("run_base_sha"):
+                # no earlier subtask changed code, so the whole-task diff can start past the pull
+                u["run_base_sha"] = head
+                ledger(state, u, f"review: subtask {n} only pulled {changed['pulled']} upstream commit(s); the run base moves to {head}")
+            else:
+                ledger(state, u, f"review: subtask {n} only pulled {changed['pulled']} upstream commit(s); they stay in the "
+                                 "whole-task diff (earlier subtasks' work starts before them)")
         ledger(state, u, f"review: subtask {n} changed no code outside the planning store; its conformance review is "
                          "skipped (the whole-task review follows)")
         u["_next"] = "next_subtask"
     else:
         u["_next"] = "build_gauntlet_prompt"
+        if not _subtask_phase(state):
+            u["subtask_changed_files"] = None
     return u
+
+
+def _cache_files(u, changed):
+    """Keep this round's file list for build_gauntlet_prompt (the same worktree, one tree hash per round)."""
+    u["subtask_changed_files"] = list(changed["files"])
+    return changed["files"]
 
 
 def _plans_exclude(state, root):
@@ -2177,8 +2251,11 @@ def _subtask_changes(state):
         stray = git_out(root, "diff", "--name-only", "--no-renames", head, now, "--", *files, default="x")
         stamps = git_out(root, "log", "--format=%ct", f"{start_head}..{head}", default="").split()
         since = as_int(state.get("subtask_started_at"))
-        if (set(files) <= set(moved) and not stray and stamps and since
+        upstream = git_out(root, "rev-parse", "--verify", "--quiet", "@{upstream}", default="")
+        # a pull brings commits that already exist upstream and predate the subtask; anything else is the subtask's own
+        if (set(files) <= set(moved) and not stray and stamps and since and upstream
                 and git(root, "merge-base", "--is-ancestor", start_head, head)[0] == 0
+                and git(root, "merge-base", "--is-ancestor", head, upstream)[0] == 0
                 and all(as_int(t) < since for t in stamps)):
             result.update({"files": [], "pulled": len(stamps)})
     return result
@@ -2220,13 +2297,19 @@ def build_gauntlet_prompt(state):
              f"Diff: {diff}",
              f"Rigor: {state.get('quality_rigor') or 'production'}   Security posture: {_posture(state)}"]
     if _subtask_phase(state):
-        changed = _subtask_changes(state)
-        spec = _subtask_spec(state, (changed or {}).get("files"))
+        files = state.get("subtask_changed_files")
+        if not isinstance(files, list):
+            files = (_subtask_changes(state) or {}).get("files")
+        spec = _subtask_spec(state, files)
     else:
         spec = (state.get("spec_text") or "").strip()
         if spec and truthy(state.get("final_review")):
             spec += (f"\n\nScope: the whole task, all {len(as_list(state.get('subtasks')))} subtasks, over the diff from "
                      "the run base: every acceptance criterion above must hold.")
+            amended = _subtask_amendments(state)
+            if amended:
+                spec += ("\n\nSubtask criteria the user amended during the run (settled rulings; the parent criteria "
+                         "above are unchanged):\n" + "\n".join(f"- {a}" for a in amended))
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
     if rounds:
