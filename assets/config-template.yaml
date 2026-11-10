@@ -310,7 +310,7 @@ mesh:
   knock_retention_hours: 24      # How long unanswered knocks from known identities are kept (default: 24; must be 1 or more)
   collision_protection: false    # Whether an identity trusted for all destinations is refused when it announces or claims an instance id recorded under another
                                  # identity, or heard in the peer table under one trusted for all destinations (default: false = served, with a warning to you;
-                                 # true = refused with an error until you trust its new destination with `.mesh trust`; a destination you trusted explicitly is
+                                 # true = refused with an error until you trust its new destination with `.mesh access trust`; a destination you trusted explicitly is
                                  # served either way)
   peer_max_concurrent: 1         # Envoy runs one sending identity may have queued or running at once; on a live link a message that would start a run while
                                  # the sender already has that many queued or running is refused before it is acknowledged with the bare throttled code, which

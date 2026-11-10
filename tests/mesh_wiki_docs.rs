@@ -372,8 +372,8 @@ fn every_command_row_in_the_wiki_table_matches_the_repl_commands_table() {
 /// Every `.mesh <path>` a mesh page spells inside a code span is a group or a command
 /// path `run` in `src/repl/mesh.rs` dispatches: a reader who types what the page shows is
 /// never refused with the unknown-command error. A `<placeholder>` or `[option]` after
-/// `.mesh` is not a path and is not judged; fenced blocks are transcripts, not
-/// instructions, and are skipped.
+/// `.mesh` is not a path and is not judged. The command samples of fenced transcripts are
+/// judged as well, so a `> .mesh <old verb>` line in a fence fails like one in prose.
 #[test]
 fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
     let Some(wiki) = wiki_dir() else { return };
@@ -429,10 +429,22 @@ fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
                 .collect::<Vec<_>>()
         })
         .collect();
+    let unknown_in_samples: Vec<String> = mesh_pages(&wiki)
+        .iter()
+        .flat_map(|page| {
+            let label = page.file_name().unwrap().to_string_lossy().to_string();
+            mesh_command_samples(&read(page), &groups)
+                .into_iter()
+                .filter(|(_, path, _)| !paths.contains(path) && !groups.contains(path))
+                .map(|(line, path, _)| format!("{label}:{line}: `.mesh {path}`"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     assert!(
-        unknown.is_empty(),
-        "a mesh page spells a `.mesh` path the REPL does not dispatch (COMMANDS has no row for it, so typing it is refused as an unknown command):\n{}",
-        unknown.join("\n")
+        unknown.is_empty() && unknown_in_samples.is_empty(),
+        "a mesh page spells a `.mesh` path the REPL does not dispatch (COMMANDS has no row for it, so typing it is refused as an unknown command):\n{}\n{}",
+        unknown.join("\n"),
+        unknown_in_samples.join("\n")
     );
 }
 
@@ -4348,17 +4360,38 @@ mod first_contact_wiki_pins {
             .expect("Mesh.md has no paragraph saying \"Either side may join first\"");
         for verb in [
             "`.mesh access trust`",
-            "`info`",
-            "`knock`",
-            "`status`",
-            "`message`",
-            "`fetch`",
+            "`.mesh people info`",
+            "`.mesh access ask`",
+            "`.mesh people status`",
+            "`.mesh messaging send`",
+            "`.mesh files fetch`",
         ] {
             assert!(
                 paragraph.contains(verb),
                 "Mesh.md's first-contact paragraph does not name {verb}:\n{paragraph}"
             );
         }
+    }
+
+    /// The unknown-command error Mesh-Commands.md quotes is the one `unknown_command_error`
+    /// formats, `<verb>` standing for what was typed.
+    #[test]
+    fn the_commands_page_quotes_the_unknown_command_error_as_the_code_formats_it() {
+        let error = string_literals(&fn_body("src/repl/mesh.rs", "unknown_command_error"))
+            .into_iter()
+            .find(|literal| literal.starts_with("Unknown "))
+            .expect("unknown_command_error formats a literal starting `Unknown `")
+            .replace("{typed}", "<verb>");
+        assert!(
+            error.contains("<verb>") && !error.contains('{'),
+            "the unknown-command error kept a placeholder the pin does not fill: {error}"
+        );
+        let Some(wiki) = wiki_dir() else { return };
+        let page = read(wiki.join("Mesh-Commands.md"));
+        assert!(
+            page.contains(&format!("`` `{error}` ``")),
+            "Mesh-Commands.md does not quote the unknown-command error as `` `{error}` ``"
+        );
     }
 
     #[test]
@@ -5994,7 +6027,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     for needle in [
         format!("{head} {send_tail}"),
         format!("asks the network for a path and waits up to {timeout} s for the answer"),
-        "a request to one peer (`.mesh status`, `.mesh messaging send`, a `mesh__ask`) from a restarted node reaches a peer it already knew at once, without waiting for a heartbeat".to_string(),
+        "a request to one peer (`.mesh people status`, `.mesh messaging send`, a `mesh__ask`) from a restarted node reaches a peer it already knew at once, without waiting for a heartbeat".to_string(),
         "A bulletin (`.mesh messaging broadcast`) still goes only to peers the transport already has a route to".to_string(),
         "The answer to a path request is not a sighting: `last seen` does not move, and `mesh.peer.discovered` does not fire".to_string(),
         format!("reports such a peer unreachable at once rather than waiting {timeout} s for each"),
