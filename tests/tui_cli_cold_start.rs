@@ -5,7 +5,7 @@
 //! report. Each case runs the built binary with stdin on the null device or
 //! a pipe and both output streams piped, so no pty is involved and the file
 //! runs on every CI leg. The cases that need a real tty to watch the chosen
-//! shell come up live in `tui_binary.rs`.
+//! shell come up live in `tui_binary_wizards.rs`.
 
 mod common;
 

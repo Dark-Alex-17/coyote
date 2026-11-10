@@ -1,0 +1,629 @@
+//! The pty harness the full-screen UI suites share: temp config dirs,
+//! the dry-run and scripted-model configs, the bash wrappers that run the
+//! binary and report its exit code and the tty flags afterwards, and the
+//! scanners that read the raw escape stream back. Unix-only, as the pty
+//! it drives is.
+#![cfg(unix)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{env, fs, iter, process};
+
+use super::fake_llm::{FakeLlm, Reply};
+use super::pty::{Pty, strip_ansi};
+
+/// Covers the keyboard-enhancement probe, which waits two seconds for an
+/// answer a pseudo-terminal never gives.
+pub const PTY_DEADLINE: Duration = Duration::from_secs(20);
+/// Hotkeys on a modal count only once both the last keystroke and the
+/// modal's appearance are at least HOTKEY_IDLE (1 s) old; 1200 ms settles
+/// both.
+pub const HOTKEY_GAP: Duration = Duration::from_millis(1200);
+
+pub struct TempDirGuard(pub PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn fresh_config_dir(scenario: &str) -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = env::temp_dir().join(format!(
+        "coyote-tui-binary-{scenario}-{}-{unique}-{sequence}",
+        process::id()
+    ));
+    fs::create_dir_all(dir.join("home")).unwrap();
+    fs::create_dir_all(dir.join("sessions")).unwrap();
+    dir
+}
+
+/// A dry-run config that never asks to save a session, so every exit path
+/// is prompt-free. Paths land in single-quoted YAML scalars.
+pub fn write_dry_run_config(dir: &Path) {
+    write_config(dir, "save_session: false\n");
+}
+
+/// The same config with `extra` top-level YAML appended by the caller;
+/// with `save_session` left unset a dirty session asks "Save session?"
+/// on `.exit session`.
+pub fn write_config(dir: &Path, extra: &str) {
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: dryrun:dry-model\n\
+             dry_run: true\n\
+             stream: true\n\
+             vault_password_file: '{vault_pass}'\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: dryrun\n\
+             \x20   auth: none\n\
+             \x20   api_key: 'unused'\n\
+             \x20   models:\n\
+             \x20     - name: dry-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             {extra}\
+             workspace_instructions: false\n\
+             memory: false\n",
+            vault_pass = vault_pass.display(),
+        ),
+    )
+    .unwrap();
+}
+
+/// Runs the binary in the background of a bash wrapper on a fresh pty with
+/// the tty on stdin. The wrapper names the child's pid, waits for it, and
+/// then reports its exit code and the tty flags so a test can check both
+/// after any exit path.
+pub fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
+    spawn_tui_under(dir, extra_env, WAIT_WRAPPER, "/dev/tty")
+}
+
+/// [`spawn_tui`] with command-line flags after the binary; `args` are
+/// plain ASCII flags, so they go into the wrapper unquoted.
+pub fn spawn_tui_with_args(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> Pty {
+    let args = format!(" {}", args.join(" "));
+    spawn_binary_under(
+        built_binary(),
+        dir,
+        extra_env,
+        WAIT_WRAPPER,
+        "/dev/tty",
+        &args,
+    )
+}
+
+/// Report line emitted by both wrappers once the binary has exited. The
+/// alternate screen leaves no newline behind once escapes are stripped,
+/// so the report starts a fresh line first.
+pub const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
+     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
+
+/// The plain wrapper: one process group, `wait` for the child. Being a
+/// `setsid` leader whose parent sits in another session makes that group
+/// orphaned, and the kernel discards SIGTSTP for orphaned groups, so this
+/// wrapper cannot observe a suspend.
+pub const WAIT_WRAPPER: &str =
+    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
+
+/// A job-control wrapper that behaves like the user's shell: the binary
+/// runs as the foreground job in its own process group; when it stops the
+/// wrapper regains the terminal, says so, reports the tty flags it sees,
+/// and after a moment resumes the job with `fg` as a user would. (`fg`
+/// must keep its own stdout: redirecting it stops bash handing the tty
+/// over.)
+pub const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}'{args} <{stdin}; rc=$?; \
+     while [ -n \"$(jobs -s)\" ]; do echo; echo job-stopped; \
+     echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
+     sleep 1; fg %1; rc=$?; done; {report}";
+
+/// The build's own binary; every spawn goes through [`spawn_binary_under`].
+pub fn built_binary() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_coyote"))
+}
+
+/// [`spawn_binary_under`] for the build's own binary: `wrapper` is one of
+/// the bash scripts above and `stdin` the path the binary's stdin is
+/// redirected from.
+pub fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin: &str) -> Pty {
+    spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin, "")
+}
+
+/// [`spawn_tui_under`] for a copy of the binary living elsewhere (the
+/// self-update path classifies the install by where the executable is);
+/// `args` fills the wrapper's `{args}` slot right after the binary.
+pub fn spawn_binary_under(
+    binary: &Path,
+    dir: &Path,
+    extra_env: &[(&str, &str)],
+    wrapper: &str,
+    stdin: &str,
+    args: &str,
+) -> Pty {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(
+        wrapper
+            .replace("{coyote}", binary.to_str().unwrap())
+            .replace("{args}", args)
+            .replace("{stdin}", stdin)
+            .replace("{report}", TTY_REPORT),
+    );
+    base_env(&mut cmd, dir);
+    cmd.env("COYOTE_UI", "tui").envs(extra_env.iter().copied());
+    Pty::spawn(cmd).unwrap()
+}
+
+/// The environment every spawn of the binary shares: working dir, config
+/// and cache dirs and `HOME` all under `dir`, the fixture bin first on
+/// `PATH`, and no inherited `COYOTE_*` or color variables.
+pub fn base_env(cmd: &mut Command, dir: &Path) {
+    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
+    let path = env::join_paths(
+        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("COYOTE_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.current_dir(dir)
+        .env("COYOTE_CONFIG_DIR", dir)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("HOME", dir.join("home"))
+        .env("TERM", "xterm-256color")
+        .env("PATH", path)
+        .env_remove("IS_SANDBOX")
+        .env_remove("COLORTERM")
+        .env_remove("NO_COLOR");
+}
+
+pub fn tty_flag_tokens(transcript: &str) -> Vec<&str> {
+    let flags = transcript
+        .lines()
+        .find_map(|line| line.strip_prefix("tty-flags: "))
+        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
+    flags
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .collect()
+}
+
+/// Raw mode clears echo, icanon, isig and opost; the UI must have put all
+/// four back.
+pub fn assert_tty_restored(transcript: &str) {
+    let tokens = tty_flag_tokens(transcript);
+    // Raw mode clears all four; a restored line discipline has them back.
+    for flag in ["echo", "icanon", "isig", "opost"] {
+        assert!(
+            tokens.contains(&flag),
+            "stty did not report {flag} after the UI left:\n{transcript}"
+        );
+        let off = format!("-{flag}");
+        assert!(
+            !tokens.contains(&off.as_str()),
+            "the terminal was left with {flag} off:\n{transcript}"
+        );
+    }
+}
+
+pub fn exit_code(transcript: &str) -> i32 {
+    transcript
+        .lines()
+        .find_map(|line| line.strip_prefix("exit="))
+        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+pub fn child_pid(transcript: &str) -> i32 {
+    transcript
+        .lines()
+        .find_map(|line| line.strip_prefix("cpid="))
+        .unwrap_or_else(|| panic!("no cpid= line in the transcript:\n{transcript}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Types `text` into a field modal and sends it. Enter on a field modal
+/// only counts once the modal has been up for a second; the gate runs
+/// from its appearance, not from typing.
+pub fn answer_field_modal(pty: &mut Pty, text: &str) {
+    pty.read_for(HOTKEY_GAP);
+    pty.send(format!("{text}\r").as_bytes()).unwrap();
+}
+
+pub const ENTER_ALT: &[u8] = b"\x1b[?1049h";
+pub const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+
+pub fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack[from.min(haystack.len())..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|at| from + at)
+}
+
+pub fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+pub fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// The 1-based (row, col) of the cursor-position sequence (`CSI r;c H`)
+/// that placed each occurrence of `needle` from `from` on: the painter
+/// positions the cursor before the first changed cell of a row, so this
+/// is the screen row a piece of text was drawn on.
+pub fn painted_at(haystack: &[u8], needle: &[u8], from: usize) -> Vec<(u16, u16)> {
+    let mut positions = Vec::new();
+    let mut at = from;
+    while let Some(hit) = find(haystack, needle, at) {
+        let mut end = hit;
+        while let Some(start) = rfind(&haystack[..end], b"\x1b[") {
+            let params: Vec<u8> = haystack[start + 2..hit]
+                .iter()
+                .copied()
+                .take_while(|b| b.is_ascii_digit() || *b == b';')
+                .collect();
+            if haystack.get(start + 2 + params.len()) == Some(&b'H')
+                && let Some((row, col)) = std::str::from_utf8(&params)
+                    .ok()
+                    .and_then(|p| p.split_once(';'))
+                && let (Ok(row), Ok(col)) = (row.parse(), col.parse())
+            {
+                positions.push((row, col));
+                break;
+            }
+            end = start;
+        }
+        at = hit + 1;
+    }
+    positions
+}
+
+/// Every SGR parameter list (`ESC [ ... m`) in the raw output, split into
+/// its numeric parameters.
+pub fn sgr_params(raw: &[u8]) -> Vec<Vec<u16>> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = Vec::new();
+    let mut rest: &str = &text;
+    while let Some(start) = rest.find("\x1b[") {
+        rest = &rest[start + 2..];
+        let end = rest
+            .find(|c: char| !(('\x30'..='\x3f').contains(&c) || ('\x20'..='\x2f').contains(&c)));
+        let Some(end) = end else { break };
+        if rest.as_bytes()[end] == b'm' {
+            let params = &rest[..end];
+            if params.is_empty() {
+                out.push(vec![0]);
+            } else {
+                out.push(
+                    params
+                        .split([';', ':'])
+                        .map(|p| p.parse::<u16>().unwrap_or(u16::MAX))
+                        .collect(),
+                );
+            }
+        }
+        let final_byte = rest[end..].chars().next().map_or(1, char::len_utf8);
+        rest = &rest[end + final_byte..];
+    }
+    out
+}
+
+/// Whether an SGR parameter list switches conceal on: an `8` standing on
+/// its own. The arguments of an extended colour are stepped over, so a
+/// palette index or channel value of 8 (`38;5;8`, `48;2;8;8;8`) is not
+/// mistaken for the attribute.
+pub fn is_conceal_sgr(params: &[u16]) -> bool {
+    let mut i = 0;
+    while i < params.len() {
+        match params[i] {
+            38 | 48 | 58 => {
+                i += match params.get(i + 1) {
+                    Some(5) => 3,
+                    Some(2) => 5,
+                    _ => 1,
+                };
+            }
+            8 => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+pub fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Dirties a temp session the way the save-modal cases do: a dry-run turn
+/// records nothing, so a session setting is what flips the dirty bit.
+pub fn open_and_dirty_a_session(pty: &mut Pty) {
+    pty.send(b".session\r").unwrap();
+    pty.wait_for("temp", PTY_DEADLINE).unwrap();
+    pty.send(b".set skills_enabled false\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+}
+
+/// The dry-run config with its only client pointed at `fake` instead, so a
+/// turn can carry a tool call. `save_session: false` keeps every exit
+/// prompt-free, as in [`write_dry_run_config`].
+pub fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: fake:fake-model\n\
+             function_calling_support: true\n\
+             stream: true\n\
+             save_session: false\n\
+             vault_password_file: '{vault_pass}'\n\
+             clients:\n\
+             \x20 - type: openai-compatible\n\
+             \x20   name: fake\n\
+             \x20   api_base: '{api_base}'\n\
+             \x20   api_key: 'unused'\n\
+             \x20   models:\n\
+             \x20     - name: fake-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             workspace_instructions: false\n\
+             memory: false\n",
+            vault_pass = vault_pass.display(),
+            api_base = fake.api_base(),
+        ),
+    )
+    .unwrap();
+}
+
+/// Drops one bash tool into the config's `functions/tools` dir; the binary
+/// builds its shim on startup. No `set -e`: the fixture `tput` on PATH
+/// exits 1 for everything but `cols`/`lines`, and the prompt helper's
+/// colour assignments would abort the tool under it.
+pub fn write_tool(dir: &Path, file: &str, body: &str) {
+    let tools = dir.join("functions").join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(tools.join(file), body).unwrap();
+}
+
+/// Pumps the pty until `path` exists, so the child's output never backs up
+/// while the test waits on a side effect.
+pub fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    while !path.exists() {
+        let text = pty.read_for(Duration::from_millis(100));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} ({}) never appeared:\n{text}",
+            path.display()
+        );
+    }
+}
+
+/// Waits until `marker` is on screen with its surrounding whitespace
+/// squeezed out (a rendered markdown cell may wrap it), returning the
+/// transcript.
+pub fn wait_for_squeezed(pty: &mut Pty, marker: &str, what: &str) -> String {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let wanted: String = marker.chars().filter(|c| !c.is_whitespace()).collect();
+    loop {
+        let text = pty.read_for(Duration::from_millis(200));
+        let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if squeezed.contains(&wanted) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never appeared:\n{text}"
+        );
+    }
+}
+
+/// A confirm tool that also records the answer it got at `out`, so a
+/// test can see the value the modal produced rather than only the
+/// model's follow-up.
+pub const RECORDING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user before continuing and record the answer.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   v=\"$(confirm \"Really do it? q9d-q\")\"\n\
+    \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
+    \x20   echo \"fixture confirm: ${v:-cancelled} q9d-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+pub fn squeezed(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Files under `dir` (outside the cache) that were not there before and
+/// carry `name` in their path.
+pub fn new_files_named(dir: &Path, before: &[PathBuf], name: &str) -> Vec<PathBuf> {
+    walk(dir)
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .filter(|path| !path.to_string_lossy().contains("/cache/"))
+        .filter(|path| path.to_string_lossy().contains(name))
+        .collect()
+}
+
+/// The dry-run config with two embedding models on the dry-run client, so
+/// creating a RAG has something to ask about (which model, which
+/// documents) instead of failing on "No available embedding model".
+pub fn write_dry_run_config_with_embeddings(dir: &Path) {
+    write_config(
+        dir,
+        "\x20     - name: dry-embed-a\n\
+         \x20       type: embedding\n\
+         \x20       max_input_tokens: 2048\n\
+         \x20       default_chunk_size: 1000\n\
+         \x20       max_batch_size: 100\n\
+         \x20     - name: dry-embed-b\n\
+         \x20       type: embedding\n\
+         \x20       max_input_tokens: 2048\n\
+         \x20       default_chunk_size: 1000\n\
+         \x20       max_batch_size: 100\n\
+         save_session: false\n",
+    );
+}
+
+/// A copy of the binary under `<home>/.cargo/bin`, where the self-update
+/// path classifies it as a Cargo install and asks `Update anyway?` before
+/// it goes anywhere near the network.
+pub fn cargo_installed_binary(dir: &Path) -> PathBuf {
+    let bin_dir = dir.join("home").join(".cargo").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let copy = bin_dir.join("coyote");
+    // A copy, never a hard link: the metadata checked afterwards must be
+    // this file's own, not shared with the binary cargo may rebuild.
+    fs::copy(built_binary(), &copy).unwrap();
+    copy
+}
+
+/// Waits for the modal `command` raises after `before`: every squeezed
+/// marker and the modal's `Esc = cancel` legend are on screen and the
+/// terminal was never released.
+pub fn wait_for_the_modal(
+    pty: &mut Pty,
+    before: usize,
+    command: &str,
+    modal_markers: &[&str],
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let modal = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        let flat = squeezed(&since);
+        if modal_markers.iter().all(|marker| flat.contains(marker)) && flat.contains("Esc=cancel") {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`{command}` did not raise the modal showing {modal_markers:?} within 10s:\n{since}"
+        );
+    };
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the question of `{command}` released the terminal:\n{modal}"
+    );
+    modal
+}
+
+/// Esc on the modal, then a repaint forced by a resize so the frame can
+/// be checked for the modal's legend being gone.
+pub fn esc_cancels_the_modal(pty: &mut Pty, command: &str) {
+    pty.read_for(HOTKEY_GAP);
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    pty.resize(60, 110).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(
+        !squeezed(&since).contains("Esc=cancel"),
+        "the modal of `{command}` is still up after Esc:\n{since}"
+    );
+}
+
+/// Runs one fake-LLM turn with no session open, then `.session <name>`:
+/// the question whether to carry the exchange into the new session is
+/// asked as the modal, not refused. Returns the pty with the modal up.
+/// The fake comes back with the pty so it outlives every later turn.
+pub fn open_session_after_a_turn(dir: &Path, name: &str) -> (Pty, FakeLlm) {
+    let fake = FakeLlm::start(vec![Reply::Text("fixture first reply xk3".to_string())]);
+    write_fake_llm_config(dir, &fake);
+    let mut pty = spawn_tui(dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"first question xk3\r").unwrap();
+    wait_for_squeezed(&mut pty, "fixture first reply xk3", "the first reply");
+    pty.read_for(Duration::from_millis(500));
+    let asked_at = pty.raw().len();
+    pty.send(format!(".session {name}\r").as_bytes()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+        if squeezed(&since).contains("incorporatesthelastquestionandanswer") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`.session` after a turn did not ask about the last exchange within 10s:\n{since}"
+        );
+    }
+    pty.read_for(HOTKEY_GAP);
+    (pty, fake)
+}
+
+/// Answers the open modal with `key` and checks the session comes up: the
+/// footer names it, `.info session` shows it empty or holding the
+/// exchange, and the UI leaves clean. (The window is grown first: the
+/// repaint that forces paints every footer cell, where an incremental one
+/// skips the cells the old footer shared, and the whole table then fits.)
+pub fn answer_and_expect_session(mut pty: Pty, key: &[u8], name: &str, empty: bool) {
+    pty.send(key).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let grown_at = pty.raw().len();
+    pty.resize(120, 120).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let grown = strip_ansi(&String::from_utf8_lossy(&pty.raw()[grown_at..]));
+    assert!(
+        squeezed(&grown).contains(name),
+        "the footer does not name `{name}` after answering the modal with {key:?}:\n{grown}"
+    );
+    let info_at = pty.raw().len();
+    pty.send(b".info session\r").unwrap();
+    pty.wait_for_after("total_tokens", info_at, PTY_DEADLINE)
+        .expect("`.info session` never rendered after the modal was answered");
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+    assert_eq!(
+        squeezed(&since).contains("total_tokens0"),
+        empty,
+        "the session after answering with {key:?} should be empty: {empty}\n{since}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}

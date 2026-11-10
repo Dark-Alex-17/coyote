@@ -2,8 +2,9 @@
 //! each spawn of the built `coyote` must point the child at a temp config
 //! dir and a temp cache dir, so nothing a test run spawns lands in the
 //! developer's real config or cache. The pin reads the harness sources
-//! themselves, keyed on the spawn site, so a new harness that boots the
-//! binary without pinning either dir fails here before it ever runs.
+//! themselves (the suites under `tests/` and the shared modules under
+//! `tests/common/`), keyed on the spawn site, so a new harness that boots
+//! the binary without pinning either dir fails here before it ever runs.
 
 use std::fs;
 use std::path::Path;
@@ -17,9 +18,13 @@ const CACHE_ENV: &str = ".env(\"COYOTE_CACHE_DIR\"";
 #[test]
 fn every_binary_spawn_in_the_harnesses_pins_the_config_dir_and_the_cache_dir() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let common_dir = tests_dir.join("common");
     let mut pinned = Vec::new();
-    for entry in fs::read_dir(&tests_dir).expect("tests dir is readable") {
-        let path = entry.expect("tests dir entry").path();
+    let sources = [&tests_dir, &common_dir]
+        .into_iter()
+        .flat_map(|dir| fs::read_dir(dir).expect("tests dir is readable"))
+        .map(|entry| entry.expect("tests dir entry").path());
+    for path in sources {
         if path.extension().is_none_or(|ext| ext != "rs") {
             continue;
         }
@@ -40,7 +45,7 @@ fn every_binary_spawn_in_the_harnesses_pins_the_config_dir_and_the_cache_dir() {
         pinned.push(path.file_name().unwrap().to_string_lossy().into_owned());
     }
     assert!(
-        pinned.len() >= 9,
+        pinned.len() >= 30,
         "expected the known binary harnesses to be scanned, found {pinned:?}"
     );
 }

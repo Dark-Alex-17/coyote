@@ -1,7 +1,8 @@
 //! Suspend, signal, resize and keyboard-protocol cases for the full-screen
 //! UI. Each case runs the binary cold on a pseudo-terminal under the same
-//! bash wrappers `tui_binary.rs` uses, so the exit code and the tty flags
-//! are reported after every exit path. Unix-only for the same reasons.
+//! bash wrappers `tests/common/tui_harness.rs` holds, so the exit code and
+//! the tty flags are reported after every exit path. Unix-only for the
+//! same reasons.
 #![cfg(unix)]
 
 mod common;

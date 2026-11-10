@@ -4,3 +4,5 @@
 pub mod fake_llm;
 #[allow(dead_code)]
 pub mod pty;
+#[allow(dead_code)]
+pub mod tui_harness;

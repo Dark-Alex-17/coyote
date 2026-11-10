@@ -2,8 +2,9 @@
 //! that has to survive Ctrl-Z, SIGTERM and a window shrunk to a single
 //! row or column, and an `$EDITOR` shell-out whose editor fails. Each
 //! case runs the binary cold on a pseudo-terminal under the same bash
-//! wrappers `tui_binary.rs` uses, so the exit code and the tty flags are
-//! reported after every exit path. Unix-only for the same reasons.
+//! wrappers `tests/common/tui_harness.rs` holds, so the exit code and the
+//! tty flags are reported after every exit path. Unix-only for the same
+//! reasons.
 #![cfg(unix)]
 
 mod common;
