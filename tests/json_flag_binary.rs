@@ -372,6 +372,134 @@ fn a_missing_prompt_fails_on_stderr_with_empty_stdout() {
     );
 }
 
+// ---- first-time RAG build reached by an agent load ----
+
+const RAG_INIT_LINE: &str = "Initializing RAG";
+
+/// Like `serve(Behaviour::Answer)`, but answers an embeddings request (a
+/// body carrying `input`) with one fixed vector per input.
+fn serve_with_embeddings() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Some(body) = read_request_body(&mut stream) else {
+                continue;
+            };
+            let request = serde_json::from_str::<Value>(&body).unwrap_or_default();
+            let (content_type, payload) = if request.get("input").is_some() {
+                let count = request["input"].as_array().map_or(1, Vec::len);
+                ("application/json", json!({
+                    "object": "list",
+                    "data": (0..count)
+                        .map(|i| json!({ "object": "embedding", "index": i, "embedding": [0.1, 0.2, 0.3] }))
+                        .collect::<Vec<_>>(),
+                    "model": "stub-embed",
+                    "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+                })
+                .to_string())
+            } else if request["stream"] == json!(true) {
+                ("text/event-stream", sse_completion())
+            } else {
+                ("application/json", plain_completion())
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+/// A cold config dir with a chat and an embedding model, plus a graph agent
+/// whose rag node builds its knowledge base on first load with no prompts.
+fn rag_graph_dir(label: &str) -> TempDir {
+    let dir = TempDir::new(label);
+    let port = serve_with_embeddings();
+    write_config(&dir.0, port, false);
+    let config = fs::read_to_string(dir.0.join("config.yaml")).unwrap();
+    let config = config.replace(
+        "       supports_function_calling: true\n",
+        "       supports_function_calling: true\n\
+         \x20     - name: stub-embed\n\
+         \x20       type: embedding\n\
+         \x20       max_tokens_per_chunk: 8000\n\
+         \x20       default_chunk_size: 1000\n\
+         \x20       max_batch_size: 10\n",
+    );
+    fs::write(dir.0.join("config.yaml"), config).unwrap();
+    let agent_dir = dir.0.join("agents").join("rag-graph");
+    fs::create_dir_all(agent_dir.join("knowledge")).unwrap();
+    fs::write(
+        agent_dir.join("knowledge").join("notes.md"),
+        "The stub knows one fact.\n",
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: rag-graph\n\
+         version: \"1.0\"\n\
+         description: Retrieves, then asks.\n\
+         initial_state: { context: \"\", reply: \"\" }\n\
+         start: retrieve\n\
+         nodes:\n\
+         \x20 retrieve:\n\
+         \x20   type: rag\n\
+         \x20   documents: [ ./knowledge/ ]\n\
+         \x20   embedding_model: stub:stub-embed\n\
+         \x20   chunk_size: 1000\n\
+         \x20   chunk_overlap: 100\n\
+         \x20   driver: yaml\n\
+         \x20   state_updates: { context: \"{{output.context}}\" }\n\
+         \x20   next: ask\n\
+         \x20 ask: { type: llm, prompt: \"{{initial_prompt}}\", state_updates: { reply: \"{{output}}\" }, next: done }\n\
+         \x20 done: { type: end, output: \"{{reply}}\" }\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn a_first_time_agent_rag_build_goes_to_stderr_under_json() {
+    let plain_dir = rag_graph_dir("rag-build-plain");
+    let plain = run(&plain_dir.0, &["--agent", "rag-graph", "hi"]);
+    assert!(plain.status.success(), "{}", combined(&plain));
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains(RAG_INIT_LINE),
+        "without --json the RAG build progress is on stdout:\n{}",
+        combined(&plain)
+    );
+
+    let dir = rag_graph_dir("rag-build-json");
+    let output = run(&dir.0, &["--json", "--agent", "rag-graph", "hi"]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in [
+        RAG_INIT_LINE,
+        "Embedding model",
+        "Chunk size",
+        "Chunk overlap",
+        "Saved RAG",
+        "Load ",
+    ] {
+        assert!(
+            !stdout.contains(line),
+            "`{line}` reached stdout under --json:\n{}",
+            combined(&output)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(RAG_INIT_LINE),
+        "under --json the RAG build progress moves to stderr:\n{}",
+        combined(&output)
+    );
+    assert!(output.stdout.is_empty(), "{}", combined(&output)); // TASK-433: graph runs print the --json wrapper here
+}
+
 #[test]
 fn a_setup_error_before_the_run_stays_plain() {
     let output = json_run(
@@ -616,6 +744,11 @@ fn a_tool_call_log_never_reaches_stdout() {
     let report = the_only_object(&output);
     assert_eq!(report["result"], json!(REPLY), "{report}");
     assert_eq!(report["num_turns"], json!(2), "{report}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(&format!("Call {TOOL}")),
+        "under --json the call log is dropped, not moved to stderr:\n{}",
+        combined(&output)
+    );
 }
 
 #[test]
@@ -675,7 +808,7 @@ fn loading_an_installed_skill_leaves_stdout_to_the_object() {
     );
 }
 
-// ---- usage probe: script-tool relay and the loop warning ----
+// ---- script-tool relay and the loop warning ----
 
 const SCRIPT_TOOL: &str = "shout";
 const RELAYED: &str = "RELAYED-FROM-THE-TOOL";
@@ -724,7 +857,7 @@ fn script_tool_run(label: &str, calls: usize, json_flag: bool) -> Output {
 }
 
 #[test]
-fn usage_probe_a_script_tool_relay_goes_to_stderr_under_json() {
+fn a_script_tool_relay_goes_to_stderr_under_json() {
     if cfg!(windows) {
         eprintln!("skipping: the tool is a bash script");
         return;
@@ -750,7 +883,7 @@ fn usage_probe_a_script_tool_relay_goes_to_stderr_under_json() {
 }
 
 #[test]
-fn usage_probe_the_loop_warning_goes_to_stderr_under_json() {
+fn the_loop_warning_goes_to_stderr_under_json() {
     if cfg!(windows) {
         eprintln!("skipping: the tool is a bash script");
         return;
