@@ -12397,7 +12397,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.1824
-    output_price: 9.3388
+    output_price: 10.1489
     cache_read_price: 0.18
     max_output_tokens: 943718
     supports_vision: true
