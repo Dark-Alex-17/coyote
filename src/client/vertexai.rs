@@ -813,15 +813,26 @@ mod tests {
     }
 
     #[test]
-    fn gemini_tool_results_without_images_keep_parts() {
-        let body = gemini_body_for(vec![fs_read_result("call_A")]);
+    fn gemini_tool_result_round_keeps_thought_signature_on_model_turn() {
+        let signed_call = ToolCall::new("fs_read".into(), json!({"path": "x"}), Some("call_A".into()))
+            .with_thought_signature(Some("sig".into()));
+        let body = gemini_body_for(vec![ToolResult::new(signed_call, json!("ok"))]);
 
         assert_eq!(
-            body["contents"][2]["parts"],
-            json!([function_response_json()]),
+            body["contents"],
+            json!([
+                { "role": "user", "parts": [{ "text": "hello" }] },
+                {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": { "name": "fs_read", "args": { "path": "x" } },
+                        "thoughtSignature": "sig",
+                    }],
+                },
+                { "role": "user", "parts": [function_response_json()] },
+            ]),
             "body: {body}"
         );
-        assert_eq!(body["contents"].as_array().unwrap().len(), 3, "body: {body}");
     }
 
     #[test]
