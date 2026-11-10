@@ -854,7 +854,7 @@ fn select_uninstall_candidate(
                         "pick between the bundles matching '{spec}' ({})",
                         described.join(", ")
                     ),
-                    "; or re-run with the exact bundle name or source URL.",
+                    ", or pass the exact bundle name or source URL.",
                 ));
             }
 
@@ -2472,7 +2472,7 @@ mod tests {
     };
     use crate::sandbox::SANDBOX_ENV_FLAG;
     use crate::testing::EnvVarGuard;
-    use crate::utils::{IS_STDOUT_TERMINAL, get_env_name};
+    use crate::utils::get_env_name;
     use serial_test::serial;
     use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3134,16 +3134,10 @@ mod tests {
     }
 
     #[test]
-    // The hint it asserts follows the UI flag, which the serial tests of
-    // this binary flip.
     #[serial]
     fn merge_non_tty_conflict_aborts_without_force() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping merge_non_tty_conflict_aborts_without_force: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let dir = fresh_temp_dir("merge-non-tty-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -3378,16 +3372,10 @@ mod tests {
     }
 
     #[test]
-    // The terminal check it relies on follows the UI flag, which the
-    // serial tests of this binary flip.
     #[serial]
     fn handle_missing_secrets_defers_all_in_non_tty() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping handle_missing_secrets_defers_all_in_non_tty: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let missing = vec![
             "COYOTE_TEST_STEP4_A".to_string(),
             "COYOTE_TEST_STEP4_B".to_string(),
@@ -4139,12 +4127,8 @@ mod tests {
     #[test]
     #[serial]
     fn apply_plan_records_files_written_before_a_mid_run_abort() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping apply_plan_records_files_written_before_a_mid_run_abort: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("prov-abort");
         let src_dir = fresh_temp_dir("prov-abort-src-");
         let src_new = src_dir.join("new.yaml");
@@ -4386,12 +4370,8 @@ mod tests {
     #[test]
     #[serial]
     fn builtin_asset_install_writes_no_provenance() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping builtin_asset_install_writes_no_provenance: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("prov-builtin");
 
         config::install_assets(config::AssetCategory::Macros, &ScriptedPrompter::refusing())
@@ -4404,12 +4384,8 @@ mod tests {
     #[test]
     #[serial]
     fn builtin_hooks_category_installs_example_scripts() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping builtin_hooks_category_installs_example_scripts: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("prov-hooks");
         let hooks_key = get_env_name("hooks_dir");
         let previous_hooks = env::var_os(&hooks_key);
@@ -4444,12 +4420,8 @@ mod tests {
     fn update_silently_refreshes_owned_unmodified_files() {
         use crate::config::bundles::hash_bytes;
 
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_silently_refreshes_owned_unmodified_files: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-refresh");
         let src_root = fresh_temp_dir("upd-refresh-src-");
         let repo = src_root.join("bundle");
@@ -4480,13 +4452,8 @@ mod tests {
     #[test]
     #[serial]
     fn update_with_yes_keeps_modified_files_and_updates_the_rest() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_with_yes_keeps_modified_files_and_updates_the_rest: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-yes");
         let src_root = fresh_temp_dir("upd-yes-src-");
         let repo = src_root.join("bundle");
@@ -4527,13 +4494,8 @@ mod tests {
     #[test]
     #[serial]
     fn update_takes_remote_for_owned_unmodified_mcp_entries() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_takes_remote_for_owned_unmodified_mcp_entries: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-mcp-auto");
         let src_root = fresh_temp_dir("upd-mcp-auto-src-");
         let repo = src_root.join("bundle");
@@ -4675,12 +4637,8 @@ mod tests {
     #[test]
     #[serial]
     fn update_bails_non_interactively_on_unowned_conflict() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_bails_non_interactively_on_unowned_conflict: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-unowned");
         let src_root = fresh_temp_dir("upd-unowned-src-");
         let repo = src_root.join("bundle");
@@ -4798,13 +4756,8 @@ mod tests {
     #[test]
     #[serial]
     fn update_keeps_modified_obsolete_files_non_interactively() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_keeps_modified_obsolete_files_non_interactively: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-obsolete-keep");
         let src_root = fresh_temp_dir("upd-obsolete-keep-src-");
         let repo = src_root.join("bundle");
@@ -4991,13 +4944,8 @@ mod tests {
     #[test]
     #[serial]
     fn handle_obsolete_keeps_modified_files_non_interactively() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping handle_obsolete_keeps_modified_files_non_interactively: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-obsolete-mod");
         let dir = paths::config_dir();
         let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -5692,12 +5640,8 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_shorthand_with_multiple_matches_bails_non_interactively() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping uninstall_shorthand_with_multiple_matches_bails_non_interactively: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("uninst-short-multi");
         let mut store = BundleStore::load().unwrap();
         store
@@ -5720,6 +5664,10 @@ mod tests {
             "got: {message}"
         );
         assert!(message.contains("omc-fork"), "got: {message}");
+        assert!(
+            message.ends_with("Re-run in a terminal, or pass the exact bundle name or source URL."),
+            "got: {message}"
+        );
         let store = BundleStore::load().unwrap();
         assert!(store.get("omc").is_some());
         assert!(store.get("omc-fork").is_some());
@@ -6526,7 +6474,7 @@ mod tests {
             "got: {message}"
         );
         assert!(
-            message.contains("non-interactively. Re-run in a terminal; or re-run with the exact bundle name or source URL."),
+            message.ends_with("non-interactively. Re-run in a terminal, or pass the exact bundle name or source URL."),
             "got: {message}"
         );
     }

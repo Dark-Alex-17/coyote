@@ -3548,6 +3548,77 @@ mod tests {
         assert!(prompter.requests().is_empty());
     }
 
+    /// The attach wizard is refused the same way: up front, before the
+    /// driver question or any secret handling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn attach_without_a_terminal_is_refused_before_any_prompt() {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let store = EmptyVault::new("attach-no-tty");
+        let dir = TempDir::new("attach-no-tty-rag");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = Rag::attach(
+            &AppConfig::default(),
+            &store.vault,
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &prompter,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to run the attach wizard for RAG 'kb' non-interactively. Re-run in a terminal."
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    /// A configured build with no embedding model anywhere would have to
+    /// ask for one; without a terminal it is refused with the remedy that
+    /// names the field, before the model list is consulted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn init_with_config_without_a_terminal_and_no_embedding_model_is_refused_before_any_prompt()
+     {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let dir = TempDir::new("init-config-no-tty");
+        let doc = dir.path.join("doc.txt");
+        fs::write(&doc, "").unwrap();
+        let prompter = ScriptedPrompter::refusing();
+        let config = RagInitConfig {
+            embedding_model: None,
+            ..init_config()
+        };
+
+        let err = Rag::init_with_config(
+            &seeded_client_app(),
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &[doc.display().to_string()],
+            &config,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks: RagSyncHooks::resolve(&rag_hooks_ctx("init-config-no-tty")),
+                prompter: &prompter,
+            },
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to choose an embedding model for RAG knowledge base 'kb' non-interactively. \
+             Re-run in a terminal. Set `embedding_model` on the rag node, or run the agent interactively once."
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
     /// A rejected answer is asked again with the reason in front of the
     /// label, so the field keeps its name in the modal.
     #[test]

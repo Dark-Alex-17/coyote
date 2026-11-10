@@ -692,15 +692,6 @@ mod tests {
         assert_eq!(InquirePrompter::select_options(&closed), vec!["a", "b"]);
     }
 
-    #[test]
-    fn a_closed_tool_select_renders_without_the_custom_row() {
-        let closed = PromptRequest {
-            closed: true,
-            ..request(PromptAction::Select, Some("x"))
-        };
-        assert_eq!(InquirePrompter::select_options(&closed), closed.options);
-    }
-
     /// Which widget a closed select gets depends on who asks: a command
     /// menu takes inquire's bare select, a tool keeps the REPL styling
     /// its selects always had. Pinned on the source, since the widget

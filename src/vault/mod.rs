@@ -440,6 +440,7 @@ mod tests {
         ]);
 
         store.vault.add_secret("tui-entered", &prompter).unwrap();
+        assert!(store.has_secrets_file());
         assert_eq!(
             store.vault.get_secret("tui-entered", false).unwrap(),
             "s3cret"
