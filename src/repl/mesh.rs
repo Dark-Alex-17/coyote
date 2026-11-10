@@ -80,7 +80,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// (group, one-line summary), in `.mesh help` order.
-pub(super) const GROUPS: &[(&str, &str)] = &[
+pub(crate) const GROUPS: &[(&str, &str)] = &[
     (
         "people",
         "See the nodes heard on the mesh and what one of them is doing",

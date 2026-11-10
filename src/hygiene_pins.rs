@@ -12,6 +12,9 @@
 //! after its dash so a lowercase repository name sharing the prefix is not a citation. The
 //! spec draft id, the wire-spec id and the plan docs directory are matched on the raw
 //! comment text; every other needle sees quotes and code spans removed.
+//!
+//! One more pin reads the string literals of every tracked Rust file under `src/` and
+//! `tests/` and holds each `.mesh` path they spell to the mesh command table.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
@@ -234,10 +237,22 @@ fn char_or_lifetime_len(source: &str, at: usize) -> usize {
     }
 }
 
-/// Text inside line and block comments, without the `//`, `///`, `//!`, `/*`, `*/`
-/// markers. String, raw string and char literals are tracked across lines so a `//` or
-/// `/*` inside one is not a comment; `#[doc = "..."]` is a string.
 fn rust_comment_lines(source: &str) -> Vec<(usize, String)> {
+    rust_text(source).comments
+}
+
+/// The comment text and the string literal bodies of a Rust source, each keyed by the
+/// 1-based line it starts on.
+struct RustText {
+    comments: Vec<(usize, String)>,
+    literals: Vec<(usize, String)>,
+}
+
+/// Comments come without the `//`, `///`, `//!`, `/*`, `*/` markers. String, raw string
+/// and char literals are tracked across lines so a `//` or `/*` inside one is not a
+/// comment; `#[doc = "..."]` is a string. A literal body is the source text between its
+/// quotes, escapes left as written.
+fn rust_text(source: &str) -> RustText {
     enum State {
         Code,
         Str,
@@ -246,9 +261,11 @@ fn rust_comment_lines(source: &str) -> Vec<(usize, String)> {
     }
     let bytes = source.as_bytes();
     let mut out = Vec::new();
+    let mut literals = Vec::new();
     let mut state = State::Code;
     let mut line = 1;
     let mut block_start = 0;
+    let mut literal_start = (0, 0);
     let mut at = 0;
     while at < bytes.len() {
         let byte = bytes[at];
@@ -276,9 +293,11 @@ fn rust_comment_lines(source: &str) -> Vec<(usize, String)> {
                 } else if byte == b'"' {
                     state = State::Str;
                     at += 1;
+                    literal_start = (line, at);
                 } else if let Some((opener, hashes)) = raw_string_opener(bytes, at) {
                     state = State::RawStr(hashes);
                     at += opener;
+                    literal_start = (line, at);
                 } else if byte == b'\'' {
                     at += char_or_lifetime_len(source, at);
                 } else {
@@ -288,6 +307,7 @@ fn rust_comment_lines(source: &str) -> Vec<(usize, String)> {
             State::Str => match byte {
                 b'\\' if bytes.get(at + 1) != Some(&b'\n') => at += 2,
                 b'"' => {
+                    literals.push((literal_start.0, source[literal_start.1..at].to_string()));
                     state = State::Code;
                     at += 1;
                 }
@@ -297,6 +317,7 @@ fn rust_comment_lines(source: &str) -> Vec<(usize, String)> {
                 if byte == b'"'
                     && bytes[at + 1..].iter().take_while(|b| **b == b'#').count() >= hashes
                 {
+                    literals.push((literal_start.0, source[literal_start.1..at].to_string()));
                     state = State::Code;
                     at += 1 + hashes;
                 } else {
@@ -322,7 +343,10 @@ fn rust_comment_lines(source: &str) -> Vec<(usize, String)> {
             }
         }
     }
-    out
+    RustText {
+        comments: out,
+        literals,
+    }
 }
 
 /// Bytes consumed by a quoted string after its opening `quote`, closing quote included;
@@ -1311,5 +1335,211 @@ fn the_allow_list_is_the_three_dot_diff_minus_docs_and_examples() {
     assert!(
         missing.is_empty() && extra.is_empty(),
         "added on this branch but not allow-listed: {missing:?}\nallow-listed but not added on this branch: {extra:?}"
+    );
+}
+
+/// (file, path) pairs a string literal may spell although the `.mesh` table does not
+/// dispatch them: the tests that type a retired or unknown verb to assert the
+/// unknown-command error or its absence from the help, and the completer tests that type
+/// a partial word.
+const UNDISPATCHED_MESH_PATHS: &[(&str, &str)] = &[
+    ("src/repl/completer.rs", "access tr"),
+    ("src/repl/completer.rs", "he"),
+    ("src/repl/completer.rs", "mes"),
+    ("src/repl/completer.rs", "messaging se"),
+    ("src/repl/completer.rs", "pe"),
+    ("src/repl/completer.rs", "rep"),
+    ("src/repl/mesh.rs", "bogus"),
+    ("src/repl/mesh.rs", "files undeny"),
+    ("src/repl/mesh.rs", "reply"),
+    ("src/repl/mesh.rs", "undeny"),
+    ("tests/mesh_autostart_repl.rs", "reply"),
+];
+
+/// Words that follow the bare `.mesh` name in prose, as in the unknown-command error,
+/// rather than starting a path.
+const MESH_NAME_IN_PROSE: &[&str] = &["command"];
+
+/// Files that still spell `.mesh` paths from before the commands were grouped. This list
+/// only ever shrinks: a file comes off once its literals name the grouped paths, and the
+/// list must be empty once every file has moved. A listed file with no stale path left
+/// fails the pin, and `src/repl/mesh.rs` never belongs here.
+const STALE_MESH_PATH_FILES: &[&str] = &[
+    "src/config/macro_policy.rs",
+    "src/config/macros.rs",
+    "src/config/request_context.rs",
+    "src/mesh/envoy_sessions.rs",
+    "src/mesh/message.rs",
+    "src/mesh/pending.rs",
+    "src/mesh/trust.rs",
+    "src/render/markdown.rs",
+    "src/render/mod.rs",
+    "src/repl/mod.rs",
+    "tests/macro_bracketing.rs",
+    "tests/mesh_autostart_repl.rs",
+    "tests/mesh_wiki_docs.rs",
+    "tests/propagation_node_image.rs",
+];
+
+const MESH_TABLE_FILE: &str = "src/repl/mesh.rs";
+
+fn is_mesh_group(word: &str) -> bool {
+    crate::repl::mesh::GROUPS
+        .iter()
+        .any(|(group, _)| *group == word)
+}
+
+/// Each `.mesh` or `/mesh` command a string literal spells, as (line offset into the
+/// literal, sigil, path): the sigil stands at a token boundary the way
+/// `CommandPrefix::render_hints` reads one, or after a `\n` or `\t` escape. The path is
+/// one lowercase word, plus the next when the first names a group and a single space
+/// separates them; the words after a top-level verb are its arguments.
+fn mesh_paths(literal: &str) -> Vec<(usize, char, String)> {
+    let word_len = |text: &str| {
+        text.find(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+            .unwrap_or(text.len())
+    };
+    let mut out = Vec::new();
+    for (at, _) in literal.match_indices("mesh ") {
+        let Some(sigil_at) = at.checked_sub(1) else {
+            continue;
+        };
+        let sigil = char::from(literal.as_bytes()[sigil_at]);
+        let before = &literal[..sigil_at];
+        let at_boundary = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '('))
+            || before.ends_with("\\n")
+            || before.ends_with("\\t");
+        if !matches!(sigil, '.' | '/') || !at_boundary {
+            continue;
+        }
+        let rest = &literal[at + "mesh ".len()..];
+        let first = word_len(rest);
+        if first == 0 {
+            continue;
+        }
+        let mut path = rest[..first].to_string();
+        if let Some(tail) = rest[first..].strip_prefix(' ')
+            && is_mesh_group(&path)
+        {
+            let second = word_len(tail);
+            if second > 0 {
+                path.push(' ');
+                path.push_str(&tail[..second]);
+            }
+        }
+        out.push((before.matches('\n').count(), sigil, path));
+    }
+    out
+}
+
+/// Whether the `.mesh` table dispatches `path`: a top-level verb, a group, or a group and
+/// one of its verbs.
+fn mesh_table_dispatches(path: &str) -> bool {
+    let has_row = |group: &str, verb: &str| {
+        crate::repl::mesh::COMMANDS
+            .iter()
+            .any(|row| row.0 == group && row.1 == verb)
+    };
+    match path.split_once(' ') {
+        Some((group, verb)) => is_mesh_group(group) && has_row(group, verb),
+        None => is_mesh_group(path) || has_row("", path),
+    }
+}
+
+#[test]
+fn mesh_path_scanner_reads_paths_at_token_boundaries() {
+    let sigil = |c: char| [c.to_string(), "mesh".to_string()].concat();
+    let dot = sigil('.');
+    let slash = sigil('/');
+    let literal = format!(
+        "Run `{dot} people list`, ({slash} status alice)\\n{dot} config\n\"{dot} on\" x{dot} off src{slash} people {dot} Files {dot} undeny docs {dot}"
+    );
+    assert_eq!(
+        mesh_paths(&literal),
+        [
+            (0, '.', "people list".to_string()),
+            (0, '/', "status".to_string()),
+            (0, '.', "config".to_string()),
+            (1, '.', "on".to_string()),
+            (1, '.', "undeny".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn mesh_table_dispatches_groups_their_verbs_and_top_level_verbs_only() {
+    for path in ["status", "people", "people list", "on", "help"] {
+        assert!(mesh_table_dispatches(path), "{path}");
+    }
+    for path in [
+        "peers",
+        "people lst",
+        "people on",
+        "rotate",
+        "status people",
+    ] {
+        assert!(!mesh_table_dispatches(path), "{path}");
+    }
+}
+
+/// Every `.mesh` or `/mesh` path spelled in a string literal of a tracked Rust file under
+/// `src/` or `tests/` is one the table dispatches, so a hint cannot name a command that
+/// would answer with the unknown-command error.
+#[test]
+fn every_mesh_path_a_string_literal_spells_is_dispatched() {
+    assert!(
+        !STALE_MESH_PATH_FILES.contains(&MESH_TABLE_FILE),
+        "{MESH_TABLE_FILE} carries the table and may not hold a stale path"
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut hits = Vec::new();
+    let mut stale: BTreeMap<&str, usize> = STALE_MESH_PATH_FILES
+        .iter()
+        .map(|file| (*file, 0))
+        .collect();
+    let mut allowed_seen = BTreeSet::new();
+    for file in tracked_paths(root) {
+        if !(file.starts_with("src/") || file.starts_with("tests/")) || !file.ends_with(".rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(root.join(&file))
+            .unwrap_or_else(|e| panic!("read {file}: {e}"));
+        for (line, literal) in rust_text(&source).literals {
+            for (offset, sigil, path) in mesh_paths(&literal) {
+                if mesh_table_dispatches(&path) || MESH_NAME_IN_PROSE.contains(&path.as_str()) {
+                    continue;
+                }
+                if let Some(entry) = UNDISPATCHED_MESH_PATHS
+                    .iter()
+                    .find(|(listed, spelled)| *listed == file && *spelled == path)
+                {
+                    allowed_seen.insert(*entry);
+                } else if let Some(count) = stale.get_mut(file.as_str()) {
+                    *count += 1;
+                } else {
+                    hits.push(format!("{file}:{}: {sigil}mesh {path}", line + offset));
+                }
+            }
+        }
+    }
+    for (file, count) in &stale {
+        println!("{file}: {count} stale path(s)");
+    }
+    let rotted: Vec<&&str> = stale
+        .iter()
+        .filter_map(|(file, count)| (*count == 0).then_some(file))
+        .collect();
+    let unused: Vec<&(&str, &str)> = UNDISPATCHED_MESH_PATHS
+        .iter()
+        .filter(|entry| !allowed_seen.contains(*entry))
+        .collect();
+    assert!(
+        hits.is_empty() && rotted.is_empty() && unused.is_empty(),
+        "{} path(s) the mesh command table does not dispatch:\n{}\nstale-path files with no stale path left: {rotted:?}\nallowed paths no literal spells: {unused:?}",
+        hits.len(),
+        hits.join("\n")
     );
 }
