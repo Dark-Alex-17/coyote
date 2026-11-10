@@ -1531,6 +1531,24 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_supports_structured_output() {
+        let key = "supports_structured_output: true";
+        let example = include_str!("../../config.example.yaml");
+        assert!(CONFIG_TEMPLATE.contains(&format!("\n#       {key}")));
+        assert!(example.contains(&format!("\n  #       {key}")));
+        let documented = |text: &str| {
+            text.lines()
+                .find(|line| line.contains(key))
+                .unwrap()
+                .trim()
+                .trim_start_matches('#')
+                .trim()
+                .to_string()
+        };
+        assert_eq!(documented(CONFIG_TEMPLATE), documented(example));
+    }
+
+    #[test]
     fn config_template_documents_memory_cap_as_enforced() {
         let facts_default = format!("null = {}", memory::DEFAULT_MEMORY_FACTS_CAP);
         let drill_default = format!("null = {}", memory::DEFAULT_MEMORY_DRILL_CAP);
