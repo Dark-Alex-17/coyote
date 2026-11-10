@@ -4250,3 +4250,377 @@ fn update_with_a_piped_stdout_and_a_tty_on_stdin_is_refused_in_the_shared_shape(
     );
     assert_tty_restored(&on_tty);
 }
+
+// ---------------------------------------------------------------------------
+// The REPL deltas seen from the real binary (a tool's list question
+// keeps its arrow help and loses only the custom row;
+// the asset-overwrite warning is an Enter-answered confirm; a blank
+// required agent variable is re-asked with its reason), and the tty-less
+// `.rag` with no name that refuses before it touches the temp rag.
+// ---------------------------------------------------------------------------
+
+/// A tool that asks the human to pick one of three entries through the
+/// prompt helpers' `list` and records the index it got back.
+const RECORDING_LIST_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user to pick one entry and record the index.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   v=\"$(list \"Pick one entry q7l-q\" alpha-q7l beta-q7l gamma-q7l)\"\n\
+    \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
+    \x20   echo \"fixture picked: ${v:-cancelled} q7l-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// The scripted model: one call of the list tool, then a closing line.
+fn list_tool_turn(dir: &Path) -> (FakeLlm, PathBuf) {
+    let out = dir.join("list-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_list_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture done q7l".to_string()),
+    ]);
+    write_fake_llm_config(dir, &fake);
+    write_tool(dir, "fixture_list_rec.sh", RECORDING_LIST_TOOL);
+    (fake, out)
+}
+
+/// A tool's `list` question in the plain REPL is the inquire select it
+/// always was, minus the dead `Other (custom)` row: the three entries
+/// are listed under the question with the `to move, enter to select`
+/// help, a typed letter does not filter the list (Down then Enter still
+/// lands on the second entry, not on the only one starting with that
+/// letter), the index flows back to the tool and the turn completes.
+#[test]
+#[serial]
+fn a_tools_list_question_in_the_plain_repl_is_a_closed_select_keeping_the_arrow_help() {
+    let dir = fresh_config_dir("tool-list-repl");
+    let _guard = TempDirGuard(dir.clone());
+    let (fake, out) = list_tool_turn(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let asked_at = pty.raw().len();
+    pty.send(b"call the list tool\r").unwrap();
+    pty.wait_for_after("q7l-q", asked_at, PTY_DEADLINE)
+        .expect("the tool's list question never reached the terminal");
+    pty.wait_for_after("gamma-q7l", asked_at, PTY_DEADLINE)
+        .expect("the last entry of the list never reached the terminal");
+    pty.read_for(Duration::from_millis(500));
+    let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+    for entry in ["alpha-q7l", "beta-q7l", "gamma-q7l"] {
+        assert!(
+            asked.contains(entry),
+            "the list question does not offer `{entry}`:\n{asked}"
+        );
+    }
+    assert!(
+        !asked.contains("Other (custom)"),
+        "a tool's list question still offers the free-text row:\n{asked}"
+    );
+    assert!(
+        asked.contains("to move, enter to select"),
+        "the tool's list question lost its arrow help:\n{asked}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{asked}"
+    );
+
+    // `g` would narrow a filtering select to `gamma-q7l`; here it is
+    // ignored, so Down then Enter picks the second entry.
+    pty.send(b"g").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\x1b[B").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "Down then Enter on the list did not reach the tool as the second entry (a typed \
+         letter must not filter the list):\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The same tool's `list` question under the UI is the Select modal with
+/// exactly the tool's entries (no `Other (custom)` row), the terminal is
+/// never released, Down then Enter answers it with the second entry and
+/// the index flows back to the tool.
+#[test]
+#[serial]
+fn a_tools_list_question_under_the_ui_is_a_closed_select_modal_without_the_custom_row() {
+    let dir = fresh_config_dir("tool-list-modal");
+    let _guard = TempDirGuard(dir.clone());
+    let (fake, out) = list_tool_turn(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let asked_at = pty.raw().len();
+    pty.send(b"call the list tool\r").unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        asked_at,
+        "the list tool",
+        &[
+            "q7l-q",
+            "alpha-q7l",
+            "beta-q7l",
+            "gamma-q7l",
+            "Up/Down=move",
+        ],
+    );
+    assert!(
+        !modal.contains("Other (custom)"),
+        "the Select modal of a tool's list question offers the free-text row:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b[B").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "Down then Enter on the Select modal did not reach the tool as the second entry:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `.install <category>` in the plain REPL: the overwrite warning is
+/// followed by the inquire `Continue? (y/N)` confirm, which Enter
+/// answers - a bare `y` on its own does nothing until Enter follows
+/// (the single-key `[y/N]` read is gone), and a bare Enter takes the
+/// `No` default: `Aborted. No files were changed.` and the category
+/// directory is untouched.
+#[test]
+#[serial]
+fn dot_install_of_a_builtin_category_in_the_plain_repl_confirms_on_enter_not_on_a_bare_key() {
+    let dir = fresh_config_dir("install-builtins-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let macros_dir = dir.join("macros");
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    // The built-in macros are seeded on startup; the question must not
+    // touch them from here on.
+    let files_before = walk(&macros_dir);
+    let before = pty.raw().len();
+    pty.send(b".install macros\r").unwrap();
+    pty.wait_for_after("Continue?", before, PTY_DEADLINE)
+        .expect("`.install macros` in the plain REPL did not ask `Continue?`");
+    pty.read_for(Duration::from_millis(500));
+    let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    assert!(
+        asked.contains("(y/N)"),
+        "the `Continue?` question is not the inquire confirm with its `(y/N)` legend:\n{asked}"
+    );
+
+    // A bare `y` is typed, not acted on.
+    pty.send(b"y").unwrap();
+    let after_y = pty.read_for(Duration::from_millis(1500));
+    let flat = squeezed(&strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..])));
+    assert!(
+        !flat.contains("Aborted") && !flat.contains("Installed") && !flat.contains("Reinstalled"),
+        "a bare `y` without Enter already settled the `Continue?` question:\n{after_y}"
+    );
+    assert_eq!(
+        walk(&macros_dir),
+        files_before,
+        "a bare `y` without Enter already changed the macros directory"
+    );
+
+    // Backspace takes the `y` back; Enter then answers with the default.
+    pty.send(b"\x7f").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    let settled = wait_for_squeezed(
+        &mut pty,
+        "No files were changed",
+        "the plain REPL's answer to Enter on `Continue?`",
+    );
+    assert!(
+        squeezed(&settled).contains("Continue?No"),
+        "Enter on the confirm did not take the `No` default:\n{settled}"
+    );
+    assert_eq!(
+        walk(&macros_dir),
+        files_before,
+        "the declined reinstall changed the macros directory"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{settled}"
+    );
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// An agent whose `username` variable has no default, so starting it asks
+/// for the value.
+fn write_agent_with_a_required_variable(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!(
+            "name: {name}\n\
+             description: an agent with a variable\n\
+             version: 0.1.0\n\
+             instructions: |\n\
+             \x20 You are an assistant for {{{{username}}}}. Reply briefly.\n\
+             variables:\n\
+             \x20 - name: username\n\
+             \x20   description: Your user name\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// `.agent <name>` in the plain REPL for an agent whose variable has no
+/// default: a blank Enter is re-asked with the reason as a sentence
+/// (`This field is required.`) instead of being taken, the next answer
+/// is taken, and `.info agent` carries it.
+#[test]
+#[serial]
+fn dot_agent_needing_a_variable_in_the_plain_repl_reasks_a_blank_answer_with_the_reason() {
+    let dir = fresh_config_dir("agent-variable-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    write_agent_with_a_required_variable(&dir, "vars-agent-p3r");
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b".agent vars-agent-p3r\r").unwrap();
+    pty.wait_for_after("username", before, PTY_DEADLINE)
+        .expect("`.agent` with an unset variable did not ask for it in the plain REPL");
+    pty.read_for(Duration::from_millis(500));
+
+    pty.send(b"\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let reasked = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        if since.contains("This field is required.") && since.matches("username").count() >= 2 {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a blank required variable was not re-asked with `This field is required.`:\n{since}"
+        );
+    };
+    assert!(
+        !squeezed(&reasked).contains("config_file"),
+        "the blank answer was taken and the agent started:\n{reasked}"
+    );
+    pty.read_for(Duration::from_millis(300));
+
+    pty.send(b"typed-user-p3r\r").unwrap();
+    // The prompt comes back carrying the agent's name.
+    pty.wait_for_after("vars-agent-p3r>>", before, PTY_DEADLINE)
+        .expect("the prompt did not come back after the variable was answered");
+    pty.read_for(Duration::from_millis(300));
+    let info_at = pty.raw().len();
+    pty.send(b".info agent\r").unwrap();
+    pty.wait_for_after("config_file", info_at, PTY_DEADLINE)
+        .expect("`.info agent` never rendered after the variable was answered");
+    pty.read_for(Duration::from_millis(800));
+    let info = squeezed(&strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..])));
+    assert!(
+        info.contains("username:typed-user-p3r"),
+        "`.info agent` does not carry the value typed after the re-ask:\n{info}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{info}"
+    );
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A bare `.rag` with no terminal, while a previous temp rag is on disk:
+/// the step is refused in the shared shape naming `temp` BEFORE the temp
+/// rag is removed, so the file and its contents are still there
+/// afterwards, nothing new is written and the macro does not go on.
+#[test]
+#[serial]
+fn a_tty_less_bare_dot_rag_is_refused_before_the_temp_rag_is_removed() {
+    let dir = fresh_config_dir("ttyless-rag-temp");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros").join("bare-rag.yaml"),
+        "isolated: false\nsteps:\n  - \".rag\"\n  - \".info\"\n",
+    )
+    .unwrap();
+    let rags = dir.join("rags");
+    fs::create_dir_all(&rags).unwrap();
+    let temp_rag = rags.join("temp.yaml");
+    let seeded = "embedding_model: dryrun:dry-embed-a\nchunk_size: 1000\nchunk_overlap: 50\ndocument_paths: []\nfiles: []\nmarker: temp-rag-seeded-p3t\n";
+    fs::write(&temp_rag, seeded).unwrap();
+    let files_before = walk(&dir);
+
+    let (ok, out) = run_ttyless(&dir, &["--macro", "bare-rag"], "tty-less bare .rag");
+    assert!(!ok, "a refused tty-less bare `.rag` exited 0:\n{out}");
+    let (action, _remedy) = refusal_shape(&out).unwrap_or_else(|| {
+        panic!("the refusal is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{out}")
+    });
+    assert!(
+        action.contains("'temp'"),
+        "the refusal does not name the temp rag it would have initialized: {action:?}\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(&temp_rag).ok().as_deref(),
+        Some(seeded),
+        "the refused tty-less `.rag` removed or rewrote the temp rag first:\n{out}"
+    );
+    // The first run seeds the built-in assets; only the rag directory is
+    // what the refused step could have written to.
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "the refused tty-less `.rag` still wrote {written:?}:\n{out}"
+    );
+    assert!(
+        !out.contains("log_path"),
+        "the macro went on to `.info` after the refused `.rag`:\n{out}"
+    );
+}
