@@ -309,7 +309,7 @@ sync_models_ttl_hours: 24        # Hours before the synced model catalog is cons
 #       max_input_tokens: 100000
 #       supports_vision: true
 #       supports_function_calling: true
-#       supports_structured_output: true            # Send graph output_schema natively to the provider
+#       supports_structured_output: true            # Send graph JSON schemas (output_schema, routing, extraction) natively when the client supports it
 #     - name: xxxx                                  # Embedding model
 #       type: embedding
 #       default_chunk_size: 1500
