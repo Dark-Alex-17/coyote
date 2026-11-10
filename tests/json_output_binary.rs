@@ -923,3 +923,108 @@ fn a_think_block_in_the_middle_of_the_graph_output_is_stripped_too() {
     );
     assert_turns_match_requests(&report, &model, 1);
 }
+
+// ---- late graph failures, think blocks, graph without a prompt ----
+
+const SECOND_MARKER: &str = "SECOND-MARKER";
+
+/// On the graph path the first llm node succeeds and the second gets a
+/// provider 500. Both attempted calls count, only the succeeded one adds
+/// usage, and the unpriced succeeded call leaves the cost unknown.
+#[test]
+fn a_graph_failing_after_a_succeeded_node_counts_both_calls_and_one_usage() {
+    let dir = TempDir::new("graph-late-500");
+    let model = ScriptedModel::answering(|request, _| {
+        if mentions(request, SECOND_MARKER) {
+            Reply::Status(
+                500,
+                json!({ "error": { "message": "stub exploded", "type": "server_error" } }),
+            )
+        } else {
+            Reply::Text("first done".into())
+        }
+    });
+    write_config(&dir.0, model.port, false, true);
+    write_graph_agent(
+        &dir.0,
+        "late-fail-graph",
+        &format!(
+            "name: late-fail-graph\n\
+             version: \"1.0\"\n\
+             description: Two llm nodes, the second fails.\n\
+             initial_state: {{ first: \"\", second: \"\" }}\n\
+             start: one\n\
+             nodes:\n\
+             \x20 one: {{ type: llm, prompt: \"{{{{initial_prompt}}}}\", state_updates: {{ first: \"{{{{output}}}}\" }}, next: two }}\n\
+             \x20 two: {{ type: llm, prompt: \"{SECOND_MARKER} {{{{first}}}}\", state_updates: {{ second: \"{{{{output}}}}\" }}, next: done }}\n\
+             \x20 done: {{ type: end, output: \"{{{{second}}}}\" }}\n"
+        ),
+    );
+
+    let output = run(&dir.0, &["--json", "--agent", "late-fail-graph", "hi"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["is_error"], json!(true), "{report}");
+    assert_eq!(report["result"], Value::Null, "{report}");
+    assert!(report["error"].is_string(), "{report}");
+    assert_turns_match_requests(&report, &model, 2);
+    assert_usage_of(&report, 1);
+    assert_eq!(report["total_cost_usd"], Value::Null, "{report}");
+}
+
+/// On the streamed plain path every think block, wherever it sits,
+/// is dropped from `result`.
+#[test]
+fn every_think_block_is_stripped_from_a_streamed_plain_result() {
+    let dir = TempDir::new("think-stream");
+    let model = ScriptedModel::answering(|_, _| {
+        Reply::Text("<think>a\nb</think>\none <think>c</think> two".into())
+    });
+    write_config(&dir.0, model.port, true, false);
+
+    let output = run(&dir.0, &["--json", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(model.requests()[0]["stream"], json!(true), "{report}");
+    assert_eq!(report["result"], json!("one two"), "{report}");
+}
+
+/// Every think block is dropped on the graph path too, with several in the
+/// final output.
+#[test]
+fn every_think_block_is_stripped_from_a_graph_result() {
+    let dir = TempDir::new("graph-think-many");
+    let model = ScriptedModel::answering(|_, _| {
+        Reply::Text("<think>x</think>alpha <think>y</think>beta".into())
+    });
+    write_config(&dir.0, model.port, false, true);
+    write_one_llm_node_graph(&dir.0, "many-think-graph", "{{reply}}");
+
+    let output = run(&dir.0, &["--json", "--agent", "many-think-graph", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!("alpha beta"), "{report}");
+}
+
+/// `--json` with a graph agent and no prompt fails plainly before any call.
+#[test]
+fn a_graph_agent_without_a_prompt_fails_plainly_on_stderr() {
+    let dir = TempDir::new("graph-no-prompt");
+    let model = ScriptedModel::answering(|_, _| Reply::Text(REPLY.into()));
+    write_config(&dir.0, model.port, false, true);
+    write_one_llm_node_graph(&dir.0, "quiet-graph", "{{reply}}");
+
+    let output = run(&dir.0, &["--json", "--agent", "quiet-graph"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
+    assert!(output.stdout.is_empty(), "{}", combined(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--json requires a prompt"),
+        "{}",
+        combined(&output)
+    );
+    assert!(model.requests().is_empty());
+}

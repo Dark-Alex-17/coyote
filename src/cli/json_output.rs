@@ -32,7 +32,8 @@ pub struct JsonUsage {
 
 impl JsonResult {
     /// `outcome` is the final assistant text, or the rendered error. Every
-    /// `<think>` block is dropped from the text, wherever it appears.
+    /// `<think>` block is dropped from the text, wherever it appears, and
+    /// surrounding whitespace is trimmed.
     pub fn new(
         outcome: Result<String, String>,
         model: String,
