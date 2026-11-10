@@ -293,7 +293,7 @@ pub(crate) struct SyncSchedule {
 
 impl SyncSchedule {
     /// `interval_secs` of 0, or a node that does not announce, means fetch only on
-    /// `.mesh sync`: no request is accepted and no timer is armed
+    /// `.mesh messaging sync`: no request is accepted and no timer is armed
     /// (`propagation_sync_every`).
     pub(crate) fn new(interval_secs: u64, announce: bool) -> Self {
         Self {
@@ -539,7 +539,7 @@ fn synced_line(report: &FetchReport) -> String {
 }
 
 /// Why some of a sync's deferred messages wait on an announce and what to do next, shared
-/// by the idle sync line and `.mesh sync`.
+/// by the idle sync line and `.mesh messaging sync`.
 pub(crate) fn sync_ask_suffix(deferred: usize, deferred_after_ask: usize) -> Option<String> {
     if deferred_after_ask == 0 {
         return None;
@@ -1353,7 +1353,7 @@ mod tests {
             .expect("the first silence is said");
         assert_eq!(
             line,
-            "sync from 5e1e07ce failed: Propagation node 5e1e07ce did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced"
+            "sync from 5e1e07ce failed: Propagation node 5e1e07ce did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced"
         );
         assert_eq!(logged(&node), 1);
 
@@ -1492,7 +1492,7 @@ mod tests {
         assert_eq!(
             schedule.finished(&no_link, start).as_deref(),
             Some(
-                "sync from 11a7e0ff failed: Propagation node 11a7e0ff did not bring a link up within 10 s; it may be restarting or out of reach. The automatic sync retries every 60 s, or run .mesh sync again; .mesh info shows when it announces again"
+                "sync from 11a7e0ff failed: Propagation node 11a7e0ff did not bring a link up within 10 s; it may be restarting or out of reach. The automatic sync retries every 60 s, or run .mesh messaging sync again; .mesh config show shows when it announces again"
             )
         );
         for minute in 1..60 {

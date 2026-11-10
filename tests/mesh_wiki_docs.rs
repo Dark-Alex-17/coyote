@@ -4199,8 +4199,8 @@ fn mesh_sync_documents_a_propagation_node_that_does_not_answer_the_list_request(
         "the page says `60 s` of the fetch request timeout; reword it and this pin with it"
     );
     let lines = [
-        "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced",
-        "The link to propagation node {node} closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh sync tries again, and .mesh info shows when it last announced",
+        "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced",
+        "The link to propagation node {node} closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh messaging sync tries again, and .mesh config show shows when it last announced",
     ];
     for line in lines {
         assert!(

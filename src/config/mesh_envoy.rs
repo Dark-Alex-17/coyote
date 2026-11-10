@@ -77,7 +77,7 @@ pub(crate) const PROVIDER_REFUSAL_TEXT: &str = "the envoy declined to answer";
 /// Ends the owner's line when the provider refused or failed, since another model may
 /// answer where this one would not.
 const SWITCH_MODEL_NEXT_STEP: &str =
-    "; read it with .mesh inbox, or set mesh.envoy_model to another model";
+    "; read it with .mesh messaging inbox, or set mesh.envoy_model to another model";
 /// Closes the system tail only when the run resumes remembered turns; a fresh thread's
 /// prompt says nothing about memory.
 const RESUMED_THREAD_NOTE: &str = "The earlier exchanges in this thread hold earlier answers, which may be out of date: where they disagree with the session brief, the brief wins. Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
@@ -947,7 +947,7 @@ impl EnvoyRunner {
     /// The hold is taken before the question is filed, under the one lock `holds` and
     /// `answer` read, so a human who sees the question on file can always answer it
     /// through the live run. A question that cannot be filed (the mesh is off, or the id
-    /// is held open by another peer) is never advertised: `.mesh answer` would reach the
+    /// is held open by another peer) is never advertised: `.mesh envoy answer` would reach the
     /// wrong record. The peer is told last and only on the run's first escalation, with
     /// the send bounded by the run's cancellation and remaining ceiling, so the human's
     /// line and the hold are never delayed by a slow peer.
@@ -1083,7 +1083,7 @@ impl EnvoyRunner {
                 .frame("the envoy could not tell ")
                 .peer(card.who.as_str())
                 .frame(format!(
-                    " its question was escalated: {why}; `.mesh pending` still lists it for you to answer"
+                    " its question was escalated: {why}; `.mesh envoy questions` still lists it for you to answer"
                 )),
             model_note: None,
         });
@@ -1096,7 +1096,7 @@ impl EnvoyRunner {
     /// model's own final text is never sent, and `drive` reads a run that finished after
     /// taking the answer as that answer without classifying the text. An escalated question
     /// leaves the store only once the peer has heard its answer; an unsent one stays open
-    /// so `.mesh answer` can send it again. A run-time refusal of a stored message is
+    /// so `.mesh envoy answer` can send it again. A run-time refusal of a stored message is
     /// replied to once per identity, per reason, per hour, on the claim the accept-time
     /// refusals spend; one withheld here is still filed and surfaced, but nothing is sent
     /// and nothing is reported unsent.
@@ -1233,7 +1233,7 @@ impl EnvoyRunner {
             );
             let retry = if settles_question {
                 NoticeText::default()
-                    .frame("; the question stays open for `.mesh answer ")
+                    .frame("; the question stays open for `.mesh envoy answer ")
                     .peer(id.to_string())
                     .frame("`")
             } else {
@@ -1463,9 +1463,9 @@ fn strip_tool_tag(question: &str) -> &str {
 }
 
 /// The line the person at the keyboard sees for an escalated `question`: the peer's
-/// words cut for the line, then `(full text: .mesh pending)` when they were cut, then
+/// words cut for the line, then `(full text: .mesh envoy questions)` when they were cut, then
 /// the answer command with the whole `message_id`, whatever the question's length.
-/// `.mesh pending` is the surface: the record is filed there before this line prints,
+/// `.mesh envoy questions` is the surface: the record is filed there before this line prints,
 /// while the inbox copy lands only once the envoy run ends.
 /// The name and the question are peer runs, printed as the peer wrote them.
 pub(crate) fn escalation_line(who: &str, question: &str, message_id: &str) -> NoticeText {
@@ -1479,7 +1479,7 @@ pub(crate) fn escalation_line(who: &str, question: &str, message_id: &str) -> No
         .peer(who)
         .frame(" asks: ")
         .peer(words.text)
-        .frame(format!("{pointer}; answer with `.mesh answer "))
+        .frame(format!("{pointer}; answer with `.mesh envoy answer "))
         .peer(message_id)
         .frame(" \"<text>\"`")
 }
@@ -1499,7 +1499,7 @@ mod peer_text_prefix_tests {
         assert_eq!(
             lines,
             [
-                "[mesh:message] .info asks: can I read .vault? please .session list; answer with `/mesh answer q-1 \"<text>\"`"
+                "[mesh:message] .info asks: can I read .vault? please .session list; answer with `/mesh envoy answer q-1 \"<text>\"`"
             ]
         );
     }
@@ -1512,7 +1512,9 @@ mod peer_text_prefix_tests {
             .render_notification_lines(CommandPrefix::Slash);
         assert_eq!(
             lines,
-            ["[mesh:message] Bea asks: may I?; answer with `/mesh answer .session \"<text>\"`"]
+            [
+                "[mesh:message] Bea asks: may I?; answer with `/mesh envoy answer .session \"<text>\"`"
+            ]
         );
     }
 }
@@ -1971,7 +1973,7 @@ mod tests {
     fn the_escalation_line_keeps_the_whole_answer_command_past_a_long_question() {
         assert_eq!(
             escalation_line("alice", "Should we merge?", "msg-esc-1").plain(),
-            "alice asks: Should we merge?; answer with `.mesh answer msg-esc-1 \"<text>\"`"
+            "alice asks: Should we merge?; answer with `.mesh envoy answer msg-esc-1 \"<text>\"`"
         );
 
         // Eleven-letter words: character 160 falls inside the fourteenth word, so a cut
@@ -1991,10 +1993,10 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "alice asks: {kept}... (full text: .mesh pending); answer with `.mesh answer 0123456789abcdef0123456789abcdef \"<text>\"`"
+                "alice asks: {kept}... (full text: .mesh envoy questions); answer with `.mesh envoy answer 0123456789abcdef0123456789abcdef \"<text>\"`"
             )
         );
-        assert!(line.ends_with("`.mesh answer 0123456789abcdef0123456789abcdef \"<text>\"`"));
+        assert!(line.ends_with("`.mesh envoy answer 0123456789abcdef0123456789abcdef \"<text>\"`"));
     }
 
     #[test]
@@ -2622,7 +2624,7 @@ mod tests {
         assert!(
             idle.texts().iter().any(|text| {
                 text.contains("asks: Should we merge?")
-                    && text.contains("`.mesh answer msg-esc-1 \"<text>\"`")
+                    && text.contains("`.mesh envoy answer msg-esc-1 \"<text>\"`")
             }),
             "{:?}",
             idle.texts()
@@ -2642,7 +2644,7 @@ mod tests {
         app.mesh
             .deliver_peer(job(PeerKind::Ask, "msg-esc-2", "merge the other one").message);
         wait_until("the worker to take the next question", || {
-            idle.has("`.mesh answer msg-esc-2 \"<text>\"`")
+            idle.has("`.mesh envoy answer msg-esc-2 \"<text>\"`")
         })
         .await;
         runner.stop().await;
@@ -2690,10 +2692,10 @@ mod tests {
         assert_eq!(reply.kind, PeerKind::Reply);
         assert_eq!(reply.content, "yes, merge");
         // The mesh is off, so the reply never left: the question stays on file for a
-        // retry through `.mesh answer`.
+        // retry through `.mesh envoy answer`.
         assert!(store.get("msg-held").unwrap().is_some());
         assert!(
-            idle.has("could not be sent: mesh is off; the question stays open for `.mesh answer msg-held`"),
+            idle.has("could not be sent: mesh is off; the question stays open for `.mesh envoy answer msg-held`"),
             "{:?}",
             idle.texts()
         );
@@ -3044,7 +3046,7 @@ mod tests {
 
     /// A held escalation whose wait lapses sends the escalation message (the peer is told
     /// there is no answer yet), the run ends, and the question stays open in the inbound store
-    /// so a late `.mesh answer` can still route it. The dead run must not be able to take
+    /// so a late `.mesh envoy answer` can still route it. The dead run must not be able to take
     /// that late answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -3235,7 +3237,7 @@ mod tests {
     }
 
     /// The escalation shape after a hold is cut short: the leader is told the envoy
-    /// escalated and to wait for `.mesh answer`, no "timed out" or "interrupted" line
+    /// escalated and to wait for `.mesh envoy answer`, no "timed out" or "interrupted" line
     /// appears, and the question stays filed.
     fn assert_escalation_shape(app: &AppState, idle: &RecordingIdleSink, store: &InboundStore) {
         assert_eq!(
@@ -3249,7 +3251,7 @@ mod tests {
         let notes = app.mesh.take_model_notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
-            notes[0].next_action.contains(".mesh answer msg-held"),
+            notes[0].next_action.contains(".mesh envoy answer msg-held"),
             "{}",
             notes[0].next_action
         );
@@ -3347,7 +3349,7 @@ mod tests {
     /// `in_reply_to` at ITS destination; an escalated question gets an `escalated`
     /// `Reply` the moment it goes to the human, while the run is still held, and is
     /// then followed by a `Message` naming the question once the hold lapses, so the
-    /// asker's correlation stays open; and the human's late `.mesh answer` (via
+    /// asker's correlation stays open; and the human's late `.mesh envoy answer` (via
     /// `answer_inbound`, the routing seam) reaches the same peer as the correlated
     /// `answered` `Reply` without any live run.
     #[cfg(unix)]
@@ -3442,7 +3444,7 @@ mod tests {
         assert!(runner.holds("live-2"));
         assert!(store.get("live-2").unwrap().is_some());
         wait_until("the human to be told", || {
-            idle.has("`.mesh answer live-2 \"<text>\"`")
+            idle.has("`.mesh envoy answer live-2 \"<text>\"`")
         })
         .await;
         assert!(!idle.has("could not tell"), "{:?}", idle.texts());
@@ -3781,7 +3783,7 @@ mod tests {
         })
         .await;
         wait_until("the human to be told", || {
-            idle.has("`.mesh answer live-held \"<text>\"`")
+            idle.has("`.mesh envoy answer live-held \"<text>\"`")
         })
         .await;
         assert_escalated_notice(&link.heard_for("live-held")[0], "live-held");
@@ -3867,7 +3869,7 @@ mod tests {
             })
             .await;
             wait_until("the human to be told", || {
-                idle.has("`.mesh answer in-hold \"<text>\"`")
+                idle.has("`.mesh envoy answer in-hold \"<text>\"`")
             })
             .await;
             assert!(runner.holds("in-hold"));
@@ -4143,7 +4145,9 @@ mod tests {
         let texts = refused_escalation(&app, "msg-x").await;
 
         assert!(
-            !texts.iter().any(|text| text.contains(".mesh answer msg-x")),
+            !texts
+                .iter()
+                .any(|text| text.contains(".mesh envoy answer msg-x")),
             "{texts:?}"
         );
         assert!(
@@ -4197,7 +4201,7 @@ mod tests {
         app.mesh
             .deliver_peer(job(PeerKind::Ask, "msg-x", "merge the branch").message);
         wait_until("the escalation to be advertised", || {
-            idle.has("`.mesh answer msg-x \"<text>\"`")
+            idle.has("`.mesh envoy answer msg-x \"<text>\"`")
         })
         .await;
         runner.stop().await;
@@ -4231,7 +4235,7 @@ mod tests {
             .position(|note| {
                 note.text
                     .plain()
-                    .contains("`.mesh answer msg-x \"<text>\"`")
+                    .contains("`.mesh envoy answer msg-x \"<text>\"`")
             })
             .unwrap();
         assert!(expired_at < advertised_at, "{pushed:?}");
@@ -4252,7 +4256,7 @@ mod tests {
         assert!(
             !texts
                 .iter()
-                .any(|text| text.contains(".mesh answer msg-off")),
+                .any(|text| text.contains(".mesh envoy answer msg-off")),
             "{texts:?}"
         );
         assert!(
@@ -4330,7 +4334,7 @@ mod tests {
 
         assert!(store.get("msg-unsent").unwrap().is_some());
         assert!(
-            idle.has("could not be sent: mesh is off; the question stays open for `.mesh answer msg-unsent`"),
+            idle.has("could not be sent: mesh is off; the question stays open for `.mesh envoy answer msg-unsent`"),
             "{:?}",
             idle.texts()
         );
@@ -6508,7 +6512,7 @@ mod tests {
             assert_eq!(
                 line,
                 &format!(
-                    "envoy declined (provider refusal: cyber); {} asks: how do I scan a port? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    "envoy declined (provider refusal: cyber); {} asks: how do I scan a port? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
                     sender8()
                 )
             );
@@ -6545,7 +6549,7 @@ mod tests {
             assert_eq!(
                 failed[0],
                 &format!(
-                    "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
                     sender8()
                 )
             );
@@ -6579,7 +6583,7 @@ mod tests {
             assert_eq!(
                 line,
                 &format!(
-                    "envoy failed: the provider sent a reply the envoy could not read; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    "envoy failed: the provider sent a reply the envoy could not read; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
                     sender8()
                 )
             );
@@ -7227,7 +7231,7 @@ mod tests {
         app.mesh
             .deliver_peer(job(PeerKind::Ask, "live-untold", "merge the branch").message);
         wait_until("the human to be told", || {
-            idle.has("`.mesh answer live-untold \"<text>\"`")
+            idle.has("`.mesh envoy answer live-untold \"<text>\"`")
         })
         .await;
         wait_until("the human to hear the notice failed", || {
@@ -7245,7 +7249,7 @@ mod tests {
             idle.texts().iter().any(|text| {
                 text.contains("could not tell")
                     && text.contains("its question was escalated")
-                    && text.ends_with("; `.mesh pending` still lists it for you to answer")
+                    && text.ends_with("; `.mesh envoy questions` still lists it for you to answer")
             }),
             "{:?}",
             idle.texts()
@@ -7264,12 +7268,12 @@ mod tests {
         runner.stop().await;
         assert!(!runner.holds("live-untold"));
         // The final reply could not reach the peer either, so the question stays on
-        // file for a later `.mesh answer` and the human is told so.
+        // file for a later `.mesh envoy answer` and the human is told so.
         assert!(store.get("live-untold").unwrap().is_some());
         assert!(
             idle.texts().iter().any(|text| {
                 text.contains("could not be sent")
-                    && text.contains("stays open for `.mesh answer live-untold`")
+                    && text.contains("stays open for `.mesh envoy answer live-untold`")
             }),
             "{:?}",
             idle.texts()
@@ -7328,7 +7332,7 @@ mod tests {
         assert_eq!(heard[0].content, "this node cannot answer right now");
         assert!(!runner.holds("live-x"));
         assert!(
-            !idle.has("`.mesh answer live-x \"<text>\"`"),
+            !idle.has("`.mesh envoy answer live-x \"<text>\"`"),
             "{:?}",
             idle.texts()
         );
@@ -7536,7 +7540,7 @@ mod tests {
     /// The human is told and the hold armed before the peer hears `escalated`: with a
     /// peer that takes the notice but never acknowledges it, the "asks:" line, the hold
     /// and the filed question are all there long before the stalled send could have
-    /// ended, and `.mesh answer` given while the notice is still in flight is taken; once
+    /// ended, and `.mesh envoy answer` given while the notice is still in flight is taken; once
     /// the peer comes round it hears the notice and then the human's answer, in that
     /// order, and the human never hears the notice failed.
     #[cfg(unix)]
@@ -7631,7 +7635,7 @@ mod tests {
     /// the stalled send would have timed out, and the run ends as the escalation an
     /// escalated run always is, with the question still on file and no "interrupted"
     /// line; once the peer comes round it hears the escalation `Message`, and the human's
-    /// late `.mesh answer` still reaches it and closes the question.
+    /// late `.mesh envoy answer` still reaches it and closes the question.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -8145,7 +8149,7 @@ mod tests {
         assert!(
             idle.texts().iter().any(|text| {
                 text.contains("could not be sent")
-                    && text.contains("stays open for `.mesh answer failed-hook`")
+                    && text.contains("stays open for `.mesh envoy answer failed-hook`")
             }),
             "{:?}",
             idle.texts()
@@ -8270,7 +8274,7 @@ mod tests {
     /// Two real nodes through a relay. Node A is the asking peer and drives `mesh__ask`,
     /// `mesh__collect` and `mesh__check_inbox` through `handle_mesh_tool`, exactly as a
     /// model does; node B is the answering node, whose envoy runs on `app_b`. Each trusts
-    /// the other's destination the way `.mesh trust` does.
+    /// the other's destination the way `.mesh access trust` does.
     #[cfg(unix)]
     struct AskingPeer {
         relay: TransportRelay,
@@ -8455,7 +8459,7 @@ mod tests {
     /// lists the id as escalated and carries the notice itself as a bare `escalated`
     /// reply in the question's thread (replies always take the inbox path too), and a
     /// second collect says `escalated` again at once;
-    /// then the human's `.mesh answer` on node B, given while the run still holds the
+    /// then the human's `.mesh envoy answer` on node B, given while the run still holds the
     /// question, reaches the asker as `replied` with `disposition: answered` carrying the
     /// envoy's words, no `retry_after`, and closes the question.
     #[cfg(unix)]
@@ -8499,7 +8503,7 @@ mod tests {
         assert!(runner.holds(&id));
         assert!(store_b.get(&id).unwrap().is_some());
         wait_until("the human on B to be told", || {
-            idle_b.has(&format!("`.mesh answer {id} \"<text>\"`"))
+            idle_b.has(&format!("`.mesh envoy answer {id} \"<text>\"`"))
         })
         .await;
         // The collect wakes on the correlation before the notice is filed in the
@@ -8555,7 +8559,7 @@ mod tests {
     /// Node B is restarted between the escalation and the human's answer. The new node
     /// knows A only from the peer table it read back from disk; its transport has heard
     /// no announce from A, and A does not announce again (its next heartbeat is an hour
-    /// away). `.mesh answer` still reaches A: B asks the network for a route, the relay
+    /// away). `.mesh envoy answer` still reaches A: B asks the network for a route, the relay
     /// answers from its path table, and the reply goes over a link.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8670,7 +8674,7 @@ mod tests {
         assert!(runner.holds(&id));
         assert!(store_b.get(&id).unwrap().is_some());
         wait_until("the human on B to be told", || {
-            idle_b.has(&format!("`.mesh answer {id} \"<text>\"`"))
+            idle_b.has(&format!("`.mesh envoy answer {id} \"<text>\"`"))
         })
         .await;
         wait_until("the notice to reach A's inbox", || {
@@ -8709,8 +8713,8 @@ mod tests {
 
     /// The human's access decisions take the same road as the answer: A asks B for two
     /// paths, B files both as pending, B is restarted and knows A only from the persisted
-    /// peer table (no announce heard, A does not announce again). `.mesh refuse` on the
-    /// first and a one-off `.mesh grant` on the second both reach A over a direct link
+    /// peer table (no announce heard, A does not announce again). `.mesh files refuse` on the
+    /// first and a one-off `.mesh files grant` on the second both reach A over a direct link
     /// (nothing falls back to store-and-forward), each as the fenced `{"access": ...}`
     /// decision the asker collects, the pending records are closed, and A's row keeps the
     /// `last_seen` the restart read back: the path responses were not sightings.
@@ -8925,7 +8929,7 @@ mod tests {
         assert!(!runner.holds(&id));
         assert!(store_b.get(&id).unwrap().is_none(), "nothing filed on B");
         assert!(
-            !idle_b.has(".mesh answer"),
+            !idle_b.has(".mesh envoy answer"),
             "no line for B's human: {:?}",
             idle_b.texts()
         );

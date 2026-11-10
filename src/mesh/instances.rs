@@ -128,14 +128,14 @@ pub(crate) fn by_destination(cache_dir: &Path) -> Sessions {
         }
         Err(RegistryRead::Version(found)) => {
             warn!(
-                "{} Until then `.mesh peers` and `mesh__peers` name none of your sessions.",
+                "{} Until then `.mesh people list` and `mesh__peers` name none of your sessions.",
                 refusal(&path, found)
             );
             Sessions::default()
         }
         Err(RegistryRead::Corrupt { cause, error }) => {
             warn!(
-                "Mesh instance registry '{}' {} ({}). `.mesh peers` and `mesh__peers` name none of your sessions until the next `.mesh on` moves the file aside.",
+                "Mesh instance registry '{}' {} ({}). `.mesh people list` and `mesh__peers` name none of your sessions until the next `.mesh on` moves the file aside.",
                 path.display(),
                 redact_hashes(&cause),
                 redact_hashes(&error)
@@ -199,7 +199,7 @@ fn update(cache_dir: &Path, change: impl FnOnce(&mut BTreeMap<String, InstanceRo
     let path = registry_path(cache_dir);
     if let Err(err) = rewrite(&path, change) {
         warn!(
-            "Mesh instance registry '{}' was not updated ({}). `.mesh peers` and `mesh__peers` may not name your sessions on this computer until each one runs `.mesh on` again; nothing else reads this file.",
+            "Mesh instance registry '{}' was not updated ({}). `.mesh people list` and `mesh__peers` may not name your sessions on this computer until each one runs `.mesh on` again; nothing else reads this file.",
             path.display(),
             redact_hashes(&format!("{err:#}"))
         );
@@ -364,7 +364,7 @@ fn set_aside_older(path: &Path, found: u64) {
 fn set_aside_corrupt(path: &Path, cause: &str, error: &str) {
     let aside = path.with_extension("json.corrupt");
     warn!(
-        "Mesh instance registry '{}' {} ({}). Starting it afresh, so `.mesh peers` and `mesh__peers` name your other running sessions only once each runs `.mesh on` again. Nothing else needs to be done; delete '{}' once you no longer need it.",
+        "Mesh instance registry '{}' {} ({}). Starting it afresh, so `.mesh people list` and `mesh__peers` name your other running sessions only once each runs `.mesh on` again. Nothing else needs to be done; delete '{}' once you no longer need it.",
         path.display(),
         redact_hashes(cause),
         redact_hashes(error),

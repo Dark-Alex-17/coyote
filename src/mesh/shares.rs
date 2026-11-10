@@ -1792,7 +1792,7 @@ fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
 pub(crate) fn canonical_peer(peer: &str) -> Result<String> {
     canonical_hash(peer).ok_or_else(|| {
         anyhow!(
-            "`{peer}` is not a peer hash; scope a share to a peer by the 32-hex identity or destination hash `.mesh peers` shows."
+            "`{peer}` is not a peer hash; scope a share to a peer by the 32-hex identity or destination hash `.mesh people list` shows."
         )
     })
 }

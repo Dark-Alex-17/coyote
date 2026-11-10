@@ -294,7 +294,7 @@ mod tests {
                 "peer:1a2b3c4d",
                 "mesh",
                 true,
-                "the human was asked; wait for `.mesh answer q1` instead of replying".into(),
+                "the human was asked; wait for `.mesh envoy answer q1` instead of replying".into(),
             );
             for (prefix, mesh) in [
                 (CommandPrefix::Dot, ".mesh"),
@@ -303,7 +303,7 @@ mod tests {
             ] {
                 let mut expected = typed.to_value();
                 expected["next_action"] = json!(format!(
-                    "the human was asked; wait for `{mesh} answer q1` instead of replying"
+                    "the human was asked; wait for `{mesh} envoy answer q1` instead of replying"
                 ));
                 assert_eq!(
                     typed.clone().with_hints_in(prefix).to_value(),

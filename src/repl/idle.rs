@@ -681,7 +681,7 @@ mod tests {
                 "q1",
                 "peer",
                 true,
-                "wait for `.mesh answer q1` instead of replying".into(),
+                "wait for `.mesh envoy answer q1` instead of replying".into(),
             );
 
             driver
@@ -692,7 +692,7 @@ mod tests {
 
             assert_eq!(
                 flushed.next_action,
-                "wait for `/mesh answer q1` instead of replying"
+                "wait for `/mesh envoy answer q1` instead of replying"
             );
             driver.stop().await;
         }

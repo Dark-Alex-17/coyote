@@ -164,7 +164,7 @@ pub(crate) const BODY_DEDUP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60
 /// of the inbox, since each later mark is a later delivery.
 pub(crate) const OWN_ENTRY_MARKS: usize = 2 * PEER_INBOX_CAPACITY;
 
-/// What the asker reads in the `refused` reply `.mesh dismiss` sends.
+/// What the asker reads in the `refused` reply `.mesh envoy dismiss` sends.
 pub(crate) const HUMAN_DECLINED: &str = "the human declined to answer";
 
 /// Where a node keeps its identity, the user's trust list and its disposable state.
@@ -1419,7 +1419,7 @@ impl MeshRuntime {
     /// Human labels of the connected interfaces, in config order. A pending interface
     /// joins the list when the interface watcher sees it come up; `mesh.started` fired once
     /// at install with the kinds connected then and nothing refires on a later connect,
-    /// so a hook consumer learns of it only through `.mesh info`.
+    /// so a hook consumer learns of it only through `.mesh config show`.
     pub(crate) fn interfaces(&self) -> Vec<String> {
         self.connected_interfaces()
             .map(|status| status.label)
@@ -2366,7 +2366,7 @@ fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
         Ok(granted) => granted,
         Err(err) => {
             warn!(
-                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh info` shows.",
+                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh config show` shows.",
                 short(fingerprint),
                 redact_hashes(&format!("{err:#}")),
                 trust.path().display()
@@ -3843,12 +3843,12 @@ async fn sweep_envoy_memory(
 }
 
 /// Lets the slot's expired escalations go on each heartbeat, so a question nobody
-/// answers is reported while the node runs and not only when `.mesh pending` is next
+/// answers is reported while the node runs and not only when `.mesh envoy questions` is next
 /// typed. The slot is held weakly, since it owns the node that owns this task.
 async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
     let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
     // The first tick of an interval fires immediately, which would put expiry lines in
-    // the middle of `.mesh on`'s output; the first heartbeat or `.mesh pending` sweeps.
+    // the middle of `.mesh on`'s output; the first heartbeat or `.mesh envoy questions` sweeps.
     ticks.tick().await;
     loop {
         tokio::select! {
@@ -4340,7 +4340,7 @@ impl MeshSlot {
     /// destination serves at once finds them, and a re-key that fails puts the
     /// original's back, since the original is what stays served.
     /// Questions peers escalated before the fork are copied into the fork's inbound file
-    /// so `.mesh answer` still finds them after the switch. A fork pending file this
+    /// so `.mesh envoy answer` still finds them after the switch. A fork pending file this
     /// Coyote cannot read is logged and the fork starts with no questions pending, as
     /// `install` does: the node must not be reported as failed for a cache file. A fork
     /// grants or sent-threads file that cannot be opened refuses the re-key, as it would
@@ -4370,7 +4370,7 @@ impl MeshSlot {
             match fork_inbound.adopt_from(current, now) {
                 Ok(adopted) => self.announce_expired(adopted.displaced),
                 Err(err) => warn!(
-                    "Mesh questions escalated before the fork could not be carried into it, so `.mesh answer` will not find them: {}",
+                    "Mesh questions escalated before the fork could not be carried into it, so `.mesh envoy answer` will not find them: {}",
                     redact_hashes(&format!("{err:#}"))
                 ),
             }
@@ -4692,7 +4692,7 @@ impl MeshSlot {
     }
 
     /// Asks the idle-time driver for a propagation fetch; without a driver nothing is
-    /// fetched until `.mesh sync`.
+    /// fetched until `.mesh messaging sync`.
     pub(crate) fn request_sync(&self) {
         if let Some(sink) = self.idle.load_full() {
             sink.request_sync();
@@ -4812,8 +4812,10 @@ impl MeshSlot {
 
     /// Lets go of the escalated questions and access requests that have outlived
     /// `PENDING_TTL`, one idle line each, so the person at the keyboard learns what went
-    /// without an answer. Run on the heartbeat and first thing under `.mesh pending`,
-    /// `.mesh answer`, `.mesh dismiss`, `.mesh grant` and `.mesh refuse`, so a row that
+    /// without an answer. Run on the heartbeat and first thing under `.mesh messaging sent`,
+    /// `.mesh envoy questions`, `.mesh files requests`, `.mesh envoy answer`,
+    /// `.mesh messaging follow-up`, `.mesh envoy dismiss`, `.mesh files grant` and
+    /// `.mesh files refuse`, so a row that
     /// expired never renders and an expired id reads as no question or request once its
     /// expiry line has been pushed. A store that cannot be read or rewritten is logged
     /// and left for the next sweep: nothing here may stop the node.
@@ -5394,7 +5396,7 @@ impl MeshSlot {
 
     /// The envoy asked the human about `original` and the answer will go out through
     /// `answer_inbound`. The original takes the inbox path so the model can read it,
-    /// but its note tells the model to wait for `.mesh answer {id}` rather than reply to
+    /// but its note tells the model to wait for `.mesh envoy answer {id}` rather than reply to
     /// a question the human is already being asked; `id` is the peer's message id as
     /// `PeerMessage::new` cleaned it, the same one the idle line shows. The person at
     /// the keyboard gets one line saying the envoy escalated.
@@ -5415,7 +5417,7 @@ impl MeshSlot {
             &local_id,
             "mesh",
             true,
-            format!("the human was asked; wait for `.mesh answer {id}` instead of replying"),
+            format!("the human was asked; wait for `.mesh envoy answer {id}` instead of replying"),
         ));
         self.push_idle(IdleNotify {
             source: Source::Message,
@@ -5597,7 +5599,7 @@ impl MeshSlot {
         Ok(outcome)
     }
 
-    /// The owner's late answer, or the refusal `.mesh dismiss` sent, joins the thread
+    /// The owner's late answer, or the refusal `.mesh envoy dismiss` sent, joins the thread
     /// the envoy remembers, as the turn after the escalation line the run stored when
     /// it ended without an answer of its own, and after whatever a run in the thread
     /// wrote meanwhile. Written only once the send succeeded: a
@@ -5658,11 +5660,11 @@ impl MeshSlot {
         }
     }
 
-    /// The human's `.mesh answer` or `.mesh dismiss` of `record` went to the peer with
+    /// The human's `.mesh envoy answer` or `.mesh envoy dismiss` of `record` went to the peer with
     /// no live run. The reply lands in the inbox, minted like the envoy's and carrying
     /// the disposition of `reply_kind`, so the model reads what the peer heard, and
     /// marked as this node's own like the envoy's; one note supersedes the "wait for
-    /// `.mesh answer`" one and the person at the keyboard gets one line saying what they
+    /// `.mesh envoy answer`" one and the person at the keyboard gets one line saying what they
     /// did.
     fn record_human_reply(&self, record: &InboundRecord, text: &str, reply_kind: HumanReply) {
         let runtime = self.get();
@@ -5704,7 +5706,10 @@ impl MeshSlot {
                 if words.cut {
                     text = text.frame(format!(" {INBOX_FULL_TEXT_POINTER}"));
                 }
-                (text, "the human answered via `.mesh answer`; nothing to do")
+                (
+                    text,
+                    "the human answered via `.mesh envoy answer`; nothing to do",
+                )
             }
         };
         self.own_entries.lock().mark(&reply);
@@ -5833,7 +5838,7 @@ impl MeshSlot {
     }
 
     /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
-    /// person typed with `.mesh answer`. Read from the marks those two producers set as
+    /// person typed with `.mesh envoy answer`. Read from the marks those two producers set as
     /// they filed, keyed on the entry's source destination and message id, which `stop`
     /// and `rekey` leave alone, so an entry filed before a `.mesh off` or a re-key still
     /// reads as its own and a bare slot's reply does too. Only the newest
@@ -6174,8 +6179,8 @@ fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
     in_reply_to.is_none() && matches!(kind, PeerKind::Message | PeerKind::Ask)
 }
 
-/// The two replies a human sends to a peer's question by hand: `.mesh answer` and
-/// `.mesh dismiss`. Narrower than `Disposition` so the wording that files them does
+/// The two replies a human sends to a peer's question by hand: `.mesh envoy answer` and
+/// `.mesh envoy dismiss`. Narrower than `Disposition` so the wording that files them does
 /// not have to speak for the envoy's outcomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HumanReply {
@@ -6503,7 +6508,7 @@ impl MeshSlot {
     /// `FetchServing::share_locations`, cache dir and configured inbox protected, and
     /// `inbox_dir` is never called; while the mesh is off it is built from
     /// `MeshPaths::from_env()` with the directory `inbox_dir` resolves, the configured
-    /// `mesh.fetch.inbox_dir`, protected the same way, so `.mesh shares` and the
+    /// `mesh.fetch.inbox_dir`, protected the same way, so `.mesh files list` and the
     /// `.mesh on` preview see exactly what the node will serve.
     pub(crate) fn share_locations(
         &self,
@@ -9393,7 +9398,7 @@ mod tests {
     }
 
     /// Both producers of this node's own inbox entries, the envoy's reply and the
-    /// human's `.mesh answer`, mint the reply from the running instance's destination,
+    /// human's `.mesh envoy answer`, mint the reply from the running instance's destination,
     /// and mark it as they file it; the original they answer stays a peer's.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9580,7 +9585,7 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].event, "peer_ask");
         assert!(
-            notes[0].next_action.contains(".mesh answer a-1"),
+            notes[0].next_action.contains(".mesh envoy answer a-1"),
             "{}",
             notes[0].next_action
         );
@@ -9935,7 +9940,7 @@ mod tests {
         let notes = slot.take_model_notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
-            notes[0].next_action.contains(".mesh answer"),
+            notes[0].next_action.contains(".mesh envoy answer"),
             "{}",
             notes[0].next_action
         );
@@ -11040,7 +11045,7 @@ mod tests {
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(notes[0].id, format!("peer:{dest8}"));
         assert!(
-            notes[0].next_action.contains(".mesh answer"),
+            notes[0].next_action.contains(".mesh envoy answer"),
             "{}",
             notes[0].next_action
         );
@@ -18909,7 +18914,7 @@ mod tests {
             assert!(!seed_own_grant(&trust, OWN, true));
 
             let remedy = format!(
-                "make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh info` shows",
+                "make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh config show` shows",
                 trust.path().display()
             );
             let warned = warn_snapshot();
@@ -20856,7 +20861,7 @@ mod tests {
             "the translated inbox is protected: {locations:?}"
         );
 
-        // Later resolutions, as the REPL's `.mesh shares` would do with no node, are quiet.
+        // Later resolutions, as the REPL's `.mesh files list` would do with no node, are quiet.
         let fetch = crate::config::mesh_config::MeshFetch {
             inbox_dir: Some(configured.clone()),
             ..Default::default()

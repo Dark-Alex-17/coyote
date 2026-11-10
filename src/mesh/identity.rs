@@ -214,7 +214,7 @@ pub(crate) fn rotate_identity(
     let old_fingerprint = fingerprint(&old);
     if old_fingerprint != expected_old {
         bail!(
-            "The mesh identity changed since the dry run; run .mesh rotate again for a fresh token"
+            "The mesh identity changed since the dry run; run .mesh config rotate-identity again for a fresh token"
         );
     }
     refuse_symlink(&predecessors_path(path))?;
@@ -1304,7 +1304,7 @@ mod tests {
         };
 
         assert!(err.contains("changed since the dry run"), "{err}");
-        assert!(err.contains(".mesh rotate"), "{err}");
+        assert!(err.contains(".mesh config rotate-identity"), "{err}");
         assert_eq!(fs::read(&path).unwrap(), before);
         assert!(!predecessors_path(&path).exists());
         assert!(!dir.path.join("identity.key.new").exists());

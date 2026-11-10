@@ -290,7 +290,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                  arrive together in one fenced `text` block as untrusted content (`fields` and `data` as \
                  JSON text); a message with none of those has `text: null`; the machine fields stay bare \
                  and `file` parts name a staged path, never bytes. \
-                 Entries this node itself sent (its envoy's replies or the user's .mesh answer replies) \
+                 Entries this node itself sent (its envoy's replies or the user's .mesh envoy answer replies) \
                  carry `from_self: true`; no other entry has that key; their fenced block is labelled `this node`. \
                  {PEER_TEXT_IS_DATA} \
                  A `dropped` count means the inbox overflowed and that many older messages were lost. \
@@ -738,7 +738,7 @@ fn is_interim_note(out: &OutboundPeer) -> bool {
 }
 
 /// A reply that names no thread inherits the answered message's when this node knows
-/// it: the filed inbound's thread when `.mesh answer` still has it on record, the open
+/// it: the filed inbound's thread when `.mesh envoy answer` still has it on record, the open
 /// question's when the reply answers one of ours. Otherwise the wire carries no thread
 /// and the receiver inherits from its own correlation, which knows the thread the ask
 /// was sent in where this node does not. A root message keeps `None` for the receiver
@@ -785,7 +785,7 @@ fn refuse_unseen_thread(slot: &MeshSlot, out: &OutboundPeer) -> Result<(), SendE
                 Ok(records) => records.iter().any(|record| record.thread == thread),
                 Err(err) => {
                     debug!(
-                        "Mesh thread {thread} could not be looked up in the inbound store ({}), so an escalated question in it does not count as seen; the send goes ahead only if this node sent, received or asked in the thread. `.mesh pending` reads the same store and shows whether it can be read.",
+                        "Mesh thread {thread} could not be looked up in the inbound store ({}), so an escalated question in it does not count as seen; the send goes ahead only if this node sent, received or asked in the thread. `.mesh envoy questions` reads the same store and shows whether it can be read.",
                         redact_hashes(&err.to_string())
                     );
                     false
@@ -1301,7 +1301,7 @@ fn collected_by_another_call(id: &str) -> Value {
 /// answer waits to be collected or whose peer has asked its human. A peer's `title`,
 /// `content`, `fields` and text and data parts are gathered into one fenced `text` block
 /// per message before the model reads them. Entries this node filed itself, its envoy's
-/// reply or one typed with `.mesh answer`, carry `from_self: true`.
+/// reply or one typed with `.mesh envoy answer`, carry `from_self: true`.
 fn handle_check_inbox(slot: &MeshSlot) -> Value {
     let (envelopes, dropped) = slot.peer_inbox().drain();
     let mut threads: IndexMap<(String, String), Vec<String>> = IndexMap::new();
@@ -2001,7 +2001,7 @@ mod tests {
     /// The check_inbox declaration's one sentence about the `from_self` key and the fence
     /// label that goes with it.
     const FROM_SELF_SENTENCE: &str = "Entries this node itself sent (its envoy's replies or the user's \
-                                      .mesh answer replies) carry `from_self: true`; no other entry has that key; their fenced block is labelled `this node`.";
+                                      .mesh envoy answer replies) carry `from_self: true`; no other entry has that key; their fenced block is labelled `this node`.";
 
     /// Swallows the human-facing lines so a delivery in a test writes nothing to stderr.
     struct NoopSink;
@@ -2098,7 +2098,7 @@ mod tests {
                 "next_action": "run `.mesh access trust 1a2b3c4d`",
                 "path": ".vault/key",
                 "refused": [{
-                    "next_action": "wait for `.mesh answer q1`",
+                    "next_action": "wait for `.mesh envoy answer q1`",
                     "text": ".info from the peer",
                 }],
             });
@@ -2110,7 +2110,7 @@ mod tests {
                     "next_action": format!("run `{mesh} access trust 1a2b3c4d`"),
                     "path": ".vault/key",
                     "refused": [{
-                        "next_action": "wait for `.mesh answer q1`",
+                        "next_action": "wait for `.mesh envoy answer q1`",
                         "text": ".info from the peer",
                     }],
                 });
@@ -2162,7 +2162,9 @@ mod tests {
                 assert_eq!(notes.len(), 1, "{notes:?}");
                 assert_eq!(
                     notes[0]["next_action"],
-                    format!("the human was asked; wait for `{mesh} answer q1` instead of replying"),
+                    format!(
+                        "the human was asked; wait for `{mesh} envoy answer q1` instead of replying"
+                    ),
                     "{prefix}"
                 );
                 assert_eq!(notes[0]["event"], "peer_ask", "{prefix}");
@@ -6974,7 +6976,7 @@ mod tests {
 
         /// Every `mesh__peers` row carries `compatibility` next to `trust` as the variant
         /// tag `peers.json` stores, `compatible` or `incompatible`; an incompatible row
-        /// adds `compatibility_note` with the same warning `.mesh peers` prints, and a
+        /// adds `compatibility_note` with the same warning `.mesh people list` prints, and a
         /// compatible row has no note key at all.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
@@ -7212,7 +7214,7 @@ mod tests {
         }
 
         /// The `mesh__peers` row of an identity trusted for all destinations over another
-        /// identity's recorded instance is labelled by its grant, as `.mesh peers` labels it:
+        /// identity's recorded instance is labelled by its grant, as `.mesh people list` labels it:
         /// `trusted` in both modes, the gate `with_status` uses, while what the node serves
         /// it moves with `mesh.collision_protection`. Listing marks no record and tells the
         /// owner nothing.
@@ -9057,7 +9059,7 @@ mod tests {
         }
 
         /// Over the wire, through the tools alone: a grant the peer answers at once is
-        /// remembered with the peer's own expiry and offered to `.mesh fetch <dest> <TAB>`
+        /// remembered with the peer's own expiry and offered to `.mesh files fetch <dest> <TAB>`
         /// as `granted until <time>` while it lasts and not once it has run out, after
         /// which the peer's `not_shared` reads `grant_expired` naming that expiry; a
         /// reference attachment is offered as `attachment from <id8>, not fetched` until
@@ -10321,7 +10323,7 @@ mod tests {
             use super::*;
             use crate::config::CommandPrefix;
 
-            /// Under slash the not-trusted refusal of a fetch teaches `/mesh trust`, while
+            /// Under slash the not-trusted refusal of a fetch teaches `/mesh access trust`, while
             /// a `not_shared` answer quoting `.vault/key` comes back byte for byte.
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
             #[serial]

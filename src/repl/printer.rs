@@ -320,14 +320,14 @@ mod tests {
                     ),
                     (
                         Source::Access,
-                        "Tia asks for 2 paths; `.mesh pending` lists it",
-                        format!("Tia asks for 2 paths; `{mesh} pending` lists it"),
+                        "Tia asks for 2 paths; `.mesh files requests` lists it",
+                        format!("Tia asks for 2 paths; `{mesh} files requests` lists it"),
                     ),
                     (
                         Source::Message,
-                        "envoy escalated to the human; answer with `.mesh answer 1a2b3c4d`",
+                        "envoy escalated to the human; answer with `.mesh envoy answer 1a2b3c4d`",
                         format!(
-                            "envoy escalated to the human; answer with `{mesh} answer 1a2b3c4d`"
+                            "envoy escalated to the human; answer with `{mesh} envoy answer 1a2b3c4d`"
                         ),
                     ),
                 ] {
@@ -712,7 +712,10 @@ mod tests {
         #[test]
         fn an_escalation_line_wraps_on_words_under_one_prefix_at_common_widths() {
             let line = escalated();
-            assert!(line.contains("(full text: .mesh pending);"), "{line}");
+            assert!(
+                line.contains("(full text: .mesh envoy questions);"),
+                "{line}"
+            );
             let prefix = Source::Message.prefix();
             let indent = " ".repeat(display_width(prefix) + 1);
             for width in [80, 120, 200] {
@@ -732,7 +735,7 @@ mod tests {
                     .flat_map(|body| body.split_whitespace())
                     .collect();
                 assert_eq!(tokens, line.split_whitespace().collect::<Vec<_>>());
-                assert!(tokens.contains(&"pending);"), "{tokens:?}");
+                assert!(tokens.contains(&"questions);"), "{tokens:?}");
                 assert!(tokens.contains(&MESSAGE_ID), "{tokens:?}");
             }
         }

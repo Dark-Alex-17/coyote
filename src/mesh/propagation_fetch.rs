@@ -245,27 +245,27 @@ impl fmt::Display for FetchError {
             Self::Cancelled => write!(f, "The propagation fetch was cancelled"),
             Self::Link(RequestError::LocalTimeout { after, .. }) => write!(
                 f,
-                "This node's own mesh transport did not finish its part of the sync within {}, handing a request to the link or looking up a sender's key, so this says nothing about the propagation node; .mesh sync tries again",
+                "This node's own mesh transport did not finish its part of the sync within {}, handing a request to the link or looking up a sender's key, so this says nothing about the propagation node; .mesh messaging sync tries again",
                 seconds(*after)
             ),
             Self::Link(RequestError::IdentifyTimeout { after, .. }) => write!(
                 f,
-                "This node's own mesh transport did not send its identity proof to the propagation node within {}, so this says nothing about the propagation node, which was never asked for its messages; .mesh sync tries again",
+                "This node's own mesh transport did not send its identity proof to the propagation node within {}, so this says nothing about the propagation node, which was never asked for its messages; .mesh messaging sync tries again",
                 seconds(*after)
             ),
             Self::Link(RequestError::ResponseIncomplete { after, .. }) => write!(
                 f,
-                "The propagation node started to answer, but the answer had not finished arriving within {}, so the way to it is slow or was cut; .mesh sync tries again",
+                "The propagation node started to answer, but the answer had not finished arriving within {}, so the way to it is slow or was cut; .mesh messaging sync tries again",
                 seconds(*after)
             ),
             Self::Link(RequestError::RequestIncomplete { after, .. }) => write!(
                 f,
-                "The request to the propagation node was too large for one packet, and its upload had not finished within {}, so the node never had all of it to answer; .mesh sync tries again",
+                "The request to the propagation node was too large for one packet, and its upload had not finished within {}, so the node never had all of it to answer; .mesh messaging sync tries again",
                 seconds(*after)
             ),
             Self::Link(RequestError::ResponseOversize { max }) => write!(
                 f,
-                "The propagation node answered with more than the {max} bytes this sync allows, so the answer was dropped; run .mesh sync again, and if it fails the same way, tell the node's operator that it serves more than a sync asks for"
+                "The propagation node answered with more than the {max} bytes this sync allows, so the answer was dropped; run .mesh messaging sync again, and if it fails the same way, tell the node's operator that it serves more than a sync asks for"
             ),
             Self::Link(err) => write!(f, "{err}"),
             Self::ListLinkTimeout {
@@ -281,21 +281,21 @@ impl fmt::Display for FetchError {
                 match retry_every {
                     Some(every) => write!(
                         f,
-                        "The automatic sync retries every {}, or run .mesh sync again",
+                        "The automatic sync retries every {}, or run .mesh messaging sync again",
                         seconds(*every)
                     )?,
-                    None => f.write_str("Run .mesh sync again")?,
+                    None => f.write_str("Run .mesh messaging sync again")?,
                 }
-                f.write_str("; .mesh info shows when it announces again")
+                f.write_str("; .mesh config show shows when it announces again")
             }
             Self::ListUnanswered { node, after } => write!(
                 f,
-                "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced",
+                "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced",
                 seconds(*after)
             ),
             Self::ListLinkClosed { node } => write!(
                 f,
-                "The link to propagation node {node} closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh sync tries again, and .mesh info shows when it last announced"
+                "The link to propagation node {node} closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh messaging sync tries again, and .mesh config show shows when it last announced"
             ),
             Self::NodeSawNoIdentity { node } => write!(
                 f,
@@ -3568,7 +3568,7 @@ mod tests {
         );
         assert_eq!(
             silent.to_string(),
-            "Propagation node 9af2fd91 did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh sync tries again, and .mesh info shows when it last announced"
+            "Propagation node 9af2fd91 did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced"
         );
         assert_eq!(
             round_one_error(RequestError::Refused(RefusalCode::NoAccess), "n", "i", None),
@@ -3587,7 +3587,7 @@ mod tests {
         );
         assert_eq!(
             closed.to_string(),
-            "The link to propagation node 9af2fd91 closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh sync tries again, and .mesh info shows when it last announced"
+            "The link to propagation node 9af2fd91 closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh messaging sync tries again, and .mesh config show shows when it last announced"
         );
         for not_silence in [
             RequestError::LocalTimeout {
@@ -3620,7 +3620,7 @@ mod tests {
         .to_string();
         assert_eq!(
             text,
-            "This node's own mesh transport did not finish its part of the sync within 60 s, handing a request to the link or looking up a sender's key, so this says nothing about the propagation node; .mesh sync tries again"
+            "This node's own mesh transport did not finish its part of the sync within 60 s, handing a request to the link or looking up a sender's key, so this says nothing about the propagation node; .mesh messaging sync tries again"
         );
         assert!(!text.contains("did not answer"), "{text}");
         assert_eq!(seconds(Duration::from_millis(1500)), "1.5 s");
@@ -3651,7 +3651,7 @@ mod tests {
         let text = err.to_string();
         assert_eq!(
             text,
-            "Propagation node 9af2fd91 did not bring a link up within 10 s; it may be restarting or out of reach. The automatic sync retries every 300 s, or run .mesh sync again; .mesh info shows when it announces again"
+            "Propagation node 9af2fd91 did not bring a link up within 10 s; it may be restarting or out of reach. The automatic sync retries every 300 s, or run .mesh messaging sync again; .mesh config show shows when it announces again"
         );
         assert!(!text.contains("No mesh link to the peer"), "{text}");
         let farewell = left_mesh_hint_when(true).trim().trim_end_matches('.');
@@ -3661,7 +3661,7 @@ mod tests {
         let manual = fetch_error(never_linked, "9af2fd91", "id1", None).to_string();
         assert_eq!(
             manual,
-            "Propagation node 9af2fd91 did not bring a link up within 10 s; it may be restarting or out of reach. Run .mesh sync again; .mesh info shows when it announces again"
+            "Propagation node 9af2fd91 did not bring a link up within 10 s; it may be restarting or out of reach. Run .mesh messaging sync again; .mesh config show shows when it announces again"
         );
         assert!(!manual.contains("automatic"), "{manual}");
     }
@@ -3778,22 +3778,22 @@ mod tests {
                 path: path.clone(),
                 after
             }),
-            "This node's own mesh transport did not send its identity proof to the propagation node within 10 s, so this says nothing about the propagation node, which was never asked for its messages; .mesh sync tries again"
+            "This node's own mesh transport did not send its identity proof to the propagation node within 10 s, so this says nothing about the propagation node, which was never asked for its messages; .mesh messaging sync tries again"
         );
         assert_eq!(
             text(RequestError::ResponseIncomplete {
                 path: path.clone(),
                 after
             }),
-            "The propagation node started to answer, but the answer had not finished arriving within 10 s, so the way to it is slow or was cut; .mesh sync tries again"
+            "The propagation node started to answer, but the answer had not finished arriving within 10 s, so the way to it is slow or was cut; .mesh messaging sync tries again"
         );
         assert_eq!(
             text(RequestError::RequestIncomplete { path, after }),
-            "The request to the propagation node was too large for one packet, and its upload had not finished within 10 s, so the node never had all of it to answer; .mesh sync tries again"
+            "The request to the propagation node was too large for one packet, and its upload had not finished within 10 s, so the node never had all of it to answer; .mesh messaging sync tries again"
         );
         assert_eq!(
             text(RequestError::ResponseOversize { max: 1024 }),
-            "The propagation node answered with more than the 1024 bytes this sync allows, so the answer was dropped; run .mesh sync again, and if it fails the same way, tell the node's operator that it serves more than a sync asks for"
+            "The propagation node answered with more than the 1024 bytes this sync allows, so the answer was dropped; run .mesh messaging sync again, and if it fails the same way, tell the node's operator that it serves more than a sync asks for"
         );
     }
 
@@ -4827,7 +4827,7 @@ mod tests {
             );
             assert!(
                 text.ends_with(
-                    ".mesh sync tries again, and .mesh info shows when it last announced"
+                    ".mesh messaging sync tries again, and .mesh config show shows when it last announced"
                 ),
                 "{text}"
             );

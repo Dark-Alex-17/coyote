@@ -105,7 +105,7 @@ pub(crate) const PEER_LINE_MAX_CHARS: usize = 160;
 /// inbox, the knock list, or the pending list for a question the envoy escalated.
 pub(crate) const INBOX_FULL_TEXT_POINTER: &str = "(full text: .mesh messaging inbox)";
 pub(crate) const KNOCKS_FULL_TEXT_POINTER: &str = "(full text: .mesh access requests)";
-pub(crate) const PENDING_FULL_TEXT_POINTER: &str = "(full text: .mesh pending)";
+pub(crate) const PENDING_FULL_TEXT_POINTER: &str = "(full text: .mesh envoy questions)";
 /// Takes the knock pointer's place when the cache refused the knock: `.mesh knocks` then
 /// has nothing to show, so the line says the rest is gone rather than where to read it.
 pub(crate) const KNOCKS_NOT_KEPT_NOTE: &str =
