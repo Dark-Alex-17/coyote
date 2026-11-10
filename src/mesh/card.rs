@@ -359,8 +359,9 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
 
 /// The card for `snapshot` as of `now`. The objective is the first of `objective_override`,
 /// the snapshot's own objective and `digest_objective` that has any text once sanitised.
-/// No snapshot, as before the first turn boundary, still yields a card: state unknown and
-/// every optional field absent, since a trusted peer asking early is not refused.
+/// No snapshot, as before the first turn boundary, still yields a card: state unknown,
+/// no objective even when an override is set, and only the fields read from configuration,
+/// since a trusted peer asking early is not refused.
 pub(crate) fn build_card(
     snapshot: Option<&MeshSnapshot>,
     objective_override: Option<&str>,
@@ -370,14 +371,16 @@ pub(crate) fn build_card(
     caps: &[String],
     now: SystemTime,
 ) -> StatusCard {
-    let objective = [
-        objective_override,
-        snapshot.and_then(|snapshot| snapshot.objective.as_deref()),
-        digest_objective,
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|text| display_text(text, OBJECTIVE_MAX_CHARS));
+    let objective = snapshot.and_then(|snapshot| {
+        [
+            objective_override,
+            snapshot.objective.as_deref(),
+            digest_objective,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|text| display_text(text, OBJECTIVE_MAX_CHARS))
+    });
     let state = match snapshot.map(|snapshot| snapshot.state) {
         None => CardState {
             code: STATE_UNKNOWN,
@@ -932,6 +935,33 @@ mod tests {
 
         let card = build_card(Some(&snapshot), Some("  "), None, None, None, &[], now());
         assert_eq!(card.objective, None);
+    }
+
+    #[test]
+    fn a_card_without_a_snapshot_carries_no_objective() {
+        let card = build_card(
+            None,
+            Some("from the override"),
+            Some("from the digest"),
+            Some("Alex"),
+            Some("Ask me about the mesh"),
+            &["fetch".to_string()],
+            now(),
+        );
+        assert_eq!(card.objective, None);
+        assert_eq!(card.state.code, STATE_UNKNOWN);
+        assert_eq!(card.display_name.as_deref(), Some("Alex"));
+        assert_eq!(card.about.as_deref(), Some("Ask me about the mesh"));
+        assert_eq!(card.caps, ["fetch".to_string()]);
+        let Value::Map(entries) = card.to_value() else {
+            unreachable!("a card encodes as a map");
+        };
+        assert!(
+            !entries
+                .iter()
+                .any(|(key, _)| key.as_str() == Some("objective")),
+            "{entries:?}"
+        );
     }
 
     fn with_version(card: &StatusCard, version: Value) -> Value {

@@ -4326,9 +4326,10 @@ impl DispatchErrorGen {
     }
 }
 
-/// The dispatch error as a predicate: `error` a `str` naming one of the two kinds,
-/// `path_hash` exactly 32 hex digits, `path` one of the known paths (`KNOWN_PATHS`); first
-/// occurrence wins.
+/// The dispatch error as a predicate: `error` a `str` naming one of the two kinds; for
+/// `unknown_path` the map holds only `error` and `path_hash`, once each, and `path_hash` is
+/// exactly 32 lowercase hex digits; for `no_provider` `path` is one of the known paths
+/// (`KNOWN_PATHS`), first occurrence winning.
 fn expect_dispatch_error(value: &Value) -> Option<DispatchError> {
     let entries = value.as_map()?;
     let field = |name: &str| {
@@ -4340,9 +4341,17 @@ fn expect_dispatch_error(value: &Value) -> Option<DispatchError> {
     match field("error")? {
         "unknown_path" => {
             let path_hash = field("path_hash")?;
-            let well_formed = path_hash.len() == 2 * ADDRESS_HASH_SIZE
-                && path_hash.bytes().all(|b| b.is_ascii_hexdigit());
-            well_formed.then(|| DispatchError::UnknownPath {
+            let mut keys: Vec<Option<&str>> = entries
+                .iter()
+                .map(|(name_value, _)| name_value.as_str())
+                .collect();
+            keys.sort_unstable();
+            let only_the_two_keys = keys == [Some("error"), Some("path_hash")];
+            let lower_hex = path_hash.len() == 2 * ADDRESS_HASH_SIZE
+                && path_hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            (only_the_two_keys && lower_hex).then(|| DispatchError::UnknownPath {
                 path_hash: path_hash.to_string(),
             })
         }

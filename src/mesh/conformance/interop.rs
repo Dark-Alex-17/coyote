@@ -1526,7 +1526,7 @@ async fn reference_requests_hear_the_specified_replies() {
         "v": 1,
         "kind": "bulletin",
         "id": "py-farewell",
-        "content": "leaving the mesh",
+        "content": "leaving",
         "fields": { "presence": "leaving" },
         "ts": unix_now(),
     });
@@ -1800,7 +1800,7 @@ async fn our_requests_are_decoded_by_the_reference() {
     );
     assert_eq!(body["v"], json!(1), "{heard}");
     assert_eq!(body["kind"], json!("bulletin"), "{heard}");
-    assert_eq!(body["content"], json!("leaving the mesh"), "{heard}");
+    assert_eq!(body["content"], json!("leaving"), "{heard}");
     assert_eq!(body["fields"], json!({ "presence": "leaving" }), "{heard}");
     assert!(
         stopping.elapsed() < REQUEST_TIMEOUT,

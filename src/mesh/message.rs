@@ -94,8 +94,9 @@ pub(crate) const FAREWELL_BUDGET: Duration = Duration::from_secs(2);
 /// Farewell recipients sent to at once. Higher than a broadcast's, since every recipient
 /// shares the one short budget.
 const FAREWELL_MAX_CONCURRENCY: usize = 16;
-/// The words a farewell carries beside its `fields.presence`.
-pub(crate) const FAREWELL_CONTENT: &str = "leaving the mesh";
+/// The `content` of a farewell bulletin, fixed by the spec to the same word as its
+/// `fields.presence`.
+pub(crate) const FAREWELL_CONTENT: &str = "leaving";
 /// The `fields.presence` of a farewell bulletin.
 pub(crate) const PRESENCE_LEAVING: &str = "leaving";
 /// The one-line rendering a message earns on the terminal.
@@ -5153,7 +5154,7 @@ mod tests {
 
         let farewell = farewell_message().unwrap();
         assert_eq!(farewell.kind, PeerKind::Bulletin);
-        assert_eq!(farewell.content, "leaving the mesh");
+        assert_eq!(farewell.content, "leaving");
         assert_eq!(farewell.fields, Some(leaving));
         assert_eq!(FAREWELL_BUDGET, Duration::from_secs(2));
     }

@@ -156,8 +156,10 @@ impl DispatchError {
     }
 
     /// Reads a dispatch error off the wire. The detail is peer-controlled and ends up in
-    /// user-facing text, so only a path this node knows or a well-formed path hash is
-    /// accepted; anything else reads as no dispatch error at all.
+    /// user-facing text, so only a path this node knows is accepted. The retired
+    /// `unknown_path` answer is read only in its exact shape, the `error` and `path_hash`
+    /// keys and nothing else with a lowercase 16-byte hex hash; anything else reads as
+    /// no dispatch error at all.
     pub(crate) fn from_value(value: &Value) -> Option<Self> {
         let entries = value.as_map()?;
         let field = |name: &str| {
@@ -169,9 +171,12 @@ impl DispatchError {
         match field("error")? {
             "unknown_path" => {
                 let path_hash = field("path_hash")?;
-                let well_formed = path_hash.len() == 2 * ADDRESS_HASH_SIZE
-                    && path_hash.chars().all(|c| c.is_ascii_hexdigit());
-                well_formed.then(|| Self::UnknownPath {
+                let exact_shape = entries.len() == 2
+                    && path_hash.len() == 2 * ADDRESS_HASH_SIZE
+                    && path_hash
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                exact_shape.then(|| Self::UnknownPath {
                     path_hash: path_hash.to_string(),
                 })
             }
@@ -543,6 +548,47 @@ mod tests {
     use rns_transport::identity::PrivateIdentity;
     use rns_transport::rand_core::OsRng;
     use std::sync::Mutex;
+
+    #[test]
+    fn unknown_path_is_read_only_in_its_exact_shape() {
+        let hash = PathHash::of(STATUS_PATH).to_string();
+        let exact = Value::Map(vec![
+            (Value::from("error"), Value::from("unknown_path")),
+            (Value::from("path_hash"), Value::from(hash.as_str())),
+        ]);
+        assert_eq!(
+            DispatchError::from_value(&exact),
+            Some(DispatchError::UnknownPath {
+                path_hash: hash.clone()
+            })
+        );
+
+        let extra_key = Value::Map(vec![
+            (Value::from("error"), Value::from("unknown_path")),
+            (Value::from("path_hash"), Value::from(hash.as_str())),
+            (Value::from("path"), Value::from(STATUS_PATH)),
+        ]);
+        assert_eq!(DispatchError::from_value(&extra_key), None, "extra key");
+
+        let duplicate_key = Value::Map(vec![
+            (Value::from("error"), Value::from("unknown_path")),
+            (Value::from("path_hash"), Value::from(hash.as_str())),
+            (Value::from("path_hash"), Value::from(hash.as_str())),
+        ]);
+        assert_eq!(
+            DispatchError::from_value(&duplicate_key),
+            None,
+            "repeated key"
+        );
+
+        let upper = hash.to_ascii_uppercase();
+        assert_ne!(upper, hash, "the hash has a hex letter to upper-case");
+        let uppercase = Value::Map(vec![
+            (Value::from("error"), Value::from("unknown_path")),
+            (Value::from("path_hash"), Value::from(upper.as_str())),
+        ]);
+        assert_eq!(DispatchError::from_value(&uppercase), None, "uppercase hex");
+    }
 
     #[test]
     fn no_provider_with_an_unknown_path_is_not_a_dispatch_error() {

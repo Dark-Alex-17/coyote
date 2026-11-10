@@ -4,6 +4,10 @@
 
 - **mesh**: envoy conversation memory per (sender identity, sending destination, thread): `mesh.envoy_memory.*` (off by default) remembers a trusted peer's turns and the node's replies so a follow-up in the same thread is answered in context; `.mesh memory forget <identity|all> [thread]` wipes it, `.mesh status`/`.mesh info` report it, and `.mesh untrust --identity`/`.mesh block` say what they forget
 
+### Fix
+
+- **mesh**: the farewell bulletin a leaving node sends carries `content` exactly `leaving` (was `leaving the mesh`), as SCOPE-MSG-043 requires; receivers still recognise a farewell by its `fields.presence` alone
+
 ## v0.10.3 (2026-09-15)
 
 ### Feat
