@@ -5041,9 +5041,16 @@ fn bundle_mcp_json(secrets: &[&str]) -> String {
 
 /// A local git repository laid out as a bundle (`coyote-bundle.yaml`, a
 /// role, an `mcp.json` referencing `secrets`), committed so `.install`
-/// can clone it. Returns the repository path.
+/// can clone it, at `dir/bundle-src`. Returns the repository path.
 fn write_bundle_repo(dir: &Path, name: &str, secrets: &[&str]) -> PathBuf {
     let repo = dir.join("bundle-src");
+    write_bundle_repo_at(&repo, name, secrets);
+    repo
+}
+
+/// `write_bundle_repo` at a path of the caller's choosing, for a test
+/// that installs two bundles; the store tells bundles apart by source.
+fn write_bundle_repo_at(repo: &Path, name: &str, secrets: &[&str]) {
     fs::create_dir_all(repo.join("roles")).unwrap();
     fs::write(repo.join("coyote-bundle.yaml"), format!("name: {name}\n")).unwrap();
     fs::write(
@@ -5057,10 +5064,9 @@ fn write_bundle_repo(dir: &Path, name: &str, secrets: &[&str]) -> PathBuf {
     )
     .unwrap();
     fs::write(repo.join("mcp.json"), bundle_mcp_json(secrets)).unwrap();
-    git(&repo, &["init", "-q"]);
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "bundle"]);
-    repo
+    git(repo, &["init", "-q"]);
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-q", "-m", "bundle"]);
 }
 
 /// Pumps the pty until `marker` is on screen after `from` (whitespace
@@ -8506,12 +8512,13 @@ fn refusal_shape(out: &str) -> Option<(String, String)> {
 }
 
 /// With no terminal, the three menus that still refuse do so in one
-/// shape, each naming the flag that settles it: `--install` at a
-/// conflicting local file (`--install-force`, the file keeps its local
-/// text), `--update` on a Cargo install (`--force`), and `--uninstall`
-/// without `--yes` (`--yes`); all exit non-zero. `--add-secret` with no
-/// terminal is refused too, naming the missing tty, and writes no vault
-/// file.
+/// shape, each naming the flag that settles it: `--install` of a second
+/// bundle at a conflicting local file (`--install-force`, the file keeps
+/// its local text), `--update` on a Cargo install (`--force`), and
+/// `--uninstall` of a bundle installed for real by a tty-less `--install`
+/// with nothing to ask, without `--yes` (`--yes`); all exit non-zero.
+/// `--add-secret` with no terminal is refused too, naming the missing
+/// tty, and writes no vault file.
 #[test]
 #[serial]
 fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
@@ -8520,7 +8527,18 @@ fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
     write_dry_run_config(&dir);
     let name = "bundle-c3h";
     let repo = write_bundle_repo(&dir, name, &[]);
-    let locals = write_conflicting_local_roles(&dir, name);
+    let repo_arg = repo.to_str().unwrap();
+    let (ok, out) = run_ttyless(&dir, &["--install", repo_arg], "tty-less install");
+    let role = dir.join("roles").join(format!("{name}-role.md"));
+    assert!(
+        ok && role.exists(),
+        "a tty-less `--install` of a bundle with nothing to ask did not proceed silently:\n{out}"
+    );
+
+    let conflicting = "bundle-c3h-conflict";
+    let conflicting_repo = dir.join("bundle-conflict-src");
+    write_bundle_repo_at(&conflicting_repo, conflicting, &[]);
+    let locals = write_conflicting_local_roles(&dir, conflicting);
     let cargo_copy = cargo_installed_binary(&dir);
 
     let mut shapes = Vec::new();
@@ -8528,7 +8546,7 @@ fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
         (
             "install at a conflicting file",
             built_binary().to_path_buf(),
-            vec!["--install", repo.to_str().unwrap()],
+            vec!["--install", conflicting_repo.to_str().unwrap()],
             "--install-force",
         ),
         (
@@ -8567,6 +8585,10 @@ fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
             path.display()
         );
     }
+    assert!(
+        role.exists(),
+        "the refused tty-less uninstall still removed a bundle file:\n{shapes:?}"
+    );
 
     let files_before = walk(&dir);
     let (ok, out) = run_ttyless(&dir, &["--add-secret", "ttyless-secret-c3h"], "add-secret");
