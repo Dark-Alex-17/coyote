@@ -152,8 +152,9 @@ pub fn drain_stale_tty_input() {
 
     // Under the full-screen UI the event stream owns stdin; reading here
     // would steal its keystrokes and toggle the raw mode it set. The
-    // inquire prompter drains before every widget but a confirm; under the
-    // UI the modal answers in its place, so this branch guards the next caller.
+    // inquire prompter drains before every widget except a tool-approval
+    // confirm, which keeps its type-ahead; under the UI the modal answers
+    // in its place, so this branch guards the next caller.
     if crate::tui::active() || !io::stdin().is_terminal() {
         return;
     }

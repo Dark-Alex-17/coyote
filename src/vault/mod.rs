@@ -176,6 +176,12 @@ impl Vault {
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
         }
+        if !crate::config::conflict::menu_can_use_terminal() {
+            return Err(crate::config::conflict::refuse_non_interactive(
+                format_args!("add secret '{secret_name}'"),
+                ".",
+            ));
+        }
         let secret_value = Self::ask_secret_value(prompter)?;
 
         let h = Handle::current();
@@ -210,6 +216,12 @@ impl Vault {
             bail!(
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
+        }
+        if !crate::config::conflict::menu_can_use_terminal() {
+            return Err(crate::config::conflict::refuse_non_interactive(
+                format_args!("update secret '{secret_name}'"),
+                ".",
+            ));
         }
         let secret_value = Self::ask_secret_value(prompter)?;
         let h = Handle::current();
@@ -446,11 +458,39 @@ mod tests {
         }
     }
 
+    /// Off the UI, the value is only asked for when both stdout and stdin
+    /// are terminals; without them the entry is refused before the
+    /// prompter is consulted and nothing reaches the provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn without_a_terminal_secret_entry_is_refused_before_asking_and_writes_nothing() {
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let store = TempVault::new("no-terminal");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = store.vault.add_secret("x", &prompter).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to add secret 'x' non-interactively. Re-run in a terminal."
+        );
+
+        let err = store.vault.update_secret("x", &prompter).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to update secret 'x' non-interactively. Re-run in a terminal."
+        );
+
+        assert!(prompter.requests().is_empty());
+        assert!(!store.has_secrets_file());
+    }
+
     /// An empty value is asked again with inquire's own wording in front
     /// of the label; the first non-empty one lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn an_empty_secret_value_is_asked_again() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
         let store = TempVault::new("re-ask");
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Text(String::new()),
@@ -480,6 +520,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn secret_entry_without_an_answer_writes_nothing() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
         let store = TempVault::new("no-answer");
 
         let cancelled = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
@@ -508,6 +549,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn headless_add_secret_is_a_typed_password_refusal_with_nothing_on_stdout() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
         let store = TempVault::new("headless");
         let (saved, mut reader) = crate::testing::capture_stdout();
 

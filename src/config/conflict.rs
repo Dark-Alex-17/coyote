@@ -9,6 +9,7 @@ use crate::prompt::{Prompter, select_closed};
 use crate::utils::IS_STDOUT_TERMINAL;
 
 use anyhow::{Context, Result, anyhow, bail};
+use is_terminal::IsTerminal;
 use std::fs;
 use std::path::Path;
 
@@ -109,12 +110,15 @@ pub(crate) fn resolve_conflict(
 }
 
 /// Whether a question has somewhere to be shown: the full-screen UI's
-/// modal, or a terminal on stdout for an inquire widget.
+/// modal, or a terminal on both stdout and stdin for an inquire widget.
+/// The widget paints stdout and reads its answer from stdin, so a tty on
+/// one side with a pipe on the other would hang or fall over mid-prompt.
 pub(crate) fn menu_can_use_terminal() -> bool {
     #[cfg(test)]
-    let on_tty = prompt_script::forced_tty().unwrap_or(*IS_STDOUT_TERMINAL);
+    let on_tty = prompt_script::forced_tty()
+        .unwrap_or_else(|| *IS_STDOUT_TERMINAL && std::io::stdin().is_terminal());
     #[cfg(not(test))]
-    let on_tty = *IS_STDOUT_TERMINAL;
+    let on_tty = *IS_STDOUT_TERMINAL && std::io::stdin().is_terminal();
     crate::tui::active() || on_tty
 }
 
@@ -356,6 +360,29 @@ mod tests {
 
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         assert!(!menu_can_use_terminal());
+    }
+
+    /// Outside the UI an inquire widget needs stdout to paint and stdin to
+    /// read, so the gate is the conjunction of the two; the test seam
+    /// forces both legs at once.
+    #[test]
+    #[serial]
+    fn menu_can_use_terminal_needs_both_ttys_outside_the_tui() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        assert_eq!(
+            menu_can_use_terminal(),
+            *IS_STDOUT_TERMINAL && std::io::stdin().is_terminal()
+        );
+
+        let forced_on = prompt_script::install(&[]);
+        assert!(menu_can_use_terminal());
+        drop(forced_on);
+
+        let _forced_off = prompt_script::install_non_interactive();
+        assert!(!menu_can_use_terminal());
+
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert!(menu_can_use_terminal());
     }
 
     /// The refusal has one shape; only the action and the remedy vary.

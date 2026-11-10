@@ -3447,6 +3447,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn accepting_every_missing_secret_creates_the_password_file_once_and_stores_each() {
+        let _script = conflict::prompt_script::install(&[]);
         let guard = TestVaultConfigGuard::new("secrets-accept");
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
         let password_file = guard.path.join("vault-pass");

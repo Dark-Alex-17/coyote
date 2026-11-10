@@ -315,6 +315,9 @@ impl Agent {
         Ok(())
     }
 
+    /// The prompter arrives as an `Arc` because the RAG build runs inside
+    /// the owning `rag_cache.load_with` future, which captures by move and
+    /// cannot borrow from this frame; a clone of the handle goes in.
     pub async fn init(
         app: &AppConfig,
         app_state: &AppState,
