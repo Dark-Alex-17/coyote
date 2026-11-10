@@ -11,6 +11,7 @@ mod openai_oauth;
 mod macros;
 mod model;
 mod stream;
+pub mod structured_output;
 
 pub use crate::function::ToolCall;
 pub use common::*;

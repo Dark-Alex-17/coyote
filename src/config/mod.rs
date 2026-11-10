@@ -21,6 +21,7 @@ mod rag_cache;
 mod request_context;
 mod role;
 mod round_chains;
+mod run_stats;
 mod session;
 mod skill;
 mod skill_policy;
@@ -68,6 +69,9 @@ pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
 pub use self::round_chains::RoundChains;
+#[cfg(test)]
+pub(crate) use self::run_stats::RunStats;
+pub use self::run_stats::{RunCallOutcome, RunStatsSnapshot};
 pub use self::session::{
     Session, SessionScope, TURN_INTERRUPTED_TEXT, labeled_session_names, session_scope_dirs,
 };
@@ -1524,6 +1528,21 @@ clients:
         assert!(example.contains("Spawned children and graph nodes always use 5m"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.prompt_cache_ttl, None);
+    }
+
+    #[test]
+    fn config_template_documents_supports_structured_output() {
+        let fragment = "#       supports_structured_output: true";
+        let example = include_str!("../../config.example.yaml");
+        assert!(CONFIG_TEMPLATE.contains(&format!("\n{fragment}")));
+        assert!(example.contains(&format!("\n  {fragment}")));
+        let documented = |text: &str| {
+            let line = text.lines().find(|line| line.contains(fragment)).unwrap();
+            assert!(line.is_ascii(), "{line}");
+            assert!(!line.contains("TASK-"), "{line}"); // debris-exempt
+            line.trim().trim_start_matches('#').trim().to_string()
+        };
+        assert_eq!(documented(CONFIG_TEMPLATE), documented(example));
     }
 
     #[test]

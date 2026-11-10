@@ -1,17 +1,13 @@
-use super::{AbortSignal, IS_STDOUT_TERMINAL, poll_abort_signal, wait_abort_signal};
+use super::{
+    AbortSignal, IS_STDOUT_TERMINAL, JSON_OUTPUT, OutputSink, poll_abort_signal, wait_abort_signal,
+};
 
 use anyhow::{Result, anyhow};
 use crossterm::{cursor, queue, style, terminal};
+use std::sync::atomic::Ordering;
 #[cfg(test)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-use std::{
-    future::Future,
-    io::{Write, stdout},
-    time::Duration,
-};
+use std::sync::{Arc, atomic::AtomicUsize};
+use std::{future::Future, io::Write, time::Duration};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver},
@@ -44,7 +40,7 @@ impl SpinnerInner {
         if !*IS_STDOUT_TERMINAL || self.message.is_empty() {
             return Ok(());
         }
-        let mut writer = stdout();
+        let mut writer = spinner_sink(JSON_OUTPUT.load(Ordering::SeqCst)).writer();
         let frame = Self::DATA[self.index % Self::DATA.len()];
         let dots = ".".repeat((self.index / 5) % 4);
         let line = format!("{frame}{}{:<3}", self.message, dots);
@@ -77,7 +73,7 @@ impl SpinnerInner {
         if !*IS_STDOUT_TERMINAL {
             return Ok(());
         }
-        let mut writer = stdout();
+        let mut writer = spinner_sink(JSON_OUTPUT.load(Ordering::SeqCst)).writer();
         queue!(
             writer,
             cursor::MoveToColumn(0),
@@ -87,6 +83,10 @@ impl SpinnerInner {
         writer.flush()?;
         Ok(())
     }
+}
+
+fn spinner_sink(json_output: bool) -> OutputSink {
+    OutputSink::pick(json_output, OutputSink::Suppressed)
 }
 
 /// Restores the terminal when the spinner goes away by any route, not just the
@@ -340,6 +340,12 @@ mod tests {
         let mut spinner = SpinnerInner::observed(cleared.clone());
         spinner.set_message(message.to_string()).unwrap();
         (spinner, cleared)
+    }
+
+    #[test]
+    fn the_spinner_is_suppressed_under_json() {
+        assert_eq!(spinner_sink(false), OutputSink::Stdout);
+        assert_eq!(spinner_sink(true), OutputSink::Suppressed);
     }
 
     #[test]

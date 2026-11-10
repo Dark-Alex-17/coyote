@@ -1,6 +1,7 @@
 use super::access_token::*;
 use super::claude::*;
 use super::openai::*;
+use super::structured_output::{SchemaDialect, StructuredOutputSpec, convert_schema};
 use super::*;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,6 +39,14 @@ impl VertexAIClient {
 #[async_trait::async_trait]
 impl Client for VertexAIClient {
     client_common_fns!();
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        match ModelCategory::from_str(self.model().real_name()) {
+            Ok(ModelCategory::Gemini) => Some(SchemaDialect::Gemini),
+            Ok(ModelCategory::Claude) => Some(SchemaDialect::Anthropic),
+            Ok(ModelCategory::Mistral) | Err(_) => None,
+        }
+    }
 
     async fn chat_completions_inner(
         &self,
@@ -92,7 +101,7 @@ impl Client for VertexAIClient {
     }
 }
 
-fn prepare_chat_completions(
+pub(super) fn prepare_chat_completions(
     self_: &VertexAIClient,
     data: ChatCompletionsData,
     model_category: &ModelCategory,
@@ -155,6 +164,8 @@ fn prepare_chat_completions(
             let mut body = openai_build_chat_completions_body(data, &self_.model);
             if let Some(body_obj) = body.as_object_mut() {
                 body_obj["model"] = strip_model_version(self_.model.real_name()).into();
+                // Vertex Mistral has no native structured-output dialect.
+                body_obj.remove("response_format");
             }
             body
         }
@@ -227,6 +238,12 @@ pub async fn gemini_chat_completions_streaming(
         let handle = |value: &str| -> Result<()> {
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
+            // Each chunk's `usageMetadata` is cumulative and the handler keeps
+            // the latest values, so chunks must never be summed.
+            if let Some(usage) = gemini_parse_usage(&data["usageMetadata"]) {
+                debug!("token-usage: {usage:?}");
+                handler.usage(usage);
+            }
             if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
                 for (i, part) in parts.iter().enumerate() {
                     if let Some(text) = part["text"].as_str() {
@@ -332,9 +349,41 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        usage: gemini_parse_usage(&data["usageMetadata"]),
         ..Default::default()
     };
     Ok(output)
+}
+
+/// `promptTokenCount` includes cached content, so cached tokens are
+/// subtracted to keep the buckets disjoint. Thinking tokens are billed as
+/// output but reported apart from `candidatesTokenCount`. Gemini has no
+/// cache-creation counter.
+pub fn gemini_parse_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+
+    let cached_tokens = usage["cachedContentTokenCount"].as_u64();
+    let input_tokens = usage["promptTokenCount"].as_u64().map(|v| {
+        v.saturating_add(usage["toolUsePromptTokenCount"].as_u64().unwrap_or(0))
+            .saturating_sub(cached_tokens.unwrap_or(0))
+    });
+    let output_tokens = match (
+        usage["candidatesTokenCount"].as_u64(),
+        usage["thoughtsTokenCount"].as_u64(),
+    ) {
+        (None, None) => None,
+        (candidates, thoughts) => {
+            Some(candidates.unwrap_or(0).saturating_add(thoughts.unwrap_or(0)))
+        }
+    };
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: cached_tokens,
+    })
 }
 
 pub fn gemini_build_chat_completions_body(
@@ -349,6 +398,7 @@ pub fn gemini_build_chat_completions_body(
         functions,
         stream: _,
         prompt_cache_ttl: _,
+        structured_output,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -437,10 +487,10 @@ pub fn gemini_build_chat_completions_body(
                         } else {
                             let mut turns = vec![
                                 json!({ "role": "model", "parts": model_parts }),
-                                json!({ "role": "function", "parts": function_parts }),
+                                json!({ "role": "user", "parts": function_parts }),
                             ];
-                            // Gemini rejects image parts inside the function turn, so
-                            // tool images follow it in their own user turn.
+                            // Gemini rejects image parts inside the function-response turn,
+                            // so tool images follow it in their own user turn.
                             if !image_parts.is_empty() {
                                 turns.push(json!({ "role": "user", "parts": image_parts }));
                             }
@@ -476,6 +526,11 @@ pub fn gemini_build_chat_completions_body(
     if let Some(v) = reasoning_effort {
         body["generationConfig"]["thinking_config"] = json!({"thinking_level": v});
     }
+    if let Some(StructuredOutputSpec { schema, .. }) = structured_output {
+        body["generationConfig"]["responseMimeType"] = "application/json".into();
+        body["generationConfig"]["responseJsonSchema"] =
+            convert_schema(&schema, SchemaDialect::Gemini);
+    }
 
     if let Some(functions) = functions {
         // Gemini doesn't support functions with parameters that have empty properties, so we need to patch it.
@@ -499,7 +554,7 @@ pub fn gemini_build_chat_completions_body(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelCategory {
+pub(super) enum ModelCategory {
     Gemini,
     Claude,
     Mistral,
@@ -636,6 +691,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
 
         let body = gemini_build_chat_completions_body(data, &Model::new("vertexai", "gemini-test"))
@@ -686,6 +742,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         gemini_build_chat_completions_body(data, &Model::new("vertexai", "gemini-test")).unwrap()
     }
@@ -718,7 +775,7 @@ mod tests {
         ]);
 
         let function_content = &body["contents"][2];
-        assert_eq!(function_content["role"], "function", "body: {body}");
+        assert_eq!(function_content["role"], "user", "body: {body}");
         assert_eq!(
             function_content["parts"],
             json!([function_response_json(), function_response_json()]),
@@ -738,15 +795,44 @@ mod tests {
     }
 
     #[test]
-    fn gemini_tool_results_without_images_keep_parts() {
+    fn gemini_plain_tool_result_round_sends_function_responses_in_a_user_turn() {
         let body = gemini_body_for(vec![fs_read_result("call_A")]);
 
         assert_eq!(
-            body["contents"][2]["parts"],
-            json!([function_response_json()]),
+            body["contents"],
+            json!([
+                { "role": "user", "parts": [{ "text": "hello" }] },
+                {
+                    "role": "model",
+                    "parts": [{ "functionCall": { "name": "fs_read", "args": { "path": "x" } } }],
+                },
+                { "role": "user", "parts": [function_response_json()] },
+            ]),
             "body: {body}"
         );
-        assert_eq!(body["contents"].as_array().unwrap().len(), 3, "body: {body}");
+    }
+
+    #[test]
+    fn gemini_tool_result_round_keeps_thought_signature_on_model_turn() {
+        let signed_call = ToolCall::new("fs_read".into(), json!({"path": "x"}), Some("call_A".into()))
+            .with_thought_signature(Some("sig".into()));
+        let body = gemini_body_for(vec![ToolResult::new(signed_call, json!("ok"))]);
+
+        assert_eq!(
+            body["contents"],
+            json!([
+                { "role": "user", "parts": [{ "text": "hello" }] },
+                {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": { "name": "fs_read", "args": { "path": "x" } },
+                        "thoughtSignature": "sig",
+                    }],
+                },
+                { "role": "user", "parts": [function_response_json()] },
+            ]),
+            "body: {body}"
+        );
     }
 
     #[test]
@@ -791,6 +877,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
 
         let body = claude_build_chat_completions_body(
@@ -807,6 +894,278 @@ mod tests {
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
             ]),
             "body: {body}"
+        );
+    }
+
+    #[test]
+    fn gemini_extract_parses_usage_metadata() {
+        let data = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "hi" }] } }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 30,
+                "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 5,
+                "toolUsePromptTokenCount": 4,
+            }
+        });
+
+        let usage = gemini_extract_chat_completions_text(&data)
+            .unwrap()
+            .usage
+            .unwrap();
+
+        assert_eq!(usage.input_tokens, Some(74));
+        assert_eq!(usage.output_tokens, Some(25));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn gemini_extract_usage_without_cached_content_has_no_cache_read() {
+        let data = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "hi" }] } }],
+            "usageMetadata": { "promptTokenCount": 100, "candidatesTokenCount": 20 }
+        });
+
+        let usage = gemini_extract_chat_completions_text(&data)
+            .unwrap()
+            .usage
+            .unwrap();
+
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn gemini_extract_without_usage_metadata_leaves_it_none() {
+        let data = json!({ "candidates": [{ "content": { "parts": [{ "text": "hi" }] } }] });
+
+        assert!(
+            gemini_extract_chat_completions_text(&data)
+                .unwrap()
+                .usage
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_keeps_the_last_cumulative_usage() {
+        let chunks = json!([
+            {
+                "candidates": [{ "content": { "parts": [{ "text": "a" }] } }],
+                "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 30, "candidatesTokenCount": 3, "toolUsePromptTokenCount": 4 }
+            },
+            {
+                "candidates": [{ "content": { "parts": [{ "text": "b" }] } }],
+                "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 30, "candidatesTokenCount": 10, "thoughtsTokenCount": 5, "toolUsePromptTokenCount": 4 }
+            },
+            {
+                "candidates": [{ "content": { "parts": [{ "text": "c" }] }, "finishReason": "STOP" }],
+                "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 30, "candidatesTokenCount": 20, "thoughtsTokenCount": 5, "toolUsePromptTokenCount": 4 }
+            }
+        ]);
+        let url =
+            super::super::openai::test_server::serve_once("application/json", chunks.to_string())
+                .await;
+        let builder = super::super::openai::test_server::client().post(url);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(sender, crate::utils::create_abort_signal());
+
+        gemini_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("vertexai", "gemini-test"),
+        )
+        .await
+        .unwrap();
+
+        let (text, _, _, usage) = handler.take();
+        assert_eq!(text, "abc");
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(74));
+        assert_eq!(usage.output_tokens, Some(25));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    fn mistral_client(name: &str) -> VertexAIClient {
+        set_access_token(
+            name,
+            "vertex-at".into(),
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+        VertexAIClient {
+            app_config: std::sync::Arc::new(crate::config::AppConfig::default()),
+            config: VertexAIConfig {
+                name: Some(name.into()),
+                project_id: Some("project".into()),
+                location: Some("us-central1".into()),
+                ..Default::default()
+            },
+            model: Model::new(name, "mistral-large"),
+        }
+    }
+
+    fn hello_data(stream: bool) -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream,
+            prompt_cache_ttl: None,
+            structured_output: None,
+        }
+    }
+
+    #[test]
+    fn native_structured_output_dialect_follows_model_category() {
+        let cases = [
+            ("gemini-2.5-pro", Some(SchemaDialect::Gemini)),
+            ("claude-sonnet-4", Some(SchemaDialect::Anthropic)),
+            ("mistral-large", None),
+            ("llama-3", None),
+        ];
+        for (real_name, expected) in cases {
+            let client = VertexAIClient {
+                app_config: std::sync::Arc::new(crate::config::AppConfig::default()),
+                config: VertexAIConfig::default(),
+                model: Model::new("vertexai", real_name),
+            };
+
+            assert_eq!(
+                client.native_structured_output_dialect(),
+                expected,
+                "{real_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn mistral_bodies_omit_stream_options() {
+        let client = mistral_client("vertex-mistral-stream-usage-test");
+
+        for stream in [true, false] {
+            let request_data =
+                prepare_chat_completions(&client, hello_data(stream), &ModelCategory::Mistral)
+                    .unwrap();
+
+            assert!(
+                request_data.body.get("stream_options").is_none(),
+                "body: {}",
+                request_data.body
+            );
+            assert_eq!(request_data.body.get("stream").is_some(), stream);
+        }
+    }
+
+    fn structured_output_schema() -> Value {
+        structured_output_data().structured_output.unwrap().schema
+    }
+
+    #[test]
+    fn gemini_spec_joins_existing_generation_config() {
+        let mut model = Model::new("vertexai", "gemini-test");
+        model.set_max_tokens(Some(256), true);
+        let mut data = structured_output_data();
+        data.temperature = Some(0.5);
+        data.top_p = Some(0.9);
+        data.reasoning_effort = Some("high".into());
+
+        let body = gemini_build_chat_completions_body(data, &model).unwrap();
+
+        assert_eq!(
+            body["generationConfig"],
+            json!({
+                "maxOutputTokens": 256,
+                "temperature": 0.5,
+                "topP": 0.9,
+                "thinking_config": { "thinking_level": "high" },
+                "responseMimeType": "application/json",
+                "responseJsonSchema": convert_schema(&structured_output_schema(), SchemaDialect::Gemini),
+            })
+        );
+    }
+
+    #[test]
+    fn gemini_without_spec_body_is_unchanged() {
+        let body = gemini_build_chat_completions_body(
+            hello_data(false),
+            &Model::new("vertexai", "gemini-test"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body.to_string(),
+            r#"{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":{}}"#
+        );
+    }
+
+    #[test]
+    fn vertex_gemini_body_carries_the_spec() {
+        let client = VertexAIClient {
+            model: Model::new("vertex-gemini-structured-test", "gemini-2.5-pro"),
+            ..mistral_client("vertex-gemini-structured-test")
+        };
+
+        let request_data =
+            prepare_chat_completions(&client, structured_output_data(), &ModelCategory::Gemini)
+                .unwrap();
+
+        assert_eq!(
+            request_data.body["generationConfig"]["responseJsonSchema"],
+            convert_schema(&structured_output_schema(), SchemaDialect::Gemini)
+        );
+        assert_eq!(
+            request_data.body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn vertex_claude_body_has_the_claude_output_config() {
+        let client = VertexAIClient {
+            model: Model::new("vertex-claude-structured-test", "claude-sonnet-4"),
+            ..mistral_client("vertex-claude-structured-test")
+        };
+        let mut data = structured_output_data();
+        data.reasoning_effort = Some("high".into());
+
+        let request_data =
+            prepare_chat_completions(&client, data, &ModelCategory::Claude).unwrap();
+
+        assert_eq!(
+            request_data.body["output_config"],
+            json!({
+                "effort": "high",
+                "format": {
+                    "type": "json_schema",
+                    "schema": convert_schema(&structured_output_schema(), SchemaDialect::Anthropic),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn mistral_body_drops_the_spec() {
+        let client = mistral_client("vertex-mistral-structured-test");
+
+        let request_data =
+            prepare_chat_completions(&client, structured_output_data(), &ModelCategory::Mistral)
+                .unwrap();
+
+        assert!(
+            request_data.body.get("response_format").is_none(),
+            "body: {}",
+            request_data.body
         );
     }
 }

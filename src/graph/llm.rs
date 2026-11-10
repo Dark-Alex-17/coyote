@@ -1,8 +1,10 @@
 use super::state::StateManager;
 use super::state_updates;
 use super::structured;
+use super::structured::{ExtractorTransport, with_native_format_fallback};
 use super::types::LlmNode;
 use super::{is_transient_error, wall_clock};
+use crate::client::structured_output::{SchemaDialect, StructuredOutputSpec, sanitize_schema_name};
 use crate::client::{Model, ModelType, call_chat_completions_streaming_quiet};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
@@ -15,7 +17,7 @@ use crate::function::skill::skill_function_declarations;
 use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Error, Result, anyhow, bail};
-use log::warn;
+use log::{debug, warn};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
@@ -61,17 +63,46 @@ async fn finish(
     result: Result<String>,
     abort: &AbortSignal,
 ) -> Result<LlmExecutionOutcome> {
+    let mut transport = quiet_transport(abort.clone());
+    finish_with(
+        node,
+        state_manager,
+        parent_ctx,
+        result,
+        abort,
+        &mut transport,
+    )
+    .await
+}
+
+async fn finish_with(
+    node: &LlmNode,
+    state_manager: &mut StateManager,
+    parent_ctx: &mut RequestContext,
+    result: Result<String>,
+    abort: &AbortSignal,
+    transport: &mut ExtractorTransport<'_>,
+) -> Result<LlmExecutionOutcome> {
+    let final_turn = parent_ctx.native_format.final_turn.take();
     let (output, failure_reason) = match result {
         Ok(raw) => match &node.output_schema {
-            Some(schema) => match structured::extract(&raw, schema, parent_ctx, abort).await {
-                Ok(value) => (value, None),
-                Err(e) => {
-                    warn!("llm node structured extraction failed: {e:#}");
-                    (
-                        Value::String(format!("LLM node structured-extraction failed: {e:#}")),
-                        Some(format!("structured-extraction failed: {e:#}")),
-                    )
-                }
+            Some(schema) => match final_turn.and_then(|turn| parse_native_final_turn(turn, schema))
+            {
+                Some(value) => (value, None),
+                None => match structured::extract_with_transport(
+                    &raw, schema, parent_ctx, abort, None, transport,
+                )
+                .await
+                {
+                    Ok(value) => (value, None),
+                    Err(e) => {
+                        warn!("llm node structured extraction failed: {e:#}");
+                        (
+                            Value::String(format!("LLM node structured-extraction failed: {e:#}")),
+                            Some(format!("structured-extraction failed: {e:#}")),
+                        )
+                    }
+                },
             },
             None => (Value::String(raw), None),
         },
@@ -86,6 +117,20 @@ async fn finish(
 
     apply_state_updates_with_output(node, state_manager, &output);
     outcome_from(failure_reason.as_deref(), node.fallback.as_deref())
+}
+
+/// The final turn alone, when it ran under the native format, is the
+/// schema-constrained answer; earlier turns' prose is not part of it.
+fn parse_native_final_turn(
+    (text, dialect): (String, SchemaDialect),
+    schema: &Value,
+) -> Option<Value> {
+    let Some(mut value) = structured::try_parse_json(&text) else {
+        debug!("native {dialect:?} final turn is not JSON; extracting from the accumulated output");
+        return None;
+    };
+    structured::strip_nulls_for(Some(dialect), &mut value, schema);
+    Some(value)
 }
 
 fn outcome_from(
@@ -143,6 +188,7 @@ async fn run(
     validate_tools_subset(&regular_tools, &mcp_servers, parent_ctx)?;
 
     let mut role = build_inline_role(
+        node_id,
         node,
         instructions.as_deref(),
         &regular_tools,
@@ -204,6 +250,7 @@ async fn run(
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(composed_role);
+    parent_ctx.native_format = Default::default();
     // Jobs are node-local: everything job__start registers while this node
     // runs is recorded here and reaped on every exit path below.
     let saved_job_scope = parent_ctx.node_job_scope.replace(Vec::new());
@@ -283,10 +330,38 @@ pub(crate) type CompletionRunner<'f> = dyn for<'a> FnMut(&'a Input, &'a mut Requ
 pub(crate) fn default_completion_runner()
 -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 {
-    |input, ctx, abort| {
+    completion_runner_with(quiet_transport)
+}
+
+/// The production runner over the transport `make_transport` builds for
+/// each call; tests pass a fake transport to drive the format fallback.
+fn completion_runner_with<T, F>(
+    make_transport: F,
+) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+where
+    F: Fn(AbortSignal) -> T + Send,
+    T: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send + 'static,
+{
+    move |input, ctx, abort| {
+        let transport = make_transport(abort);
         Box::pin(async move {
             let client = input.create_client()?;
+            let dialect = input.native_structured_output(client.as_ref());
             ctx.before_chat_completion(input)?;
+            with_native_format_fallback(dialect, input, ctx, transport).await
+        })
+    }
+}
+
+/// One quiet streaming call per invocation, each with its own client, so
+/// the native-format fallback can repeat it with a different input.
+pub(crate) fn quiet_transport(
+    abort: AbortSignal,
+) -> impl for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send {
+    move |input, ctx| {
+        let abort = abort.clone();
+        Box::pin(async move {
+            let client = input.create_client()?;
             call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
         })
     }
@@ -315,6 +390,14 @@ pub(crate) mod test_support {
         fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
     ) -> CompletionFuture<'a> {
         Box::pin(fut)
+    }
+
+    /// The transport-side twin of `completion_runner`.
+    pub(crate) fn transport_call<F>(f: F) -> F
+    where
+        F: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send,
+    {
+        f
     }
 }
 
@@ -376,6 +459,23 @@ async fn run_chat_loop(
     abort: &AbortSignal,
     runner: &mut CompletionRunner<'_>,
 ) -> Result<String> {
+    ctx.native_format.final_turn = None;
+    let result = run_chat_turns(node_id, node, prompt, ctx, abort, runner).await;
+    // Only a successful attempt's final turn may reach `finish`.
+    if result.is_err() {
+        ctx.native_format.final_turn = None;
+    }
+    result
+}
+
+async fn run_chat_turns(
+    node_id: &str,
+    node: &LlmNode,
+    prompt: &str,
+    ctx: &mut RequestContext,
+    abort: &AbortSignal,
+    runner: &mut CompletionRunner<'_>,
+) -> Result<String> {
     let abort = abort.clone();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
@@ -388,6 +488,7 @@ async fn run_chat_loop(
             bail!("llm node aborted");
         }
         let (output, tool_results) = runner(&input, ctx, abort.clone()).await?;
+        let turn_dialect = ctx.native_format.last_dialect;
         // Defence in depth: the transport bails on abort itself; this closes
         // the window between its check and ours.
         if abort.aborted() {
@@ -403,6 +504,7 @@ async fn run_chat_loop(
         }
 
         if tool_results.is_empty() {
+            ctx.native_format.final_turn = turn_dialect.map(|d| (output, d));
             // Whitespace-only output across every turn is a provider blip, not a
             // conclusion, unless the guardrail still has a reminder to deliver.
             let said_nothing = accumulated.trim().is_empty();
@@ -420,7 +522,9 @@ async fn run_chat_loop(
                     warn!("llm node '{node_id}' returned an empty completion on turn {turn}");
                     bail!("empty completion: model returned no text and no tool calls");
                 }
-                GuardrailAction::NoAction => return Ok(accumulated),
+                GuardrailAction::NoAction => {
+                    return Ok(accumulated);
+                }
                 GuardrailAction::ForceTerminate(ids) => {
                     warn!(
                         "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
@@ -458,6 +562,7 @@ async fn run_chat_loop(
 }
 
 fn build_inline_role(
+    node_id: &str,
     node: &LlmNode,
     instructions: Option<&str>,
     regular_tools: &[String],
@@ -483,6 +588,12 @@ fn build_inline_role(
     }
     if let Some(v) = &node.reasoning_effort {
         role.set_reasoning_effort(Some(v.clone()));
+    }
+    if let Some(schema) = &node.output_schema {
+        role.set_structured_output(Some(StructuredOutputSpec {
+            name: sanitize_schema_name(node_id),
+            schema: schema.clone(),
+        }));
     }
 
     if node.tools.as_deref().unwrap_or_default().is_empty() {
@@ -608,7 +719,7 @@ fn format_schema_hint(schema: &Value) -> String {
 mod tests {
     use super::super::state_updates::OUTPUT_KEY;
     use super::super::types::*;
-    use super::test_support::{boxed_completion, completion_runner};
+    use super::test_support::{boxed_completion, completion_runner, transport_call};
     use super::*;
     use crate::config::{Agent, AgentConfig, AppState, WorkingMode};
     use crate::utils::create_abort_signal;
@@ -1936,5 +2047,481 @@ mod tests {
         assert!(attached.with_session());
         let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(attached).unwrap();
         assert!(checkpoint.is_some());
+    }
+
+    fn structured_model() -> Model {
+        let mut data = crate::client::ModelData::new("structured");
+        data.supports_function_calling = true;
+        data.supports_structured_output = true;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn openai_ctx() -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(crate::config::AppConfig {
+            clients: vec![crate::client::ClientConfig::OpenAIConfig(Default::default())],
+            ..crate::config::AppConfig::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    fn inline_role_for(node_id: &str, node: &LlmNode, ctx: &RequestContext) -> Role {
+        let (regular, mcp) = categorize_tools(node.tools.as_deref());
+        build_inline_role(node_id, node, None, &regular, &mcp, ctx).unwrap()
+    }
+
+    #[test]
+    fn build_inline_role_attaches_a_spec_named_after_the_node_for_every_schema_node() {
+        let ctx = plain_ctx();
+        let schema = json!({"type": "object", "properties": {"goal": {"type": "string"}}});
+        let mut no_tools = node_with_schema(None, schema.clone());
+        no_tools.tools = Some(vec![]);
+        let mut with_tools = node_with_schema(None, schema.clone());
+        with_tools.tools = Some(vec!["fs_cat".into(), "mcp:github".into()]);
+        let mut with_skills = node_with_schema(None, schema.clone());
+        with_skills.skills_enabled = Some(true);
+
+        for node in [no_tools, with_tools, with_skills] {
+            let role = inline_role_for("plan step.1", &node, &ctx);
+            let mut plain = node.clone();
+            plain.output_schema = None;
+            let baseline = inline_role_for("plan step.1", &plain, &ctx);
+
+            assert_eq!(
+                role.structured_output(),
+                Some(&StructuredOutputSpec {
+                    name: "plan_step_1".to_string(),
+                    schema: schema.clone(),
+                })
+            );
+            assert!(baseline.structured_output().is_none());
+            assert_eq!(role.enabled_tools(), baseline.enabled_tools());
+            assert_eq!(role.enabled_mcp_servers(), baseline.enabled_mcp_servers());
+        }
+    }
+
+    #[test]
+    fn node_without_output_schema_sends_the_same_request_as_a_bare_tool_free_role() {
+        let ctx = plain_ctx();
+        let node = node_with(None);
+        let model = structured_model();
+
+        let role = inline_role_for("plain", &node, &ctx);
+        let input = Input::from_str(&ctx, "user", Some(role)).unwrap();
+        let data = input.prepare_completion_data(&model, false).unwrap();
+        let baseline = input
+            .without_structured_output()
+            .prepare_completion_data(&model, false)
+            .unwrap();
+        let mut bare_role = Role::new("llm_node", "");
+        bare_role.set_model(ctx.current_model().clone());
+        bare_role.set_enabled_tools(Some(vec![]));
+        bare_role.set_enabled_mcp_servers(Some(vec![]));
+        let bare = Input::from_str(&ctx, "user", Some(bare_role))
+            .unwrap()
+            .prepare_completion_data(&model, false)
+            .unwrap();
+
+        assert!(input.role().structured_output().is_none());
+        assert!(data.structured_output.is_none());
+        assert_eq!(format!("{data:?}"), format!("{baseline:?}"));
+        assert_eq!(format!("{data:?}"), format!("{bare:?}"));
+    }
+
+    /// Runs a schema node and returns, for each call, the system and user
+    /// message texts the request carried and the spec on its role.
+    async fn hint_and_spec_per_call(
+        node: &LlmNode,
+    ) -> Vec<(Vec<String>, Vec<String>, Option<StructuredOutputSpec>)> {
+        let mut state = manager_with(&[]);
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+        let mut calls = Vec::new();
+
+        run(
+            "decide",
+            node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|input, _ctx, _abort| {
+                let messages = input.build_messages().unwrap();
+                let texts = |system: bool| {
+                    messages
+                        .iter()
+                        .filter(|m| m.role.is_system() == system)
+                        .map(|m| m.content.to_text())
+                        .collect::<Vec<_>>()
+                };
+                calls.push((
+                    texts(true),
+                    texts(false),
+                    input.role().structured_output().cloned(),
+                ));
+                boxed_completion(async { Ok((r#"{"done": true}"#.to_string(), vec![])) })
+            }),
+        )
+        .await
+        .unwrap();
+        calls
+    }
+
+    #[tokio::test]
+    async fn schema_hint_goes_into_instructions_alongside_native_format() {
+        let schema = json!({"type": "object", "properties": {"done": {"type": "boolean"}}});
+        let node = node_with_schema(None, schema.clone());
+        let hint = format_schema_hint(&schema);
+
+        let calls = hint_and_spec_per_call(&node).await;
+
+        let [(system, user, spec)] = calls.as_slice() else {
+            panic!("expected one call, got {calls:?}");
+        };
+        assert!(system.iter().any(|s| s.contains(&hint)), "{system:?}");
+        assert!(!user.iter().any(|s| s.contains(&hint)), "{user:?}");
+        assert_eq!(
+            spec.as_ref(),
+            Some(&StructuredOutputSpec {
+                name: "decide".to_string(),
+                schema,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_hint_goes_into_user_prompt_alongside_native_format() {
+        let schema = json!({"type": "object", "properties": {"done": {"type": "boolean"}}});
+        let mut node = node_with_schema(None, schema.clone());
+        node.instructions = None;
+        let hint = format_schema_hint(&schema);
+
+        let calls = hint_and_spec_per_call(&node).await;
+
+        let [(system, user, spec)] = calls.as_slice() else {
+            panic!("expected one call, got {calls:?}");
+        };
+        assert!(!system.iter().any(|s| s.contains(&hint)), "{system:?}");
+        assert!(user.iter().any(|s| s.contains(&hint)), "{user:?}");
+        assert_eq!(
+            spec.as_ref(),
+            Some(&StructuredOutputSpec {
+                name: "decide".to_string(),
+                schema,
+            })
+        );
+    }
+
+    /// A `tools: []` node under an agent still declares the agent's
+    /// teammate functions; the native format must leave them alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn schema_node_under_a_teammate_agent_keeps_its_functions() {
+        use crate::testing::TestConfigDirGuard;
+
+        let _guard = TestConfigDirGuard::new("llm-structured");
+        let name = format!(
+            "llm_structured_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = crate::config::paths::agent_data_dir(&name);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
+        let mut node = node_with_schema(None, json!({"type": "object"}));
+        node.tools = Some(vec![]);
+        let model = structured_model();
+
+        let role = inline_role_for("decide", &node, &ctx);
+        let input = Input::from_str(&ctx, "user", Some(role)).unwrap();
+        let data = input.prepare_completion_data(&model, false).unwrap();
+        let baseline = input
+            .without_structured_output()
+            .prepare_completion_data(&model, false)
+            .unwrap();
+
+        assert_eq!(
+            data.structured_output.map(|spec| spec.name),
+            Some("decide".to_string())
+        );
+        let functions = data.functions.unwrap_or_default();
+        assert!(
+            functions.iter().any(|f| f.name.starts_with("agent__")),
+            "{:?}",
+            functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            format!("{functions:?}"),
+            format!("{:?}", baseline.functions.unwrap_or_default())
+        );
+    }
+
+    /// Every request of a schema node, tool rounds included, carries the
+    /// node's spec, and the client gate and the request gate read the same
+    /// model.
+    #[tokio::test]
+    async fn schema_node_sends_its_spec_on_every_call_of_a_session_backed_run() {
+        use crate::config::Session;
+        use crate::function::ToolCall;
+
+        let node = node_with_schema(None, json!({"type": "object"}));
+        let mut state = manager_with(&[]);
+        let mut ctx = openai_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let mut session = Session::default();
+        session.set_model(structured_model());
+        ctx.session = Some(session);
+        ctx.native_format.rejected = true;
+        let abort = create_abort_signal();
+        let mut calls = Vec::new();
+
+        let out = run(
+            "summarise",
+            &node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|input, ctx, _abort| {
+                let client = input.create_client().unwrap();
+                let data = input
+                    .prepare_completion_data(client.model(), false)
+                    .unwrap();
+                calls.push((
+                    data.structured_output.map(|spec| spec.name),
+                    client.model().id() == input.role().model().id(),
+                    input.native_structured_output(client.as_ref()),
+                    ctx.native_format.rejected,
+                ));
+                let first = calls.len() == 1;
+                boxed_completion(async move {
+                    if first {
+                        let call = ToolCall::new("t".into(), json!({}), Some("id-0".into()));
+                        Ok((String::new(), vec![ToolResult::new(call, json!("ok"))]))
+                    } else {
+                        Ok((r#"{"done": true}"#.to_string(), vec![]))
+                    }
+                })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, r#"{"done": true}"#);
+        let expected = (
+            Some("summarise".to_string()),
+            true,
+            Some(crate::client::structured_output::SchemaDialect::OpenAiStrict),
+            false,
+        );
+        assert_eq!(calls, vec![expected.clone(), expected]);
+    }
+
+    fn done_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"done": {"type": "boolean"}, "note": {"type": "string"}},
+            "required": ["done"]
+        })
+    }
+
+    /// An OpenAI ctx whose current model supports the native format, so an
+    /// extractor call gets past `create_client` to the transport.
+    fn extractor_ctx() -> RequestContext {
+        let mut ctx = openai_ctx();
+        let mut role = Role::new("parent", "");
+        role.set_model(structured_model());
+        ctx.role = Some(role);
+        ctx
+    }
+
+    /// Runs a schema node whose first turn says some prose and calls a tool
+    /// and whose second turn answers with JSON, marking that turn native when
+    /// `final_dialect` is set; returns the outcome, the final state, the
+    /// number of node model calls and the number of extractor calls.
+    async fn run_two_turn_schema_node(
+        final_dialect: Option<SchemaDialect>,
+    ) -> (Result<LlmExecutionOutcome>, StateManager, u32, u32) {
+        use crate::function::ToolCall;
+
+        let node = node_with_schema(None, done_schema());
+        let mut state = manager_with(&[]);
+        let mut ctx = extractor_ctx();
+        let mut agent = Agent::test_new(AgentConfig::default());
+        agent.set_model(structured_model());
+        ctx.agent = Some(agent);
+        let abort = create_abort_signal();
+        let mut calls = 0u32;
+        let mut extractor_calls = 0u32;
+
+        let result = run(
+            "decide",
+            &node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, ctx, _abort| {
+                calls += 1;
+                if calls == 1 {
+                    ctx.native_format.last_dialect = None;
+                    boxed_completion(async {
+                        let call = ToolCall::new("t".into(), json!({}), Some("id-0".into()));
+                        Ok((
+                            "let me check".to_string(),
+                            vec![ToolResult::new(call, json!("ok"))],
+                        ))
+                    })
+                } else {
+                    ctx.native_format.last_dialect = final_dialect;
+                    boxed_completion(async {
+                        Ok((r#"{"done": true, "note": null}"#.to_string(), vec![]))
+                    })
+                }
+            }),
+        )
+        .await;
+        let mut transport = transport_call(|_input, _ctx| {
+            extractor_calls += 1;
+            boxed_completion(async { Ok((r#"{"done": false}"#.to_string(), vec![])) })
+        });
+        let outcome =
+            finish_with(&node, &mut state, &mut ctx, result, &abort, &mut transport).await;
+        (outcome, state, calls, extractor_calls)
+    }
+
+    #[tokio::test]
+    async fn native_final_turn_is_parsed_without_the_extractor() {
+        let (outcome, state, calls, extractor_calls) =
+            run_two_turn_schema_node(Some(SchemaDialect::OpenAiStrict)).await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(calls, 2);
+        assert_eq!(extractor_calls, 0);
+        assert_eq!(state.state().get("done"), Some(&json!(true)));
+        assert_eq!(state.state().get("note"), None);
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_final_turn_is_parsed_and_keeps_its_nulls() {
+        let (outcome, state, calls, extractor_calls) =
+            run_two_turn_schema_node(Some(SchemaDialect::Anthropic)).await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(calls, 2);
+        assert_eq!(extractor_calls, 0);
+        assert_eq!(state.state().get("done"), Some(&json!(true)));
+        assert_eq!(state.state().get("note"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn final_turn_without_the_format_extracts_from_the_accumulated_text() {
+        let (outcome, state, calls, extractor_calls) = run_two_turn_schema_node(None).await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(calls, 2);
+        assert_eq!(extractor_calls, 1);
+        assert_eq!(state.state().get("done"), Some(&json!(false)));
+    }
+
+    /// An unparseable native final turn falls back to the accumulated text,
+    /// which was not written under the format, so its nulls stay.
+    #[tokio::test]
+    async fn unparseable_native_final_turn_falls_back_to_the_accumulated_text() {
+        let node = node_with_schema(None, done_schema());
+        let mut state = manager_with(&[]);
+        let mut ctx = extractor_ctx();
+        ctx.native_format.final_turn = Some(("not json".to_string(), SchemaDialect::OpenAiStrict));
+        let abort = create_abort_signal();
+        let mut extractor_calls = 0u32;
+        let mut transport = transport_call(|_input, _ctx| {
+            extractor_calls += 1;
+            boxed_completion(async { Ok((r#"{"done": false}"#.to_string(), vec![])) })
+        });
+
+        let outcome = finish_with(
+            &node,
+            &mut state,
+            &mut ctx,
+            Ok(r#"{"done": true, "note": null}"#.to_string()),
+            &abort,
+            &mut transport,
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(extractor_calls, 0);
+        assert_eq!(state.state().get("done"), Some(&json!(true)));
+        assert_eq!(state.state().get("note"), Some(&Value::Null));
+        assert_eq!(ctx.native_format.final_turn, None);
+    }
+
+    #[tokio::test]
+    async fn finish_without_a_schema_clears_the_final_turn() {
+        let node = node_with(None);
+        let mut state = manager_with(&[]);
+        let mut ctx = plain_ctx();
+        ctx.native_format.final_turn = Some(("{}".to_string(), SchemaDialect::OpenAiStrict));
+
+        finish(
+            &node,
+            &mut state,
+            &mut ctx,
+            Ok("{}".to_string()),
+            &create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.native_format.final_turn, None);
+    }
+
+    #[tokio::test]
+    async fn completion_runner_retries_without_the_format_after_a_400() {
+        let mut ctx = openai_ctx();
+        let mut role = Role::new("r", "");
+        role.set_model(structured_model());
+        role.set_structured_output(Some(StructuredOutputSpec {
+            name: "answer".to_string(),
+            schema: json!({"type": "object"}),
+        }));
+        let input = Input::from_str(&ctx, "hi", Some(role)).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = completion_runner_with(|_abort| {
+            let seen = Arc::clone(&seen);
+            transport_call(move |input, _ctx| {
+                let has_spec = input.role().structured_output().is_some();
+                seen.lock().unwrap().push(has_spec);
+                boxed_completion(async move {
+                    if has_spec {
+                        Err(Error::new(crate::client::ApiStatusError {
+                            status: 400,
+                            message: "rejected".to_string(),
+                        }))
+                    } else {
+                        Ok(("ok".to_string(), vec![]))
+                    }
+                })
+            })
+        });
+
+        let (output, _) = runner(&input, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(output, "ok");
+        assert_eq!(*seen.lock().unwrap(), vec![true, false]);
+        assert!(ctx.native_format.rejected);
     }
 }

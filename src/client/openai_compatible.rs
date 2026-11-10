@@ -1,6 +1,7 @@
 use super::access_token::get_access_token;
 use super::oauth;
 use super::openai::*;
+use super::structured_output::SchemaDialect;
 use super::*;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,6 +39,10 @@ impl Client for OpenAICompatibleClient {
 
     fn supports_oauth(&self) -> bool {
         self.config.auth.as_deref() == Some("oauth")
+    }
+
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        Some(SchemaDialect::OpenAiStrict)
     }
 
     async fn chat_completions_inner(
@@ -94,7 +99,7 @@ impl Client for OpenAICompatibleClient {
     }
 }
 
-async fn prepare_chat_completions(
+pub(super) async fn prepare_chat_completions(
     self_: &OpenAICompatibleClient,
     client: &ReqwestClient,
     data: ChatCompletionsData,
@@ -290,6 +295,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_structured_output_dialect_is_openai_strict() {
+        let client = make_client(OpenAICompatibleConfig::default());
+
+        assert_eq!(
+            client.native_structured_output_dialect(),
+            Some(SchemaDialect::OpenAiStrict)
+        );
+    }
+
     fn prepare(
         client: &OpenAICompatibleClient,
         stream: bool,
@@ -317,6 +332,7 @@ mod tests {
             functions: None,
             stream,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -449,5 +465,20 @@ mod tests {
             messages[3]["content"][1]["image_url"]["url"],
             "data:image/png;base64,aGVsbG8="
         );
+    }
+
+    #[test]
+    fn chat_bodies_omit_stream_options() {
+        let client = make_client(compat_config(Some(WireApi::Chat)));
+
+        for stream in [true, false] {
+            let (request_data, _) = prepare(&client, stream).unwrap();
+
+            assert!(
+                request_data.body.get("stream_options").is_none(),
+                "body: {}",
+                request_data.body
+            );
+        }
     }
 }

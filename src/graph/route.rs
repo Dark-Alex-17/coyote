@@ -1,7 +1,9 @@
-use super::llm::CompletionRunner;
+use super::llm::{CompletionRunner, quiet_transport};
 use super::structured;
+use super::structured::ExtractorTransport;
 use super::transcript::truncate_from_front;
 use super::types::{Graph, SessionBlock};
+use crate::client::structured_output::StructuredOutputSpec;
 use crate::client::{Message, MessageContent, Model, ModelType};
 use crate::config::{Input, RequestContext, Role, RoleLike};
 use crate::utils::AbortSignal;
@@ -22,6 +24,8 @@ pub const ROUTE_SCHEMA: &str = r#"{"type":"object","properties":{"decision":{"ty
 
 pub const ROUTE_ROLE_NAME: &str = "__graph_route__";
 
+const ROUTE_SCHEMA_NAME: &str = "route_decision";
+
 const ROUTE_QUESTION: &str = "Is the user instructing the agent to perform its task (run) or asking about / discussing previous work (chat)? Answer with JSON matching the schema.";
 
 pub async fn classify(
@@ -40,6 +44,7 @@ pub async fn classify(
     // without the taken state.
     let saved_last_message = ctx.last_message.take();
     let saved_declared = std::mem::take(&mut ctx.declared_function_names);
+    ctx.native_format = Default::default();
     let outcome = decide(&input, ctx, abort, runner).await;
     ctx.last_message = saved_last_message;
     ctx.declared_function_names = saved_declared;
@@ -56,7 +61,8 @@ async fn decide(
         .await
         .context("Graph route classifier call failed")?;
     let schema: Value = serde_json::from_str(ROUTE_SCHEMA)?;
-    let value = structured::extract(&raw, &schema, ctx, abort)
+    let mut transport = quiet_transport(abort.clone());
+    let value = extract_decision_with(&raw, &schema, ctx, abort, &mut transport)
         .await
         .context("Graph route classifier could not read the decision")?;
     match value.get("decision").and_then(Value::as_str) {
@@ -64,6 +70,19 @@ async fn decide(
         Some("chat") => Ok(Branch::Chat),
         _ => bail!("Graph route classifier returned an unrecognised decision: {value}"),
     }
+}
+
+/// Must run straight after the classifier call: the dialect that call ran
+/// under is still in `ctx.native_format.last_dialect`.
+async fn extract_decision_with(
+    raw: &str,
+    schema: &Value,
+    ctx: &mut RequestContext,
+    abort: &AbortSignal,
+    transport: &mut ExtractorTransport<'_>,
+) -> Result<Value> {
+    let producer_dialect = ctx.native_format.last_dialect;
+    structured::extract_with_transport(raw, schema, ctx, abort, producer_dialect, transport).await
 }
 
 fn build_route_role(ctx: &RequestContext, block: &SessionBlock) -> Result<Role> {
@@ -79,6 +98,10 @@ fn build_route_role(ctx: &RequestContext, block: &SessionBlock) -> Result<Role> 
     role.set_model(model);
     role.set_enabled_tools(Some(Vec::new()));
     role.set_enabled_mcp_servers(Some(Vec::new()));
+    role.set_structured_output(Some(StructuredOutputSpec {
+        name: ROUTE_SCHEMA_NAME.to_string(),
+        schema: serde_json::from_str(ROUTE_SCHEMA)?,
+    }));
     Ok(role)
 }
 
@@ -619,6 +642,87 @@ mod tests {
             "{err:#}"
         );
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn build_route_role_carries_the_route_decision_spec() {
+        let ctx = ctx_with_session();
+
+        let role = build_route_role(&ctx, &block(None)).unwrap();
+
+        assert_eq!(
+            role.structured_output(),
+            Some(&StructuredOutputSpec {
+                name: "route_decision".to_string(),
+                schema: serde_json::from_str(ROUTE_SCHEMA).unwrap(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_runs_with_a_fresh_native_format_state() {
+        let mut ctx = ctx_with_session();
+        ctx.native_format.rejected = true;
+        let mut rejected_during_call = Vec::new();
+        let mut runner = completion_runner(|_input, ctx, _abort| {
+            rejected_during_call.push(ctx.native_format.rejected);
+            boxed_completion(async { Ok((r#"{"decision":"run"}"#.to_string(), vec![])) })
+        });
+
+        let outcome = classify(
+            &mut ctx,
+            &graph(""),
+            &block(None),
+            "x",
+            &create_abort_signal(),
+            &mut runner,
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), Branch::Run);
+        assert_eq!(rejected_during_call, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn decision_extraction_strips_nulls_by_the_classifier_calls_dialect() {
+        use crate::client::structured_output::SchemaDialect;
+        use crate::graph::llm::test_support::transport_call;
+        use serde_json::json;
+
+        let schema = json!({
+            "type": "object",
+            "properties": {"decision": {"type": "string"}, "note": {"type": "string"}},
+            "required": ["decision"]
+        });
+        let raw = r#"{"decision":"run","note":null}"#;
+        for (dialect, expected) in [
+            (
+                Some(SchemaDialect::OpenAiStrict),
+                json!({"decision": "run"}),
+            ),
+            (None, json!({"decision": "run", "note": null})),
+        ] {
+            let mut ctx = ctx_with_session();
+            ctx.native_format.last_dialect = dialect;
+            let mut extractor_calls = 0u32;
+            let mut transport = transport_call(|_input, _ctx| {
+                extractor_calls += 1;
+                boxed_completion(async { Ok(("{}".to_string(), vec![])) })
+            });
+
+            let value = extract_decision_with(
+                raw,
+                &schema,
+                &mut ctx,
+                &create_abort_signal(),
+                &mut transport,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(value, expected, "dialect {dialect:?}");
+            assert_eq!(extractor_calls, 0);
+        }
     }
 
     #[test]

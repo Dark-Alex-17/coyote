@@ -43,8 +43,9 @@ use nu_ansi_term::Color;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::io;
-use std::sync::atomic::AtomicBool;
+use std::fmt::Display;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::{cmp, env, path::PathBuf};
 use syntect::highlighting::{Highlighter, Theme};
@@ -63,6 +64,39 @@ pub static SHOW_TOOL_CALLS: LazyLock<bool> = LazyLock::new(|| {
 });
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
+pub static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+/// Where a human-facing line goes. Under `--json` stdout carries only the
+/// final report, so a line that would print there moves to stderr or is
+/// dropped instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSink {
+    Stdout,
+    Stderr,
+    Suppressed,
+}
+
+impl OutputSink {
+    pub fn pick(json_output: bool, when_json: OutputSink) -> Self {
+        if json_output { when_json } else { Self::Stdout }
+    }
+
+    pub fn println(self, line: impl Display) {
+        match self {
+            Self::Stdout => println!("{line}"),
+            Self::Stderr => eprintln!("{line}"),
+            Self::Suppressed => {}
+        }
+    }
+
+    pub fn writer(self) -> Box<dyn Write + Send> {
+        match self {
+            Self::Stdout => Box::new(io::stdout()),
+            Self::Stderr => Box::new(io::stderr()),
+            Self::Suppressed => Box::new(io::sink()),
+        }
+    }
+}
 
 static ACP_PERMISSION_QUEUE: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
 
@@ -357,6 +391,35 @@ pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_json_every_sink_is_stdout() {
+        for when_json in [
+            OutputSink::Stdout,
+            OutputSink::Stderr,
+            OutputSink::Suppressed,
+        ] {
+            assert_eq!(OutputSink::pick(false, when_json), OutputSink::Stdout);
+        }
+    }
+
+    #[test]
+    fn under_json_the_requested_sink_wins() {
+        for when_json in [
+            OutputSink::Stdout,
+            OutputSink::Stderr,
+            OutputSink::Suppressed,
+        ] {
+            assert_eq!(OutputSink::pick(true, when_json), when_json);
+        }
+    }
+
+    #[test]
+    fn a_suppressed_writer_accepts_and_drops_everything() {
+        let mut writer = OutputSink::Suppressed.writer();
+        assert_eq!(writer.write(b"dropped").unwrap(), 7);
+        writer.flush().unwrap();
+    }
 
     #[test]
     #[cfg(not(target_os = "windows"))]

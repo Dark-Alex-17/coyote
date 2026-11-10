@@ -150,7 +150,8 @@ pub async fn fetch_with_loaders(
                     save_file.write_all(&chunk).await?;
                 }
                 let contents = if size == 0 {
-                    println!("{}", warning_text(&format!("No content at '{path}'")));
+                    fetch_warning_sink(JSON_OUTPUT.load(Ordering::SeqCst))
+                        .println(warning_text(&format!("No content at '{path}'")));
                     String::new()
                 } else {
                     run_loader_command(&save_path, &extension, loader_command)?
@@ -238,12 +239,13 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
     let start_url = Url::parse(start_url)?;
     let mut paths = vec![start_url.path().to_string()];
     let normalized_start_url = normalize_start_url(&start_url);
+    let progress = crawl_progress_sink(JSON_OUTPUT.load(Ordering::SeqCst));
     if !options.no_log {
-        println!(
+        progress.println(format_args!(
             "Start crawling url={start_url} exclude={} extract={}",
             options.exclude.join(","),
             options.extract.as_deref().unwrap_or_default()
-        );
+        ));
     }
 
     if let Ok(true) = GITHUB_REPO_RE.is_match(start_url.as_str()) {
@@ -292,7 +294,7 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
             match res {
                 Ok((path, text, links)) => {
                     if !options.no_log {
-                        println!("Crawled {path}");
+                        progress.println(format_args!("Crawled {path}"));
                     }
                     if !text.is_empty() {
                         result_pages.push(Page { path, text });
@@ -307,7 +309,7 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
                     if BREAK_ON_ERROR {
                         return Err(err);
                     } else if !options.no_log {
-                        println!("{}", error_text(&pretty_error(&err)));
+                        progress.println(error_text(&pretty_error(&err)));
                     }
                 }
             }
@@ -487,6 +489,14 @@ fn match_link(path: &str, link: &str) -> bool {
                 .trim_end_matches("/index.htm")
 }
 
+fn fetch_warning_sink(json_output: bool) -> OutputSink {
+    OutputSink::pick(json_output, OutputSink::Stderr)
+}
+
+fn crawl_progress_sink(json_output: bool) -> OutputSink {
+    OutputSink::pick(json_output, OutputSink::Stderr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +505,18 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     const TEST_CAP: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_no_content_warning_moves_to_stderr_under_json() {
+        assert_eq!(fetch_warning_sink(false), OutputSink::Stdout);
+        assert_eq!(fetch_warning_sink(true), OutputSink::Stderr);
+    }
+
+    #[test]
+    fn crawl_progress_moves_to_stderr_under_json() {
+        assert_eq!(crawl_progress_sink(false), OutputSink::Stdout);
+        assert_eq!(crawl_progress_sink(true), OutputSink::Stderr);
+    }
 
     async fn serve_raw(head: String, body: Vec<u8>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

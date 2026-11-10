@@ -422,6 +422,37 @@ pub(crate) fn interleaved_user_data() -> super::ChatCompletionsData {
         functions: None,
         stream: false,
         prompt_cache_ttl: None,
+        structured_output: None,
+    }
+}
+
+/// One plain user turn carrying a structured-output spec. The optional,
+/// length-bounded `note` property is rewritten by the strict dialects, so a
+/// builder that skips conversion produces a different schema.
+#[cfg(test)]
+pub(crate) fn structured_output_data() -> super::ChatCompletionsData {
+    super::ChatCompletionsData {
+        messages: vec![Message::new(
+            MessageRole::User,
+            MessageContent::Text("hello".into()),
+        )],
+        temperature: None,
+        top_p: None,
+        reasoning_effort: None,
+        functions: None,
+        stream: false,
+        prompt_cache_ttl: None,
+        structured_output: Some(super::structured_output::StructuredOutputSpec {
+            name: "answer".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "answer": { "type": "string" },
+                    "note": { "type": "string", "minLength": 1 },
+                },
+                "required": ["answer"],
+            }),
+        }),
     }
 }
 

@@ -6,13 +6,14 @@ use super::{
 };
 use crate::config::paths;
 use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
-use crate::utils::{AbortSignal, render_image_slots, strip_image_slots};
+use crate::utils::{AbortSignal, JSON_OUTPUT, OutputSink, render_image_slots, strip_image_slots};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use log::info;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 pub fn active_agent_graph_name(ctx: &RequestContext) -> Option<String> {
     let name = ctx.agent.as_ref()?.name().to_string();
@@ -237,7 +238,7 @@ pub async fn run_graph_turn(
         None => route::classify(ctx, &graph, &block, &record_prompt, &abort, runner).await?,
     };
     ctx.set_last_graph_branch(branch, forced.is_some());
-    println!("{}", route::routing_line(branch));
+    routing_line_sink(JSON_OUTPUT.load(Ordering::SeqCst)).println(route::routing_line(branch));
     match branch {
         Branch::Run => {
             let previous_turns = previous_turns_for(ctx);
@@ -415,6 +416,10 @@ pub fn carried_for(ctx: &RequestContext, carry: &[String]) -> IndexMap<String, V
         .unwrap_or_default()
 }
 
+fn routing_line_sink(json_output: bool) -> OutputSink {
+    OutputSink::pick(json_output, OutputSink::Stderr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +441,12 @@ mod tests {
     const TURNS_ECHO_GRAPH: &str = "initial_state:\n  initial_prompt: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{previous_turns}}\"\n";
     /// A graph that carries `said` and echoes it.
     const CARRY_ECHO_GRAPH: &str = "carry: [said]\ninitial_state:\n  said: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{said}}\"\n";
+
+    #[test]
+    fn the_routing_line_moves_to_stderr_under_json() {
+        assert_eq!(routing_line_sink(false), OutputSink::Stdout);
+        assert_eq!(routing_line_sink(true), OutputSink::Stderr);
+    }
 
     fn yaml_defaults() -> HashMap<String, Value> {
         HashMap::from([
