@@ -20,15 +20,12 @@ use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
     DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
-use crate::events::Origin;
 use crate::function::write_file_atomic;
 use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
-use crate::prompt::{
-    NeedsHuman, PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present,
-};
+use crate::prompt::{NeedsHuman, Prompter, confirm, human_present, input, reask};
 use crate::rag::{RagInitConfig, RagInitRun};
 use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
@@ -401,17 +398,13 @@ impl Agent {
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
             if menu_can_use_terminal() {
-                let req = PromptRequest {
-                    default: Some(json!(true)),
-                    ..PromptRequest::new(
-                        PromptAction::Confirm,
-                        "The agent has documents attached, init RAG?",
-                        Origin::detached(),
-                    )
-                };
                 // The knowledge base is optional, so a run with no human
                 // to ask declines it instead of failing.
-                ans = match ask(prompter.as_ref(), req).and_then(PromptAnswer::into_confirmed) {
+                ans = match confirm(
+                    prompter.as_ref(),
+                    "The agent has documents attached, init RAG?".to_string(),
+                    true,
+                ) {
                     Ok(answer) => answer,
                     Err(e) if NeedsHuman::caused(&e) => false,
                     Err(e) => return Err(e),
@@ -1443,15 +1436,11 @@ async fn init_graph_rags(
                     ));
                 }
 
-                let req = PromptRequest {
-                    default: Some(json!(true)),
-                    ..PromptRequest::new(
-                        PromptAction::Confirm,
-                        format!("Initialize RAG knowledge base for rag node '{node_id}'?"),
-                        Origin::detached(),
-                    )
-                };
-                let ans = ask(prompter.as_ref(), req)?.into_confirmed()?;
+                let ans = confirm(
+                    prompter.as_ref(),
+                    format!("Initialize RAG knowledge base for rag node '{node_id}'?"),
+                    true,
+                )?;
 
                 if !ans {
                     bail!(
@@ -1610,20 +1599,18 @@ fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
     bail!("{message}")
 }
 
-/// Asks for an agent variable until the answer is not blank.
+/// Asks for an agent variable until the answer is not blank; a blank one
+/// is asked again with the requirement in front of the label.
 fn ask_required_variable(prompter: &dyn Prompter, name: &str, description: &str) -> Result<String> {
+    let label = format!("{name} ({description}):");
+    let mut question = label.clone();
     loop {
-        let req = PromptRequest::new(
-            PromptAction::Input,
-            format!("{name} ({description}):"),
-            Origin::detached(),
-        );
-        let value = ask(prompter, req)?.into_text()?;
+        let value = input(prompter, &question, None, None)?;
         if value.trim().is_empty() {
-            eprintln!("This field is required");
-        } else {
-            return Ok(value);
+            question = reask("This field is required.", &label);
+            continue;
         }
+        return Ok(value);
     }
 }
 
@@ -1637,15 +1624,19 @@ fn may_ask_human(interactive: bool, tty: bool) -> bool {
 mod tests {
     use super::*;
     use crate::config::conflict::prompt_script::Scripted;
-    use crate::prompt::{HeadlessPrompter, ScriptedPrompter};
+    use crate::prompt::{HeadlessPrompter, PromptAction, PromptAnswer, ScriptedPrompter};
     use crate::testing::{self, AtomicFlagGuard};
     use crate::utils::{ACP_SERVER, HEADLESS};
     use serial_test::serial;
 
+    /// A blank answer is asked again with the reason in front of the
+    /// label, so the modal says why it is back; the first non-blank one
+    /// lands.
     #[test]
     #[serial]
-    fn ask_required_variable_re_asks_until_the_answer_is_not_blank() {
+    fn a_blank_required_variable_is_asked_again_with_the_reason() {
         let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
             PromptAnswer::Text("  ".to_string()),
             PromptAnswer::Text("value-7p".to_string()),
         ]);
@@ -1660,7 +1651,11 @@ mod tests {
             .collect();
         assert_eq!(
             questions,
-            vec!["region (Deployment region):", "region (Deployment region):"]
+            vec![
+                "region (Deployment region):",
+                "This field is required. region (Deployment region):",
+                "This field is required. region (Deployment region):",
+            ]
         );
         assert!(
             prompter
