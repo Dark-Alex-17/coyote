@@ -195,6 +195,13 @@ pub fn pending_tasks(ctx: &RequestContext) -> Vec<PendingTask> {
     tasks
 }
 
+fn running_agent_count(tasks: &[PendingTask]) -> usize {
+    tasks
+        .iter()
+        .filter(|t| t.kind == TaskKind::Agent && !t.finished)
+        .count()
+}
+
 pub fn build_pending_tasks_guardrail_prompt(tasks: &[PendingTask]) -> String {
     let running: Vec<&PendingTask> = tasks.iter().filter(|t| !t.finished).collect();
     let finished: Vec<&PendingTask> = tasks.iter().filter(|t| t.finished).collect();
@@ -222,7 +229,7 @@ pub fn build_pending_tasks_guardrail_prompt(tasks: &[PendingTask]) -> String {
              response expecting them to 'report back' — they will not.",
             count = running.len()
         );
-        let running_agents = running.iter().filter(|t| t.kind == TaskKind::Agent).count();
+        let running_agents = running_agent_count(tasks);
         for (count, family, wait) in [
             (running_agents, "agents", "agent__wait"),
             (running.len() - running_agents, "jobs", "job__wait"),
@@ -455,8 +462,7 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                           NOT return or consume results: it lists the finished ids, each with the exact collect \
                           command in `next_action`. Call it alone in a batch, then collect the reported ids. It \
                           does not reclaim anything: you must still collect or cancel every agent before ending \
-                          your turn. Do not repeat an identical timed wait: that is flagged as a loop, so change \
-                          `timeout_secs` or do other work first.".to_string(),
+                          your turn. On a timeout, wait again or do other work.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -2626,7 +2632,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         return Err(error);
     }
 
-    Ok(json!({
+    let mut result = json!({
         "status": "ok",
         "id": agent_id,
         "agent": agent_name,
@@ -2636,7 +2642,21 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
                            done, returns output) or `agent__cancel` (if you no longer need it). Ending your turn with \
                            unreclaimed agents will be rejected and forces you to handle them. Do NOT assume the agent \
                            will 'report back' on its own."),
-    }))
+    });
+    append_spawn_wait_hint(ctx, &mut result);
+
+    Ok(result)
+}
+
+fn append_spawn_wait_hint(ctx: &RequestContext, result: &mut Value) {
+    if running_agent_count(&pending_tasks(ctx)) >= 2
+        && let Some(Value::String(message)) = result.get_mut("message")
+    {
+        message.push_str(
+            " With several agents running and nothing else to do, `agent__wait` blocks until the \
+             first one finishes; then collect the ids it reports.",
+        );
+    }
 }
 
 async fn handle_check(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
@@ -3008,7 +3028,7 @@ async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
                 "ready": [],
                 "running": running,
                 "unknown": unknown,
-                "message": "No watched agent finished before the timeout. Nothing is lost: every agent is still running and registered. Do other work, or wait again with a different timeout_secs (repeating an identical call is flagged as a loop).",
+                "message": "No watched agent finished before the timeout. Nothing is lost: every agent is still running and registered. Do other work, or wait again.",
             });
         }
 
@@ -15989,6 +16009,112 @@ mod tests {
 
         ctx.node_job_scope = None;
         assert_eq!(pending_tasks(&ctx).len(), 2);
+    }
+
+    fn register_never_finishing_job(ctx: &mut RequestContext, id: &str) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(JobResult {
+                output: json!(null),
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        mem::forget(rt);
+        let job = JobHandle {
+            id: id.to_string(),
+            tool: "execute_command".to_string(),
+            started_at: std::time::Instant::now(),
+            join_handle,
+            abort_signal: create_abort_signal(),
+            state: Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            })),
+            output_buf: Arc::new(Mutex::new(RingBuf::default())),
+            no_change_checks: 0,
+            last_check_state: None,
+        };
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(job)
+            .unwrap();
+    }
+
+    const SPAWN_WAIT_HINT: &str = " With several agents running and nothing else to do, \
+                                   `agent__wait` blocks until the first one finishes; then \
+                                   collect the ids it reports.";
+
+    const SPAWN_BASE_MESSAGE: &str = "Agent 'explore' spawned as 'a1' and is running in the \
+                                      background. Do NOT assume the agent will 'report back' on \
+                                      its own.";
+
+    fn spawn_message(ctx: &RequestContext) -> String {
+        let mut result = json!({ "status": "ok", "message": SPAWN_BASE_MESSAGE });
+        append_spawn_wait_hint(ctx, &mut result);
+        result["message"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn spawn_message_has_no_wait_hint_for_a_lone_running_agent() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _new = register_running_agent(&mut ctx, "a1", "explore");
+
+            let message = spawn_message(&ctx);
+
+            assert_eq!(message, SPAWN_BASE_MESSAGE);
+        });
+    }
+
+    #[test]
+    fn spawn_message_appends_the_wait_hint_once_two_agents_are_running() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _other = register_running_agent(&mut ctx, "a0", "explore");
+            let _new = register_running_agent(&mut ctx, "a1", "explore");
+
+            let message = spawn_message(&ctx);
+
+            assert_eq!(message, format!("{SPAWN_BASE_MESSAGE}{SPAWN_WAIT_HINT}"));
+        });
+    }
+
+    #[test]
+    fn spawn_message_does_not_count_a_finished_uncollected_agent() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            register_fake_agent(&mut ctx, "a0", "explore");
+            wait_until_finished(&ctx, "a0");
+            let _new = register_running_agent(&mut ctx, "a1", "explore");
+
+            let message = spawn_message(&ctx);
+
+            assert_eq!(message, SPAWN_BASE_MESSAGE);
+        });
+    }
+
+    #[test]
+    fn spawn_message_does_not_count_running_jobs() {
+        run_async(async {
+            let mut ctx = ctx_with_job_capable_supervisor();
+            register_never_finishing_job(&mut ctx, "job_1");
+            register_never_finishing_job(&mut ctx, "job_2");
+            let _new = register_running_agent(&mut ctx, "a1", "explore");
+            assert_eq!(
+                pending_tasks(&ctx).iter().filter(|t| !t.finished).count(),
+                3
+            );
+
+            let message = spawn_message(&ctx);
+
+            assert_eq!(message, SPAWN_BASE_MESSAGE);
+        });
     }
 
     #[test]
