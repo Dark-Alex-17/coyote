@@ -4385,7 +4385,13 @@ mod tests {
                 },
             ]
         );
-        assert!(own_events(&sink, ".info").is_empty());
+        assert!(
+            !sink
+                .drain()
+                .iter()
+                .any(|event| matches!(event, Event::QueuedInput { text } if text == ".info")),
+            "a held command was announced as queued input"
+        );
         let frame = harness.draw();
         assert!(frame.contains("pending: 2"), "{frame}");
 
@@ -8879,13 +8885,32 @@ mod tests {
         files
     }
 
-    /// Every direct keyboard read outside this module: crossterm's
+    /// The calls that read the keyboard directly: crossterm's
     /// `read`/`poll`, `read_single_key`, `edit_file` (which hands the tty
     /// to `$EDITOR`), `run_command` and `wait_for_status` (a child on the
     /// inherited tty), inquire's prompt builders (nothing else under
     /// `src/` constructs a `Text`, `Select` or the like), and the
     /// `InquirePrompter` constructors, since a handler seating its own
     /// terminal prompter bypasses the one on `ctx.prompter`.
+    const NEEDLES: [&str; 14] = [
+        "event::read(",
+        "event::poll(",
+        "read_single_key(",
+        "edit_file(",
+        "run_command(",
+        "wait_for_status(",
+        "wait_for_status_interruptible(",
+        "Confirm::new(",
+        "Select::new(",
+        "MultiSelect::new(",
+        "Text::new(",
+        "Password::new(",
+        "InquirePrompter::default(",
+        "InquirePrompter::new(",
+    ];
+
+    /// Every function outside this module whose body makes one of the
+    /// [`NEEDLES`] calls.
     fn keyboard_readers() -> Vec<KeyboardReader> {
         fn at_word_start(line: &str, at: usize) -> bool {
             line[..at]
@@ -8893,22 +8918,6 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
         }
-        const NEEDLES: [&str; 14] = [
-            "event::read(",
-            "event::poll(",
-            "read_single_key(",
-            "edit_file(",
-            "run_command(",
-            "wait_for_status(",
-            "wait_for_status_interruptible(",
-            "Confirm::new(",
-            "Select::new(",
-            "MultiSelect::new(",
-            "Text::new(",
-            "Password::new(",
-            "InquirePrompter::default(",
-            "InquirePrompter::new(",
-        ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = root.join("src");
         let mut readers: Vec<KeyboardReader> = Vec::new();
@@ -9098,6 +9107,26 @@ mod tests {
                 .iter()
                 .any(|r| r.file == "src/utils/command.rs" && r.function == "edit_file" && r.gated)
         );
+        // The allowlist keys the inquire prompter's methods by bare name,
+        // which the prompt module's free fns `confirm` and `input` share.
+        // Those, and the other free askers beside them, must stay free of
+        // widgets so a builder in one cannot hide behind a method's entry.
+        let prompt = include_str!("../prompt/mod.rs");
+        for signature in [
+            "pub fn ask(",
+            "pub(crate) fn confirm(",
+            "pub(crate) fn confirm_with_help(",
+            "pub(crate) fn select_closed(",
+            "pub(crate) fn input(",
+        ] {
+            let body = fn_body(prompt, signature);
+            for needle in NEEDLES {
+                assert!(
+                    !body.contains(needle),
+                    "{signature} reads the keyboard itself:\n{body}"
+                );
+            }
+        }
         // The loader never reads the terminal: both of its branches hand
         // the child /dev/null, so the source says `Stdio::null()` for every
         // spawn it makes and never `Stdio::inherit()`.

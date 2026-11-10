@@ -8581,24 +8581,27 @@ fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
     let cargo_copy = cargo_installed_binary(&dir);
 
     let mut shapes = Vec::new();
-    for (what, binary, args, flag) in [
+    for (what, binary, args, flag, action_prefix) in [
         (
             "install at a conflicting file",
             built_binary().to_path_buf(),
             vec!["--install", conflicting_repo.to_str().unwrap()],
             "--install-force",
+            "overwrite local file ",
         ),
         (
             "self-update of a Cargo install",
             cargo_copy.clone(),
             vec!["--update"],
             "--force",
+            "update a Cargo install",
         ),
         (
             "uninstall without --yes",
             built_binary().to_path_buf(),
             vec!["--uninstall", name],
             "--yes",
+            "uninstall bundle 'bundle-c3h'",
         ),
     ] {
         let (ok, out) = run_ttyless_binary(&binary, &dir, &args, what);
@@ -8606,6 +8609,10 @@ fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
         let (action, remedy) = refusal_shape(&out).unwrap_or_else(|| {
             panic!("{what}: the refusal is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{out}")
         });
+        assert!(
+            action.starts_with(action_prefix),
+            "{what}: the refusal names the action {action:?}, not `{action_prefix}...`:\n{out}"
+        );
         assert!(
             remedy.contains(flag),
             "{what}: the refusal's remedy does not name `{flag}`:\n{out}"

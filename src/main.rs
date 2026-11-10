@@ -1020,7 +1020,7 @@ fn resolve_oauth_client(
                 let choice = crate::prompt::select_closed(
                     prompter,
                     "Select a client to authenticate:",
-                    candidates.clone(),
+                    candidates,
                 )?;
                 find_by_name(&choice)
                     .ok_or_else(|| anyhow!("Selected client '{choice}' not found"))?

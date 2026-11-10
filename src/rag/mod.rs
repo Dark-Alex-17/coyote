@@ -1095,7 +1095,7 @@ impl Rag {
 
         if has_error {
             let mut aborted = true;
-            if menu_can_use_terminal() && total > 0 {
+            if menu_can_use_terminal() {
                 let ans = confirm(
                     prompter,
                     "Some documents failed to load. Continue?".to_string(),

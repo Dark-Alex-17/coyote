@@ -65,8 +65,8 @@ fn required_input(
 }
 
 /// The password that encrypts the vault, asked until it is at least ten
-/// characters; each shortfall is asked again with inquire's wording in
-/// front of the label.
+/// characters; each shortfall is asked again with the reason as a
+/// sentence in front of the label.
 fn ask_vault_password(prompter: &dyn Prompter) -> Result<String> {
     let label = "Enter a password to encrypt all vault secrets:";
     let mut question = label.to_string();

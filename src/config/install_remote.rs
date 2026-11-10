@@ -2471,6 +2471,7 @@ mod tests {
         HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
     };
     use crate::sandbox::SANDBOX_ENV_FLAG;
+    use crate::testing::EnvVarGuard;
     use crate::utils::{IS_STDOUT_TERMINAL, get_env_name};
     use serial_test::serial;
     use std::env;
@@ -3437,6 +3438,86 @@ mod tests {
             "declining every secret must not touch the vault"
         );
         assert!(handle_missing_secrets(&missing, dot_io(&declined())).is_ok());
+    }
+
+    /// Accepting every secret creates the password file once, on the
+    /// first accepted secret, and stores each value: the first secret
+    /// costs the create-file confirm, its path and the vault password;
+    /// the second only its own confirm and value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn accepting_every_missing_secret_creates_the_password_file_once_and_stores_each() {
+        let guard = TestVaultConfigGuard::new("secrets-accept");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "ACCEPT_SECRET_ONE".to_string(),
+            "ACCEPT_SECRET_TWO".to_string(),
+        ];
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Text(password_file.display().to_string()),
+            PromptAnswer::Text("vault-password-9q".to_string()),
+            PromptAnswer::Text("secret-one".to_string()),
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Text("secret-two".to_string()),
+        ]);
+
+        let (added, deferred) = prompt_for_each_secret(&missing, &prompter).unwrap();
+
+        assert_eq!(added, missing);
+        assert!(deferred.is_empty(), "got: {deferred:?}");
+        let requests = prompter.requests();
+        let asked: Vec<(PromptAction, &str)> = requests
+            .iter()
+            .map(|req| (req.action, req.question.as_str()))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    PromptAction::Confirm,
+                    "Add {{ ACCEPT_SECRET_ONE }} to vault now?"
+                ),
+                (
+                    PromptAction::Confirm,
+                    "No password file configured. Do you want to create one now?"
+                ),
+                (
+                    PromptAction::Input,
+                    "Enter the path to the password file to create:"
+                ),
+                (
+                    PromptAction::Password,
+                    "Enter a password to encrypt all vault secrets:"
+                ),
+                (PromptAction::Password, "Enter the secret value:"),
+                (
+                    PromptAction::Confirm,
+                    "Add {{ ACCEPT_SECRET_TWO }} to vault now?"
+                ),
+                (PromptAction::Password, "Enter the secret value:"),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&password_file).unwrap(),
+            "vault-password-9q"
+        );
+        let vault = Vault::init_bare().unwrap();
+        assert_eq!(
+            vault.get_secret("ACCEPT_SECRET_ONE", false).unwrap(),
+            "secret-one"
+        );
+        assert_eq!(
+            vault.get_secret("ACCEPT_SECRET_TWO", false).unwrap(),
+            "secret-two"
+        );
     }
 
     /// Under the full-screen UI a modified obsolete file is a closed
