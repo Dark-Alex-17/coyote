@@ -522,10 +522,12 @@ impl PendingPrompt {
         let field = match req.action {
             PromptAction::Input => {
                 let mut field = new_field(false);
-                // An input's default is offered as the field's text, so
-                // Enter alone accepts it the way inquire's widget does.
+                // An input's default is shown as the placeholder, the way
+                // inquire's widget does: Enter alone accepts it and typing
+                // replaces it rather than appending to it.
                 if let Some(default) = req.default.as_ref().and_then(serde_json::Value::as_str) {
-                    field.insert_str(default);
+                    field.set_placeholder_text(default);
+                    field.set_placeholder_style(DIM);
                 }
                 Some(field)
             }
@@ -643,7 +645,8 @@ impl PendingPrompt {
     }
 
     /// What the field holds as an answer, by the kind that opened it: a
-    /// select's custom text is a selection, the others are text.
+    /// select's custom text is a selection, the others are text; an
+    /// input left empty answers with its default.
     fn field_answer(&self) -> PromptAnswer {
         let text = self
             .field
@@ -652,6 +655,14 @@ impl PendingPrompt {
             .unwrap_or_default();
         match self.req.action {
             PromptAction::Select => PromptAnswer::Selected(text),
+            PromptAction::Input if text.is_empty() => {
+                let default = self
+                    .req
+                    .default
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str);
+                PromptAnswer::Text(default.unwrap_or_default().to_string())
+            }
             _ => PromptAnswer::Text(text),
         }
     }
@@ -4856,11 +4867,11 @@ mod tests {
         );
     }
 
-    /// An input's default is already in the field with the cursor after
-    /// it, so Enter alone accepts it and typing appends; its help line
+    /// An input's default sits dimmed in the empty field as a placeholder,
+    /// so Enter alone accepts it and typing replaces it; its help line
     /// sits dimmed between the question and the field.
     #[test]
-    fn an_input_modal_offers_its_default_in_the_field_under_the_help() {
+    fn an_input_modal_shows_its_default_as_a_placeholder_and_typing_replaces_it() {
         let mut harness = Harness::standalone(80, 24);
         let req = PromptRequest {
             default: Some(serde_json::json!("us-east-1")),
@@ -4891,7 +4902,7 @@ mod tests {
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
-            PromptAnswer::Text("xyz".to_string())
+            PromptAnswer::Text("yz".to_string())
         );
     }
 

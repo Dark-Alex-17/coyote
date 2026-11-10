@@ -23,6 +23,6 @@ expression: frame
 "                                                                                "
 "AWS region:                                                                     "
 "Where your secrets live (e.g. us-east-1, eu-west-2)                             "
-"us-east-1                                                                       "
+" us-east-1                                                                      "
 "Enter = answer  Esc = cancel                                                    "
 "openai:test-model . no session . agents 0 . jobs 0                              "

@@ -8622,3 +8622,295 @@ fn update_with_a_tty_on_stdout_but_a_piped_stdin_is_refused_cleanly() {
     );
     assert_tty_restored(&plain);
 }
+
+// ---------------------------------------------------------------------
+// Wizards driven from a clean config dir: the rag wizard's Input modal
+// against its plain-REPL twin, the closed Select's key handling, and
+// typeahead on the `.update` confirm.
+// ---------------------------------------------------------------------
+
+/// Walks the rag wizard from the embedding Select modal to the
+/// `Set chunk size:` Input modal with Enter (the highlighted choice or the
+/// default) and returns the frame showing the chunk-size question. Every
+/// frame is forced by a resize, so `rows` alternates between two heights
+/// and the caller keeps using it for the frames that follow.
+fn walk_to_the_chunk_size_modal(pty: &mut Pty, command: &str, rows: &mut u16) -> String {
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    let mut frame = next_wizard_frame(pty, rows);
+    let mut steps = 0;
+    while !squeezed(&frame).contains("Setchunksize:") {
+        assert!(
+            !squeezed(&frame).contains("Adddocuments:"),
+            "`{command}` reached `Add documents:` without asking the chunk size:\n{frame}"
+        );
+        assert!(
+            steps < 4,
+            "`{command}` did not reach `Set chunk size:` within 4 answers:\n{frame}"
+        );
+        pty.read_for(HOTKEY_GAP);
+        pty.send(b"\r").unwrap();
+        frame = next_wizard_frame(pty, rows);
+        steps += 1;
+    }
+    frame
+}
+
+/// A repaint forced by flipping the height between 50 and 48 rows.
+fn next_wizard_frame(pty: &mut Pty, rows: &mut u16) -> String {
+    *rows = if *rows == 50 { 48 } else { 50 };
+    repainted_frame(pty, *rows, 120)
+}
+
+/// Typing a value into the `Set chunk size:` Input modal must mean the
+/// same as typing it at the plain REPL's `Set chunk size: (1000)`: the
+/// answer is what was typed, not the default with the typed digits
+/// appended. The wizard derives the chunk-overlay default from the
+/// accepted chunk size (1/20th of it), so the next modal shows which value
+/// was taken: `25` for 500, `50025` for 1000500.
+#[test]
+#[serial]
+fn dot_rag_chunk_size_typed_into_the_input_modal_replaces_the_default_like_the_plain_repl() {
+    let dir = fresh_config_dir("rag-input-default-typed");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".rag new-rag-q8d\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        before,
+        ".rag new-rag-q8d",
+        &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
+    );
+    let mut rows = 48;
+    let frame = walk_to_the_chunk_size_modal(&mut pty, ".rag new-rag-q8d", &mut rows);
+    assert!(
+        squeezed(&frame).contains("Setchunksize:1000"),
+        "the `Set chunk size:` Input modal does not show its default 1000:\n{frame}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"500\r").unwrap();
+    let frame = next_wizard_frame(&mut pty, &mut rows);
+    let flat = squeezed(&frame);
+    assert!(
+        flat.contains("Setchunkoverlay:") && flat.contains("Esc=cancel"),
+        "the wizard did not move on to `Set chunk overlay:` after the chunk size was typed:\n{frame}"
+    );
+    assert!(
+        !flat.contains("Setchunkoverlay:50025"),
+        "typing 500 into the Input modal appended to the default: the wizard took chunk size \
+         1000500 (overlay default 50025), where the plain REPL takes 500:\n{frame}"
+    );
+    assert!(
+        flat.contains("Setchunkoverlay:25"),
+        "the chunk-overlay default is not 25, so the chunk size taken was not the typed 500:\n{frame}"
+    );
+
+    esc_cancels_the_modal(&mut pty, ".rag new-rag-q8d");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in ["q8d", "/rags/"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "the cancelled wizard still wrote {written:?}:\n{since}"
+        );
+    }
+    assert_ui_alive_then_quit(&mut pty, "the cancelled wizard");
+}
+
+/// The plain-REPL twin of the case above, the contract the modal is held
+/// to: inquire shows the default as `(1000)`, `500` typed over it is the
+/// answer, and the next question's default is `(25)`.
+#[test]
+#[serial]
+fn dot_rag_chunk_size_typed_in_the_plain_repl_replaces_the_default() {
+    let dir = fresh_config_dir("rag-input-default-typed-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".rag new-rag-r9e\r").unwrap();
+    pty.wait_for_after("Select embedding model:", before, PTY_DEADLINE)
+        .expect("`.rag <new>` in the plain REPL did not ask for the embedding model");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"\r").unwrap();
+    let mut answered = 0;
+    loop {
+        let text = pty.read_for(Duration::from_millis(800));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        if since.contains("Set chunk size: (1000)") {
+            break;
+        }
+        assert!(
+            answered < 4,
+            "the plain REPL wizard did not reach `Set chunk size: (1000)` within 4 answers:\n{text}"
+        );
+        pty.send(b"\r").unwrap();
+        answered += 1;
+    }
+
+    let typed_at = pty.raw().len();
+    pty.send(b"500\r").unwrap();
+    let since = pty
+        .wait_for_after("Set chunk overlay:", typed_at, PTY_DEADLINE)
+        .expect("the plain REPL wizard did not move on to `Set chunk overlay:`");
+    assert!(
+        since.contains("Set chunk overlay: (25)"),
+        "typing 500 at `Set chunk size: (1000)` did not make the chunk size 500 \
+         (the overlay default is 1/20th of it):\n{since}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{since}"
+    );
+
+    let esc_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+    pty.wait_for_after("dry-model)>", esc_at, PTY_DEADLINE)
+        .expect("Esc on the inquire text prompt did not bring the prompt back");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in ["r9e", "/rags/"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "the cancelled `.rag` still wrote {written:?}:\n{since}"
+        );
+    }
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A closed Select modal takes only its rows: a digit past the last row
+/// is ignored and the question stays up. A non-integer typed into the
+/// `Set chunk size:` Input modal is re-asked in the modal with the
+/// reason (`Must be an integer.`), the way the plain REPL re-asks; Esc
+/// then leaves nothing on disk.
+#[test]
+#[serial]
+fn dot_rag_ignores_a_digit_past_the_closed_select_and_reasks_a_non_integer_chunk_size_in_the_modal()
+{
+    let dir = fresh_config_dir("rag-closed-select-and-reask");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".rag new-rag-t3m\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        before,
+        ".rag new-rag-t3m",
+        &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"9").unwrap();
+    let mut rows = 48;
+    let frame = next_wizard_frame(&mut pty, &mut rows);
+    let flat = squeezed(&frame);
+    assert!(
+        flat.contains("Selectembeddingmodel:") && flat.contains("Esc=cancel"),
+        "`9` on a two-row closed Select closed the modal instead of being ignored:\n{frame}"
+    );
+    assert!(
+        !flat.contains("Setchunksize:"),
+        "`9` on a two-row closed Select answered it and the wizard moved on:\n{frame}"
+    );
+
+    walk_to_the_chunk_size_modal(&mut pty, ".rag new-rag-t3m", &mut rows);
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"abc\r").unwrap();
+    let frame = next_wizard_frame(&mut pty, &mut rows);
+    let flat = squeezed(&frame);
+    assert!(
+        flat.contains("Mustbeaninteger.")
+            && flat.contains("Setchunksize:")
+            && flat.contains("Esc=cancel"),
+        "a non-integer chunk size was not re-asked in the modal with its reason:\n{frame}"
+    );
+    assert!(
+        !flat.contains("Setchunkoverlay:"),
+        "a non-integer chunk size was accepted and the wizard moved on:\n{frame}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "a wizard question released the terminal:\n{frame}"
+    );
+
+    esc_cancels_the_modal(&mut pty, ".rag new-rag-t3m");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in ["t3m", "/rags/"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "the cancelled wizard still wrote {written:?}:\n{since}"
+        );
+    }
+    assert_ui_alive_then_quit(&mut pty, "the cancelled wizard");
+}
+
+/// `.update` followed at once by `y` in the same burst of keys (a user
+/// typing ahead of the confirm): the `y` must not accept `Update anyway?`,
+/// so the modal is still up well past the idle gate, the update has not
+/// started, and `n` then cancels it with the binary untouched.
+#[test]
+#[serial]
+fn dot_update_y_typed_ahead_with_the_command_does_not_accept_the_confirm_modal() {
+    let dir = fresh_config_dir("update-typeahead-y");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let binary = cargo_installed_binary(&dir);
+    let binary_before = fs::metadata(&binary).unwrap();
+    let mut pty = spawn_binary_under(&binary, &dir, &[], WAIT_WRAPPER, "/dev/tty", "");
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b".update\ry").unwrap();
+    wait_for_the_modal(&mut pty, before, ".update", &["Updateanyway?", "y=yes"]);
+
+    pty.read_for(Duration::from_millis(2500));
+    let frame = repainted_frame(&mut pty, 58, 140);
+    let flat = squeezed(&frame);
+    assert!(
+        flat.contains("Updateanyway?") && flat.contains("Esc=cancel"),
+        "the `y` typed ahead with `.update` accepted the confirm modal:\n{frame}"
+    );
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    assert!(
+        !since.contains("Checking target-arch") && !since.contains("updating anyway"),
+        "the update started on the typed-ahead `y`:\n{since}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "Update cancelled.",
+        "the cancellation after `n` on the modal",
+    );
+    let binary_after = fs::metadata(&binary).unwrap();
+    assert!(
+        binary_after.len() == binary_before.len()
+            && binary_after.modified().unwrap() == binary_before.modified().unwrap(),
+        "the cancelled update touched the binary at {}",
+        binary.display()
+    );
+    assert_ui_alive_then_quit(&mut pty, "the cancelled update");
+}
