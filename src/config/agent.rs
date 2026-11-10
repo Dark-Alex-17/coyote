@@ -557,7 +557,7 @@ impl Agent {
             if no_interaction {
                 continue;
             }
-            if may_ask_human(interactive, *IS_STDOUT_TERMINAL) {
+            if may_ask_human(interactive, menu_can_use_terminal()) {
                 if !printed {
                     println!("⚙ Init agent variables...");
                     printed = true;
@@ -1615,7 +1615,10 @@ fn ask_required_variable(prompter: &dyn Prompter, name: &str, description: &str)
 }
 
 /// Whether a required agent variable may be asked for rather than
-/// reported as missing.
+/// reported as missing. The prompter would refuse the question on its
+/// own without a human, but failing on the first refusal would name one
+/// variable; gating here lets the loop collect every unset variable and
+/// report them all in one bail.
 fn may_ask_human(interactive: bool, tty: bool) -> bool {
     interactive && tty && human_present()
 }
@@ -1718,6 +1721,35 @@ mod tests {
             err.to_string().contains("region: Deployment region"),
             "{err}"
         );
+    }
+
+    /// With a human but no terminal there is nowhere to draw the
+    /// question, so the variable is reported missing and nothing is asked.
+    #[test]
+    #[serial]
+    fn without_a_tty_a_missing_required_variable_is_reported_not_asked() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+        let variables = vec![AgentVariable {
+            name: "region".to_string(),
+            description: "Deployment region".to_string(),
+            default: None,
+            value: String::new(),
+        }];
+
+        let err =
+            Agent::init_agent_variables(&variables, None, false, true, &prompter).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "The following agent variables are required:\n  - region: Deployment region"
+            ),
+            "{err}"
+        );
+        assert!(prompter.requests().is_empty());
     }
 
     #[test]
