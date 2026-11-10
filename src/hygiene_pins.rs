@@ -1340,8 +1340,8 @@ fn the_allow_list_is_the_three_dot_diff_minus_docs_and_examples() {
 
 /// (file, path) pairs a string literal may spell although the `.mesh` table does not
 /// dispatch them: the tests that type a retired or unknown verb to assert the
-/// unknown-command error or its absence from the help, and the completer tests that type
-/// a partial word.
+/// unknown-command error or its absence from the help or from a README, and the
+/// completer tests that type a partial word.
 const UNDISPATCHED_MESH_PATHS: &[(&str, &str)] = &[
     ("src/repl/completer.rs", "access tr"),
     ("src/repl/completer.rs", "he"),
@@ -1356,6 +1356,9 @@ const UNDISPATCHED_MESH_PATHS: &[(&str, &str)] = &[
     ("tests/mesh_autostart_repl.rs", "reply"),
     ("tests/mesh_wiki_docs.rs", "reply"),
     ("tests/mesh_wiki_docs.rs", "replying"),
+    ("tests/propagation_node_image.rs", "fetch"),
+    ("tests/propagation_node_image.rs", "knock"),
+    ("tests/propagation_node_image.rs", "sync"),
 ];
 
 /// Words that follow the bare `.mesh` name in prose, as in the unknown-command error,

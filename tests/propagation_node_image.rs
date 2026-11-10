@@ -37,6 +37,10 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The flat paths the store-and-forward sentences named before the `.mesh` commands were
+/// grouped; neither README may spell them again.
+const RETIRED_SYNC_SENTENCE_PATHS: [&str; 3] = ["`.mesh sync`", "`.mesh fetch`", "`.mesh knock`"];
+
 fn deployment_dir() -> PathBuf {
     repo_root().join("deployment").join("propagation-node")
 }
@@ -674,6 +678,12 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
             "root README must not name the file verb `.mesh files fetch` as the manual fetch: {withdrawn}"
         );
     }
+    for retired in RETIRED_SYNC_SENTENCE_PATHS {
+        assert!(
+            !root.contains(retired),
+            "root README must not name the retired path {retired}"
+        );
+    }
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
         readme.contains("it posts the message to a propagation node"),
@@ -744,6 +754,12 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         assert!(
             !readme.contains(withdrawn),
             "deployment README must not name the file verb `.mesh files fetch` as the manual fetch: {withdrawn}"
+        );
+    }
+    for retired in RETIRED_SYNC_SENTENCE_PATHS {
+        assert!(
+            !readme.contains(retired),
+            "deployment README must not name the retired path {retired}"
         );
     }
 }

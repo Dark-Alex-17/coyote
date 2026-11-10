@@ -176,7 +176,7 @@ place of the `local` entry; the Docker image (from v0.10.4) has its own `rnsd` a
 `COYOTE_MESH_RELAY=<node host>:4242` instead.
 
 Once the node's announce is heard, `.mesh config show` shows it under `propagation_nodes`. Selection is nearest by hops;
-pinning a specific node is not supported yet, and `.mesh config show` prints that line itself.
+pinning a specific node is not supported yet.
 
 Deployment recipes and the trust model are in the wiki:
 [Mesh Deployment](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment) and
