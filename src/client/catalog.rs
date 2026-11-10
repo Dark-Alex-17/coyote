@@ -1300,6 +1300,34 @@ rules:
     }
 
     #[test]
+    fn deepseek_rule_clears_structured_output_after_openrouter_fill() {
+        let modelsdev = json!({
+            "deepseek": {"models": {"deepseek-v4-flash": {"structured_output": false}}},
+            "deepinfra": {"models": {"deepseek-ai/DeepSeek-V4-Flash": {"structured_output": true}}},
+        })
+        .to_string();
+        let openrouter = json!({"data": [
+            {"id": "deepseek/deepseek-v4-flash", "supported_parameters": ["structured_outputs"]},
+        ]})
+        .to_string();
+        let build = build_catalog(
+            &make_sources(Some(&modelsdev), Some(&openrouter)),
+            &ALL_QUIRKS,
+        );
+
+        for (provider, model) in [
+            ("deepseek", "deepseek-v4-flash"),
+            ("deepinfra", "deepseek-ai/DeepSeek-V4-Flash"),
+            ("openrouter", "deepseek/deepseek-v4-flash"),
+        ] {
+            assert!(
+                !find_model(find_provider(&build, provider), model).supports_structured_output,
+                "{provider}:{model} still supports structured output"
+            );
+        }
+    }
+
+    #[test]
     fn overlay_hand_owned_ors_structured_output() {
         let mut enabled = ModelData::new("m");
         enabled.supports_structured_output = true;

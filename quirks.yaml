@@ -7,6 +7,9 @@
 # `models:` entries are self-complete. `rules` apply ONLY to API-sourced
 # models, never to hand-owned `models:` entries. Legacy verbatim-preserved
 # entries are grouped under a `# legacy -- pruning candidates` comment.
+#
+# The DeepSeek rules turn off structured output: native strict structured
+# output stops DeepSeek models from calling declared tools.
 
 - provider: openai
   exclude:
@@ -347,6 +350,9 @@
 - provider: mistral
   exclude:
     - "voxtral-*"
+  rules:
+    - match: "*deepseek*"
+      supports_structured_output: false
   models:
     - name: mistral-embed
       type: embedding
@@ -549,6 +555,8 @@
       default_reasoning_effort: high
     - match: "claude-sonnet-4-6"
       default_reasoning_effort: high
+    - match: "*deepseek*"
+      supports_structured_output: false
   variants:
     - match: "claude-opus-4-6"
       suffix: ":thinking"
@@ -754,6 +762,8 @@
       default_reasoning_effort: high
     - match: "us.anthropic.claude-sonnet-4-6"
       default_reasoning_effort: high
+    - match: "*deepseek*"
+      supports_structured_output: false
   variants:
     - match: "us.anthropic.claude-opus-4-6-v1"
       suffix: ":thinking"
@@ -878,6 +888,8 @@
   rules:
     - match: "@cf/*"
       require_max_tokens: true
+    - match: "*deepseek*"
+      supports_structured_output: false
   models:
     - name: '@cf/baai/bge-large-en-v1.5'
       type: embedding
@@ -941,6 +953,8 @@
       patch:
         body:
           enable_thinking: false
+    - match: "*deepseek*"
+      supports_structured_output: false
   variants:
     - match: "qwen3-max"
       suffix: ":thinking"
@@ -1029,6 +1043,9 @@
       max_batch_size: 100
 
 - provider: deepseek
+  rules:
+    - match: "*"
+      supports_structured_output: false
   models:
     # legacy -- pruning candidates
     - name: deepseek-chat
@@ -1195,6 +1212,8 @@
       patch:
         body:
           include_reasoning: true
+    - match: "*deepseek*"
+      supports_structured_output: false
   models:
     # legacy -- pruning candidates
     - name: google/gemini-3-pro-preview
@@ -1351,6 +1370,9 @@
       max_input_tokens: 131072
 
 - provider: deepinfra
+  rules:
+    - match: "*deepseek*"
+      supports_structured_output: false
   models:
     - name: BAAI/bge-large-en-v1.5
       type: embedding
