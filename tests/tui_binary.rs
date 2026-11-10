@@ -8934,7 +8934,9 @@ fn dot_rag_ignores_a_digit_past_the_closed_select_and_reasks_a_non_integer_chunk
 /// `.update` followed at once by `y` in the same burst of keys (a user
 /// typing ahead of the confirm): the `y` must not accept `Update anyway?`,
 /// so the modal is still up well past the idle gate, the update has not
-/// started, and `n` then cancels it with the binary untouched.
+/// started, and `n` then cancels it with the binary untouched. Where the
+/// `y` lands depends on timing (dropped by the modal's idle gate, or typed
+/// into the composer before the modal opened); either way it is not an answer.
 #[test]
 #[serial]
 fn dot_update_y_typed_ahead_with_the_command_does_not_accept_the_confirm_modal() {
@@ -8979,5 +8981,10 @@ fn dot_update_y_typed_ahead_with_the_command_does_not_accept_the_confirm_modal()
         "the cancelled update touched the binary at {}",
         binary.display()
     );
+    // A `y` that reached the composer before the modal opened would ride
+    // along with the next command; one Backspace clears it and is a no-op
+    // on an empty composer.
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x7f").unwrap();
     assert_ui_alive_then_quit(&mut pty, "the cancelled update");
 }
