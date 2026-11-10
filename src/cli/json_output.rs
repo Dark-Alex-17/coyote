@@ -1,7 +1,11 @@
 use crate::config::RunStatsSnapshot;
-use crate::utils::strip_think_tag;
+use fancy_regex::Regex;
 use serde::Serialize;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+static THINK_BLOCK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>\s*").unwrap());
 
 /// The single object `--json` prints on stdout for a one-shot run. Field
 /// order is the output order, and absent values serialise as `null`.
@@ -27,8 +31,8 @@ pub struct JsonUsage {
 }
 
 impl JsonResult {
-    /// `outcome` is the final assistant text, or the rendered error. A
-    /// leading `<think>` block is dropped from the text.
+    /// `outcome` is the final assistant text, or the rendered error. Every
+    /// `<think>` block is dropped from the text, wherever it appears.
     pub fn new(
         outcome: Result<String, String>,
         model: String,
@@ -37,7 +41,10 @@ impl JsonResult {
         elapsed: Duration,
     ) -> Self {
         let (result, error) = match outcome {
-            Ok(text) => (Some(strip_think_tag(&text).into_owned()), None),
+            Ok(text) => (
+                Some(THINK_BLOCK_RE.replace_all(&text, "").trim().to_string()),
+                None,
+            ),
             Err(err) => (None, Some(err)),
         };
         Self {
@@ -99,6 +106,33 @@ mod tests {
         );
 
         assert_eq!(report.result.as_deref(), Some("final"));
+    }
+
+    fn result_of(text: &str) -> Option<String> {
+        JsonResult::new(
+            Ok(text.into()),
+            "stub:m".into(),
+            None,
+            RunStatsSnapshot::default(),
+            Duration::ZERO,
+        )
+        .result
+    }
+
+    #[test]
+    fn a_mid_text_think_block_is_stripped_from_the_result() {
+        assert_eq!(
+            result_of("Sure. <think>x</think> done").as_deref(),
+            Some("Sure. done")
+        );
+    }
+
+    #[test]
+    fn every_think_block_is_stripped_from_the_result() {
+        assert_eq!(
+            result_of("<think>a</think>\none <think>\nb\n</think> two").as_deref(),
+            Some("one two")
+        );
     }
 
     #[test]

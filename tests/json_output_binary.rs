@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
@@ -330,36 +330,65 @@ fn run_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     wait_bounded(child, args)
 }
 
+/// Waits for the child to exit and for both of its pipes to close, all
+/// within one `RUN_TIMEOUT`. A grandchild that keeps a pipe open counts as
+/// a hang just like a child that never exits.
 fn wait_bounded(mut child: Child, args: &[&str]) -> Output {
-    let drain = |mut pipe: Box<dyn Read + Send>| {
+    let (sender, drained) = mpsc::channel();
+    let pipes: [Box<dyn Read + Send>; 2] = [
+        Box::new(child.stdout.take().unwrap()),
+        Box::new(child.stderr.take().unwrap()),
+    ];
+    for (index, mut pipe) in pipes.into_iter().enumerate() {
+        let sender = sender.clone();
         thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let stdout = drain(Box::new(child.stdout.take().unwrap()));
-    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+            let _ = sender.send((index, buf));
+        });
+    }
+    let mut buffers: [Option<Vec<u8>>; 2] = [None, None];
     let deadline = Instant::now() + RUN_TIMEOUT;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "coyote {args:?} did not exit within {}s",
-                RUN_TIMEOUT.as_secs()
-            );
+            for (index, buf) in drained.try_iter() {
+                buffers[index] = Some(buf);
+            }
+            give_up(&mut child, args, "exit", &buffers);
         }
         thread::sleep(Duration::from_millis(20));
     };
+    while buffers.iter().any(Option::is_none) {
+        match drained.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((index, buf)) => buffers[index] = Some(buf),
+            Err(_) => give_up(&mut child, args, "close its output pipes", &buffers),
+        }
+    }
+    let [stdout, stderr] = buffers.map(Option::unwrap_or_default);
     Output {
         status,
-        stdout: stdout.join().unwrap(),
-        stderr: stderr.join().unwrap(),
+        stdout,
+        stderr,
     }
+}
+
+fn give_up(child: &mut Child, args: &[&str], what: &str, buffers: &[Option<Vec<u8>>; 2]) -> ! {
+    let _ = child.kill();
+    let _ = child.wait();
+    let shown = |buf: &Option<Vec<u8>>| {
+        buf.as_deref()
+            .map_or("<still open>".into(), String::from_utf8_lossy)
+            .into_owned()
+    };
+    panic!(
+        "coyote {args:?} did not {what} within {}s\nstdout:\n{}\nstderr:\n{}",
+        RUN_TIMEOUT.as_secs(),
+        shown(&buffers[0]),
+        shown(&buffers[1])
+    );
 }
 
 fn combined(output: &Output) -> String {
@@ -527,9 +556,21 @@ fn a_provider_error_prints_the_error_wrapper_counting_the_failed_call() {
         "{report}"
     );
     assert_turns_match_requests(&report, &model, 1);
-    for key in ["input_tokens", "output_tokens", "cache_read_input_tokens"] {
+    assert_no_usage_and_zero_cost(&report);
+}
+
+/// A run whose every call failed reported no usage, and since only a
+/// succeeded call can make the cost unknown, its cost is a known zero.
+fn assert_no_usage_and_zero_cost(report: &Value) {
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
         assert_eq!(report["usage"][key], Value::Null, "{key}: {report}");
     }
+    assert_eq!(report["total_cost_usd"], json!(0.0), "{report}");
 }
 
 // ---- rejected invocations ----
@@ -687,9 +728,198 @@ fn a_rejected_native_format_is_retried_without_it_and_the_rejection_counts() {
     assert!(output.status.success(), "{}", combined(&output));
     let report = the_only_object(&output);
     assert_eq!(report["result"], json!("forty-two"), "{report}");
+    assert_turns_match_requests(&report, &model, 2);
     let requests = model.requests();
     assert!(has_response_format(&requests[0]), "{requests:?}");
     assert!(!has_response_format(&requests[1]), "{}", requests[1]);
-    assert_turns_match_requests(&report, &model, 2);
     assert_usage_of(&report, 1);
+}
+
+const ITEM_MARKER: &str = "ITEM-MARKER";
+
+/// A map node fans an llm branch out over three items: every branch call
+/// is a model call the wrapper must count and whose usage it must sum.
+#[test]
+fn a_map_over_three_items_counts_every_branch_call() {
+    let dir = TempDir::new("graph-map");
+    let model = ScriptedModel::answering(|request, _| {
+        if mentions(request, ITEM_MARKER) {
+            Reply::Text("branch done".into())
+        } else {
+            Reply::Text("unexpected".into())
+        }
+    });
+    write_config(&dir.0, model.port, false, true);
+    write_graph_agent(
+        &dir.0,
+        "map-graph",
+        &format!(
+            "name: map-graph\n\
+             version: \"1.0\"\n\
+             description: Fans out over three items.\n\
+             initial_state: {{ items: [a, b, c] }}\n\
+             start: fan_out\n\
+             nodes:\n\
+             \x20 fan_out:\n\
+             \x20   type: map\n\
+             \x20   over: \"{{{{items}}}}\"\n\
+             \x20   as: item\n\
+             \x20   branch: one\n\
+             \x20   collect_into: results\n\
+             \x20   max_concurrency: 3\n\
+             \x20   next: done\n\
+             \x20 one:\n\
+             \x20   type: llm\n\
+             \x20   prompt: \"{ITEM_MARKER} {{{{item}}}}\"\n\
+             \x20   state_updates: {{ output: \"{{{{output}}}}\" }}\n\
+             \x20 done: {{ type: end, output: \"mapped\" }}\n"
+        ),
+    );
+
+    let output = run(&dir.0, &["--json", "--agent", "map-graph", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    for key in KEYS {
+        assert!(report.get(key).is_some(), "missing {key}: {report}");
+    }
+    assert_eq!(report["is_error"], json!(false), "{report}");
+    assert_eq!(report["result"], json!("mapped"), "{report}");
+    assert_turns_match_requests(&report, &model, 3);
+    assert_usage_of(&report, 3);
+}
+
+const LEFT_MARKER: &str = "LEFT-MARKER";
+const RIGHT_MARKER: &str = "RIGHT-MARKER";
+
+/// A node whose `next` lists two llm nodes runs them in the same
+/// super-step, so their calls race; each is answered by its prompt.
+#[test]
+fn a_parallel_fan_out_counts_the_calls_of_both_branches() {
+    let dir = TempDir::new("graph-fan-out");
+    let model = ScriptedModel::answering(|request, _| {
+        if mentions(request, LEFT_MARKER) {
+            Reply::Text("left done".into())
+        } else if mentions(request, RIGHT_MARKER) {
+            Reply::Text("right done".into())
+        } else {
+            Reply::Text("fanned".into())
+        }
+    });
+    write_config(&dir.0, model.port, false, true);
+    write_graph_agent(
+        &dir.0,
+        "fan-graph",
+        &format!(
+            "name: fan-graph\n\
+             version: \"1.0\"\n\
+             description: Splits into two parallel llm nodes.\n\
+             initial_state: {{ left: \"\", right: \"\" }}\n\
+             start: fan\n\
+             nodes:\n\
+             \x20 fan: {{ type: llm, prompt: \"{{{{initial_prompt}}}}\", next: [left, right] }}\n\
+             \x20 left: {{ type: llm, prompt: \"{LEFT_MARKER}\", state_updates: {{ left: \"{{{{output}}}}\" }}, next: done }}\n\
+             \x20 right: {{ type: llm, prompt: \"{RIGHT_MARKER}\", state_updates: {{ right: \"{{{{output}}}}\" }}, next: done }}\n\
+             \x20 done: {{ type: end, output: \"{{{{left}}}} and {{{{right}}}}\" }}\n"
+        ),
+    );
+
+    let output = run(&dir.0, &["--json", "--agent", "fan-graph", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["is_error"], json!(false), "{report}");
+    assert_eq!(
+        report["result"],
+        json!("left done and right done"),
+        "{report}"
+    );
+    assert_turns_match_requests(&report, &model, 3);
+    assert_usage_of(&report, 3);
+}
+
+/// One llm node whose reply lands in `reply`, then an end node rendering
+/// `output`.
+fn write_one_llm_node_graph(dir: &Path, name: &str, output: &str) {
+    write_graph_agent(
+        dir,
+        name,
+        &format!(
+            "name: {name}\n\
+             version: \"1.0\"\n\
+             description: One llm node.\n\
+             initial_state: {{ reply: \"\" }}\n\
+             start: ask\n\
+             nodes:\n\
+             \x20 ask: {{ type: llm, prompt: \"{{{{initial_prompt}}}}\", state_updates: {{ reply: \"{{{{output}}}}\" }}, next: done }}\n\
+             \x20 done: {{ type: end, output: \"{output}\" }}\n"
+        ),
+    );
+}
+
+/// A graph whose only llm node keeps getting a provider 500: the run fails
+/// with exit 1, stdout is still exactly the wrapper, and every attempted
+/// call counts as a turn while adding no usage.
+#[test]
+fn a_failing_graph_node_prints_the_error_wrapper_and_exits_1() {
+    let dir = TempDir::new("graph-500");
+    let model = ScriptedModel::answering(|_, _| {
+        Reply::Status(
+            500,
+            json!({ "error": { "message": "stub exploded", "type": "server_error" } }),
+        )
+    });
+    write_config(&dir.0, model.port, false, true);
+    write_one_llm_node_graph(&dir.0, "failing-graph", "{{reply}}");
+
+    let output = run(&dir.0, &["--json", "--agent", "failing-graph", "hi"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["is_error"], json!(true), "{report}");
+    assert_eq!(report["result"], Value::Null, "{report}");
+    assert!(report["error"].is_string(), "{report}");
+    assert_turns_match_requests(&report, &model, 1);
+    assert_no_usage_and_zero_cost(&report);
+}
+
+/// The graph's final output carries an inline think block from an llm
+/// node; `result` drops it on the graph path too.
+#[test]
+fn a_think_block_in_the_graph_output_is_stripped_from_the_result() {
+    let dir = TempDir::new("graph-think");
+    let model = ScriptedModel::answering(|_, _| {
+        Reply::Text("<think>pondering</think>\nplain answer".into())
+    });
+    write_config(&dir.0, model.port, false, true);
+    write_one_llm_node_graph(&dir.0, "think-graph", "{{reply}}");
+
+    let output = run(&dir.0, &["--json", "--agent", "think-graph", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!("plain answer"), "{report}");
+    assert_turns_match_requests(&report, &model, 1);
+    assert_usage_of(&report, 1);
+}
+
+#[test]
+fn a_think_block_in_the_middle_of_the_graph_output_is_stripped_too() {
+    let dir = TempDir::new("graph-think-mid");
+    let model = ScriptedModel::answering(|_, _| {
+        Reply::Text("the gist <think>pondering</think> in full".into())
+    });
+    write_config(&dir.0, model.port, false, true);
+    write_one_llm_node_graph(&dir.0, "summary-graph", "Summary: {{reply}}");
+
+    let output = run(&dir.0, &["--json", "--agent", "summary-graph", "hi"]);
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(
+        report["result"],
+        json!("Summary: the gist in full"),
+        "{report}"
+    );
+    assert_turns_match_requests(&report, &model, 1);
 }

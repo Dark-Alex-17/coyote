@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
@@ -272,36 +273,65 @@ fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str,
     wait_bounded(child, args)
 }
 
+/// Waits for the child to exit and for both of its pipes to close, all
+/// within one `RUN_TIMEOUT`. A grandchild that keeps a pipe open counts as
+/// a hang just like a child that never exits.
 fn wait_bounded(mut child: Child, args: &[&str]) -> Output {
-    let drain = |mut pipe: Box<dyn Read + Send>| {
+    let (sender, drained) = mpsc::channel();
+    let pipes: [Box<dyn Read + Send>; 2] = [
+        Box::new(child.stdout.take().unwrap()),
+        Box::new(child.stderr.take().unwrap()),
+    ];
+    for (index, mut pipe) in pipes.into_iter().enumerate() {
+        let sender = sender.clone();
         thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let stdout = drain(Box::new(child.stdout.take().unwrap()));
-    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+            let _ = sender.send((index, buf));
+        });
+    }
+    let mut buffers: [Option<Vec<u8>>; 2] = [None, None];
     let deadline = Instant::now() + RUN_TIMEOUT;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "coyote {args:?} did not exit within {}s",
-                RUN_TIMEOUT.as_secs()
-            );
+            for (index, buf) in drained.try_iter() {
+                buffers[index] = Some(buf);
+            }
+            give_up(&mut child, args, "exit", &buffers);
         }
         thread::sleep(Duration::from_millis(20));
     };
+    while buffers.iter().any(Option::is_none) {
+        match drained.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((index, buf)) => buffers[index] = Some(buf),
+            Err(_) => give_up(&mut child, args, "close its output pipes", &buffers),
+        }
+    }
+    let [stdout, stderr] = buffers.map(Option::unwrap_or_default);
     Output {
         status,
-        stdout: stdout.join().unwrap(),
-        stderr: stderr.join().unwrap(),
+        stdout,
+        stderr,
     }
+}
+
+fn give_up(child: &mut Child, args: &[&str], what: &str, buffers: &[Option<Vec<u8>>; 2]) -> ! {
+    let _ = child.kill();
+    let _ = child.wait();
+    let shown = |buf: &Option<Vec<u8>>| {
+        buf.as_deref()
+            .map_or("<still open>".into(), String::from_utf8_lossy)
+            .into_owned()
+    };
+    panic!(
+        "coyote {args:?} did not {what} within {}s\nstdout:\n{}\nstderr:\n{}",
+        RUN_TIMEOUT.as_secs(),
+        shown(&buffers[0]),
+        shown(&buffers[1])
+    );
 }
 
 fn combined(output: &Output) -> String {
