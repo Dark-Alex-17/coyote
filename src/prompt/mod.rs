@@ -363,16 +363,20 @@ impl InquirePrompter {
         options
     }
 
+    /// A closed command menu is inquire's bare widget; a tool's select,
+    /// closed or not, keeps the REPL styling (no type-to-filter, the
+    /// movement hint as help), and only an open one offers the custom row.
     fn select(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
-        if req.closed {
-            let answer = Select::new(&req.question, Self::select_options(req)).prompt()?;
-            return Ok(PromptAnswer::Selected(answer));
+        let select = Select::new(&req.question, Self::select_options(req));
+        if req.closed && req.tool.is_none() {
+            // command menus: bare select
+            return select.prompt().map(PromptAnswer::Selected);
         }
-        let mut answer = Select::new(&req.question, Self::select_options(req))
+        let mut answer = select
             .without_filtering()
             .with_help_message("↑↓ to move, enter to select") // debris-exempt: inquire help text reused verbatim
             .prompt()?;
-        if answer == CUSTOM_MULTI_CHOICE_ANSWER_OPTION {
+        if !req.closed && answer == CUSTOM_MULTI_CHOICE_ANSWER_OPTION {
             answer = Text::new("Custom response:").prompt()?;
         }
         Ok(PromptAnswer::Selected(answer))
@@ -682,6 +686,38 @@ mod tests {
             vec!["a", "b", CUSTOM_MULTI_CHOICE_ANSWER_OPTION]
         );
         assert_eq!(InquirePrompter::select_options(&closed), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_closed_tool_select_renders_without_the_custom_row() {
+        let closed = PromptRequest {
+            closed: true,
+            ..request(PromptAction::Select, Some("x"))
+        };
+        assert_eq!(InquirePrompter::select_options(&closed), closed.options);
+    }
+
+    /// Which widget a closed select gets depends on who asks: a command
+    /// menu takes inquire's bare select, a tool keeps the REPL styling
+    /// its selects always had. Pinned on the source, since the widget
+    /// only exists on a terminal.
+    #[test]
+    fn a_closed_tool_select_keeps_the_filterless_help_styling() {
+        let source = include_str!("mod.rs");
+        let start = source.find("fn select(req: &PromptRequest)").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let (_, after_marker) = body.split_once("// command menus: bare select").unwrap();
+        let (bare, styled) = after_marker.split_once("\n        }\n").unwrap();
+        assert!(bare.contains("select.prompt()"), "{bare}");
+        assert!(styled.contains(".prompt()"), "{styled}");
+        for needle in [
+            ".without_filtering()",
+            "\"↑↓ to move, enter to select\"", // debris-exempt: inquire help text reused verbatim
+        ] {
+            assert!(!bare.contains(needle), "{needle} in:\n{bare}");
+            assert!(styled.contains(needle), "{needle} missing from:\n{styled}");
+        }
     }
 
     #[test]
