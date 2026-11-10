@@ -6139,3 +6139,143 @@ fn an_own_sibling_session_reads_you_slash_its_session_name() {
         "`people info beta` reaches the sibling as you / beta: {out:?}"
     );
 }
+
+/// Cold start over a trust list where a card's advertised user name collides with a
+/// name the owner gave: after the owner names that user, every access verb that acts
+/// on them names them `<user> / <session>` (or the user's name for an identity-wide
+/// verb) on its success line, never only by hash, and the bare session name the card
+/// advertised addresses the one session.
+#[test]
+#[ignore = "the access verb lines still name a peer by hash alone until the access wording speaks users and sessions"]
+fn access_verb_lines_name_the_peer_through_the_people_view() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("people-access-lines", true, &[relay.port]);
+    seed_colliding_people_trust_file(&probe.config_dir);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+
+    let mut failures = Vec::new();
+    let mut check = |ok: bool, what: &str, out: &str| {
+        if !ok {
+            failures.push(format!("{what}: {out:?}"));
+        }
+    };
+
+    let out = people_command(&mut session, ".mesh people name d1d1d1d1 \"zed\"");
+    check(out.contains("is now zed"), "name the card user", &out);
+    // The colliding advertised `sam` stays hidden, the owner's `sam` addresses c0c0c0c0.
+    let out = people_command(&mut session, ".mesh people info zed");
+    check(
+        out.contains("user: zed (the name you gave)") && out.contains("zed / den"),
+        "the card user reads zed, its session zed / den",
+        &out,
+    );
+
+    let out = people_command(&mut session, ".mesh access block den --yes");
+    check(
+        out.contains("Blocked zed / den"),
+        "access block names the session <user> / <session>",
+        &out,
+    );
+    let out = people_command(&mut session, ".mesh access unblock den --yes");
+    check(
+        out.contains("Unblocked zed / den"),
+        "access unblock names the session <user> / <session>",
+        &out,
+    );
+    let out = people_command(&mut session, ".mesh access trust --identity zed --yes");
+    check(
+        out.lines()
+            .any(|line| line.starts_with("Trusted") && line.contains("zed")),
+        "access trust of a user names the user on its success line",
+        &out,
+    );
+    let out = people_command(&mut session, ".mesh access forget --identity zed --dry-run");
+    check(
+        out.contains("zed"),
+        "access forget names the user it would erase",
+        &out,
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Two nodes on one real rnsd, the other announcing: once the owner names the heard
+/// user, the refusals `people status` and `messaging send` print for an untrusted
+/// session and the success line of `access trust` name it `<user> / <session>`, not
+/// only by its hash.
+#[test]
+#[ignore = "the trust refusal and access trust lines still name a peer by hash alone until the access wording speaks users and sessions"]
+fn lines_about_a_heard_named_session_name_it_user_slash_session() {
+    let Some(relay) = RnsdRelay::start("people-lines") else {
+        eprintln!("skipped: no rnsd on the PATH");
+        return;
+    };
+    let me = Probe::new("people-lines-me", true, &[relay.port]).with_announce();
+    let mut command = me.command();
+    command.args(["--session", "probe"]);
+    let mut mine = spawn_repl(command);
+    wait_for(&mut mine, SESSION_PROMPT);
+    me.wait_for_marker("MESH_STARTED");
+    let other = Probe::new("people-lines-other", true, &[relay.port]).with_announce();
+    let mut command = other.command();
+    command.args(["--session", "solo"]);
+    let mut solo = spawn_repl(command);
+    wait_for(&mut solo, &session_prompt("solo"));
+    other.wait_for_marker("MESH_STARTED");
+    let carol8 = other.own_identity()[..8].to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let dest8 = loop {
+        let list = people_command(&mut mine, ".mesh people list");
+        if let Some(dest8) = sessions_of(&list, &carol8).into_iter().next() {
+            break dest8;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the announce never arrived: {list:?}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    };
+
+    let mut failures = Vec::new();
+    let mut check = |ok: bool, what: &str, out: &str| {
+        if !ok {
+            failures.push(format!("{what}: {out:?}"));
+        }
+    };
+    let out = people_command(&mut mine, &format!(".mesh people name {carol8} \"carol\""));
+    check(out.contains("is now carol"), "name the user", &out);
+    let who = format!("carol / {dest8}");
+
+    let out = people_command(&mut mine, ".mesh people status carol");
+    check(
+        out.contains(&format!("Error: {who} is untrusted")),
+        "the people status refusal names the session <user> / <session>",
+        &out,
+    );
+    let out = people_command(&mut mine, ".mesh messaging send carol --yes hello");
+    check(
+        out.contains(&format!("Error: {who} is untrusted")),
+        "the messaging send refusal names the session <user> / <session>",
+        &out,
+    );
+    let out = people_command(&mut mine, ".mesh access trust carol --yes");
+    check(
+        out.lines()
+            .any(|line| line.starts_with(&format!("Trusted {who}"))),
+        "the access trust success line names the session <user> / <session>",
+        &out,
+    );
+
+    let _ = exit_clean(&mut solo);
+    let status = exit_clean(&mut mine);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
