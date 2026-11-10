@@ -427,7 +427,11 @@ impl Default for InquirePrompter {
 
 impl Prompter for InquirePrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
-        crate::utils::drain_stale_tty_input();
+        // A confirm keeps its type-ahead: `y<Enter>` sent before a tool
+        // approval appears must still answer it.
+        if req.action != PromptAction::Confirm {
+            crate::utils::drain_stale_tty_input();
+        }
         let answer = match req.action {
             PromptAction::Select => Self::select(&req),
             PromptAction::Confirm => self.confirm(&req),

@@ -9112,7 +9112,9 @@ mod tests {
     /// The stdin readers outside this module stand down while the UI owns
     /// the terminal: no spinner polls the keyboard, no stale-input drain
     /// toggles raw mode under the event stream, and no cursor query waits
-    /// for a reply the event stream would take.
+    /// for a reply the event stream would take. The inquire prompter's
+    /// drain also skips confirms, so `y<Enter>` typed ahead of a tool
+    /// approval still answers it.
     #[test]
     fn every_other_stdin_reader_checks_the_tui_flag() {
         let spinner = include_str!("../utils/spinner.rs");
@@ -9125,10 +9127,9 @@ mod tests {
         let cursor_sync = include_str!("../utils/cursor_sync.rs");
         assert!(fn_body(cursor_sync, "fn resync_stdout").contains("crate::tui::active()"));
         let prompt = include_str!("../prompt/mod.rs");
-        assert!(
-            fn_body(prompt, "impl Prompter for InquirePrompter")
-                .contains("drain_stale_tty_input()")
-        );
+        let prompter = fn_body(prompt, "impl Prompter for InquirePrompter");
+        assert!(prompter.contains("drain_stale_tty_input()"));
+        assert!(prompter.contains("if req.action != PromptAction::Confirm {"));
     }
 
     /// Registers a lender on its own thread that runs every job it is
