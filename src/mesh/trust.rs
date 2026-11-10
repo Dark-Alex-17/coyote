@@ -79,6 +79,7 @@ use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::peers::{PeerRecord, PeerTable};
+use crate::mesh::people::{self, People, PersonEntry, Slot};
 use crate::mesh::request::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{
@@ -121,9 +122,11 @@ const TRUST_FILE_HEADER: &str = "\
 # self_trust_seeded: true once this node's own identity got its \"this node\" grant (or was\n\
 #   blocked), so it is never granted again; .mesh access revoke --identity takes the\n\
 #   grant back.\n\
-# Every entry has added_at and note; identities and destinations also have last_seen_at\n\
-#   and label, a destination names its identity, and key_changed on a destination records\n\
-#   the other identity its name was heard under.\n";
+# people: display names by identity, never read for trust: alias is the name you gave,\n\
+#   advertised the one their status card gave, and sessions holds both per destination.\n\
+# Every entry has added_at and note; identities and destinations also have last_seen_at,\n\
+#   a destination names its identity, key_changed on a destination records the other\n\
+#   identity its name was heard under, and label marks this node's own grant.\n";
 /// The trust list is the human's own decisions, so a refusal says what starting fresh costs.
 const TRUST_FILE_REMEDY: Remedy =
     Remedy::UserFile("is the trust list, and a fresh one trusts nobody");
@@ -232,6 +235,9 @@ struct TrustFile {
     denied_destinations: BTreeMap<String, OverlayEntry>,
     #[serde(default)]
     blocked_identities: BTreeMap<String, OverlayEntry>,
+    /// Display names only: no access decision, knock or dispatch reads this section.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    people: BTreeMap<String, PersonEntry>,
     /// Set once this node's own identity was given its `this node` grant, or passed over
     /// because it is blocked, so an untrust or unblock of it is never undone at a restart.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -246,6 +252,7 @@ impl Default for TrustFile {
             destinations: BTreeMap::new(),
             denied_destinations: BTreeMap::new(),
             blocked_identities: BTreeMap::new(),
+            people: BTreeMap::new(),
             self_trust_seeded: false,
         }
     }
@@ -256,6 +263,9 @@ impl Default for TrustFile {
 struct IdentityEntry {
     added_at: Stamp,
     last_seen_at: Stamp,
+    /// Read from older files and moved into `people` on load; written only as the
+    /// `this node` mark of this node's own grant, which is not a name.
+    #[serde(default, skip_serializing_if = "is_not_self_label")]
     label: Option<String>,
     note: Option<String>,
     /// The `--identity` flag: every destination this identity announces is accepted.
@@ -268,6 +278,8 @@ struct DestinationEntry {
     identity: String,
     added_at: Stamp,
     last_seen_at: Stamp,
+    /// Read from older files and moved into `people` on load; never written.
+    #[serde(default, skip_serializing)]
     label: Option<String>,
     note: Option<String>,
     /// Set once this destination's name hash was seen under an identity other than
@@ -419,6 +431,11 @@ enum TrustMutation {
         destinations: Vec<String>,
         seen_identity: String,
     },
+    /// A name of the identity or of one of its sessions in the people section changed.
+    /// Names decide nothing, so nobody is notified.
+    Names {
+        identity: String,
+    },
 }
 
 /// Every hash is truncated with `short`, as a log line requires.
@@ -471,6 +488,7 @@ impl fmt::Display for TrustMutation {
                 destinations.len(),
                 short(seen_identity)
             ),
+            Self::Names { identity } => write!(f, "names of identity {}", short(identity)),
         }
     }
 }
@@ -617,7 +635,8 @@ impl TrustMutation {
             | Self::Deny { removed: None, .. }
             | Self::Undeny { .. }
             | Self::UnblockIdentity { .. }
-            | Self::KeyChanged { .. } => {}
+            | Self::KeyChanged { .. }
+            | Self::Names { .. } => {}
         }
     }
 }
@@ -1562,7 +1581,10 @@ impl TrustStore {
                     tier: Tier::Identity,
                     hash: hash.clone(),
                     identity: None,
-                    label: entry.label.clone(),
+                    label: state
+                        .file
+                        .person_label(hash)
+                        .or_else(|| entry.label.clone()),
                     note: entry.note.clone(),
                     added_at: entry.added_at.0,
                     last_seen_at: entry.last_seen_at.0,
@@ -1580,7 +1602,7 @@ impl TrustStore {
                     tier: Tier::Destination,
                     hash: hash.clone(),
                     identity: Some(entry.identity.clone()),
-                    label: entry.label.clone(),
+                    label: state.file.session_label(&entry.identity, hash),
                     note: entry.note.clone(),
                     added_at: entry.added_at.0,
                     last_seen_at: state.effective_last_seen(hash, entry),
@@ -2008,11 +2030,12 @@ impl TrustStore {
         let mut state = self.writing()?;
         let mut file = state.file.clone();
         refuse_if_blocked(&file, &peer.identity_hash)?;
+        let TrustOptions { label, note } = opts;
         let change = match file.destinations.get_mut(&peer.destination_hash) {
             Some(entry) => {
                 entry.identity = peer.identity_hash.clone();
                 entry.last_seen_at = Stamp::new(peer.last_seen);
-                apply_options(&mut entry.label, &mut entry.note, opts);
+                apply_note(&mut entry.note, note);
                 TrustChange::Updated
             }
             None => {
@@ -2022,14 +2045,20 @@ impl TrustStore {
                         identity: peer.identity_hash.clone(),
                         added_at: Stamp::new(now),
                         last_seen_at: Stamp::new(peer.last_seen),
-                        label: opts.label,
-                        note: opts.note,
+                        label: None,
+                        note,
                         key_changed: None,
                     },
                 );
                 TrustChange::Added
             }
         };
+        apply_label(
+            &mut file,
+            &peer.identity_hash,
+            Some(&peer.destination_hash),
+            label,
+        );
         let superseded = decode_name_hash(&peer.name_hash)
             .map(|name_hash| state.binding_conflicts(&peer.identity_hash, &name_hash))
             .unwrap_or_default();
@@ -2163,6 +2192,7 @@ impl TrustStore {
         let mut state = self.writing()?;
         let mut file = state.file.clone();
         refuse_if_blocked(&file, &identity)?;
+        let TrustOptions { label, note } = opts;
         let (change, granted) = match file.identities.get_mut(&identity) {
             Some(entry) => {
                 let granted = !entry.all_destinations;
@@ -2170,17 +2200,17 @@ impl TrustStore {
                 if let Some(seen) = last_seen {
                     entry.last_seen_at = entry.last_seen_at.max(Stamp::new(seen));
                 }
-                apply_options(&mut entry.label, &mut entry.note, opts);
+                apply_note(&mut entry.note, note);
                 (TrustChange::Updated, granted)
             }
             None => {
                 let mut entry = identity_entry(now, last_seen.unwrap_or(now), true);
-                entry.label = opts.label;
-                entry.note = opts.note;
+                entry.note = note;
                 file.identities.insert(identity.clone(), entry);
                 (TrustChange::Added, true)
             }
         };
+        apply_label(&mut file, &identity, None, label);
         self.commit(
             &mut state,
             file,
@@ -2685,7 +2715,8 @@ impl TrustStore {
     /// Erases everything the trust list holds of an identity, so it is a stranger again:
     /// its record, every destination record bound to it, every deny on a destination of
     /// its (bound by record, by session twin, or by a verified peer table row), its block,
-    /// and the presence memos naming it. Whatever the envoy remembered of its conversations
+    /// its names in the people section (which revoke and block leave in place) and the
+    /// presence memos naming it. Whatever the envoy remembered of its conversations
     /// goes too. Never refuses for want of something to erase: the caller holds the knocks,
     /// which the list knows nothing of. `dry_run` reports what would go and writes nothing.
     pub(crate) fn forget_identity(
@@ -2725,6 +2756,7 @@ impl TrustStore {
                 file.denied_destinations.remove(hash);
             }
             let blocked = file.blocked_identities.remove(&identity).is_some();
+            let named = file.people.remove(&identity).is_some();
             let forgotten = Forgotten {
                 identity_record,
                 instances,
@@ -2734,7 +2766,12 @@ impl TrustStore {
             if dry_run {
                 return Ok(forgotten);
             }
-            if on_disk.is_some() || !removed.is_empty() || !forgotten.denies.is_empty() || blocked {
+            if on_disk.is_some()
+                || !removed.is_empty()
+                || !forgotten.denies.is_empty()
+                || blocked
+                || named
+            {
                 self.commit(
                     &mut state,
                     file,
@@ -2829,6 +2866,115 @@ impl TrustStore {
             mutation.notify(&**observer);
         }
         Ok(())
+    }
+}
+
+/// The people section: display names that no access decision, knock or dispatch reads.
+/// Writing a name needs no running mesh and fires no trust event.
+#[cfg_attr(not(test), expect(dead_code))] // called once the people commands and display land
+impl TrustStore {
+    /// Every person's and session's winning name, judged against `own_sessions`, the
+    /// local session names this node's owner runs under.
+    pub(crate) fn people(&self, own_sessions: &[&str]) -> People {
+        People::new(&self.loaded().file.people, own_sessions)
+    }
+
+    /// Sets the owner's alias of the person `identity_hash`, or clears it with `None`.
+    /// Refused when it breaks a naming rule or reads the same as another owner's alias
+    /// or one of `own_sessions`. The identity needs no trust record: naming a stranger
+    /// leaves it a stranger.
+    pub(crate) fn set_person_alias(
+        &self,
+        identity_hash: &str,
+        alias: Option<&str>,
+        own_sessions: &[&str],
+    ) -> Result<()> {
+        self.set_owner_alias(identity_hash, None, alias, own_sessions)
+    }
+
+    /// The same for the session at `destination_hash` of the person `identity_hash`.
+    pub(crate) fn set_session_alias(
+        &self,
+        identity_hash: &str,
+        destination_hash: &str,
+        alias: Option<&str>,
+        own_sessions: &[&str],
+    ) -> Result<()> {
+        self.set_owner_alias(identity_hash, Some(destination_hash), alias, own_sessions)
+    }
+
+    fn set_owner_alias(
+        &self,
+        identity_hash: &str,
+        destination_hash: Option<&str>,
+        alias: Option<&str>,
+        own_sessions: &[&str],
+    ) -> Result<()> {
+        let identity = valid_hash("identity", identity_hash)?;
+        let destination = destination_hash
+            .map(|hash| valid_hash("destination", hash))
+            .transpose()?;
+        let alias = alias.map(people::owner_alias).transpose()?;
+        let mut state = self.writing()?;
+        if let Some(alias) = &alias
+            && people::owner_alias_taken(
+                &state.file.people,
+                &identity,
+                destination.as_deref(),
+                alias,
+                own_sessions,
+            )
+        {
+            bail!(people::NAME_TAKEN);
+        }
+        let mut file = state.file.clone();
+        people::set_name(
+            &mut file.people,
+            &identity,
+            destination.as_deref(),
+            Slot::Alias,
+            alias,
+        );
+        if file == state.file {
+            return Ok(());
+        }
+        self.commit(&mut state, file, TrustMutation::Names { identity })
+    }
+
+    /// Keeps what a status card from the session at `destination_hash` of `identity_hash`
+    /// says it and its person are called, each cleaned first. Each replaces the one an
+    /// earlier card gave, and a field the card left out clears it. An owner's alias is
+    /// never touched. Writes only when something changed; returns whether it did.
+    pub(crate) fn record_advertised(
+        &self,
+        identity_hash: &str,
+        destination_hash: &str,
+        person_name: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<bool> {
+        let identity = valid_hash("identity", identity_hash)?;
+        let destination = valid_hash("destination", destination_hash)?;
+        let mut state = self.writing()?;
+        let mut file = state.file.clone();
+        people::set_name(
+            &mut file.people,
+            &identity,
+            None,
+            Slot::Advertised,
+            person_name.and_then(people::clean_advertised),
+        );
+        people::set_name(
+            &mut file.people,
+            &identity,
+            Some(&destination),
+            Slot::Advertised,
+            session.and_then(people::clean_advertised),
+        );
+        if file == state.file {
+            return Ok(false);
+        }
+        self.commit(&mut state, file, TrustMutation::Names { identity })?;
+        Ok(true)
     }
 }
 
@@ -3125,7 +3271,7 @@ impl State {
             .map(|(hash, entry)| BindingConflict {
                 destination_hash: hash.clone(),
                 bound_identity: entry.identity.clone(),
-                label: entry.label.clone(),
+                label: self.file.session_label(&entry.identity, hash),
                 denied: self.file.denied_destinations.contains_key(hash),
                 already_marked: entry.key_changed.is_some(),
             })
@@ -3168,7 +3314,7 @@ fn parse_trust_file(path: &Path, text: &str) -> Result<TrustFile> {
             TRUST_FILE_REMEDY
         ));
     }
-    let file: TrustFile = serde_yaml::from_str(text).with_context(|| {
+    let mut file: TrustFile = serde_yaml::from_str(text).with_context(|| {
         format!(
             "Mesh trust list '{}' could not be parsed as version {TRUST_FILE_VERSION}. {}",
             path.display(),
@@ -3177,6 +3323,7 @@ fn parse_trust_file(path: &Path, text: &str) -> Result<TrustFile> {
     })?;
     refuse_non_canonical_keys(path, &file)?;
     refuse_dangling_identities(path, &file)?;
+    migrate_labels(&mut file);
     Ok(file)
 }
 
@@ -3213,7 +3360,14 @@ fn refuse_non_canonical_keys(path: &Path, file: &TrustFile) -> Result<()> {
             file.blocked_identities
                 .keys()
                 .map(|hash| ("blocked_identities", hash)),
-        );
+        )
+        .chain(file.people.keys().map(|hash| ("people", hash)))
+        .chain(file.people.values().flat_map(|person| {
+            person
+                .sessions
+                .keys()
+                .map(|hash| ("people (sessions field)", hash))
+        }));
     for (section, hash) in hashes {
         if canonical_hash(hash).as_deref() != Some(hash.as_str()) {
             bail!(
@@ -3387,12 +3541,92 @@ fn planned_self_trust_rotation(file: &TrustFile, old: &str) -> SelfTrustRotation
     }
 }
 
-fn apply_options(label: &mut Option<String>, note: &mut Option<String>, opts: TrustOptions) {
-    if opts.label.is_some() {
-        *label = opts.label;
+fn apply_note(note: &mut Option<String>, new: Option<String>) {
+    if new.is_some() {
+        *note = new;
     }
-    if opts.note.is_some() {
-        *note = opts.note;
+}
+
+/// A trust verb's label is the owner's alias of the person, or of the session when a
+/// destination is given, kept in the people section; a blank one clears it. It passed
+/// `check_text` only, as a label always has: like a migrated label, an alias that breaks
+/// a naming rule or collides is kept and simply not used for addressing.
+fn apply_label(
+    file: &mut TrustFile,
+    identity: &str,
+    destination: Option<&str>,
+    label: Option<String>,
+) {
+    if let Some(label) = label {
+        let alias = (!label.trim().is_empty()).then_some(label);
+        people::set_name(&mut file.people, identity, destination, Slot::Alias, alias);
+    }
+}
+
+fn is_not_self_label(label: &Option<String>) -> bool {
+    label.as_deref() != Some(SELF_TRUST_LABEL)
+}
+
+/// Moves the labels an older file kept on its records into the people section, in memory
+/// and idempotently: an identity's label becomes the owner's alias of the person, a
+/// destination's the owner's alias of that session. The `this node` mark on this node's own
+/// grant is not a name and stays where it is. An alias already in the people section wins
+/// over a label. The next write persists the move.
+fn migrate_labels(file: &mut TrustFile) {
+    let mut moves = Vec::new();
+    for (identity, entry) in &mut file.identities {
+        if entry.label.as_deref() == Some(SELF_TRUST_LABEL) {
+            continue;
+        }
+        if let Some(label) = entry.label.take() {
+            moves.push((identity.clone(), None, label));
+        }
+    }
+    for (destination, entry) in &mut file.destinations {
+        if let Some(label) = entry.label.take() {
+            moves.push((entry.identity.clone(), Some(destination.clone()), label));
+        }
+    }
+    for (identity, destination, label) in moves {
+        if label.trim().is_empty() {
+            continue;
+        }
+        let existing = file
+            .people
+            .get(&identity)
+            .and_then(|person| match &destination {
+                None => person.alias.as_ref(),
+                Some(destination) => person
+                    .sessions
+                    .get(destination)
+                    .and_then(|session| session.alias.as_ref()),
+            });
+        if existing.is_none() {
+            people::set_name(
+                &mut file.people,
+                &identity,
+                destination.as_deref(),
+                Slot::Alias,
+                Some(label),
+            );
+        }
+    }
+}
+
+impl TrustFile {
+    /// The owner's alias of the person, as the trust listings label an identity record.
+    fn person_label(&self, identity: &str) -> Option<String> {
+        self.people.get(identity)?.alias.clone()
+    }
+
+    /// The owner's alias of the session, as the trust listings label a destination record.
+    fn session_label(&self, identity: &str, destination: &str) -> Option<String> {
+        self.people
+            .get(identity)?
+            .sessions
+            .get(destination)?
+            .alias
+            .clone()
     }
 }
 
@@ -4873,10 +5107,11 @@ mod tests {
 
         let expected = format!(
             "{TRUST_FILE_HEADER}version: {TRUST_FILE_VERSION}\n\
-             identities:\n  {id}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
-             destinations:\n  {dest}:\n    identity: {id}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Bob\n    note: null\n\
+             identities:\n  {id}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    note: null\n    all_destinations: false\n\
+             destinations:\n  {dest}:\n    identity: {id}\n    added_at: {ts}\n    last_seen_at: {ts}\n    note: null\n\
              denied_destinations:\n  {denied}:\n    added_at: {ts}\n    note: noisy\n\
-             blocked_identities:\n  {blocked}:\n    added_at: {ts}\n    note: null\n",
+             blocked_identities:\n  {blocked}:\n    added_at: {ts}\n    note: null\n\
+             people:\n  {id}:\n    sessions:\n      {dest}:\n        alias: Bob\n",
             id = peer.identity_hash,
             dest = peer.destination_hash,
             denied = fake_hash(0xdd),
@@ -4905,6 +5140,7 @@ mod tests {
             "destinations:",
             "denied_destinations:",
             "blocked_identities:",
+            "people:",
         ] {
             assert!(
                 TRUST_FILE_HEADER.contains(&format!("# {section}")),
@@ -4918,6 +5154,9 @@ mod tests {
             "note",
             "identity",
             "key_changed",
+            "alias",
+            "advertised",
+            "sessions",
         ] {
             assert!(TRUST_FILE_HEADER.contains(key), "the header names {key}");
         }
@@ -9224,8 +9463,8 @@ mod tests {
         assert!(lifted.deny_lifted);
         assert_eq!(
             record(&fx.store, &peer.destination_hash).label.as_deref(),
-            None,
-            "the label went with the record the block took"
+            Some("Bob"),
+            "the session's name outlives the record the block took"
         );
         let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
         assert_eq!(
@@ -12954,5 +13193,582 @@ mod tests {
             );
         }
         assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+    }
+
+    mod people_section_tests {
+        use super::*;
+        use crate::mesh::people::{AliasSource, AliasUse, NAME_TAKEN};
+        use crate::testing::{debug_snapshot, info_snapshot, install_log_collector, warn_snapshot};
+
+        fn trust_labelled(fx: &Fixture, peer: &Announced, label: &str, at: SystemTime) {
+            fx.store
+                .trust_destination(
+                    &fx.mesh,
+                    &peer.destination_hash,
+                    TrustOptions {
+                        label: Some(label.to_string()),
+                        note: None,
+                    },
+                    at,
+                )
+                .unwrap();
+        }
+
+        fn person_name(store: &TrustStore, identity: &str) -> Option<String> {
+            store
+                .people(&[])
+                .person(identity)
+                .map(|alias| alias.text.clone())
+        }
+
+        fn session_name(store: &TrustStore, identity: &str, destination: &str) -> Option<String> {
+            store
+                .people(&[])
+                .session(identity, destination)
+                .map(|alias| alias.text.clone())
+        }
+
+        fn file_text(fx: &Fixture) -> String {
+            String::from_utf8(fx.file_bytes().unwrap()).unwrap()
+        }
+
+        fn trust_path(tmp: &TempDir) -> PathBuf {
+            let path = mesh_config_dir(&tmp.path).join("trust.yaml");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        }
+
+        #[test]
+        fn naming_a_stranger_leaves_it_a_stranger() {
+            let fx = Fixture::new("trust-people-stranger");
+            let stranger = announced("alpha");
+            fx.announce(&stranger, t(1_000));
+            let (id, dest) = (&stranger.identity_hash, &stranger.destination_hash);
+
+            fx.store.set_person_alias(id, Some("Bea"), &[]).unwrap();
+            fx.store
+                .set_session_alias(id, dest, Some("review"), &[])
+                .unwrap();
+            assert!(
+                fx.store
+                    .record_advertised(id, dest, Some("Beatrice"), Some("temp"))
+                    .unwrap()
+            );
+
+            assert_eq!(person_name(&fx.store, id).as_deref(), Some("Bea"));
+            assert_eq!(session_name(&fx.store, id, dest).as_deref(), Some("review"));
+            for store in [&fx.store, &fx.reopen()] {
+                assert_eq!(store.identity_standing(id), IdentityStanding::Unknown);
+                assert!(!store.knows_identity(id));
+                assert!(!store.is_trusted_identity(id));
+                assert!(!store.is_blocked_identity(id));
+                let verdict = store.authorize(id, dest);
+                assert_eq!(
+                    (verdict.decision, verdict.rule),
+                    (Decision::Refuse, Rule::DefaultClosed)
+                );
+                assert_eq!(
+                    store.verdicts([(id.as_str(), dest.as_str())]),
+                    [(verdict, IdentityStanding::Unknown)]
+                );
+                assert!(!store.may_be_asked_for(dest));
+                assert!(store.records().is_empty(), "{:#?}", store.records());
+            }
+            let text = file_text(&fx);
+            for section in [
+                "identities",
+                "destinations",
+                "denied_destinations",
+                "blocked_identities",
+            ] {
+                assert!(
+                    text.contains(&format!("\n{section}: {{}}\n")),
+                    "{section} holds nothing: {text}"
+                );
+            }
+        }
+
+        #[test]
+        fn revoke_and_block_keep_a_persons_names_and_forget_erases_them() {
+            let fx = Fixture::new("trust-people-lifecycle");
+            let peer = announced("alpha");
+            fx.announce(&peer, t(1_000));
+            let (id, dest) = (&peer.identity_hash, &peer.destination_hash);
+            trust_labelled(&fx, &peer, "laptop", t(1_000));
+            fx.store.set_person_alias(id, Some("Alex"), &[]).unwrap();
+            let named = (Some("Alex".to_string()), Some("laptop".to_string()));
+            let names =
+                |store: &TrustStore| (person_name(store, id), session_name(store, id, dest));
+            assert_eq!(names(&fx.store), named);
+
+            fx.store.untrust_destination(&fx.mesh, dest, false).unwrap();
+            assert_eq!(
+                names(&fx.store),
+                named,
+                "revoking the session keeps the names"
+            );
+
+            fx.store
+                .trust_destination(&fx.mesh, dest, TrustOptions::default(), t(1_100))
+                .unwrap();
+            assert_eq!(
+                record(&fx.store, dest).label.as_deref(),
+                Some("laptop"),
+                "a re-trusted session is listed under the name it kept"
+            );
+            fx.trust_identity(id, t(1_200));
+            fx.store.untrust_identity(&fx.mesh, id, false).unwrap();
+            assert_eq!(
+                names(&fx.store),
+                named,
+                "revoking the person keeps the names"
+            );
+
+            fx.store
+                .deny_destination(&fx.mesh, dest, None, t(1_300), false)
+                .unwrap();
+            assert_eq!(
+                names(&fx.store),
+                named,
+                "blocking the session keeps the names"
+            );
+
+            fx.store
+                .block_identity(&fx.mesh, id, None, t(1_400))
+                .unwrap();
+            assert_eq!(fx.store.identity_standing(id), IdentityStanding::Blocked);
+            assert_eq!(
+                names(&fx.store),
+                named,
+                "blocking the person keeps the names"
+            );
+            assert_eq!(names(&fx.reopen()), named, "and the file keeps them");
+
+            fx.store.forget_identity(&fx.mesh, id, true).unwrap();
+            assert_eq!(names(&fx.store), named, "a dry run erases nothing");
+
+            fx.store.forget_identity(&fx.mesh, id, false).unwrap();
+            assert_eq!(names(&fx.store), (None, None));
+            assert_eq!(names(&fx.reopen()), (None, None));
+            assert!(!file_text(&fx).contains("\npeople:"), "{}", file_text(&fx));
+        }
+
+        #[test]
+        fn forget_erases_the_names_of_a_stranger_named_and_nothing_else() {
+            let fx = Fixture::new("trust-people-forget-stranger");
+            let (stranger, other) = (fake_hash(0x31), fake_hash(0x32));
+            fx.store
+                .set_person_alias(&stranger, Some("Bea"), &[])
+                .unwrap();
+            fx.store.set_person_alias(&other, Some("Cy"), &[]).unwrap();
+
+            let forgotten = fx
+                .store
+                .forget_identity(&fx.mesh, &stranger, false)
+                .unwrap();
+
+            assert!(
+                forgotten.is_empty(),
+                "no access record was held: {forgotten:?}"
+            );
+            let reopened = fx.reopen();
+            assert_eq!(person_name(&reopened, &stranger), None);
+            assert_eq!(person_name(&reopened, &other).as_deref(), Some("Cy"));
+        }
+
+        #[test]
+        fn a_trust_label_is_the_owners_alias_and_is_never_written_on_the_record() {
+            let fx = Fixture::new("trust-people-label");
+            let peer = announced("alpha");
+            fx.announce(&peer, t(1_000));
+            let (id, dest) = (&peer.identity_hash, &peer.destination_hash);
+            trust_labelled(&fx, &peer, "Bob desk", t(1_000));
+            fx.store
+                .trust_identity(
+                    &fx.mesh,
+                    id,
+                    TrustOptions {
+                        label: Some("Bob".to_string()),
+                        note: Some("met at the meetup".to_string()),
+                    },
+                    t(1_000),
+                )
+                .unwrap();
+
+            assert_eq!(record(&fx.store, id).label.as_deref(), Some("Bob"));
+            assert_eq!(record(&fx.store, dest).label.as_deref(), Some("Bob desk"));
+            assert_eq!(
+                record(&fx.store, id).note.as_deref(),
+                Some("met at the meetup")
+            );
+            let people = fx.store.people(&[]);
+            assert_eq!(people.person(id).unwrap().source, AliasSource::Owner);
+            assert_eq!(people.session(id, dest).unwrap().source, AliasSource::Owner);
+            let text = file_text(&fx);
+            assert!(!text.contains("    label:"), "{text}");
+            assert!(text.contains("\npeople:\n"), "{text}");
+
+            trust_labelled(&fx, &peer, " ", t(1_100));
+            assert_eq!(record(&fx.store, dest).label, None, "a blank label clears");
+            assert_eq!(record(&fx.store, id).label.as_deref(), Some("Bob"));
+        }
+
+        #[test]
+        fn labels_in_an_older_file_move_into_the_people_section_on_load_and_persist_on_the_next_write()
+         {
+            let tmp = TempDir::new("trust-people-migrate");
+            let path = trust_path(&tmp);
+            let (own, peer, blank, dest) = (
+                fake_hash(0x11),
+                fake_hash(0x22),
+                fake_hash(0x33),
+                fake_hash(0x44),
+            );
+            let ts = "2026-01-01T00:00:00Z";
+            let identity = |hash: &str, label: &str, all: bool| {
+                format!(
+                    "  {hash}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: {label}\n    note: null\n    all_destinations: {all}\n"
+                )
+            };
+            let old = format!(
+                "version: {TRUST_FILE_VERSION}\nidentities:\n{}{}{}destinations:\n  {dest}:\n    identity: {peer}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: laptop\n    note: null\nself_trust_seeded: true\n",
+                identity(&own, SELF_TRUST_LABEL, true),
+                identity(&peer, "Alex", false),
+                identity(&blank, "'  '", false),
+            );
+            fs::write(&path, &old).unwrap();
+
+            let store = TrustStore::open(&tmp.path).unwrap();
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                old,
+                "loading writes nothing"
+            );
+            assert_eq!(
+                record(&store, &own).label.as_deref(),
+                Some(SELF_TRUST_LABEL)
+            );
+            assert_eq!(record(&store, &peer).label.as_deref(), Some("Alex"));
+            assert_eq!(record(&store, &dest).label.as_deref(), Some("laptop"));
+            assert_eq!(
+                record(&store, &blank).label,
+                None,
+                "a blank label is no name"
+            );
+            let people = store.people(&[]);
+            assert_eq!(
+                people.person(&own),
+                None,
+                "this node's own mark is not a name"
+            );
+            let alex = people.person(&peer).unwrap();
+            assert_eq!(
+                (alex.text.as_str(), alex.source, alex.status),
+                ("Alex", AliasSource::Owner, AliasUse::Addressable)
+            );
+            assert_eq!(
+                session_name(&store, &peer, &dest).as_deref(),
+                Some("laptop")
+            );
+            let records = store.records();
+
+            store.set_person_alias(&blank, Some("Kim"), &[]).unwrap();
+            let written = fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                written.matches("label:").count(),
+                1,
+                "only the own mark stays a label: {written}"
+            );
+            assert!(
+                written.contains(&format!("label: {SELF_TRUST_LABEL}\n")),
+                "{written}"
+            );
+            let file: TrustFile = serde_yaml::from_str(&written).unwrap();
+            assert_eq!(file.people[&peer].alias.as_deref(), Some("Alex"));
+            assert_eq!(
+                file.people[&peer].sessions[&dest].alias.as_deref(),
+                Some("laptop")
+            );
+            assert_eq!(file.people[&blank].alias.as_deref(), Some("Kim"));
+            assert!(!file.people.contains_key(&own));
+
+            let reopened = TrustStore::open(&tmp.path).unwrap();
+            let mut expected = records;
+            expected
+                .iter_mut()
+                .filter(|record| record.hash == blank)
+                .for_each(|record| record.label = Some("Kim".to_string()));
+            assert_eq!(
+                reopened.records(),
+                expected,
+                "the migrated file reads the same"
+            );
+            let mut again = parse_trust_file(&path, &written).unwrap();
+            let once = again.clone();
+            migrate_labels(&mut again);
+            assert_eq!(again, once, "migrating a migrated list changes nothing");
+            let mut old_file = parse_trust_file(&path, &old).unwrap();
+            let migrated = old_file.clone();
+            migrate_labels(&mut old_file);
+            assert_eq!(
+                old_file, migrated,
+                "a second pass over the old file changes nothing"
+            );
+        }
+
+        #[test]
+        fn a_people_alias_already_on_file_wins_over_a_leftover_label() {
+            let tmp = TempDir::new("trust-people-migrate-both");
+            let path = trust_path(&tmp);
+            let peer = fake_hash(0x22);
+            let ts = "2026-01-01T00:00:00Z";
+            fs::write(
+                &path,
+                format!(
+                    "version: {TRUST_FILE_VERSION}\nidentities:\n  {peer}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Old\n    note: null\n    all_destinations: true\npeople:\n  {peer}:\n    alias: New\n"
+                ),
+            )
+            .unwrap();
+
+            let store = TrustStore::open(&tmp.path).unwrap();
+
+            assert_eq!(record(&store, &peer).label.as_deref(), Some("New"));
+            assert_eq!(person_name(&store, &peer).as_deref(), Some("New"));
+        }
+
+        #[test]
+        fn a_non_canonical_hash_in_the_people_section_is_refused_at_load() {
+            let tmp = TempDir::new("trust-people-non-canonical");
+            let path = trust_path(&tmp);
+            let upper = fake_hash(0xab).to_ascii_uppercase();
+            for (text, section) in [
+                (
+                    format!(
+                        "version: {TRUST_FILE_VERSION}\npeople:\n  {upper}:\n    alias: Alex\n"
+                    ),
+                    "`people`",
+                ),
+                (
+                    format!(
+                        "version: {TRUST_FILE_VERSION}\npeople:\n  {}:\n    sessions:\n      {upper}:\n        advertised: temp\n",
+                        fake_hash(0x01)
+                    ),
+                    "`people (sessions field)`",
+                ),
+            ] {
+                fs::write(&path, &text).unwrap();
+                let err = format!("{:#}", TrustStore::open(&tmp.path).err().unwrap());
+                assert!(err.contains(section), "{err}");
+            }
+            fs::write(
+                &path,
+                format!(
+                    "version: {TRUST_FILE_VERSION}\npeople:\n  {}:\n    nickname: Al\n",
+                    fake_hash(0x01)
+                ),
+            )
+            .unwrap();
+            assert!(
+                TrustStore::open(&tmp.path).is_err(),
+                "an unknown people field is refused"
+            );
+        }
+
+        #[test]
+        fn an_owner_alias_breaking_a_rule_or_taken_is_refused_and_nothing_is_written() {
+            let fx = Fixture::new("trust-people-refusals");
+            let (a, b, d) = (fake_hash(0x01), fake_hash(0x02), fake_hash(0x03));
+            fx.store.set_person_alias(&a, Some("Alex"), &[]).unwrap();
+            let before = fx.file_bytes();
+
+            for (identity, destination, name, own, needle) in [
+                (&b, None, "you", &[][..], "reserved"),
+                (&b, None, "a/b", &[][..], "`/`"),
+                (&b, None, "deadbeef", &[][..], "hash"),
+                (&b, None, "  ", &[][..], "empty"),
+                (&b, None, "bad\u{7}", &[][..], "control"),
+                (&b, None, "ALEX", &[][..], NAME_TAKEN),
+                (&b, None, "Main", &["main"][..], NAME_TAKEN),
+                (&a, Some(&d), "alex", &[][..], NAME_TAKEN),
+            ] {
+                let err = match destination {
+                    None => fx.store.set_person_alias(identity, Some(name), own),
+                    Some(destination) => {
+                        fx.store
+                            .set_session_alias(identity, destination, Some(name), own)
+                    }
+                }
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains(needle), "{name:?}: {err}");
+                assert_eq!(fx.file_bytes(), before, "{name:?} wrote");
+            }
+            let err = fx
+                .store
+                .set_person_alias("not-a-hash", Some("Kim"), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a valid identity hash"), "{err}");
+
+            fx.store
+                .set_person_alias(&a.to_ascii_uppercase(), Some(" Alex "), &[])
+                .unwrap();
+            assert_eq!(
+                fx.file_bytes(),
+                before,
+                "the same name again writes nothing"
+            );
+            fx.store
+                .set_session_alias(&b, &d, Some("alex-review"), &[])
+                .unwrap();
+            assert_eq!(
+                session_name(&fx.store, &b, &d).as_deref(),
+                Some("alex-review")
+            );
+
+            fx.store.set_person_alias(&a, None, &[]).unwrap();
+            assert_eq!(person_name(&fx.store, &a), None);
+            fx.store.set_session_alias(&b, &d, None, &[]).unwrap();
+            assert!(!file_text(&fx).contains("\npeople:"), "{}", file_text(&fx));
+        }
+
+        #[test]
+        fn a_card_replaces_its_advertised_names_and_never_the_owners() {
+            let fx = Fixture::new("trust-people-advertised");
+            let (id, dest) = (fake_hash(0x01), fake_hash(0x02));
+            let advertised = |store: &TrustStore| -> Option<String> {
+                store.loaded().file.people.get(&id)?.advertised.clone()
+            };
+
+            assert!(
+                fx.store
+                    .record_advertised(&id, &dest, Some("Alexandra"), Some("temp"))
+                    .unwrap()
+            );
+            let alexandra = fx.store.people(&[]).person(&id).cloned().unwrap();
+            assert_eq!(
+                (alexandra.text.as_str(), alexandra.source),
+                ("Alexandra", AliasSource::Advertised)
+            );
+            assert_eq!(session_name(&fx.store, &id, &dest).as_deref(), Some("temp"));
+
+            let before = fx.file_bytes();
+            assert!(
+                !fx.store
+                    .record_advertised(&id, &dest, Some("Alexandra"), Some("temp"))
+                    .unwrap()
+            );
+            assert!(
+                !fx.store
+                    .record_advertised(
+                        &id,
+                        &dest,
+                        Some("\u{1b}[1mAlexandra\u{200b}"),
+                        Some(" temp ")
+                    )
+                    .unwrap(),
+                "the cleaned card reads the same"
+            );
+            assert_eq!(fx.file_bytes(), before, "an unchanged card writes nothing");
+
+            assert!(
+                fx.store
+                    .record_advertised(&id, &dest, Some("Alexandra"), Some("named-session"))
+                    .unwrap()
+            );
+            assert_eq!(
+                session_name(&fx.store, &id, &dest).as_deref(),
+                Some("named-session"),
+                "a renamed session replaces the name the earlier card gave"
+            );
+
+            fx.store.set_person_alias(&id, Some("Alex"), &[]).unwrap();
+            fx.store
+                .record_advertised(&id, &dest, Some("Lexi"), Some("named-session"))
+                .unwrap();
+            let alex = fx.store.people(&[]).person(&id).cloned().unwrap();
+            assert_eq!(
+                (alex.text.as_str(), alex.source),
+                ("Alex", AliasSource::Owner)
+            );
+            assert_eq!(advertised(&fx.store).as_deref(), Some("Lexi"));
+
+            fx.store.record_advertised(&id, &dest, None, None).unwrap();
+            assert_eq!(
+                advertised(&fx.store),
+                None,
+                "a card without the field clears it"
+            );
+            assert_eq!(session_name(&fx.store, &id, &dest), None);
+            assert_eq!(person_name(&fx.reopen(), &id).as_deref(), Some("Alex"));
+        }
+
+        #[test]
+        fn a_colliding_advertised_name_is_kept_but_neither_shown_nor_addressable() {
+            let fx = Fixture::new("trust-people-collision");
+            let (a, b, d) = (fake_hash(0x01), fake_hash(0x02), fake_hash(0x03));
+            fx.store.set_person_alias(&a, Some("Sam"), &[]).unwrap();
+            fx.store
+                .record_advertised(&b, &d, Some("sam"), Some("you"))
+                .unwrap();
+
+            let people = fx.reopen().people(&[]);
+            assert!(people.person(&a).unwrap().addressable());
+            let sam = people.person(&b).unwrap();
+            assert_eq!(sam.text, "sam", "the colliding name is stored");
+            assert!(!sam.displayable() && !sam.addressable());
+            let you = people.session(&b, &d).unwrap();
+            assert_eq!(
+                you.status,
+                AliasUse::DisplayOnly,
+                "a reserved word is never an address"
+            );
+        }
+
+        #[test]
+        fn no_name_reaches_a_log_line() {
+            install_log_collector();
+            let fx = Fixture::new("trust-people-unlogged");
+            let peer = announced("alpha");
+            fx.announce(&peer, t(1_000));
+            let (id, dest) = (&peer.identity_hash, &peer.destination_hash);
+            let names = [
+                "Quilliam-pp1",
+                "Quilliam-pp2",
+                "Quilliam-pp3",
+                "Quilliam-pp4",
+                "Quilliam-pp5",
+            ];
+            trust_labelled(&fx, &peer, names[0], t(1_000));
+            fx.store.set_person_alias(id, Some(names[1]), &[]).unwrap();
+            fx.store
+                .record_advertised(id, dest, Some(names[2]), Some(names[3]))
+                .unwrap();
+            fx.store
+                .set_session_alias(id, dest, Some(names[4]), &[])
+                .unwrap();
+            let _ = fx
+                .store
+                .set_person_alias(&fake_hash(0x09), Some(names[1]), &[]);
+            fx.store.forget_identity(&fx.mesh, id, false).unwrap();
+
+            let logged: Vec<String> = debug_snapshot()
+                .into_iter()
+                .chain(info_snapshot())
+                .chain(warn_snapshot())
+                .collect();
+            assert!(
+                logged
+                    .iter()
+                    .any(|line| line.contains(&format!("names of identity {}", short(id)))),
+                "the collector reached the store's debug line"
+            );
+            for name in names {
+                assert!(
+                    !logged.iter().any(|line| line.contains(name)),
+                    "{name} was logged"
+                );
+            }
+        }
     }
 }

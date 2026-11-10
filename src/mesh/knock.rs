@@ -1961,6 +1961,39 @@ mod tests {
         assert!(rig.gate.tracked_identities().is_empty());
     }
 
+    /// Names are display only: a stranger the owner named, and whose card names it, is
+    /// still a stranger to the gate.
+    #[test]
+    fn a_named_stranger_is_still_never_a_knock() {
+        let rig = Rig::new("knock-gate-named-stranger", TrustList::default());
+        let (stranger, instance) = (hash_of("stranger"), hash_of("inst"));
+        rig.gate
+            .trust
+            .set_person_alias(&stranger, Some("Bea"), &[])
+            .unwrap();
+        rig.gate
+            .trust
+            .set_session_alias(&stranger, &instance, Some("review"), &[])
+            .unwrap();
+        rig.gate
+            .trust
+            .record_advertised(&stranger, &instance, Some("Beatrice"), Some("temp"))
+            .unwrap();
+
+        for via in [KnockVia::Direct, KnockVia::StoreAndForward] {
+            let admission = rig.gate.admit(
+                knock_from(&stranger, &instance, via),
+                now(),
+                SystemTime::now(),
+            );
+            assert_eq!(admission, Admission::Unknown, "{via:?}");
+        }
+
+        assert!(rig.surface.texts().is_empty());
+        assert!(!rig.gate.cache().path().exists());
+        assert!(rig.gate.tracked_identities().is_empty());
+    }
+
     #[test]
     fn a_denied_instance_and_a_trusted_one_are_not_knocks() {
         install_log_collector();

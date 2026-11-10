@@ -105,6 +105,7 @@ pub(crate) const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
             "OverlayEntry",
         ],
     ),
+    ("people.rs", &["PersonEntry", "SessionNames"]),
     ("knocks.rs", &["KnockRecord"]),
     ("pending.rs", &["PendingRecord", "InboundRecord"]),
     ("message.rs", &["PeerMessage", "Part"]),

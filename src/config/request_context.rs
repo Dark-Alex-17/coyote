@@ -39324,8 +39324,11 @@ mod tests {
         );
         assert_eq!(
             completion_description(&fixture.complete(&["access", "block", ""]), &dest),
-            format!("Bea . {} . trusted . 1 hops . heard 1m ago", short(&dest)),
-            "`block` offers the lifted instance again"
+            format!(
+                "Bea Lab . {} . trusted . 1 hops . heard 1m ago",
+                short(&dest)
+            ),
+            "`block` offers the lifted instance again, under the session name the block left in place"
         );
         assert!(
             !fixture

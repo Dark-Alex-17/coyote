@@ -6313,6 +6313,50 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// Names are display only: B named by A's owner, and by B's own card, is still a
+    /// stranger whose request A drops unanswered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_stranger_is_dropped_as_unknown() {
+        install_log_collector();
+        let pair =
+            NodePair::start_with("request-named-stranger", |_| {}, |_| TrustList::default()).await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_destination = pair.responder.desc.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+        trust
+            .set_person_alias(&b_identity, Some("Bea"), &[])
+            .unwrap();
+        trust
+            .set_session_alias(&b_identity, &b_destination, Some("review"), &[])
+            .unwrap();
+        trust
+            .record_advertised(&b_identity, &b_destination, Some("Beatrice"), Some("temp"))
+            .unwrap();
+        assert_eq!(
+            trust.identity_standing(&b_identity),
+            IdentityStanding::Unknown
+        );
+
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err, timed_out(STATUS_PATH));
+        assert_debug_logged_from(&b_identity[..8], "dropped: unknown identity");
+        assert_eq!(cached_knocks(&pair), 0);
+        assert!(idle.0.lock().is_empty(), "{:#?}", idle.0.lock());
+        assert!(pair.trust_records_of_others().is_empty());
+        pair.stop_node_a().await;
+    }
+
     /// B's identity is trusted for all destinations and B's instance carries a bound
     /// record, but B has not been heard yet (no peer row). `block <destination>` removes
     /// the record and writes the deny; `unblock <destination>` lifts the deny and reports

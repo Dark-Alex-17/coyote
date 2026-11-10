@@ -3,6 +3,7 @@
 ### Feat
 
 - **mesh**: envoy conversation memory per (sender identity, sending destination, thread): `mesh.envoy_memory.*` (off by default) remembers a trusted peer's turns and the node's replies so a follow-up in the same thread is answered in context; `.mesh memory forget <identity|all> [thread]` wipes it, `.mesh status`/`.mesh info` report it, and `.mesh untrust --identity`/`.mesh block` say what they forget
+- **mesh**: names of people and their sessions live in a new `people:` section of `mesh/trust.yaml`, kept apart from every trust decision: the labels an earlier file kept on its identity and destination records move there when the file is loaded and are written there on the next change, revoking or blocking keeps them and forgetting erases them. A Coyote from before this change refuses a trust list that has a `people:` section
 
 ### Fix
 

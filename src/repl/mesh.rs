@@ -30790,7 +30790,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .find(|record| record.hash == dest)
                         .expect("the lift writes a record");
                     assert!(!record.denied);
-                    assert_eq!(record.label, None, "the block took the labelled record");
+                    assert_eq!(
+                        record.label.as_deref(),
+                        Some("Tia's desk"),
+                        "the session's name outlives the record the block took"
+                    );
                     assert_eq!(record.identity.as_deref(), Some(id.as_str()));
                     assert!(trust.denied().is_empty());
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
@@ -30802,10 +30806,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(
                         offered_as(&offers(&ctx, "block"), &dest).is_some_and(|text| text
                             .starts_with(&format!(
-                                "Tia . {} . trusted . 1 hops . heard ",
+                                "Tia's desk . {} . trusted . 1 hops . heard ",
                                 short(&dest)
                             ))),
-                        "the label went with the blocked record, so the announced name leads: {:?}",
+                        "the session's name outlived the block, so it leads the lifted record again: {:?}",
                         offers(&ctx, "block")
                     );
 

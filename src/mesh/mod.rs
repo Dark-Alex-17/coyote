@@ -26,6 +26,7 @@ mod node;
 pub(crate) mod notify;
 mod peers;
 pub(crate) mod pending;
+pub(crate) mod people;
 #[cfg(test)]
 mod pins;
 mod propagation;
@@ -2607,7 +2608,7 @@ mod tests {
     /// the log rule: "a peer's message content or title, its `fields`, a knock introduction,
     /// an envoy question or answer, a status card or any text of one, nor the human's brief,
     /// objective or session name".
-    const UNLOGGABLE_WORDS: [&str; 15] = [
+    const UNLOGGABLE_WORDS: [&str; 17] = [
         "content",
         "body",
         "brief",
@@ -2623,6 +2624,8 @@ mod tests {
         "answer",
         "reply",
         "reply_text",
+        "alias",
+        "person_name",
     ];
     /// Identifiers that carry a full identity or destination hash; each must be inside
     /// `short(` where it is logged.
@@ -3102,8 +3105,13 @@ mod tests {
 
     #[test]
     fn redaction_scanner_flags_each_rule_and_passes_the_permitted_forms() {
-        let flagged: [(&str, &[&str]); 19] = [
+        let flagged: [(&str, &[&str]); 21] = [
             ("debug!(\"got {content}\")", &["interpolates `{content}`"]),
+            ("debug!(\"named {alias}\")", &["interpolates `{alias}`"]),
+            (
+                "info!(\"card says {}\", card_fields.person_name)",
+                &["passes `person_name`"],
+            ),
             ("debug!(\"{content:?}\")", &["interpolates `{content}`"]),
             ("debug!(\"got {}\", message.title)", &["passes `title`"]),
             ("debug!(\"sent {}\", answer)", &["passes `answer`"]),
