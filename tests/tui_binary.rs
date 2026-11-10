@@ -6199,7 +6199,7 @@ fn write_conflicting_local_mcp(dir: &Path) -> String {
 }
 
 const MCP_CONFLICT_REFUSAL: &str =
-    "Refusing to merge MCP server 'bundle-k7s-server' non-interactively";
+    "Refusing to merge the already-installed MCP server 'bundle-k7s-server' non-interactively";
 const REPL_HINT: &str = "Re-run in the plain REPL";
 const TERMINAL_HINT: &str = "Re-run in a terminal";
 

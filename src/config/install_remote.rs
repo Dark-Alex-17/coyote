@@ -2283,7 +2283,7 @@ fn resolve_mcp_conflict(
     }
     if !conflict::menu_can_use_terminal() {
         return Err(conflict::refuse_non_interactive(
-            format_args!("merge MCP server '{name}'"),
+            format_args!("merge the already-installed MCP server '{name}'"),
             ", with --install-force (installs), or with --yes (updates).",
         ));
     }
@@ -3165,7 +3165,8 @@ mod tests {
 
         assert!(
             err.to_string().contains(
-                "Refusing to merge MCP server 'alpha' non-interactively. Re-run in a terminal"
+                "Refusing to merge the already-installed MCP server 'alpha' \
+                 non-interactively. Re-run in a terminal"
             ),
             "got: {err}"
         );
