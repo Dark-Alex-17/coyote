@@ -1405,6 +1405,9 @@ fn mesh_paths(literal: &str) -> Vec<(usize, char, String)> {
             continue;
         };
         let sigil = char::from(literal.as_bytes()[sigil_at]);
+        if !matches!(sigil, '.' | '/') {
+            continue;
+        }
         let before = &literal[..sigil_at];
         let at_boundary = before
             .chars()
@@ -1412,7 +1415,7 @@ fn mesh_paths(literal: &str) -> Vec<(usize, char, String)> {
             .is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '('))
             || before.ends_with("\\n")
             || before.ends_with("\\t");
-        if !matches!(sigil, '.' | '/') || !at_boundary {
+        if !at_boundary {
             continue;
         }
         let rest = &literal[at + "mesh ".len()..];
