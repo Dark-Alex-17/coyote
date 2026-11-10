@@ -298,7 +298,7 @@ pub(crate) fn other_sessions_asked(
                     }),
             ),
             Err(err) => log::debug!(
-                "Questions asked from instance {} are left out of `.mesh pending`: {}",
+                "Questions asked from instance {} are left out of `.mesh messaging sent`: {}",
                 short(&instance_id),
                 redact_hashes(&format!("{err:#}"))
             ),

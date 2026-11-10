@@ -641,7 +641,7 @@ impl EnvoySessions {
             }
             Err(err) if self.is_record_error(&err, identity, destination, thread) => {
                 warn!(
-                    "Mesh envoy memory for thread {thread} could not be read ({}), so it was not resumed. A new conversation starts under message {message_id}; run `.mesh memory forget {} {thread}` to clear the unreadable record.",
+                    "Mesh envoy memory for thread {thread} could not be read ({}), so it was not resumed. A new conversation starts under message {message_id}; run `.mesh envoy memory forget {} {thread}` to clear the unreadable record.",
                     redact_hashes(&err.to_string()),
                     short(identity)
                 );
@@ -649,7 +649,7 @@ impl EnvoySessions {
             }
             Err(err) => {
                 warn!(
-                    "Mesh envoy memory could not be used ({}), so thread {thread} was not resumed. A new conversation starts under message {message_id}. Check that the cache directory is readable and writable and the disk has room; if the index cannot be read, run `.mesh memory forget all` to empty the store.",
+                    "Mesh envoy memory could not be used ({}), so thread {thread} was not resumed. A new conversation starts under message {message_id}. Check that the cache directory is readable and writable and the disk has room; if the index cannot be read, run `.mesh envoy memory forget all` to empty the store.",
                     redact_hashes(&err.to_string())
                 );
                 fresh()
@@ -3698,7 +3698,10 @@ mod tests {
 
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
-        let forget = format!(".mesh memory forget {} t-unreadable", short(IDENTITY_A));
+        let forget = format!(
+            ".mesh envoy memory forget {} t-unreadable",
+            short(IDENTITY_A)
+        );
         let warns = warn_snapshot();
         assert!(
             warns.iter().any(|message| message
@@ -3727,7 +3730,7 @@ mod tests {
 
         assert_eq!(session.thread, "m-3");
         assert!(session.resumed.is_none());
-        let forget_thread = format!(".mesh memory forget {} t-held", short(IDENTITY_A));
+        let forget_thread = format!(".mesh envoy memory forget {} t-held", short(IDENTITY_A));
         let warns = warn_snapshot();
         assert!(
             warns.iter().any(|message| message
@@ -3735,7 +3738,7 @@ mod tests {
                 && message.contains(
                     "so thread t-held was not resumed. A new conversation starts under message m-3"
                 )
-                && message.contains("`.mesh memory forget all`")
+                && message.contains("`.mesh envoy memory forget all`")
                 && !message.contains(&forget_thread)),
             "captured: {warns:#?}"
         );

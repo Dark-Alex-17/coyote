@@ -3553,11 +3553,11 @@ mod tests {
                 ..raw("")
             });
             let line = message
-                .summary_line_with_tail(Some(".info"), "; run .mesh reply")
+                .summary_line_with_tail(Some(".info"), "; run .mesh messaging send")
                 .render(CommandPrefix::Slash);
             assert!(line.starts_with(".info says: .session list"), "{line}");
             assert!(
-                line.ends_with("...; run /mesh reply (full text: /mesh messaging inbox)"),
+                line.ends_with("...; run /mesh messaging send (full text: /mesh messaging inbox)"),
                 "{line}"
             );
         }

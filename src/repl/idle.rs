@@ -516,7 +516,7 @@ async fn sync_outcome(
 /// A knock surfaces once per instance of an identity until the owner acts on that
 /// identity, only for an identity already trusted at the identity tier
 /// (`KnockGate::admit` drops unknown ones), and its line carries the full hash the
-/// `.mesh trust` hint needs. A reply answers a question this node asked, so replies are
+/// `.mesh access trust` hint needs. A reply answers a question this node asked, so replies are
 /// bounded by our own asks. An access request is capped per identity
 /// (`ACCESS_MAX_PENDING_PER_IDENTITY`) and its line carries the id the grant verb needs.
 fn exempt_from_folding(source: Source) -> bool {
@@ -1849,7 +1849,8 @@ mod tests {
         }
 
         /// A fetch identifies the node to the propagation node, so a node whose operator
-        /// chose not to announce is never identified on its own; `.mesh sync` still is.
+        /// chose not to announce is never identified on its own; `.mesh messaging sync` still
+        /// is.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_node_that_does_not_announce_never_fetches_automatically() {
             let ctx = ctx_for(MeshConfig {
@@ -2037,7 +2038,7 @@ mod tests {
 
         /// The `.mesh off` / `.mesh on` cycle: leaving the mesh disarms the schedule with
         /// nothing owed; the next install asks again on its own, so a rejoined node gets
-        /// its join-time fetch without `.mesh sync`, and a fetch that receives nothing
+        /// its join-time fetch without `.mesh messaging sync`, and a fetch that receives nothing
         /// stays silent across both joins.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn rejoining_after_mesh_off_starts_the_join_time_sync_again() {

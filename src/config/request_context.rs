@@ -284,7 +284,7 @@ mod mesh_path {
     ];
 }
 
-/// Flags for `.mesh inbox`, `rest` being everything after the verb: `--purge-files`
+/// Flags for `.mesh messaging inbox`, `rest` being everything after the verb: `--purge-files`
 /// until it is given, then `--yes` and `--dry-run`, each dropping once its partner is
 /// present.
 fn mesh_completion_inbox(rest: &[&str]) -> Vec<(String, Option<String>)> {
@@ -317,7 +317,7 @@ fn heard_peers(runtime: &MeshRuntime) -> Vec<PeerRecord> {
     peers
 }
 
-/// The knock cache as `.mesh knocks` would list it; an unreadable cache completes to
+/// The knock cache as `.mesh access requests` would list it; an unreadable cache completes to
 /// nothing rather than failing the key press.
 fn cached_knocks(runtime: &MeshRuntime, now: SystemTime) -> Vec<KnockRecord> {
     runtime
@@ -431,7 +431,7 @@ enum DestinationFilter {
     TrustedAndHeard,
     /// `trust`: heard peers whose row kept the name hash and knockers whose newest knock
     /// did, the two sightings the verb proves the binding from, less a blocked identity's,
-    /// which `trust` refuses until `.mesh unblock`, a refused destination included, since
+    /// which `trust` refuses until `.mesh access unblock`, a refused destination included, since
     /// `trust` lifts the deny.
     Trustable,
     /// `block`: heard peers and knockers not already blocked, an identity-covered
@@ -532,7 +532,7 @@ fn destination_row(candidate: &DestinationCandidate) -> (String, Option<String>)
 
 /// The name a row for `destination`, heard under `identity`, offers in place of its hash:
 /// your session running there when the row is under that session's identity, else the
-/// label `.mesh peers` shows for it. A name is offered only when it is
+/// label `.mesh people list` shows for it. A name is offered only when it is
 /// one word that displays as spelled, is not itself a whole hash (which the verbs would
 /// take as given), is not a reserved word or flag the verbs would read as such (`clear`,
 /// anything starting `--`), and every name spelled the same stands for this destination,
@@ -1054,7 +1054,7 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         .collect()
 }
 
-/// Where a `.mesh answer <TAB>` row cuts the question it describes.
+/// Where a `.mesh envoy answer <TAB>` row cuts the question it describes.
 const ANSWER_COMPLETION_QUESTION_CHARS: usize = 60;
 
 const SET_COMPLETION_KEYS: [&str; 29] = [
@@ -6935,11 +6935,11 @@ impl RequestContext {
         collect_destination_rows(&runtime, SystemTime::now(), filter)
     }
 
-    /// Identities for `.mesh trust --identity <TAB>` (the peer table alone) and, with
-    /// `include_knocks`, `.mesh block --identity <TAB>` (knockers first, then peers): each distinct
-    /// identity described by its label or short hash, less the identities already blocked,
-    /// which `trust` refuses and `block` has nothing left to do for. Empty while the mesh
-    /// is off.
+    /// Identities for `.mesh access trust --identity <TAB>` (the peer table alone) and, with
+    /// `include_knocks`, `.mesh access block --identity <TAB>` (knockers first, then peers):
+    /// each distinct identity described by its label or short hash, less the identities
+    /// already blocked, which `trust` refuses and `block` has nothing left to do for. Empty
+    /// while the mesh is off.
     fn mesh_completion_identities(&self, include_knocks: bool) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
@@ -6972,7 +6972,7 @@ impl RequestContext {
         values
     }
 
-    /// Identity-tier records for `.mesh forget --identity <TAB>` and the `--peer` of the
+    /// Identity-tier records for `.mesh access forget --identity <TAB>` and the `--peer` of the
     /// share verbs, each shown as `{label} . {short hash} . trusted {since}`. Empty while
     /// the mesh is off.
     fn mesh_completion_trusted_identities(&self) -> Vec<(String, Option<String>)> {
@@ -6984,7 +6984,7 @@ impl RequestContext {
         })
     }
 
-    /// Identity records for `.mesh untrust --identity <TAB>`: those the verb takes, which
+    /// Identity records for `.mesh access revoke --identity <TAB>`: those the verb takes, which
     /// is a record granting all destinations, or one with no instance bound to it. A
     /// binding-only record whose instances stand holds nothing to withdraw, so `untrust`
     /// refuses it and names `untrust <destination>` and `forget --identity` instead.
@@ -7027,14 +7027,14 @@ impl RequestContext {
             .map(|remembered| remembered.by_identity)
             .unwrap_or_else(|err| {
                 debug!(
-                    "envoy memory unreadable while completing `.mesh memory`: {}",
+                    "envoy memory unreadable while completing `.mesh envoy memory`: {}",
                     redact_hashes(&err.to_string())
                 );
                 BTreeMap::new()
             })
     }
 
-    /// `.mesh memory forget <TAB>` and what follows, `rest` being everything after
+    /// `.mesh envoy memory forget <TAB>` and what follows, `rest` being everything after
     /// `forget`. The first position is every identity the envoy remembers, each as
     /// `{peer name or short hash} . {n} conversations`, then with the mesh on the trust
     /// list's identities it remembers nothing of, less the blocked, and `all` last. The
@@ -7236,11 +7236,11 @@ impl RequestContext {
             }
             (mesh_path::ACCESS_UNBLOCK, ["--identity", _]) => self.mesh_completion_blocked(),
             (mesh_path::ENVOY_ANSWER, [_]) => {
-                self.mesh_completion_escalated_questions("answer", SystemTime::now())
+                self.mesh_completion_escalated_questions("envoy answer", SystemTime::now())
             }
             (mesh_path::MESSAGING_FOLLOW_UP, [_]) => self.mesh_completion_asked_questions(),
             (mesh_path::ENVOY_DISMISS, [_]) => {
-                self.mesh_completion_escalated_questions("dismiss", SystemTime::now())
+                self.mesh_completion_escalated_questions("envoy dismiss", SystemTime::now())
             }
             (mesh_path::ENVOY_BRIEF, [_]) => {
                 super::map_completion_values(vec!["note ", "auto", "manual", "off"])
@@ -7256,14 +7256,15 @@ impl RequestContext {
     }
 
     /// What peers escalated and this node has not yet decided; empty, with a debug line,
-    /// when the store cannot be read, since completion never fails the prompt.
-    fn mesh_completion_inbound(&self, verb: &str, now: SystemTime) -> Vec<InboundRecord> {
+    /// naming the `path` being completed, when the store cannot be read, since completion
+    /// never fails the prompt.
+    fn mesh_completion_inbound(&self, path: &str, now: SystemTime) -> Vec<InboundRecord> {
         match self.app.mesh.inbound_store() {
             Some(store) => match store.list(now) {
                 Ok(records) => records,
                 Err(err) => {
                     debug!(
-                        "inbound store unreadable while completing `.mesh {verb}`: {}",
+                        "inbound store unreadable while completing `.mesh {path}`: {}",
                         redact_hashes(&format!("{err:#}"))
                     );
                     Vec::new()
@@ -7274,8 +7275,8 @@ impl RequestContext {
     }
 
     /// One question's completion row: `{short id} . {name} ({short peer}) . {age} .
-    /// "{question}"`, the peer named as `.mesh pending` names it, the question cut on a
-    /// word past `ANSWER_COMPLETION_QUESTION_CHARS`.
+    /// "{question}"`, the peer named as `.mesh envoy questions` names it, the question cut
+    /// on a word past `ANSWER_COMPLETION_QUESTION_CHARS`.
     fn describe_question(
         &self,
         now: SystemTime,
@@ -7300,15 +7301,16 @@ impl RequestContext {
         )
     }
 
-    /// Ids for `.mesh dismiss <TAB>`, and the first half of `.mesh answer`'s: the
-    /// questions peers escalated, never their access requests, each a `describe_question`
-    /// row.
+    /// Ids for `.mesh envoy dismiss <TAB>`, and the first half of `.mesh envoy answer`'s:
+    /// the questions peers escalated, never their access requests, each a
+    /// `describe_question` row. `path` names the completed command in the
+    /// unreadable-store debug line.
     fn mesh_completion_escalated_questions(
         &self,
-        verb: &str,
+        path: &str,
         now: SystemTime,
     ) -> Vec<(String, Option<String>)> {
-        self.mesh_completion_inbound(verb, now)
+        self.mesh_completion_inbound(path, now)
             .into_iter()
             .filter(|record| record.kind != InboundKind::Access)
             .map(|record| {
@@ -7349,13 +7351,14 @@ impl RequestContext {
             .collect()
     }
 
-    /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
-    /// escalated, each described as `{short peer} . {n paths} . {age}`. Never the paths
-    /// or the reason, which a completion popup would show to whoever is at the screen.
-    /// `verb` names the completed verb in the unreadable-store debug line.
+    /// Ids for `.mesh files grant <TAB>` and `.mesh files refuse <TAB>`: the access
+    /// requests peers escalated, each described as `{short peer} . {n paths} . {age}`.
+    /// Never the paths or the reason, which a completion popup would show to whoever is
+    /// at the screen. `verb` names the completed `files` verb in the unreadable-store
+    /// debug line.
     fn mesh_completion_access_requests(&self, verb: &str) -> Vec<(String, Option<String>)> {
         let now = SystemTime::now();
-        self.mesh_completion_inbound(verb, now)
+        self.mesh_completion_inbound(&format!("files {verb}"), now)
             .into_iter()
             .filter(|record| record.kind == InboundKind::Access)
             .map(|record| {
@@ -7373,8 +7376,8 @@ impl RequestContext {
             .collect()
     }
 
-    /// Completions for `.mesh grant` and `.mesh refuse`, `rest` being everything after
-    /// the verb: the pending access requests until the id is given, since the first
+    /// Completions for `.mesh files grant` and `.mesh files refuse`, `rest` being everything
+    /// after the verb: the pending access requests until the id is given, since the first
     /// word is read as the id, then for `grant` the flags not yet used, `--standing` and
     /// `--for` each dropping once the other is present, and `--global`/`--workspace`,
     /// which name the share file a standing grant writes to, offered only after
@@ -7412,14 +7415,14 @@ impl RequestContext {
         values
     }
 
-    /// Completions for `.mesh fetch`, `rest` being everything after the verb, from the
+    /// Completions for `.mesh files fetch`, `rest` being everything after the verb, from the
     /// node's caches alone. Until the peer is given, the trusted heard peers, those whose
     /// last card advertises `fetch` tagged `. fetch` and none hidden for a card not heard
     /// yet; after it, the paths that peer has told this node it may read, each once with
     /// the first word on it: reference attachments not yet fetched, then grants not yet
     /// expired, both under the identity the peer table holds for the destination, then
     /// the last listing page; then `--if-sha256 `, offered once. A path that would not
-    /// display as the peer spelled it is left out, since no `.mesh fetch` could type it.
+    /// display as the peer spelled it is left out, since no `.mesh files fetch` could type it.
     /// A session name or label typed for the peer reads that destination's caches.
     fn mesh_completion_fetch(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
         let Some((_, prior)) = rest.split_last() else {
@@ -7502,12 +7505,13 @@ impl RequestContext {
         }
     }
 
-    /// Completions for `.mesh request`, `rest` being everything after the verb, from the
+    /// Completions for `.mesh files request`, `rest` being everything after the verb, from the
     /// node's caches alone. Until the destination is given, the trusted heard peers; after
     /// it, at every position, the paths of that peer's last listing not typed yet, then
     /// `--reason ` and `--yes`, each offered once. Nothing follows `--reason`, whose value
     /// is free text and never counts as the destination or a path. A path that would not
-    /// display as the peer spelled it is left out, since no `.mesh request` could type it.
+    /// display as the peer spelled it is left out, since no `.mesh files request` could type
+    /// it.
     /// A session name or label typed for the destination reads that destination's listing.
     fn mesh_completion_request(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
         let Some((_, prior)) = rest.split_last() else {
@@ -7676,8 +7680,8 @@ impl RequestContext {
             .share_locations(|| self.app.config.mesh.fetch.inbox_dir())
     }
 
-    /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
-    /// the share-root directory `typed` names, directories with a trailing `/`, less
+    /// Root-relative paths for `.mesh files allow <TAB>` and `.mesh files deny <TAB>`: the
+    /// entries of the share-root directory `typed` names, directories with a trailing `/`, less
     /// `.git`, the workspace config directory, anything the built-in deny names, every
     /// directory the walk skips and every symlink, since the walk judges files by their
     /// real path and a rule naming the link would serve none. Local filesystem and the
@@ -7775,7 +7779,7 @@ impl RequestContext {
         values
     }
 
-    /// Patterns for `.mesh unshare <TAB>`: every entry of both share files as they are on
+    /// Patterns for `.mesh files unshare <TAB>`: every entry of both share files as they are on
     /// disk, described as `{allow|deny|override} . {global|workspace}`; a pattern both
     /// files hold keeps its first description, and one that is nothing but escapes is not
     /// offered. Works while the mesh is off.
@@ -36304,7 +36308,7 @@ mod tests {
         create_dir_all(&macros_dir).unwrap();
         write(
             macros_dir.join("meshy.yaml"),
-            "description: grants trust\nsteps:\n  - \".model x\"\n  - \"  .mesh trust {{peer}}\"\n",
+            "description: grants trust\nsteps:\n  - \".model x\"\n  - \"  .mesh access trust {{peer}}\"\n",
         )
         .unwrap();
         write(macros_dir.join("plain.yaml"), "steps:\n  - \".model x\"\n").unwrap();
@@ -36320,7 +36324,7 @@ mod tests {
 
         assert_eq!(
             render("meshy"),
-            "invalid (step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest)"
+            "invalid (step 2 '  .mesh access trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest)"
         );
         // The row keeps its description so the listing stays informative.
         assert_eq!(
@@ -37395,7 +37399,7 @@ mod tests {
         }
 
         /// An instance under both an identity label and a destination label offers the
-        /// destination label whichever the trust list holds first, as `.mesh peers` shows
+        /// destination label whichever the trust list holds first, as `.mesh people list` shows
         /// it; where a verb reads an identity label as the identity, an identity label is
         /// never a destination row's value.
         #[test]
@@ -38544,7 +38548,7 @@ mod tests {
             !trust
                 .iter()
                 .any(|(value, _)| *value == fixture.blocked_destination),
-            "a blocked identity's destination is refused until `.mesh unblock`"
+            "a blocked identity's destination is refused until `.mesh access unblock`"
         );
         assert!(
             !trust
@@ -38863,7 +38867,7 @@ mod tests {
             !identities
                 .iter()
                 .any(|(value, _)| *value == fixture.blocked_identity),
-            "a blocked identity is refused until `.mesh unblock`"
+            "a blocked identity is refused until `.mesh access unblock`"
         );
 
         fixture.stop().await;
@@ -40094,7 +40098,7 @@ mod tests {
             "an access request is decided, not answered: {ids:?}"
         );
 
-        // `.mesh dismiss <TAB>` offers the questions peers escalated and nothing else:
+        // `.mesh envoy dismiss <TAB>` offers the questions peers escalated and nothing else:
         // not this node's own question (only the peer's reply closes it), not the access
         // request (`grant`/`refuse` decide it), each row the shape the answer row has.
         let dismissals = ctx.repl_complete(".mesh", &["envoy", "dismiss", ""], "");
@@ -40189,7 +40193,7 @@ mod tests {
         );
         file("ask", InboundKind::Access, then - Duration::from_secs(90));
 
-        let listed = ctx.mesh_completion_inbound("answer", then);
+        let listed = ctx.mesh_completion_inbound("envoy answer", then);
         let mut ids: Vec<&str> = listed.iter().map(|record| record.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(
@@ -40197,7 +40201,7 @@ mod tests {
             ["ask", "old", "young"],
             "all three are live under their own clock"
         );
-        let described = ctx.mesh_completion_escalated_questions("answer", then);
+        let described = ctx.mesh_completion_escalated_questions("envoy answer", then);
         let young = described.iter().find(|(id, _)| id == "young").unwrap();
         assert!(
             young
@@ -40208,7 +40212,7 @@ mod tests {
         );
         let later = then + Duration::from_secs(2 * 3_600);
         let ids: Vec<String> = ctx
-            .mesh_completion_escalated_questions("answer", later)
+            .mesh_completion_escalated_questions("envoy answer", later)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -40218,7 +40222,7 @@ mod tests {
             "two hours on, the old question's week has run out"
         );
         assert!(
-            ctx.mesh_completion_inbound("grant", SystemTime::now())
+            ctx.mesh_completion_inbound("files grant", SystemTime::now())
                 .is_empty(),
             "under the wall clock every row is expired, so a second sample would hide them all"
         );
@@ -41287,7 +41291,7 @@ mod tests {
         let _guard = HelperConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-decision-unreadable").await;
         let unreadable_reports = |verb: &str| {
-            let head = format!("inbound store unreadable while completing `.mesh {verb}`: ");
+            let head = format!("inbound store unreadable while completing `.mesh files {verb}`: ");
             debug_snapshot()
                 .iter()
                 .filter(|line| line.starts_with(&head))

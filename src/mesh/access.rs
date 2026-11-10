@@ -5336,7 +5336,7 @@ mod tests {
     /// carries but the peer table holds under another identity trusted for all
     /// destinations. Under `mesh.collision_protection` the request is dropped before
     /// admission is asked, the human gets one `error:` line naming both identities and
-    /// `.mesh trust <requester's destination>`, nothing is marked (there is no record to
+    /// `.mesh access trust <requester's destination>`, nothing is marked (there is no record to
     /// mark) and `trust.yaml` keeps its bytes; with protection off the same request is
     /// filed and the path adds no line of its own.
     #[test]

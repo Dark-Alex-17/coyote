@@ -2838,8 +2838,9 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     Ok(())
 }
 
-/// The line `.mesh access ask` shows before it asks to knock, naming the peer as `.mesh
-/// message` does. The name and the intro the human typed are quoted as they stand.
+/// The line `.mesh access ask` shows before it asks to knock, naming the peer as
+/// `.mesh messaging send` does. The name and the intro the human typed are quoted as they
+/// stand.
 fn knock_confirmation(name: &str, destination: &str, trust: &str, intro: &str) -> NoticeText {
     let intro_label = if intro.is_empty() {
         NoticeText::from("without an intro")
@@ -7580,8 +7581,8 @@ mod name_addressing_tests {
     }
 
     /// An instance under this node's own identity that no running session serves is
-    /// `(you)` before any label, the identity's `this node` grant included, as `.mesh
-    /// peers` names it; with the mesh off no identity is this node's.
+    /// `(you)` before any label, the identity's `this node` grant included, as
+    /// `.mesh people list` names it; with the mesh off no identity is this node's.
     #[test]
     fn an_instance_under_your_own_identity_is_you_before_any_label() {
         let own_grant = AddressName {
@@ -9610,8 +9611,8 @@ mod peers_you_tests {
 /// stale row, and a later row of the same identity at another destination says where the
 /// identity went, which is more useful than how long this row has been silent, so a
 /// superseded row is never also called stale. `.mesh people list` puts the marker in the
-/// `state` column, where it is joined by the compatibility line and nothing else; `.mesh
-/// info <dest>` appends it to the `last seen` line.
+/// `state` column, where it is joined by the compatibility line and nothing else;
+/// `.mesh people info <dest>` appends it to the `last seen` line.
 fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime) -> Option<String> {
     if let Some(successor) = successor {
         return Some(format!(
@@ -9702,10 +9703,10 @@ fn period_text(period: Duration) -> String {
     }
 }
 
-/// The verbs that change what a denied old record keeps, worded the same under `.mesh
-/// peers`' marker and `.mesh access trust`'s superseded line: `.mesh access unblock <destination>` lifts
-/// the block and leaves the record untrusted; `.mesh access forget --identity` erases the old
-/// key, the block on it included.
+/// The verbs that change what a denied old record keeps, worded the same under
+/// `.mesh people list`'s marker and `.mesh access trust`'s superseded line:
+/// `.mesh access unblock <destination>` lifts the block and leaves the record untrusted;
+/// `.mesh access forget --identity` erases the old key, the block on it included.
 fn denied_remedy(destination: &str, identity: &str) -> String {
     format!(
         ".mesh access unblock {destination} lifts the block, .mesh access forget --identity {identity} erases the old key, the block on it included"
@@ -13186,10 +13187,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
     }
 
-    /// Ann's identity grants only listed instances, so the old key goes with `.mesh
-    /// untrust <destination>`; Dee's grants every destination, which makes that untrust a
-    /// refusal, so the line names `access block` for the old key and `access revoke --identity` for the
-    /// grant. Bob's denied record keeps its refusal, lifted by `access unblock`, erased by `access forget`.
+    /// Ann's identity grants only listed instances, so the old key goes with
+    /// `.mesh access revoke <destination>`; Dee's grants every destination, which makes
+    /// that revoke a refusal, so the line names `access block` for the old key and
+    /// `access revoke --identity` for the grant. Bob's denied record keeps its refusal,
+    /// lifted by `access unblock`, erased by `access forget`.
     #[test]
     fn peers_marks_a_record_whose_instance_was_announced_under_another_identity() {
         let now = SystemTime::now();
@@ -20022,9 +20024,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// every row reads `no route`, except that of two stale rows under one identity
             /// the older is superseded by the newer (the successor need not be live); the
             /// legend is the last line; the markers are render-time only (the persisted table
-            /// carries no such state) and a second listing renders the same bytes. `.mesh
-            /// info`, which reads no path, marks a row seen exactly two heartbeats ago stale,
-            /// not one seen a little less than that.
+            /// carries no such state) and a second listing renders the same bytes.
+            /// `.mesh people info`, which reads no path, marks a row seen exactly two
+            /// heartbeats ago stale, not one seen a little less than that.
             #[test]
             #[serial]
             fn peers_marks_boundary_rows_and_persists_nothing_about_the_state() {
@@ -22291,14 +22293,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// The remedies the `error:` line names, run as the operator runs them, against a
             /// real node under `collision_protection: true`. The new key presents an instance
             /// the peer table holds under the old key, is refused and earns the one owner
-            /// line; the old row then ages out and the refusal stands from memory. `.mesh
-            /// untrust --identity <old> --confirm untrust-<short>` admits the new key, the
-            /// memo refusing only for a holder still trusted for all destinations, and
-            /// trusting the old key again refuses it again from the same memo; `.mesh access block
-            /// <new> --yes` refuses the new key as blocked, admits the old key and clears the
-            /// memo, so `.mesh access unblock` and a fresh identity grant admit the new key with the
-            /// old row gone. The listing keeps labelling the old key's row `trusted` with no
-            /// marker row, no record is ever marked and the owner hears the one line only.
+            /// line; the old row then ages out and the refusal stands from memory.
+            /// `.mesh access revoke --identity <old> --confirm untrust-<short>` admits the new
+            /// key, the memo refusing only for a holder still trusted for all destinations,
+            /// and trusting the old key again refuses it again from the same memo;
+            /// `.mesh access block <new> --yes` refuses the new key as blocked, admits the old
+            /// key and clears the memo, so `.mesh access unblock` and a fresh identity grant
+            /// admit the new key with the old row gone. The listing keeps labelling the old
+            /// key's row `trusted` with no marker row, no record is ever marked and the owner
+            /// hears the one line only.
             #[test]
             #[serial]
             fn block_and_untrust_identity_through_the_repl_are_the_remedies_of_a_remembered_presence_refusal()
@@ -32141,8 +32144,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The other process is a second `flock` on the same lock file, which is what
-            /// `FetchLock` refuses on. Nothing is asked of the node, and the next `.mesh
-            /// sync` after the lock is released runs normally.
+            /// `FetchLock` refuses on. Nothing is asked of the node, and the next
+            /// `.mesh messaging sync` after the lock is released runs normally.
             #[test]
             #[serial]
             fn sync_held_by_another_process_prints_one_line_and_succeeds() {
@@ -32579,10 +32582,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// A trusted peer that said it left is tried over no link and waited on for no
-            /// path, though it would answer: with no propagation node known, `.mesh
-            /// message`, `.mesh files request` and mesh__send, mesh__ask and mesh__request_access
-            /// each say at once that it is unreachable and queue nothing, and `.mesh
-            /// pending` shows the question still open to it beside `peer left`.
+            /// path, though it would answer: with no propagation node known,
+            /// `.mesh messaging send`, `.mesh files request` and mesh__send, mesh__ask and
+            /// mesh__request_access each say at once that it is unreachable and queue
+            /// nothing, and `.mesh messaging sent` shows the question still open to it
+            /// beside `peer left`.
             #[test]
             #[serial]
             fn a_peer_that_said_it_left_is_not_tried_and_pending_says_it_left() {
@@ -32780,9 +32784,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// `.mesh messaging send`, `.mesh files request`, mesh__send, mesh__ask and
             /// mesh__request_access each go to the propagation node at once, with no path
             /// wait and no link to the peer, and each says the peer left, that the node
-            /// holds it and who gets it. The tools name the peer by its full hash, `.mesh
-            /// pending` marks the open question `peer left`, and once the peer announces
-            /// again the next send goes straight to it.
+            /// holds it and who gets it. The tools name the peer by its full hash,
+            /// `.mesh messaging sent` marks the open question `peer left`, and once the
+            /// peer announces again the next send goes straight to it.
             #[test]
             #[serial]
             fn a_send_to_a_peer_that_left_is_held_at_once_and_says_so_on_every_surface() {
@@ -35308,11 +35312,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// With an instance blocked in place, `access trust --prune --confirm` for an ancient
-            /// horizon sweeps a stale sibling but leaves the block where it is, `.mesh
-            /// peers` shows the instance as `blocked (instance)`, `access block` then `access unblock` of
-            /// its identity leaves the deny standing, and the verb error after that spells
-            /// the full destination twice.
+            /// With an instance blocked in place, `access revoke --stale --confirm` for an
+            /// ancient horizon sweeps a stale sibling but leaves the block where it is,
+            /// `.mesh people list` shows the instance as `blocked (instance)`,
+            /// `access block` then `access unblock` of its identity leaves the deny
+            /// standing, and the verb error after that spells the full destination twice.
             #[test]
             #[serial]
             fn prune_then_block_unblock_leave_a_blocked_instances_deny_standing() {
@@ -42582,12 +42586,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// Rows under `.git` BEHIND A GLOB that an older
-                /// file (or a hand) placed are still inspectable and removable: `.mesh
-                /// shares` lists them with their file, the `files unshare` completer offers them,
-                /// `--effective` never lists a `.git` file for them, and `files unshare` removes
-                /// each (a single holder without a question; the `**`-rooted one after
-                /// the broad confirmation); removal is the remedy, so the write verbs'
-                /// never-shared refusal does not stand in its way.
+                /// file (or a hand) placed are still inspectable and removable:
+                /// `.mesh files list` lists them with their file, the `files unshare`
+                /// completer offers them, `--effective` never lists a `.git` file for them,
+                /// and `files unshare` removes each (a single holder without a question;
+                /// the `**`-rooted one after the broad confirmation); removal is the
+                /// remedy, so the write verbs' never-shared refusal does not stand in its
+                /// way.
                 #[test]
                 #[serial]
                 fn unshare_removes_hand_placed_behind_glob_git_rows() {

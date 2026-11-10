@@ -109,16 +109,18 @@ pub(crate) const TRUST_FILE_VERSION: u64 = 2;
 /// Written ahead of the YAML so the file explains itself to whoever opens it. The parser
 /// never sees it: YAML comments are skipped, so a file without it reads the same.
 const TRUST_FILE_HEADER: &str = "\
-# Coyote's mesh trust list. .mesh trust, untrust, block, unblock and forget edit it; a hand\n\
-# edit is read on the next look.\n\
+# Coyote's mesh trust list. .mesh access trust, revoke, block, unblock and forget edit\n\
+# it; a hand edit is read on the next look.\n\
 # version: the file format.\n\
 # identities: the identities this node knows. all_destinations: true trusts every instance\n\
 #   of that identity; all_destinations: false only means its other instances may knock.\n\
 # destinations: the instances (one per destination) this node trusts and serves.\n\
-# denied_destinations: instances refused by .mesh block <destination>.\n\
-# blocked_identities: identities refused outright by .mesh block --identity <identity>.\n\
+# denied_destinations: instances refused by .mesh access block <destination>.\n\
+# blocked_identities: identities refused outright by\n\
+#   .mesh access block --identity <identity>.\n\
 # self_trust_seeded: true once this node's own identity got its \"this node\" grant (or was\n\
-#   blocked), so it is never granted again; .mesh untrust --identity takes the grant back.\n\
+#   blocked), so it is never granted again; .mesh access revoke --identity takes the\n\
+#   grant back.\n\
 # Every entry has added_at and note; identities and destinations also have last_seen_at\n\
 #   and label, a destination names its identity, and key_changed on a destination records\n\
 #   the other identity its name was heard under.\n";

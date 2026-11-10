@@ -10862,7 +10862,10 @@ local_hello() {\n\
     #[test]
     fn command_head_unwraps_multiline_fence() {
         let head = |line| command_head(line, CommandPrefix::Dot);
-        assert_eq!(head("::: .mesh trust abc :::").as_deref(), Some(".mesh"));
+        assert_eq!(
+            head("::: .mesh access trust abc :::").as_deref(),
+            Some(".mesh")
+        );
         assert_eq!(head(":::\n.mesh status\n:::").as_deref(), Some(".mesh"));
     }
 
