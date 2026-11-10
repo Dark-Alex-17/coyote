@@ -77,8 +77,8 @@ pub(crate) enum RequestError {
 impl RequestError {
     /// `true` when the peer answered `NoAccess`, the one refusal byte every refused rule
     /// shares, so the request was heard and turned away rather than lost. The wire does not
-    /// say which rule: the peer's owner lifts a default-closed refusal with `.mesh trust`
-    /// and a block of this instance with `.mesh unblock`; a refusal after this identity's
+    /// say which rule: the peer's owner lifts a default-closed refusal with `.mesh access trust`
+    /// and a block of this instance with `.mesh access unblock`; a refusal after this identity's
     /// key change is lifted the same way as the first, by trusting the new destination.
     pub(crate) fn is_access_refusal(&self) -> bool {
         matches!(self, Self::Refused(RefusalCode::NoAccess))
@@ -244,7 +244,7 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
         | RequestError::LinkFailed(_)
         | RequestError::LinkNotOpened(_)
         | RequestError::LinkClosed => {
-            "Try again in a minute; `.mesh peers` shows when the peer was last heard"
+            "Try again in a minute; `.mesh people list` shows when the peer was last heard"
         }
         RequestError::Oversize { .. } => {
             "Shorten the message or send fewer parts so the frame fits the limit, then send it again"
@@ -258,7 +258,7 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
         RequestError::Send(_) => "Try again; if it repeats, report it",
         RequestError::Refused(code) => refusal_remedy(*code),
         RequestError::UnsupportedVersion { .. } => {
-            "One of the two needs upgrading before they can talk; `.mesh peers` names which"
+            "One of the two needs upgrading before they can talk; `.mesh people list` names which"
         }
         RequestError::NotRunning | RequestError::Shutdown => "Run `.mesh on`, then try again",
     }
@@ -332,7 +332,7 @@ impl RemoteRefusal {
     /// identity's key change, filed none, and the wire does not say which it was.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node unblocks it: ask the person at {} to run .mesh trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh knocks on their side).",
+            "Nothing on this node unblocks it: ask the person at {} to run .mesh access trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh access requests on their side).",
             short(&self.destination),
             self.own_destination
         )
@@ -363,7 +363,7 @@ impl fmt::Display for RemoteRefusal {
         }
         write!(
             f,
-            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {dest8}.)",
+            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {dest8}.)",
             own = self.own_destination
         )
     }
@@ -392,7 +392,7 @@ impl NoAnswer {
     /// that stays silent filed no knock, so unlike a refusal nothing reached its owner.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node lifts it: ask the person at {} to run .mesh trust {} (or .mesh unblock {} if they blocked this instance); the peer did not answer, so nothing reached them.",
+            "Nothing on this node lifts it: ask the person at {} to run .mesh access trust {} (or .mesh access unblock {} if they blocked this instance); the peer did not answer, so nothing reached them.",
             short(&self.destination),
             self.own_destination,
             self.own_destination
@@ -415,7 +415,7 @@ impl fmt::Display for NoAnswer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance).",
             short(&self.destination),
             own = self.own_destination
         )
@@ -435,12 +435,15 @@ mod no_answer_tests {
         assert_eq!(
             no_answer.to_string(),
             format!(
-                "no answer from bbbbbbbb: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance)."
+                "no answer from bbbbbbbb: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance)."
             )
         );
         let next = no_answer.next_action();
         assert!(next.is_ascii(), "{next}");
-        assert!(next.contains(&format!(".mesh trust {own}")), "{next}");
+        assert!(
+            next.contains(&format!(".mesh access trust {own}")),
+            "{next}"
+        );
         assert!(!next.contains("knock"), "silence filed no knock: {next}");
     }
 
@@ -474,7 +477,7 @@ mod no_answer_tests {
 
         assert_eq!(
             format!("{err}. {}.", request_remedy(&err)),
-            "No mesh link to the peer came up within 10.0s. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; `.mesh peers` shows when the peer was last heard."
+            "No mesh link to the peer came up within 10.0s. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; `.mesh people list` shows when the peer was last heard."
         );
     }
 
@@ -515,7 +518,7 @@ mod no_answer_tests {
             assert!(!text.contains("trust"), "{text}");
             assert_eq!(
                 request_remedy(&err),
-                "Try again in a minute; `.mesh peers` shows when the peer was last heard"
+                "Try again in a minute; `.mesh people list` shows when the peer was last heard"
             );
         }
         assert!(!RequestError::Timeout { path, after }.is_retryable_wait());

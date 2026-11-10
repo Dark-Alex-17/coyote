@@ -1469,22 +1469,22 @@ pub(crate) fn not_shared_sentence(
     let paths = [("shown", shown), ("path", path)];
     match reason {
         NotSharedReason::AlreadyFetched { staged, .. } => NoticeText::from_template(
-            "`{shown}` was a one-time attachment from {peer} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {peer} if you need a fresh copy.",
+            "`{shown}` was a one-time attachment from {peer} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {peer} if you need a fresh copy.",
             &[("peer", peer)],
             &[("shown", shown), ("staged", &staged.display().to_string())],
         ),
         NotSharedReason::GrantExpired { expires } => NoticeText::from_template(
-            "The grant for `{shown}` from {peer} expired at {expires}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow {path}.",
+            "The grant for `{shown}` from {peer} expired at {expires}; ask again with mesh__request_access, or ask the person at that node to run .mesh files allow {path}.",
             &[("peer", peer), ("expires", &rfc3339_utc(*expires))],
             &paths,
         ),
         NotSharedReason::PeerWithoutFetch => NoticeText::from_template(
-            "{peer} does not share files; it may run an older Coyote or have sharing off. .mesh info {peer} shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again.",
+            "{peer} does not share files; it may run an older Coyote or have sharing off. .mesh people info {peer} shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again.",
             &[("peer", peer)],
             &[],
         ),
         NotSharedReason::Unknown => NoticeText::from_template(
-            "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow {path}, or let the model request access with mesh__request_access.",
+            "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow {path}, or let the model request access with mesh__request_access.",
             &[("peer", peer)],
             &paths,
         ),
@@ -1800,7 +1800,7 @@ mod no_answer_tests {
         assert_eq!(
             silent.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance).",
                 short(&to)
             )
         );
@@ -1825,7 +1825,7 @@ mod no_answer_tests {
         );
         assert_eq!(
             never_linked.to_string(),
-            "No mesh link to the peer came up within 2.0s. Try again in a minute; `.mesh peers` shows when the peer was last heard."
+            "No mesh link to the peer came up within 2.0s. Try again in a minute; `.mesh people list` shows when the peer was last heard."
         );
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
@@ -3646,25 +3646,25 @@ mod tests {
             |reason| not_shared_sentence("abcd1234", "docs/a.md", "docs/a.md", &reason).plain();
         assert_eq!(
             sentence(NotSharedReason::Unknown),
-            "abcd1234 did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access."
+            "abcd1234 did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access."
         );
         assert_eq!(
             sentence(NotSharedReason::AlreadyFetched {
                 message_id: "m-1".to_string(),
                 staged: PathBuf::from("/inbox/peer/docs/a.md"),
             }),
-            "`docs/a.md` was a one-time attachment from abcd1234 and this node already fetched it (staged at /inbox/peer/docs/a.md). Ask for it again with .mesh message abcd1234 if you need a fresh copy."
+            "`docs/a.md` was a one-time attachment from abcd1234 and this node already fetched it (staged at /inbox/peer/docs/a.md). Ask for it again with .mesh messaging send abcd1234 if you need a fresh copy."
         );
         assert_eq!(
             sentence(NotSharedReason::GrantExpired { expires }),
             format!(
-                "The grant for `docs/a.md` from abcd1234 expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
+                "The grant for `docs/a.md` from abcd1234 expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh files allow docs/a.md.",
                 rfc3339_utc(expires)
             )
         );
         assert_eq!(
             sentence(NotSharedReason::PeerWithoutFetch),
-            "abcd1234 does not share files; it may run an older Coyote or have sharing off. .mesh info abcd1234 shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again."
+            "abcd1234 does not share files; it may run an older Coyote or have sharing off. .mesh people info abcd1234 shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again."
         );
     }
 
@@ -3677,25 +3677,25 @@ mod tests {
             let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
             let sentence = |reason| not_shared_sentence("abcd1234", ".vault", ".session", &reason);
             let unknown = sentence(NotSharedReason::Unknown);
-            let today = "abcd1234 did not serve `.vault`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow .session, or let the model request access with mesh__request_access.";
+            let today = "abcd1234 did not serve `.vault`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow .session, or let the model request access with mesh__request_access.";
             assert_eq!(unknown.render(CommandPrefix::Dot), today);
             assert_eq!(
                 unknown.render(CommandPrefix::Slash),
-                today.replace(".mesh allow", "/mesh allow")
+                today.replace(".mesh files allow", "/mesh files allow")
             );
             let fetched = sentence(NotSharedReason::AlreadyFetched {
                 message_id: "m-1".to_string(),
-                staged: PathBuf::from(".mesh trust x"),
+                staged: PathBuf::from(".mesh access trust x"),
             });
             assert_eq!(
                 fetched.render(CommandPrefix::Slash),
-                "`.vault` was a one-time attachment from abcd1234 and this node already fetched it (staged at .mesh trust x). Ask for it again with /mesh message abcd1234 if you need a fresh copy."
+                "`.vault` was a one-time attachment from abcd1234 and this node already fetched it (staged at .mesh access trust x). Ask for it again with /mesh messaging send abcd1234 if you need a fresh copy."
             );
             let expired = sentence(NotSharedReason::GrantExpired { expires });
             assert_eq!(
                 expired.render(CommandPrefix::Slash),
                 format!(
-                    "The grant for `.vault` from abcd1234 expired at {}; ask again with mesh__request_access, or ask the person at that node to run /mesh allow .session.",
+                    "The grant for `.vault` from abcd1234 expired at {}; ask again with mesh__request_access, or ask the person at that node to run /mesh files allow .session.",
                     rfc3339_utc(expires)
                 )
             );

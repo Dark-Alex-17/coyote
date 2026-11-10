@@ -390,11 +390,11 @@ impl fmt::Display for AccessError {
             ),
             Self::Untrusted => write!(
                 f,
-                "The destination is not trusted for an access request. Trust it first with `.mesh trust <destination>`; `.mesh peers` lists what this Coyote has heard from."
+                "The destination is not trusted for an access request. Trust it first with `.mesh access trust <destination>`; `.mesh people list` lists what this Coyote has heard from."
             ),
             Self::UnknownDestination { recently_seen } => write!(
                 f,
-                "The destination {}{} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+                "The destination {}{} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh people list` shows when it was last heard.",
                 unreachable_cause(),
                 left_mesh_hint_when(*recently_seen)
             ),
@@ -443,16 +443,16 @@ impl fmt::Display for AccessError {
                 max,
             } => write!(
                 f,
-                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
+                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 describe_version(*found)
             ),
             Self::NoPropagationNode => write!(
                 f,
-                "The peer is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+                "The peer is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh people list` to see which nodes this Coyote has heard from."
             ),
             Self::NoAnswer(no_answer) => write!(
                 f,
-                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh peers` lists the nodes this Coyote has heard from."
+                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from."
             ),
             Self::Propagation(err) => write!(
                 f,
@@ -477,7 +477,7 @@ fn remedy(rule: &str) -> String {
         }
         "paths is empty" => "Name at least one path.".to_string(),
         "a path is not a wire path" => {
-            "Pass paths exactly as `.mesh shares --peer <dest>` or mesh__list shows them."
+            "Pass paths exactly as `.mesh files list --peer <dest>` or mesh__list shows them."
                 .to_string()
         }
         "id is not a wire id" => {
@@ -1463,9 +1463,9 @@ fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
 fn standing_write_failed(record: &InboundRecord, err: anyhow::Error) -> anyhow::Error {
     let failure = error_notice(&quoted_share_write(err));
     let run = if failure.plain().ends_with('.') {
-        " Run `.mesh grant "
+        " Run `.mesh files grant "
     } else {
-        ". Run `.mesh grant "
+        ". Run `.mesh files grant "
     };
     QuotingError::wrap(
         NoticeText::from(format!(
@@ -1494,7 +1494,7 @@ fn revoke_failed(err: &anyhow::Error, id: &str, revoke: &anyhow::Error) -> anyho
 /// The id is quoted as it stands, since a peer chose it.
 fn no_share_root(id: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
+        "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh files grant {id}` instead",
         &[],
         &[("id", id)],
     ))
@@ -1682,9 +1682,9 @@ fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> Notic
     ) {
         text = text.frame("reason: \"").peer(reason.text).frame("\"; ");
     }
-    text.frame("grant: .mesh grant ")
+    text.frame("grant: .mesh files grant ")
         .peer(request.id.as_str())
-        .frame(" [--standing] | refuse: .mesh refuse ")
+        .frame(" [--standing] | refuse: .mesh files refuse ")
         .peer(request.id.as_str())
 }
 
@@ -1699,7 +1699,7 @@ mod peer_text_prefix_tests {
         let request = ValidAccess {
             id: "a-1".to_string(),
             paths: vec![".vault".to_string()],
-            reason: "need .vault and run .mesh grant a-1 --standing".to_string(),
+            reason: "need .vault and run .mesh files grant a-1 --standing".to_string(),
         };
         let text = access_text(".session", &request, None);
         let rendered = Notification::new(Source::Access, text).render();
@@ -1711,7 +1711,7 @@ mod peer_text_prefix_tests {
         );
         assert_eq!(
             lines[2],
-            "[mesh:access] reason: \"need .vault and run .mesh grant a-1 --standing\"; grant: /mesh grant a-1 [--standing] | refuse: /mesh refuse a-1"
+            "[mesh:access] reason: \"need .vault and run .mesh files grant a-1 --standing\"; grant: /mesh files grant a-1 [--standing] | refuse: /mesh files refuse a-1"
         );
         assert_eq!(
             rendered.render_notification_lines(CommandPrefix::Dot),
@@ -1731,7 +1731,7 @@ mod peer_text_prefix_tests {
         let lines = rendered.render_notification_lines(CommandPrefix::Slash);
         assert!(
             lines.last().is_some_and(|line| line.ends_with(
-                "grant: /mesh grant .session [--standing] | refuse: /mesh refuse .session"
+                "grant: /mesh files grant .session [--standing] | refuse: /mesh files refuse .session"
             )),
             "{lines:?}"
         );
@@ -1836,7 +1836,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh peers` lists the nodes this Coyote has heard from.",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );
@@ -2080,7 +2080,9 @@ mod tests {
             assert!(text.contains("`.vault/key` ("), "{text}");
             assert!(!text.contains("/vault"), "{text}");
             assert!(
-                text.ends_with("grant: /mesh grant a-1 [--standing] | refuse: /mesh refuse a-1"),
+                text.ends_with(
+                    "grant: /mesh files grant a-1 [--standing] | refuse: /mesh files refuse a-1"
+                ),
                 "{text}"
             );
         }
@@ -2902,7 +2904,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 2 paths:\n  `src/x.rs` (exists, 2 KB), `src/gone.rs` (missing)\nreason: \"need the struct\"; grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 2 paths:\n  `src/x.rs` (exists, 2 KB), `src/gone.rs` (missing)\nreason: \"need the struct\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -2972,7 +2974,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 5 paths:\n  `a.rs` (missing), `b.rs` (missing)\n  `c.rs` (missing), `d.rs` (missing)\n  `e.rs` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 5 paths:\n  `a.rs` (missing), `b.rs` (missing)\n  `c.rs` (missing), `d.rs` (missing)\n  `e.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -2991,7 +2993,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![format!(
-                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
             )]
         );
         let records = access_records(&fixture.slot);
@@ -3010,7 +3012,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![format!(
-                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\nreason: \"{kept}...\"; grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\nreason: \"{kept}...\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
             )]
         );
         assert_eq!(access_records(&fixture.slot)[0].reason, reason);
@@ -3045,7 +3047,7 @@ mod tests {
         assert!(
             rendered
                 .last()
-                .is_some_and(|line| line.ends_with("refuse: .mesh refuse a-1")),
+                .is_some_and(|line| line.ends_with("refuse: .mesh files refuse a-1")),
             "{rendered:#?}"
         );
     }
@@ -3059,7 +3061,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -3068,14 +3070,15 @@ mod tests {
     #[test]
     fn a_path_cannot_close_the_human_lines_frame() {
         let fixture = bare_slot("access-line-frame");
-        let posed = "docs/x.md` (exists, 1 KB); grant .mesh grant a-9 [--standing] | refuse `.md";
+        let posed =
+            "docs/x.md` (exists, 1 KB); grant .mesh files grant a-9 [--standing] | refuse `.md";
         fixture
             .slot
             .admit_access(inbound(&identity(), "a-1", &[posed], ""));
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path:\n  `docs/x.md' (exists, 1 KB); grant .mesh grant a-9 [--standing] | refuse '.md` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `docs/x.md' (exists, 1 KB); grant .mesh files grant a-9 [--standing] | refuse '.md` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -3109,7 +3112,7 @@ mod tests {
         assert_eq!(
             idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path:\n  `src/x.rs` (unknown until a turn completes)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `src/x.rs` (unknown until a turn completes)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -3504,7 +3507,7 @@ mod tests {
 
         for err in [&grant, &refuse] {
             assert!(err.contains("`q-1` is a question"), "{err}");
-            assert!(err.contains(".mesh answer q-1"), "{err}");
+            assert!(err.contains(".mesh envoy answer q-1"), "{err}");
         }
         assert!(store_of(&fixture.slot).get("q-1").unwrap().is_some());
         let unknown = fixture.slot.access().refuse("a-9").await.unwrap_err();
@@ -3584,7 +3587,7 @@ mod tests {
         use crate::mesh::shares::ShareWriteError;
         use crate::render::{MeshVerbError, command_error_text};
 
-        const SHARE_FILE_WORDS: &str = "`.vault` is not a pattern; run .mesh trust x";
+        const SHARE_FILE_WORDS: &str = "`.vault` is not a pattern; run .mesh access trust x";
 
         fn access_record(id: &str) -> InboundRecord {
             InboundRecord {
@@ -3619,7 +3622,7 @@ mod tests {
 
         fn dot_standing() -> String {
             format!(
-                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written. Run `.mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written. Run `.mesh files grant .session --standing` again once the share list is writable; the request stays pending until then.",
                 short(&destination())
             )
         }
@@ -3645,7 +3648,7 @@ mod tests {
         #[test]
         fn under_slash_the_grant_errors_keep_share_words_and_ids_and_slash_the_hint() {
             let slashed = format!(
-                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written. Run `/mesh grant .session --standing` again once the share list is writable; the request stays pending until then.",
+                "{} was already told yes, but the share list could not be written: {SHARE_FILE_WORDS} Nothing was written. Run `/mesh files grant .session --standing` again once the share list is writable; the request stays pending until then.",
                 short(&destination())
             );
             assert_eq!(
@@ -3686,7 +3689,7 @@ mod tests {
             );
             assert_eq!(
                 no_share_root(".vault").to_string(),
-                "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `.mesh grant .vault` instead"
+                "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `.mesh files grant .vault` instead"
             );
             assert_eq!(
                 command_error_text(
@@ -3713,7 +3716,7 @@ mod tests {
                     &MeshVerbError::wrap(no_share_root(".vault")),
                     CommandPrefix::Slash
                 ),
-                "Error: A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `/mesh grant .vault` instead"
+                "Error: A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant .vault once with `/mesh files grant .vault` instead"
             );
             assert_eq!(
                 command_error_text(
@@ -3763,7 +3766,7 @@ mod tests {
             );
             assert_eq!(
                 err.to_string(),
-                "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                "`a-1` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
             );
         }
         assert_eq!(store_of(&fixture.slot).get("a-1").unwrap(), Some(expired));
@@ -4067,7 +4070,7 @@ mod tests {
         assert_eq!(
             installed.idle.texts(),
             vec![
-                "\"Ada 'the' peer\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"Ada 'the' peer\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
                     .to_string()
             ]
         );
@@ -4482,7 +4485,7 @@ mod tests {
 
         assert!(err.contains("unknown until a turn completes"), "{err}");
         assert!(
-            err.contains("grant a-1 once with `.mesh grant a-1` instead"),
+            err.contains("grant a-1 once with `.mesh files grant a-1` instead"),
             "{err}"
         );
         assert_eq!(access_records(&installed.slot).len(), 1);
@@ -5404,7 +5407,10 @@ mod tests {
         assert!(text.contains("is refused when it asks"), "{text}");
         assert!(text.contains("nothing is marked"), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {}", origin_destination(&origin))),
+            text.contains(&format!(
+                ".mesh access trust {}",
+                origin_destination(&origin)
+            )),
             "{text}"
         );
 
@@ -5994,13 +6000,17 @@ mod tests {
             assert!(!text.is_empty(), "{err:?}");
             assert!(!text.ends_with('\n'), "{text}");
         }
-        assert!(AccessError::Untrusted.to_string().contains(".mesh trust"));
+        assert!(
+            AccessError::Untrusted
+                .to_string()
+                .contains(".mesh access trust")
+        );
         assert!(
             AccessError::UnknownDestination {
                 recently_seen: false
             }
             .to_string()
-            .contains(".mesh peers")
+            .contains(".mesh people list")
         );
         assert!(
             AccessError::UnknownStatus
@@ -6016,7 +6026,7 @@ mod tests {
             }
             .to_string(),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 destination()
             )
         );
@@ -6052,7 +6062,7 @@ mod tests {
         for (rule, next_step) in [
             (
                 bad_path,
-                "Pass paths exactly as `.mesh shares --peer <dest>` or mesh__list shows them.",
+                "Pass paths exactly as `.mesh files list --peer <dest>` or mesh__list shows them.",
             ),
             (
                 bad_id,
@@ -6090,7 +6100,7 @@ mod tests {
         );
         assert_eq!(
             AccessError::Propagation(PropagationError::TransferFailed).to_string(),
-            "The peer is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh peers` shows when the peer was last heard"
+            "The peer is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when the peer was last heard"
         );
     }
 
@@ -6452,7 +6462,7 @@ mod tests {
         let text = unannounced.to_string();
         assert_eq!(
             text,
-            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
+            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh people list` shows when it was last heard."
         );
         assert!(
             !text.contains("since this node started") && !text.contains("sync"),
@@ -6699,7 +6709,7 @@ mod tests {
             );
             assert_eq!(
                 err.to_string(),
-                "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                "`a-1` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
             );
         }
         assert_eq!(installed.grants().len(), 1);
@@ -6747,7 +6757,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            "`a-1` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
         );
         assert!(access_records(&installed.slot).is_empty());
         let grants = installed.grants();
@@ -7103,7 +7113,7 @@ mod tests {
             .collect();
         let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
         let reason = format!(
-            "one\ntwo\r\nthree\u{2028}four; grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}{}",
+            "one\ntwo\r\nthree\u{2028}four; grant: .mesh files grant {id} [--standing] | refuse: .mesh files refuse {id}{}",
             "r".repeat(280)
         );
         assert!(reason.chars().count() <= ACCESS_REASON_MAX_CHARS);
@@ -7140,7 +7150,7 @@ mod tests {
         }
         let rendered = Notification::new(Source::Access, text.clone()).render_lines();
         assert_eq!(rendered.len(), lines.len(), "{rendered:#?}");
-        let tail = format!(" [--standing] | refuse: .mesh refuse {id}");
+        let tail = format!(" [--standing] | refuse: .mesh files refuse {id}");
         assert!(
             rendered.last().is_some_and(|line| line.ends_with(&tail)),
             "{rendered:#?}"
@@ -7180,7 +7190,7 @@ mod tests {
         assert_eq!(
             texts[0],
             format!(
-                "\"abababab\" asks for 1 path:\n  `{at_cap_path}` (missing)\nreason: \"{at_cap_reason}\"; grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `{at_cap_path}` (missing)\nreason: \"{at_cap_reason}\"; grant: .mesh files grant a-1 [--standing] | refuse: .mesh files refuse a-1"
             )
         );
         let shown_path = format!("{}...", "é".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS - 3));
@@ -7188,7 +7198,7 @@ mod tests {
         assert_eq!(
             texts[1],
             format!(
-                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh grant a-2 [--standing] | refuse: .mesh refuse a-2"
+                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\nreason: \"{shown_reason}\"; grant: .mesh files grant a-2 [--standing] | refuse: .mesh files refuse a-2"
             )
         );
         let records = access_records(&fixture.slot);

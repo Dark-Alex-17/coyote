@@ -3928,7 +3928,7 @@ pub(crate) mod network {
         assert!(text.contains(&presenter_hex), "{text}");
         assert!(text.contains("is refused when it asks"), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {presenter_destination}")),
+            text.contains(&format!(".mesh access trust {presenter_destination}")),
             "{text}"
         );
         assert!(
@@ -5902,12 +5902,15 @@ pub(crate) mod network {
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh trust {a_instance}")),
+            text.contains(&format!(".mesh access trust {a_instance}")),
             "{text}"
         );
-        assert!(text.contains(&format!(".mesh info {a_instance}")), "{text}");
         assert!(
-            text.contains(&format!(".mesh block --identity {a_identity}")),
+            text.contains(&format!(".mesh people info {a_instance}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh access block --identity {a_identity}")),
             "{text}"
         );
         let cached = rig.gate.cache().list(SystemTime::now()).unwrap();
@@ -5984,7 +5987,7 @@ pub(crate) mod network {
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh trust {b_instance}")),
+                text.contains(&format!(".mesh access trust {b_instance}")),
                 "{text}"
             );
         }
@@ -6494,7 +6497,7 @@ pub(crate) mod network {
     /// lifts the instance block alone: the lift names the identity's block as what still
     /// refuses the instance, and B's status request is dropped in silence. Lifting the
     /// identity block trusts nothing (B is a stranger whose request is dropped), and the
-    /// remedy the instance line named, `.mesh trust <destination>`, is accepted afterwards
+    /// remedy the instance line named, `.mesh access trust <destination>`, is accepted afterwards
     /// and serves B's next request on the destination tier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unblock_of_an_instance_under_a_blocked_identity_names_the_block_and_its_remedy_works()
@@ -6656,11 +6659,11 @@ pub(crate) mod network {
             assert!(text.starts_with("warning: "), "{text}");
             assert!(text.contains("is served while it asks"), "{text}");
             assert!(
-                text.contains(&format!(".mesh trust {b_instance}")),
+                text.contains(&format!(".mesh access trust {b_instance}")),
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh block --identity {b_identity}")),
+                text.contains(&format!(".mesh access block --identity {b_identity}")),
                 "{text}"
             );
         }
@@ -6739,7 +6742,7 @@ pub(crate) mod network {
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains("is refused when it asks"), "{text}");
             assert!(
-                text.contains(&format!(".mesh trust {b_instance}")),
+                text.contains(&format!(".mesh access trust {b_instance}")),
                 "{text}"
             );
         }
@@ -6832,7 +6835,7 @@ pub(crate) mod network {
 
     /// The same identity-tier rotation under `mesh.collision_protection: true`: no record
     /// carries the instance, but the peer table does, so B's announce earns the owner one
-    /// `error:` line naming both identities and `.mesh trust <B's destination>`, and B's
+    /// `error:` line naming both identities and `.mesh access trust <B's destination>`, and B's
     /// `/status` request is refused `NoAccess` until then. Nothing is marked, `trust.yaml`
     /// is untouched, and the refused request restates nothing. The refusal outlives the
     /// table: with both rows swept at `PEER_TTL`, B's next request is refused the same way
@@ -6887,7 +6890,7 @@ pub(crate) mod network {
             assert!(!text.contains("is served while it asks"), "{text}");
             assert!(text.contains("nothing is marked"), "{text}");
             assert!(
-                text.contains(&format!(".mesh trust {b_instance}")),
+                text.contains(&format!(".mesh access trust {b_instance}")),
                 "{text}"
             );
         }
@@ -6947,7 +6950,7 @@ pub(crate) mod network {
     /// The one action the `error:` line names ends the presence refusal.
     /// Under `mesh.collision_protection: true` node A refuses B's `/status` (B, trusted
     /// for all destinations, presents an instance A's peer table holds under another such
-    /// identity). The human runs the named `.mesh trust <B's destination>`: B's next
+    /// identity). The human runs the named `.mesh access trust <B's destination>`: B's next
     /// `/status` is served, the record written is B's own destination grant with no
     /// key-change mark, and the owner hears nothing further: the destination allow is
     /// judged before the identity allow, so the peer table is not consulted for B.
@@ -7003,7 +7006,7 @@ pub(crate) mod network {
         let line = idle.0.lock()[0].text.plain();
         assert!(line.starts_with("error: "), "{line}");
         assert!(
-            line.contains(&format!(".mesh trust {b_instance}")),
+            line.contains(&format!(".mesh access trust {b_instance}")),
             "the line names the action: {line}"
         );
 
@@ -7369,11 +7372,11 @@ pub(crate) mod network {
                 "advises confirming with the identity's holder: {text}"
             );
             assert!(
-                text.contains(&format!(".mesh trust {b_instance}")),
+                text.contains(&format!(".mesh access trust {b_instance}")),
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh block --identity {b_identity}")),
+                text.contains(&format!(".mesh access block --identity {b_identity}")),
                 "{text}"
             );
         }
@@ -7526,7 +7529,7 @@ pub(crate) mod network {
                 "advises confirming with the identity's holder: {text}"
             );
             assert!(
-                text.contains(&format!(".mesh trust {b_instance}")),
+                text.contains(&format!(".mesh access trust {b_instance}")),
                 "names the clearing trust: {text}"
             );
         }
@@ -7864,7 +7867,7 @@ pub(crate) mod network {
         assert_eq!(
             err.to_string(),
             format!(
-                "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
+                "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
             )
         );
         assert_eq!(pair.responder.adapter.admitted_count(), 0);
@@ -8150,7 +8153,7 @@ pub(crate) mod network {
             err.to_string(),
             "The knock could not be sent: The mesh peer refused the request: throttled (0xf6). Wait a minute and try again"
         );
-        assert!(!err.to_string().contains(".mesh peers"), "{err}");
+        assert!(!err.to_string().contains(".mesh people list"), "{err}");
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(KNOCK_PATH));
         sleep(Duration::from_millis(500)).await;
         node.nothing_else_received();
@@ -8190,7 +8193,7 @@ pub(crate) mod network {
             .unwrap_err();
 
         assert_eq!(err, KnockError::NoPropagationNode);
-        assert!(err.to_string().contains(".mesh peers"), "{err}");
+        assert!(err.to_string().contains(".mesh people list"), "{err}");
         let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
         assert!(slot.stop().await.unwrap());
@@ -8448,7 +8451,7 @@ pub(crate) mod network {
             .unwrap_err();
 
         assert_eq!(err, AccessError::NoPropagationNode);
-        assert!(err.to_string().contains(".mesh peers"), "{err}");
+        assert!(err.to_string().contains(".mesh people list"), "{err}");
         let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
         assert!(slot.stop().await.unwrap());
@@ -9191,7 +9194,7 @@ pub(crate) mod network {
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh trust {a_instance}")),
+            text.contains(&format!(".mesh access trust {a_instance}")),
             "{text}"
         );
         assert!(
@@ -9259,7 +9262,7 @@ pub(crate) mod network {
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh trust {a_instance}")),
+                text.contains(&format!(".mesh access trust {a_instance}")),
                 "{text}"
             );
             assert!(!text.contains("0xf1"), "{text}");
@@ -10459,7 +10462,7 @@ pub(crate) mod network {
         );
         assert!(
             err.to_string()
-                .contains(&format!(".mesh trust {b_instance}")),
+                .contains(&format!(".mesh access trust {b_instance}")),
             "{err}"
         );
 
@@ -11482,7 +11485,7 @@ pub(crate) mod network {
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh trust {a_instance}")),
+            text.contains(&format!(".mesh access trust {a_instance}")),
             "{text}"
         );
         assert!(
@@ -11899,7 +11902,7 @@ pub(crate) mod network {
                 notes[0].text
             );
             assert!(
-                notes[0].text.plain().contains(".mesh grant acc-1"),
+                notes[0].text.plain().contains(".mesh files grant acc-1"),
                 "{}",
                 notes[0].text
             );
@@ -13686,7 +13689,7 @@ pub(crate) mod network {
             assert!(reason_clause.starts_with("need  "), "{reason_clause:?}");
             assert!(
                 reason_clause.contains(
-                    " badly\"; grant: .mesh grant acc-7 [--standing] | refuse: .mesh refuse acc-7"
+                    " badly\"; grant: .mesh files grant acc-7 [--standing] | refuse: .mesh files refuse acc-7"
                 ),
                 "{reason_clause:?}"
             );

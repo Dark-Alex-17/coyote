@@ -64,7 +64,7 @@ pub(crate) const KNOCK_BUCKET_BURST: u32 = 3;
 /// One token returns to an identity's bucket per interval. Knocking is a human act asking
 /// for a human decision; a few per hour is plenty.
 pub(crate) const KNOCK_BUCKET_REFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
-/// Drop times the gate keeps per identity for `.mesh knocks`; the oldest goes when the
+/// Drop times the gate keeps per identity for `.mesh access requests`; the oldest goes when the
 /// list is full. Only drops within the last refill interval are reported, so the cap
 /// bites only on an identity dropped more often than that within one interval.
 pub(crate) const KNOCK_DROPS_REMEMBERED: usize = 16;
@@ -207,7 +207,7 @@ pub(crate) enum KnockFallback {
 }
 
 /// The sentence every silent-knock report ends with: what a knock can and cannot do.
-pub(crate) const KNOCK_IS_NOT_FIRST_CONTACT: &str = "A knock is heard only by a peer that already trusts this identity (a new instance of a known identity); for first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides.";
+pub(crate) const KNOCK_IS_NOT_FIRST_CONTACT: &str = "A knock is heard only by a peer that already trusts this identity (a new instance of a known identity); for first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KnockOutcome {
@@ -259,11 +259,11 @@ impl fmt::Display for KnockError {
             ),
             Self::Unanswered { dest8 } => write!(
                 f,
-                "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
+                "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
             ),
             Self::NoPropagationNode => write!(
                 f,
-                "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+                "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh people list` to see which nodes this Coyote has heard from."
             ),
             Self::Propagation {
                 fallback: KnockFallback::Unreachable,
@@ -367,24 +367,16 @@ mod knock_error_quoting_tests {
         let slash = shown_as(&direct, CommandPrefix::Slash);
         assert_eq!(
             slash,
-            format!(
-                "Error: {}",
-                direct.to_string().replace("`.mesh peers`", "`/mesh peers`")
-            )
+            "Error: The knock could not be sent: The mesh link failed: no route to .vault. Try again in a minute; `/mesh people list` shows when the peer was last heard"
         );
         assert!(slash.contains("no route to .vault"), "{slash}");
-        assert!(slash.contains("`/mesh peers`"), "{slash}");
+        assert!(slash.contains("`/mesh people list`"), "{slash}");
         let slash = shown_as(&stored, CommandPrefix::Slash);
         assert!(slash.contains("field .vault"), "{slash}");
         assert!(!slash.contains("/vault"), "{slash}");
         assert_eq!(
             shown_as(&KnockError::NoPropagationNode, CommandPrefix::Slash),
-            format!(
-                "Error: {}",
-                KnockError::NoPropagationNode
-                    .to_string()
-                    .replace("`.mesh peers`", "`/mesh peers`")
-            )
+            "Error: The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `/mesh people list` to see which nodes this Coyote has heard from."
         );
     }
 }
@@ -903,13 +895,13 @@ impl KnockGate {
 }
 
 /// Two lines: who knocks from where, then the three things the user can do about it.
-/// `.mesh trust` and `.mesh info` take the destination, since trust is granted to an
-/// instance and the peer table is keyed by one; `.mesh block --identity` names the identity,
+/// `.mesh access trust` and `.mesh people info` take the destination, since trust is granted to an
+/// instance and the peer table is keyed by one; `.mesh access block --identity` names the identity,
 /// since a block of it silences every instance. Full hashes, because the user pastes them. The
 /// name and the intro are quoted and any quote inside them becomes an apostrophe, so peer
 /// text cannot close its own quotes and pose as the frame. An intro longer than a peer
-/// line is cut on a word, and `(full text: .mesh knocks)` follows the closing quote; when
-/// the cache refused the knock, `.mesh knocks` has nothing to show, so the quote is
+/// line is cut on a word, and `(full text: .mesh access requests)` follows the closing quote; when
+/// the cache refused the knock, `.mesh access requests` has nothing to show, so the quote is
 /// followed by a note that the rest is gone instead. The name and the intro are peer
 /// runs, printed as the peer wrote them.
 fn knock_text(knock: &InboundKnock, display_name: Option<&str>, cached: bool) -> NoticeText {
@@ -941,7 +933,7 @@ fn knock_text(knock: &InboundKnock, display_name: Option<&str>, cached: bool) ->
             .frame(format!("\"{pointer}"));
     }
     text.frame(format!(
-        "\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}",
+        "\ntrust: .mesh access trust {destination} | who: .mesh people info {destination} | silence: .mesh access block --identity {identity}",
         identity = knock.identity_hash,
         destination = knock.destination_hash,
     ))
@@ -962,7 +954,7 @@ mod peer_text_prefix_tests {
             destination_hash: destination.clone(),
             name_hash: "ef".repeat(16),
             via: KnockVia::Direct,
-            intro: Some(".mesh trust x".to_string()),
+            intro: Some(".mesh access trust x".to_string()),
         };
         let text = knock_text(&knock, Some(".info"), true);
         let lines = Notification::new(Source::Knock, text)
@@ -972,10 +964,10 @@ mod peer_text_prefix_tests {
             lines,
             [
                 format!(
-                    "[mesh:knock] \".info\" (identity {identity}) knocks from instance {destination}: \".mesh trust x\""
+                    "[mesh:knock] \".info\" (identity {identity}) knocks from instance {destination}: \".mesh access trust x\""
                 ),
                 format!(
-                    "[mesh:knock] trust: /mesh trust {destination} | who: /mesh info {destination} | silence: /mesh block --identity {identity}"
+                    "[mesh:knock] trust: /mesh access trust {destination} | who: /mesh people info {destination} | silence: /mesh access block --identity {identity}"
                 ),
             ]
         );
@@ -1224,7 +1216,7 @@ mod tests {
                 max: 2,
             })
             .to_string(),
-            "The knock could not be sent: Protocol version 7 is outside the supported range 1..=2. One of the two needs upgrading before they can talk; `.mesh peers` names which"
+            "The knock could not be sent: Protocol version 7 is outside the supported range 1..=2. One of the two needs upgrading before they can talk; `.mesh people list` names which"
         );
         assert_eq!(
             KnockError::Direct(RequestError::Decode("short frame".into())).to_string(),
@@ -1236,7 +1228,7 @@ mod tests {
                 err: PropagationError::TransferFailed,
             }
             .to_string(),
-            "The peer is unreachable and the knock could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh peers` shows when the peer was last heard"
+            "The peer is unreachable and the knock could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when the peer was last heard"
         );
         assert_eq!(
             KnockError::Propagation {
@@ -1477,7 +1469,7 @@ mod tests {
         assert_eq!(
             lines[1],
             format!(
-                "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}",
+                "trust: .mesh access trust {dest} | who: .mesh people info {dest} | silence: .mesh access block --identity {identity}",
                 dest = hash_of("inst-a1")
             )
         );
@@ -1535,9 +1527,9 @@ mod tests {
         let texts = rig.surface.texts();
         let text = &texts[0];
         for needle in [
-            ".mesh trust ",
-            ".mesh info ",
-            ".mesh block --identity ",
+            ".mesh access trust ",
+            ".mesh people info ",
+            ".mesh access block --identity ",
             identity.as_str(),
             hash_of("inst-hint").as_str(),
         ] {
@@ -1549,8 +1541,8 @@ mod tests {
         assert!(!text.contains('\r'), "{text:?}");
         let intro_start = text.find(": \"").unwrap() + 3;
         let intro_end = text
-            .find("\" (full text: .mesh knocks)\ntrust:")
-            .unwrap_or_else(|| panic!("the cut intro points at .mesh knocks: {text:?}"));
+            .find("\" (full text: .mesh access requests)\ntrust:")
+            .unwrap_or_else(|| panic!("the cut intro points at .mesh access requests: {text:?}"));
         let intro = &text[intro_start..intro_end];
         // The run of x's is one word too long for the line, so the cut falls back to the
         // last word before it.
@@ -1558,11 +1550,11 @@ mod tests {
         let rendered = Notification::new(Source::Knock, text.clone()).render_lines();
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         assert!(
-            rendered[0].ends_with(&format!("{intro}\" (full text: .mesh knocks)")),
+            rendered[0].ends_with(&format!("{intro}\" (full text: .mesh access requests)")),
             "the longest line survives rendering uncut: {}",
             rendered[0]
         );
-        assert!(rendered[1].ends_with(&format!(".mesh block --identity {identity}")));
+        assert!(rendered[1].ends_with(&format!(".mesh access block --identity {identity}")));
         assert!(
             rendered
                 .iter()
@@ -1782,7 +1774,7 @@ mod tests {
     }
 
     /// The least recently seen identity makes room past the cap. Seen means knocked:
-    /// `.mesh knocks` reading an identity's drops is not a sighting, so a listing between
+    /// `.mesh access requests` reading an identity's drops is not a sighting, so a listing between
     /// two knocks leaves the eviction order where the knocks put it. The evicted
     /// identity's drops leave the listing with it.
     #[test]
@@ -2129,7 +2121,7 @@ mod tests {
     /// the peer table holds under I1, another identity trusted for all
     /// destinations. Under `mesh.collision_protection` that is identity changed, not a
     /// knock: the knocker is refused, the human gets one `error:` line naming both
-    /// identities and `.mesh trust <knocker's destination>`, nothing is marked (there is
+    /// identities and `.mesh access trust <knocker's destination>`, nothing is marked (there is
     /// no record to mark), `trust.yaml` keeps its bytes and the cache and bucket are
     /// untouched. With protection off the same knock is no knock either, already
     /// trusted, and the request path earns no second line: the dedupe is shared and the
@@ -2209,7 +2201,7 @@ mod tests {
         assert!(text.contains("nothing is marked"), "{text}");
         assert!(text.contains("presented under"), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {knocker_destination}")),
+            text.contains(&format!(".mesh access trust {knocker_destination}")),
             "{text}"
         );
 
@@ -2313,7 +2305,7 @@ mod tests {
         assert!(texts[0].contains(&knocker), "{}", texts[0]);
         assert!(texts[0].contains("is refused when it asks"), "{}", texts[0]);
         assert!(
-            texts[0].contains(&format!(".mesh trust {knocker_destination}")),
+            texts[0].contains(&format!(".mesh access trust {knocker_destination}")),
             "{}",
             texts[0]
         );
@@ -2364,7 +2356,7 @@ mod tests {
     /// protection the all-destinations knocker over a foreign instance is identity
     /// changed, not a knock: refused, nothing cached, the record marked, and
     /// exactly one error line naming the knocker, the holder check and the one clearing
-    /// action (`.mesh trust <new destination>`).
+    /// action (`.mesh access trust <new destination>`).
     #[test]
     fn a_protected_all_destinations_knocker_over_a_foreign_instance_is_refused_and_marks() {
         let bound = hash_of("id-bound-protected");
@@ -2425,11 +2417,11 @@ mod tests {
         assert!(text.contains(&knocker), "{text}");
         assert!(text.contains("holder out of band"), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {new_destination}")),
+            text.contains(&format!(".mesh access trust {new_destination}")),
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh block --identity {knocker}")),
+            text.contains(&format!(".mesh access block --identity {knocker}")),
             "{text}"
         );
 
@@ -2645,10 +2637,10 @@ mod tests {
             lines,
             vec![
                 format!(
-                    "A peer (identity {identity}) knocks from instance {dest}: \"{kept}...\" (full text: .mesh knocks)"
+                    "A peer (identity {identity}) knocks from instance {dest}: \"{kept}...\" (full text: .mesh access requests)"
                 ),
                 format!(
-                    "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"
+                    "trust: .mesh access trust {dest} | who: .mesh people info {dest} | silence: .mesh access block --identity {identity}"
                 ),
             ]
         );
@@ -2712,7 +2704,7 @@ mod tests {
                     "A peer (identity {identity}) knocks from instance {dest}: \"{kept}...\" {KNOCKS_NOT_KEPT_NOTE}"
                 ),
                 format!(
-                    "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"
+                    "trust: .mesh access trust {dest} | who: .mesh people info {dest} | silence: .mesh access block --identity {identity}"
                 ),
             ]
         );
@@ -2932,7 +2924,7 @@ mod tests {
         assert_eq!(cached[0].intro.as_deref(), Some("stored"));
         let texts = rig.surface.texts();
         assert_eq!(texts.len(), 1);
-        assert!(texts[0].contains(&format!(".mesh trust {expected_destination}")));
+        assert!(texts[0].contains(&format!(".mesh access trust {expected_destination}")));
         assert!(debug_snapshot().iter().any(|line| line
             == &format!(
                 "Propagated knock from {} dropped: custom data is missing or not a map",
@@ -3306,7 +3298,7 @@ mod tests {
         }
 
         /// Surfaces a knock from instance A, quiets its repeat, then trusts instance C of
-        /// the same identity in the rig's trust list, as `.mesh trust` would.
+        /// the same identity in the rig's trust list, as `.mesh access trust` would.
         fn surface_a_then_trust_c(rig: &Rig, identity: &str, at: Instant) {
             assert_eq!(
                 knock_at(rig, identity, "inst-a", at),
@@ -3464,7 +3456,7 @@ mod tests {
             notes[0].text.plain(),
             format!(
                 "A peer (identity {identity}) knocks from instance {dest}\n\
-                 trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"
+                 trust: .mesh access trust {dest} | who: .mesh people info {dest} | silence: .mesh access block --identity {identity}"
             )
         );
         let text = notes[0].text.plain();

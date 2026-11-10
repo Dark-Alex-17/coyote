@@ -2366,7 +2366,7 @@ fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
         Ok(granted) => granted,
         Err(err) => {
             warn!(
-                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity <hash>` with the identity hash `.mesh info` shows.",
+                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh info` shows.",
                 short(fingerprint),
                 redact_hashes(&format!("{err:#}")),
                 trust.path().display()
@@ -5694,7 +5694,7 @@ impl MeshSlot {
         let (text, note) = match reply_kind {
             HumanReply::Declined => (
                 NoticeText::from(format!("you declined {dest8}'s question")),
-                "the human declined via `.mesh dismiss`; nothing to do",
+                "the human declined via `.mesh envoy dismiss`; nothing to do",
             ),
             HumanReply::Answered => {
                 let words = reply.capped_words(PEER_LINE_MAX_CHARS);
@@ -5971,7 +5971,7 @@ impl std::error::Error for AlreadyClosed {}
 
 pub(crate) fn already_closed(id: &str) -> AlreadyClosed {
     AlreadyClosed(NoticeText::from_template(
-        "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+        "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open.",
         &[],
         &[("id", id)],
     ))
@@ -5981,7 +5981,7 @@ pub(crate) fn already_closed(id: &str) -> AlreadyClosed {
 /// `dismiss_held_by_envoy` does.
 fn answer_held_by_envoy(id: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "`{id}` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer {id} --attach <path>.",
+        "`{id}` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh envoy answer {id} --attach <path>.",
         &[],
         &[("id", id)],
     ))
@@ -5998,7 +5998,7 @@ fn decline_not_told(name: &str, id: &str, err: &anyhow::Error) -> anyhow::Error 
         )
         .then(error_notice(err))
         .then(NoticeText::from_template(
-            "); {short} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent.",
+            "); {short} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {id} --silent.",
             &[],
             &[("short", short(id)), ("id", id)],
         )),
@@ -6009,7 +6009,7 @@ fn decline_not_told(name: &str, id: &str, err: &anyhow::Error) -> anyhow::Error 
 /// peer chose it.
 pub(crate) fn dismiss_held_by_envoy(id: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}.",
+        "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss {id}.",
         &[],
         &[("id", id)],
     ))
@@ -6031,7 +6031,7 @@ mod held_and_declined_quoting_tests {
             NoticeText::default()
                 .frame("No path to ")
                 .peer(".vault")
-                .frame(" is known; `.mesh peers` lists what this node has heard from"),
+                .frame(" is known; `.mesh people list` lists what this node has heard from"),
         )
     }
 
@@ -6039,12 +6039,12 @@ mod held_and_declined_quoting_tests {
     fn under_dot_the_hold_and_decline_errors_read_as_they_did() {
         assert_eq!(
             shown(answer_held_by_envoy(".vault"), CommandPrefix::Dot),
-            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer .vault --attach <path>."
+            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh envoy answer .vault --attach <path>."
         );
         let declined = decline_not_told(".session", ".vault", &send_failure());
         assert_eq!(
             declined.to_string(),
-            "Could not tell .session that you declined (No path to .vault is known; `.mesh peers` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with .mesh dismiss .vault --silent."
+            "Could not tell .session that you declined (No path to .vault is known; `.mesh people list` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with .mesh envoy dismiss .vault --silent."
         );
         assert_eq!(
             shown(declined, CommandPrefix::Dot),
@@ -6059,23 +6059,24 @@ mod held_and_declined_quoting_tests {
     fn under_slash_the_hold_and_decline_errors_keep_peer_text_and_slash_their_hints() {
         assert_eq!(
             shown(answer_held_by_envoy(".vault"), CommandPrefix::Slash),
-            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then /mesh answer .vault --attach <path>."
+            "Error: `.vault` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then /mesh envoy answer .vault --attach <path>."
         );
         assert_eq!(
             shown(
                 decline_not_told(".session", ".vault", &send_failure()),
                 CommandPrefix::Slash
             ),
-            "Error: Could not tell .session that you declined (No path to .vault is known; `/mesh peers` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with /mesh dismiss .vault --silent."
+            "Error: Could not tell .session that you declined (No path to .vault is known; `/mesh people list` lists what this node has heard from); .vault stays pending. Retry, or remove it without a message with /mesh envoy dismiss .vault --silent."
         );
     }
 
     #[test]
     fn a_decline_keeps_each_link_of_an_unquoted_send_failure() {
-        let err = anyhow!("`.mesh peers` shows when it was last heard").context("The link failed");
+        let err =
+            anyhow!("`.mesh people list` shows when it was last heard").context("The link failed");
         assert_eq!(
             shown(decline_not_told("Tia", "p1", &err), CommandPrefix::Slash),
-            "Error: Could not tell Tia that you declined (The link failed: `/mesh peers` shows when it was last heard); p1 stays pending. Retry, or remove it without a message with /mesh dismiss p1 --silent."
+            "Error: Could not tell Tia that you declined (The link failed: `/mesh people list` shows when it was last heard); p1 stays pending. Retry, or remove it without a message with /mesh envoy dismiss p1 --silent."
         );
     }
 }
@@ -6305,7 +6306,7 @@ impl KnockSurface for MeshSlot {
 
 /// The one line the owner gets when a peer that said it left announces again, or is heard
 /// over a link, while `open` questions to it still wait: `bob is back; your question from
-/// 2d ago is still open; .mesh pending lists it`, or, for several, how many and when the
+/// 2d ago is still open; .mesh messaging sent lists it`, or, for several, how many and when the
 /// oldest was asked.
 /// `None` with nothing open. The name is quoted as it stands, since the peer chose it.
 fn return_line(name: &str, open: &[PendingRecord], now: SystemTime) -> Option<NoticeText> {
@@ -6319,9 +6320,9 @@ fn return_line(name: &str, open: &[PendingRecord], now: SystemTime) -> Option<No
     };
     let tail = match open.len() {
         0 => return None,
-        1 => format!(" is back; your question {from} is still open; .mesh pending lists it"),
+        1 => format!(" is back; your question {from} is still open; .mesh messaging sent lists it"),
         n => format!(
-            " is back; your {n} questions, the oldest {from}, are still open; .mesh pending lists them"
+            " is back; your {n} questions, the oldest {from}, are still open; .mesh messaging sent lists them"
         ),
     };
     Some(NoticeText::default().peer(name).frame(tail))
@@ -7316,13 +7317,13 @@ mod tests {
             return_line("bob", &[asked("a", 2 * 86_400)], now)
                 .unwrap()
                 .plain(),
-            "bob is back; your question from 2d ago is still open; .mesh pending lists it"
+            "bob is back; your question from 2d ago is still open; .mesh messaging sent lists it"
         );
         assert_eq!(
             return_line("bob", &[asked("a", 60), asked("b", 3 * 3600)], now)
                 .unwrap()
                 .plain(),
-            "bob is back; your 2 questions, the oldest from 3h ago, are still open; .mesh pending lists them"
+            "bob is back; your 2 questions, the oldest from 3h ago, are still open; .mesh messaging sent lists them"
         );
     }
 
@@ -7357,7 +7358,7 @@ mod tests {
         let text = pushed[0].text.plain();
         assert!(
             text.starts_with(&format!("{} is back; your question from ", short(&peer)))
-                && text.ends_with("s ago is still open; .mesh pending lists it"),
+                && text.ends_with("s ago is still open; .mesh messaging sent lists it"),
             "{text}"
         );
         assert_eq!(
@@ -9267,7 +9268,7 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "{} said: {}...; envoy replied: {}... (full text: .mesh inbox)",
+                "{} said: {}...; envoy replied: {}... (full text: .mesh messaging inbox)",
                 &hex_lower(&PEER_INSTANCE)[..8],
                 words('q', 6),
                 words('r', 6)
@@ -9275,7 +9276,14 @@ mod tests {
         );
         assert_eq!(words('q', 6).chars().count(), 71);
         assert!(words('q', 7).chars().count() > half);
-        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
+        assert_eq!(
+            pushed[0]
+                .text
+                .plain()
+                .matches(".mesh messaging inbox")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -9291,7 +9299,7 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "{} asked: words of a-1; envoy replied: {}... (full text: .mesh inbox)",
+                "{} asked: words of a-1; envoy replied: {}... (full text: .mesh messaging inbox)",
                 &hex_lower(&PEER_INSTANCE)[..8],
                 "r".repeat(PEER_LINE_MAX_CHARS / 2)
             )
@@ -9544,11 +9552,18 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "envoy timed out; {dest8} says: {}... is in the inbox (full text: .mesh inbox)",
+                "envoy timed out; {dest8} says: {}... is in the inbox (full text: .mesh messaging inbox)",
                 "q".repeat(PEER_LINE_MAX_CHARS)
             )
         );
-        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
+        assert_eq!(
+            pushed[0]
+                .text
+                .plain()
+                .matches(".mesh messaging inbox")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -9594,11 +9609,18 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "envoy escalated to the human; {dest8} asks: {}... is in the inbox (full text: .mesh inbox)",
+                "envoy escalated to the human; {dest8} asks: {}... is in the inbox (full text: .mesh messaging inbox)",
                 "q".repeat(PEER_LINE_MAX_CHARS)
             )
         );
-        assert_eq!(pushed[0].text.plain().matches(".mesh inbox").count(), 1);
+        assert_eq!(
+            pushed[0]
+                .text
+                .plain()
+                .matches(".mesh messaging inbox")
+                .count(),
+            1
+        );
     }
 
     fn inbound_record(id: &str) -> InboundRecord {
@@ -9681,11 +9703,11 @@ mod tests {
                 ),
                 (
                     slot.answer_inbound(".session", "yes").await.unwrap_err(),
-                    "`.session` is an access request, not a question; decide it with `.mesh grant .session` or `.mesh refuse .session`".to_string(),
+                    "`.session` is an access request, not a question; decide it with `.mesh files grant .session` or `.mesh files refuse .session`".to_string(),
                 ),
                 (
                     slot.answer_inbound(".info", "yes").await.unwrap_err(),
-                    "`.info` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.".to_string(),
+                    "`.info` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open.".to_string(),
                 ),
                 (
                     slot.answer_inbound(".vault", "yes").await.unwrap_err(),
@@ -9710,8 +9732,8 @@ mod tests {
             let peer = short(&hex_lower(&PEER_INSTANCE)).to_string();
             let slashed = [
                 "Mesh is off; turn it on with `/mesh on` before answering .vault".to_string(),
-                "`.session` is an access request, not a question; decide it with `/mesh grant .session` or `/mesh refuse .session`".to_string(),
-                "`.info` was already closed by another process, so nothing more was done. /mesh pending shows what is still open.".to_string(),
+                "`.session` is an access request, not a question; decide it with `/mesh files grant .session` or `/mesh files refuse .session`".to_string(),
+                "`.info` was already closed by another process, so nothing more was done. /mesh envoy questions and /mesh files requests show what is still open.".to_string(),
                 format!("Mesh is off, so the answer to .vault cannot be sent to {peer}"),
             ];
             for ((err, _), slash) in refusals().await.into_iter().zip(slashed) {
@@ -9746,7 +9768,7 @@ mod tests {
 
         assert!(
             err.to_string().contains(
-                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`"
+                "`acc-1` is an access request, not a question; decide it with `.mesh files grant acc-1` or `.mesh files refuse acc-1`"
             ),
             "{err}"
         );
@@ -9811,7 +9833,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "`a-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer a-1 --attach <path>."
+            "`a-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh envoy answer a-1 --attach <path>."
         );
         assert!(
             envoy.answers.lock().is_empty(),
@@ -9995,7 +10017,7 @@ mod tests {
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(
             notes[0].next_action,
-            "the human declined via `.mesh dismiss`; nothing to do"
+            "the human declined via `.mesh envoy dismiss`; nothing to do"
         );
         let idle_lines: Vec<String> = idle
             .pushed
@@ -10063,7 +10085,7 @@ mod tests {
             let err = slot.dismiss_inbound("acc-1", silent).await.unwrap_err();
             assert_eq!(
                 err.to_string(),
-                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`"
+                "`acc-1` is an access request, not a question; decide it with `.mesh files grant acc-1` or `.mesh files refuse acc-1`"
             );
         }
         assert!(store.get("acc-1").unwrap().is_some());
@@ -10091,7 +10113,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "`a-1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss a-1."
+            "`a-1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss a-1."
         );
         assert!(store.get("a-1").unwrap().is_some());
         assert!(
@@ -10123,7 +10145,7 @@ mod tests {
         );
         assert!(
             text.ends_with(
-                "); a-1 stays pending. Retry, or remove it without a message with .mesh dismiss a-1 --silent."
+                "); a-1 stays pending. Retry, or remove it without a message with .mesh envoy dismiss a-1 --silent."
             ),
             "{text}"
         );
@@ -10795,7 +10817,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            "`a-1` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
         );
         assert!(stub.seen().is_empty(), "{:?}", stub.seen());
 
@@ -10892,7 +10914,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "`q-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            "`q-1` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
         );
         assert!(stub.seen().is_empty(), "{:?}", stub.seen());
         assert!(
@@ -11052,7 +11074,7 @@ mod tests {
         assert_eq!(kept.chars().count(), PEER_LINE_MAX_CHARS - 1);
         assert_eq!(
             pushed[0].text.plain(),
-            format!("you answered {dest8}: {kept}... (full text: .mesh inbox)")
+            format!("you answered {dest8}: {kept}... (full text: .mesh messaging inbox)")
         );
     }
 
@@ -12393,7 +12415,7 @@ mod tests {
             texts[0]
         );
         assert!(
-            texts[0].contains(&format!(".mesh trust {b_destination}")),
+            texts[0].contains(&format!(".mesh access trust {b_destination}")),
             "{}",
             texts[0]
         );
@@ -12795,7 +12817,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh people list` shows when it was last heard."
             )
         );
 
@@ -15458,7 +15480,7 @@ mod tests {
                 let text = pushed[0].text.plain();
                 assert!(
                     text.starts_with(&format!("{name} is back; your question from "))
-                        && text.ends_with(" ago is still open; .mesh pending lists it"),
+                        && text.ends_with(" ago is still open; .mesh messaging sent lists it"),
                     "{text}"
                 );
             }
@@ -18887,7 +18909,7 @@ mod tests {
             assert!(!seed_own_grant(&trust, OWN, true));
 
             let remedy = format!(
-                "make '{}' readable and writable again (fix or move it), then run `.mesh trust --identity <hash>` with the identity hash `.mesh info` shows",
+                "make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh info` shows",
                 trust.path().display()
             );
             let warned = warn_snapshot();
@@ -19597,7 +19619,7 @@ mod tests {
             assert!(err.downcast_ref::<AlreadyClosed>().is_some(), "{err}");
             assert_eq!(
                 err.to_string(),
-                "`stale-q` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                "`stale-q` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
             );
         }
         let err = slot.answer_inbound("stale-q", "yes").await.unwrap_err();
@@ -19775,14 +19797,14 @@ mod tests {
         assert_eq!(sentence.matches(&new_hash).count(), 3, "{sentence}");
         assert!(
             sentence.contains(&format!(
-                "Its owner can run .mesh trust {new_hash} (or .mesh unblock {new_hash} if it blocked this instance)."
+                "Its owner can run .mesh access trust {new_hash} (or .mesh access unblock {new_hash} if it blocked this instance)."
             )),
             "{sentence}"
         );
         let next_action = refusal.next_action();
         assert!(!next_action.contains(&old_hash), "{next_action}");
         assert!(
-            next_action.contains(&format!("to run .mesh trust {new_hash};")),
+            next_action.contains(&format!("to run .mesh access trust {new_hash};")),
             "{next_action}"
         );
         let json = serde_json::to_value(&refusal).unwrap();

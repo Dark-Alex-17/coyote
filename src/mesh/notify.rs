@@ -177,17 +177,17 @@ mod template_tests {
     #[test]
     fn a_template_quotes_its_peer_values_and_spells_its_own_hints() {
         let text = NoticeText::from_template(
-            "`{id}` from {peer}; run .mesh grant {id} or {missing}",
+            "`{id}` from {peer}; run .mesh files grant {id} or {missing}",
             &[("peer", "abcd1234")],
             &[("id", ".vault")],
         );
         assert_eq!(
             text.render(CommandPrefix::Dot),
-            "`.vault` from abcd1234; run .mesh grant .vault or {missing}"
+            "`.vault` from abcd1234; run .mesh files grant .vault or {missing}"
         );
         assert_eq!(
             text.render(CommandPrefix::Slash),
-            "`.vault` from abcd1234; run /mesh grant .vault or {missing}"
+            "`.vault` from abcd1234; run /mesh files grant .vault or {missing}"
         );
     }
 }
@@ -508,12 +508,14 @@ mod tests {
             let note = rendered(
                 NoticeText::default()
                     .frame("reason: \"")
-                    .peer(".mesh grant a-1 and .vault")
-                    .frame("\"; grant: .mesh grant a-1"),
+                    .peer(".mesh files grant a-1 and .vault")
+                    .frame("\"; grant: .mesh files grant a-1"),
             );
             assert_eq!(
                 note.render_notification_lines(CommandPrefix::Slash),
-                ["[mesh:access] reason: \".mesh grant a-1 and .vault\"; grant: /mesh grant a-1"]
+                [
+                    "[mesh:access] reason: \".mesh files grant a-1 and .vault\"; grant: /mesh files grant a-1"
+                ]
             );
             for prefix in [CommandPrefix::Dot, CommandPrefix::Both] {
                 assert_eq!(note.render_notification_lines(prefix), note.lines());

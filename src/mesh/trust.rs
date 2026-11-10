@@ -1957,7 +1957,7 @@ impl TrustStore {
             );
             if offered == Offered::Dropped {
                 warn!(
-                    "Mesh key-change notice for {} was dropped; the mark stands and .mesh peers shows it",
+                    "Mesh key-change notice for {} was dropped; the mark stands and .mesh people list shows it",
                     short(&change.destination_hash)
                 );
             }
@@ -2343,7 +2343,7 @@ impl TrustStore {
                 .is_some_and(|entry| entry.all_destinations)
         {
             bail!(
-                "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {destination}. To stop trusting the whole identity, run .mesh untrust --identity {identity}.",
+                "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block {destination}. To stop trusting the whole identity, run .mesh access revoke --identity {identity}.",
                 short(&destination),
                 short(identity)
             );
@@ -2421,7 +2421,7 @@ impl TrustStore {
                     .count();
             if !was_granting && bound > 0 {
                 bail!(
-                    "Identity {identity} holds no grant for all destinations, so there is no grant to withdraw; its {bound} instance(s) are trusted on their own. .mesh untrust <destination> stops serving one, .mesh forget --identity {identity} erases them all."
+                    "Identity {identity} holds no grant for all destinations, so there is no grant to withdraw; its {bound} instance(s) are trusted on their own. .mesh access revoke <destination> stops serving one, .mesh access forget --identity {identity} erases them all."
                 );
             }
             if dry_run {
@@ -2527,7 +2527,7 @@ impl TrustStore {
         let mut file = state.file.clone();
         if file.blocked_identities.remove(&identity).is_none() {
             bail!(
-                "Identity {identity} is not blocked, so there is nothing to unblock; .mesh block --identity {identity} silences it, .mesh trust --identity {identity} serves every instance."
+                "Identity {identity} is not blocked, so there is nothing to unblock; .mesh access block --identity {identity} silences it, .mesh access trust --identity {identity} serves every instance."
             );
         }
         if dry_run {
@@ -2641,12 +2641,12 @@ impl TrustStore {
                 resolved.filter(|identity| file.blocked_identities.contains_key(identity))
             {
                 bail!(
-                    "Destination {destination} is not blocked, so there is nothing to unblock; its identity {} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it.",
+                    "Destination {destination} is not blocked, so there is nothing to unblock; its identity {} is blocked: .mesh access unblock --identity {identity} first, then .mesh access trust {destination} serves it.",
                     short(&identity)
                 );
             }
             bail!(
-                "Destination {destination} is not blocked, so there is nothing to unblock; .mesh block {destination} refuses it, .mesh trust {destination} serves it."
+                "Destination {destination} is not blocked, so there is nothing to unblock; .mesh access block {destination} refuses it, .mesh access trust {destination} serves it."
             );
         }
         let served_by = match resolved {
@@ -3292,7 +3292,7 @@ fn check_text(field: &str, text: Option<&str>) -> Result<()> {
 fn refuse_if_blocked(file: &TrustFile, identity: &str) -> Result<()> {
     if file.blocked_identities.contains_key(identity) {
         bail!(
-            "Identity {identity} is blocked. Run `.mesh unblock --identity {identity}` first if you want to trust it."
+            "Identity {identity} is blocked. Run `.mesh access unblock --identity {identity}` first if you want to trust it."
         );
     }
     Ok(())
@@ -3305,19 +3305,19 @@ fn nothing_to_untrust(
 ) -> anyhow::Error {
     if file.denied_destinations.contains_key(destination) {
         return anyhow!(
-            "Destination {destination} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {destination} lifts the block."
+            "Destination {destination} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {destination} lifts the block."
         );
     }
     if let Some(identity) =
         identity.filter(|identity| file.blocked_identities.contains_key(*identity))
     {
         return anyhow!(
-            "Destination {destination} is not in the trust list, so there is nothing to untrust; its identity {} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it.",
+            "Destination {destination} is not in the trust list, so there is nothing to untrust; its identity {} is blocked: .mesh access unblock --identity {identity} first, then .mesh access trust {destination} serves it.",
             short(identity)
         );
     }
     anyhow!(
-        "Destination {destination} is not in the trust list, so there is nothing to untrust; .mesh block {destination} refuses it, .mesh trust {destination} serves it."
+        "Destination {destination} is not in the trust list, so there is nothing to untrust; .mesh access block {destination} refuses it, .mesh access trust {destination} serves it."
     )
 }
 
@@ -3328,12 +3328,12 @@ fn nothing_to_untrust(
 pub(crate) fn nothing_to_untrust_identity(identity: &str, blocked: bool) -> anyhow::Error {
     if blocked {
         return anyhow!(
-            "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {identity} lifts the block.",
+            "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh access unblock --identity {identity} lifts the block.",
             short(identity)
         );
     }
     anyhow!(
-        "Identity {identity} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {identity} grants it, .mesh block --identity {identity} silences it."
+        "Identity {identity} is not in the trust list, so there is nothing to untrust; .mesh access trust --identity {identity} grants it, .mesh access block --identity {identity} silences it."
     )
 }
 
@@ -3470,7 +3470,7 @@ fn resolve_destination(
     }
     let Some(knock) = mesh.knock(&destination, now) else {
         bail!(
-            "Destination {destination} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
+            "Destination {destination} is not in the peer table and has not knocked. Run `.mesh people list` to see the nodes that have announced or `.mesh access requests` to see who asked to be trusted, and trust one of those."
         );
     };
     if knock.name_hash.is_empty() {
@@ -3572,8 +3572,8 @@ fn key_change_text(
                 " is bound to identity {bound} but was presented under \
              identity {seen}, which is trusted for all destinations and is served while it \
              asks; the record is marked and {standing}. If the peer rotated, confirm with its \
-             holder out of band and run .mesh trust {new_destination} to clear the mark; \
-             otherwise .mesh block --identity {seen}"
+             holder out of band and run .mesh access trust {new_destination} to clear the mark; \
+             otherwise .mesh access block --identity {seen}"
             ),
         ),
         KeyChangeOutcome::Refused => (
@@ -3582,8 +3582,8 @@ fn key_change_text(
                 " is bound to identity {bound} but was presented under \
              identity {seen} and is refused when it asks; {standing} and the new key is a \
              stranger. Confirm with the identity's holder out of band before granting anything: \
-             if the peer rotated, run .mesh trust {new_destination} to trust the new key and \
-             clear the mark; otherwise .mesh block --identity {seen} silences it"
+             if the peer rotated, run .mesh access trust {new_destination} to trust the new key and \
+             clear the mark; otherwise .mesh access block --identity {seen} silences it"
             ),
         ),
     };
@@ -3608,7 +3608,7 @@ mod key_change_prefix_tests {
             let text =
                 key_change_text(&change, &"12".repeat(16), outcome).render(CommandPrefix::Slash);
             assert!(text.contains("instance .info is bound"), "{text}");
-            assert!(text.contains("run /mesh trust "), "{text}");
+            assert!(text.contains("run /mesh access trust "), "{text}");
             assert!(!text.contains("/info"), "{text}");
         }
     }
@@ -3632,14 +3632,14 @@ fn presence_collision_text(
              trusted for all destinations and is served while it asks because \
              collision_protection is off; no record carries the instance, so nothing is marked. \
              If the peer rotated, confirm with its holder out of band; otherwise \
-             .mesh block --identity {seen_identity}"
+             .mesh access block --identity {seen_identity}"
         ),
         KeyChangeOutcome::Refused => format!(
             "error: instance {instance} was heard under identity {old_identity}, trusted for all \
              destinations, and is now presented under identity {seen_identity}, which is \
              refused when it asks; no record carries the instance, so nothing is marked. Confirm \
              with the identity's holder out of band before granting anything: if the peer rotated, run \
-             .mesh trust {new_destination}; otherwise .mesh block --identity {seen_identity}"
+             .mesh access trust {new_destination}; otherwise .mesh access block --identity {seen_identity}"
         ),
     }
 }
@@ -4160,8 +4160,8 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains(".mesh peers"), "{err}");
-        assert!(err.contains(".mesh knocks"), "{err}");
+        assert!(err.contains(".mesh people list"), "{err}");
+        assert!(err.contains(".mesh access requests"), "{err}");
         assert!(err.contains("has not knocked"), "{err}");
         assert!(err.contains(&fake_hash(0x9f)), "{err}");
         assert_eq!(fx.file_bytes(), None);
@@ -6221,7 +6221,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains(".mesh unblock"), "{err}");
+        assert!(err.contains(".mesh access unblock"), "{err}");
 
         let before = fx.file_bytes();
         fx.store
@@ -6246,7 +6246,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "Identity {} is not blocked, so there is nothing to unblock; .mesh block --identity {} silences it, .mesh trust --identity {} serves every instance.",
+                "Identity {} is not blocked, so there is nothing to unblock; .mesh access block --identity {} silences it, .mesh access trust --identity {} serves every instance.",
                 peer.identity_hash, peer.identity_hash, peer.identity_hash
             )
         );
@@ -6369,7 +6369,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "Identity {} holds no grant for all destinations, so there is no grant to withdraw; its 1 instance(s) are trusted on their own. .mesh untrust <destination> stops serving one, .mesh forget --identity {} erases them all.",
+                "Identity {} holds no grant for all destinations, so there is no grant to withdraw; its 1 instance(s) are trusted on their own. .mesh access revoke <destination> stops serving one, .mesh access forget --identity {} erases them all.",
                 first.identity_hash, first.identity_hash
             )
         );
@@ -8279,7 +8279,7 @@ mod tests {
         let sink = fx.observed();
         let before = fx.file_bytes();
         let expected = format!(
-            "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {}. To stop trusting the whole identity, run .mesh untrust --identity {}.",
+            "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block {}. To stop trusting the whole identity, run .mesh access revoke --identity {}.",
             short(&peer.destination_hash),
             short(&peer.identity_hash),
             peer.destination_hash,
@@ -8761,7 +8761,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "Destination {} is not blocked, so there is nothing to unblock; .mesh block {} refuses it, .mesh trust {} serves it.",
+                    "Destination {} is not blocked, so there is nothing to unblock; .mesh access block {} refuses it, .mesh access trust {} serves it.",
                     peer.destination_hash, peer.destination_hash, peer.destination_hash
                 )
             );
@@ -8864,7 +8864,7 @@ mod tests {
         // With the deny gone and no record left, both verbs on the blocked identity's
         // instance name the block as what stands in the way.
         let blocked_tail = format!(
-            "its identity {} is blocked: .mesh unblock --identity {} first, then .mesh trust {} serves it.",
+            "its identity {} is blocked: .mesh access unblock --identity {} first, then .mesh access trust {} serves it.",
             short(&blocked.identity_hash),
             blocked.identity_hash,
             blocked.destination_hash
@@ -8977,7 +8977,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "Destination {destination} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {destination} lifts the block."
+                    "Destination {destination} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {destination} lifts the block."
                 )
             );
         }
@@ -8989,7 +8989,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "Destination {stranger} is not in the trust list, so there is nothing to untrust; .mesh block {stranger} refuses it, .mesh trust {stranger} serves it."
+                "Destination {stranger} is not in the trust list, so there is nothing to untrust; .mesh access block {stranger} refuses it, .mesh access trust {stranger} serves it."
             )
         );
         assert_eq!(fx.file_bytes(), before);
@@ -9017,7 +9017,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {id} lifts the block.",
+                    "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh access unblock --identity {id} lifts the block.",
                     short(&id)
                 ),
                 "{dry_run}"
@@ -9036,7 +9036,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {id} grants it, .mesh block --identity {id} silences it."
+                "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh access trust --identity {id} grants it, .mesh access block --identity {id} silences it."
             )
         );
     }
@@ -9604,11 +9604,14 @@ mod tests {
         assert!(text.contains(short(&old.identity_hash)), "{text}");
         assert!(text.contains(short(&new.identity_hash)), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {}", new.destination_hash)),
+            text.contains(&format!(".mesh access trust {}", new.destination_hash)),
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh block --identity {}", new.identity_hash)),
+            text.contains(&format!(
+                ".mesh access block --identity {}",
+                new.identity_hash
+            )),
             "{text}"
         );
         assert!(text.contains("presented under"), "{text}");
@@ -9945,7 +9948,7 @@ mod tests {
         assert!(text.starts_with("warning: "), "{text}");
         assert!(text.contains("is served"), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {}", new.destination_hash)),
+            text.contains(&format!(".mesh access trust {}", new.destination_hash)),
             "{text}"
         );
         assert_eq!(
@@ -10011,11 +10014,14 @@ mod tests {
         assert!(text.contains(&new.identity_hash), "{text}");
         assert!(text.contains("nothing is marked"), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {}", new.destination_hash)),
+            text.contains(&format!(".mesh access trust {}", new.destination_hash)),
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh block --identity {}", new.identity_hash)),
+            text.contains(&format!(
+                ".mesh access block --identity {}",
+                new.identity_hash
+            )),
             "{text}"
         );
     }
@@ -10060,7 +10066,7 @@ mod tests {
         assert!(texts[0].contains(&old.identity_hash), "{}", texts[0]);
         assert!(texts[0].contains(&new.identity_hash), "{}", texts[0]);
         assert!(
-            texts[0].contains(&format!(".mesh trust {}", new.destination_hash)),
+            texts[0].contains(&format!(".mesh access trust {}", new.destination_hash)),
             "the new destination is derived from the canonical hash: {}",
             texts[0]
         );
@@ -10116,7 +10122,7 @@ mod tests {
                 .is_some()
         );
         let line = format!(
-            "Mesh key-change notice for {} was dropped; the mark stands and .mesh peers shows it",
+            "Mesh key-change notice for {} was dropped; the mark stands and .mesh people list shows it",
             short(&old.destination_hash)
         );
         assert!(warn_snapshot().contains(&line), "{line}");
@@ -10816,7 +10822,10 @@ mod tests {
         assert!(!text.contains("grant stays"), "{text}");
         assert!(text.contains("presented under"), "{text}");
         assert!(
-            text.contains(&format!(".mesh block --identity {}", new.identity_hash)),
+            text.contains(&format!(
+                ".mesh access block --identity {}",
+                new.identity_hash
+            )),
             "{text}"
         );
     }
@@ -10852,7 +10861,10 @@ mod tests {
         assert!(text.contains(&new.identity_hash), "{text}");
         assert!(text.contains("nothing is marked"), "{text}");
         assert!(
-            text.contains(&format!(".mesh block --identity {}", new.identity_hash)),
+            text.contains(&format!(
+                ".mesh access block --identity {}",
+                new.identity_hash
+            )),
             "{text}"
         );
         assert_eq!(
@@ -10954,7 +10966,7 @@ mod tests {
         assert!(!text.contains("announced under"), "{text}");
         assert!(
             text.contains(&format!(
-                ".mesh trust {}; otherwise .mesh block --identity {}",
+                ".mesh access trust {}; otherwise .mesh access block --identity {}",
                 new.destination_hash, new.identity_hash
             )),
             "{text}"
@@ -11461,7 +11473,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh block --identity {}", new.identity_hash)),
+            text.contains(&format!(
+                ".mesh access block --identity {}",
+                new.identity_hash
+            )),
             "{text}"
         );
     }
@@ -12089,7 +12104,10 @@ mod tests {
             texts[1]
         );
         assert!(
-            texts[1].contains(&format!(".mesh trust {}", successor.destination_hash)),
+            texts[1].contains(&format!(
+                ".mesh access trust {}",
+                successor.destination_hash
+            )),
             "{}",
             texts[1]
         );
@@ -12327,7 +12345,7 @@ mod tests {
             texts[0].starts_with("error: ")
                 && texts[0].contains(&format!("presented under identity {}", first.identity_hash))
                 && texts[0].contains(&format!(
-                    ".mesh trust {}",
+                    ".mesh access trust {}",
                     destination_for(&first, instance)
                 )),
             "{}",
@@ -12351,7 +12369,7 @@ mod tests {
                     second.identity_hash
                 ))
                 && texts[1].contains(&format!(
-                    ".mesh trust {}",
+                    ".mesh access trust {}",
                     destination_for(&second, instance)
                 ))
                 && !texts[1].contains(&first.identity_hash),
@@ -12626,7 +12644,7 @@ mod tests {
                     short(&holder.destination_hash)
                 ))
                 && texts[1].contains(&format!(
-                    ".mesh trust {}",
+                    ".mesh access trust {}",
                     destination_for(&newcomer, instance)
                 )),
             "{}",
@@ -12743,11 +12761,11 @@ mod tests {
                     newcomer.identity_hash
                 ))
                 && texts[1].contains(&format!(
-                    ".mesh trust {}",
+                    ".mesh access trust {}",
                     destination_for(&newcomer, instance)
                 ))
                 && texts[1].contains(&format!(
-                    ".mesh block --identity {}",
+                    ".mesh access block --identity {}",
                     newcomer.identity_hash
                 )),
             "{}",

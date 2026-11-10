@@ -564,7 +564,7 @@ impl fmt::Display for StatusError {
             ),
             Self::NotServed(DispatchError::NoProvider { path }) => write!(
                 f,
-                "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
+                "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <destination> does; ask the person at that node to upgrade, then try again"
             ),
             Self::NotServed(DispatchError::UnknownPath { path_hash }) => write!(
                 f,
@@ -656,7 +656,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). A status request is answered live or not at all; nothing queues it for later.",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). A status request is answered live or not at all; nothing queues it for later.",
                 short(&to)
             )
         );
@@ -1883,7 +1883,7 @@ mod tests {
         assert_eq!(
             not_served,
             format!(
-                "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
+                "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <destination> does; ask the person at that node to upgrade, then try again"
             )
         );
         let unknown_path = StatusError::NotServed(DispatchError::UnknownPath {
@@ -1909,7 +1909,7 @@ mod tests {
         .to_string();
         assert_eq!(
             unopened,
-            "The mesh link failed: no known path to destination abababab. Try again in a minute; `.mesh peers` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later."
+            "The mesh link failed: no known path to destination abababab. Try again in a minute; `.mesh people list` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later."
         );
         let malformed = StatusError::Malformed("`v` is 0".into()).to_string();
         assert!(malformed.contains("status card"), "{malformed}");
@@ -1975,7 +1975,7 @@ mod tests {
             "transport is live-only: {transport}"
         );
         assert!(
-            refused.contains("live or not at all") && refused.contains(".mesh trust"),
+            refused.contains("live or not at all") && refused.contains(".mesh access trust"),
             "the peer's refusal is live-only and names the remedy: {refused}"
         );
         assert!(

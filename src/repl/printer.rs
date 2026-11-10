@@ -135,7 +135,7 @@ mod injected_width_tests {
 
     #[test]
     fn a_wrapped_line_keeps_its_width_bound_and_its_words_at_every_width() {
-        let body = format!("{}then `.mesh trust a1`", "word ".repeat(90));
+        let body = format!("{}then `.mesh access trust a1`", "word ".repeat(90));
         let prefix = Source::Knock.prefix();
         let indent = " ".repeat(display_width(prefix) + 1);
         for width in [20, 80, 500] {
@@ -315,8 +315,8 @@ mod tests {
                 for (source, text, expected) in [
                     (
                         Source::Knock,
-                        "Tia knocked; `.mesh trust 1a2b3c4d` lets it in",
-                        format!("Tia knocked; `{mesh} trust 1a2b3c4d` lets it in"),
+                        "Tia knocked; `.mesh access trust 1a2b3c4d` lets it in",
+                        format!("Tia knocked; `{mesh} access trust 1a2b3c4d` lets it in"),
                     ),
                     (
                         Source::Access,
@@ -350,10 +350,10 @@ mod tests {
             printer.notify(Notification::new(Source::Knock, "first").render());
             printer.notify(Notification::new(Source::Knock, "dropped").render());
             assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] first"));
-            printer.notify(Notification::new(Source::Knock, "`.mesh knocks`").render());
+            printer.notify(Notification::new(Source::Knock, "`.mesh access requests`").render());
             assert_eq!(
                 attached.get_line().as_deref(),
-                Some("[mesh] (1 notification dropped)\n[mesh:knock] `/mesh knocks`")
+                Some("[mesh] (1 notification dropped)\n[mesh:knock] `/mesh access requests`")
             );
         }
     }
@@ -742,10 +742,10 @@ mod tests {
             let identity = "cd".repeat(16);
             let destination = "ab".repeat(16);
             let text = format!(
-                "\"Tia\" (identity {identity}) knocks from instance {destination}\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}"
+                "\"Tia\" (identity {identity}) knocks from instance {destination}\ntrust: .mesh access trust {destination} | who: .mesh people info {destination} | silence: .mesh access block --identity {identity}"
             );
             let prefix = Source::Knock.prefix();
-            let rows = rendered_rows(Source::Knock, &text, 200);
+            let rows = rendered_rows(Source::Knock, &text, 240);
             assert_eq!(
                 rows,
                 vec![
@@ -753,7 +753,7 @@ mod tests {
                         "{prefix} \"Tia\" (identity {identity}) knocks from instance {destination}"
                     ),
                     format!(
-                        "{} trust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}",
+                        "{} trust: .mesh access trust {destination} | who: .mesh people info {destination} | silence: .mesh access block --identity {identity}",
                         " ".repeat(display_width(prefix))
                     ),
                 ]
@@ -923,11 +923,11 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "envoy escalated to the human; {} asks: {kept}... is in the inbox (full text: .mesh inbox)",
+                "envoy escalated to the human; {} asks: {kept}... is in the inbox (full text: .mesh messaging inbox)",
                 &instance[..8]
             )
         );
-        assert_eq!(line.matches(".mesh inbox").count(), 1);
+        assert_eq!(line.matches(".mesh messaging inbox").count(), 1);
         assert!(
             line.chars().count() > 160,
             "the tail sits outside the peer-text budget"
@@ -997,7 +997,7 @@ mod tests {
         assert_eq!(
             squeezed(&bodies(&rows, Source::Message.prefix()).join(" ")),
             squeezed(&format!(
-                "envoy escalated to the human; abababab asks: {}... is in the inbox (full text: .mesh inbox)",
+                "envoy escalated to the human; abababab asks: {}... is in the inbox (full text: .mesh messaging inbox)",
                 "q".repeat(160)
             ))
         );

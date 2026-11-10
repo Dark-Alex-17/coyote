@@ -562,7 +562,7 @@ mod peer_text_prefix_tests {
         assert!(
             rendered["next_action"]
                 .as_str()
-                .is_some_and(|action| action.contains(&format!("run .mesh trust {own}"))),
+                .is_some_and(|action| action.contains(&format!("run .mesh access trust {own}"))),
             "{rendered}"
         );
         let no_answer = NoAnswer::new(&hex_lower(&[0xbb; 16]), own.clone());
@@ -574,9 +574,12 @@ mod peer_text_prefix_tests {
         assert_eq!(silent["next_action"], no_answer.next_action());
         let message = silent["message"].as_str().unwrap_or_default();
         assert!(message.starts_with(&no_answer.to_string()), "{message}");
-        assert!(message.contains(&format!(".mesh trust {own}")), "{message}");
         assert!(
-            message.ends_with("`/mesh peers` lists the nodes this Coyote has heard from."),
+            message.contains(&format!(".mesh access trust {own}")),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("`/mesh people list` lists the nodes this Coyote has heard from."),
             "{message}"
         );
     }
@@ -678,7 +681,7 @@ fn unreachable_live(runtime: &MeshRuntime, destination: &str) -> Value {
         "status": "error",
         "kind": "unknown_destination",
         "message": format!(
-            "{}{hint} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            "{}{hint} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
             unreachable_head(destination)
         ),
     })
@@ -1376,7 +1379,7 @@ async fn handle_broadcast(runtime: &MeshRuntime, args: &Value) -> Result<Value> 
             "id": outcome.id,
             "recipients": [],
             "count": 0,
-            "message": "No peer this node trusts has a known path right now; nothing was sent. `.mesh peers` lists what this Coyote has heard from.",
+            "message": "No peer this node trusts has a known path right now; nothing was sent. `.mesh people list` lists what this Coyote has heard from.",
         }));
     }
     let tally = outcome.tally();
@@ -2091,8 +2094,8 @@ mod tests {
         fn prose_hints_rewrite_top_level_message_and_next_action_and_nothing_else() {
             let typed = json!({
                 "status": "error",
-                "message": "Not trusted; `.mesh trust 1a2b3c4d` trusts it.",
-                "next_action": "run `.mesh trust 1a2b3c4d`",
+                "message": "Not trusted; `.mesh access trust 1a2b3c4d` trusts it.",
+                "next_action": "run `.mesh access trust 1a2b3c4d`",
                 "path": ".vault/key",
                 "refused": [{
                     "next_action": "wait for `.mesh answer q1`",
@@ -2103,8 +2106,8 @@ mod tests {
                 let rendered = with_prose_hints(typed.clone(), prefix);
                 let expected = json!({
                     "status": "error",
-                    "message": format!("Not trusted; `{mesh} trust 1a2b3c4d` trusts it."),
-                    "next_action": format!("run `{mesh} trust 1a2b3c4d`"),
+                    "message": format!("Not trusted; `{mesh} access trust 1a2b3c4d` trusts it."),
+                    "next_action": format!("run `{mesh} access trust 1a2b3c4d`"),
                     "path": ".vault/key",
                     "refused": [{
                         "next_action": "wait for `.mesh answer q1`",
@@ -2122,7 +2125,7 @@ mod tests {
             let refusal = json!({
                 "status": "error",
                 "kind": "unknown_destination",
-                "message": "No path is known. `.mesh peers` shows when it was last heard.",
+                "message": "No path is known. `.mesh people list` shows when it was last heard.",
             });
             let not_shared = json!({
                 "status": "not_shared",
@@ -2133,7 +2136,7 @@ mod tests {
             for (prefix, mesh) in PREFIXES {
                 assert_eq!(
                     refusal_hints(refusal.clone(), prefix)["message"],
-                    format!("No path is known. `{mesh} peers` shows when it was last heard."),
+                    format!("No path is known. `{mesh} people list` shows when it was last heard."),
                     "{prefix}"
                 );
                 assert_eq!(
@@ -3881,7 +3884,12 @@ mod tests {
         assert_eq!(value["status"], "error");
         assert_eq!(value["kind"], "not_trusted");
         assert_eq!(value["message"], err.to_string());
-        assert!(value["message"].as_str().unwrap().contains(".mesh trust "));
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains(".mesh access trust ")
+        );
         assert_eq!(
             send_error(&SendError::NoPropagationNode)["kind"],
             "no_propagation_node"
@@ -4913,7 +4921,7 @@ mod tests {
         let refusal =
             RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some("Bea"), hex_lower(&[0xaa; 16]));
         let expected_action = format!(
-            "Nothing on this node unblocks it: ask the person at bbbbbbbb to run .mesh trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh knocks on their side).",
+            "Nothing on this node unblocks it: ask the person at bbbbbbbb to run .mesh access trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh access requests on their side).",
             "aa".repeat(16)
         );
         let sent = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
@@ -6743,7 +6751,7 @@ mod tests {
             assert_eq!(
                 error,
                 format!(
-                    "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
+                    "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <destination> does; ask the person at that node to upgrade, then try again"
                 )
             );
             assert!(!error.contains("0x") && error.is_ascii(), "{error}");
@@ -7476,7 +7484,7 @@ mod tests {
             assert_eq!(
                 result["message"],
                 format!(
-                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard."
+                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard."
                 ),
                 "{result}"
             );
@@ -8699,10 +8707,10 @@ mod tests {
             live.stub.know_identity(runtime.fingerprint());
 
             let refusal = format!(
-                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)"
+                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: ask the person at {d8} to run .mesh trust {own}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh knocks on their side)."
+                "Nothing on this node unblocks it: ask the person at {d8} to run .mesh access trust {own}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh access requests on their side)."
             );
 
             let calls = [
@@ -8864,10 +8872,10 @@ mod tests {
             }
             let cee_d8 = short(&cee.destination_hex()).to_string();
             let refusal = format!(
-                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
+                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh trust {own}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh knocks on their side)."
+                "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh access trust {own}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh access requests on their side)."
             );
 
             let result = handle_mesh_tool(
@@ -9078,7 +9086,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("no row for {value}: {rows:?}"))
             };
             let fetch_rows =
-                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["fetch", &to, ""], "");
+                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["files", "fetch", &to, ""], "");
             // Whole seconds, so the wire's f64 round-trips exactly.
             let now_secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -9326,7 +9334,7 @@ mod tests {
             let d8 = short(&to).to_string();
             let fetch = format!("{MESH_FUNCTION_PREFIX}fetch");
             let fetch_values = |ctx: &RequestContext| -> Vec<String> {
-                ctx.repl_complete(".mesh", &["fetch", &to, ""], "")
+                ctx.repl_complete(".mesh", &["files", "fetch", &to, ""], "")
                     .into_iter()
                     .map(|(value, _)| value)
                     .collect()
@@ -9514,7 +9522,7 @@ mod tests {
             let fetch = format!("{MESH_FUNCTION_PREFIX}fetch");
             let access = format!("{MESH_FUNCTION_PREFIX}request_access");
             let fetch_rows =
-                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["fetch", &to, ""], "");
+                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["files", "fetch", &to, ""], "");
             let values = |rows: Vec<(String, Option<String>)>| -> Vec<String> {
                 rows.into_iter().map(|(value, _)| value).collect()
             };
@@ -9632,7 +9640,7 @@ mod tests {
             let access = format!("{MESH_FUNCTION_PREFIX}request_access");
             let collect = format!("{MESH_FUNCTION_PREFIX}collect");
             let fetch_rows =
-                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["fetch", &to, ""], "");
+                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["files", "fetch", &to, ""], "");
             let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
                 rows.iter().map(|(value, _)| value.clone()).collect()
             };
@@ -9828,7 +9836,7 @@ mod tests {
             let collect = format!("{MESH_FUNCTION_PREFIX}collect");
             let check_inbox = format!("{MESH_FUNCTION_PREFIX}check_inbox");
             let fetch_rows =
-                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["fetch", &to, ""], "");
+                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["files", "fetch", &to, ""], "");
             let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
                 rows.iter().map(|(value, _)| value.clone()).collect()
             };
@@ -10336,8 +10344,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(refused["kind"], "not_trusted", "{refused}");
                 let message = refused["message"].as_str().unwrap();
-                assert!(message.contains("/mesh trust"), "{refused}");
-                assert!(!message.contains(".mesh trust"), "{refused}");
+                assert!(message.contains("/mesh access trust"), "{refused}");
+                assert!(!message.contains(".mesh access trust"), "{refused}");
                 assert!(message.is_ascii(), "{refused}");
 
                 let answered = fetch_result(
@@ -10423,7 +10431,7 @@ mod tests {
                     assert!(!message.is_empty(), "{tool} {to}: {result}");
                     if expected == "not_trusted" {
                         assert!(
-                            message.contains(".mesh trust"),
+                            message.contains(".mesh access trust"),
                             "the refusal teaches the operator verb: {tool} {to}: {result}"
                         );
                     }

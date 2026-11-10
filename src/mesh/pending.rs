@@ -427,7 +427,7 @@ impl InboundKind {
 /// The id is quoted as typed, since a peer may have chosen one that reads as a command.
 pub(crate) fn access_not_a_question(id: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`",
+        "`{id}` is an access request, not a question; decide it with `.mesh files grant {id}` or `.mesh files refuse {id}`",
         &[],
         &[("id", id)],
     ))
@@ -436,7 +436,7 @@ pub(crate) fn access_not_a_question(id: &str) -> anyhow::Error {
 /// The id is quoted as typed, since a peer may have chosen one that reads as a command.
 pub(crate) fn question_not_an_access_request(id: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "`{id}` is a question, not an access request; answer it with `.mesh answer {id}`",
+        "`{id}` is a question, not an access request; answer it with `.mesh envoy answer {id}`",
         &[],
         &[("id", id)],
     ))

@@ -163,7 +163,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "access",
         "block",
         ".mesh access block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]",
-        "Refuse one instance without a knock, or silence a whole identity; `block` remembers where `untrust` only stops serving",
+        "Refuse one instance without a knock, or silence a whole identity; `access block` remembers where `access revoke` only stops serving",
     ),
     (
         "access",
@@ -271,7 +271,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "files",
         "deny",
         ".mesh files deny \"src/vault/*\" [--global|--workspace] [--yes|--dry-run]",
-        "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)",
+        "Never share files matching a pattern, whatever `files allow` says; a share rule, not a peer refusal (that is `access block`)",
     ),
     (
         "files",
@@ -329,10 +329,10 @@ const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node tr
 const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
 const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
-const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked or an identity it has blocked; `.mesh unblock <destination>` or `.mesh trust <destination>` lifts the one, `.mesh unblock --identity <identity>` the other.";
-const UNHEARD_KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked, and the mesh is not asked about one it has not heard; `.mesh unblock <destination>` lifts the block.";
-const INFO_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; `.mesh unblock <destination>` lifts the block.";
-const TRUST_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; run `.mesh unblock <destination>`, then `.mesh trust <destination>` again.";
+const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked or an identity it has blocked; `.mesh access unblock <destination>` or `.mesh access trust <destination>` lifts the one, `.mesh access unblock --identity <identity>` the other.";
+const UNHEARD_KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked, and the mesh is not asked about one it has not heard; `.mesh access unblock <destination>` lifts the block.";
+const INFO_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; `.mesh access unblock <destination>` lifts the block.";
+const TRUST_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; run `.mesh access unblock <destination>`, then `.mesh access trust <destination>` again.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
 const OWN_IDENTITY_TRUSTED: &str =
@@ -342,11 +342,11 @@ const SHARE_ROOT_UNKNOWN: &str =
     "The share root is unknown until a turn completes in this session; run one, then try again.";
 /// Above this many matching files a share pattern is confirmed before it is written.
 const BROAD_MATCH_LIMIT: usize = 100;
-/// How long a trusted instance goes unheard before `.mesh trust --prune` lists it, when
+/// How long a trusted instance goes unheard before `.mesh access revoke --stale` lists it, when
 /// `--older-than` is not given.
 const PRUNE_DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// The longest one-off grant `.mesh grant --for` writes; anything longer is a standing
-/// allow rule, which `.mesh shares` lists and `.mesh unshare` takes back.
+/// The longest one-off grant `.mesh files grant --for` writes; anything longer is a standing
+/// allow rule, which `.mesh files list` lists and `.mesh files unshare` takes back.
 const GRANT_FOR_MAX: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub(crate) async fn run(
@@ -730,9 +730,9 @@ fn unheard_label(trust: &TrustStore, record: &TrustRecord) -> &'static str {
 
 /// The key-change mark on `peer`'s trust record, paired with the destination the same
 /// instance derives under the identity that caused the mark.
-/// Whether the list grants `identity` every destination, which makes `.mesh untrust
+/// Whether the list grants `identity` every destination, which makes `.mesh access revoke
 /// <destination>` of one of its instances a refusal; the lines that name what to do with
-/// an old key name `block` instead then.
+/// an old key name `access block` instead then.
 fn grants_all(store: &TrustStore, identity: &str) -> bool {
     standing_grants_all(store.identity_standing(identity))
 }
@@ -862,7 +862,7 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     if matches!(knock, KnockLookup::Unreadable) {
         err_path_text(
             &NoticeText::from(
-                "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh knocks` reports the error.",
+                "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh access requests` reports the error.",
             )
             .render(live_prefix()),
         );
@@ -923,7 +923,7 @@ async fn peer_status(
     let route = match route_to(&runtime, &destination, abort_signal).await {
         Ok(route) => route,
         Err(Unrouted::NoAnswer) => bail!(
-            "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
             unreachable_head(&destination),
             left_mesh_hint(Some(&peer), SystemTime::now())
         ),
@@ -959,7 +959,7 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
                     brief.render_for_human()
                 ),
                 None if mode == MeshBrief::Off => format!(
-                    "brief mode: {mode}\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on."
+                    "brief mode: {mode}\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on."
                 ),
                 None => format!(
                     "brief mode: {mode}\nNo brief is assembled yet: it is built at the first turn boundary after the mesh is on."
@@ -970,18 +970,18 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         BriefArg::Note(text) => {
             ctx.app.mesh.set_user_brief(Some(text.to_string()));
             // Under off the bare verb shows no sections, so the next command is the mode
-            // that will carry the note, not `.mesh brief`.
+            // that will carry the note, not `.mesh envoy brief`.
             let line = if ctx.app.config.mesh.brief != MeshBrief::Off {
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from."
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from."
             } else {
-                "Note set, but brief mode is off, so your envoy does not include it until `.mesh brief auto` or `.mesh brief manual`; then it goes with the card (and, in auto mode, the digest)."
+                "Note set, but brief mode is off, so your envoy does not include it until `.mesh envoy brief auto` or `.mesh envoy brief manual`; then it goes with the card (and, in auto mode, the digest)."
             };
             out_text(&ctx.render_hints(line));
         }
         BriefArg::NoteClear => {
             ctx.app.mesh.set_user_brief(None);
             out_text(&ctx.render_hints(
-                "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one.",
+                "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one.",
             ));
         }
         BriefArg::Mode(mode) => {
@@ -991,7 +991,7 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         BriefArg::Retired(word) => bail!(
             "{}",
             ctx.render_hints(&format!(
-                ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+                ".mesh envoy brief has no '{word}' argument. Set the note with `.mesh envoy brief note \"text\"` and remove it with `.mesh envoy brief note clear`."
             ))
         ),
         BriefArg::Help => out_text(&render_verb_help("envoy", "brief")),
@@ -999,24 +999,24 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The confirmation for `.mesh brief auto|manual|off`: what the envoy answers peers from
+/// The confirmation for `.mesh envoy brief auto|manual|off`: what the envoy answers peers from
 /// under the new mode, and the command that shows or reverses it.
 fn brief_mode_line(mode: MeshBrief) -> &'static str {
     match mode {
         MeshBrief::Auto => {
-            "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections."
+            "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections."
         }
         MeshBrief::Manual => {
-            "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections."
+            "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections."
         }
         MeshBrief::Off => {
-            "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on."
+            "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on."
         }
     }
 }
 
 /// One label per section the brief is assembled from, present or not, so the user sees
-/// what the envoy answers from and what `.mesh brief note` would add. `mode` is the
+/// what the envoy answers from and what `.mesh envoy brief note` would add. `mode` is the
 /// session's brief mode; `sources` describe the brief actually assembled.
 fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
     let has = |source| brief.sources.contains(&source);
@@ -1033,7 +1033,7 @@ fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
     let note = if has(BriefSource::UserBrief) {
         "your note"
     } else {
-        "your note (none; .mesh brief note \"text\" sets it)"
+        "your note (none; .mesh envoy brief note \"text\" sets it)"
     };
     let todo = if has(BriefSource::Todo) {
         "todo"
@@ -1348,7 +1348,7 @@ fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
     Ok(())
 }
 
-/// What `.mesh answer <id>` sends to: the destination of the peer whose escalated
+/// What `.mesh envoy answer <id>` sends to: the destination of the peer whose escalated
 /// question `id` names, or the question this node asked under `id`.
 enum Answering {
     Peer(String),
@@ -1362,10 +1362,7 @@ enum Answering {
 /// answering before the prompt asks for the text (a refused `--attach` therefore never
 /// lands after the answer was typed); the send comes last.
 async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -> Result<()> {
-    let (group, verb) = match wanted {
-        AnswerRoute::Outbound => ("messaging", "follow-up"),
-        _ => ("envoy", "answer"),
-    };
+    let (group, verb) = wanted.command();
     let Some(rest) = rest.map(str::trim).filter(|rest| !rest.is_empty()) else {
         out_text(&render_verb_help(group, verb));
         return Ok(());
@@ -1428,10 +1425,10 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
     );
     let text = match given {
         Some(text) => text.to_string(),
-        None => match prompt_answer_text(id)? {
+        None => match prompt_answer_text(wanted, id)? {
             Some(text) => text,
             None => {
-                out_path_text(&nothing_sent(id).render(live_prefix()));
+                out_path_text(&nothing_sent(wanted, id).render(live_prefix()));
                 return Ok(());
             }
         },
@@ -1504,7 +1501,7 @@ fn answered_line(id: &str) -> NoticeText {
 }
 
 /// The line a reply into one of this node's own questions ends with, the question's id
-/// quoted as `.mesh pending` lists it.
+/// quoted as `.mesh messaging sent` lists it.
 fn reply_sent_line(sent: &str, destination: &str, id: &str, via: &str) -> NoticeText {
     NoticeText::from_template(
         "Sent {sent} to {destination} as a reply to {id} (via {via}).",
@@ -1539,9 +1536,9 @@ fn outbound_answer(
     .with_disposition(Disposition::Answered, None))
 }
 
-/// `.mesh dismiss`: closes an escalated question without answering it. The asker hears
+/// `.mesh envoy dismiss`: closes an escalated question without answering it. The asker hears
 /// a `refused` reply saying the human declined, or nothing with `--silent`; `--all`
-/// closes every open question at once and leaves access requests to `grant`/`refuse`.
+/// closes every open question at once and leaves access requests to `files grant`/`files refuse`.
 async fn dismiss(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest.map(str::trim).filter(|rest| !rest.is_empty()) else {
         out_text(&render_verb_help("envoy", "dismiss"));
@@ -1570,7 +1567,7 @@ async fn dismiss(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let Some(id) = args.positional.first() else {
         bail!(
-            "`.mesh dismiss` takes an id or `--all`. {}",
+            "`.mesh envoy dismiss` takes an id or `--all`. {}",
             render_verb_help("envoy", "dismiss")
         );
     };
@@ -1580,7 +1577,7 @@ async fn dismiss(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// Expired escalations are swept first, so an expired id reads as no question once its
 /// expiry line has been pushed. The refusals come before the block, so a wrong id never
 /// prints a question it then does nothing with; the block is printed before the send,
-/// as `.mesh answer` does. A question another process closes under the verb, in either
+/// as `.mesh envoy answer` does. A question another process closes under the verb, in either
 /// window (before the node's own lookup or between that and its take), is reported by
 /// the one race sentence the node words it with.
 async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()> {
@@ -1623,9 +1620,9 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
 /// they stand, since a peer chose them.
 fn dismissed_line(id: &str, name: &str, silent: bool) -> NoticeText {
     let template = if silent {
-        "Dismissed {id} without telling {name}. .mesh pending shows what is still open."
+        "Dismissed {id} without telling {name}. .mesh envoy questions shows what is still open."
     } else {
-        "Dismissed {id}; {name} hears that {declined}. .mesh pending shows what is still open."
+        "Dismissed {id}; {name} hears that {declined}. .mesh envoy questions shows what is still open."
     };
     NoticeText::from_template(
         template,
@@ -1641,7 +1638,7 @@ fn dismissed_line(id: &str, name: &str, silent: bool) -> NoticeText {
 /// reported by the race sentence but did not stay; any other failure, a put-back that
 /// failed included, counts as stayed. Expired escalations are swept first, so none is
 /// listed. The rows carry full ids: a question id resolves by exact key, so the id a
-/// row shows is the one `.mesh dismiss <id>` then takes.
+/// row shows is the one `.mesh envoy dismiss <id>` then takes.
 async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: bool) -> Result<()> {
     live(ctx)?;
     let now = SystemTime::now();
@@ -1656,7 +1653,7 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     if questions.is_empty() {
         out_path_text(
             &NoticeText::from(
-                "No open questions to dismiss; `.mesh pending` lists what this node knows about.",
+                "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about.",
             )
             .render(live_prefix()),
         );
@@ -1727,7 +1724,7 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     Ok(())
 }
 
-/// One question `--all` lists before it asks, carrying the full id `.mesh dismiss <id>`
+/// One question `--all` lists before it asks, carrying the full id `.mesh envoy dismiss <id>`
 /// takes. The id and the asker's name are quoted as they stand, since a peer chose them.
 fn dismiss_all_row(id: &str, name: &str, destination: &str, asked: &str) -> NoticeText {
     NoticeText::from_template(
@@ -1761,7 +1758,7 @@ fn dismiss_all_summary(
         )
     };
     let mut summary = NoticeText::from(format!(
-        "Dismissed {dismissed}; .mesh pending shows what is still open"
+        "Dismissed {dismissed}; .mesh envoy questions shows what is still open"
     ));
     if !held.is_empty() {
         summary = summary
@@ -1770,15 +1767,18 @@ fn dismiss_all_summary(
                 held.len()
             ))
             .then(ids(held))
-            .frame(". Dismiss each with .mesh dismiss <id> once its hold lapses");
+            .frame(". Dismiss each with .mesh envoy dismiss <id> once its hold lapses");
     }
     if !stayed.is_empty() {
         let (head, tail) = if silent {
-            ("stay pending", "Retry with .mesh dismiss --all --silent")
+            (
+                "stay pending",
+                "Retry with .mesh envoy dismiss --all --silent",
+            )
         } else {
             (
                 "could not be told and stay pending",
-                "Retry, or .mesh dismiss --all --silent",
+                "Retry, or .mesh envoy dismiss --all --silent",
             )
         };
         summary = summary
@@ -1802,13 +1802,13 @@ mod dismiss_and_answer_line_tests {
         vec![
             (
                 dismissed_line(".vault", ".session", true),
-                "Dismissed .vault without telling .session. .mesh pending shows what is still open.",
-                "Dismissed .vault without telling .session. /mesh pending shows what is still open.",
+                "Dismissed .vault without telling .session. .mesh envoy questions shows what is still open.",
+                "Dismissed .vault without telling .session. /mesh envoy questions shows what is still open.",
             ),
             (
                 dismissed_line(".vault", ".session", false),
-                "Dismissed .vault; .session hears that the human declined to answer. .mesh pending shows what is still open.",
-                "Dismissed .vault; .session hears that the human declined to answer. /mesh pending shows what is still open.",
+                "Dismissed .vault; .session hears that the human declined to answer. .mesh envoy questions shows what is still open.",
+                "Dismissed .vault; .session hears that the human declined to answer. /mesh envoy questions shows what is still open.",
             ),
             (
                 dismiss_all_row(".vault", ".session", DESTINATION, "5m ago"),
@@ -1817,13 +1817,13 @@ mod dismiss_and_answer_line_tests {
             ),
             (
                 dismiss_all_summary(1, &held, &stayed, false),
-                "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: .vault. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: .session. Retry, or .mesh dismiss --all --silent.",
-                "Dismissed 1; /mesh pending shows what is still open; 1 still being answered by the envoy: .vault. Dismiss each with /mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: .session. Retry, or /mesh dismiss --all --silent.",
+                "Dismissed 1; .mesh envoy questions shows what is still open; 1 still being answered by the envoy: .vault. Dismiss each with .mesh envoy dismiss <id> once its hold lapses; 1 could not be told and stay pending: .session. Retry, or .mesh envoy dismiss --all --silent.",
+                "Dismissed 1; /mesh envoy questions shows what is still open; 1 still being answered by the envoy: .vault. Dismiss each with /mesh envoy dismiss <id> once its hold lapses; 1 could not be told and stay pending: .session. Retry, or /mesh envoy dismiss --all --silent.",
             ),
             (
                 dismiss_all_summary(0, &[], &stayed, true),
-                "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: .session. Retry with .mesh dismiss --all --silent.",
-                "Dismissed 0; /mesh pending shows what is still open; 1 stay pending: .session. Retry with /mesh dismiss --all --silent.",
+                "Dismissed 0; .mesh envoy questions shows what is still open; 1 stay pending: .session. Retry with .mesh envoy dismiss --all --silent.",
+                "Dismissed 0; /mesh envoy questions shows what is still open; 1 stay pending: .session. Retry with /mesh envoy dismiss --all --silent.",
             ),
             (
                 answered_line(".vault"),
@@ -1846,8 +1846,8 @@ mod dismiss_and_answer_line_tests {
                 };
                 (
                     own_reply_sent_line(&held, DESTINATION, ".vault", now),
-                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. .mesh peers shows when it announces again.",
-                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. /mesh peers shows when it announces again.",
+                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. .mesh people list shows when it announces again.",
+                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. /mesh people list shows when it announces again.",
                 )
             },
         ]
@@ -1870,7 +1870,7 @@ mod dismiss_and_answer_line_tests {
 }
 
 /// The escalated question `id` names, whole or by prefix, or the sentence for a missing
-/// one, for an access request (which `grant` and `refuse` decide) or for a question this
+/// one, for an access request (which `files grant` and `files refuse` decide) or for a question this
 /// node asked, which only the peer's reply or its timeout closes. A row past its expiry
 /// that the sweep has not yet taken out is no question, as the node reads it.
 fn open_escalated_question(
@@ -1897,7 +1897,7 @@ fn asked_by_this_node(id: &str) -> anyhow::Error {
     QuotingError::wrap(
         NoticeText::default()
             .peer(id)
-            .frame(" is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."),
+            .frame(" is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."),
     )
 }
 
@@ -1907,7 +1907,7 @@ fn no_open_question(id: &str) -> anyhow::Error {
         NoticeText::default()
             .frame("No open question has id ")
             .peer(id)
-            .frame(". `.mesh pending` lists the ones this node knows about."),
+            .frame(". `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."),
     )
 }
 
@@ -2012,7 +2012,7 @@ async fn message(
     Ok(())
 }
 
-/// The line `.mesh message` ends with: where the message went, or, for a peer that had
+/// The line `.mesh messaging send` ends with: where the message went, or, for a peer that had
 /// gone, that the propagation node holds it and for whom. `name` is how the peer goes by
 /// here, quoted as it stands.
 fn sent_line(outcome: &SendOutcome, destination: &str, name: &str, now: SystemTime) -> NoticeText {
@@ -2028,9 +2028,9 @@ fn sent_line(outcome: &SendOutcome, destination: &str, name: &str, now: SystemTi
 }
 
 /// The next step after a message held for a peer that had gone.
-const SEE_WHEN_IT_IS_BACK: &str = ".mesh peers shows when it announces again.";
+const SEE_WHEN_IT_IS_BACK: &str = ".mesh people list shows when it announces again.";
 
-/// The line `.mesh message` shows before it asks to send, with the name the peer goes
+/// The line `.mesh messaging send` shows before it asks to send, with the name the peer goes
 /// by here quoted as it stands.
 fn send_confirmation(name: &str, destination: &str, trust: &str) -> NoticeText {
     NoticeText::from_template(
@@ -2093,7 +2093,7 @@ mod peer_side_refusal_tests {
 
     fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
         command_error_text(
-            &MeshVerbError::wrap(err.context("`.mesh fetch` failed")),
+            &MeshVerbError::wrap(err.context("`.mesh files fetch` failed")),
             prefix,
         )
     }
@@ -2129,11 +2129,14 @@ mod peer_side_refusal_tests {
                 shown_as(anyhow!(today.clone()), CommandPrefix::Dot)
             );
             let slash = shown_as(quoted(), CommandPrefix::Slash);
-            assert!(slash.starts_with("Error: `/mesh fetch` failed"), "{slash}");
+            assert!(
+                slash.starts_with("Error: `/mesh files fetch` failed"),
+                "{slash}"
+            );
             assert!(slash.ends_with(&format!("    {today}")), "{slash}");
             assert!(slash.contains(&format!("\"{}\"", ".session")), "{slash}");
             assert!(
-                slash.contains(&format!("can run .mesh trust {}", "cd".repeat(16))),
+                slash.contains(&format!("can run .mesh access trust {}", "cd".repeat(16))),
                 "{slash}"
             );
         }
@@ -2156,11 +2159,11 @@ mod peer_side_refusal_tests {
         assert!(
             slash.ends_with(&format!(
                 "    {no_answer}{}",
-                tail.replace("`.mesh peers`", "`/mesh peers`")
+                tail.replace("`.mesh people list`", "`/mesh people list`")
             )),
             "{slash}"
         );
-        assert!(tail.contains("`.mesh peers`"), "{tail}");
+        assert!(tail.contains("`.mesh people list`"), "{tail}");
     }
 }
 
@@ -2385,7 +2388,7 @@ fn parts_of(attachment: Option<Attachment>) -> Vec<RawPart> {
 /// node's inline limit, by reference above it. Inline, the share rules are not consulted
 /// since the human named the file, but the directories nothing serves out of still
 /// refuse, and the built-in deny refuses until `--force` says the name was meant; the
-/// checks run in the order `.mesh allow` judges a pattern: the text alone, the protected
+/// checks run in the order `.mesh files allow` judges a pattern: the text alone, the protected
 /// directories, the disk, then the built-in deny. By reference the peer's fetch delivers
 /// the file, so one the serving side would refuse (by size, by a rule the one-off grant
 /// never lifts, or because the share list was refused at load) is refused here rather
@@ -2407,7 +2410,7 @@ pub(crate) fn attachment(
             NoticeText::default()
                 .frame("`--attach` takes a path relative to ")
                 .peer(root.display().to_string())
-                .frame(", as `.mesh allow` does; '")
+                .frame(", as `.mesh files allow` does; '")
                 .peer(shown)
                 .frame("' is not one."),
         ));
@@ -2709,7 +2712,7 @@ async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     Ok(())
 }
 
-/// What `.mesh sync` prints for a fetch that ended: the report, or a notice for a fetch
+/// What `.mesh messaging sync` prints for a fetch that ended: the report, or a notice for a fetch
 /// already running here or in another process. Every other failure, a propagation node
 /// that refused or did not answer included, is the command's error in the fetch's words.
 fn sync_outcome_text(outcome: Result<FetchReport, FetchError>) -> Result<String> {
@@ -2783,7 +2786,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let route = match route_to(&runtime, &destination, abort_signal).await {
         Ok(route) => route,
         Err(Unrouted::NoAnswer) => bail!(
-            "{}{} Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+            "{}{} Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh people list` shows when it was last heard.",
             unreachable_head(&destination),
             left_mesh_hint(Some(&peer), SystemTime::now())
         ),
@@ -2816,7 +2819,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     Ok(())
 }
 
-/// The line `.mesh knock` shows before it asks to knock, naming the peer as `.mesh
+/// The line `.mesh access ask` shows before it asks to knock, naming the peer as `.mesh
 /// message` does. The name and the intro the human typed are quoted as they stand.
 fn knock_confirmation(name: &str, destination: &str, trust: &str, intro: &str) -> NoticeText {
     let intro_label = if intro.is_empty() {
@@ -2832,10 +2835,10 @@ fn knock_confirmation(name: &str, destination: &str, trust: &str, intro: &str) -
             short(destination)
         ))
         .then(intro_label)
-        .frame("; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.")
+        .frame("; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh access trust` on both sides.")
 }
 
-/// The line `.mesh knock` ends with for a knock that was delivered somewhere. A link that
+/// The line `.mesh access ask` ends with for a knock that was delivered somewhere. A link that
 /// came up and drew no reply is the mark of a peer that does not trust this identity,
 /// so that report says what a knock is for instead of calling the peer unreachable.
 fn knock_report(dest8: &str, outcome: &KnockOutcome) -> String {
@@ -2867,15 +2870,15 @@ fn knock_report(dest8: &str, outcome: &KnockOutcome) -> String {
 fn request_refusal_tail(destination: &str, blocked_identity: Option<&str>) -> String {
     match blocked_identity {
         Some(identity) => format!(
-            "Nothing is asked of a destination this node does not trust; `.mesh unblock --identity {identity}` and then `.mesh trust {destination}` trust it."
+            "Nothing is asked of a destination this node does not trust; `.mesh access unblock --identity {identity}` and then `.mesh access trust {destination}` trust it."
         ),
         None => format!(
-            "Nothing is asked of a destination this node does not trust; `.mesh trust {destination}` trusts it."
+            "Nothing is asked of a destination this node does not trust; `.mesh access trust {destination}` trusts it."
         ),
     }
 }
 
-/// `.mesh request <destination> <path>... [--reason "text"] [--yes]`: asks a trusted
+/// `.mesh files request <destination> <path>... [--reason "text"] [--yes]`: asks a trusted
 /// peer's human for files it does not share yet. The request is held to the rules the
 /// peer would refuse it by before the prompt, so a refusal never follows a yes.
 async fn request(
@@ -2921,7 +2924,7 @@ async fn request(
     let valid = match validate_access(&id, args.paths, reason) {
         Ok(valid) => valid,
         Err("a path is not a wire path") => bail!(
-            "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it."
+            "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh files list --effective --all prints it."
         ),
         Err(rule) => bail!(AccessError::Invalid(rule).to_string()),
     };
@@ -2952,7 +2955,7 @@ async fn send_request(
     let route = match route_to(runtime, destination, abort_signal).await {
         Ok(route) => route,
         Err(Unrouted::NoAnswer) => bail!(
-            "{}{} Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard.",
+            "{}{} Try again in a minute; nothing was sent. `.mesh people list` shows when it was last heard.",
             unreachable_head(destination),
             left_mesh_hint(runtime.peers().get(destination).as_ref(), SystemTime::now())
         ),
@@ -2989,7 +2992,7 @@ async fn send_request(
         joined = &mut handle => joined,
         _ = wait_user_interrupt(Some(abort_signal)) => {
             out_path_text(&NoticeText::from(format!(
-                "Request interrupted; it may still reach {d8}. If it does, the decision arrives as an idle line; .mesh inbox lists it."
+                "Request interrupted; it may still reach {d8}. If it does, the decision arrives as an idle line; .mesh messaging inbox lists it."
             ))
             .render(live_prefix()));
             return Ok(());
@@ -2997,7 +3000,7 @@ async fn send_request(
     };
     let Ok(outcome) = joined else {
         bail!(
-            "The access request to {d8} stopped before it could finish; nothing more is known about it. `.mesh pending` and `.mesh inbox` show what reached this node; try `.mesh request` again."
+            "The access request to {d8} stopped before it could finish; nothing more is known about it. `.mesh files requests` and `.mesh messaging inbox` show what reached this node; try `.mesh files request` again."
         );
     };
     match outcome {
@@ -3012,7 +3015,7 @@ async fn send_request(
     Ok(())
 }
 
-/// The line `.mesh request` ends with. A grant names a path, so the line is printed
+/// The line `.mesh files request` ends with. A grant names a path, so the line is printed
 /// byte for byte and its hints are rendered in `prefix` here.
 fn request_outcome_line(
     outcome: &AccessRequestOutcome,
@@ -3022,8 +3025,8 @@ fn request_outcome_line(
 ) -> String {
     let id8 = short(&outcome.id);
     let d8 = short(destination);
-    let decision_arrives =
-        prefix.render_hints("(the decision arrives as an idle line; .mesh inbox lists it)");
+    let decision_arrives = prefix
+        .render_hints("(the decision arrives as an idle line; .mesh messaging inbox lists it)");
     match &outcome.status {
         AccessOutcome::Pending => match (outcome.via, outcome.departed) {
             (PeerVia::Direct, _) => format!("request {id8} to {d8}: pending {decision_arrives}"),
@@ -3040,7 +3043,7 @@ fn request_outcome_line(
                 Some(at) => format!("granted until {}", rfc3339_utc(at)),
                 None => "granted, until a time this node cannot read".to_string(),
             };
-            let fetch = prefix.render_hints(".mesh fetch");
+            let fetch = prefix.render_hints(".mesh files fetch");
             let first = paths.first().map_or("", String::as_str);
             let others = match paths.len() {
                 0 | 1 => String::new(),
@@ -3113,7 +3116,7 @@ fn parse_request_args(rest: &str) -> Result<Option<RequestArgs>> {
     }))
 }
 
-/// `.mesh fetch <destination> <path> [--if-sha256 <hex>]`: pulls one file a trusted peer
+/// `.mesh files fetch <destination> <path> [--if-sha256 <hex>]`: pulls one file a trusted peer
 /// shares into the staging inbox and says where it landed. The bytes are never printed.
 async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
@@ -3149,7 +3152,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let route = match route_to(&runtime, &destination, abort_signal).await {
         Ok(route) => route,
         Err(Unrouted::NoAnswer) => bail!(
-            "{}{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            "{}{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
             unreachable_head(&destination),
             left_mesh_hint(Some(&record), SystemTime::now())
         ),
@@ -3234,7 +3237,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
 /// file name there and not a command.
 fn invalid_path_refusal(peer: &str, shown: &str, rule: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it.",
+        "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh files list --peer {peer}` or mesh__list shows it.",
         &[("rule", rule), ("peer", peer)],
         &[("shown", shown)],
     ))
@@ -3250,7 +3253,7 @@ fn too_large_refusal(peer: &str, shown: &str, limit: u64) -> anyhow::Error {
 
 fn undelivered_refusal(peer: &str, shown: &str, path: &str, err: &FileFetchError) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {path}` again; if it repeats, the peer may run a different Coyote.",
+        "{peer} did not deliver `{shown}`: {err}. Try `.mesh files fetch {peer} {path}` again; if it repeats, the peer may run a different Coyote.",
         &[("peer", peer), ("err", &err.to_string())],
         &[("shown", shown), ("path", path)],
     ))
@@ -3271,7 +3274,7 @@ mod fetch_path_refusal_tests {
         let mut cases = vec![
             (
                 invalid_path_refusal(peer, path, "dot_segment"),
-                "`.vault/key` is not a path the mesh carries (rule `dot_segment`); pass the path exactly as `.mesh shares --peer 1a2b3c4d` or mesh__list shows it.".to_string(),
+                "`.vault/key` is not a path the mesh carries (rule `dot_segment`); pass the path exactly as `.mesh files list --peer 1a2b3c4d` or mesh__list shows it.".to_string(),
             ),
             (
                 too_large_refusal(peer, path, 1024),
@@ -3287,7 +3290,7 @@ mod fetch_path_refusal_tests {
             cases.push((
                 undelivered_refusal(peer, path, path, &err),
                 format!(
-                    "1a2b3c4d did not deliver `.vault/key`: {fault}. Try `.mesh fetch 1a2b3c4d .vault/key` again; if it repeats, the peer may run a different Coyote."
+                    "1a2b3c4d did not deliver `.vault/key`: {fault}. Try `.mesh files fetch 1a2b3c4d .vault/key` again; if it repeats, the peer may run a different Coyote."
                 ),
             ));
         }
@@ -3334,11 +3337,11 @@ mod not_shared_refusal_tests {
             staged: PathBuf::from("/nonexistent/.vault"),
         };
         let refusal = not_shared_refusal("abcd1234", ".session", ".session", &reason);
-        let today = "`.session` was a one-time attachment from abcd1234 and this node already fetched it (staged at /nonexistent/.vault). Ask for it again with .mesh message abcd1234 if you need a fresh copy. That copy is no longer at that path.";
+        let today = "`.session` was a one-time attachment from abcd1234 and this node already fetched it (staged at /nonexistent/.vault). Ask for it again with .mesh messaging send abcd1234 if you need a fresh copy. That copy is no longer at that path.";
         assert_eq!(refusal.render(CommandPrefix::Dot), today);
         assert_eq!(
             refusal.render(CommandPrefix::Slash),
-            today.replace(".mesh message", "/mesh message")
+            today.replace(".mesh messaging send", "/mesh messaging send")
         );
     }
 }
@@ -3367,7 +3370,7 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
             let hash = decode_hex(&value).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
             let Some(hash) = hash else {
                 bail!(
-                    "`--if-sha256` takes the 64-hex sha256 `.mesh fetch` printed last time; '{value}' is not one. {}",
+                    "`--if-sha256` takes the 64-hex sha256 `.mesh files fetch` printed last time; '{value}' is not one. {}",
                     render_verb_help("files", "fetch")
                 );
             };
@@ -3389,7 +3392,7 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
     }))
 }
 
-/// `.mesh memory forget <identity|all> [thread]`: forgets what the envoy remembers of a
+/// `.mesh envoy memory forget <identity|all> [thread]`: forgets what the envoy remembers of a
 /// peer's threads in every instance's store, the one this node serves and any fork's or
 /// re-keyed predecessor's alike. What would go is listed first; nothing is asked or
 /// written when the scope names nothing remembered. A conversation is counted once however
@@ -3400,7 +3403,7 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
 /// that forgets it once the store can be written. A store whose index cannot be read is
 /// counted as such in the listing and the result: `all` empties it unread, record files
 /// and index alike; an identity or thread scope leaves it as it is and names
-/// `.mesh memory forget all` as the way to empty it. `all` also removes record files no
+/// `.mesh envoy memory forget all` as the way to empty it. `all` also removes record files no
 /// index names, and counts them. Runs with the mesh off and with
 /// `mesh.envoy_memory.enabled` false, since the records may be on disk from when it was on.
 fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -3410,7 +3413,7 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     if sub_verb != "forget" {
         bail!(
-            "'{sub_verb}' is not a `.mesh memory` command; `forget` is the one it takes. {}",
+            "'{sub_verb}' is not a `.mesh envoy memory` command; `forget` is the one it takes. {}",
             render_verb_help("envoy", "memory")
         );
     }
@@ -3566,10 +3569,10 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     if !residue.is_empty() {
         let remedy = match &args.scope {
-            ForgetScope::All => ".mesh memory forget all".to_string(),
-            ForgetScope::Identity(identity) => format!(".mesh memory forget {identity}"),
+            ForgetScope::All => ".mesh envoy memory forget all".to_string(),
+            ForgetScope::Identity(identity) => format!(".mesh envoy memory forget {identity}"),
             ForgetScope::Thread { identity, thread } => {
-                format!(".mesh memory forget {identity} {thread}")
+                format!(".mesh envoy memory forget {identity} {thread}")
             }
         };
         let forgot = if forgotten.removed > 0 {
@@ -3657,7 +3660,7 @@ fn parse_memory_forget_args(
         let identity = resolve_known(ctx, &target, HashKind::Identity, remembered)?;
         match thread {
             Some(thread) if !is_wire_id(&thread) => bail!(
-                "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {}",
+                "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh envoy memory forget <identity> --dry-run` lists them. {}",
                 render_verb_help("envoy", "memory")
             ),
             Some(thread) => ForgetScope::Thread { identity, thread },
@@ -3673,7 +3676,7 @@ fn parse_memory_forget_args(
 
 /// What `scope` names of `remembered`: how many conversations go and the listing rows
 /// shown before anything is asked. Rows name every identity in full so one can be pasted
-/// back into `.mesh memory forget <identity>`; a single thread needs no rows.
+/// back into `.mesh envoy memory forget <identity>`; a single thread needs no rows.
 struct ForgetPreview {
     count: usize,
     rows: Vec<String>,
@@ -3732,11 +3735,11 @@ fn unreadable_note(stores: usize) -> Option<String> {
     match stores {
         0 => None,
         1 => Some(
-            "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it."
+            "1 store whose index cannot be read is left as it is and may hold more; run .mesh envoy memory forget all to empty it."
                 .to_string(),
         ),
         n => Some(format!(
-            "{n} stores whose index cannot be read are left as they are and may hold more; run .mesh memory forget all to empty them."
+            "{n} stores whose index cannot be read are left as they are and may hold more; run .mesh envoy memory forget all to empty them."
         )),
     }
 }
@@ -3764,7 +3767,7 @@ fn render_sync(report: &FetchReport) -> String {
     }
     if report.wanted > 0 && report.received == 0 {
         let mut line = format!(
-            "{node} lists {} for this node and {} were asked for, but none were served; run .mesh sync again or check the node's logs.",
+            "{node} lists {} for this node and {} were asked for, but none were served; run .mesh messaging sync again or check the node's logs.",
             plural(report.listed, "message", "messages"),
             report.wanted
         );
@@ -3797,7 +3800,7 @@ fn render_sync(report: &FetchReport) -> String {
         line.push_str(&format!(" {left} {LEFT_FOR_ANOTHER_SESSION}."));
     }
     if report.wanted == MAX_WANTS_PER_FETCH {
-        line.push_str(" More may be held; run .mesh sync again.");
+        line.push_str(" More may be held; run .mesh messaging sync again.");
     }
     line
 }
@@ -3823,7 +3826,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&report),
-            "Fetched from deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 0 duplicates, 0 discarded, 1 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute."
+            "Fetched from deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 0 duplicates, 0 discarded, 1 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute."
         );
     }
 
@@ -3844,12 +3847,12 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&report),
-            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: for 1 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute."
+            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: for 1 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute."
         );
         report.deferred_after_ask = 3;
         assert_eq!(
             render_sync(&report),
-            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh sync in a minute."
+            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh messaging sync in a minute."
         );
     }
 
@@ -3900,7 +3903,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&none_served),
-            "deadbeef lists 3 messages for this node and 2 were asked for, but none were served; run .mesh sync again or check the node's logs. 1 left on the node for another session."
+            "deadbeef lists 3 messages for this node and 2 were asked for, but none were served; run .mesh messaging sync again or check the node's logs. 1 left on the node for another session."
         );
     }
 }
@@ -3989,18 +3992,18 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                     }))
             {
                 out_text(&format!(
-                    "{OWN_IDENTITY_TRUSTED} It is already trusted for every instance, so nothing was changed; .mesh untrust --identity {identity} takes the grant back."
+                    "{OWN_IDENTITY_TRUSTED} It is already trusted for every instance, so nothing was changed; .mesh access revoke --identity {identity} takes the grant back."
                 ));
                 return Ok(());
             }
             let mut preview = format!(
-                "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is surfaced from the peer table when heard, never marked; .mesh trust <destination> is the grant that carries a mark.",
+                "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is surfaced from the peer table when heard, never marked; .mesh access trust <destination> is the grant that carries a mark.",
                 short(&identity)
             );
             let refused = store.denied_destinations_of(mesh, &identity)?.len();
             if refused > 0 {
                 preview.push_str(&format!(
-                    " {refused} instance(s) of this identity stay blocked; .mesh unblock <destination> lifts each."
+                    " {refused} instance(s) of this identity stay blocked; .mesh access unblock <destination> lifts each."
                 ));
             }
             out_text(&preview);
@@ -4053,7 +4056,7 @@ fn prune(
         && expected != stale.len()
     {
         bail!(
-            "The stale list has changed since the dry run (now {}, token names {expected}); run .mesh trust --prune again for a fresh token.",
+            "The stale list has changed since the dry run (now {}, token names {expected}); run .mesh access revoke --stale again for a fresh token.",
             stale.len()
         );
     }
@@ -4100,7 +4103,7 @@ fn prune(
             n => format!(", {n} of them marked key-changed"),
         };
         lines.push(format!(
-            "{DRY_RUN_NOTHING_CHANGED} To remove these {} instance(s){marked}, run: .mesh trust --prune{older_than_flag} --confirm prune-{}",
+            "{DRY_RUN_NOTHING_CHANGED} To remove these {} instance(s){marked}, run: .mesh access revoke --stale{older_than_flag} --confirm prune-{}",
             stale.len(),
             stale.len()
         ));
@@ -4204,7 +4207,7 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 fn untrusted_tail(destination: &str, deny_stays: bool) -> String {
     if deny_stays {
         format!(
-            "It stays blocked, so it is refused without a knock; .mesh unblock {destination} lifts that."
+            "It stays blocked, so it is refused without a knock; .mesh access unblock {destination} lifts that."
         )
     } else {
         "It is served no longer; a knock from it will be filed again.".to_string()
@@ -4249,9 +4252,9 @@ fn title_case(word: &str) -> String {
 
 /// Like `prune`, a dry run until the printed token comes back; the store's dry run is the
 /// refusal check, the listing is its records. Only the grant goes: the instances bound to
-/// the identity are listed as staying, and `forget` is named as the verb that erases them.
+/// the identity are listed as staying, and `access forget` is named as the verb that erases them.
 /// With none bound the identity is a stranger and the store sweeps its envoy memory, so
-/// the confirmed output appends the sweep line `forget` and `block --identity` print.
+/// the confirmed output appends the sweep line `access forget` and `access block --identity` print.
 fn untrust_identity(
     store: &TrustStore,
     mesh: &dyn LiveMesh,
@@ -4281,7 +4284,7 @@ fn untrust_identity(
         && *token != expected
     {
         bail!(
-            "'{token}' is not the token for identity {}; run .mesh untrust --identity {identity} --confirm {expected}",
+            "'{token}' is not the token for identity {}; run .mesh access revoke --identity {identity} --confirm {expected}",
             short(identity)
         );
     }
@@ -4325,7 +4328,7 @@ fn untrust_identity(
                 ));
             }
             lines.push(format!(
-                "{DRY_RUN_NOTHING_CHANGED} To {next}, run: .mesh untrust --identity {identity} --confirm {expected}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {identity}."
+                "{DRY_RUN_NOTHING_CHANGED} To {next}, run: .mesh access revoke --identity {identity} --confirm {expected}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {identity}."
             ));
             out_text(&lines.join("\n"));
         }
@@ -4342,11 +4345,11 @@ fn untrust_identity(
             };
             let instances = if standing == 0 {
                 format!(
-                    "no instance of it is trusted. .mesh trust --identity {identity} grants it again."
+                    "no instance of it is trusted. .mesh access trust --identity {identity} grants it again."
                 )
             } else {
                 format!(
-                    "{standing} instance(s) stay trusted on their own. .mesh forget --identity {identity} erases them too."
+                    "{standing} instance(s) stay trusted on their own. .mesh access forget --identity {identity} erases them too."
                 )
             };
             let mut lines = vec![format!(
@@ -4391,7 +4394,7 @@ fn envoy_memory_sweep_line(
             _ => None,
         },
         Some(Ok(remaining)) => Some(format!(
-            "{} remembered of it could not be forgotten; run .mesh memory forget {identity}.",
+            "{} remembered of it could not be forgotten; run .mesh envoy memory forget {identity}.",
             plural(
                 remaining.threads,
                 "envoy conversation",
@@ -4399,7 +4402,7 @@ fn envoy_memory_sweep_line(
             )
         )),
         Some(Err(err)) => Some(format!(
-            "Its remembered envoy conversations could not be counted: {}; run .mesh memory forget {identity} to be sure.",
+            "Its remembered envoy conversations could not be counted: {}; run .mesh envoy memory forget {identity} to be sure.",
             redact_hashes(&err.to_string())
         )),
     };
@@ -4411,22 +4414,22 @@ fn envoy_memory_sweep_line(
 }
 
 /// What a revocation's disclosure says of the envoy memory stores whose index cannot be
-/// read: they may hold more of the identity, and only `.mesh memory forget all` reaches
+/// read: they may hold more of the identity, and only `.mesh envoy memory forget all` reaches
 /// them. Nothing when every store could be read.
 fn unreadable_memory_stores(stores: usize) -> Option<String> {
     match stores {
         0 => None,
         1 => Some(
-            "1 envoy memory store whose index cannot be read may hold more of it; run .mesh memory forget all to empty it"
+            "1 envoy memory store whose index cannot be read may hold more of it; run .mesh envoy memory forget all to empty it"
                 .to_string(),
         ),
         n => Some(format!(
-            "{n} envoy memory stores whose index cannot be read may hold more of it; run .mesh memory forget all to empty them"
+            "{n} envoy memory stores whose index cannot be read may hold more of it; run .mesh envoy memory forget all to empty them"
         )),
     }
 }
 
-/// Like `untrust --identity`, a dry run until the printed token comes back, with the
+/// Like `access revoke --identity`, a dry run until the printed token comes back, with the
 /// `forget-<short>` token. The trust store is swept first and the knock gate after it, so
 /// a knock that lands between the two is filed against a stranger and kept. The
 /// remembered attachments, grants and access requests are swept third.
@@ -4470,7 +4473,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     if preview.is_empty() && knocks == 0 && claims == 0 && !remembered {
         bail!(
-            "Identity {identity} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {identity} --dry-run lists what the envoy memory on disk holds of it."
+            "Identity {identity} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh envoy memory forget {identity} --dry-run lists what the envoy memory on disk holds of it."
         );
     }
     let expected = format!("forget-{}", short(&identity));
@@ -4478,7 +4481,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         && *token != expected
     {
         bail!(
-            "'{token}' is not the token for identity {}; run .mesh forget --identity {identity} --confirm {expected}",
+            "'{token}' is not the token for identity {}; run .mesh access forget --identity {identity} --confirm {expected}",
             short(&identity)
         );
     }
@@ -4552,7 +4555,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 lines.push(format!("  {stores}"));
             }
             lines.push(format!(
-                "{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {identity} --confirm {expected}"
+                "{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {identity} --confirm {expected}"
             ));
             out_text(&lines.join("\n"));
         }
@@ -4573,7 +4576,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             out_text(&lines.join("\n"));
             if let Err(err) = knocks {
                 err_text(&format!(
-                    "The knock cache could not be rewritten, so its knocks may still be listed: {err:#}; .mesh forget --identity {identity} again rewrites it."
+                    "The knock cache could not be rewritten, so its knocks may still be listed: {err:#}; .mesh access forget --identity {identity} again rewrites it."
                 ));
             }
         }
@@ -4629,7 +4632,7 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     format!(" (identity {} otherwise unchanged)", short(identity))
                 });
             let mut lines = vec![format!(
-                "Blocked {}: it is refused without a knock{identity_clause}. .mesh unblock {destination} lifts it.",
+                "Blocked {}: it is refused without a knock{identity_clause}. .mesh access unblock {destination} lifts it.",
                 short(&destination)
             )];
             if outcome.record_removed {
@@ -4756,7 +4759,7 @@ fn unblock(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
             store.unblock_identity(mesh, &identity, false)?;
             out_text(&format!(
-                "Unblocked identity {}; nothing is trusted: .mesh trust --identity {identity} serves every instance again, .mesh trust <destination> one of them.",
+                "Unblocked identity {}; nothing is trusted: .mesh access trust --identity {identity} serves every instance again, .mesh access trust <destination> one of them.",
                 short(&identity)
             ));
         }
@@ -4774,20 +4777,20 @@ fn unblocked_standing(destination: &str, served_by: &ServedBy) -> String {
         ),
         ServedBy::OwnRecord => "it is served again on its own trust record.".to_string(),
         ServedBy::IdentityBlocked(identity) => format!(
-            "nothing is trusted and its identity {} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it.",
+            "nothing is trusted and its identity {} is blocked: .mesh access unblock --identity {identity} first, then .mesh access trust {destination} serves it.",
             short(identity)
         ),
         ServedBy::Nothing => {
-            format!("nothing is trusted: .mesh trust {destination} serves it again.")
+            format!("nothing is trusted: .mesh access trust {destination} serves it again.")
         }
         ServedBy::Unresolved => format!(
-            "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {destination} does."
+            "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh access trust {destination} does."
         ),
     }
 }
 
-/// Like `untrust --identity`, a dry run until the printed token comes back. Bare
-/// `.mesh rotate` is the dry run itself: there is no target to prompt help for. The
+/// Like `access revoke --identity`, a dry run until the printed token comes back. Bare
+/// `.mesh config rotate-identity` is the dry run itself: there is no target to prompt help for. The
 /// identity lock is taken here so a node in another process refuses the dry run as well,
 /// after the key is named so a config dir without one is left untouched; `rotate_identity`
 /// re-reads the key under its own lock, so the guard is released before the confirm.
@@ -4800,7 +4803,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     )?;
     if args.yes {
         bail!(
-            "`.mesh rotate` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+            "`.mesh config rotate-identity` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
         );
     }
     if let Some(token) = args.positional.first() {
@@ -4834,18 +4837,18 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 ),
                 "  the instance id is unchanged, so the node announces a new destination hash under the new identity".to_string(),
                 "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
-                "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band".to_string(),
+                "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh access trust again after verifying the new hash out of band".to_string(),
             ];
             let text = NoticeText::default()
                 .frame(format!("{}\n  ", lines.join("\n")))
                 .then(own_trust)
                 .frame(format!(
-                    "\n{DRY_RUN_NOTHING_CHANGED} To rotate, run: .mesh rotate --confirm {expected}"
+                    "\n{DRY_RUN_NOTHING_CHANGED} To rotate, run: .mesh config rotate-identity --confirm {expected}"
                 ));
             out_path_text(&text.render(live_prefix()));
         }
         Some(token) if token != expected => bail!(
-            "'{token}' is not the token for identity {}; run .mesh rotate --confirm {expected}",
+            "'{token}' is not the token for identity {}; run .mesh config rotate-identity --confirm {expected}",
             short(&old)
         ),
         Some(_) => {
@@ -4876,7 +4879,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                         .frame("), so it is not trusted and your sessions on this config dir cannot message each other yet. Make the file readable and writable again (fix or move ")
                         .peer(trust_path)
                         .frame(format!(
-                            "), then run .mesh on, then .mesh trust --identity {new}; .mesh untrust --identity {old} withdraws the old identity's \"{SELF_TRUST_LABEL}\" grant if the list still holds it."
+                            "), then run .mesh on, then .mesh access trust --identity {new}; .mesh access revoke --identity {old} withdraws the old identity's \"{SELF_TRUST_LABEL}\" grant if the list still holds it."
                         )),
                 ));
             }
@@ -4894,7 +4897,7 @@ fn trust_file_path(config_dir: &Path) -> String {
 
 /// The dry run's line on the own grant; see `planned_self_trust_rotation`.
 fn rotation_self_trust_preview(own_trust: SelfTrustRotation) -> String {
-    let next = "to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh trust --identity <the new hash the rotation prints>";
+    let next = "to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh access trust --identity <the new hash the rotation prints>";
     match own_trust {
         SelfTrustRotation {
             granted: true,
@@ -4932,7 +4935,7 @@ fn unread_trust_preview(config_dir: &Path, err: &anyhow::Error) -> NoticeText {
             "), so rotating will not move the \"{SELF_TRUST_LABEL}\" grant; fix or move "
         ))
         .peer(trust_file_path(config_dir))
-        .frame(", and after rotating run .mesh on, then .mesh trust --identity <the new hash the rotation prints>")
+        .frame(", and after rotating run .mesh on, then .mesh access trust --identity <the new hash the rotation prints>")
 }
 
 /// What `rotate_self_trust` did, for the rotation's result.
@@ -4965,7 +4968,7 @@ fn rotated_self_trust_text(new: &str, own_trust: SelfTrustRotation) -> String {
                 "The".to_string()
             };
             format!(
-                "{what} new identity {new_short} is blocked on your trust list, so it was not trusted. {next} .mesh unblock --identity {new} --yes and .mesh trust --identity {new}."
+                "{what} new identity {new_short} is blocked on your trust list, so it was not trusted. {next} .mesh access unblock --identity {new} --yes and .mesh access trust --identity {new}."
             )
         }
         SelfTrustRotation { retired: true, .. } => format!(
@@ -4974,15 +4977,15 @@ fn rotated_self_trust_text(new: &str, own_trust: SelfTrustRotation) -> String {
         SelfTrustRotation {
             blocked_old: true, ..
         } => format!(
-            "The new identity {new_short} is not trusted, because the old identity was blocked on your trust list and so held no \"{SELF_TRUST_LABEL}\" grant to move. {next} .mesh trust --identity {new}."
+            "The new identity {new_short} is not trusted, because the old identity was blocked on your trust list and so held no \"{SELF_TRUST_LABEL}\" grant to move. {next} .mesh access trust --identity {new}."
         ),
         SelfTrustRotation { .. } => format!(
-            "The new identity {new_short} is not trusted, because the old identity held no \"{SELF_TRUST_LABEL}\" grant. {next} .mesh trust --identity {new}."
+            "The new identity {new_short} is not trusted, because the old identity held no \"{SELF_TRUST_LABEL}\" grant. {next} .mesh access trust --identity {new}."
         ),
     }
 }
 
-/// `.mesh allow <pattern>`: an allow rule for every trusted peer or for one. `--force`
+/// `.mesh files allow <pattern>`: an allow rule for every trusted peer or for one. `--force`
 /// adds the override that lifts the built-in deny for one exact file, which only the
 /// global file may carry.
 fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -5022,7 +5025,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     if let Some(destination) = canonical_hash(&pattern) {
         bail!(
-            "`.mesh allow` takes a file pattern, not a peer; to trust the instance {} run `.mesh trust {destination}`, or scope a share to it with `--peer {destination}`.",
+            "`.mesh files allow` takes a file pattern, not a peer; to trust the instance {} run `.mesh access trust {destination}`, or scope a share to it with `--peer {destination}`.",
             short(&destination)
         );
     }
@@ -5189,8 +5192,8 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `.mesh deny <pattern>`: a deny rule, which no allow in either file gets past. A hash
-/// in the pattern's place is the withdrawn peer verb's spelling and is sent to `untrust`.
+/// `.mesh files deny <pattern>`: a deny rule, which no allow in either file gets past. A hash
+/// in the pattern's place is the withdrawn peer verb's spelling and is sent to `access revoke`.
 fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("files", "deny"));
@@ -5215,7 +5218,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     } = args;
     if let Some(destination) = canonical_hash(&pattern) {
         bail!(
-            "`.mesh deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh block {destination}`.",
+            "`.mesh files deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh access block {destination}`.",
             short(&destination)
         );
     }
@@ -5291,7 +5294,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `.mesh unshare <pattern>`: removes every rule whose text is `pattern`, allow, deny or
+/// `.mesh files unshare <pattern>`: removes every rule whose text is `pattern`, allow, deny or
 /// override alike, from the file that holds it. Under the write rule a pattern held
 /// only by the other file is refused with the flag that reaches it; when both files hold
 /// it, both are named and the removal confirmed before either is edited.
@@ -5374,7 +5377,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     &path_of(first_layer).to_string(),
                     &kind_list(&first_held),
                     NoticeText::default()
-                        .frame("; without a flag `.mesh unshare` edits ")
+                        .frame("; without a flag `.mesh files unshare` edits ")
                         .peer(path_of(reach).to_string())
                         .frame(", which does not hold it"),
                     flag_of(first_layer),
@@ -5438,7 +5441,9 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         set = loaded_for_writing(ctx)?.1;
         if share_holders(&set, &pattern) != holders {
-            bail!("The share list changed while the prompt was open; run `.mesh unshare` again.");
+            bail!(
+                "The share list changed while the prompt was open; run `.mesh files unshare` again."
+            );
         }
     }
     for (layer, held) in &targets {
@@ -5462,7 +5467,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `.mesh shares`: the rules as the two files hold them, or with `--effective` the files
+/// `.mesh files list`: the rules as the two files hold them, or with `--effective` the files
 /// they resolve to under the root with the verdict a fetch of each would get. Inspection
 /// only, so it works while the mesh is off and never prints a file's contents. `--all`
 /// widens `--effective` to every file under the root, whether an allow names it or not.
@@ -5477,7 +5482,7 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Err(unexpected(token, "files", "list"));
     }
     if args.all && !args.effective {
-        bail!("`--all` works with `--effective`: run `.mesh shares --effective --all`.");
+        bail!("`--all` works with `--effective`: run `.mesh files list --effective --all`.");
     }
     let peer = args
         .peer
@@ -5519,7 +5524,7 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `.mesh grant <id>`: lets the peer behind an access request read what it asked for,
+/// `.mesh files grant <id>`: lets the peer behind an access request read what it asked for,
 /// once through a short grant or with `--standing` through an allow rule per path in the
 /// share list. The id is the first token whatever it starts with, since a wire id may
 /// begin with `-`.
@@ -5608,7 +5613,7 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `.mesh refuse <id>`: tells the peer no; nothing is written.
+/// `.mesh files refuse <id>`: tells the peer no; nothing is written.
 async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("files", "refuse"));
@@ -5637,7 +5642,7 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 }
 
 /// The access request `id` names, whole or by prefix, or the sentence for a missing one
-/// or for a question, which `.mesh answer` takes, or for a question this node asked. A
+/// or for a question, which `.mesh envoy answer` takes, or for a question this node asked. A
 /// row past its expiry that the sweep has not yet taken out is no request, as the node
 /// reads it.
 fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Result<InboundRecord> {
@@ -5663,7 +5668,7 @@ fn no_open_access_request(id: &str) -> anyhow::Error {
         NoticeText::default()
             .frame("No open access request has id ")
             .peer(id)
-            .frame(". `.mesh pending` lists the ones this node knows about."),
+            .frame(". `.mesh files requests` lists the ones this node knows about."),
     )
 }
 
@@ -5726,7 +5731,7 @@ fn unservable(shown: String, why: impl std::fmt::Display, id: &str) -> anyhow::E
         NoticeText::default()
             .peer(shown)
             .frame(format!(
-                " would not be served even once granted ({why}); refuse the request with `.mesh refuse "
+                " would not be served even once granted ({why}); refuse the request with `.mesh files refuse "
             ))
             .peer(id)
             .frame("`, or lift the rule first."),
@@ -5747,11 +5752,11 @@ fn no_share_rule(
             .peer(global.to_string())
             .frame(" or ")
             .peer(workspace.to_string())
-            .frame("; `.mesh shares` lists them."),
+            .frame("; `.mesh files list` lists them."),
     )
 }
 
-/// A pattern held only by the file `.mesh unshare` was not pointed at. The pattern and
+/// A pattern held only by the file `.mesh files unshare` was not pointed at. The pattern and
 /// the files are quoted as typed; the sentence and the command follow the prefix.
 fn held_elsewhere(
     pattern: &str,
@@ -5768,7 +5773,7 @@ fn held_elsewhere(
             .peer(holder)
             .frame(format!(" ({kinds})"))
             .then(not_here)
-            .frame(". Run `.mesh unshare ")
+            .frame(". Run `.mesh files unshare ")
             .peer(pattern)
             .frame(format!(" {flag}` to remove it from "))
             .peer(holder)
@@ -5783,7 +5788,7 @@ mod peer_text_prefix_tests {
 
     fn shown_under_slash(err: anyhow::Error) -> String {
         command_error_text(
-            &MeshVerbError::wrap(err.context("`.mesh grant` failed")),
+            &MeshVerbError::wrap(err.context("`.mesh files grant` failed")),
             CommandPrefix::Slash,
         )
     }
@@ -5803,9 +5808,12 @@ mod peer_text_prefix_tests {
             ),
         ] {
             let text = shown_under_slash(err);
-            assert!(text.starts_with("Error: `/mesh grant` failed"), "{text}");
+            assert!(
+                text.starts_with("Error: `/mesh files grant` failed"),
+                "{text}"
+            );
             assert!(text.contains("    `.vault` would not be served"), "{text}");
-            assert!(text.contains("`/mesh refuse a-1`"), "{text}");
+            assert!(text.contains("`/mesh files refuse a-1`"), "{text}");
         }
     }
 
@@ -5814,7 +5822,7 @@ mod peer_text_prefix_tests {
         let text = shown_under_slash(no_share_rule(".vault", ".coyote/shares.yaml", ".shares"));
         assert!(
             text.ends_with(
-                "No share rule has the pattern `.vault` in .coyote/shares.yaml or .shares; `/mesh shares` lists them."
+                "No share rule has the pattern `.vault` in .coyote/shares.yaml or .shares; `/mesh files list` lists them."
             ),
             "{text}"
         );
@@ -5822,9 +5830,12 @@ mod peer_text_prefix_tests {
 
     #[test]
     fn a_share_file_refused_at_load_is_quoted_byte_for_byte() {
-        let refusal = "shares.yaml line 2: `.vault` is a protected path; run .mesh shares";
+        let refusal = "shares.yaml line 2: `.vault` is a protected path; run .mesh files list";
         let text = shown_under_slash(refused_at_load(refusal, " Nothing was sent."));
-        assert!(text.starts_with("Error: `/mesh grant` failed"), "{text}");
+        assert!(
+            text.starts_with("Error: `/mesh files grant` failed"),
+            "{text}"
+        );
         assert!(
             text.ends_with(&format!("    {refusal} Nothing was sent.")),
             "{text}"
@@ -5842,13 +5853,13 @@ mod peer_text_prefix_tests {
                 ".session",
             ));
             assert!(
-                refused.contains("refuse the request with `/mesh refuse .session`"),
+                refused.contains("refuse the request with `/mesh files refuse .session`"),
                 "{refused}"
             );
             let missing = shown_under_slash(no_open_access_request(".session"));
             assert!(
                 missing.ends_with(
-                    "No open access request has id .session. `/mesh pending` lists the ones this node knows about."
+                    "No open access request has id .session. `/mesh files requests` lists the ones this node knows about."
                 ),
                 "{missing}"
             );
@@ -5886,12 +5897,12 @@ mod peer_text_prefix_tests {
         #[test]
         fn a_refused_write_quotes_the_share_file_and_the_pattern_as_they_stand() {
             let refused = shown_under_slash(quoted_share_write(
-                ShareWriteError::Refused("`.vault` is not a pattern; run .mesh shares".into())
+                ShareWriteError::Refused("`.vault` is not a pattern; run .mesh files list".into())
                     .into(),
             ));
             assert!(
                 refused.ends_with(
-                    "    `.vault` is not a pattern; run .mesh shares Nothing was written."
+                    "    `.vault` is not a pattern; run .mesh files list Nothing was written."
                 ),
                 "{refused}"
             );
@@ -5925,7 +5936,7 @@ mod peer_text_prefix_tests {
             ));
             assert!(
                 text.ends_with(
-                    "`.vault` is held by .coyote/shares.yaml (deny), not by .shares. Run `/mesh unshare .vault --global` to remove it from .coyote/shares.yaml."
+                    "`.vault` is held by .coyote/shares.yaml (deny), not by .shares. Run `/mesh files unshare .vault --global` to remove it from .coyote/shares.yaml."
                 ),
                 "{text}"
             );
@@ -5938,14 +5949,14 @@ mod peer_text_prefix_tests {
                 ".coyote/shares.yaml",
                 "allow",
                 NoticeText::default()
-                    .frame("; without a flag `.mesh unshare` edits ")
+                    .frame("; without a flag `.mesh files unshare` edits ")
                     .peer(".shares")
                     .frame(", which does not hold it"),
                 "--global",
             ));
             assert!(
                 text.ends_with(
-                    "`.vault` is held by .coyote/shares.yaml (allow); without a flag `/mesh unshare` edits .shares, which does not hold it. Run `/mesh unshare .vault --global` to remove it from .coyote/shares.yaml."
+                    "`.vault` is held by .coyote/shares.yaml (allow); without a flag `/mesh files unshare` edits .shares, which does not hold it. Run `/mesh files unshare .vault --global` to remove it from .coyote/shares.yaml."
                 ),
                 "{text}"
             );
@@ -6026,14 +6037,15 @@ fn render_share_rules(
             return format!(
                 "No share rule applies to peer {}; {}",
                 short(hash),
-                prefix.render_hints("`.mesh shares` lists every rule.")
+                prefix.render_hints("`.mesh files list` lists every rule.")
             );
         }
         return format!(
             "No share rules in {} or {}. {}",
             locations.global.display(),
             locations.workspace.display(),
-            prefix.render_hints("`.mesh allow docs/**` shares docs/ with every trusted peer.")
+            prefix
+                .render_hints("`.mesh files allow docs/**` shares docs/ with every trusted peer.")
         );
     }
     let presence = |path: &Path| if path.exists() { "" } else { " (absent)" };
@@ -6178,7 +6190,7 @@ fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
 /// rather than taught `<dir>/**`: the verb would refuse that glob the same way. Judged
 /// against the root when a snapshot has named one, so a configured inbox counts, and by
 /// `.git` and the workspace config directory's names otherwise, so it fires before the
-/// mesh gate. `unshare` keeps the teaching, since a rule under such a directory an older
+/// mesh gate. `files unshare` keeps the teaching, since a rule under such a directory an older
 /// file holds can still be removed.
 fn refuse_protected_directory_pattern(
     ctx: &RequestContext,
@@ -6269,8 +6281,8 @@ fn typed_protected_dir(pattern: &str, head: &str) -> Option<String> {
 /// Allow and the walk judge a file by the path it resolves to and never enter a linked
 /// directory, so a pattern that spells a link (whole, or as a literal leading segment) can
 /// serve nothing; the human is told the resolved path to name instead. A link to a file
-/// the built-in deny has a say over is left to `allow`'s `builtin_denies` arms, which teach
-/// it; `deny` has none, so it refuses here. Nothing resolving into a protected directory
+/// the built-in deny has a say over is left to `files allow`'s `builtin_denies` arms, which teach
+/// it; `files deny` has none, so it refuses here. Nothing resolving into a protected directory
 /// is ever taught, since the verb would refuse the remedy.
 fn refuse_link_in_pattern(
     root: &Path,
@@ -6505,7 +6517,7 @@ fn breadth_words(count: &MatchCount) -> String {
     }
 }
 
-/// One entry whose text is exactly the pattern `unshare` was given; `peer` is the allow
+/// One entry whose text is exactly the pattern `files unshare` was given; `peer` is the allow
 /// row's scope, so two allows for the same pattern read as distinct rows.
 #[derive(Debug, PartialEq, Eq)]
 struct ShareHolder {
@@ -6581,7 +6593,7 @@ fn trust_store(ctx: &RequestContext) -> Result<Arc<TrustStore>> {
 }
 
 /// The fewest characters of a hash a verb accepts in place of the whole thing; what
-/// `short` prints, so a row read off `.mesh peers` can be typed back as it stands.
+/// `short` prints, so a row read off `.mesh people list` can be typed back as it stands.
 const HASH_PREFIX_MIN_CHARS: usize = 8;
 
 /// What a verb's hash argument names, which decides the hashes a prefix is matched
@@ -6592,7 +6604,7 @@ enum HashKind {
     Identity,
     /// Either, as `--peer` on the share verbs takes it.
     Peer,
-    /// The id of a question or access request `.mesh pending` lists. Peer-chosen ids
+    /// The id of a question or access request `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` list. Peer-chosen ids
     /// need not be hex, so these are matched against the ids this node holds by
     /// `resolve_pending_id`, not by the hash rules.
     Message,
@@ -6628,9 +6640,11 @@ impl HashKind {
     /// ending in the verb of listing.
     fn listing(self) -> &'static str {
         match self {
-            HashKind::Destination | HashKind::Peer => "`.mesh peers` lists",
-            HashKind::Identity => "`.mesh knocks` and `.mesh peers` list",
-            HashKind::Message => "`.mesh pending` lists",
+            HashKind::Destination | HashKind::Peer => "`.mesh people list` lists",
+            HashKind::Identity => "`.mesh access requests` and `.mesh people list` list",
+            HashKind::Message => {
+                "`.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` list"
+            }
         }
     }
 }
@@ -6698,7 +6712,7 @@ where
 
 /// The id this node holds that `token` names: the one held id equal to it or beginning
 /// with it, compared without regard to case. Short of the whole id, a token needs
-/// `HASH_PREFIX_MIN_CHARS` characters, what `.mesh pending` prints at the least. A token
+/// `HASH_PREFIX_MIN_CHARS` characters, what `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` print at the least. A token
 /// two held ids begin is refused, even when it is the whole of one of them, so an id a
 /// peer chose to begin another never takes the other's place. A token no held
 /// id begins comes back as typed (32 hex digits lower-cased), so the verb's own lookup
@@ -6799,7 +6813,7 @@ fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> N
     what.frame(". Act on ")
         .then(longer_names)
         .frame(format!(
-            " first, typed as `.mesh pending` lists {it}, then '"
+            " first, typed as `.mesh envoy questions`, `.mesh messaging sent` or `.mesh files requests` lists {it}, then '"
         ))
         .peer(token)
         .frame("' picks the one left; or ")
@@ -6807,8 +6821,8 @@ fn whole_id_refusal(token: &str, matches: &[(String, Option<InboundKind>)]) -> N
         .frame(".")
 }
 
-/// How the entries `shown` names leave `.mesh pending` when no id can pick them: a peer's
-/// questions by `.mesh dismiss --all`, which leaves access requests alone, an access
+/// How the entries `shown` names leave `.mesh files requests` when no id can pick them: a peer's
+/// questions by `.mesh envoy dismiss --all`, which leaves access requests alone, an access
 /// request at its expiry, and a question this node asked by no verb at all.
 fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind>)]) -> NoticeText {
     let of_kind = |kind: Option<InboundKind>| {
@@ -6824,12 +6838,12 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
     let asked = of_kind(None);
     if questions.len() == matches.len() {
         let all = if matches.len() == 2 { "both" } else { "them" };
-        return format!("clear {all} with `.mesh dismiss --all`").into();
+        return format!("clear {all} with `.mesh envoy dismiss --all`").into();
     }
     let mut clauses = Vec::new();
     if !questions.is_empty() {
         clauses.push(
-            NoticeText::from("`.mesh dismiss --all` clears ")
+            NoticeText::from("`.mesh envoy dismiss --all` clears ")
                 .then(join_and_text(quoted_ids(&questions))),
         );
     }
@@ -6841,7 +6855,7 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
         };
         clauses.push(
             join_and_text(quoted_ids(&access))
-                .frame(format!(" {leave} `.mesh pending` when {expire}")),
+                .frame(format!(" {leave} `.mesh files requests` when {expire}")),
         );
     }
     if !asked.is_empty() {
@@ -7106,14 +7120,14 @@ fn unpicked_identity_label(name: &str, identity: &str, instances: &[String]) -> 
         .peer(name)
         .frame(format!("` is on identity {}", short(identity)));
     if instances.is_empty() {
-        return head.frame(", and this node has heard no instance of it, so there is no destination to use yet. Wait until it announces (`.mesh peers` lists it then), or type a destination hash in its place.");
+        return head.frame(", and this node has heard no instance of it, so there is no destination to use yet. Wait until it announces (`.mesh people list` lists it then), or type a destination hash in its place.");
     }
     let shorts: Vec<String> = instances
         .iter()
         .map(|hash| short(hash).to_string())
         .collect();
     head.frame(format!(
-        ", which runs {} instances this node has heard: {}. Type the one you mean in its place, or give each its own name with `.mesh trust <destination> --label <name>`.",
+        ", which runs {} instances this node has heard: {}. Type the one you mean in its place, or give each its own name with `.mesh access trust <destination> --label <name>`.",
         instances.len(),
         join_and(&shorts)
     ))
@@ -7138,8 +7152,9 @@ fn not_an_identity(token: &str, names: &[&AddressName]) -> NoticeText {
         .then(joined_names(names, HashKind::Identity))
         .frame(", which names a running instance, not an identity; ");
     match identities.as_slice() {
-        [] => text
-            .frame("run `.mesh peers` to see its identity hash, then type that hash in its place."),
+        [] => text.frame(
+            "run `.mesh people list` to see its identity hash, then type that hash in its place.",
+        ),
         [one] => text.frame(format!("type its identity hash {one} in its place.")),
         many => text.frame(format!(
             "type one of the identity hashes {} in its place.",
@@ -7351,7 +7366,7 @@ mod name_addressing_tests {
         assert!(text.contains("runs 2 instances"), "{text}");
         assert!(text.contains(short(MAKI_DESK)), "{text}");
         assert!(
-            text.contains("`.mesh trust <destination> --label <name>`"),
+            text.contains("`.mesh access trust <destination> --label <name>`"),
             "{text}"
         );
 
@@ -7394,7 +7409,7 @@ mod name_addressing_tests {
         );
         assert!(
             text.ends_with(
-                "run `.mesh peers` to see its identity hash, then type that hash in its place."
+                "run `.mesh people list` to see its identity hash, then type that hash in its place."
             ),
             "{text}"
         );
@@ -7489,7 +7504,7 @@ mod name_addressing_tests {
     }
 
     /// A labelled peer is named by its own grant's label first, else its identity's,
-    /// with the announced name after it, in `.mesh peers` and `.mesh pending` alike.
+    /// with the announced name after it, in `.mesh people list` and the pending lists (`.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests`) alike.
     #[test]
     fn a_labelled_peer_shows_the_label_then_its_announced_name() {
         let names = names();
@@ -7525,8 +7540,8 @@ mod name_addressing_tests {
         assert!(text.contains(NAME_ADDRESSING_LINE), "{text}");
     }
 
-    /// `.mesh pending`, `.mesh answer` and `.mesh message` name your session and your
-    /// labelled peer as `.mesh peers` does, and leave an instance you did not name to
+    /// `.mesh envoy questions`, `.mesh messaging sent`, `.mesh envoy answer` and `.mesh messaging send` name your session and your
+    /// labelled peer as `.mesh people list` does, and leave an instance you did not name to
     /// the verb. A row heard at one of your sessions' destinations under an identity
     /// that is not this node's is not your session.
     #[test]
@@ -7573,7 +7588,7 @@ mod name_addressing_tests {
         );
     }
 
-    /// A label is quoted as you spelled it in a `.mesh pending` entry and a `.mesh answer`
+    /// A label is quoted as you spelled it in a `.mesh envoy questions` entry and a `.mesh envoy answer`
     /// block under any command prefix, while this node's own hints follow the prefix.
     #[test]
     fn a_label_is_quoted_verbatim_in_pending_and_the_question_block() {
@@ -7590,6 +7605,7 @@ mod name_addressing_tests {
             extra: Vec::new(),
             expires_in: None,
             peer_left: None,
+            route: AnswerRoute::Inbound,
         };
         let now = SystemTime::now();
         let pending = render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, false);
@@ -7598,18 +7614,18 @@ mod name_addressing_tests {
         assert!(pending.plain().contains(entry), "{pending}");
         let slash = pending.render(CommandPrefix::Slash);
         assert!(slash.contains(entry), "{slash}");
-        assert!(slash.contains("answer: /mesh answer <id>"), "{slash}");
+        assert!(slash.contains("answer: /mesh envoy answer <id>"), "{slash}");
 
         let block = render_question_block(&row, now, 80, true).render(CommandPrefix::Slash);
         assert!(
             block.contains("awaiting your answer . .info (maki) (22222222) . asked"),
             "{block}"
         );
-        assert!(block.contains("answer: /mesh answer p1"), "{block}");
+        assert!(block.contains("answer: /mesh envoy answer p1"), "{block}");
     }
 }
 
-/// The full id of the entry `token` names among those `.mesh pending` lists: the
+/// The full id of the entry `token` names among those `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` list: the
 /// unexpired questions and access requests peers sent, then the questions this node
 /// asked, then those the other sessions on this cache dir asked, which the verbs then
 /// refuse by name. A store that cannot be read contributes nothing rather than failing
@@ -7655,7 +7671,7 @@ fn asked_elsewhere(ctx: &RequestContext, id: &str, now: SystemTime) -> Option<an
     let head = NoticeText::default().frame("Question ").peer(id);
     let answer_there = |session: &str| {
         NoticeText::default()
-            .frame("run `.mesh answer ")
+            .frame("run `.mesh messaging follow-up ")
             .peer(id)
             .frame(" \"<text>\"` in session ")
             .peer(session)
@@ -7690,7 +7706,7 @@ fn change_text(change: TrustChange) -> &'static str {
     }
 }
 
-/// The first line of a `.mesh trust <destination>` that went through. The grant is one
+/// The first line of a `.mesh access trust <destination>` that went through. The grant is one
 /// instance, so the tail says what the identity gets out of it: a fresh identity becomes
 /// known (its other instances may knock), one already trusted for all destinations was
 /// serving every instance before and still is.
@@ -7855,7 +7871,7 @@ fn confirmed_identity_arg(
 ) -> Result<(String, Option<String>)> {
     if yes {
         bail!(
-            "`.mesh {token} --identity` takes `--confirm {token}-<identity-short>` from a dry run, not `--yes`."
+            "`.mesh access {verb} --identity` takes `--confirm {token}-<identity-short>` from a dry run, not `--yes`."
         );
     }
     if let Some(target) = positional.first() {
@@ -7873,13 +7889,13 @@ struct ForgetArg {
     confirm: Option<String>,
 }
 
-/// `forget` takes `--identity` only; a destination on its own is refused with the verbs
+/// `access forget` takes `--identity` only; a destination on its own is refused with the verbs
 /// that act on one, since forgetting is about a person, not an instance.
 fn classify_forget(args: MutationArgs) -> Result<Option<ForgetArg>> {
     let Some(identity) = args.identity else {
         if let Some(destination) = args.positional.first() {
             bail!(
-                ".mesh forget takes --identity <id>: a destination is untrusted with .mesh untrust {destination} or refused with .mesh block {destination}."
+                ".mesh access forget takes --identity <id>: a destination is untrusted with .mesh access revoke {destination} or refused with .mesh access block {destination}."
             );
         }
         return Ok(None);
@@ -7910,7 +7926,7 @@ enum BlockArg {
     },
 }
 
-/// `block` and `unblock` take one destination, or one identity behind `--identity`;
+/// `access block` and `access unblock` take one destination, or one identity behind `--identity`;
 /// `None` when neither was named.
 fn classify_block(args: MutationArgs, verb: &str) -> Result<Option<BlockArg>> {
     if let Some(identity) = args.identity {
@@ -7963,7 +7979,7 @@ struct MutationArgs {
 }
 
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
-/// sit anywhere; `message` differs, honouring `--yes` as the leading word only, because the
+/// sit anywhere; `messaging send` differs, honouring `--yes` as the leading word only, because the
 /// rest of its line is free text.
 fn parse_mutation_args(
     rest: &str,
@@ -8087,7 +8103,7 @@ fn prune_token_count(token: &str) -> Result<usize> {
         .and_then(|count| count.parse().ok())
         .ok_or_else(|| {
             anyhow!(
-                "'{token}' is not a prune token: run .mesh trust --prune for a dry run and pass the prune-<N> it prints."
+                "'{token}' is not a prune token: run .mesh access revoke --stale for a dry run and pass the prune-<N> it prints."
             )
         })
 }
@@ -8258,13 +8274,23 @@ fn parse_outgoing(rest: &str) -> Option<Outgoing<'_>> {
     Some(Outgoing { yes, text })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AnswerRoute {
     /// A peer's escalated question: the answer goes back to the peer as its reply.
     Inbound,
     /// A question this node asked: the text goes to the peer as a follow-up.
     Outbound,
     Unknown,
+}
+
+impl AnswerRoute {
+    /// The `(group, verb)` that takes an id of this kind.
+    fn command(self) -> (&'static str, &'static str) {
+        match self {
+            AnswerRoute::Outbound => ("messaging", "follow-up"),
+            AnswerRoute::Inbound | AnswerRoute::Unknown => ("envoy", "answer"),
+        }
+    }
 }
 
 /// An id held by both stores answers the peer: their question is the one waiting on a human.
@@ -8352,9 +8378,12 @@ const ANSWER_PROMPT: &str = "Your answer:";
 /// What a blank or cancelled `Your answer:` prompt leaves behind: the question stays
 /// open, so the line carries the full id, quoted as the peer chose it, for the one-line
 /// form.
-fn nothing_sent(id: &str) -> NoticeText {
+fn nothing_sent(route: AnswerRoute, id: &str) -> NoticeText {
+    let (group, verb) = route.command();
     NoticeText::from_template(
-        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\".",
+        &format!(
+            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh {group} {verb} {{id}} \"<text>\"."
+        ),
         &[],
         &[("id", id)],
     )
@@ -8363,25 +8392,27 @@ fn nothing_sent(id: &str) -> NoticeText {
 /// Asks for the answer to `id` when none came on the line: no terminal on stdin is an
 /// error naming the one-line form rather than a hang, and an empty or cancelled prompt
 /// (Esc, Ctrl-C, EOF) is `None`.
-fn prompt_answer_text(id: &str) -> Result<Option<String>> {
+fn prompt_answer_text(route: AnswerRoute, id: &str) -> Result<Option<String>> {
     #[cfg(test)]
     if let Some(forced_tty) = prompt_script::forced_tty() {
-        return prompt_answer_text_with(id, forced_tty, prompt_script::next_text);
+        return prompt_answer_text_with(route, id, forced_tty, prompt_script::next_text);
     }
-    prompt_answer_text_with(id, std::io::stdin().is_terminal(), |question| {
+    prompt_answer_text_with(route, id, std::io::stdin().is_terminal(), |question| {
         drain_stale_tty_input();
         Text::new(question).prompt().ok()
     })
 }
 
 fn prompt_answer_text_with(
+    route: AnswerRoute,
     id: &str,
     stdin_is_tty: bool,
     prompt: impl FnOnce(&str) -> Option<String>,
 ) -> Result<Option<String>> {
     if !stdin_is_tty {
+        let (group, verb) = route.command();
         bail!(
-            "`.mesh answer {id}` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer {id} \"<text>\"`."
+            "`.mesh {group} {verb} {id}` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh {group} {verb} {id} \"<text>\"`."
         );
     }
     Ok(prompt(ANSWER_PROMPT)
@@ -8492,7 +8523,7 @@ pub(crate) mod prompt_script {
         guard
     }
 
-    /// Forces a terminal on stdin and puts every question to `answer`, which runs
+    /// Forces a terminal on stdin and puts every question to `envoy answer`, which runs
     /// between the verb's prompt and its write, so a test can change the files it is
     /// about to write while the question stands. Its callers start a node, which the
     /// tests only do on unix.
@@ -8787,7 +8818,7 @@ fn trust_refusal(
         return None;
     }
     Some(format!(
-        "{} is {} in this node's trust list; `.mesh peers` shows the standing. {only}",
+        "{} is {} in this node's trust list; `.mesh people list` shows the standing. {only}",
         short(destination),
         trust_label(verdict, standing)
     ))
@@ -8849,13 +8880,13 @@ fn render_on_preview(
         "  announce: nothing until you contact a peer (announce: false)".to_string()
     });
     lines.push(match (config.announce, config.propagation_sync_interval_secs) {
-        (false, _) => "  propagation sync: off (announce: false); .mesh sync runs one".to_string(),
+        (false, _) => "  propagation sync: off (announce: false); .mesh messaging sync runs one".to_string(),
         (true, 0) => {
-            "  propagation sync: off (propagation_sync_interval_secs: 0); .mesh sync runs one"
+            "  propagation sync: off (propagation_sync_interval_secs: 0); .mesh messaging sync runs one"
                 .to_string()
         }
         (true, interval) => format!(
-            "  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every {interval} s; .mesh sync runs one now"
+            "  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every {interval} s; .mesh messaging sync runs one now"
         ),
     });
     lines.push(match &config.display_name {
@@ -8878,7 +8909,7 @@ fn render_on_preview(
             "  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such".to_string()
         }
         MeshBrief::Off => {
-            "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on".to_string()
+            "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on".to_string()
         }
     });
     if let Some(shared) = shared.filter(|shared| shared.files > 0) {
@@ -8892,7 +8923,7 @@ fn render_on_preview(
             MatchCount { files, .. } => files.to_string(),
         };
         lines.push(format!(
-            "  files: {n} path(s) are shared with trusted peers (`.mesh shares`)"
+            "  files: {n} path(s) are shared with trusted peers (`.mesh files list`)"
         ));
     }
     if fresh {
@@ -8964,7 +8995,7 @@ fn render_on_summary(runtime: &MeshRuntime, fresh: bool) -> String {
 /// config dir gets the grant with its first key and needs no telling.
 fn self_trust_notice(identity: &str) -> String {
     format!(
-        "Trusted your own identity {} as \"{SELF_TRUST_LABEL}\", so your other sessions on this config dir can message this one; .mesh untrust --identity {identity} takes the grant back.",
+        "Trusted your own identity {} as \"{SELF_TRUST_LABEL}\", so your other sessions on this config dir can message this one; .mesh access revoke --identity {identity} takes the grant back.",
         short(identity)
     )
 }
@@ -9002,7 +9033,7 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                             advice: DialAdvice::StartRnsd,
                         }),
                 } => format!(
-                    "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
+                    "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh config show` shows when it connects"
                 ),
                 InterfaceState::Connecting {
                     dial_failure:
@@ -9011,13 +9042,13 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                             advice: DialAdvice::Redialing,
                         }),
                 } => format!(
-                    "WARNING: {label} is not reachable yet: {reason}; the transport keeps redialing it, and `.mesh info` shows when it connects"
+                    "WARNING: {label} is not reachable yet: {reason}; the transport keeps redialing it, and `.mesh config show` shows when it connects"
                 ),
                 InterfaceState::Connecting { dial_failure: None } => format!(
                     "WARNING: {label} has not finished connecting; mesh traffic through it waits until it does"
                 ),
                 InterfaceState::Disconnected { reason } => format!(
-                    "WARNING: {label} lost its connection: {reason}; the transport is redialing it, and `.mesh info` shows when it reconnects"
+                    "WARNING: {label} lost its connection: {reason}; the transport is redialing it, and `.mesh config show` shows when it reconnects"
                 ),
             })
         })
@@ -9029,7 +9060,7 @@ fn name_label(name: Option<&str>) -> String {
         .unwrap_or_else(|| "(no name)".to_string())
 }
 
-/// One `.mesh peers` line: a node heard on the mesh with its trust label and the key-change
+/// One `.mesh people list` line: a node heard on the mesh with its trust label and the key-change
 /// mark on its trust record; a denied destination nothing has announced from yet, listed
 /// so the deny (and any mark it carries) is visible; or a marked record whose destination
 /// has aged out of the peer table, listed so the mark outlives the row it was first shown on.
@@ -9054,7 +9085,7 @@ struct HeardFacts {
     label: Option<String>,
 }
 
-/// How `.mesh peers` and `.mesh pending` name an instance that is one of your own running
+/// How `.mesh people list` and the pending lists name an instance that is one of your own running
 /// sessions.
 fn own_session_name(session: &str) -> String {
     format!("(you: {session})")
@@ -9072,7 +9103,7 @@ fn asked_by(asker: Option<&InstanceSession>) -> String {
     }
 }
 
-/// How `.mesh peers` and `.mesh pending` name a peer you labelled: the label, then the
+/// How `.mesh people list` and the pending lists name a peer you labelled: the label, then the
 /// name the peer announces, if any, in parentheses.
 fn labelled_name(label: &str, display_name: Option<&str>) -> String {
     let label = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap_or_else(|| label.to_string());
@@ -9110,7 +9141,7 @@ fn given_name(
     }
 }
 
-/// How `.mesh pending` and `.mesh answer` name the peer at `destination`: `given_name`,
+/// How the pending lists and `.mesh envoy answer` name the peer at `destination`: `given_name`,
 /// else the name the peer table holds, else its short hash.
 pub(crate) fn name_at(
     ctx: &RequestContext,
@@ -9287,7 +9318,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
     }
     let mut lines = key_changes;
     lines.push(format!(
-        "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+        "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
         rows.len()
     ));
     lines.push(NAME_ADDRESSING_LINE.to_string());
@@ -9298,8 +9329,8 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
         .frame(format!("\n{}", lines.join("\n")))
 }
 
-/// The `.mesh peers` line under the count that teaches typing a name in place of a hash.
-const NAME_ADDRESSING_LINE: &str = "Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.";
+/// The `.mesh people list` line under the count that teaches typing a name in place of a hash.
+const NAME_ADDRESSING_LINE: &str = "Type a session name or a trust label in place of a hash, as in `.mesh people status <name>` or `.mesh messaging send <name> <text>`; give an instance a label with `.mesh access trust <dest> --label <name>`.";
 
 #[cfg(test)]
 mod peers_route_tests {
@@ -9342,7 +9373,7 @@ mod peers_route_tests {
         assert_eq!(cells[1][6], "", "{text}");
         assert!(
             peers_legend().contains(
-                "no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh peers again;"
+                "no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"
             ),
             "{text}"
         );
@@ -9550,7 +9581,7 @@ mod peers_you_tests {
             "{legend}"
         );
         assert!(
-            legend.contains("no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh peers again;"),
+            legend.contains("no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"),
             "{legend}"
         );
     }
@@ -9559,7 +9590,7 @@ mod peers_you_tests {
 /// Why a heard row is not current, if it is not. A successor is only ever found for a
 /// stale row, and a later row of the same identity at another destination says where the
 /// identity went, which is more useful than how long this row has been silent, so a
-/// superseded row is never also called stale. `.mesh peers` puts the marker in the
+/// superseded row is never also called stale. `.mesh people list` puts the marker in the
 /// `state` column, where it is joined by the compatibility line and nothing else; `.mesh
 /// info <dest>` appends it to the `last seen` line.
 fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime) -> Option<String> {
@@ -9583,7 +9614,7 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
 /// which only says how long the row has been silent, and yields to `superseded`, which
 /// says where the identity went. A relay that restarted holds no path to a peer until that
 /// peer announces again, so the marker does not claim the peer has left.
-const NO_ROUTE_STATE: &str = "(no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh peers after its next announce)";
+const NO_ROUTE_STATE: &str = "(no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce)";
 
 /// The `state` of a heard row whose instance said it was leaving the mesh, `left_at` by
 /// this node's clock. It outranks `no route` and `stale`, being the peer's own word, and
@@ -9597,7 +9628,7 @@ fn left_state(now: SystemTime, left_at: SystemTime) -> String {
     )
 }
 
-/// How `.mesh peers` names a session of yours on this computer that has stopped or whose
+/// How `.mesh people list` names a session of yours on this computer that has stopped or whose
 /// process has gone, while the instance registry still keeps its tombstone.
 const GONE_SESSION_NAME: &str = "(you, gone)";
 
@@ -9613,15 +9644,15 @@ fn deny_only_label() -> &'static str {
     )
 }
 
-/// The second-to-last line of a non-empty `.mesh peers`, reading the trust column.
+/// The second-to-last line of a non-empty `.mesh people list`, reading the trust column.
 fn trust_legend() -> &'static str {
-    "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>"
+    "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block <destination>; blocked (identity) = .mesh access block --identity <identity>"
 }
 
-/// The last line of a non-empty `.mesh peers`, reading the row markers and the `(you)` names.
+/// The last line of a non-empty `.mesh people list`, reading the row markers and the `(you)` names.
 fn peers_legend() -> String {
     format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh peers again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
@@ -9653,29 +9684,29 @@ fn period_text(period: Duration) -> String {
 }
 
 /// The verbs that change what a denied old record keeps, worded the same under `.mesh
-/// peers`' marker and `.mesh trust`'s superseded line: `.mesh unblock <destination>` lifts
-/// the block and leaves the record untrusted; `.mesh forget --identity` erases the old
+/// peers`' marker and `.mesh access trust`'s superseded line: `.mesh access unblock <destination>` lifts
+/// the block and leaves the record untrusted; `.mesh access forget --identity` erases the old
 /// key, the block on it included.
 fn denied_remedy(destination: &str, identity: &str) -> String {
     format!(
-        ".mesh unblock {destination} lifts the block, .mesh forget --identity {identity} erases the old key, the block on it included"
+        ".mesh access unblock {destination} lifts the block, .mesh access forget --identity {identity} erases the old key, the block on it included"
     )
 }
 
-/// The verbs that take a trusted old record away: `.mesh untrust <destination>` on its
+/// The verbs that take a trusted old record away: `.mesh access revoke <destination>` on its
 /// own, unless its identity is granted every destination, which makes that untrust a
-/// refusal; then `block` refuses the one key and `untrust --identity` withdraws the grant.
+/// refusal; then `access block` refuses the one key and `access revoke --identity` withdraws the grant.
 fn trusted_remedy(destination: &str, identity: &str, identity_grants_all: bool) -> String {
     if identity_grants_all {
         format!(
-            ".mesh block {destination} refuses the old key, .mesh untrust --identity {identity} withdraws the grant"
+            ".mesh access block {destination} refuses the old key, .mesh access revoke --identity {identity} withdraws the grant"
         )
     } else {
-        format!(".mesh untrust {destination} stops serving the old key")
+        format!(".mesh access revoke {destination} stops serving the old key")
     }
 }
 
-/// The line `.mesh trust` adds for a record the newly trusted instance supersedes: its mark
+/// The line `.mesh access trust` adds for a record the newly trusted instance supersedes: its mark
 /// is cleared, and what the old key keeps, a grant or a refusal, stays, with the verb that
 /// changes it.
 fn superseded_line(old: &BindingConflict, identity_grants_all: bool) -> String {
@@ -9696,7 +9727,7 @@ fn superseded_line(old: &BindingConflict, identity_grants_all: bool) -> String {
     )
 }
 
-/// A key-changed row's line under the `.mesh peers` table: the row's `dest`, then
+/// A key-changed row's line under the `.mesh people list` table: the row's `dest`, then
 /// `key_change_line`. The remedy is kept out of the `state` cell because it runs to some
 /// 300 characters with two full hashes; a table column that narrow splits the hashes
 /// across lines, while plain text soft-wraps and stays copyable.
@@ -9725,8 +9756,8 @@ fn key_change_line(
     now: SystemTime,
 ) -> String {
     let trust = match &mark.new_destination {
-        Some(destination) => format!(".mesh trust {destination}"),
-        None => ".mesh trust its new destination once heard".to_string(),
+        Some(destination) => format!(".mesh access trust {destination}"),
+        None => ".mesh access trust its new destination once heard".to_string(),
     };
     let (standing, old_key) = if mark.denied {
         (
@@ -9740,7 +9771,7 @@ fn key_change_line(
         )
     };
     format!(
-        "key changed: announced under identity {} {}; {standing} {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh block --identity {}; {old_key}",
+        "key changed: announced under identity {} {}; {standing} {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh access block --identity {}; {old_key}",
         short(&mark.change.seen_identity),
         age_text(now, mark.change.at),
         short(bound_identity),
@@ -9806,7 +9837,7 @@ fn render_knocks(
             .find(|knock| knock.identity_hash == drop.identity_hash);
         let serve = match newest_cached {
             Some(knock) => format!(
-                "; its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                "; its earlier knocks are listed above, .mesh access trust {} on one of them serves it",
                 knock.destination_hash
             ),
             None => "; none of its knocks is on file".to_string(),
@@ -9821,7 +9852,7 @@ fn render_knocks(
     joined_text(lines, "\n")
 }
 
-/// The bare `.mesh info` card: the settings, then the node's own rows, as one key/value
+/// The `.mesh config show` card: the settings, then the node's own rows, as one key/value
 /// table.
 fn render_info_table(rows: Vec<(String, String)>) -> String {
     let mut table = mesh_table(&["key", "value"]);
@@ -9863,7 +9894,9 @@ fn node_fact_rows(
     if key_changes > 0 {
         row(
             "key changes",
-            format!("{key_changes} instance(s) announced under another identity; see .mesh peers"),
+            format!(
+                "{key_changes} instance(s) announced under another identity; see .mesh people list"
+            ),
         );
     }
     row("envoy memory", envoy_memory_text(runtime));
@@ -9958,7 +9991,7 @@ fn propagation_node_rows(
             "none heard yet".to_string()
         } else {
             format!(
-                "none heard in the last {} h ({heard} aged out); .mesh sync finds one once it announces again",
+                "none heard in the last {} h ({heard} aged out); .mesh messaging sync finds one once it announces again",
                 PROPAGATION_NODE_TTL.as_secs() / 3600
             )
         };
@@ -9978,7 +10011,7 @@ fn propagation_node_rows(
     rows
 }
 
-/// What `.mesh info` found in the knock cache for a destination.
+/// What `.mesh people info` found in the knock cache for a destination.
 enum KnockLookup {
     Knocked(KnockRecord),
     NotKnocked,
@@ -10015,7 +10048,7 @@ fn render_peer_detail(
         }
         lines.push(format!("hops: {}", peer.hops).into());
         let mut line = format!("last seen: {}", age_text(now, peer.last_seen));
-        // A farewell outranks `stale` here as in `.mesh peers`; `superseded` outranks both.
+        // A farewell outranks `stale` here as in `.mesh people list`; `superseded` outranks both.
         let state = match (successor, peer.left_at) {
             (None, Some(left_at)) => Some(left_state(now, left_at)),
             _ => row_state(peer, successor, now),
@@ -10050,7 +10083,7 @@ fn render_peer_detail(
     joined_text(lines, "\n")
 }
 
-/// One `.mesh inbox` block: a peer message, who put it in the inbox and when it landed.
+/// One `.mesh messaging inbox` block: a peer message, who put it in the inbox and when it landed.
 struct InboxRow {
     sender: InboxSender,
     received: DateTime<Utc>,
@@ -10058,7 +10091,7 @@ struct InboxRow {
 }
 
 /// Who sent an inbox message: a peer, by its resolved name, or this node itself (its
-/// envoy or `.mesh answer`; the inbox cannot tell them apart), with the resolved name of
+/// envoy or `.mesh envoy answer`; the inbox cannot tell them apart), with the resolved name of
 /// the peer whose message it answered.
 enum InboxSender {
     Peer(String),
@@ -10229,7 +10262,7 @@ fn inbox_header(row: &InboxRow) -> String {
 
 /// What a reply's disposition means for the reader, after its wire name: from the
 /// peer's side for a peer's reply, from this node's for its own copy of what the person
-/// sent with `.mesh answer` or `.mesh dismiss`, the only dispositions an own copy
+/// sent with `.mesh envoy answer` or `.mesh envoy dismiss`, the only dispositions an own copy
 /// carries.
 fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'static str {
     match (sender, disposition) {
@@ -10246,7 +10279,7 @@ fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'stati
     }
 }
 
-/// One `.mesh pending` entry or `.mesh answer` block: a question and who it is between.
+/// One pending-list entry or `.mesh envoy answer` block: a question and who it is between.
 struct QuestionRow {
     /// `awaiting your answer`, `access request`, or an outbound state word.
     state: &'static str,
@@ -10274,6 +10307,9 @@ struct QuestionRow {
     /// When the peer of a question still waiting on it said it was leaving the mesh,
     /// rendered as `peer left <age>` beside the state. Only an outbound row carries it.
     peer_left: Option<SystemTime>,
+    /// Which verb its footer names: `messaging follow-up` for a question this node asked,
+    /// `envoy answer` for the rest.
+    route: AnswerRoute,
 }
 
 impl QuestionRow {
@@ -10318,6 +10354,7 @@ impl QuestionRow {
             extra: Vec::new(),
             expires_in: None,
             peer_left: None,
+            route: AnswerRoute::Outbound,
         }
     }
 
@@ -10334,6 +10371,7 @@ impl QuestionRow {
             extra: Vec::new(),
             expires_in: time_left(&record.received_at, now),
             peer_left: None,
+            route: AnswerRoute::Inbound,
         }
     }
 
@@ -10350,6 +10388,7 @@ impl QuestionRow {
             extra: vec![("", plural(record.paths.len(), "path", "paths"))],
             expires_in: time_left(&record.received_at, now),
             peer_left: None,
+            route: AnswerRoute::Inbound,
         }
     }
 }
@@ -10363,14 +10402,19 @@ fn time_left(received_at: &str, now: SystemTime) -> Option<Duration> {
         .map(|end| end.duration_since(now).unwrap_or_default())
 }
 
-fn answer_footer(id: &str) -> NoticeText {
-    NoticeText::from_template("answer: .mesh answer {id} \"<text>\"", &[], &[("id", id)])
+fn answer_footer(route: AnswerRoute, id: &str) -> NoticeText {
+    let (group, verb) = route.command();
+    NoticeText::from_template(
+        &format!("answer: .mesh {group} {verb} {{id}} \"<text>\""),
+        &[],
+        &[("id", id)],
+    )
 }
 
-/// A question block in the `.mesh inbox` shape: a header the colour paints, then the
+/// A question block in the `.mesh messaging inbox` shape: a header the colour paints, then the
 /// body, the envoy's framing and the extra rows, each indented and word-wrapped at
 /// `width` through `indented_rows`, then the answer footer on its own indented line.
-/// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
+/// The escalation idle line points cut text at `.mesh envoy questions`, so the envoy's question
 /// is rendered at the length the store keeps it, never shorter. The footer is this
 /// node's own text and carries the full id, so it is neither wrapped nor shortened. The
 /// peer's name, id and words are quoted as they stand; only this node's hints follow the
@@ -10400,7 +10444,7 @@ fn render_question_block(
                 .map(NoticeText::from),
         );
     }
-    lines.push(NoticeText::from("  ").then(answer_footer(&row.id)));
+    lines.push(NoticeText::from("  ").then(answer_footer(row.route, &row.id)));
     joined_text(lines, "\n")
 }
 
@@ -10509,21 +10553,21 @@ fn render_pending(
         (
             PendingList::Escalated,
             "Waiting for YOU",
-            "answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+            "answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
             escalated,
             false,
         ),
         (
             PendingList::Access,
             "Access requests",
-            "grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>",
+            "grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
             access,
             false,
         ),
         (
             PendingList::Asked,
             "Asked by this node",
-            "collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+            "collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
             asked,
             true,
         ),
@@ -10598,7 +10642,7 @@ fn shown_id_len(id: &str, ids: &[String]) -> usize {
     distinguishing_len(&sharing)
 }
 
-/// One numbered `.mesh pending` entry. The first line is
+/// One numbered entry of `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests`. The first line is
 /// `-> <name> (<dest8>) <age> . <state> . id <id>` for a question this node asked, with
 /// ` . peer left <age>` after the state while its peer has said it left, and
 /// `<name> (<dest8>) asked <age> . expires in <span> . id <id>` for a peer's question or
@@ -10668,7 +10712,7 @@ fn pending_entry(
 /// this node's own hints follow the prefix.
 fn render_broadcast(outcome: &BroadcastOutcome) -> NoticeText {
     if outcome.recipients.is_empty() {
-        return "No trusted peer has a known path right now; nothing was sent. `.mesh peers` lists what this node has heard from.".into();
+        return "No trusted peer has a known path right now; nothing was sent. `.mesh people list` lists what this node has heard from.".into();
     }
     let mut report = NoticeText::default();
     for recipient in &outcome.recipients {
@@ -10894,7 +10938,7 @@ mod tests {
             .collect()
     }
 
-    /// The first `key changed:` line printed under the `.mesh peers` table.
+    /// The first `key changed:` line printed under the `.mesh people list` table.
     fn key_change_line_of(text: &str) -> String {
         table_footer(text)
             .into_iter()
@@ -10903,7 +10947,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no key-change line in {text}"))
     }
 
-    /// Every `key changed:` line under the `.mesh peers` table, in table-row order.
+    /// Every `key changed:` line under the `.mesh people list` table, in table-row order.
     fn key_change_lines(text: &str) -> Vec<String> {
         table_footer(text)
             .into_iter()
@@ -10933,7 +10977,7 @@ mod tests {
         };
         assert_eq!(
             knock_report("abcd1234", &unanswered),
-            "Knocked on abcd1234; no answer over the link, so a propagation node holds the knock until the peer fetches it. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity); for first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides."
+            "Knocked on abcd1234; no answer over the link, so a propagation node holds the knock until the peer fetches it. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity); for first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides."
         );
         assert!(!knock_report("abcd1234", &unanswered).contains("unreachable"));
 
@@ -10979,7 +11023,7 @@ mod tests {
                     &["docs/a.md"],
                     CommandPrefix::Dot
                 ),
-                "request 01234567 to fedcba98: pending (the decision arrives as an idle line; .mesh inbox lists it)"
+                "request 01234567 to fedcba98: pending (the decision arrives as an idle line; .mesh messaging inbox lists it)"
             );
             assert_eq!(
                 line(
@@ -10988,7 +11032,7 @@ mod tests {
                     &["docs/a.md"],
                     CommandPrefix::Dot
                 ),
-                "request 01234567 to fedcba98: pending; no answer over the link, so a propagation node holds it until fedcba98 fetches it (the decision arrives as an idle line; .mesh inbox lists it)"
+                "request 01234567 to fedcba98: pending; no answer over the link, so a propagation node holds it until fedcba98 fetches it (the decision arrives as an idle line; .mesh messaging inbox lists it)"
             );
         }
 
@@ -11010,7 +11054,7 @@ mod tests {
                     &["docs/a.md".to_string()],
                     CommandPrefix::Dot
                 ),
-                "request 01234567 to fedcba98: pending; fedcba98 left 2h ago; held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; .mesh inbox lists it)"
+                "request 01234567 to fedcba98: pending; fedcba98 left 2h ago; held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; .mesh messaging inbox lists it)"
             );
             assert_eq!(
                 request_outcome_line(
@@ -11021,11 +11065,11 @@ mod tests {
                     &["docs/a.md".to_string()],
                     CommandPrefix::Slash
                 ),
-                "request 01234567 to fedcba98: pending; fedcba98 has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard 3m ago); held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; /mesh inbox lists it)"
+                "request 01234567 to fedcba98: pending; fedcba98 has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard 3m ago); held at the propagation node, delivered to any of fedcba98's sessions when one syncs (the decision arrives as an idle line; /mesh messaging inbox lists it)"
             );
         }
 
-        /// `.mesh message` names the peer as it goes by here, quoted, when the message is
+        /// `.mesh messaging send` names the peer as it goes by here, quoted, when the message is
         /// held for a peer that had gone, and keeps the plain line otherwise.
         #[test]
         fn a_message_held_for_a_departed_peer_names_it_twice_quoted() {
@@ -11042,11 +11086,11 @@ mod tests {
             let line = sent_line(&left, DEST, ".bob", now);
             assert_eq!(
                 line.plain(),
-                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. .mesh peers shows when it announces again."
+                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. .mesh people list shows when it announces again."
             );
             assert_eq!(
                 line.render(CommandPrefix::Slash),
-                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. /mesh peers shows when it announces again.",
+                "Sent 01234567 to fedcba98: .bob left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. /mesh people list shows when it announces again.",
                 "the name is quoted as it stands under any prefix; the hint follows it"
             );
             assert_eq!(
@@ -11060,7 +11104,7 @@ mod tests {
         }
 
         /// An open question whose peer said it left reads `peer left <age>` beside its
-        /// state in `.mesh pending`; a row without the mark reads as before.
+        /// state in `.mesh messaging sent`; a row without the mark reads as before.
         #[test]
         fn an_open_question_to_a_peer_that_left_says_so_in_pending() {
             let now = SystemTime::now();
@@ -11115,7 +11159,7 @@ mod tests {
                     CommandPrefix::Dot
                 ),
                 format!(
-                    "request 01234567 to fedcba98: granted until {until}: .mesh fetch fedcba98 docs/a.md"
+                    "request 01234567 to fedcba98: granted until {until}: .mesh files fetch fedcba98 docs/a.md"
                 )
             );
             assert_eq!(
@@ -11126,7 +11170,7 @@ mod tests {
                     CommandPrefix::Dot
                 ),
                 format!(
-                    "request 01234567 to fedcba98: granted until {until}: .mesh fetch fedcba98 docs/a.md, then the same for the other 2 path(s)."
+                    "request 01234567 to fedcba98: granted until {until}: .mesh files fetch fedcba98 docs/a.md, then the same for the other 2 path(s)."
                 )
             );
             for unreadable in [f64::NAN, -1.0, f64::INFINITY] {
@@ -11139,7 +11183,7 @@ mod tests {
                         &["docs/a.md", "docs/b.md"],
                         CommandPrefix::Dot
                     ),
-                    "request 01234567 to fedcba98: granted, until a time this node cannot read: .mesh fetch fedcba98 docs/a.md, then the same for the other 1 path(s).",
+                    "request 01234567 to fedcba98: granted, until a time this node cannot read: .mesh files fetch fedcba98 docs/a.md, then the same for the other 1 path(s).",
                     "{unreadable}"
                 );
             }
@@ -11156,7 +11200,7 @@ mod tests {
                     &[".vault"],
                     CommandPrefix::Slash
                 ),
-                "request 01234567 to fedcba98: granted, until a time this node cannot read: /mesh fetch fedcba98 .vault"
+                "request 01234567 to fedcba98: granted, until a time this node cannot read: /mesh files fetch fedcba98 .vault"
             );
             assert_eq!(
                 line(
@@ -11165,7 +11209,7 @@ mod tests {
                     &[".vault"],
                     CommandPrefix::Slash
                 ),
-                "request 01234567 to fedcba98: pending (the decision arrives as an idle line; /mesh inbox lists it)"
+                "request 01234567 to fedcba98: pending (the decision arrives as an idle line; /mesh messaging inbox lists it)"
             );
         }
 
@@ -11199,7 +11243,7 @@ mod tests {
         let unreachable = crate::mesh::knock::KnockError::NoPropagationNode.to_string();
         assert_eq!(
             unreachable,
-            "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+            "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh people list` to see which nodes this Coyote has heard from."
         );
         let unanswered = crate::mesh::knock::KnockError::Unanswered {
             dest8: "abcd1234".to_string(),
@@ -11207,7 +11251,7 @@ mod tests {
         .to_string();
         assert_eq!(
             unanswered,
-            "Knocked on abcd1234; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
+            "Knocked on abcd1234; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
         );
         assert!(!unanswered.contains("unreachable"));
     }
@@ -11274,26 +11318,32 @@ mod tests {
     /// send, and no terminal is refused naming the id and the one-line form.
     #[test]
     fn answer_prompt_trims_and_treats_blank_or_cancelled_as_nothing() {
-        let typed = prompt_answer_text_with("p1", true, |question| {
+        let typed = prompt_answer_text_with(AnswerRoute::Inbound, "p1", true, |question| {
             assert_eq!(question, "Your answer:");
             Some("  yes, go ahead  ".to_string())
         })
         .unwrap();
         assert_eq!(typed.as_deref(), Some("yes, go ahead"));
         assert_eq!(
-            prompt_answer_text_with("p1", true, |_| Some("   ".to_string())).unwrap(),
+            prompt_answer_text_with(AnswerRoute::Inbound, "p1", true, |_| Some(
+                "   ".to_string()
+            ))
+            .unwrap(),
             None
         );
-        assert_eq!(prompt_answer_text_with("p1", true, |_| None).unwrap(), None);
+        assert_eq!(
+            prompt_answer_text_with(AnswerRoute::Inbound, "p1", true, |_| None).unwrap(),
+            None
+        );
 
-        let err = prompt_answer_text_with("3fe1be40", false, |_| {
+        let err = prompt_answer_text_with(AnswerRoute::Inbound, "3fe1be40", false, |_| {
             panic!("the prompt must not run without a terminal")
         })
         .unwrap_err()
         .to_string();
         assert_eq!(
             err,
-            "`.mesh answer 3fe1be40` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer 3fe1be40 \"<text>\"`."
+            "`.mesh envoy answer 3fe1be40` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh envoy answer 3fe1be40 \"<text>\"`."
         );
     }
 
@@ -11363,22 +11413,22 @@ mod tests {
         assert!(render_verb_help("access", "revoke").contains("Stop serving one trusted instance"));
         assert!(
             render_verb_help("access", "block")
-                .contains("`block` remembers where `untrust` only stops serving")
+                .contains("`access block` remembers where `access revoke` only stops serving")
         );
         assert!(render_verb_help("access", "forget").contains("Erase everything this node knows"));
     }
 
     /// The withdrawn verbs appear in neither place. The `revoke` line says it stops
-    /// serving an instance or withdraws an identity grant, leaving the instances; `forget`
-    /// says it erases an identity; `unblock` says it grants nothing; the `revoke` usage
-    /// reads `[--yes|--dry-run]`, the grammar the parser takes, and `forget` takes
+    /// serving an instance or withdraws an identity grant, leaving the instances; `access forget`
+    /// says it erases an identity; `access unblock` says it grants nothing; the `revoke` usage
+    /// reads `[--yes|--dry-run]`, the grammar the parser takes, and `access forget` takes
     /// `--identity` alone. The command list carries the groups, never a verb.
     #[test]
     fn help_literals_match_in_the_verb_table_and_the_command_list() {
         const UNTRUST: &str = "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own. `--stale` prunes the trusted instances not heard from lately";
         const FORGET: &str = "Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger";
         const UNBLOCK: &str = "Lift a block on an instance or an identity; it grants nothing, so only trust the list still holds serves it afterwards";
-        const DENY: &str = "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)";
+        const DENY: &str = "Never share files matching a pattern, whatever `files allow` says; a share rule, not a peer refusal (that is `access block`)";
 
         let verb_description = |group: &str, verb: &str| -> &str {
             COMMANDS
@@ -11424,7 +11474,7 @@ mod tests {
         ] {
             assert!(help.contains(present), "{present:?} missing from\n{help}");
         }
-        // `deny` is a file verb; the peer refusal is `block`.
+        // `files deny` is a file verb; the peer refusal is `access block`.
         assert_eq!(verb_description("files", "deny"), DENY);
         assert!(listed(".mesh files"));
         for withdrawn in [".mesh undeny", ".mesh files undeny"] {
@@ -11773,28 +11823,28 @@ mod tests {
         );
         assert_eq!(
             err("deadbeef", HashKind::Destination),
-            "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh peers` lists."
+            "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh people list` lists."
         );
         assert_eq!(
             err("deadbeef00", HashKind::Identity),
-            "Identity deadbeef00 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh knocks` and `.mesh peers` list."
+            "Identity deadbeef00 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh access requests` and `.mesh people list` list."
         );
         assert_eq!(
             err("fedcba9", HashKind::Destination),
-            "'fedcba9' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+            "'fedcba9' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
         );
         assert_eq!(
             err("fedcba9x", HashKind::Identity),
-            "'fedcba9x' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh knocks` and `.mesh peers` list (8 or more characters)."
+            "'fedcba9x' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
         );
         assert_eq!(
             err("bob", HashKind::Peer),
-            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
         );
         assert_eq!(
             err(&format!("{gamma}0"), HashKind::Destination),
             format!(
-                "'{gamma}0' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+                "'{gamma}0' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
             ),
             "33 characters is not a prefix of anything"
         );
@@ -11802,7 +11852,7 @@ mod tests {
             resolve_hash("fedcba98", HashKind::Destination, Vec::new())
                 .unwrap_err()
                 .to_string(),
-            "Destination fedcba98 has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh peers` lists.",
+            "Destination fedcba98 has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh people list` lists.",
             "nothing is known while the mesh is off"
         );
     }
@@ -11908,7 +11958,7 @@ mod tests {
         assert!(text.contains("announce:"), "{text}");
         assert!(
             text.contains(
-                "\n  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every 300 s; .mesh sync runs one now\n"
+                "\n  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every 300 s; .mesh messaging sync runs one now\n"
             ),
             "{text}"
         );
@@ -11940,7 +11990,9 @@ mod tests {
         let text = render_on_preview(&quiet, "work", true, None);
         assert!(text.contains("announce: nothing until"), "{text}");
         assert!(
-            text.contains("\n  propagation sync: off (announce: false); .mesh sync runs one\n"),
+            text.contains(
+                "\n  propagation sync: off (announce: false); .mesh messaging sync runs one\n"
+            ),
             "{text}"
         );
         assert!(text.contains("display name: none"), "{text}");
@@ -11956,7 +12008,7 @@ mod tests {
         let text = render_on_preview(&manual, "work", false, None);
         assert!(
             text.contains(
-                "\n  propagation sync: off (propagation_sync_interval_secs: 0); .mesh sync runs one\n"
+                "\n  propagation sync: off (propagation_sync_interval_secs: 0); .mesh messaging sync runs one\n"
             ),
             "{text}"
         );
@@ -11993,7 +12045,7 @@ mod tests {
         let text = render_on_preview(&off, "work", false, None);
         assert!(
             text.contains(
-                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on\n"
+                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on\n"
             ),
             "{text}"
         );
@@ -12250,11 +12302,11 @@ mod tests {
                 "WARNING: lan is unreachable (address in use); peers on this link-local segment are out of reach.".to_string(),
                 "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
-                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects".to_string(),
-                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: rnsd did not answer; the transport keeps redialing it, and `.mesh info` shows when it connects".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd (`rnsd`), and `.mesh config show` shows when it connects".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: rnsd did not answer; the transport keeps redialing it, and `.mesh config show` shows when it connects".to_string(),
                 "WARNING: local rnsd at @rns/default has not finished connecting; mesh traffic through it waits until it does".to_string(),
-                "WARNING: local rnsd at @rns/default lost its connection: rnsd closed the socket; the transport is redialing it, and `.mesh info` shows when it reconnects".to_string(),
-                "WARNING: local rnsd at @rns/default lost its connection: the connection ended; the transport is redialing it, and `.mesh info` shows when it reconnects".to_string(),
+                "WARNING: local rnsd at @rns/default lost its connection: rnsd closed the socket; the transport is redialing it, and `.mesh config show` shows when it reconnects".to_string(),
+                "WARNING: local rnsd at @rns/default lost its connection: the connection ended; the transport is redialing it, and `.mesh config show` shows when it reconnects".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is unreachable (attach to the shared instance failed: InvalidArgument); sessions on this machine cannot reach each other until that is fixed (start rnsd or fix mesh.interfaces) and the mesh is restarted with `.mesh off`, then `.mesh on`.".to_string(),
             ]
         );
@@ -12395,10 +12447,10 @@ mod tests {
         assert_eq!(
             table_footer(&text),
             [
-                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
                 NAME_ADDRESSING_LINE,
-                "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh peers again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
+                "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block <destination>; blocked (identity) = .mesh access block --identity <identity>",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances",
             ],
             "{text}"
         );
@@ -12434,7 +12486,7 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120)
     }
 
-    /// The whole `.mesh peers` text for another session of the owner's, one of the owner's
+    /// The whole `.mesh people list` text for another session of the owner's, one of the owner's
     /// sessions that has ended, a current trusted row whose key changed, a row with no
     /// route, a current successor, the stale row it supersedes and a stale row of its own:
     /// the sample the Commands page carries. The test
@@ -12523,28 +12575,28 @@ mod tests {
         assert_eq!(render_peers(&rows, now).plain(), PEERS_SNAPSHOT);
     }
 
-    const PEERS_SNAPSHOT: &str = r#"┌─────────────┬──────────┬──────────┬───────────┬──────┬───────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ name        ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                     │
-╞═════════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
-│ (you)       ┆ 2c3d4e5f ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                                                                           │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (you, gone) ┆ 6a7b8c9d ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh peers after its next announce) │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ alice       ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                                                                           │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob         ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh peers after its next announce) │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob         ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                                                                                                          │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (no name)   ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                          │
-└─────────────┴──────────┴──────────┴───────────┴──────┴───────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
-6 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
-Type a session name or a trust label in place of a hash, as in `.mesh status <name>` or `.mesh message <name> <text>`; give an instance a label with `.mesh trust <dest> --label <name>`.
-trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh peers again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
+    const PEERS_SNAPSHOT: &str = r#"┌─────────────┬──────────┬──────────┬───────────┬──────┬───────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ name        ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                           │
+╞═════════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
+│ (you)       ┆ 2c3d4e5f ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                                                                                 │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ (you, gone) ┆ 6a7b8c9d ┆ 8b9c0d1e ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ alice       ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                                                                                 │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob         ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob         ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                                                                                                                │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ (no name)   ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                │
+└─────────────┴──────────┴──────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh access trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh access block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh access revoke 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
+6 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.
+Type a session name or a trust label in place of a hash, as in `.mesh people status <name>` or `.mesh messaging send <name> <text>`; give an instance a label with `.mesh access trust <dest> --label <name>`.
+trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block <destination>; blocked (identity) = .mesh access block --identity <identity>
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named; left = the instance said it was leaving the mesh, until it announces again or is heard over a link; no route = this node has no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; (you: <session>) = your session of that name, running on this computer; (you, gone) = your session on this computer that has ended; (you) = another session of yours on this config dir that is not running here; <label> (<name>) = your trust label, then the name the peer announces; instance = a running session; identity = a person or an installation, which can run several instances"#;
 
-    /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
+    /// The whole `.mesh access requests` text for two cached knocks and one identity's dropped knocks.
     #[test]
     fn knocks_table_snapshot() {
         let now = fixed_now();
@@ -12579,7 +12631,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 │ carol ┆ 9a8b7c6d ┆ 1e2f3a4b ┆ 12m ago ┆ (no intro)     │
 └───────┴──────────┴──────────┴─────────┴────────────────┘
 2 knock(s). Names and intros are peer-supplied text.
-2 knock(s) from 0c1d2e3f dropped in the last 10 min (rate limit; next accepted in 6m); its earlier knocks are listed above, .mesh trust 5e6f7a8b5e6f7a8b5e6f7a8b5e6f7a8b on one of them serves it"#;
+2 knock(s) from 0c1d2e3f dropped in the last 10 min (rate limit; next accepted in 6m); its earlier knocks are listed above, .mesh access trust 5e6f7a8b5e6f7a8b5e6f7a8b5e6f7a8b on one of them serves it"#;
 
     /// Share rules and files under a temp config dir and share root; the rendered text
     /// is compared with the two directories written as `<config_dir>` and `<root>`.
@@ -12639,7 +12691,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         }
     }
 
-    /// The whole `.mesh shares` text for an allow of each scope, a deny and an override, all
+    /// The whole `.mesh files list` text for an allow of each scope, a deny and an override, all
     /// in the global file, with no workspace file.
     #[test]
     fn shares_table_snapshot() {
@@ -12674,7 +12726,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 │ override ┆ config/.env.example ┆ global ┆ lifts the built-in deny for this file │
 └──────────┴─────────────────────┴────────┴───────────────────────────────────────┘"#;
 
-    /// The whole `.mesh shares --effective` text for a shared file, one under the built-in
+    /// The whole `.mesh files list --effective` text for a shared file, one under the built-in
     /// deny and one the user denied.
     #[test]
     fn effective_shares_table_snapshot() {
@@ -12727,7 +12779,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             )
         }
 
-        /// The whole `.mesh shares --effective --all` text with no allow rule: a secret
+        /// The whole `.mesh files list --effective --all` text with no allow rule: a secret
         /// name, a file under `.git` and a plain source file, each with its verdict.
         #[test]
         fn effective_shares_all_table_snapshot() {
@@ -12783,7 +12835,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
     }
 
-    /// The node facts of a bare `.mesh info` with the node on, the shipped default (the
+    /// The node facts of a `.mesh config show` with the node on, the shipped default (the
     /// local rnsd, as a non-Linux host labels it) connected, nothing retired or heard yet:
     /// the rows the Commands page carries, the ages the page cannot know as placeholders.
     #[test]
@@ -12911,7 +12963,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     /// successor carries no marker. A row still announcing is never superseded, so two live
     /// sessions under one identity both render plainly with their ages. A same-identity row
     /// under a different name is another instance, not a successor, and a row without a
-    /// name cannot disagree. `.mesh info` prints the same marker on its `last seen` line.
+    /// name cannot disagree. `.mesh people info` prints the same marker on its `last seen` line.
     #[test]
     fn peers_marks_a_superseded_row_by_its_successor() {
         let now = SystemTime::now();
@@ -13106,7 +13158,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             table_footer(&text),
             [
-                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
                 NAME_ADDRESSING_LINE,
                 trust_legend(),
                 peers_legend().as_str(),
@@ -13117,8 +13169,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
     /// Ann's identity grants only listed instances, so the old key goes with `.mesh
     /// untrust <destination>`; Dee's grants every destination, which makes that untrust a
-    /// refusal, so the line names `block` for the old key and `untrust --identity` for the
-    /// grant. Bob's denied record keeps its refusal, lifted by `unblock`, erased by `forget`.
+    /// refusal, so the line names `access block` for the old key and `access revoke --identity` for the
+    /// grant. Bob's denied record keeps its refusal, lifted by `access unblock`, erased by `access forget`.
     #[test]
     fn peers_marks_a_record_whose_instance_was_announced_under_another_identity() {
         let now = SystemTime::now();
@@ -13199,18 +13251,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "{text}"
         );
         assert!(
-            ann.contains(&format!("then .mesh trust {new_destination}; ")),
+            ann.contains(&format!("then .mesh access trust {new_destination}; ")),
             "{text}"
         );
         assert!(
             ann.contains(&format!(
-                "; otherwise .mesh block --identity {seen_identity}; "
+                "; otherwise .mesh access block --identity {seen_identity}; "
             )),
             "the block exit names the full seen identity: {text}"
         );
         assert!(
             ann.ends_with(&format!(
-                ".mesh untrust {} stops serving the old key",
+                ".mesh access revoke {} stops serving the old key",
                 "ab".repeat(16)
             )),
             "{text}"
@@ -13228,7 +13280,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert!(
             bob.ends_with(&format!(
-                "then .mesh trust its new destination once heard; otherwise .mesh block --identity {seen_identity}; .mesh unblock {} lifts the block, .mesh forget --identity {} erases the old key, the block on it included",
+                "then .mesh access trust its new destination once heard; otherwise .mesh access block --identity {seen_identity}; .mesh access unblock {} lifts the block, .mesh access forget --identity {} erases the old key, the block on it included",
                 "ab".repeat(16),
                 "cd".repeat(16)
             )),
@@ -13246,7 +13298,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert!(
             dee.ends_with(&format!(
-                "; otherwise .mesh block --identity {seen_identity}; .mesh block {} refuses the old key, .mesh untrust --identity {} withdraws the grant",
+                "; otherwise .mesh access block --identity {seen_identity}; .mesh access block {} refuses the old key, .mesh access revoke --identity {} withdraws the grant",
                 "ab".repeat(16),
                 "cd".repeat(16)
             )),
@@ -13325,7 +13377,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert!(
             marks[0].contains(&format!(
-                "then .mesh trust {}; otherwise .mesh block --identity {seen_identity}; .mesh untrust {old_destination} stops serving the old key",
+                "then .mesh access trust {}; otherwise .mesh access block --identity {seen_identity}; .mesh access revoke {old_destination} stops serving the old key",
                 successor.destination_hash
             )),
             "the exits name the heard successor, the full seen identity and the full old hash: {text}"
@@ -13335,7 +13387,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(marks[1].starts_with("66666666 key changed: "), "{text}");
         assert!(
             marks[1].contains(&format!(
-                "then .mesh trust its new destination once heard; otherwise .mesh block --identity {seen_identity}; .mesh untrust "
+                "then .mesh access trust its new destination once heard; otherwise .mesh access block --identity {seen_identity}; .mesh access revoke "
             )),
             "a mark whose successor is not heard still says what to do: {text}"
         );
@@ -13487,7 +13539,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(!text.contains("the grant stays"), "{text}");
         assert!(
             mark.ends_with(&format!(
-                "otherwise .mesh block --identity {seen_identity}; .mesh unblock {old_destination} lifts the block, .mesh forget --identity {} erases the old key, the block on it included",
+                "otherwise .mesh access block --identity {seen_identity}; .mesh access unblock {old_destination} lifts the block, .mesh access forget --identity {} erases the old key, the block on it included",
                 "88".repeat(16)
             )),
             "a block is lifted by unblocking the old destination, heard or not, and erased with the identity: {text}"
@@ -13591,7 +13643,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
     }
 
-    /// An intro at the cache's cap reaches the table and the `.mesh info` knock row
+    /// An intro at the cache's cap reaches the table and the `.mesh people info` knock row
     /// whole; the table wraps the cell but drops nothing.
     #[test]
     fn knock_intro_at_the_cache_cap_renders_uncut() {
@@ -13664,7 +13716,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             footer[3],
             format!(
-                "{KNOCK_DROPS_REMEMBERED}+ knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                "{KNOCK_DROPS_REMEMBERED}+ knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh access trust {} on one of them serves it",
                 "12".repeat(16)
             )
         );
@@ -13775,7 +13827,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
             let records = [knock(
                 Some(".session"),
-                Some(".mesh trust x"),
+                Some(".mesh access trust x"),
                 "2026-09-21T14:13:20Z",
             )];
             let dropped = [DroppedKnocks {
@@ -13787,9 +13839,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let dot = listing.render(CommandPrefix::Dot);
             let table = table_rows(&dot);
             assert_eq!(table[0][0], ".session", "{dot}");
-            assert_eq!(table[0][4], ".mesh trust x", "{dot}");
+            assert_eq!(table[0][4], ".mesh access trust x", "{dot}");
             let drop_line = format!(
-                "1 knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                "1 knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh access trust {} on one of them serves it",
                 "12".repeat(16)
             );
             assert!(dot.ends_with(&format!("\n{drop_line}")), "{dot}");
@@ -13800,7 +13852,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(
                 slash.ends_with(&format!(
                     "\n{}",
-                    drop_line.replace(".mesh trust", "/mesh trust")
+                    drop_line.replace(".mesh access trust", "/mesh access trust")
                 )),
                 "{slash}"
             );
@@ -13812,7 +13864,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let destination = "12".repeat(16);
             let knocker = knock(
                 Some(".session"),
-                Some(".mesh trust x"),
+                Some(".mesh access trust x"),
                 "2026-09-21T14:13:20Z",
             );
             let detail = render_peer_detail(
@@ -13828,7 +13880,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(
                 dot,
                 format!(
-                    "destination: {destination}\nidentity: {}\nname: .session\ntrust: untrusted (seen only in its knock)\nknocked: {age}, intro: .mesh trust x\nNames and intros are peer-supplied text.",
+                    "destination: {destination}\nidentity: {}\nname: .session\ntrust: untrusted (seen only in its knock)\nknocked: {age}, intro: .mesh access trust x\nNames and intros are peer-supplied text.",
                     "ef".repeat(16)
                 )
             );
@@ -13905,7 +13957,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             rows,
             vec![(
                 "propagation_nodes".to_string(),
-                "none heard in the last 24 h (2 aged out); .mesh sync finds one once it announces again"
+                "none heard in the last 24 h (2 aged out); .mesh messaging sync finds one once it announces again"
                     .to_string()
             )],
             "nodes that all aged out are counted, not reported as never heard"
@@ -14047,7 +14099,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(!text.contains("answering"), "{text}");
     }
 
-    /// A reply this node sent, by its envoy or by `.mesh answer`, is headed `this node`
+    /// A reply this node sent, by its envoy or by `.mesh envoy answer`, is headed `this node`
     /// and points at the peer it answered: the message's destination, never its source,
     /// which is this node itself.
     #[test]
@@ -14249,7 +14301,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "yes",
                 "disposition: answered (the peer answered; the question is closed)",
             ],
-            "the peer's human answers with `.mesh answer` too, so no clause names its envoy: {text}"
+            "the peer's human answers with `.mesh envoy answer` too, so no clause names its envoy: {text}"
         );
         assert_eq!(indented_lines(blocks[3]), ["hi"], "{text}");
         assert!(!blocks[3].contains("disposition"), "{text}");
@@ -14792,14 +14844,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             lines,
             [
-                "Waiting for YOU (2)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+                "Waiting for YOU (2)     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
                 "  1. alice (12121212) asked 3m ago . expires in 6d . id p1",
                 "     \"may I read the plan?\"",
                 "     envoy asks: Share the plan?",
                 "  2. alice (12121212) asked 3m ago . expires in 6d . id p2",
                 "     \"may I read the plan?\"",
                 "Access requests: none",
-                "Asked by this node (2)  collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+                "Asked by this node (2)  collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
                 "  1. -> bob (abababab) 3m ago . open . id q1",
                 "     \"what now?\"",
                 "  2. -> bob (abababab) 3m ago . answered, awaiting collect . id q2",
@@ -14814,7 +14866,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     }
 
     /// The builders give every row its state word, label and stamp; the escalated state
-    /// word in particular is the one `.mesh pending` printed before the block shape.
+    /// word in particular is the one `.mesh envoy questions` printed before the block shape.
     #[test]
     fn question_rows_carry_the_state_words_and_labels() {
         let open = asked_row("q1", PendingState::Open);
@@ -14900,7 +14952,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(question_header(&row, now).plain().ends_with(" . id p1"));
     }
 
-    /// The block for each kind of question `.mesh answer` prints, rendered plain: header,
+    /// The block for each kind of question `.mesh envoy answer` and `.mesh messaging follow-up` print, rendered plain: header,
     /// body, envoy row, footer. A never-heard peer carries its short destination as its
     /// name and so reads `<dest8> (<dest8>)`, a stamp that does not parse reads as an
     /// unknown time, and a filled `expires_in` lands at the end of the header.
@@ -14914,7 +14966,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             [
                 "open . bob (abababab) . sent 3m ago . id q1",
                 "  what now?",
-                "  answer: .mesh answer q1 \"<text>\"",
+                "  answer: .mesh messaging follow-up q1 \"<text>\"",
             ]
         );
 
@@ -14926,7 +14978,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "awaiting your answer . alice (12121212) . asked 3m ago . id p1 . expires in 6d",
                 "  may I read the plan?",
                 "  envoy asks: Share the plan?",
-                "  answer: .mesh answer p1 \"<text>\"",
+                "  answer: .mesh envoy answer p1 \"<text>\"",
             ]
         );
 
@@ -14943,7 +14995,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert_eq!(
             lines[2],
-            format!("  answer: .mesh answer {full_id} \"<text>\""),
+            format!("  answer: .mesh envoy answer {full_id} \"<text>\""),
             "the footer carries the full id: {text}"
         );
     }
@@ -14965,7 +15017,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert_eq!(
             lines[lines.len() - 1],
-            "  answer: .mesh answer 3fe1be40a1b2c3d43fe1be40a1b2c3d4 \"<text>\""
+            "  answer: .mesh envoy answer 3fe1be40a1b2c3d43fe1be40a1b2c3d4 \"<text>\""
         );
     }
 
@@ -15084,7 +15136,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "an empty access section still shows: {questions_only}"
         );
         assert!(
-            !questions_only.contains("answer: .mesh answer p1"),
+            !questions_only.contains("answer: .mesh envoy answer p1"),
             "the commands sit on the section header, not under each entry: {questions_only}"
         );
     }
@@ -15146,16 +15198,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(
                 text.lines().collect::<Vec<_>>(),
                 [
-                    "Waiting for YOU (2)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+                    "Waiting for YOU (2)     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
                     "  1. alice (12121212) asked 3m ago . expires in 6d . id 320b8f7b",
                     "     \"may I read the plan?\"",
                     "     envoy asks: Do you want this rename done here?",
                     "  2. alice (12121212) asked 3m ago . expires in 6d . id 7c9d2e1f",
                     "     \"Please delete docs/notes.md.\"",
-                    "Access requests (1)     grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>",
+                    "Access requests (1)     grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
                     "  1. carol (12121212) asked 3m ago . expires in 6d . id 1046c2c6",
                     "     2 paths",
-                    "Asked by this node (1)  collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+                    "Asked by this node (1)  collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
                     "  1. -> bob (abababab) 3m ago . answered, awaiting collect . id 9e519dff",
                     "     \"what now?\"",
                 ],
@@ -15270,13 +15322,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn command_shaped_row() -> QuestionRow {
             let mut row = escalated_row(".vault", "");
             row.name = ".session".to_string();
-            row.body = ".mesh trust x".to_string();
+            row.body = ".mesh access trust x".to_string();
             row
         }
 
         fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
             command_error_text(
-                &MeshVerbError::wrap(err.context("`.mesh answer` failed")),
+                &MeshVerbError::wrap(err.context("`.mesh envoy answer` failed")),
                 prefix,
             )
         }
@@ -15287,11 +15339,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 render_pending_lists(&[], &[command_shaped_row()], &[], pending_now(), 80, false);
             assert_eq!(
                 listing.render(CommandPrefix::Dot),
-                "Waiting for YOU (1)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh trust x\"\nAccess requests: none\nAsked by this node: none"
+                "Waiting for YOU (1)     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh access trust x\"\nAccess requests: none\nAsked by this node: none"
             );
             assert_eq!(
                 listing.render(CommandPrefix::Slash),
-                "Waiting for YOU (1)     answer: /mesh answer <id> \"<text>\" . dismiss: /mesh dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh trust x\"\nAccess requests: none\nAsked by this node: none"
+                "Waiting for YOU (1)     answer: /mesh envoy answer <id> \"<text>\" . dismiss: /mesh envoy dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh access trust x\"\nAccess requests: none\nAsked by this node: none"
             );
         }
 
@@ -15301,11 +15353,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let header = "awaiting your answer . .session (12121212) . asked 3m ago . id .vault . expires in 6d";
             assert_eq!(
                 block.render(CommandPrefix::Dot),
-                format!("{header}\n  .mesh trust x\n  answer: .mesh answer .vault \"<text>\"")
+                format!(
+                    "{header}\n  .mesh access trust x\n  answer: .mesh envoy answer .vault \"<text>\""
+                )
             );
             assert_eq!(
                 block.render(CommandPrefix::Slash),
-                format!("{header}\n  .mesh trust x\n  answer: /mesh answer .vault \"<text>\"")
+                format!(
+                    "{header}\n  .mesh access trust x\n  answer: /mesh envoy answer .vault \"<text>\""
+                )
             );
             let painted = render_question_block(&command_shaped_row(), pending_now(), 80, true)
                 .render(CommandPrefix::Slash);
@@ -15314,14 +15370,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 Some(tool_name_text_forced(header).as_str())
             );
 
-            let left = nothing_sent(".vault");
+            let left = nothing_sent(AnswerRoute::Inbound, ".vault");
             assert_eq!(
                 left.render(CommandPrefix::Dot),
-                "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer .vault \"<text>\"."
+                "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh envoy answer .vault \"<text>\"."
             );
             assert_eq!(
                 left.render(CommandPrefix::Slash),
-                "Nothing was sent: the answer was left blank or cancelled. Answer later with /mesh answer .vault \"<text>\"."
+                "Nothing was sent: the answer was left blank or cancelled. Answer later with /mesh envoy answer .vault \"<text>\"."
             );
         }
 
@@ -15336,7 +15392,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let cases = [
                 (
                     resolve_pending_id(".vault", held(&[(".vault:a", question)])),
-                    "'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them.",
+                    "'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` list them.",
                 ),
                 (
                     resolve_pending_id(
@@ -15350,14 +15406,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ".session",
                         held(&[(".session", question), (".session:b", question)]),
                     ),
-                    "'.session' is a whole pending id and also how .session:... begins, so it cannot pick one. Act on .session:... first, typed as `.mesh pending` lists it, then '.session' picks the one left; or clear both with `.mesh dismiss --all`.",
+                    "'.session' is a whole pending id and also how .session:... begins, so it cannot pick one. Act on .session:... first, typed as `.mesh envoy questions`, `.mesh messaging sent` or `.mesh files requests` lists it, then '.session' picks the one left; or clear both with `.mesh envoy dismiss --all`.",
                 ),
                 (
                     resolve_pending_id(
                         ".session",
                         held(&[(".session", question), (".SESSION", question)]),
                     ),
-                    "'.SESSION' and '.session' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`.",
+                    "'.SESSION' and '.session' differ only in case, so neither can be picked; clear both with `.mesh envoy dismiss --all`.",
                 ),
                 (
                     resolve_pending_id(
@@ -15368,7 +15424,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             (".session:b", None),
                         ]),
                     ),
-                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `.mesh dismiss --all` clears .session, and .session:a leaves `.mesh pending` when it expires, and .session:b is a question this node asked, which no verb clears.",
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `.mesh envoy dismiss --all` clears .session, and .session:a leaves `.mesh files requests` when it expires, and .session:b is a question this node asked, which no verb clears.",
                 ),
             ];
             for (refused, dot) in cases {
@@ -15390,12 +15446,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 CommandPrefix::Slash,
             );
             assert!(
-                slashed.starts_with("Error: `/mesh answer` failed"),
+                slashed.starts_with("Error: `/mesh envoy answer` failed"),
                 "{slashed}"
             );
             assert!(
                 slashed.ends_with(
-                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `/mesh dismiss --all` clears .session, and .session:a leaves `/mesh pending` when it expires, and .session:b is a question this node asked, which no verb clears."
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `/mesh envoy dismiss --all` clears .session, and .session:a leaves `/mesh files requests` when it expires, and .session:b is a question this node asked, which no verb clears."
                 ),
                 "{slashed}"
             );
@@ -15404,7 +15460,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 CommandPrefix::Slash,
             );
             assert!(
-                short.ends_with("'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `/mesh pending` lists them."),
+                short.ends_with("'.vault' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `/mesh envoy questions`, `/mesh messaging sent` and `/mesh files requests` list them."),
                 "{short}"
             );
         }
@@ -15417,7 +15473,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
             command_error_text(
-                &MeshVerbError::wrap(err.context("`.mesh answer` failed")),
+                &MeshVerbError::wrap(err.context("`.mesh envoy answer` failed")),
                 prefix,
             )
         }
@@ -15428,28 +15484,28 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             vec![
                 (
                     no_open_question(".vault"),
-                    "No open question has id .vault. `.mesh pending` lists the ones this node knows about.",
-                    "No open question has id .vault. `/mesh pending` lists the ones this node knows about.",
+                    "No open question has id .vault. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.",
+                    "No open question has id .vault. `/mesh envoy questions` and `/mesh messaging sent` list the ones this node knows about.",
                 ),
                 (
                     asked_by_this_node(".vault"),
-                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then.",
-                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `/mesh pending` shows it until then.",
+                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
+                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `/mesh messaging sent` shows it until then.",
                 ),
                 (
                     access_not_a_question(".vault"),
-                    "`.vault` is an access request, not a question; decide it with `.mesh grant .vault` or `.mesh refuse .vault`",
-                    "`.vault` is an access request, not a question; decide it with `/mesh grant .vault` or `/mesh refuse .vault`",
+                    "`.vault` is an access request, not a question; decide it with `.mesh files grant .vault` or `.mesh files refuse .vault`",
+                    "`.vault` is an access request, not a question; decide it with `/mesh files grant .vault` or `/mesh files refuse .vault`",
                 ),
                 (
                     question_not_an_access_request(".vault"),
-                    "`.vault` is a question, not an access request; answer it with `.mesh answer .vault`",
-                    "`.vault` is a question, not an access request; answer it with `/mesh answer .vault`",
+                    "`.vault` is a question, not an access request; answer it with `.mesh envoy answer .vault`",
+                    "`.vault` is a question, not an access request; answer it with `/mesh envoy answer .vault`",
                 ),
                 (
                     anyhow::Error::new(already_closed(".vault")),
-                    "`.vault` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
-                    "`.vault` was already closed by another process, so nothing more was done. /mesh pending shows what is still open.",
+                    "`.vault` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open.",
+                    "`.vault` was already closed by another process, so nothing more was done. /mesh envoy questions and /mesh files requests show what is still open.",
                 ),
             ]
         }
@@ -15460,7 +15516,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 assert_eq!(err.to_string(), dot);
                 assert_eq!(
                     shown_as(err, CommandPrefix::Dot),
-                    format!("Error: `.mesh answer` failed\n\nCaused by:\n    {dot}")
+                    format!("Error: `.mesh envoy answer` failed\n\nCaused by:\n    {dot}")
                 );
             }
         }
@@ -15470,7 +15526,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             for (err, _, slash) in refusals() {
                 assert_eq!(
                     shown_as(err, CommandPrefix::Slash),
-                    format!("Error: `/mesh answer` failed\n\nCaused by:\n    {slash}")
+                    format!("Error: `/mesh envoy answer` failed\n\nCaused by:\n    {slash}")
                 );
             }
         }
@@ -15492,8 +15548,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn under_dot_each_failure_line_reads_as_it_did() {
             let dots = [
-                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss .vault.",
-                "`.vault` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss .vault.",
+                "`.vault` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open.",
             ];
             for (err, dot) in failures().into_iter().zip(dots) {
                 assert_eq!(format!("{err:#}"), dot);
@@ -15506,11 +15562,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let [held, closed] = failures();
             assert_eq!(
                 dismiss_failure_line(&held, CommandPrefix::Slash),
-                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then /mesh dismiss .vault."
+                "`.vault` is being answered by the envoy right now; wait for its hold to lapse, then /mesh envoy dismiss .vault."
             );
             assert_eq!(
                 dismiss_failure_line(&closed, CommandPrefix::Slash),
-                "`.vault` was already closed by another process, so nothing more was done. /mesh pending shows what is still open."
+                "`.vault` was already closed by another process, so nothing more was done. /mesh envoy questions and /mesh files requests show what is still open."
             );
         }
     }
@@ -15532,14 +15588,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "This sends your text to (no name) (1a2b3c4d, trust: known) over the mesh."
             );
             assert_eq!(
-                knock_confirmation(".session", DESTINATION, "known", ".mesh trust x")
+                knock_confirmation(".session", DESTINATION, "known", ".mesh access trust x")
                     .render(CommandPrefix::Dot),
-                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh access trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh access trust` on both sides."
             );
             assert_eq!(
                 knock_confirmation(&name_label(None), DESTINATION, "known", "")
                     .render(CommandPrefix::Dot),
-                "This knocks on (no name) (1a2b3c4d, trust: known) so it can trust this instance, without an intro; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+                "This knocks on (no name) (1a2b3c4d, trust: known) so it can trust this instance, without an intro; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh access trust` on both sides."
             );
         }
 
@@ -15550,9 +15606,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "This sends your text to .session (1a2b3c4d, trust: trusted) over the mesh."
             );
             assert_eq!(
-                knock_confirmation(".session", DESTINATION, "known", ".mesh trust x")
+                knock_confirmation(".session", DESTINATION, "known", ".mesh access trust x")
                     .render(CommandPrefix::Slash),
-                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `/mesh trust` on both sides."
+                "This knocks on .session (1a2b3c4d, trust: known) so it can trust this instance, with intro \".mesh access trust x\"; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `/mesh access trust` on both sides."
             );
         }
     }
@@ -15609,7 +15665,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(pick("REQ-2026-11", &held).unwrap(), "req-2026-11-0001");
             assert_eq!(
                 pick("req-20", &held).unwrap_err().to_string(),
-                "'req-20' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them."
+                "'req-20' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` list them."
             );
         }
 
@@ -15633,7 +15689,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let held = ["320b8f7b", FIRST, OTHER];
             assert_eq!(
                 pick("320b8f7b", &held).unwrap_err().to_string(),
-                "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh pending` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh dismiss --all`."
+                "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh envoy questions`, `.mesh messaging sent` or `.mesh files requests` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh envoy dismiss --all`."
             );
             assert_eq!(pick("320b8f7b1", &held).unwrap(), FIRST);
         }
@@ -15642,7 +15698,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn a_short_whole_id_names_every_longer_id_it_begins() {
             assert_eq!(
                 pick("q1", &["q1", "q10", "q11"]).unwrap_err().to_string(),
-                "'q1' is a whole pending id and also how q10, q11 begin, so it cannot pick one. Act on q10, q11 first, typed as `.mesh pending` lists them, then 'q1' picks the one left; or clear them with `.mesh dismiss --all`."
+                "'q1' is a whole pending id and also how q10, q11 begin, so it cannot pick one. Act on q10, q11 first, typed as `.mesh envoy questions`, `.mesh messaging sent` or `.mesh files requests` lists them, then 'q1' picks the one left; or clear them with `.mesh envoy dismiss --all`."
             );
         }
 
@@ -15652,7 +15708,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 pick("ab12cd34", &["ab12cd34", "AB12CD34"])
                     .unwrap_err()
                     .to_string(),
-                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`."
+                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; clear both with `.mesh envoy dismiss --all`."
             );
             assert_eq!(
                 held_as(
@@ -15662,11 +15718,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 )
                 .unwrap_err()
                 .to_string(),
-                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
+                "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh files requests` when they expire."
             );
         }
 
-        /// `.mesh dismiss --all` clears only questions, so an access request in the way
+        /// `.mesh envoy dismiss --all` clears only questions, so an access request in the way
         /// is named by when it leaves, and a question this node asked, which no verb
         /// clears, takes away the advice to act on the longer id first.
         #[test]
@@ -15677,7 +15733,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ];
             assert_eq!(
                 resolve_pending_id("q1", held).unwrap_err().to_string(),
-                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one. Act on q10 first, typed as `.mesh pending` lists it, then 'q1' picks the one left; or `.mesh dismiss --all` clears q1, and q10 leaves `.mesh pending` when it expires."
+                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one. Act on q10 first, typed as `.mesh envoy questions`, `.mesh messaging sent` or `.mesh files requests` lists it, then 'q1' picks the one left; or `.mesh envoy dismiss --all` clears q1, and q10 leaves `.mesh files requests` when it expires."
             );
             let held = vec![
                 ("q1".to_string(), Some(InboundKind::Access)),
@@ -15685,7 +15741,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ];
             assert_eq!(
                 resolve_pending_id("q1", held).unwrap_err().to_string(),
-                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one; q1 leaves `.mesh pending` when it expires, and q10 is a question this node asked, which no verb clears."
+                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one; q1 leaves `.mesh files requests` when it expires, and q10 is a question this node asked, which no verb clears."
             );
         }
 
@@ -15701,7 +15757,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         #[test]
         fn hex_shorter_than_eight_is_refused() {
-            let refusal = "is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them.";
+            let refusal = "is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` list them.";
             assert_eq!(
                 resolve("1046c2c").unwrap_err().to_string(),
                 format!("'1046c2c' {refusal}")
@@ -16033,7 +16089,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "{text}"
             );
             assert!(
-                lines[0].contains(&format!("run .mesh trust {own}")),
+                lines[0].contains(&format!("run .mesh access trust {own}")),
                 "{text}"
             );
             assert!(
@@ -16047,7 +16103,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(
                 render_broadcast(&nobody)
                     .render(CommandPrefix::Slash)
-                    .contains("`/mesh peers` lists"),
+                    .contains("`/mesh people list` lists"),
             );
         }
     }
@@ -16106,7 +16162,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(BROADCAST_NOTICE.contains("not trusted receive nothing"));
     }
 
-    /// Peer-supplied text in `.mesh pending` and `.mesh knocks` goes through `display_text`:
+    /// Peer-supplied text in `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` and `.mesh access requests` goes through `display_text`:
     /// escape sequences, control characters and line breaks never reach the terminal, and one
     /// record never renders as two rows.
     #[test]
@@ -16128,7 +16184,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         for c in forbidden {
             assert!(
                 !text.contains(c),
-                "{c:?} leaked into `.mesh pending`: {text:?}"
+                "{c:?} leaked into `.mesh envoy questions`: {text:?}"
             );
         }
         let lines: Vec<&str> = text.lines().collect();
@@ -16161,7 +16217,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         for c in forbidden {
             assert!(
                 !text.contains(c),
-                "{c:?} leaked into `.mesh knocks`: {text:?}"
+                "{c:?} leaked into `.mesh access requests`: {text:?}"
             );
         }
         let rows = table_rows(&text);
@@ -16294,7 +16350,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _prefix = installed(prefix);
                     let _capture = capture::install();
                     out_text(MESH_OFF);
-                    err_text("Not trusted yet; `.mesh trust 1a2b3c4d` trusts it.");
+                    err_text("Not trusted yet; `.mesh access trust 1a2b3c4d` trusts it.");
                     assert_eq!(
                         capture::lines(),
                         [
@@ -16304,7 +16360,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ),
                             (
                                 capture::Stream::Err,
-                                format!("Not trusted yet; `{mesh} trust 1a2b3c4d` trusts it.")
+                                format!(
+                                    "Not trusted yet; `{mesh} access trust 1a2b3c4d` trusts it."
+                                )
                             ),
                         ],
                         "{prefix}"
@@ -16337,9 +16395,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .collect()
             }
 
-            /// The node-off line of `.mesh info` and the `.mesh off` pointer follow the
-            /// prefix the session was switched to, as do the refusals `.mesh pending` and
-            /// `.mesh knocks` raise while the mesh is off.
+            /// The node-off line of `.mesh config show` and the `.mesh off` pointer follow the
+            /// prefix the session was switched to, as do the refusals `.mesh envoy questions` and
+            /// `.mesh access requests` raise while the mesh is off.
             #[test]
             #[serial]
             fn mesh_verbs_spell_their_hints_in_the_configured_prefix() {
@@ -16394,7 +16452,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let printer =
                     PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live).with_width(80);
                 let attached = printer.attach();
-                let knock = || Notification::new(Source::Knock, "`.mesh trust 1a2b`").render();
+                let knock =
+                    || Notification::new(Source::Knock, "`.mesh access trust 1a2b`").render();
                 let _capture = capture::install();
 
                 run_async(run(&mut ctx, ".mesh config show")).unwrap();
@@ -16414,13 +16473,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 for mesh in [".mesh", "/mesh"] {
                     assert_eq!(
                         attached.get_line(),
-                        Some(format!("[mesh:knock] `{mesh} trust 1a2b`"))
+                        Some(format!("[mesh:knock] `{mesh} access trust 1a2b`"))
                     );
                 }
             }
         }
 
-        /// One inbox block's `.mesh inbox` output as logical lines: the header, then each
+        /// One inbox block's `.mesh messaging inbox` output as logical lines: the header, then each
         /// labelled row with its hanging continuation rows joined back on by a single
         /// space. The arm wraps at the live terminal width, so a test that pins a row's
         /// text compares these, not the physical rows.
@@ -16683,7 +16742,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
 
         /// The mesh-off refusal comes from the store's own text and lands before any
-        /// prompt, so an unattended `.mesh trust` never hangs on a question it cannot act on.
+        /// prompt, so an unattended `.mesh access trust` never hangs on a question it cannot act on.
         #[test]
         #[serial]
         fn trust_mutations_are_refused_while_the_mesh_is_off_before_any_prompt() {
@@ -16711,8 +16770,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
 
         /// Both verbs refuse with the same teaching text as every other node verb, before
-        /// any prompt and before any progress line, so an unattended `.mesh sync` or
-        /// `.mesh knock` never hangs or claims to be asking a node that is not there.
+        /// any prompt and before any progress line, so an unattended `.mesh messaging sync` or
+        /// `.mesh access ask` never hangs or claims to be asking a node that is not there.
         #[test]
         #[serial]
         fn sync_and_knock_are_refused_while_the_mesh_is_off_before_any_prompt() {
@@ -16755,7 +16814,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
 
         /// A propagation node that refused, brought no link up, did not answer, or whose
-        /// link closed under the list request ends `.mesh sync` as an error carrying the
+        /// link closed under the list request ends `.mesh messaging sync` as an error carrying the
         /// fetch's own line; a sync already running is a notice, not an error.
         #[test]
         fn sync_ends_in_the_fetchs_own_error_for_a_node_that_refused_or_did_not_answer() {
@@ -16832,7 +16891,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             };
             assert_eq!(
                 render_sync(&none_served),
-                "deadbeef lists 7 messages for this node and 3 were asked for, but none were served; run .mesh sync again or check the node's logs."
+                "deadbeef lists 7 messages for this node and 3 were asked for, but none were served; run .mesh messaging sync again or check the node's logs."
             );
             let full_page_none_served = FetchReport {
                 listed: 100,
@@ -16861,7 +16920,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             };
             assert_eq!(
                 render_sync(&full_page),
-                "Fetched from deadbeef: 100 listed, 64 wanted, 64 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred. More may be held; run .mesh sync again."
+                "Fetched from deadbeef: 100 listed, 64 wanted, 64 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred. More may be held; run .mesh messaging sync again."
             );
         }
 
@@ -16905,7 +16964,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(lines[0], "brief mode: auto", "{out}");
             assert_eq!(
                 lines[1],
-                "sections: card . digest (none yet) . your note (none; .mesh brief note \"text\" sets it) . todo (empty)",
+                "sections: card . digest (none yet) . your note (none; .mesh envoy brief note \"text\" sets it) . todo (empty)",
                 "{out}"
             );
             assert_eq!(
@@ -16956,15 +17015,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             for (word, expected) in [
                 (
                     "auto",
-                    "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.",
+                    "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.",
                 ),
                 (
                     "manual",
-                    "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.",
+                    "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.",
                 ),
                 (
                     "off",
-                    "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.",
+                    "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on.",
                 ),
             ] {
                 let out =
@@ -17020,13 +17079,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let out = run_async(out_of(&mut ctx, ".mesh envoy brief")).unwrap();
             assert_eq!(
                 out,
-                "brief mode: off\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on."
+                "brief mode: off\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on."
             );
         }
 
         /// A note set under `off` is kept but reaches no peer until a mode assembles a
         /// brief again, so the confirmation says so, and points at the modes rather than
-        /// at `.mesh brief`, whose bare form under off shows no sections (and so no held
+        /// at `.mesh envoy brief`, whose bare form under off shows no sections (and so no held
         /// note) to go and see.
         #[test]
         #[serial]
@@ -17043,10 +17102,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             .unwrap();
             assert_eq!(
                 out,
-                "Note set, but brief mode is off, so your envoy does not include it until `.mesh brief auto` or `.mesh brief manual`; then it goes with the card (and, in auto mode, the digest)."
+                "Note set, but brief mode is off, so your envoy does not include it until `.mesh envoy brief auto` or `.mesh envoy brief manual`; then it goes with the card (and, in auto mode, the digest)."
             );
             assert_eq!(
-                out.matches("`.mesh brief").count(),
+                out.matches("`.mesh envoy brief").count(),
                 2,
                 "the off confirmation's next commands are the two modes, never the bare verb: {out}"
             );
@@ -17063,7 +17122,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let _capture = capture::install();
             let mut ctx = off_ctx();
             let hash = "ab".repeat(16);
-            // `.mesh rotate` is gated the other way round and has its own tests.
+            // `.mesh config rotate-identity` is gated the other way round and has its own tests.
             for line in [
                 ".mesh people list".to_string(),
                 ".mesh access requests".to_string(),
@@ -17438,7 +17497,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             for control in ['\x1b', '\u{7}', '\r'] {
                 assert!(
                     !out.contains(control),
-                    "{control:?} leaked into `.mesh inbox`: {out:?}"
+                    "{control:?} leaked into `.mesh messaging inbox`: {out:?}"
                 );
             }
             assert!(!out.contains("[31m"), "{out}");
@@ -17545,7 +17604,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             );
         }
 
-        /// A file part's `name` and its `reference` are peer-chosen paths, so `.mesh inbox`
+        /// A file part's `name` and its `reference` are peer-chosen paths, so `.mesh messaging inbox`
         /// passes both through `display_text`: a line terminator, a carriage return, an
         /// escape sequence, a line separator or a variation selector in either can neither
         /// split the row nor reach the terminal, and a clean path renders byte for byte.
@@ -17642,7 +17701,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             for leaked in ['\x1b', '\r', '\u{2028}'] {
                 assert!(
                     !out.contains(leaked),
-                    "{leaked:?} leaked into `.mesh inbox`: {out:?}"
+                    "{leaked:?} leaked into `.mesh messaging inbox`: {out:?}"
                 );
             }
             assert_eq!(
@@ -17708,7 +17767,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
                 let mut ctx = chat_capable_ctx(prefix);
 
-                // Bare `/mesh` is the verb list, `/mesh info` the info card.
+                // Bare `/mesh` is the verb list, `/mesh config show` the info card.
                 let help = run_async(out_of(&mut ctx, "/mesh")).unwrap();
                 assert!(help.contains("Mesh commands"), "{prefix}: {help}");
                 let info = run_async(out_of(&mut ctx, "/mesh config show")).unwrap();
@@ -17746,7 +17805,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let _capture = capture::install();
             let _script = prompt_script::install(&[]);
 
-            // Under slash, `.mesh info` is prose: the dry-run chat path
+            // Under slash, `.mesh config show` is prose: the dry-run chat path
             // completes and nothing of the info card is printed.
             let mut ctx = chat_capable_ctx(CommandPrefix::Slash);
             let out = run_async(out_of(&mut ctx, ".mesh config show"))
@@ -17807,7 +17866,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             run(ctx, line).await.expect_err(line).to_string()
         }
 
-        /// The rows of the last `.mesh info` printed, as `(key, value)`.
+        /// The rows of the last `.mesh config show` printed, as `(key, value)`.
         fn info_rows(out: &str) -> Vec<(String, String)> {
             let last = out
                 .rfind('┌')
@@ -17818,7 +17877,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 .collect()
         }
 
-        /// The value of the row keyed `name` in the last `.mesh info` printed.
+        /// The value of the row keyed `name` in the last `.mesh config show` printed.
         fn info_row(out: &str, name: &str) -> String {
             info_rows(out)
                 .into_iter()
@@ -17826,7 +17885,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 .unwrap_or_else(|| panic!("no {name} row in {out}"))
         }
 
-        /// Whether `out` carries a `.mesh info` table with a row keyed `name`.
+        /// Whether `out` carries a `.mesh config show` table with a row keyed `name`.
         fn has_info_row(out: &str, name: &str) -> bool {
             out.contains('┌') && info_rows(out).iter().any(|(key, _)| key == name)
         }
@@ -17989,7 +18048,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(!err.to_lowercase().contains("macro"), "{err}");
         }
 
-        /// `.mesh brief auto|manual|off` flips the per-session mode and `note`/`note clear`
+        /// `.mesh envoy brief auto|manual|off` flips the per-session mode and `note`/`note clear`
         /// drive `set_user_brief`, all in memory: config.yaml is never written. The
         /// retired `set`/`clear` spellings are errors that change nothing and name the
         /// new ones.
@@ -18016,7 +18075,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             .unwrap();
             assert_eq!(
                 out,
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from."
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from."
             );
             assert_eq!(
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
@@ -18034,7 +18093,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 assert_eq!(
                     err,
                     format!(
-                        ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+                        ".mesh envoy brief has no '{word}' argument. Set the note with `.mesh envoy brief note \"text\"` and remove it with `.mesh envoy brief note clear`."
                     )
                 );
                 assert_eq!(
@@ -18046,7 +18105,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let out = run_async(out_of(&mut ctx, ".mesh envoy brief note clear")).unwrap();
             assert_eq!(
                 out,
-                "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one."
+                "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one."
             );
             assert!(ctx.app.mesh.user_brief().is_none());
 
@@ -18058,9 +18117,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
 
         /// The `.mesh on` preview's brief row follows the brief mode set in this
-        /// session, not the config file's: after `.mesh brief manual` the row drops the
-        /// digest, after `.mesh brief off` it says none is assembled and names the two
-        /// commands that turn it on, and after `.mesh brief auto` it is the full row. A
+        /// session, not the config file's: after `.mesh envoy brief manual` the row drops the
+        /// digest, after `.mesh envoy brief off` it says none is assembled and names the two
+        /// commands that turn it on, and after `.mesh envoy brief auto` it is the full row. A
         /// declined preview changes nothing.
         #[test]
         #[serial]
@@ -18077,7 +18136,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
             const AUTO_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such";
             const MANUAL_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such";
-            const OFF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on";
+            const OFF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on";
 
             for (mode, row) in [("manual", MANUAL_ROW), ("off", OFF_ROW), ("auto", AUTO_ROW)] {
                 run_async(run(&mut ctx, &format!(".mesh envoy brief {mode}"))).unwrap();
@@ -18228,7 +18287,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let out = run_async(out_of(&mut ctx, ".mesh envoy brief   note    clear  ")).unwrap();
             assert_eq!(
                 out,
-                "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one."
+                "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one."
             );
             assert!(ctx.app.mesh.user_brief().is_none());
 
@@ -18309,7 +18368,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 );
                 assert!(out.contains("mesh/identity.key.lock"), "{line}: {out}");
                 assert!(
-                    out.contains(&format!(".mesh rotate --confirm {token}")),
+                    out.contains(&format!(".mesh config rotate-identity --confirm {token}")),
                     "{line}: {out}"
                 );
                 assert_eq!(fs::read(&path).unwrap(), before, "{line}");
@@ -18466,7 +18525,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let err = err_of(&mut ctx, ".mesh config rotate-identity --yes");
             assert_eq!(
                 err,
-                "`.mesh rotate` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+                "`.mesh config rotate-identity` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
             );
             assert_eq!(fs::read(&path).unwrap(), before);
 
@@ -18518,7 +18577,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 assert_eq!(
                     text,
                     format!(
-                        "Trusted your own identity abababab as \"this node\", so your other sessions on this config dir can message this one; .mesh untrust --identity {identity} takes the grant back."
+                        "Trusted your own identity abababab as \"this node\", so your other sessions on this config dir can message this one; .mesh access revoke --identity {identity} takes the grant back."
                     )
                 );
                 assert!(text.is_ascii());
@@ -18704,9 +18763,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     dry_run.contains("does not trust the new identity"),
                     "{dry_run}"
                 );
-                assert!(dry_run.contains(".mesh trust --identity"), "{dry_run}");
                 assert!(
-                    dry_run.contains("because the old identity holds no \"this node\" grant; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh trust --identity <the new hash the rotation prints>"),
+                    dry_run.contains(".mesh access trust --identity"),
+                    "{dry_run}"
+                );
+                assert!(
+                    dry_run.contains("because the old identity holds no \"this node\" grant; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh access trust --identity <the new hash the rotation prints>"),
                     "{dry_run}"
                 );
                 let new = current();
@@ -18718,7 +18780,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 );
                 assert!(out.contains("is not trusted"), "{out}");
                 assert!(
-                    out.contains(&format!(".mesh on, then .mesh trust --identity {new}.")),
+                    out.contains(&format!(
+                        ".mesh on, then .mesh access trust --identity {new}."
+                    )),
                     "{out}"
                 );
             }
@@ -18743,13 +18807,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = stdout_lines().join("\n");
                 assert!(
-                    out.contains(&format!(".mesh rotate --confirm rotate-{}", short(&old))),
+                    out.contains(&format!(
+                        ".mesh config rotate-identity --confirm rotate-{}",
+                        short(&old)
+                    )),
                     "{out}"
                 );
                 assert!(out.contains("the trust list could not be read ("), "{out}");
                 assert!(
                     out.contains(&format!(
-                        "so rotating will not move the \"this node\" grant; fix or move {}, and after rotating run .mesh on, then .mesh trust --identity <the new hash the rotation prints>",
+                        "so rotating will not move the \"this node\" grant; fix or move {}, and after rotating run .mesh on, then .mesh access trust --identity <the new hash the rotation prints>",
                         trust_path.display()
                     )),
                     "{out}"
@@ -18779,13 +18846,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let err = format!("{err:#}");
                 assert!(
                     err.contains(&format!(
-                        "(fix or move {}), then run .mesh on, then .mesh trust --identity {new}",
+                        "(fix or move {}), then run .mesh on, then .mesh access trust --identity {new}",
                         trust_path.display()
                     )),
                     "{err}"
                 );
                 assert!(
-                    err.contains(&format!(".mesh untrust --identity {old}")),
+                    err.contains(&format!(".mesh access revoke --identity {old}")),
                     "{err}"
                 );
             }
@@ -18801,12 +18868,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 };
                 assert_eq!(
                     rotation_self_trust_preview(blocked_old),
-                    "your own trust list keeps its entries and does not trust the new identity, because the old identity is blocked on it and so holds no \"this node\" grant to move; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh trust --identity <the new hash the rotation prints>"
+                    "your own trust list keeps its entries and does not trust the new identity, because the old identity is blocked on it and so holds no \"this node\" grant to move; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh access trust --identity <the new hash the rotation prints>"
                 );
                 assert_eq!(
                     rotated_self_trust_text(&new, blocked_old),
                     format!(
-                        "The new identity abababab is not trusted, because the old identity was blocked on your trust list and so held no \"this node\" grant to move. To let your sessions on this config dir message each other, run .mesh on, then .mesh trust --identity {new}."
+                        "The new identity abababab is not trusted, because the old identity was blocked on your trust list and so held no \"this node\" grant to move. To let your sessions on this config dir message each other, run .mesh on, then .mesh access trust --identity {new}."
                     )
                 );
                 let never_seeded = SelfTrustRotation {
@@ -18852,7 +18919,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         text.contains(&format!(
-                            "new identity abababab is blocked on your trust list, so it was not trusted. To let your sessions on this config dir message each other, run .mesh on, then .mesh unblock --identity {new} --yes and .mesh trust --identity {new}."
+                            "new identity abababab is blocked on your trust list, so it was not trusted. To let your sessions on this config dir message each other, run .mesh on, then .mesh access unblock --identity {new} --yes and .mesh access trust --identity {new}."
                         )),
                         "{text}"
                     );
@@ -19242,7 +19309,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh info <old destination>` of a stale row whose identity has since
+            /// `.mesh people info <old destination>` of a stale row whose identity has since
             /// announced from another destination carries the superseded marker on its
             /// `last seen` line, read through the live peer table rather than a rendered
             /// fixture, and the new row carries none.
@@ -19400,7 +19467,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// With sessions `a` and `temp` running on one cache dir, `a` names temp's
-                /// row `(you: temp)` in `.mesh peers` and in `.mesh pending`, while an own
+                /// row `(you: temp)` in `.mesh people list` and in `.mesh messaging sent`, while an own
                 /// identity row no running session serves stays `(you)`.
                 #[test]
                 #[serial]
@@ -19469,9 +19536,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// Once `temp` stops in order its registry row stays as a tombstone: `a`
-                /// names temp's row `(you, gone)` with `no route` in `.mesh peers`,
+                /// names temp's row `(you, gone)` with `no route` in `.mesh people list`,
                 /// `mesh__peers` marks it `session_gone` and unreachable, the question it
-                /// left open reads `asked by (you, gone: temp)` in `.mesh pending`, and
+                /// left open reads `asked by (you, gone: temp)` in `.mesh messaging sent`, and
                 /// the name `temp` no longer resolves.
                 #[test]
                 #[serial]
@@ -19592,10 +19659,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `a`'s `.mesh pending` lists the questions every other session on the
+                /// `a`'s `.mesh messaging sent` lists the questions every other session on the
                 /// cache dir asked under `Asked by this node`, each naming the session
                 /// that asked it (running, ended, or no longer in the registry) and
-                /// saying to collect it there; `.mesh answer` on one is refused with
+                /// saying to collect it there; `.mesh messaging follow-up` on one is refused with
                 /// the same name and the command to run in that session, and nothing
                 /// is sent or opened in `a`.
                 #[test]
@@ -19667,7 +19734,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert!(out.contains(&format!(". id {id}")), "no {id} in {out}");
                         }
 
-                        let running = "Question q-temp-0001 was asked by (you: temp), not this session, and only the session that asked it can collect the reply or follow up: run `.mesh answer q-temp-0001 \"<text>\"` in session temp.";
+                        let running = "Question q-temp-0001 was asked by (you: temp), not this session, and only the session that asked it can collect the reply or follow up: run `.mesh messaging follow-up q-temp-0001 \"<text>\"` in session temp.";
                         for verb in [
                             ".mesh envoy answer q-temp-0001 \"main\"",
                             ".mesh envoy dismiss q-temp-0001",
@@ -19681,7 +19748,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .to_string();
                         assert_eq!(
                             gone,
-                            "Question q-gone-0001 was asked by (you, gone: old), which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session old` and `.mesh on`, then run `.mesh answer q-gone-0001 \"<text>\"` in session old."
+                            "Question q-gone-0001 was asked by (you, gone: old), which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session old` and `.mesh on`, then run `.mesh messaging follow-up q-gone-0001 \"<text>\"` in session old."
                         );
                         let by_prefix = out_of(&mut ctx, ".mesh envoy answer q-lost-0 \"main\"")
                             .await
@@ -19704,7 +19771,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     use super::*;
 
                     /// A row forged at a running session's destination under another
-                    /// identity is not that session in `.mesh peers` or `.mesh pending`,
+                    /// identity is not that session in `.mesh people list` or `.mesh messaging sent`,
                     /// and a question from an own-identity instance no session serves
                     /// names it `(you)`, never by the self-trust grant's label.
                     #[test]
@@ -19792,9 +19859,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
             }
 
-            /// `.mesh trust <destA>` makes identity I known; a second heard instance destB
+            /// `.mesh access trust <destA>` makes identity I known; a second heard instance destB
             /// of I, with no record of its own, reads `known` rather than `untrusted` in
-            /// `.mesh peers`, `.mesh info destB` and the `mesh__peers` tool's `trust` field,
+            /// `.mesh people list`, `.mesh people info destB` and the `mesh__peers` tool's `trust` field,
             /// while destA stays `trusted`.
             #[test]
             #[serial]
@@ -19872,7 +19939,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh peers` through the command path over the live peer table. No row was
+            /// `.mesh people list` through the command path over the live peer table. No row was
             /// announced over the network, so the transport holds no path to any of them and
             /// every row reads `no route`, except that of two stale rows under one identity
             /// the older is superseded by the newer (the successor need not be live); the
@@ -19968,7 +20035,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(footer.len(), 4, "{first}");
                     assert_eq!(
                         footer[0],
-                        "5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                        "5 peer(s). Names are peer-supplied text. Full hashes: `.mesh people info <dest>`.",
                         "{first}"
                     );
                     assert_eq!(
@@ -20024,7 +20091,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// With the node on, `.mesh inbox` tells a peer's message from the reply this
+            /// With the node on, `.mesh messaging inbox` tells a peer's message from the reply this
             /// node filed in answer: the peer's block is `from` the peer; this node's
             /// block is headed `this node ->` and names the peer it answered, by the
             /// peer table's name for the reply's destination, with the node's own hash
@@ -20109,7 +20176,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The reply the envoy path itself files, minted from the running instance's
-            /// destination, is what `.mesh inbox` heads `this node ->`; the question it
+            /// destination, is what `.mesh messaging inbox` heads `this node ->`; the question it
             /// answered, filed just before it, stays the peer's.
             #[test]
             #[serial]
@@ -20670,7 +20737,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap_err()
                         .to_string();
                     assert!(
-                        err.starts_with(".mesh brief has no 'set' argument."),
+                        err.starts_with(".mesh envoy brief has no 'set' argument."),
                         "{err}"
                     );
 
@@ -20708,7 +20775,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     for line in [".mesh envoy answer nope \"yes\"", ".mesh envoy answer nope"] {
                         let err = run(&mut ctx, line).await.unwrap_err().to_string();
                         assert!(err.contains("No open question has id nope"), "{err}");
-                        assert!(err.contains(".mesh pending"), "{err}");
+                        assert!(err.contains(".mesh envoy questions"), "{err}");
                         assert!(!err.contains("not a terminal"), "{line}: {err}");
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -20957,7 +21024,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(predecessors.ends_with("s ago)"), "{out}");
                     assert_eq!(
                         info_row(&out, "key changes"),
-                        "1 instance(s) announced under another identity; see .mesh peers",
+                        "1 instance(s) announced under another identity; see .mesh people list",
                         "{out}"
                     );
 
@@ -21042,7 +21109,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .find(|(key, _)| key == "key changes")
                         .unwrap_or_else(|| panic!("{rows:?}"));
                     assert!(key_changes.1.starts_with("1 instance(s)"), "{rows:?}");
-                    assert!(key_changes.1.ends_with("see .mesh peers"), "{rows:?}");
+                    assert!(key_changes.1.ends_with("see .mesh people list"), "{rows:?}");
                     assert!(
                         !keys(&rows).iter().any(|key| key == "identity predecessors"),
                         "{rows:?}"
@@ -21160,7 +21227,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(
                         rows[7].1,
-                        "1 instance(s) announced under another identity; see .mesh peers",
+                        "1 instance(s) announced under another identity; see .mesh people list",
                         "{rows:?}"
                     );
 
@@ -21304,7 +21371,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// With the memory on, `.mesh status` and `.mesh info` count the conversations
+            /// With the memory on, `.mesh status` and `.mesh config show` count the conversations
             /// and identities of the store the node serves, the count moving as the store
             /// fills.
             #[test]
@@ -21444,12 +21511,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(marker.contains(short(&new_identity)), "{out}");
                     assert!(marker.contains(short(&old_identity)), "{out}");
                     assert!(
-                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        marker.contains(&format!("then .mesh access trust {new_dest}; ")),
                         "the marker names the destination heard under the new key: {out}"
                     );
                     assert!(
                         marker.ends_with(&format!(
-                            ".mesh untrust {old_dest} stops serving the old key"
+                            ".mesh access revoke {old_dest} stops serving the old key"
                         )),
                         "{out}"
                     );
@@ -21464,7 +21531,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )),
                         "{out}"
                     );
-                    assert!(out.contains(&format!(".mesh untrust {old_dest}")), "{out}");
+                    assert!(
+                        out.contains(&format!(".mesh access revoke {old_dest}")),
+                        "{out}"
+                    );
 
                     let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert!(!out.contains("key changed:"), "{out}");
@@ -21477,8 +21547,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The superseded record is a denied one, the record-plus-deny shape an older
-            /// release wrote: `.mesh peers` marks its heard row with the refusal it keeps,
-            /// `.mesh trust` of the new destination still clears the mark, and its line says
+            /// release wrote: `.mesh people list` marks its heard row with the refusal it keeps,
+            /// `.mesh access trust` of the new destination still clears the mark, and its line says
             /// the old key keeps a refusal, not a grant.
             #[test]
             #[serial]
@@ -21528,7 +21598,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         marker.ends_with(&format!(
-                            ".mesh unblock {old_dest} lifts the block, .mesh forget --identity {old_identity} erases the old key, the block on it included"
+                            ".mesh access unblock {old_dest} lifts the block, .mesh access forget --identity {old_identity} erases the old key, the block on it included"
                         )),
                         "{out}"
                     );
@@ -21539,7 +21609,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(out.contains("added"), "{out}");
                     assert!(
                         out.contains(&format!(
-                            "trusted before as {old_dest} under another identity; that record's key-change mark is cleared. The old key stays refused there; .mesh unblock {old_dest} lifts the block, .mesh forget --identity {old_identity} erases the old key, the block on it included."
+                            "trusted before as {old_dest} under another identity; that record's key-change mark is cleared. The old key stays refused there; .mesh access unblock {old_dest} lifts the block, .mesh access forget --identity {old_identity} erases the old key, the block on it included."
                         )),
                         "{out}"
                     );
@@ -21561,8 +21631,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// The denied record an older release built when an operator trusted an identity
             /// for all destinations and untrusted one of its instances: a record with a deny
             /// on top. When that instance is then trusted under a new key, the line about
-            /// the old record advises verbs that do something: `.mesh untrust <old>` is
-            /// refused under the identity grant and changes nothing, `.mesh unblock <old>`
+            /// the old record advises verbs that do something: `.mesh access revoke <old>` is
+            /// refused under the identity grant and changes nothing, `.mesh access unblock <old>`
             /// lifts the block.
             #[test]
             #[serial]
@@ -21617,12 +21687,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(out.contains("added"), "{out}");
                     assert!(
                         out.contains(&format!(
-                            "The old key stays refused there; .mesh unblock {old_dest} lifts the block, .mesh forget --identity {old_identity} erases the old key, the block on it included."
+                            "The old key stays refused there; .mesh access unblock {old_dest} lifts the block, .mesh access forget --identity {old_identity} erases the old key, the block on it included."
                         )),
                         "{out}"
                     );
                     assert!(
-                        !out.contains(&format!(".mesh untrust {old_dest}")),
+                        !out.contains(&format!(".mesh access revoke {old_dest}")),
                         "the line must not advise a verb that is refused: {out}"
                     );
 
@@ -21632,7 +21702,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         refusal(&mut ctx, &format!(".mesh access revoke {old_dest} --yes")).await;
                     assert!(
                         err.contains(&format!(
-                            "To stop serving just this instance, run .mesh block {old_dest}."
+                            "To stop serving just this instance, run .mesh access block {old_dest}."
                         )),
                         "{err}"
                     );
@@ -21659,8 +21729,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The identity heard under the new key is then trusted for all destinations.
-            /// That grant clears nothing; `.mesh peers` still shows the collision and names
-            /// the new destination as its successor; `.mesh trust <new destination>` is what
+            /// That grant clears nothing; `.mesh people list` still shows the collision and names
+            /// the new destination as its successor; `.mesh access trust <new destination>` is what
             /// names the superseded record and clears the mark.
             #[test]
             #[serial]
@@ -21718,7 +21788,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap_or_else(|| panic!("no key-change marker in {out}"));
                     assert!(marker.contains(short(&new_identity)), "{out}");
                     assert!(
-                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        marker.contains(&format!("then .mesh access trust {new_dest}; ")),
                         "the successor is named although its identity is trusted for all: {out}"
                     );
 
@@ -21746,7 +21816,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// The old record's row has aged out of the peer table while the instance is
             /// heard under its new key, whose identity the human trusted for all
-            /// destinations: `.mesh peers` lists the marked record as not heard and its
+            /// destinations: `.mesh people list` lists the marked record as not heard and its
             /// marker names the heard successor to trust, not a destination still to come.
             #[test]
             #[serial]
@@ -21803,7 +21873,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(marker.contains(short(&new_identity)), "{out}");
                     assert!(
-                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        marker.contains(&format!("then .mesh access trust {new_dest}; ")),
                         "the marker names the heard successor: {out}"
                     );
                     assert!(!marker.contains("its new destination once heard"), "{out}");
@@ -21878,7 +21948,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
                     assert!(
-                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        marker.contains(&format!("then .mesh access trust {new_dest}; ")),
                         "the marker names the heard successor: {out}"
                     );
 
@@ -22013,7 +22083,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh info <destination>` says what `.mesh peers` says of the same row: the
+            /// `.mesh people info <destination>` says what `.mesh people list` says of the same row: the
             /// colliding identity trusted for all destinations is `trusted` by its grant in
             /// both modes, while what the node serves it moves with `mesh.collision_protection`.
             #[test]
@@ -22146,9 +22216,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// line; the old row then ages out and the refusal stands from memory. `.mesh
             /// untrust --identity <old> --confirm untrust-<short>` admits the new key, the
             /// memo refusing only for a holder still trusted for all destinations, and
-            /// trusting the old key again refuses it again from the same memo; `.mesh block
+            /// trusting the old key again refuses it again from the same memo; `.mesh access block
             /// <new> --yes` refuses the new key as blocked, admits the old key and clears the
-            /// memo, so `.mesh unblock` and a fresh identity grant admit the new key with the
+            /// memo, so `.mesh access unblock` and a fresh identity grant admit the new key with the
             /// old row gone. The listing keeps labelling the old key's row `trusted` with no
             /// marker row, no record is ever marked and the owner hears the one line only.
             #[test]
@@ -22488,7 +22558,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// Through the operator's own verbs, neither re-trusting
             /// the OLD destination nor blocking the identity seen under the new key clears a
-            /// key-change mark. `.mesh peers` keeps showing it after each, and only the
+            /// key-change mark. `.mesh people list` keeps showing it after each, and only the
             /// trust of the new destination (the one clearing path) takes it away.
             #[test]
             #[serial]
@@ -22917,7 +22987,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The operator sees the whole story through the REPL: `.mesh on` warns about
-            /// the relay that refused, `.mesh info` lists it as retrying, and once something
+            /// the relay that refused, `.mesh config show` lists it as retrying, and once something
             /// listens there the idle line `<label> connected` arrives and the same row reads
             /// `connected`, with no second `.mesh on` and no second WARNING.
             #[test]
@@ -23021,7 +23091,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// A relay on `127.0.0.2` is this machine as much as `127.0.0.1` is: refused
             /// beside a working relay it gets the local-daemon WARNING tail, and its
-            /// `.mesh info` row names the endpoint as the operator wrote it.
+            /// `.mesh config show` row names the endpoint as the operator wrote it.
             #[test]
             #[serial]
             fn mesh_on_warns_with_the_local_daemon_tail_for_any_loopback_address() {
@@ -23151,7 +23221,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
             }
 
-            /// Polls `.mesh info` until the `interfaces[index]` row reads `want`, within the
+            /// Polls `.mesh config show` until the `interfaces[index]` row reads `want`, within the
             /// connect-later budget; the client behind a `local` row redials every 2 s.
             #[cfg(unix)]
             async fn wait_for_info_row(
@@ -23178,7 +23248,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// The operator sees a `local` rnsd's whole story through the REPL. `.mesh on`
             /// beside a working relay warns that the local rnsd is not reachable yet (with
-            /// the client's dial failure and the start-the-daemon tail) and `.mesh info` lists
+            /// the client's dial failure and the start-the-daemon tail) and `.mesh config show` lists
             /// it as `connecting, retrying`; when something answers at the endpoint the
             /// client's `Connected` makes the row `connected` and the kind join the node's
             /// interfaces with no idle line (the local rnsd prints none, only the TCP kinds
@@ -23240,7 +23310,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         warnings(),
                         vec![format!(
-                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
+                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh config show` shows when it connects"
                         )],
                         "{:?}",
                         stderr_lines()
@@ -23328,7 +23398,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// The REPL surface of a `local` rnsd whose client had not connected when the
             /// start wait ran out, beside a working relay: the node comes up, `.mesh on`
             /// warns with the client's dial failure and the start-the-daemon tail, the
-            /// summary lists only the relay, and `.mesh info` carries the row as
+            /// summary lists only the relay, and `.mesh config show` carries the row as
             /// `connecting, retrying` with that reason. When a listener is on the endpoint
             /// the client's redial lands and the row is `connected`, told at info once, with
             /// no second WARNING and no idle line. Written for the TCP shape, whose refused
@@ -23380,7 +23450,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         warnings_now,
                         vec![format!(
-                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
+                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd (`rnsd`), and `.mesh config show` shows when it connects"
                         )],
                         "{:?}",
                         stderr_lines()
@@ -23515,7 +23585,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// While a node is on, the node's rows are the only `interfaces[i]` rows. While
-            /// off, bare `.mesh info` lists the configured interfaces as settings (`public
+            /// off, `.mesh config show` lists the configured interfaces as settings (`public
             /// ... (world-visible)`, `private ...`); while on (degraded), every
             /// `interfaces[i]` head appears exactly once and carries the node's `<label>
             /// <state>` value, with no settings row beside it, not even for the interface
@@ -23646,7 +23716,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// The per-interface rows are the node's; they follow the node's interface
             /// order and count even when the settings the REPL holds disagree with what
             /// the node was started on (an installed node from
-            /// another config, or a config edited after `.mesh on`): bare `.mesh info` lists
+            /// another config, or a config edited after `.mesh on`): `.mesh config show` lists
             /// the node's interfaces, never a mixture of the two lists.
             #[test]
             #[serial]
@@ -23841,8 +23911,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh answer <id>` routes an inbound id to `answer_inbound` and an outbound
-            /// correlation id to a Reply toward that correlation's peer; `message` takes a
+            /// `.mesh envoy answer <id>` routes an inbound id to `answer_inbound` and
+            /// `.mesh messaging follow-up <id>` an outbound correlation id to a Reply toward
+            /// that correlation's peer; `messaging send` takes a
             /// destination and never an id. Both peers are unheard, so each send fails fast
             /// at the trust check naming the routed destination, before any network.
             #[test]
@@ -23956,7 +24027,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh answer <id>` prints the question block before anything else: with
+            /// `.mesh envoy answer <id>` prints the question block before anything else: with
             /// text it sits above the `Sending` notice; without text a terminal gets the
             /// `Your answer:` prompt, whose typed text is sent and whose blank or cancelled
             /// answer prints the `nothing_sent` line naming the one-line form with the
@@ -24045,7 +24116,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         [
                             "  may I read the plan?",
                             "  envoy asks: Share the plan?",
-                            "  answer: .mesh answer p1 \"<text>\"",
+                            "  answer: .mesh envoy answer p1 \"<text>\"",
                             sending_notice(&asker_peer).as_str(),
                         ],
                         "{out:?}"
@@ -24084,12 +24155,23 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(out[0].ends_with(" . id q1"), "{out:?}");
                     assert_eq!(
                         &out[1..3],
-                        ["  what now?", "  answer: .mesh answer q1 \"<text>\""],
+                        [
+                            "  what now?",
+                            "  answer: .mesh messaging follow-up q1 \"<text>\""
+                        ],
                         "{out:?}"
                     );
-                    assert_eq!(out[3], nothing_sent("q1").plain(), "{out:?}");
+                    assert_eq!(
+                        out[3],
+                        nothing_sent(AnswerRoute::Outbound, "q1").plain(),
+                        "{out:?}"
+                    );
                     assert!(out[4].starts_with(&inbound_header), "{out:?}");
-                    assert_eq!(out[8], nothing_sent("p1").plain(), "{out:?}");
+                    assert_eq!(
+                        out[8],
+                        nothing_sent(AnswerRoute::Inbound, "p1").plain(),
+                        "{out:?}"
+                    );
                     assert!(
                         !out.iter()
                             .any(|line| line.contains("Sending your answer to")),
@@ -24118,7 +24200,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .to_string();
                     assert_eq!(
                         err,
-                        "`.mesh answer q1` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer q1 \"<text>\"`."
+                        "`.mesh messaging follow-up q1` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh messaging follow-up q1 \"<text>\"`."
                     );
                     let out = stdout_lines()[before..].join("\n");
                     assert!(out.starts_with(&outbound_header), "{out:?}");
@@ -24131,7 +24213,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// An answer whose quoted text is empty (`""`, `"   "`) is no answer at all:
-            /// on a terminal `.mesh answer <id> ""` opens the `Your answer:` prompt exactly
+            /// on a terminal `.mesh envoy answer <id> ""` opens the `Your answer:` prompt exactly
             /// as the bare form does, so typed text is what goes out and a blank prompt
             /// prints the nothing-sent line; with no terminal it is refused with the
             /// bare-form usage error. An empty reply is never sent either way.
@@ -24233,7 +24315,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines()[before..].join("\n");
                     let out: Vec<&str> = out.lines().collect();
                     assert!(out[0].starts_with(&outbound_header), "{out:?}");
-                    assert_eq!(out[3], nothing_sent("q1").plain(), "{out:?}");
+                    assert_eq!(
+                        out[3],
+                        nothing_sent(AnswerRoute::Outbound, "q1").plain(),
+                        "{out:?}"
+                    );
                     assert!(
                         !out.iter()
                             .any(|line| line.contains("Sending your answer to")),
@@ -24255,7 +24341,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .to_string();
                     assert_eq!(
                         err,
-                        "`.mesh answer p1` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer p1 \"<text>\"`."
+                        "`.mesh envoy answer p1` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh envoy answer p1 \"<text>\"`."
                     );
                     let out = stdout_lines()[before..].join("\n");
                     assert!(out.starts_with(&inbound_header), "{out:?}");
@@ -24285,20 +24371,30 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             fn scripted_text_prompts_feed_the_answer_prompt() {
                 {
                     let _script = prompt_script::install_text(&[Some(" typed "), None]);
-                    assert_eq!(prompt_answer_text("p1").unwrap().as_deref(), Some("typed"));
-                    assert_eq!(prompt_answer_text("p1").unwrap(), None);
+                    assert_eq!(
+                        prompt_answer_text(AnswerRoute::Inbound, "p1")
+                            .unwrap()
+                            .as_deref(),
+                        Some("typed")
+                    );
+                    assert_eq!(
+                        prompt_answer_text(AnswerRoute::Inbound, "p1").unwrap(),
+                        None
+                    );
                     assert_eq!(prompt_script::prompts_asked(), 2);
                 }
                 let _script = prompt_script::install_non_interactive();
-                let err = prompt_answer_text("p1").unwrap_err().to_string();
+                let err = prompt_answer_text(AnswerRoute::Inbound, "p1")
+                    .unwrap_err()
+                    .to_string();
                 assert!(err.contains("not a terminal"), "{err}");
-                assert!(err.contains(".mesh answer p1 \"<text>\""), "{err}");
+                assert!(err.contains(".mesh envoy answer p1 \"<text>\""), "{err}");
                 assert_eq!(prompt_script::prompts_asked(), 0);
             }
 
-            /// The refusal names `.mesh grant <id>` and `.mesh refuse <id>` and comes before
+            /// The refusal names `.mesh files grant <id>` and `.mesh files refuse <id>` and comes before
             /// any "Sending" notice, so nothing goes on the wire and the request stays filed
-            /// for the human to decide. `.mesh pending` lists the access row apart from the
+            /// for the human to decide. `.mesh files requests` lists the access row apart from the
             /// questions, with its path count and the two verbs, and never a path or the
             /// reason (peer text goes to no model and, on this surface, to no screen
             /// either). The question rows still answer.
@@ -24351,7 +24447,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out: Vec<&str> = text.lines().collect();
                     assert!(
                         !text.contains("probe-leak"),
-                        "a path or the reason leaked into `.mesh pending`: {text}"
+                        "a path or the reason leaked into `.mesh files requests`: {text}"
                     );
                     let access_title = out
                         .iter()
@@ -24389,8 +24485,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         err.contains("`acc-1` is an access request, not a question"),
                         "{err}"
                     );
-                    assert!(err.contains(".mesh grant acc-1"), "{err}");
-                    assert!(err.contains(".mesh refuse acc-1"), "{err}");
+                    assert!(err.contains(".mesh files grant acc-1"), "{err}");
+                    assert!(err.contains(".mesh files refuse acc-1"), "{err}");
                     assert!(!err.contains("No open question"), "{err}");
                     assert!(!err.contains("probe-leak"), "{err}");
                     let out = stdout_lines();
@@ -24405,7 +24501,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(filed.paths.len(), 2);
                     assert!(ctx.app.mesh.correlations().list().is_empty());
 
-                    // Bare `.mesh answer acc-1` (no text) meets the same refusal before any
+                    // Bare `.mesh envoy answer acc-1` (no text) meets the same refusal before any
                     // block is printed or any prompt asked, and a question under another id
                     // still routes as a question.
                     let before = stdout_lines().len();
@@ -24614,7 +24710,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
             }
 
-            /// `.mesh request` to a trusted peer nothing on the network can route to
+            /// `.mesh files request` to a trusted peer nothing on the network can route to
             /// fails after the route wait with what to try next, never opens a link, and
             /// leaves no correlation behind.
             #[test]
@@ -24668,7 +24764,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(err.contains("could not be reached"), "{err}");
                     assert!(
                         err.ends_with(
-                            "Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard."
+                            "Try again in a minute; nothing was sent. `.mesh people list` shows when it was last heard."
                         ),
                         "{err}"
                     );
@@ -24689,7 +24785,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// A trusted peer known only by the key its row kept, with nothing on the
-            /// network to answer for it: `.mesh request` resolves it once, and the route
+            /// network to answer for it: `.mesh files request` resolves it once, and the route
             /// it found travels with the request, so the one unanswered path request is
             /// the only wait before the request fails, not one for the route and another
             /// for the link.
@@ -24799,7 +24895,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh trust {a_instance} (or .mesh unblock {a_instance} if it blocked this instance). (This node does trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
+                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh access trust {a_instance} (or .mesh access unblock {a_instance} if it blocked this instance). (This node does trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
                             d8 = short(&b_hex)
                         )
                     );
@@ -24950,7 +25046,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// `.mesh status <dest>` on a peer that is in the table but not trusted is
             /// refused by trust standing before any link is opened, naming the same
-            /// standing `.mesh peers` lists (`untrusted` / `blocked (instance)` /
+            /// standing `.mesh people list` lists (`untrusted` / `blocked (instance)` /
             /// `blocked (identity)`); a denied destination the node has never heard is
             /// likewise never linked, and its deny-only row reads `blocked (instance)`,
             /// never `trusted`.
@@ -25061,10 +25157,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh info <dest>` consults the peer table first: a knock cache that no
+            /// `.mesh people info <dest>` consults the peer table first: a knock cache that no
             /// longer parses does not hide a known peer, while for a destination the node
             /// has not heard the command still errors rather than rendering anything.
-            /// `.mesh knocks` reports the unreadable cache as an error, never as an empty
+            /// `.mesh access requests` reports the unreadable cache as an error, never as an empty
             /// list.
             #[test]
             #[serial]
@@ -25134,7 +25230,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh info <whole destination>` for a destination in neither the peer table
+            /// `.mesh people info <whole destination>` for a destination in neither the peer table
             /// nor the knock cache asks the mesh for it and says nothing answered; once
             /// the cache cannot be read, the same lookup reports the cache rather than
             /// asking.
@@ -25354,7 +25450,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .to_string();
                     assert_eq!(
                         err,
-                        "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh peers` lists."
+                        "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh people list` lists."
                     );
                     let err = run(&mut ctx, &format!(".mesh access ask {}", &dest8[..7]))
                         .await
@@ -25363,7 +25459,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "'{}' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters).",
+                            "'{}' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters).",
                             &dest8[..7]
                         )
                     );
@@ -25373,7 +25469,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .to_string();
                     assert_eq!(
                         err,
-                        "'nothex00' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh knocks` and `.mesh peers` list (8 or more characters)."
+                        "'nothex00' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -25383,7 +25479,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 assert_eq!(prompt_script::prompts_asked(), 1);
             }
 
-            /// A destination that only knocked is still something `.mesh info` can describe,
+            /// A destination that only knocked is still something `.mesh people info` can describe,
             /// and its trust word is its identity's standing: `untrusted` for a stranger,
             /// `known` once another instance of the identity was trusted.
             #[test]
@@ -25824,7 +25920,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(out[notice].contains("with intro \"hello\""), "{out:?}");
                     assert!(
                         out[notice].ends_with(
-                            "; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+                            "; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh access trust` on both sides."
                         ),
                         "the preview says up front what a knock can do: {}",
                         out[notice]
@@ -25879,7 +25975,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh message <dest>` applies the SAME trust gate as
+            /// `.mesh messaging send <dest>` applies the SAME trust gate as
             /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
             /// the same way: plain unheard -> not-heard once the path request goes
             /// unanswered; unheard but denied at the
@@ -26150,7 +26246,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// Without a terminal each mutating verb refuses naming `--yes` instead of hanging on
             /// a prompt nobody can answer; with `--yes` each goes through, and a block takes
-            /// the identity's instance record with it. `unblock` checks there is a block
+            /// the identity's instance record with it. `access unblock` checks there is a block
             /// before it prompts, so its refusal is asked for once the identity is blocked.
             #[test]
             #[serial]
@@ -26245,7 +26341,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         out.contains("A rotation of this identity is surfaced from the peer table when heard, never marked"),
                         "{out}"
                     );
-                    assert!(out.contains(".mesh trust <destination>"), "{out}");
+                    assert!(out.contains(".mesh access trust <destination>"), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
                     assert!(
                         trust
@@ -26399,7 +26495,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(out.contains("This was a dry run"), "{line}: {out}");
                         assert!(
                             out.contains(
-                                "To remove these 1 instance(s), run: .mesh trust --prune --confirm prune-1"
+                                "To remove these 1 instance(s), run: .mesh access revoke --stale --confirm prune-1"
                             ),
                             "no key-change count when nothing is marked: {line}: {out}"
                         );
@@ -26502,7 +26598,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         out.contains(
-                            "To remove these 1 instance(s), 1 of them marked key-changed, run: .mesh trust --prune --confirm prune-1"
+                            "To remove these 1 instance(s), 1 of them marked key-changed, run: .mesh access revoke --stale --confirm prune-1"
                         ),
                         "{out}"
                     );
@@ -26528,8 +26624,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// The dry run lists the grant and the instances that stay; the confirmed run
             /// withdraws the grant alone, so the instance is still served on its own record
-            /// and `untrust <destination>` is what takes that. The binding-only identity
-            /// entry left behind once no instance names it is what a second `untrust
+            /// and `access revoke <destination>` is what takes that. The binding-only identity
+            /// entry left behind once no instance names it is what a second `access revoke
             /// --identity` removes, worded as an entry, not a grant.
             #[test]
             #[serial]
@@ -26576,7 +26672,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             lines[4],
                             format!(
-                                "This was a dry run; nothing changed. To withdraw the grant, run: .mesh untrust --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id}."
+                                "This was a dry run; nothing changed. To withdraw the grant, run: .mesh access revoke --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {id}."
                             ),
                             "{line}: {out}"
                         );
@@ -26605,7 +26701,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Untrusted identity {}: its grant for all destinations is withdrawn; 1 instance(s) stay trusted on their own. .mesh forget --identity {id} erases them too.",
+                            "Untrusted identity {}: its grant for all destinations is withdrawn; 1 instance(s) stay trusted on their own. .mesh access forget --identity {id} erases them too.",
                             short(&id)
                         )
                     );
@@ -26654,7 +26750,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         dry.lines().last().unwrap().starts_with(&format!(
-                            "This was a dry run; nothing changed. To remove the entry, run: .mesh untrust --identity {id} --confirm {token}."
+                            "This was a dry run; nothing changed. To remove the entry, run: .mesh access revoke --identity {id} --confirm {token}."
                         )),
                         "{dry}"
                     );
@@ -26667,7 +26763,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Untrusted identity {}: the trust list no longer names it; no instance of it is trusted. .mesh trust --identity {id} grants it again.",
+                            "Untrusted identity {}: the trust list no longer names it; no instance of it is trusted. .mesh access trust --identity {id} grants it again.",
                             short(&id)
                         )
                     );
@@ -26812,7 +26908,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let block_help = out_of(&mut ctx, ".mesh access block").await.unwrap();
                     assert!(
-                        block_help.contains("`untrust` only stops serving"),
+                        block_help.contains("`access revoke` only stops serving"),
                         "{block_help}"
                     );
                     let forget_help = out_of(&mut ctx, ".mesh access forget").await.unwrap();
@@ -26827,7 +26923,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `untrust <destination>` is its own question: declined it leaves the record
+            /// `access revoke <destination>` is its own question: declined it leaves the record
             /// and the Allow verdict in place; accepted it removes exactly that record and
             /// the verdict falls back to the closed default.
             #[test]
@@ -26895,9 +26991,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// Blocking one instance and blocking its identity are distinct standings with
             /// distinct words: a blocked instance of a trusted-all identity is refused by
             /// the destination rule while its siblings stay trusted; a blocked identity is
-            /// refused everywhere. `untrust` of such an instance is refused and writes
+            /// refused everywhere. `access revoke` of such an instance is refused and writes
             /// nothing. Each block declines to nothing, unblocking the identity leaves the
-            /// instance's block standing, and `trust <destination>` lifts it.
+            /// instance's block standing, and `access trust <destination>` lifts it.
             #[test]
             #[serial]
             fn block_of_a_trusted_all_instance_and_block_of_its_identity_set_distinct_verdicts() {
@@ -26939,7 +27035,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {dest}. To stop trusting the whole identity, run .mesh untrust --identity {id}.",
+                            "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block {dest}. To stop trusting the whole identity, run .mesh access revoke --identity {id}.",
                             short(&dest),
                             short(&id)
                         )
@@ -27014,7 +27110,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// Blocking a blocked instance's identity leaves the deny; after the unblock of
-            /// the identity, `untrust <dest>` on that deny-only row names the block and the
+            /// the identity, `access revoke <dest>` on that deny-only row names the block and the
             /// verb that lifts it rather than claiming there is nothing to untrust.
             #[test]
             #[serial]
@@ -27049,7 +27145,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {dest} lifts the block."
+                            "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {dest} lifts the block."
                         )
                     );
                     assert!(
@@ -27065,7 +27161,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// The `trust --identity` preview counts the instances the grant leaves blocked,
+            /// The `access trust --identity` preview counts the instances the grant leaves blocked,
             /// so the user is not surprised that a trusted-all identity still has a silent
             /// instance; with no block the preview says nothing about it.
             #[test]
@@ -27080,7 +27176,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
-                    let clause = "instance(s) of this identity stay blocked; .mesh unblock <destination> lifts each.";
+                    let clause = "instance(s) of this identity stay blocked; .mesh access unblock <destination> lifts each.";
 
                     let out = out_of(
                         &mut ctx,
@@ -27199,7 +27295,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{lines:?}"
                     );
                     assert!(lines.contains(&format!(
-                        "Blocked {}: it is refused without a knock (identity {} otherwise unchanged). .mesh unblock {dest} lifts it.",
+                        "Blocked {}: it is refused without a knock (identity {} otherwise unchanged). .mesh access unblock {dest} lifts it.",
                         short(&dest),
                         short(&id)
                     )));
@@ -27212,7 +27308,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `untrust --dry-run` of a trusted-all instance is refused with the same
+            /// `access revoke --dry-run` of a trusted-all instance is refused with the same
             /// sentence as the real run, and neither writes.
             #[test]
             #[serial]
@@ -27237,7 +27333,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(before.is_some());
 
                     let sentence = format!(
-                        "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {dest}. To stop trusting the whole identity, run .mesh untrust --identity {id}.",
+                        "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block {dest}. To stop trusting the whole identity, run .mesh access revoke --identity {id}.",
                         short(&dest),
                         short(&id)
                     );
@@ -27299,7 +27395,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// The `trust <dest>` preview says when it also lifts a standing refusal, so
+            /// The `access trust <dest>` preview says when it also lifts a standing refusal, so
             /// the question is answered knowing both effects; a declined prompt writes
             /// nothing.
             #[test]
@@ -27444,7 +27540,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// A repeat block of an instance with `--note` goes through and rewrites the
-            /// note, the deny's date kept, as `block --identity` does; without the flag it
+            /// note, the deny's date kept, as `access block --identity` does; without the flag it
             /// is answered as already blocked.
             #[test]
             #[serial]
@@ -27459,7 +27555,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let dest = hex_lower(&[0x6e; 16]);
                     let lines = format!(
-                        "This blocks instance {}: it is refused without a knock and its trust record, if any, is removed.\nBlocked {}: it is refused without a knock. .mesh unblock {dest} lifts it.",
+                        "This blocks instance {}: it is refused without a knock and its trust record, if any, is removed.\nBlocked {}: it is refused without a knock. .mesh access unblock {dest} lifts it.",
                         short(&dest),
                         short(&dest)
                     );
@@ -27513,7 +27609,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `unblock <destination>` lifts the deny alone and says what serves the
+            /// `access unblock <destination>` lifts the deny alone and says what serves the
             /// instance afterwards, worded the same in the preview and the result: the
             /// grant of an identity trusted for all, the instance's own record under a
             /// plain identity (the deny laid over a record is the shape an older release
@@ -27602,7 +27698,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "This lifts the block on instance {}; afterwards nothing is trusted: .mesh trust {bare} serves it again.\nUnblocked {}; nothing is trusted: .mesh trust {bare} serves it again.",
+                            "This lifts the block on instance {}; afterwards nothing is trusted: .mesh access trust {bare} serves it again.\nUnblocked {}; nothing is trusted: .mesh access trust {bare} serves it again.",
                             short(&bare),
                             short(&bare)
                         )
@@ -27613,7 +27709,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap();
                     let standing = format!(
-                        "nothing is trusted and its identity {} is blocked: .mesh unblock --identity {blocked_id} first, then .mesh trust {blocked} serves it.",
+                        "nothing is trusted and its identity {} is blocked: .mesh access unblock --identity {blocked_id} first, then .mesh access trust {blocked} serves it.",
                         short(&blocked_id)
                     );
                     assert_eq!(
@@ -27633,7 +27729,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Destination {blocked} is not blocked, so there is nothing to unblock; its identity {} is blocked: .mesh unblock --identity {blocked_id} first, then .mesh trust {blocked} serves it.",
+                            "Destination {blocked} is not blocked, so there is nothing to unblock; its identity {} is blocked: .mesh access unblock --identity {blocked_id} first, then .mesh access trust {blocked} serves it.",
                             short(&blocked_id)
                         )
                     );
@@ -27642,7 +27738,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap();
                     let standing = format!(
-                        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {unheard} does."
+                        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh access trust {unheard} does."
                     );
                     assert_eq!(
                         out,
@@ -27660,10 +27756,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `unblock --identity` lifts the block and nothing else: the preview says trust
+            /// `access unblock --identity` lifts the block and nothing else: the preview says trust
             /// is not restored, the result names the grants that would restore it, and the
             /// identity is default-closed afterwards. Once it is not blocked, a second
-            /// unblock is refused before any prompt, naming `block` and `trust`, and
+            /// unblock is refused before any prompt, naming `access block` and `access trust`, and
             /// writes nothing.
             #[test]
             #[serial]
@@ -27696,7 +27792,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "This lifts the block on identity {}, so it may knock again; trust is not restored.\nUnblocked identity {}; nothing is trusted: .mesh trust --identity {id} serves every instance again, .mesh trust <destination> one of them.",
+                            "This lifts the block on identity {}, so it may knock again; trust is not restored.\nUnblocked identity {}; nothing is trusted: .mesh access trust --identity {id} serves every instance again, .mesh access trust <destination> one of them.",
                             short(&id),
                             short(&id)
                         )
@@ -27719,7 +27815,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "Identity {id} is not blocked, so there is nothing to unblock; .mesh block --identity {id} silences it, .mesh trust --identity {id} serves every instance."
+                                "Identity {id} is not blocked, so there is nothing to unblock; .mesh access block --identity {id} silences it, .mesh access trust --identity {id} serves every instance."
                             ),
                             "{flag}"
                         );
@@ -27733,9 +27829,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `untrust --identity` of a blocked identity is refused before any preview
+            /// `access revoke --identity` of a blocked identity is refused before any preview
             /// with the one verb that applies: the block took its records, so neither
-            /// `trust --identity` (refused while blocked) nor `block --identity` (already
+            /// `access trust --identity` (refused while blocked) nor `access block --identity` (already
             /// in effect) would do. Following that verb lifts the block and nothing else.
             #[test]
             #[serial]
@@ -27766,7 +27862,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {id} lifts the block.",
+                            "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh access unblock --identity {id} lifts the block.",
                             short(&id)
                         )
                     );
@@ -27792,7 +27888,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `unblock <destination>` of an instance that is not blocked, trusted or merely
+            /// `access unblock <destination>` of an instance that is not blocked, trusted or merely
             /// heard, is refused before any prompt with the verbs that would refuse or
             /// serve it, and writes nothing.
             #[test]
@@ -27823,7 +27919,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(
                                 err,
                                 format!(
-                                    "Destination {dest} is not blocked, so there is nothing to unblock; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+                                    "Destination {dest} is not blocked, so there is nothing to unblock; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
                                 ),
                                 "{flag}"
                             );
@@ -27840,7 +27936,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `forget --identity` of an identity the node holds nothing of, no grant, block,
+            /// `access forget --identity` of an identity the node holds nothing of, no grant, block,
             /// knock or envoy memory, is a teaching error under every flag, before the token
             /// is checked, and writes nothing to the trust file or the knock cache.
             #[test]
@@ -27868,7 +27964,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+                                "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh envoy memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
                             ),
                             "{flag}"
                         );
@@ -27896,8 +27992,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// An identity this node knows only through what its instances lent or
-            /// granted is no stranger: `forget --identity` lists the remembered
-            /// attachments and grants, the confirmed run sweeps them so `fetch <dest>
+            /// granted is no stranger: `access forget --identity` lists the remembered
+            /// attachments and grants, the confirmed run sweeps them so `files fetch <dest>
             /// <TAB>` offers nothing for that instance any more, and a second forget is
             /// the stranger's teaching error. The peer row is what lets completion read
             /// the claims under the identity that made them; it counts for nothing in
@@ -27932,7 +28028,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting identity {id} erases:\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                            "Forgetting identity {id} erases:\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm {token}"
                         ),
                         "one claim reads in the singular"
                     );
@@ -27948,7 +28044,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting identity {id} erases:\n  2 remembered attachments, grants and access requests from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                            "Forgetting identity {id} erases:\n  2 remembered attachments, grants and access requests from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm {token}"
                         ),
                         "the claims alone make the identity worth forgetting"
                     );
@@ -27986,7 +28082,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+                            "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh envoy memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
                         ),
                         "once swept, the identity is a stranger"
                     );
@@ -27998,9 +28094,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// An access request this node sent and the peer left with its human is a
-            /// memory of that identity too: `forget --identity` lists it (in the
+            /// memory of that identity too: `access forget --identity` lists it (in the
             /// singular, as the only item), the confirmed run sweeps it, and the human's
-            /// `granted` decision landing afterwards files no grant, so `fetch <dest>
+            /// `granted` decision landing afterwards files no grant, so `files fetch <dest>
             /// <TAB>` offers nothing for that instance.
             #[test]
             #[serial]
@@ -28101,7 +28197,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting identity {id} erases:\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                            "Forgetting identity {id} erases:\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm {token}"
                         ),
                         "an open access request alone makes the identity worth forgetting"
                     );
@@ -28135,7 +28231,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// A second `block --identity` of a blocked identity is answered before any
+            /// A second `access block --identity` of a blocked identity is answered before any
             /// prompt and writes nothing: without `--note` it says the identity is already
             /// blocked, as the destination twin does; with one the note is replaced, the
             /// block's date kept, and the two lines repeat.
@@ -28221,7 +28317,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `block <destination>` of an instance with its own record takes the record
+            /// `access block <destination>` of an instance with its own record takes the record
             /// and says so on a line of its own, naming the identity it was bound to as
             /// otherwise unchanged; a hash heard from nowhere has no identity to name, so
             /// the clause is left out and no record line follows.
@@ -28251,7 +28347,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "This blocks instance {}: it is refused without a knock and its trust record, if any, is removed; identity {} is otherwise unchanged.\nBlocked {}: it is refused without a knock (identity {} otherwise unchanged). .mesh unblock {dest} lifts it.\nRemoved its trust record.",
+                            "This blocks instance {}: it is refused without a knock and its trust record, if any, is removed; identity {} is otherwise unchanged.\nBlocked {}: it is refused without a knock (identity {} otherwise unchanged). .mesh access unblock {dest} lifts it.\nRemoved its trust record.",
                             short(&dest),
                             short(&id),
                             short(&dest),
@@ -28274,7 +28370,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "This blocks instance {}: it is refused without a knock and its trust record, if any, is removed.\nBlocked {}: it is refused without a knock. .mesh unblock {stranger} lifts it.",
+                            "This blocks instance {}: it is refused without a knock and its trust record, if any, is removed.\nBlocked {}: it is refused without a knock. .mesh access unblock {stranger} lifts it.",
                             short(&stranger),
                             short(&stranger)
                         )
@@ -28288,7 +28384,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// The knocks an identity left are part of what `forget --identity` erases: the
+            /// The knocks an identity left are part of what `access forget --identity` erases: the
             /// dry run counts them beside the trust record, the confirmed run empties them
             /// from the knock cache, and an identity known from its knocks alone is not a
             /// stranger, so the verb goes through for it and leaves the trust file as it was.
@@ -28363,7 +28459,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting identity {id} erases:\n  identity {}\n  2 knocks\n  3 remembered attachments, grants and access requests from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}",
+                            "Forgetting identity {id} erases:\n  identity {}\n  2 knocks\n  3 remembered attachments, grants and access requests from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm {token}",
                             short(&id)
                         )
                     );
@@ -28426,7 +28522,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting identity {knocker_id} erases:\n  1 knock\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {knocker_id} --confirm {token}"
+                            "Forgetting identity {knocker_id} erases:\n  1 knock\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {knocker_id} --confirm {token}"
                         )
                     );
                     assert_eq!(knocks_of(&knocker_id), 1);
@@ -28464,7 +28560,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// Knocks the gate's rate limit drops never reach the cache, so `.mesh knocks`
+            /// Knocks the gate's rate limit drops never reach the cache, so `.mesh access requests`
             /// reports them from the gate: a known identity knocking five times in a row
             /// files three and is listed with the two it lost, when its next one lands and
             /// the newest filed knock to trust.
@@ -28530,7 +28626,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         drop_line.ends_with(&format!(
-                            "; its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                            "; its earlier knocks are listed above, .mesh access trust {} on one of them serves it",
                             hex_lower(&[2; 16])
                         )),
                         "the tail names the newest cached knock: {out}"
@@ -28542,8 +28638,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// A deny-only row under an identity trusted again (block the instance, block
-            /// and unblock the identity, then `trust --identity`): a repeat block is a no-op,
-            /// and `untrust` of it is refused by the identity grant; neither writes.
+            /// and unblock the identity, then `access trust --identity`): a repeat block is a no-op,
+            /// and `access revoke` of it is refused by the identity grant; neither writes.
             #[test]
             #[serial]
             fn block_and_untrust_of_a_deny_only_row_under_a_re_trusted_identity_write_nothing() {
@@ -28588,7 +28684,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         refusal(&mut ctx, &format!(".mesh access revoke {dest} --dry-run")).await;
                     assert!(
                         err.contains(&format!(
-                            "To stop serving just this instance, run .mesh block {dest}."
+                            "To stop serving just this instance, run .mesh access block {dest}."
                         )),
                         "{err}"
                     );
@@ -28602,9 +28698,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `forget` takes `--identity` alone: its own `forget-<short>` token from the
+            /// `access forget` takes `--identity` alone: its own `forget-<short>` token from the
             /// dry run, the flag refusals of its usage, and a destination is a teaching
-            /// error naming `untrust` and `block`.
+            /// error naming `access revoke` and `access block`.
             #[test]
             #[serial]
             fn forget_takes_an_identity_with_its_own_token_and_refuses_a_destination() {
@@ -28627,7 +28723,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let last = out.lines().last().unwrap();
                     assert!(
                         last.contains(&format!(
-                            ".mesh forget --identity {id} --confirm forget-{}",
+                            ".mesh access forget --identity {id} --confirm forget-{}",
                             short(&id)
                         )),
                         "{out}"
@@ -28645,7 +28741,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            ".mesh forget takes --identity <id>: a destination is untrusted with .mesh untrust {dest} or refused with .mesh block {dest}."
+                            ".mesh access forget takes --identity <id>: a destination is untrusted with .mesh access revoke {dest} or refused with .mesh access block {dest}."
                         )
                     );
                     assert_eq!(trust_file(&trust), before);
@@ -28675,9 +28771,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The envoy's memory of an identity goes with the identity's trust through
-            /// the REPL verbs: `.mesh forget --identity` and `.mesh block` remove every
+            /// the REPL verbs: `.mesh access forget --identity` and `.mesh access block` remove every
             /// thread the identity had, the dry run and the refused `--yes` remove
-            /// nothing, and `.mesh untrust <destination>` leaves the identity's threads
+            /// nothing, and `.mesh access revoke <destination>` leaves the identity's threads
             /// in place, other identities untouched throughout.
             #[test]
             #[serial]
@@ -28882,7 +28978,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         dry,
                         format!(
-                            "Forgetting identity {id} erases:\n  1 remembered envoy conversation\nThis was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                            "Forgetting identity {id} erases:\n  1 remembered envoy conversation\nThis was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm {token}"
                         )
                     );
                     assert!(
@@ -28970,7 +29066,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         dry,
                         format!(
-                            "Forgetting identity {id} erases:\n  1 envoy memory store whose index cannot be read may hold more of it; run .mesh memory forget all to empty it\nThis was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                            "Forgetting identity {id} erases:\n  1 envoy memory store whose index cannot be read may hold more of it; run .mesh envoy memory forget all to empty it\nThis was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm {token}"
                         )
                     );
                     assert_eq!(fs::read_to_string(&index).unwrap(), "{not json");
@@ -28986,7 +29082,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// the identity verbs forget the identity's threads in a store this node does
             /// not serve (a fork's, or one left by an earlier key) as well as in its own,
             /// leave every other identity's threads in both, and a second revocation of the
-            /// same identity finds nothing to forget and refuses nothing. `.mesh untrust
+            /// same identity finds nothing to forget and refuses nothing. `.mesh access revoke
             /// <destination>` leaves both stores as they were.
             #[test]
             #[serial]
@@ -29125,10 +29221,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// With the memory off the node opens no store of its own, yet `.mesh forget
-            /// --identity` and `.mesh block` still reach the records left under the cache
-            /// directory, in every instance's store, while `.mesh untrust <destination>`,
-            /// `.mesh untrust --identity` (the grant goes, the identity stays known) and the
+            /// With the memory off the node opens no store of its own, yet `.mesh access forget
+            /// --identity` and `.mesh access block` still reach the records left under the cache
+            /// directory, in every instance's store, while `.mesh access revoke <destination>`,
+            /// `.mesh access revoke --identity` (the grant goes, the identity stays known) and the
             /// other identities' threads are left as they were, so nothing of an erased
             /// peer waits there for the memory to come back.
             #[test]
@@ -29293,9 +29389,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// The verbs that erase an identity say how many envoy conversations go with
             /// it: the forget dry run lists the count, the write reports it forgotten,
-            /// `.mesh block` carries the clause in its intro and its report, and the count
+            /// `.mesh access block` carries the clause in its intro and its report, and the count
             /// is the sweep's, across every instance store and not only the one the node
-            /// serves. `.mesh untrust`, by destination or by identity, sweeps nothing and
+            /// serves. `.mesh access revoke`, by destination or by identity, sweeps nothing and
             /// says nothing of the memory.
             #[test]
             #[serial]
@@ -29409,7 +29505,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         untrust_dry_run.contains(&format!(
-                            "To withdraw the grant, run: .mesh untrust --identity {id_a} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id_a}."
+                            "To withdraw the grant, run: .mesh access revoke --identity {id_a} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {id_a}."
                         )),
                         "{untrust_dry_run}"
                     );
@@ -29428,7 +29524,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         forget_dry_run.ends_with(&format!(
-                            "To erase everything this node knows of this identity, run: .mesh forget --identity {id_a} --confirm forget-{}",
+                            "To erase everything this node knows of this identity, run: .mesh access forget --identity {id_a} --confirm forget-{}",
                             short(&id_a)
                         )),
                         "{forget_dry_run}"
@@ -29445,7 +29541,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Untrusted identity {}: its grant for all destinations is withdrawn; 1 instance(s) stay trusted on their own. .mesh forget --identity {id_a} erases them too.",
+                            "Untrusted identity {}: its grant for all destinations is withdrawn; 1 instance(s) stay trusted on their own. .mesh access forget --identity {id_a} erases them too.",
                             short(&id_a)
                         )
                     );
@@ -29520,9 +29616,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// The memory sweep is reported from what is on disk after it, not from what
             /// was asked. With a thread of the identity in a store that refuses the wipe
-            /// (its directory read-only), `.mesh forget --identity --confirm` still
+            /// (its directory read-only), `.mesh access forget --identity --confirm` still
             /// forgets, says how many conversations could not be forgotten, and names
-            /// `.mesh memory forget <identity>` as the remedy, and once the store is
+            /// `.mesh envoy memory forget <identity>` as the remedy, and once the store is
             /// writable again that very remedy clears it.
             #[test]
             #[serial]
@@ -29631,7 +29727,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the count is the one still on disk after the sweep: {out}"
                     );
                     assert!(
-                        last.contains(&format!(".mesh memory forget {id_a}")),
+                        last.contains(&format!(".mesh envoy memory forget {id_a}")),
                         "the remedy names the verb with the full identity so it can be pasted: {out}"
                     );
                     assert!(
@@ -29662,8 +29758,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// Unreadable here means a file sits where the stores directory should be. The
             /// erasing verbs still run (the forget dry run and the block intro say the
             /// count could not be read and that the sweep happens all the same, the write
-            /// says to run `.mesh memory forget` to be sure) while `untrust`, by destination
-            /// or by identity, and `block <destination>`, which never touch the memory,
+            /// says to run `.mesh envoy memory forget` to be sure) while `access revoke`, by destination
+            /// or by identity, and `access block <destination>`, which never touch the memory,
             /// neither mention it nor fail on it.
             #[test]
             #[serial]
@@ -29752,7 +29848,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let last = out.lines().last().unwrap_or_default();
                     assert!(last.contains("could not be counted"), "{out}");
                     assert!(
-                        last.contains(&format!(".mesh memory forget {id_a}")),
+                        last.contains(&format!(".mesh envoy memory forget {id_a}")),
                         "the remedy names the verb: {out}"
                     );
 
@@ -29774,7 +29870,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         out.lines()
                             .last()
                             .unwrap_or_default()
-                            .contains(".mesh memory forget"),
+                            .contains(".mesh envoy memory forget"),
                         "{out}"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -29786,11 +29882,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// One directory under the stores is unreadable, not the whole tree. The dry
-            /// run of `forget --identity` adds a row saying the store may hold more of the
-            /// identity and that only `.mesh memory forget all` empties it; `block` says it
+            /// run of `access forget --identity` adds a row saying the store may hold more of the
+            /// identity and that only `.mesh envoy memory forget all` empties it; `access block` says it
             /// in its intro; after the write each appends the same clause to its memory
             /// line: the sweep leaves that store as it is. A wrong token is refused on its
-            /// own, naming no memory at all, and `untrust`, by destination or by identity,
+            /// own, naming no memory at all, and `access revoke`, by destination or by identity,
             /// never mentions it.
             #[test]
             #[serial]
@@ -29834,7 +29930,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fs::read_to_string(&index).unwrap(), "{not json", "{why}");
                         assert!(record.exists(), "{why}");
                     };
-                    let clause = "1 envoy memory store whose index cannot be read may hold more of it; run .mesh memory forget all to empty it";
+                    let clause = "1 envoy memory store whose index cannot be read may hold more of it; run .mesh envoy memory forget all to empty it";
 
                     let dest_a = heard_trusted_peer(&started.runtime, slot);
                     let id_a = identity_of(&trust, &dest_a);
@@ -29958,7 +30054,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     untouched("forget --identity leaves a store it cannot read");
 
-                    // `block` of an identity nothing is remembered of: the intro still
+                    // `access block` of an identity nothing is remembered of: the intro still
                     // names the store, and so does the line after the write, on its own.
                     let out = out_of(
                         &mut ctx,
@@ -30055,8 +30151,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// With the node on and an identity trusted for all its instances, `undeny` is
-            /// refused as an unknown `.mesh` command and a `deny` of a destination is sent
-            /// to `untrust` (not the mesh-off teaching text, not a macro-path error); each
+            /// refused as an unknown `.mesh` command and a `files deny` of a destination is sent
+            /// to `access revoke` (not the mesh-off teaching text, not a macro-path error); each
             /// asks nothing and leaves the trust file, the deny overlay and the verdict
             /// exactly as they were. The verbs that replaced them work in their place.
             #[test]
@@ -30083,7 +30179,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
 
                     let deny_teaching = format!(
-                        "`.mesh deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh block {dest}`.",
+                        "`.mesh files deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh access block {dest}`.",
                         short(&dest)
                     );
                     for (expected, line) in [
@@ -30135,12 +30231,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{KNOCK_REFUSAL_TAIL}"
                     );
                     assert!(
-                        !KNOCK_REFUSAL_TAIL.contains(".mesh deny"),
+                        !KNOCK_REFUSAL_TAIL.contains(".mesh files deny"),
                         "{KNOCK_REFUSAL_TAIL}"
                     );
                     assert!(
-                        KNOCK_REFUSAL_TAIL.contains("`.mesh trust <destination>`"),
-                        "a denied destination is lifted by `trust`: {KNOCK_REFUSAL_TAIL}"
+                        KNOCK_REFUSAL_TAIL.contains("`.mesh access trust <destination>`"),
+                        "a denied destination is lifted by `access trust`: {KNOCK_REFUSAL_TAIL}"
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -30148,9 +30244,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `forget <dest>` is a teaching error under every flag and writes nothing;
-            /// `block <dest>` is what stops one instance of a trusted-all identity, leaving
-            /// its siblings trusted; `trust <dest>` lifts the block; and `forget --identity`
+            /// `access forget <dest>` is a teaching error under every flag and writes nothing;
+            /// `access block <dest>` is what stops one instance of a trusted-all identity, leaving
+            /// its siblings trusted; `access trust <dest>` lifts the block; and `access forget --identity`
             /// takes its own `forget-<short>` token, which erases the identity when it comes back.
             #[test]
             #[serial]
@@ -30176,7 +30272,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
                     assert!(before.is_some());
                     let sentence = format!(
-                        ".mesh forget takes --identity <id>: a destination is untrusted with .mesh untrust {dest} or refused with .mesh block {dest}."
+                        ".mesh access forget takes --identity <id>: a destination is untrusted with .mesh access revoke {dest} or refused with .mesh access block {dest}."
                     );
 
                     let printed = stdout_lines().len();
@@ -30235,7 +30331,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     )
                     .await;
                     assert!(err.contains("--confirm forget-"), "{err}");
-                    assert!(err.contains(".mesh forget --identity"), "{err}");
+                    assert!(err.contains(".mesh access forget --identity"), "{err}");
                     assert_eq!(trust_file(&trust), before);
 
                     let out = out_of(
@@ -30257,8 +30353,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// Blocking an instance that has its own labelled record takes the record and
-            /// leaves a deny-only row; `untrust --identity` then withdraws the grant and
-            /// leaves that block standing (a block is remembered), and `forget --identity`
+            /// leaves a deny-only row; `access revoke --identity` then withdraws the grant and
+            /// leaves that block standing (a block is remembered), and `access forget --identity`
             /// is what sweeps it, so the instance is merely heard again.
             #[test]
             #[serial]
@@ -30316,7 +30412,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         dry.lines().last().unwrap(),
                         format!(
-                            "This was a dry run; nothing changed. To withdraw the grant, run: .mesh untrust --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id}."
+                            "This was a dry run; nothing changed. To withdraw the grant, run: .mesh access revoke --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {id}."
                         )
                     );
                     let out = out_of(
@@ -30328,7 +30424,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Untrusted identity {}: its grant for all destinations is withdrawn; no instance of it is trusted. .mesh trust --identity {id} grants it again.",
+                            "Untrusted identity {}: its grant for all destinations is withdrawn; no instance of it is trusted. .mesh access trust --identity {id} grants it again.",
                             short(&id)
                         )
                     );
@@ -30372,7 +30468,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// Withdrawing the grant with nothing bound makes the identity a stranger, so
             /// the store sweeps its envoy memory and the output says so on the appended
-            /// sweep line, as `forget` and `block --identity` do.
+            /// sweep line, as `access forget` and `access block --identity` do.
             #[test]
             #[serial]
             fn untrust_identity_with_nothing_bound_discloses_the_envoy_memory_sweep() {
@@ -30432,7 +30528,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Untrusted identity {}: its grant for all destinations is withdrawn; no instance of it is trusted. .mesh trust --identity {id} grants it again.\nForgot the 1 envoy conversation remembered of it.",
+                            "Untrusted identity {}: its grant for all destinations is withdrawn; no instance of it is trusted. .mesh access trust --identity {id} grants it again.\nForgot the 1 envoy conversation remembered of it.",
                             short(&id)
                         )
                     );
@@ -30454,9 +30550,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// Blocking an instance never trusted on its own writes the deny alone; `forget
+            /// Blocking an instance never trusted on its own writes the deny alone; `access forget
             /// --identity` finds it through the identity the peer table proves and sweeps it
-            /// with the rest; afterwards `untrust <dest>` is truthfully "nothing to untrust".
+            /// with the rest; afterwards `access revoke <dest>` is truthfully "nothing to untrust".
             #[test]
             #[serial]
             fn forget_identity_sweeps_the_block_of_a_peer_table_only_instance() {
@@ -30520,12 +30616,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// Under a trusted-all identity the record is `block <TAB>`'s to offer, never
-            /// `untrust <TAB>`'s, since `untrust <dest>` would refuse it. While blocked,
-            /// `block <TAB>` stops offering the instance and `trust <TAB>` keeps it; the
+            /// Under a trusted-all identity the record is `access block <TAB>`'s to offer, never
+            /// `access revoke <TAB>`'s, since `access revoke <dest>` would refuse it. While blocked,
+            /// `access block <TAB>` stops offering the instance and `access trust <TAB>` keeps it; the
             /// lift says so and writes a fresh record bound to the identity (the block took
-            /// the labelled one), puts the row back under `block <TAB>`, and a second
-            /// `trust` of the plain record says nothing about a refusal. Nothing asks a
+            /// the labelled one), puts the row back under `access block <TAB>`, and a second
+            /// `access trust` of the plain record says nothing about a refusal. Nothing asks a
             /// question.
             #[test]
             #[serial]
@@ -30563,7 +30659,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
                     assert!(
                         offered_as(&offers(&ctx, "revoke"), &dest).is_none(),
-                        "`untrust <dest>` refuses a record under a trusted-all identity: {:?}",
+                        "`access revoke <dest>` refuses a record under a trusted-all identity: {:?}",
                         offers(&ctx, "revoke")
                     );
                     assert!(
@@ -30583,7 +30679,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(offered_as(&offers(&ctx, "block"), &dest).is_none());
                     assert!(
                         offered_as(&offers(&ctx, "trust"), &dest).is_some(),
-                        "`trust` can lift the block, so it still offers the instance"
+                        "`access trust` can lift the block, so it still offers the instance"
                     );
 
                     let before = trust_file(&trust);
@@ -30643,7 +30739,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// With no record of its own, the instance's identity is read from the peer
             /// table only when that row proves the binding. A row whose identity column does
             /// not derive the destination (the identity of a different, trusted-all peer
-            /// pasted in) is not a reason to refuse: `untrust <dest>` says the instance is
+            /// pasted in) is not a reason to refuse: `access revoke <dest>` says the instance is
             /// not in the trust list, writes nothing, denies nothing, and the forged
             /// identity's own standing is untouched.
             #[test]
@@ -30708,14 +30804,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// An instance known from the peer table alone is never under `untrust <TAB>`
-            /// (no record) and stays out while blocked; `trust <TAB>` keeps offering it,
-            /// `untrust --identity <TAB>` still offers the identity, `.mesh peers` labels
-            /// the row `blocked (instance)`; `untrust` of the record-less instance is refused
-            /// by the identity grant and writes nothing. After `trust <dest>` lifts the block,
-            /// `.mesh peers` says `trusted`, `block <TAB>` offers the (unlabelled) record as
-            /// `trusted`, and `untrust <TAB>` still leaves it out: the identity grant covers
-            /// it, so `untrust <dest>` stays refused and points at `--identity`.
+            /// An instance known from the peer table alone is never under `access revoke <TAB>`
+            /// (no record) and stays out while blocked; `access trust <TAB>` keeps offering it,
+            /// `access revoke --identity <TAB>` still offers the identity, `.mesh people list` labels
+            /// the row `blocked (instance)`; `access revoke` of the record-less instance is refused
+            /// by the identity grant and writes nothing. After `access trust <dest>` lifts the block,
+            /// `.mesh people list` says `trusted`, `access block <TAB>` offers the (unlabelled) record as
+            /// `trusted`, and `access revoke <TAB>` still leaves it out: the identity grant covers
+            /// it, so `access revoke <dest>` stays refused and points at `--identity`.
             #[test]
             #[serial]
             fn record_less_block_shows_in_peers_and_completion_until_lifted() {
@@ -30741,7 +30837,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .map(|(candidate, _)| candidate)
                             .collect()
                     };
-                    /// The trust cell of Tia's `.mesh peers` row.
+                    /// The trust cell of Tia's `.mesh people list` row.
                     async fn peers_trust(ctx: &mut RequestContext) -> String {
                         let out = out_of(ctx, ".mesh people list").await.unwrap();
                         table_rows(&out)
@@ -30759,7 +30855,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         refusal(&mut ctx, &format!(".mesh access revoke {dest} --dry-run")).await;
                     assert!(
                         err.contains(&format!(
-                            "To stop serving just this instance, run .mesh block {dest}."
+                            "To stop serving just this instance, run .mesh access block {dest}."
                         )),
                         "{err}"
                     );
@@ -30796,7 +30892,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(offers(&ctx, &["access", "trust", ""]).contains(&dest));
                     assert!(
                         offers(&ctx, &["access", "revoke", "--identity", ""]).contains(&id),
-                        "the identity stays trusted, so it stays under `untrust --identity`"
+                        "the identity stays trusted, so it stays under `access revoke --identity`"
                     );
                     assert!(
                         offers(&ctx, &["access", "block", "--identity", ""]).contains(&id),
@@ -30804,7 +30900,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         !offers(&ctx, &["access", "block", ""]).contains(&dest),
-                        "`block` has nothing left to do for a blocked instance"
+                        "`access block` has nothing left to do for a blocked instance"
                     );
                     assert_eq!(
                         offers(&ctx, &["access", "unblock", ""]),
@@ -30823,11 +30919,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust_cell, "trusted", "{trust_cell}");
                     assert!(
                         !offers(&ctx, &["access", "revoke", ""]).contains(&dest),
-                        "the identity grant still covers the lifted record, so `untrust <dest>` is refused and the record stays out of `untrust <TAB>`"
+                        "the identity grant still covers the lifted record, so `access revoke <dest>` is refused and the record stays out of `access revoke <TAB>`"
                     );
                     assert!(
                         offers(&ctx, &["access", "revoke", "--identity", ""]).contains(&id),
-                        "`untrust --identity` is the verb the refusal points at"
+                        "`access revoke --identity` is the verb the refusal points at"
                     );
                     let rows = ctx.repl_complete(".mesh", &["access", "block", ""], "");
                     let description = rows
@@ -30898,7 +30994,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert!(
                             out.contains(
-                                "To remove these 1 instance(s), run: .mesh trust --prune --confirm prune-1"
+                                "To remove these 1 instance(s), run: .mesh access revoke --stale --confirm prune-1"
                             ),
                             "{line}: the token counts the stale sibling only: {out}"
                         );
@@ -30935,10 +31031,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The deny-only row comes from block, then block and unblock of the identity.
-            /// `untrust <dest>` under any flag is the teaching error naming `unblock`, asks
-            /// nothing and writes nothing; `.mesh trust <dest>` with the peer heard lifts the
+            /// `access revoke <dest>` under any flag is the teaching error naming `access unblock`, asks
+            /// nothing and writes nothing; `.mesh access trust <dest>` with the peer heard lifts the
             /// deny, binds the record to the heard identity, and the instance answers
-            /// trusted again; `.mesh peers` and `untrust <TAB>` agree.
+            /// trusted again; `.mesh people list` and `access revoke <TAB>` agree.
             #[test]
             #[serial]
             fn trust_lifts_the_deny_only_row_the_teaching_error_names() {
@@ -30970,7 +31066,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let before = trust_file(&trust);
                     let teaching = format!(
-                        "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {dest} lifts the block."
+                        "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {dest} lifts the block."
                     );
 
                     for line in [
@@ -31018,10 +31114,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The deny-only row under a trusted-all identity comes from block, then block
-            /// and unblock of the identity, then `trust --identity`. A repeat `block <dest>`
-            /// is a no-op that binds nothing; the `trust --identity` preview still counts the
-            /// instance that stays blocked, read from the peer table, `untrust --identity`
-            /// lists no instance for it, and `forget --identity` lists the block.
+            /// and unblock of the identity, then `access trust --identity`. A repeat `access block <dest>`
+            /// is a no-op that binds nothing; the `access trust --identity` preview still counts the
+            /// instance that stays blocked, read from the peer table, `access revoke --identity`
+            /// lists no instance for it, and `access forget --identity` lists the block.
             #[test]
             #[serial]
             fn a_deny_only_row_under_a_re_trusted_identity_counts_in_the_trust_preview_and_the_forget_list()
@@ -31091,7 +31187,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let preview = out.lines().next().unwrap();
                     assert!(
                         preview.ends_with(
-                            " 1 instance(s) of this identity stay blocked; .mesh unblock <destination> lifts each."
+                            " 1 instance(s) of this identity stay blocked; .mesh access unblock <destination> lifts each."
                         ),
                         "{out}"
                     );
@@ -31116,7 +31212,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// A repeat `block` of a deny-only row under a re-trusted identity is a no-op
+            /// A repeat `access block` of a deny-only row under a re-trusted identity is a no-op
             /// from the verb: the REPL asks nothing, binds nothing, fires no `mesh.trust.*`
             /// hook and rewrites no file, the bare form and `--yes` alike.
             #[test]
@@ -31187,8 +31283,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `forget <dest>` on a deny-only row is the teaching error and writes nothing;
-            /// the blocked instance stays out of `untrust` completion; and `forget
+            /// `access forget <dest>` on a deny-only row is the teaching error and writes nothing;
+            /// the blocked instance stays out of `access revoke` completion; and `access forget
             /// --identity` lists the block in its dry run and takes it with the identity, so
             /// no orphan deny survives.
             #[test]
@@ -31236,7 +31332,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            ".mesh forget takes --identity <id>: a destination is untrusted with .mesh untrust {dest} or refused with .mesh block {dest}."
+                            ".mesh access forget takes --identity <id>: a destination is untrusted with .mesh access revoke {dest} or refused with .mesh access block {dest}."
                         )
                     );
                     assert_eq!(
@@ -31259,7 +31355,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust_file(&trust), before, "a dry run writes nothing");
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     // Completion never offers what the verb refuses: the blocked instance
-                    // stays off `untrust` and on `trust`.
+                    // stays off `access revoke` and on `access trust`.
                     assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
                     assert!(offers(&ctx, &["access", "trust", ""]).contains(&dest));
 
@@ -31286,7 +31382,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         refusal(&mut ctx, &format!(".mesh access revoke {dest}")).await,
                         format!(
-                            "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+                            "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
                         )
                     );
 
@@ -31402,7 +31498,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// A denied record under an identity that is not trusted for all is the shape
             /// an older release left. `--dry-run` previews and writes nothing; the consented
             /// write takes the record alone (one `mesh.trust.revoked`, no grant) and says the
-            /// block stays, naming `unblock`; the next `untrust` names the block, not a
+            /// block stays, naming `access unblock`; the next `access revoke` names the block, not a
             /// missing record.
             #[test]
             #[serial]
@@ -31459,7 +31555,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // nothing written.
                     let _script = prompt_script::install(&[]);
                     let tail = format!(
-                        "It stays blocked, so it is refused without a knock; .mesh unblock {dest} lifts that."
+                        "It stays blocked, so it is refused without a knock; .mesh access unblock {dest} lifts that."
                     );
                     let preview = format!(
                         "This untrusts instance {}: its destination record goes; the identity {} stays known. {tail}",
@@ -31497,7 +31593,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         trust.denied().len(),
                         1,
-                        "the deny outlives the record: lifting a block is `unblock`'s business"
+                        "the deny outlives the record: lifting a block is `access unblock`'s business"
                     );
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Refuse);
@@ -31516,14 +31612,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         refusal(&mut ctx, &format!(".mesh access revoke {dest}")).await,
                         format!(
-                            "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {dest} lifts the block."
+                            "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {dest} lifts the block."
                         )
                     );
                     assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
                     assert!(offers(&ctx, &["access", "unblock", ""]).contains(&dest));
                     assert!(
                         offers(&ctx, &["access", "trust", ""]).contains(&dest),
-                        "still heard, so `trust` offers it"
+                        "still heard, so `access trust` offers it"
                     );
                     assert!(sink.drain().is_empty());
 
@@ -31589,7 +31685,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                     assert!(
                         out.ends_with(&format!(
-                            " It stays blocked, so it is refused without a knock; .mesh unblock {disk_dest} lifts that."
+                            " It stays blocked, so it is refused without a knock; .mesh access unblock {disk_dest} lifts that."
                         )),
                         "{out}"
                     );
@@ -31625,7 +31721,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "This untrusts instance {}: its destination record goes; the identity {} stays known. It stays blocked, so it is refused without a knock; .mesh unblock {session_dest} lifts that.\n{DRY_RUN_NOTHING_CHANGED}",
+                            "This untrusts instance {}: its destination record goes; the identity {} stays known. It stays blocked, so it is refused without a knock; .mesh access unblock {session_dest} lifts that.\n{DRY_RUN_NOTHING_CHANGED}",
                             short(&session_dest),
                             short(&session_id)
                         )
@@ -31640,7 +31736,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .unwrap();
                     assert!(
                         out.ends_with(&format!(
-                            " It stays blocked, so it is refused without a knock; .mesh unblock {session_dest} lifts that."
+                            " It stays blocked, so it is refused without a knock; .mesh access unblock {session_dest} lifts that."
                         )),
                         "{out}"
                     );
@@ -31673,7 +31769,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         refusal(&mut ctx, &format!(".mesh access revoke {session_dest}")).await,
                         format!(
-                            "Destination {session_dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {session_dest} lifts the block."
+                            "Destination {session_dest} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {session_dest} lifts the block."
                         )
                     );
 
@@ -31759,7 +31855,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `trust --identity` is a mutating verb like the rest: without a terminal it refuses
+            /// `access trust --identity` is a mutating verb like the rest: without a terminal it refuses
             /// naming the flag, and declined at the prompt it writes nothing.
             #[test]
             #[serial]
@@ -31933,7 +32029,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// An interval of 0 turns the automatic sync off; `.mesh sync` still fetches.
+            /// An interval of 0 turns the automatic sync off; `.mesh messaging sync` still fetches.
             #[test]
             #[serial]
             fn sync_by_hand_works_while_the_interval_is_zero() {
@@ -32084,7 +32180,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// The same heard-but-untrusted destination that `.mesh message` refuses with the
+            /// The same heard-but-untrusted destination that `.mesh messaging send` refuses with the
             /// trust tail reaches the knock's consent notice, and an intro of exactly the
             /// bound is accepted.
             #[test]
@@ -32196,7 +32292,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// Only denied/blocked stand in a knock's way. An instance heard under a NEW
             /// key (marked `key changed` in the peer table; `authorize` judges it
-            /// default-closed, which refuses `.mesh message`) is still knockable: the notice
+            /// default-closed, which refuses `.mesh messaging send`) is still knockable: the notice
             /// shows `trust: untrusted` and the question is asked; nothing is sent when it
             /// is declined.
             #[test]
@@ -32320,7 +32416,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// A peer whose last link failed reads `no route` in `.mesh peers` and
+            /// A peer whose last link failed reads `no route` in `.mesh people list` and
             /// `reachable: false` in `mesh__peers` even while a path to it is held; a
             /// request to it still goes straight over that path without a route line, and
             /// the link that comes up lifts the mark from both listings.
@@ -32406,7 +32502,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// A trusted peer that said it left is tried over no link and waited on for no
             /// path, though it would answer: with no propagation node known, `.mesh
-            /// message`, `.mesh request` and mesh__send, mesh__ask and mesh__request_access
+            /// message`, `.mesh files request` and mesh__send, mesh__ask and mesh__request_access
             /// each say at once that it is unreachable and queue nothing, and `.mesh
             /// pending` shows the question still open to it beside `peer left`.
             #[test]
@@ -32603,7 +32699,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// A trusted peer that said it left two hours ago, with a propagation node known:
-            /// `.mesh message`, `.mesh request`, mesh__send, mesh__ask and
+            /// `.mesh messaging send`, `.mesh files request`, mesh__send, mesh__ask and
             /// mesh__request_access each go to the propagation node at once, with no path
             /// wait and no link to the peer, and each says the peer left, that the node
             /// holds it and who gets it. The tools name the peer by its full hash, `.mesh
@@ -32788,7 +32884,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// A trusted peer whose last link failed and whose path expired, with a
-            /// propagation node known: `.mesh message` and mesh__send go to the node with
+            /// propagation node known: `.mesh messaging send` and mesh__send go to the node with
             /// no path wait, and say the peer has no route and that the node holds it.
             #[test]
             #[serial]
@@ -32927,7 +33023,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let lines = idle.0.lock().clone();
                     assert_eq!(
                         lines,
-                        ["Tia is back; your question from 2d ago is still open; .mesh pending lists it".to_string()],
+                        ["Tia is back; your question from 2d ago is still open; .mesh messaging sent lists it".to_string()],
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -32991,8 +33087,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// The peer is a stub behind the real dispatcher that knows this node's identity
             /// but trusts none of its instances. This node trusts the stub in the one
-            /// documented sentence, lists it `trusted`, and then `.mesh message` and
-            /// `.mesh fetch` are both refused by the peer out loud: the error names the peer
+            /// documented sentence, lists it `trusted`, and then `.mesh messaging send` and
+            /// `.mesh files fetch` are both refused by the peer out loud: the error names the peer
             /// by its announced name in quotes, this node by the full destination the peer's
             /// owner would trust, the command that owner runs, and that this node does trust
             /// the peer; neither the wire code nor the retired knock hint shows.
@@ -33037,7 +33133,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(row.contains(" trusted "), "{row}");
 
                     let refusal = format!(
-                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)"
+                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)"
                     );
                     let before = stdout_lines().len();
                     let err = run(
@@ -33080,7 +33176,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// The peer is a stub behind the real dispatcher that knows no identity, so
                 /// a link to it comes up and then nothing answers. This node trusts it, and
-                /// `.mesh message` and `.mesh status` both end on the no-answer sentence
+                /// `.mesh messaging send` and `.mesh status` both end on the no-answer sentence
                 /// naming the command the peer's owner runs, never the unreachable one.
                 #[test]
                 #[serial]
@@ -33105,7 +33201,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         let own = started.runtime.current_destination_hash();
                         let no_answer = format!(
-                            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance).",
                             short(&peer)
                         );
 
@@ -33119,7 +33215,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from."
+                                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from."
                             )
                         );
 
@@ -33147,8 +33243,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// `.mesh status` against a trusted, reachable peer that accepts the request but
             /// serves nothing at `/status` (a stub behind the real dispatcher with only the
             /// message handler registered) ends on the error line the status refusal
-            /// renders: what happened, the likely why, and the two next steps (`.mesh info
-            /// <destination>` for the last card, upgrade then try again). Nothing else is
+            /// renders: what happened, the likely why, and the two next steps (`.mesh people
+            /// info <destination>` for the last card, upgrade then try again). Nothing else is
             /// printed after the progress line, and the line carries no wire code.
             #[test]
             #[serial]
@@ -33188,7 +33284,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
+                            "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <destination> does; ask the person at that node to upgrade, then try again"
                         )
                     );
                     assert!(!err.contains("0x"), "{err}");
@@ -33214,9 +33310,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `.mesh broadcast --yes` to Bea (who trusts this instance) and Cee (who only
+            /// `.mesh messaging broadcast --yes` to Bea (who trusts this instance) and Cee (who only
             /// knows its identity): the report lists Bea delivered, Cee on one line that is
-            /// the peer's own refusal sentence - the same words `.mesh message` prints for
+            /// the peer's own refusal sentence - the same words `.mesh messaging send` prints for
             /// her, with the name quoted and the knock as the next command - and NOT a
             /// `refused: <reason>` copy of it, and the total counts her refused.
             #[test]
@@ -33276,7 +33372,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
+                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(
@@ -33367,7 +33463,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "{b8} is known in this node's trust list; `.mesh peers` shows the standing. {tail}"
+                                "{b8} is known in this node's trust list; `.mesh people list` shows the standing. {tail}"
                             ),
                             "{line}"
                         );
@@ -33381,7 +33477,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// Forgetting an identity through the verb takes its rate-limit drop count with
-            /// it: `.mesh knocks` listed the drops before and lists nothing of the identity
+            /// it: `.mesh access requests` listed the drops before and lists nothing of the identity
             /// after, cache and counters alike.
             #[test]
             #[serial]
@@ -33955,7 +34051,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// B trusts A's identity for all destinations before it has heard A, so
-                /// the first `.mesh message` asks for A, passes the trust check on the
+                /// the first `.mesh messaging send` asks for A, passes the trust check on the
                 /// identity the answer carries, and delivers the message to A's inbox.
                 #[test]
                 #[serial]
@@ -34022,7 +34118,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             unanswered_path_request(&unheard),
                             format!(
-                                "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
+                                "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
                                 short(&unheard)
                             )
                         );
@@ -34079,7 +34175,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(stdout_lines().len(), printed, "{line}: nothing was asked");
                         }
                         assert!(
-                            !UNHEARD_KNOCK_REFUSAL_TAIL.contains(".mesh trust"),
+                            !UNHEARD_KNOCK_REFUSAL_TAIL.contains(".mesh access trust"),
                             "trust refuses an unheard blocked destination too, so it is no remedy"
                         );
 
@@ -34140,7 +34236,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `.mesh status`, `.mesh fetch` and `.mesh request` to an unheard destination
+                /// `.mesh status`, `.mesh files fetch` and `.mesh files request` to an unheard destination
                 /// ask for it, file the answer, then refuse the way they refuse any heard peer
                 /// this node does not trust, never with the unanswered path request sentence.
                 #[test]
@@ -34221,7 +34317,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A hash typed in capitals is the same destination: it is asked for once,
-                /// filed under its lower-case spelling and listed by `.mesh peers`. Once
+                /// filed under its lower-case spelling and listed by `.mesh people list`. Once
                 /// filed, the next verb on it neither asks again nor waits.
                 #[test]
                 #[serial]
@@ -34284,9 +34380,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     (CommandPrefix::Both, '.', ".mesh"),
                 ];
 
-                /// The refusals of the trust verbs and of `.mesh message` leave the REPL
+                /// The refusals of the trust verbs and of `.mesh messaging send` leave the REPL
                 /// as `.mesh` errors, so each hint they carry is spelled in the prefix the
-                /// session was switched to. `.mesh message` to a hash never heard fails
+                /// session was switched to. `.mesh messaging send` to a hash never heard fails
                 /// with the same unanswered path request sentence the trust row checks.
                 #[test]
                 #[serial]
@@ -34310,13 +34406,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .await
                                 .unwrap();
                             for (line, hint) in [
-                                (format!("access trust {unheard} --yes"), "peers"),
+                                (format!("access trust {unheard} --yes"), "people list"),
                                 (
                                     format!("access revoke --identity {unknown_identity}"),
-                                    "trust --identity",
+                                    "access trust --identity",
                                 ),
-                                ("access block nothex00".to_string(), "peers"),
-                                (format!("messaging send {heard} hi"), "peers"),
+                                ("access block nothex00".to_string(), "people list"),
+                                (format!("messaging send {heard} hi"), "people list"),
                             ] {
                                 let err = run(&mut ctx, &format!("{sigil}mesh {line}"))
                                     .await
@@ -34337,7 +34433,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// A live `.mesh knocks` listing under slash points at `/mesh trust`.
+                /// A live `.mesh access requests` listing under slash points at `/mesh access trust`.
                 #[test]
                 #[serial]
                 fn the_knocks_listing_spells_its_hints_in_the_prefix() {
@@ -34374,7 +34470,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(&mut ctx, "/mesh access requests").await.unwrap();
 
-                        assert!(out.contains("/mesh trust "), "{out}");
+                        assert!(out.contains("/mesh access trust "), "{out}");
                         assert!(!out.contains(".mesh"), "{out}");
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         started.relay_handle.abort();
@@ -34387,7 +34483,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 use crate::config::{CommandPrefix, live_prefix_override};
                 use crate::render::command_error_text;
 
-                /// `.mesh info .vault` and `.mesh knock .vault` refuse the token as the
+                /// `.mesh people info .vault` and `.mesh access ask .vault` refuse the token as the
                 /// human typed it under either prefix, while the listing hint after it
                 /// follows the prefix.
                 #[test]
@@ -34419,7 +34515,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     "{prefix} {verb}: {text}"
                                 );
                                 assert!(
-                                    text.contains(&format!("`{sigil}mesh peers` lists")),
+                                    text.contains(&format!("`{sigil}mesh people list` lists")),
                                     "{prefix} {verb}: {text}"
                                 );
                                 assert!(!text.contains("/vault"), "{prefix} {verb}: {text}");
@@ -34548,7 +34644,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The knock cache is read lazily, so a pre-rename line (`"version":1`; current
-            /// records are `2`) surfaces at `.mesh knocks`, naming both versions and the
+            /// records are `2`) surfaces at `.mesh access requests`, naming both versions and the
             /// remedy, instead of listing nothing. The node itself keeps running (the cache
             /// is not a start-time store), and the file is left as it was.
             #[test]
@@ -34738,7 +34834,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "{sentence}\nBlocked {}: it is refused without a knock (identity {} otherwise unchanged). .mesh unblock {dest} lifts it.",
+                            "{sentence}\nBlocked {}: it is refused without a knock (identity {} otherwise unchanged). .mesh access unblock {dest} lifts it.",
                             short(&dest),
                             short(&id)
                         )
@@ -34752,10 +34848,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// `block` asks "Block <short>?" after its sentence; a declined prompt or a
-            /// missing terminal writes nothing and the verdict stays trusted, and `untrust`
+            /// `access block` asks "Block <short>?" after its sentence; a declined prompt or a
+            /// missing terminal writes nothing and the verdict stays trusted, and `access revoke`
             /// of the same instance is refused before any question. An `untrust-<short>`
-            /// token is refused by `forget` with a hint spelling its own `forget-<short>`,
+            /// token is refused by `access forget` with a hint spelling its own `forget-<short>`,
             /// and an unknown flag is refused under each verb's own usage.
             #[test]
             #[serial]
@@ -34802,13 +34898,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
                         assert_eq!(prompt_script::prompts_asked(), 0);
 
-                        // `untrust` under the identity grant is refused before any question.
+                        // `access revoke` under the identity grant is refused before any question.
                         let printed = stdout_lines().len();
                         let err = refusal(&mut ctx, &format!(".mesh access revoke {dest}")).await;
                         assert_eq!(
                             err,
                             format!(
-                                "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {dest}. To stop trusting the whole identity, run .mesh untrust --identity {id}.",
+                                "Destination {} belongs to identity {}, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block {dest}. To stop trusting the whole identity, run .mesh access revoke --identity {id}.",
                                 short(&dest),
                                 short(&id)
                             )
@@ -34836,7 +34932,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(trust.denied().is_empty());
                     }
 
-                    // `forget` takes its own token, and says so under its own name.
+                    // `access forget` takes its own token, and says so under its own name.
                     let _script = prompt_script::install(&[]);
                     let short_id = short(&id);
                     let err = refusal(
@@ -34850,8 +34946,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         err.contains(&format!("--confirm forget-{short_id}")),
                         "{err}"
                     );
-                    assert!(err.contains(".mesh forget --identity"), "{err}");
-                    assert!(!err.contains(".mesh untrust --identity"), "{err}");
+                    assert!(err.contains(".mesh access forget --identity"), "{err}");
+                    assert!(!err.contains(".mesh access revoke --identity"), "{err}");
                     assert_eq!(trust_file(&trust).as_deref(), Some(before.as_slice()));
                     assert!(trusted_hashes(&trust).contains(&id));
 
@@ -34880,7 +34976,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// One row per command in table order, `sync` and `forget` among them and none
+            /// One row per command in table order, `messaging sync` and `access forget` among them and none
             /// of the withdrawn spellings; `.mesh help` prints the same list, `.mesh help
             /// --yes` is a single usage refusal, and under the node neither touches
             /// anything.
@@ -34968,14 +35064,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// With a blocked instance, a blocked identity that had a trusted instance, and
-            /// a plain trusted instance side by side, `untrust <TAB>` offers only the plain
-            /// one (not the blocked instance, not the blocked identity's, which `block`
-            /// already swept), `untrust --identity <TAB>` only the identity holding a grant
-            /// (not the plain instance's binding-only one, which the verb refuses), `forget
-            /// <TAB>` offers flags alone and `forget --identity <TAB>` the trusted and the
-            /// blocked identities, `trust <TAB>` never offers the blocked identity's
-            /// destination, `trust --identity <TAB>` never the blocked identity, `block
-            /// <TAB>` never an already-blocked instance or identity and `unblock <TAB>` only
+            /// a plain trusted instance side by side, `access revoke <TAB>` offers only the plain
+            /// one (not the blocked instance, not the blocked identity's, which `access block`
+            /// already swept), `access revoke --identity <TAB>` only the identity holding a grant
+            /// (not the plain instance's binding-only one, which the verb refuses), `access forget
+            /// <TAB>` offers flags alone and `access forget --identity <TAB>` the trusted and the
+            /// blocked identities, `access trust <TAB>` never offers the blocked identity's
+            /// destination, `access trust --identity <TAB>` never the blocked identity, `access block
+            /// <TAB>` never an already-blocked instance or identity and `access unblock <TAB>` only
             /// those; every candidate offered is one the verb accepts.
             #[test]
             #[serial]
@@ -35032,7 +35128,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(!identities.contains(&blocked_id), "{identities:?}");
                     // An identity trusted at the destination tier only holds no grant to
                     // withdraw while its instance stands, so the verb refuses it and the
-                    // completer leaves it out; `forget --identity` still offers it.
+                    // completer leaves it out; `access forget --identity` still offers it.
                     assert!(
                         !identities.contains(&plain_id),
                         "binding-only identity: {identities:?}"
@@ -35049,7 +35145,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         offers(&ctx, &["access", "forget", ""]),
                         ["--identity ", "--dry-run"],
-                        "`forget` takes no destination"
+                        "`access forget` takes no destination"
                     );
                     let forgettable = offers(&ctx, &["access", "forget", "--identity", ""]);
                     let mut trusted_identities = [
@@ -35066,7 +35162,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         &forgettable[trusted_identities.len()..],
                         std::slice::from_ref(&blocked_id),
-                        "then the blocked one, which `forget` erases too"
+                        "then the blocked one, which `access forget` erases too"
                     );
                     for identity in &forgettable {
                         let out = out_of(
@@ -35110,7 +35206,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::slice::from_ref(&blocked_id)
                     );
 
-                    // What `untrust <TAB>` offered, `untrust` takes without a refusal.
+                    // What `access revoke <TAB>` offered, `access revoke` takes without a refusal.
                     let before = trust_file(&trust).unwrap();
                     let hashes: Vec<String> = offers(&ctx, &["access", "revoke", ""])
                         .into_iter()
@@ -35134,9 +35230,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// With an instance blocked in place, `trust --prune --confirm` for an ancient
+            /// With an instance blocked in place, `access trust --prune --confirm` for an ancient
             /// horizon sweeps a stale sibling but leaves the block where it is, `.mesh
-            /// peers` shows the instance as `blocked (instance)`, `block` then `unblock` of
+            /// peers` shows the instance as `blocked (instance)`, `access block` then `access unblock` of
             /// its identity leaves the deny standing, and the verb error after that spells
             /// the full destination twice.
             #[test]
@@ -35221,7 +35317,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.authorize(&id, &refused).rule, Rule::DestinationDenied);
                     assert_eq!(trust.denied().len(), 1);
                     let teaching = format!(
-                        "Destination {refused} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {refused} lifts the block."
+                        "Destination {refused} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {refused} lifts the block."
                     );
                     for flag in ["", " --dry-run", " --yes"] {
                         let err =
@@ -36667,7 +36763,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files allow docs/** --peer bob").await,
-                            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+                            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
                         );
                         assert!(!fx.locations.global.exists());
 
@@ -36823,7 +36919,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "`.mesh allow` takes a file pattern, not a peer; to trust the instance {} run `.mesh trust {dest}`, or scope a share to it with `--peer {dest}`.",
+                                "`.mesh files allow` takes a file pattern, not a peer; to trust the instance {} run `.mesh access trust {dest}`, or scope a share to it with `--peer {dest}`.",
                                 short(dest)
                             )
                         );
@@ -36851,7 +36947,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "`.mesh deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh block {dest}`.",
+                                "`.mesh files deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh access block {dest}`.",
                                 short(dest)
                             )
                         );
@@ -36931,7 +37027,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     use super::*;
                     use crate::config::{CommandPrefix, live_prefix_override};
 
-                    /// Under slash every line of `.mesh deny` quotes a dotted pattern as
+                    /// Under slash every line of `.mesh files deny` quotes a dotted pattern as
                     /// it was typed: the match count, the intent and the result alike.
                     #[test]
                     #[serial]
@@ -37012,7 +37108,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let out = out_of(&mut fx.ctx, "/mesh files list").await.unwrap();
                             assert!(
                                 out.ends_with(
-                                    "`/mesh allow docs/**` shares docs/ with every trusted peer."
+                                    "`/mesh files allow docs/**` shares docs/ with every trusted peer."
                                 ),
                                 "{out}"
                             );
@@ -37032,7 +37128,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(
                                 scoped,
                                 format!(
-                                    "No share rule applies to peer {}; `/mesh shares` lists every rule.",
+                                    "No share rule applies to peer {}; `/mesh files list` lists every rule.",
                                     short(&hash)
                                 )
                             );
@@ -37304,7 +37400,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files unshare docs/**").await,
                             format!(
-                                "`docs/**` is held by {g} (allow); without a flag `.mesh unshare` edits {w}, which does not hold it. Run `.mesh unshare docs/** --global` to remove it from {g}.",
+                                "`docs/**` is held by {g} (allow); without a flag `.mesh files unshare` edits {w}, which does not hold it. Run `.mesh files unshare docs/** --global` to remove it from {g}.",
                                 g = fx.global(),
                                 w = fx.workspace()
                             )
@@ -37312,7 +37408,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files unshare docs/** --workspace").await,
                             format!(
-                                "`docs/**` is held by {g} (allow), not by {w}. Run `.mesh unshare docs/** --global` to remove it from {g}.",
+                                "`docs/**` is held by {g} (allow), not by {w}. Run `.mesh files unshare docs/** --global` to remove it from {g}.",
                                 g = fx.global(),
                                 w = fx.workspace()
                             )
@@ -37369,7 +37465,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files unshare notes/** --global").await,
                             format!(
-                                "`notes/**` is held by {w} (deny), not by {g}. Run `.mesh unshare notes/** --workspace` to remove it from {w}.",
+                                "`notes/**` is held by {w} (deny), not by {g}. Run `.mesh files unshare notes/** --workspace` to remove it from {w}.",
                                 g = fx.global(),
                                 w = fx.workspace()
                             )
@@ -37378,7 +37474,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files unshare docs/** --workspace").await,
                             format!(
-                                "`docs/**` is held by {g} (allow and deny), not by {w}. Run `.mesh unshare docs/** --global` to remove it from {g}.",
+                                "`docs/**` is held by {g} (allow and deny), not by {w}. Run `.mesh files unshare docs/** --global` to remove it from {g}.",
                                 g = fx.global(),
                                 w = fx.workspace()
                             )
@@ -37415,7 +37511,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files unshare nope/**").await,
                             format!(
-                                "No share rule has the pattern `nope/**` in {} or {}; `.mesh shares` lists them.",
+                                "No share rule has the pattern `nope/**` in {} or {}; `.mesh files list` lists them.",
                                 fx.global(),
                                 fx.workspace()
                             )
@@ -37583,7 +37679,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             err,
-                            "The share list changed while the prompt was open; run `.mesh unshare` again."
+                            "The share list changed while the prompt was open; run `.mesh files unshare` again."
                         );
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
@@ -38004,7 +38100,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                             assert_eq!(
                                 refusal(&mut fx.ctx, ".mesh files list --all").await,
-                                "`--all` works with `--effective`: run `.mesh shares --effective --all`."
+                                "`--all` works with `--effective`: run `.mesh files list --effective --all`."
                             );
                             fx.stop().await;
                         });
@@ -38035,7 +38131,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     }
                 }
 
-                /// `shares` is inspection and reads the files the node would serve from
+                /// `files list` is inspection and reads the files the node would serve from
                 /// even while it is off; the mutating verbs refuse after their usage checks and
                 /// before any prompt, like every other node verb.
                 #[test]
@@ -38139,7 +38235,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         stdout_lines().join("\n"),
                         format!(
-                            "No share rule applies to peer {}; `.mesh shares` lists every rule.",
+                            "No share rule applies to peer {}; `.mesh files list` lists every rule.",
                             short(&peer)
                         )
                     );
@@ -38182,7 +38278,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 1 path(s) are shared with trusted peers (`.mesh shares`)",
+                        "  files: 1 path(s) are shared with trusted peers (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -38211,7 +38307,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             truncated: false,
                         }))
                         .as_deref(),
-                        Some("  files: 3 path(s) are shared with trusted peers (`.mesh shares`)")
+                        Some(
+                            "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)"
+                        )
                     );
                     assert_eq!(
                         clause(Some(MatchCount {
@@ -38221,7 +38319,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }))
                         .as_deref(),
                         Some(
-                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh shares`)"
+                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh files list`)"
                         )
                     );
                     assert_eq!(
@@ -38232,7 +38330,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }))
                         .as_deref(),
                         Some(
-                            "  files: at least 7 path(s) are shared with trusted peers (`.mesh shares`)"
+                            "  files: at least 7 path(s) are shared with trusted peers (`.mesh files list`)"
                         ),
                         "a walk cut short names a floor, not a count"
                     );
@@ -38244,7 +38342,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }))
                         .as_deref(),
                         Some(
-                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh shares`)"
+                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh files list`)"
                         ),
                         "the cap wins when both hold"
                     );
@@ -38280,7 +38378,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 2 path(s) are shared with trusted peers (`.mesh shares`)",
+                        "  files: 2 path(s) are shared with trusted peers (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -38388,7 +38486,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A pattern held as both an allow and a deny in one file counts as more
-                /// than one holder: `unshare` names each with its kind, removes nothing on
+                /// than one holder: `files unshare` names each with its kind, removes nothing on
                 /// no and both on yes; a dry run previews both removals and writes nothing.
                 #[test]
                 #[serial]
@@ -38521,8 +38619,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The completer offers override paths under `unshare`, so the verb takes
-                /// one; `.mesh shares` stops flagging the inert override once it is gone.
+                /// The completer offers override paths under `files unshare`, so the verb takes
+                /// one; `.mesh files list` stops flagging the inert override once it is gone.
                 #[test]
                 #[serial]
                 fn unshare_removes_a_lone_override_entry() {
@@ -38553,7 +38651,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// Same shape as `allow`'s dry run.
+                /// Same shape as `files allow`'s dry run.
                 #[test]
                 #[serial]
                 fn deny_dry_run_prints_the_count_and_target_and_writes_nothing() {
@@ -38727,7 +38825,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 2 path(s) are shared with trusted peers (`.mesh shares`)",
+                        "  files: 2 path(s) are shared with trusted peers (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                     assert_eq!(
@@ -38799,8 +38897,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The withdrawn-spelling classification (`deny <32-hex>`) comes before the
-                /// mesh gate, so an off context hears the teaching, not `MESH_OFF`; `shares
+                /// The withdrawn-spelling classification (`files deny <32-hex>`) comes before the
+                /// mesh gate, so an off context hears the teaching, not `MESH_OFF`; `files list
                 /// --peer` refuses a non-hash rather than listing for "bob".
                 #[test]
                 #[serial]
@@ -38812,7 +38910,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
 
                     let err = err_of(&mut ctx, &format!(".mesh files deny {dest}"));
-                    assert!(err.contains(&format!(".mesh block {dest}")), "{err}");
+                    assert!(err.contains(&format!(".mesh access block {dest}")), "{err}");
                     assert_ne!(err, MESH_OFF);
 
                     let root = TempDir::new("repl-mesh-probe-classify-off-root");
@@ -38856,7 +38954,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 1000 or more path(s) are shared with trusted peers (`.mesh shares`)",
+                        "  files: 1000 or more path(s) are shared with trusted peers (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -38894,7 +38992,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 1 path(s) are shared with trusted peers (`.mesh shares`)",
+                        "  files: 1 path(s) are shared with trusted peers (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -38949,7 +39047,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A `**` head anywhere in the first segment is broad (`**/*.md` asks even
-                /// over one file); an `unshare` that needs the question fails without a
+                /// over one file); an `files unshare` that needs the question fails without a
                 /// terminal naming `--yes`, and `--yes` stands in for it; a malformed or
                 /// parent-escaping pattern is refused and writes nothing.
                 #[test]
@@ -39257,7 +39355,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// Nothing leaves this machine and nothing lands on it before consent: the
-                /// off-path `shares`, `shares --effective` and the `.mesh on` preview read
+                /// off-path `files list`, `files list --effective` and the `.mesh on` preview read
                 /// the share root's case folding without writing a probe file, and create
                 /// no share file of their own. The root directory's mtime tells which: a
                 /// probe that creates and removes a file bumps it, a read-only hint does not.
@@ -39318,7 +39416,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines().join("\n");
                     assert!(
                         out.lines().any(|line| line
-                            == "  files: 3 path(s) are shared with trusted peers (`.mesh shares`)"),
+                            == "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)"),
                         "{out}"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 1);
@@ -39443,7 +39541,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `deny` keeps the layer it announced like `allow` does,
+                /// `files deny` keeps the layer it announced like `files allow` does,
                 /// and a concurrent edit to the announced file made while the question
                 /// stands survives the write.
                 #[test]
@@ -39578,7 +39676,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             err,
-                            "The share list changed while the prompt was open; run `.mesh unshare` again."
+                            "The share list changed while the prompt was open; run `.mesh files unshare` again."
                         );
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         assert_eq!(
@@ -39593,7 +39691,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// Handing `allow` a destination hash is a pure
+                /// Handing `files allow` a destination hash is a pure
                 /// classification error: it fires with the mesh OFF (before `MESH_OFF`),
                 /// with `--peer` alongside, and writes nothing in either case.
                 #[test]
@@ -39611,7 +39709,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let err = err_of(&mut ctx, &format!(".mesh files allow {dest}"));
                     assert_ne!(err, MESH_OFF, "a pure check fires before the mesh gate");
-                    assert!(err.contains(&format!(".mesh trust {dest}")), "{err}");
+                    assert!(err.contains(&format!(".mesh access trust {dest}")), "{err}");
                     assert!(err.contains(&format!("--peer {dest}")), "{err}");
 
                     let err = err_of(
@@ -39620,13 +39718,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_ne!(err, MESH_OFF, "{err}");
                     assert!(
-                        err.contains(&format!(".mesh trust {dest}")),
+                        err.contains(&format!(".mesh access trust {dest}")),
                         "the positional is still a hash, whatever follows: {err}"
                     );
 
                     let err = err_of(&mut ctx, &format!(".mesh files allow {dest} --dry-run"));
                     assert_ne!(err, MESH_OFF, "{err}");
-                    assert!(err.contains(&format!(".mesh trust {dest}")), "{err}");
+                    assert!(err.contains(&format!(".mesh access trust {dest}")), "{err}");
 
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -39773,9 +39871,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// `deny` and `unshare` refuse by the same one sentence as `allow`, a broad
-                /// `allow` refuses before it asks, and the share files stay byte-identical,
-                /// while plain `shares` is inspection and still lists the rules. The
+                /// `files deny` and `files unshare` refuse by the same one sentence as `files allow`, a broad
+                /// `files allow` refuses before it asks, and the share files stay byte-identical,
+                /// while plain `files list` is inspection and still lists the rules. The
                 /// case-folding probe is memoised, so restoring the permissions alone does
                 /// not reopen the verbs: the sentence's own remedy (`.mesh off` then `.mesh
                 /// on`) is the only way back.
@@ -39893,7 +39991,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines()[before..].to_vec();
                     let files = index_of(
                         &out,
-                        "  files: 3 path(s) are shared with trusted peers (`.mesh shares`)",
+                        "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
@@ -40284,7 +40382,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// A `peer:` field is repo-derived text: a non-hash peer carrying an
                 /// escape is shown as "scoped to no peer" with the escape stripped, both in
-                /// the `shares` row and in the holder row `unshare` prints before asking.
+                /// the `files list` row and in the holder row `files unshare` prints before asking.
                 #[test]
                 #[serial]
                 fn shares_and_unshare_strip_escapes_from_a_non_hash_peer_field() {
@@ -40332,7 +40430,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A pattern whose head is a link resolving to `.git/` is a directory
-                /// the walk never enters: `allow`, `allow --force` and `deny` refuse it with
+                /// the walk never enters: `files allow`, `files allow --force` and `files deny` refuse it with
                 /// the protected reason and write nothing.
                 #[test]
                 #[serial]
@@ -40373,7 +40471,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `unshare` of a broad pattern that is held in both files asks
+                /// `files unshare` of a broad pattern that is held in both files asks
                 /// one question carrying the breadth words, and a `yes` removes every holder
                 /// while the files are re-read first; no temp file is left beside either.
                 #[test]
@@ -40422,10 +40520,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The three new mutators and `shares` each have a usage line,
+                /// The three new mutators and `files list` each have a usage line,
                 /// an unknown flag is a usage error that acts on nothing, and `--dry-run`
                 /// with `--yes` is refused as a usage error before the mesh gate on every
-                /// mutator (not just `allow`).
+                /// mutator (not just `files allow`).
                 #[test]
                 #[serial]
                 fn every_share_mutator_rejects_yes_with_dry_run_before_the_gate() {
@@ -40504,7 +40602,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap_or_else(|| panic!("no files clause in: {preview}"));
                         assert_eq!(
                             clause,
-                            "  files: 3 path(s) are shared with trusted peers (`.mesh shares`)"
+                            "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)"
                         );
                         fx.stop().await;
                     });
@@ -40598,7 +40696,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `unshare` writes every file that holds the pattern: when one holder
+                /// `files unshare` writes every file that holds the pattern: when one holder
                 /// is a link the verb refuses before listing holders or asking, even with
                 /// a willing answerer; a layer flag that names only the real file still
                 /// works, because only the destinations that WOULD be written are judged.
@@ -40659,7 +40757,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// The bare-directory refusal reaches nested directories, holds under
                 /// `--dry-run`, and spares what it must: a bare FILE name writes, an absent
-                /// name writes (only an EXISTING directory is refused), and `unshare` of a
+                /// name writes (only an EXISTING directory is refused), and `files unshare` of a
                 /// rule that happens to be spelled like a directory still removes it.
                 #[test]
                 #[serial]
@@ -41069,8 +41167,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// Judging a link needs the root, so it waits behind the mesh gate;
-                /// `unshare` removes an entry by its TEXT, so a rule an older build
-                /// wrote through a link can still be removed and still shows in `shares`
+                /// `files unshare` removes an entry by its TEXT, so a rule an older build
+                /// wrote through a link can still be removed and still shows in `files list`
                 /// so the link judgement never strands a legacy rule.
                 #[test]
                 #[serial]
@@ -41219,9 +41317,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// `.git/` with a trailing slash is a pure refusal ("never
-                /// shared") that fires BEFORE the mesh gate for `allow` and `deny`, at any
+                /// shared") that fires BEFORE the mesh gate for `files allow` and `files deny`, at any
                 /// depth of a by-name `.git` component, glob segments ahead of it or not;
-                /// `unshare` keeps the `<dir>/**` teaching (a legacy rule under it is
+                /// `files unshare` keeps the `<dir>/**` teaching (a legacy rule under it is
                 /// still removable); the bare `.git` directory (no slash) needs the root
                 /// and so waits behind the gate.
                 #[test]
@@ -41430,7 +41528,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                             if listed != wire {
                                 violations.push(format!(
-                                    "`shares --effective` {} `vendor/dep/.git/HEAD` while the wire path {} it",
+                                    "`files list --effective` {} `vendor/dep/.git/HEAD` while the wire path {} it",
                                     if listed { "lists" } else { "hides" },
                                     if wire { "serves" } else { "withholds" }
                                 ));
@@ -41507,9 +41605,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `deny` judges a link exactly as `allow` does: dangling or escaping
+                /// `files deny` judges a link exactly as `files allow` does: dangling or escaping
                 /// is refused saying so (even when the link is named like a secret); a link
-                /// to the root or a chain of links gets a remedy `deny` itself accepts; nothing
+                /// to the root or a chain of links gets a remedy `files deny` itself accepts; nothing
                 /// is written and nothing is asked.
                 #[test]
                 #[serial]
@@ -41910,8 +42008,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// A hand-placed row naming a nested `.git` file is listed by `.mesh shares`
-                /// with its file, and `unshare` removes it; removal is the remedy, so the
+                /// A hand-placed row naming a nested `.git` file is listed by `.mesh files list`
+                /// with its file, and `files unshare` removes it; removal is the remedy, so the
                 /// protected-directory refusal the write verbs apply does not stand in its
                 /// way; `--effective` agrees with the wire path about the file (whether the
                 /// engine honours a global exact-file override under `.git/` is not asserted
@@ -42014,7 +42112,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A link to a directory that CONTAINS a nested `.git`
-                /// is an ordinary directory link: `allow dlink` / `dlink/**` teach the
+                /// is an ordinary directory link: `files allow dlink` / `dlink/**` teach the
                 /// resolved `vendor/dep/**` (links judged before the bare-directory
                 /// rule), the taught remedy is accepted and counts only what the walk
                 /// enters (never the `.git` below it), while spelling `.git` through the
@@ -42132,7 +42230,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// The "ANY segment, literal or behind a glob" rule
                 /// covers the workspace config directory's name as well as `.git`: with a
                 /// glob segment ahead of it (`*/.coyote/mesh-shares.yaml`, `**/.coyote/**`)
-                /// both `allow` and `deny` refuse as never shared, write nothing, print
+                /// both `files allow` and `files deny` refuse as never shared, write nothing, print
                 /// nothing and ask nothing, `--dry-run` included. The trailing-slash
                 /// spelling behind a glob is the pure pre-gate refusal (fires while the
                 /// mesh is off); the no-slash spelling waits behind the gate like every
@@ -42407,8 +42505,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// Rows under `.git` BEHIND A GLOB that an older
                 /// file (or a hand) placed are still inspectable and removable: `.mesh
-                /// shares` lists them with their file, the `unshare` completer offers them,
-                /// `--effective` never lists a `.git` file for them, and `unshare` removes
+                /// shares` lists them with their file, the `files unshare` completer offers them,
+                /// `--effective` never lists a `.git` file for them, and `files unshare` removes
                 /// each (a single holder without a question; the `**`-rooted one after
                 /// the broad confirmation); removal is the remedy, so the write verbs'
                 /// never-shared refusal does not stand in its way.
@@ -42515,7 +42613,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// With the workspace file gone, both the announcement and the result
-                /// sentence name the global path, `shares` lists only the global rows, and
+                /// sentence name the global path, `files list` lists only the global rows, and
                 /// `--workspace` creates the file afresh saying "(created)" again.
                 #[test]
                 #[serial]
@@ -42619,7 +42717,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// A declined broad `allow`, `deny` and `unshare`, a `--dry-run` of each and
+                /// A declined broad `files allow`, `files deny` and `files unshare`, a `--dry-run` of each and
                 /// a non-TTY refusal all leave the file byte-identical (a hand-written
                 /// comment the serializer would drop shows that no rewrite happened) and
                 /// print `Nothing was changed.` only on the declined prompts.
@@ -42722,7 +42820,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let files = index_of(
                         &out,
                         &format!(
-                            "  files: {LIST_PAGE_SIZE} path(s) are shared with trusted peers (`.mesh shares`)"
+                            "  files: {LIST_PAGE_SIZE} path(s) are shared with trusted peers (`.mesh files list`)"
                         ),
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
@@ -42742,7 +42840,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let files = index_of(
                         &out[before..],
                         &format!(
-                            "  files: {} path(s) are shared with trusted peers (`.mesh shares`)",
+                            "  files: {} path(s) are shared with trusted peers (`.mesh files list`)",
                             LIST_PAGE_SIZE - 1
                         ),
                     );
@@ -42882,13 +42980,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                             .unwrap();
                             assert!(
-                                untrusted_refusal.contains(&format!("`.mesh trust {untrusted}`")),
+                                untrusted_refusal
+                                    .contains(&format!("`.mesh access trust {untrusted}`")),
                                 "{untrusted_refusal}"
                             );
                             let seventeen: Vec<String> =
                                 (0..=ACCESS_MAX_PATHS).map(|n| format!("p{n}.md")).collect();
                             let long_reason = "x".repeat(ACCESS_REASON_MAX_CHARS + 1);
-                            let not_a_wire_path = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it.";
+                            let not_a_wire_path = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh files list --effective --all prints it.";
                             for (line, expected) in [
                                 (
                                     format!(
@@ -42975,7 +43074,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(err, expected);
                             assert!(
                                 err.ends_with(&format!(
-                                    "`.mesh unblock --identity {identity}` and then `.mesh trust {blocked}` trust it."
+                                    "`.mesh access unblock --identity {identity}` and then `.mesh access trust {blocked}` trust it."
                                 )),
                                 "{err}"
                             );
@@ -43127,7 +43226,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     )
                                 ),
                                 format!(
-                                    "request {} to {}: pending (the decision arrives as an idle line; .mesh inbox lists it)",
+                                    "request {} to {}: pending (the decision arrives as an idle line; .mesh messaging inbox lists it)",
                                     short(&asked.id),
                                     fx.dest()
                                 )
@@ -43170,7 +43269,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     &format!("Asking {dest} for 1 path(s); Ctrl-C cancels...")
                                 ),
                                 format!(
-                                    "request {} to {dest}: granted until {until}: .mesh fetch {dest} docs/a.md",
+                                    "request {} to {dest}: granted until {until}: .mesh files fetch {dest} docs/a.md",
                                     short(&asked.id)
                                 )
                             );
@@ -43191,7 +43290,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     &format!("Asking {dest} for 3 path(s); Ctrl-C cancels...")
                                 ),
                                 format!(
-                                    "request {} to {dest}: granted until {until}: .mesh fetch {dest} docs/a.md, then the same for the other 2 path(s).",
+                                    "request {} to {dest}: granted until {until}: .mesh files fetch {dest} docs/a.md, then the same for the other 2 path(s).",
                                     short(&asked.id)
                                 )
                             );
@@ -43206,7 +43305,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(
                                 out.last().unwrap(),
                                 &format!(
-                                    "request {} to {dest}: granted, until a time this node cannot read: .mesh fetch {dest} docs/a.md",
+                                    "request {} to {dest}: granted, until a time this node cannot read: .mesh files fetch {dest} docs/a.md",
                                     short(&asked.id)
                                 )
                             );
@@ -43314,7 +43413,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 [
                                     String::new(),
                                     format!(
-                                        "Request interrupted; it may still reach {}. If it does, the decision arrives as an idle line; .mesh inbox lists it.",
+                                        "Request interrupted; it may still reach {}. If it does, the decision arrives as an idle line; .mesh messaging inbox lists it.",
                                         fx.dest()
                                     )
                                 ]
@@ -43340,7 +43439,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     use super::*;
                     use crate::config::live_prefix_override;
 
-                    /// A live `.mesh pending` listing under slash names the grant and
+                    /// A live `.mesh files requests` listing under slash names the grant and
                     /// refuse commands as `/mesh` while the request id stays as filed.
                     #[test]
                     #[serial]
@@ -43360,7 +43459,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                             assert!(
                                 out.lines().any(|line| line
-                                    == "Access requests (1)     grant: /mesh grant <id> [--standing] . refuse: /mesh refuse <id>"),
+                                    == "Access requests (1)     grant: /mesh files grant <id> [--standing] . refuse: /mesh files refuse <id>"),
                                 "{out}"
                             );
                             assert!(!out.contains(".mesh"), "{out}");
@@ -43621,11 +43720,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         for (line, expected) in [
                             (
                                 ".mesh files grant a-1",
-                                "`docs/private.md` would not be served even once granted (a deny rule names it); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
+                                "`docs/private.md` would not be served even once granted (a deny rule names it); refuse the request with `.mesh files refuse a-1`, or lift the rule first.",
                             ),
                             (
                                 ".mesh files grant a-2 --for 2h",
-                                "`.env` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
+                                "`.env` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh files refuse a-2`, or lift the rule first.",
                             ),
                         ] {
                             let printed = stdout_lines().len();
@@ -43660,7 +43759,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let printed = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant a-1").await,
-                            "`src/vault/id_rsa` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh refuse a-1`, or lift the rule first."
+                            "`src/vault/id_rsa` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh files refuse a-1`, or lift the rule first."
                         );
                         assert_eq!(stdout_lines().len(), printed);
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
@@ -43687,7 +43786,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(root.join("docs/a.md"), "a").unwrap();
                         fx.file("a-1", InboundKind::Access, &["docs/a.md", "docs"]);
 
-                        let expected = "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.";
+                        let expected = "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh files refuse a-1`, or lift the rule first.";
                         for line in [".mesh files grant a-1", ".mesh files grant a-1 --standing"] {
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
@@ -43725,7 +43824,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(root.join("docs/big.bin"), vec![0u8; 4_194_305]).unwrap();
                         fx.file("a-1", InboundKind::Access, &["docs/big.bin"]);
 
-                        let expected = "`docs/big.bin` would not be served even once granted (it is 4.2 MB and this node serves at most 4194304 bytes); refuse the request with `.mesh refuse a-1`, or lift the rule first.";
+                        let expected = "`docs/big.bin` would not be served even once granted (it is 4.2 MB and this node serves at most 4194304 bytes); refuse the request with `.mesh files refuse a-1`, or lift the rule first.";
                         let printed = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant a-1").await,
@@ -43774,19 +43873,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         for (line, expected) in [
                             (
                                 ".mesh files grant a-1",
-                                "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
+                                "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh files refuse a-1`, or lift the rule first.",
                             ),
                             (
                                 ".mesh files grant a-1 --standing",
-                                "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
+                                "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh files refuse a-1`, or lift the rule first.",
                             ),
                             (
                                 ".mesh files grant a-2 --for 2h",
-                                "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
+                                "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh files refuse a-2`, or lift the rule first.",
                             ),
                             (
                                 ".mesh files grant a-2 --standing --global",
-                                "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
+                                "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh files refuse a-2`, or lift the rule first.",
                             ),
                         ] {
                             let printed = stdout_lines().len();
@@ -43841,9 +43940,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The remedy the refusal teaches, "refuse the request with `.mesh refuse
+                /// The remedy the refusal teaches, "refuse the request with `.mesh files refuse
                 /// <id>`", works on the very request it refused. The
-                /// refused grant left the request open and untouched, so `.mesh refuse` takes
+                /// refused grant left the request open and untouched, so `.mesh files refuse` takes
                 /// it, the peer hears no, nothing was ever granted, and the id is gone.
                 #[test]
                 #[serial]
@@ -43861,7 +43960,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let err = refusal(&mut fx.ctx, ".mesh files grant a-1").await;
                         assert_eq!(
                             err,
-                            "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first."
+                            "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh files refuse a-1`, or lift the rule first."
                         );
                         assert_eq!(fx.pending_ids(), ["a-1"]);
 
@@ -43882,7 +43981,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(fx.pending_ids().is_empty());
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant a-1").await,
-                            "No open access request has id a-1. `.mesh pending` lists the ones this node knows about."
+                            "No open access request has id a-1. `.mesh files requests` lists the ones this node knows about."
                         );
                         fx.stop().await;
                     });
@@ -43914,11 +44013,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         for (line, expected) in [
                             (
                                 ".mesh files grant a-1 --standing",
-                                "`docs/private.md` would not be served even once granted (a deny rule names it); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
+                                "`docs/private.md` would not be served even once granted (a deny rule names it); refuse the request with `.mesh files refuse a-1`, or lift the rule first.",
                             ),
                             (
                                 ".mesh files grant a-2 --standing --workspace",
-                                "`.git/HEAD` would not be served even once granted (it is under a directory that is never shared); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
+                                "`.git/HEAD` would not be served even once granted (it is under a directory that is never shared); refuse the request with `.mesh files refuse a-2`, or lift the rule first.",
                             ),
                         ] {
                             let printed = stdout_lines().len();
@@ -43937,7 +44036,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// A share list refused at load serves nothing, so a grant on it would be
                 /// answered `not_shared` for every path; the refusal the file earned stops
                 /// the grant, one-off and standing, before anything is written or sent, and
-                /// `refuse` still works.
+                /// `files refuse` still works.
                 #[test]
                 #[serial]
                 fn grant_is_refused_with_the_share_list_refusal_and_refuse_still_decides() {
@@ -44052,11 +44151,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ),
                             (
                                 ".mesh files grant a-9",
-                                "No open access request has id a-9. `.mesh pending` lists the ones this node knows about.".to_string(),
+                                "No open access request has id a-9. `.mesh files requests` lists the ones this node knows about.".to_string(),
                             ),
                             (
                                 ".mesh files refuse a-9",
-                                "No open access request has id a-9. `.mesh pending` lists the ones this node knows about.".to_string(),
+                                "No open access request has id a-9. `.mesh files requests` lists the ones this node knows about.".to_string(),
                             ),
                             (
                                 ".mesh files refuse a-1 --yes",
@@ -44081,7 +44180,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `.mesh answer` on an access request and `.mesh grant`/`.mesh refuse` on
+                /// `.mesh envoy answer` on an access request and `.mesh files grant`/`.mesh files refuse` on
                 /// a question each point at the verb that takes that kind, and nothing is
                 /// sent or decided.
                 #[test]
@@ -44102,7 +44201,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh envoy answer a-1 here you go").await,
-                            "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`"
+                            "`a-1` is an access request, not a question; decide it with `.mesh files grant a-1` or `.mesh files refuse a-1`"
                         );
                         for line in [
                             ".mesh files grant q-1",
@@ -44111,7 +44210,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                "`q-1` is a question, not an access request; answer it with `.mesh answer q-1`",
+                                "`q-1` is a question, not an access request; answer it with `.mesh envoy answer q-1`",
                                 "{line}"
                             );
                         }
@@ -44159,7 +44258,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// The write rule names the workspace share file when one exists, the global
                 /// file beside it under `--global`, and a freshly created workspace file
                 /// under `--workspace` when it is missing. Each entry is scoped to the
-                /// requesting identity and the layer is announced the way `.mesh allow`
+                /// requesting identity and the layer is announced the way `.mesh files allow`
                 /// announces it.
                 #[test]
                 #[serial]
@@ -44291,7 +44390,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// Once a request is decided its record is gone, so a
-                /// second `grant` or `refuse` from the REPL teaches the unknown-id sentence,
+                /// second `files grant` or `files refuse` from the REPL teaches the unknown-id sentence,
                 /// sends nothing more and writes no second grant.
                 #[test]
                 #[serial]
@@ -44314,7 +44413,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                "No open access request has id a-1. `.mesh pending` lists the ones this node knows about.",
+                                "No open access request has id a-1. `.mesh files requests` lists the ones this node knows about.",
                                 "{line}"
                             );
                         }
@@ -44328,7 +44427,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// Take before send: when the peer will not take the
-                /// decision, the request stays in `.mesh pending`, no grant is written, no
+                /// decision, the request stays in `.mesh files requests`, no grant is written, no
                 /// share entry lands, and the human reads one teaching error.
                 mod decision_gate {
                     use crate::mesh::message::{from_request_body, received_reply};
@@ -44482,7 +44581,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The path judgement is a `grant` pre-flight only: a request naming a
+                /// The path judgement is a `files grant` pre-flight only: a request naming a
                 /// denied path can still be REFUSED, the peer hears `access denied`, the
                 /// record closes and no grant or share row appears.
                 #[test]
@@ -44525,7 +44624,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `.mesh grant`/`--standing` judge every requested path the same way as a
+                /// `.mesh files grant`/`--standing` judge every requested path the same way as a
                 /// reference, which is refused above
                 /// `FetchServing::serving_limit()`: a requested file this node would answer
                 /// `too_large` is not granted either, one-off or standing; the request stays
@@ -44557,7 +44656,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
                                 err.starts_with("`big.bin` would not be served even once granted (")
-                                    && err.ends_with("); refuse the request with `.mesh refuse a-1`, or lift the rule first."),
+                                    && err.ends_with("); refuse the request with `.mesh files refuse a-1`, or lift the rule first."),
                                 "{line}: {err}"
                             );
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
@@ -45056,7 +45155,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The ids `.mesh pending` prints, in the order it prints them.
+                /// The ids `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` print, in the order they print them.
                 async fn listed_ids(fx: &mut PeerFixture) -> Vec<String> {
                     pending_out(&mut fx.ctx, ".")
                         .await
@@ -45140,7 +45239,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh envoy answer 320b8f7b \"x\"").await,
-                            "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh pending` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh dismiss --all`."
+                            "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh envoy questions`, `.mesh messaging sent` or `.mesh files requests` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh envoy dismiss --all`."
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
 
@@ -45164,7 +45263,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// Access requests whose ids differ only in case cannot be picked by any
-                /// verb, and `.mesh dismiss --all` leaves them, so the refusal names their
+                /// verb, and `.mesh envoy dismiss --all` leaves them, so the refusal names their
                 /// expiry instead.
                 #[test]
                 #[serial]
@@ -45179,7 +45278,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files refuse ab12cd34").await,
-                            "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
+                            "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh files requests` when they expire."
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         let mut left = fx.pending_ids();
@@ -45228,7 +45327,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant 320b8f7b").await,
                             format!(
-                                "{SECOND} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+                                "{SECOND} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
                             )
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
@@ -45314,10 +45413,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             &lines[1..],
                             [
                                 "  which one?".to_string(),
-                                "  answer: .mesh answer p1 \"<text>\"".to_string(),
+                                "  answer: .mesh envoy answer p1 \"<text>\"".to_string(),
                                 telling(&fx),
                                 String::new(),
-                                "Dismissed p1; Stub hears that the human declined to answer. .mesh pending shows what is still open."
+                                "Dismissed p1; Stub hears that the human declined to answer. .mesh envoy questions shows what is still open."
                                     .to_string(),
                             ],
                             "{out}"
@@ -45340,8 +45439,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             &lines[1..],
                             [
                                 "  which one?",
-                                "  answer: .mesh answer p2 \"<text>\"",
-                                "Dismissed p2 without telling Stub. .mesh pending shows what is still open.",
+                                "  answer: .mesh envoy answer p2 \"<text>\"",
+                                "Dismissed p2 without telling Stub. .mesh envoy questions shows what is still open.",
                             ],
                             "{out}"
                         );
@@ -45352,7 +45451,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let before = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh envoy dismiss p1").await,
-                            "No open question has id p1. `.mesh pending` lists the ones this node knows about."
+                            "No open question has id p1. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
                         );
                         assert_eq!(stdout_lines().len(), before, "nothing printed");
                         fx.stop().await;
@@ -45376,7 +45475,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`",
+                                "`acc-1` is an access request, not a question; decide it with `.mesh files grant acc-1` or `.mesh files refuse acc-1`",
                                 "{line}"
                             );
                         }
@@ -45407,7 +45506,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         let err = refusal(&mut fx.ctx, ".mesh envoy dismiss --silent").await;
                         assert!(
-                            err.starts_with("`.mesh dismiss` takes an id or `--all`."),
+                            err.starts_with("`.mesh envoy dismiss` takes an id or `--all`."),
                             "{err}"
                         );
                         fx.stop().await;
@@ -45428,7 +45527,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         for line in [".mesh envoy dismiss q1", ".mesh envoy dismiss q1 --silent"] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                "q1 is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then.",
+                                "q1 is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
                                 "{line}"
                             );
                         }
@@ -45545,7 +45644,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 row("p1").as_str(),
                                 "Telling 2 askers that you declined over the mesh...",
                                 "",
-                                "Dismissed 2; .mesh pending shows what is still open."
+                                "Dismissed 2; .mesh envoy questions shows what is still open."
                             ],
                             "{out}"
                         );
@@ -45573,7 +45672,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         assert_eq!(
                             out,
-                            "No open questions to dismiss; `.mesh pending` lists what this node knows about."
+                            "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about."
                         );
 
                         fx.file("p3", InboundKind::Question, &[]);
@@ -45584,7 +45683,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             with_ages_zeroed(&out),
                             [
                                 row("p3").as_str(),
-                                "Dismissed 1; .mesh pending shows what is still open."
+                                "Dismissed 1; .mesh envoy questions shows what is still open."
                             ],
                             "the silent form prints no progress line: {out}"
                         );
@@ -45625,8 +45724,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             [
                                 row("p2").as_str(),
                                 row("p1").as_str(),
-                                "`p1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss p1.",
-                                "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses.",
+                                "`p1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss p1.",
+                                "Dismissed 1; .mesh envoy questions shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh envoy dismiss <id> once its hold lapses.",
                             ],
                             "{out}"
                         );
@@ -45638,7 +45737,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// The listing and the held clause both name the question by its full
-                /// id: `.mesh dismiss <id>` matches ids exactly, so the id the
+                /// id: `.mesh envoy dismiss <id>` matches ids exactly, so the id the
                 /// summary tells the person to paste must be the one the store holds.
                 /// Once the hold lapses, that pasted id dismisses the question.
                 #[test]
@@ -45669,10 +45768,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             [
                                 format!("  {id} . Stub ({dest8}) . asked 0s ago"),
                                 format!(
-                                    "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
+                                    "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss {id}."
                                 ),
                                 format!(
-                                    "Dismissed 0; .mesh pending shows what is still open; 1 still being answered by the envoy: {id}. Dismiss each with .mesh dismiss <id> once its hold lapses."
+                                    "Dismissed 0; .mesh envoy questions shows what is still open; 1 still being answered by the envoy: {id}. Dismiss each with .mesh envoy dismiss <id> once its hold lapses."
                                 ),
                             ],
                             "{out}"
@@ -45693,7 +45792,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             lines.last().copied(),
                             Some(
-                                "Dismissed 7c9d2e1f without telling Stub. .mesh pending shows what is still open."
+                                "Dismissed 7c9d2e1f without telling Stub. .mesh envoy questions shows what is still open."
                             ),
                             "{out}"
                         );
@@ -45764,13 +45863,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             lines[4].starts_with(&format!(
                                 "Could not tell {stranger8} that you declined ("
                             )) && lines[4].ends_with(
-                                "); s1 stays pending. Retry, or remove it without a message with .mesh dismiss s1 --silent."
+                                "); s1 stays pending. Retry, or remove it without a message with .mesh envoy dismiss s1 --silent."
                             ),
                             "{out}"
                         );
                         assert_eq!(
                             lines[5],
-                            "Dismissed 1; .mesh pending shows what is still open; 1 could not be told and stay pending: s1. Retry, or .mesh dismiss --all --silent."
+                            "Dismissed 1; .mesh envoy questions shows what is still open; 1 could not be told and stay pending: s1. Retry, or .mesh envoy dismiss --all --silent."
                         );
                         assert_eq!(fx.stub.seen().len(), 1, "the stub's question was told");
                         assert_eq!(fx.pending_ids(), ["s1"], "the untold question stays filed");
@@ -45845,7 +45944,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!out.contains("already closed"), "{out}");
                         assert_eq!(
                             lines[4],
-                            "Dismissed 0; .mesh pending shows what is still open; 1 could not be told and stay pending: w1. Retry, or .mesh dismiss --all --silent.",
+                            "Dismissed 0; .mesh envoy questions shows what is still open; 1 could not be told and stay pending: w1. Retry, or .mesh envoy dismiss --all --silent.",
                             "a put-back that failed counts as stayed: {out}"
                         );
                         assert!(fx.pending_ids().is_empty(), "the row could not be put back");
@@ -45921,7 +46020,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             err.starts_with(&format!(
                                 "Could not tell {stranger8} that you declined ("
                             )) && err.ends_with(
-                                "); s1 stays pending. Retry, or remove it without a message with .mesh dismiss s1 --silent."
+                                "); s1 stays pending. Retry, or remove it without a message with .mesh envoy dismiss s1 --silent."
                             ),
                             "{err}"
                         );
@@ -45936,7 +46035,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(
                             &block[1..],
-                            ["  anyone there?", "  answer: .mesh answer s1 \"<text>\""],
+                            [
+                                "  anyone there?",
+                                "  answer: .mesh envoy answer s1 \"<text>\""
+                            ],
                             "{printed:?}"
                         );
                         assert_eq!(
@@ -46026,11 +46128,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(
                             lines[6],
-                            "`p1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss p1."
+                            "`p1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss p1."
                         );
                         assert_eq!(
                             lines[7],
-                            "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: s1. Retry, or .mesh dismiss --all --silent."
+                            "Dismissed 1; .mesh envoy questions shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh envoy dismiss <id> once its hold lapses; 1 could not be told and stay pending: s1. Retry, or .mesh envoy dismiss --all --silent."
                         );
                         assert_eq!(fx.stub.seen().len(), 1, "p2's asker alone was told");
                         assert_eq!(fx.pending_ids(), ["s1", "p1"]);
@@ -46079,7 +46181,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(
                             lines[2],
-                            "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: p1. Retry with .mesh dismiss --all --silent."
+                            "Dismissed 0; .mesh envoy questions shows what is still open; 1 stay pending: p1. Retry with .mesh envoy dismiss --all --silent."
                         );
                         assert!(fx.stub.seen().is_empty(), "the silent form sends nothing");
                         assert_eq!(fx.pending_ids(), ["p1"], "the question stays filed");
@@ -46098,23 +46200,23 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
                     assert_eq!(
                         dismiss_all_summary(2, &[], &[], false).plain(),
-                        "Dismissed 2; .mesh pending shows what is still open."
+                        "Dismissed 2; .mesh envoy questions shows what is still open."
                     );
                     assert_eq!(
                         dismiss_all_summary(1, &ids(&["p1"]), &[], true).plain(),
-                        "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses."
+                        "Dismissed 1; .mesh envoy questions shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh envoy dismiss <id> once its hold lapses."
                     );
                     assert_eq!(
                         dismiss_all_summary(1, &[], &ids(&["s1", "s2"]), false).plain(),
-                        "Dismissed 1; .mesh pending shows what is still open; 2 could not be told and stay pending: s1, s2. Retry, or .mesh dismiss --all --silent."
+                        "Dismissed 1; .mesh envoy questions shows what is still open; 2 could not be told and stay pending: s1, s2. Retry, or .mesh envoy dismiss --all --silent."
                     );
                     assert_eq!(
                         dismiss_all_summary(0, &[], &ids(&["s1"]), true).plain(),
-                        "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: s1. Retry with .mesh dismiss --all --silent."
+                        "Dismissed 0; .mesh envoy questions shows what is still open; 1 stay pending: s1. Retry with .mesh envoy dismiss --all --silent."
                     );
                     assert_eq!(
                         dismiss_all_summary(1, &ids(&["p1"]), &ids(&["s1"]), false).plain(),
-                        "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: s1. Retry, or .mesh dismiss --all --silent."
+                        "Dismissed 1; .mesh envoy questions shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh envoy dismiss <id> once its hold lapses; 1 could not be told and stay pending: s1. Retry, or .mesh envoy dismiss --all --silent."
                     );
                 }
 
@@ -46143,7 +46245,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             err,
-                            "No open question has id old-q. `.mesh pending` lists the ones this node knows about."
+                            "No open question has id old-q. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
                         );
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         assert!(
@@ -46175,7 +46277,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             err,
-                            "No open access request has id old-a. `.mesh pending` lists the ones this node knows about."
+                            "No open access request has id old-a. `.mesh files requests` lists the ones this node knows about."
                         );
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         assert!(
@@ -46253,9 +46355,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A row past `PENDING_TTL` that no heartbeat has swept yet, met by each
-                /// verb that decides a row (`dismiss`, `answer`, `grant`, `refuse`): the
+                /// verb that decides a row (`envoy dismiss`, `envoy answer`, `files grant`, `files refuse`): the
                 /// verb sweeps first, so the row's expiry line is pushed once before the
-                /// refusal that names `.mesh pending`; no block or notice is printed,
+                /// refusal that names the list to read; no block or notice is printed,
                 /// nothing goes on the wire, the row leaves the store, and the fresh row
                 /// beside it is still decidable afterwards with no further idle line.
                 #[test]
@@ -46304,12 +46406,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         };
                         let no_question = |id: &str| {
                             format!(
-                                "No open question has id {id}. `.mesh pending` lists the ones this node knows about."
+                                "No open question has id {id}. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
                             )
                         };
                         let no_access = |id: &str| {
                             format!(
-                                "No open access request has id {id}. `.mesh pending` lists the ones this node knows about."
+                                "No open access request has id {id}. `.mesh files requests` lists the ones this node knows about."
                             )
                         };
                         let cases: [(&str, InboundKind, String, String); 5] = [
@@ -46390,7 +46492,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         assert!(
                             out.ends_with(
-                                "Dismissed p1 without telling Stub. .mesh pending shows what is still open."
+                                "Dismissed p1 without telling Stub. .mesh envoy questions shows what is still open."
                             ),
                             "{out}"
                         );
@@ -46404,11 +46506,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The default dismissal's own copy: `.mesh inbox` heads it `this node ->`,
+                /// The default dismissal's own copy: `.mesh messaging inbox` heads it `this node ->`,
                 /// answering the question, carries the refused body and a
                 /// `disposition: refused` row read from this node's side; the person at the
                 /// keyboard gets the one idle line `you declined <dest8>'s question`; the
-                /// stub heard the same refused reply. A second `.mesh inbox` finds the copy
+                /// stub heard the same refused reply. A second `.mesh messaging inbox` finds the copy
                 /// drained.
                 #[test]
                 #[serial]
@@ -46472,7 +46574,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The answer's twin: the own copy of a `.mesh answer` carries the answer's
+                /// The answer's twin: the own copy of a `.mesh envoy answer` carries the answer's
                 /// text and a `disposition: answered` row read from this node's side.
                 #[test]
                 #[serial]
@@ -46572,7 +46674,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let header_head = format!("awaiting your answer . Stub ({dest}) . asked ");
                         let race = |id: &str| {
                             format!(
-                                "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                                "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
                             )
                         };
                         let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -46595,7 +46697,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 row("p1").as_str(),
                                 "Telling 1 asker that you declined over the mesh...",
                                 "",
-                                "Dismissed 1; .mesh pending shows what is still open."
+                                "Dismissed 1; .mesh envoy questions shows what is still open."
                             ],
                             "{out}"
                         );
@@ -46668,7 +46770,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "the question another process closed is reported by the race sentence: {out}"
                         );
                         assert_eq!(
-                            lines[5], "Dismissed 1; .mesh pending shows what is still open.",
+                            lines[5],
+                            "Dismissed 1; .mesh envoy questions shows what is still open.",
                             "a question that was gone did not stay: {out}"
                         );
                         assert_eq!(
@@ -46708,7 +46811,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(block[0].starts_with(&header_head), "{printed:?}");
                         assert_eq!(
                             &block[1..],
-                            ["  which one?", "  answer: .mesh answer p4 \"<text>\""],
+                            ["  which one?", "  answer: .mesh envoy answer p4 \"<text>\""],
                             "{printed:?}"
                         );
                         assert_eq!(printed[1], telling(&fx));
@@ -46880,7 +46983,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         assert!(
                             out.ends_with(
-                                "Dismissed old-q without telling Stub. .mesh pending shows what is still open."
+                                "Dismissed old-q without telling Stub. .mesh envoy questions shows what is still open."
                             ),
                             "{out}"
                         );
@@ -46945,7 +47048,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let header_head = format!("awaiting your answer . Stub ({dest}) . asked ");
                         let race = |id: &str| {
                             format!(
-                                "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                                "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
                             )
                         };
                         let closing = |id: &str| {
@@ -47013,7 +47116,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "Telling 2 askers that you declined over the mesh...".to_string(),
                                 String::new(),
                                 race("p8"),
-                                "Dismissed 1; .mesh pending shows what is still open.".to_string(),
+                                "Dismissed 1; .mesh envoy questions shows what is still open."
+                                    .to_string(),
                             ],
                             "{out}"
                         );
@@ -47036,7 +47140,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 row("p11"),
                                 row("p10"),
                                 race("p10"),
-                                "Dismissed 1; .mesh pending shows what is still open.".to_string(),
+                                "Dismissed 1; .mesh envoy questions shows what is still open."
+                                    .to_string(),
                             ],
                             "{out}"
                         );
@@ -47046,11 +47151,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The access twin of the window above: `.mesh grant` and `.mesh refuse`
+                /// The access twin of the window above: `.mesh files grant` and `.mesh files refuse`
                 /// have no hold check between their own lookup and the node's, so the
                 /// window is pinned on its two ends: the verb's lookup finds the row
-                /// open, another process takes it out, and the node's `grant` and
-                /// `refuse` read it as the one race sentence, typed as the question's is,
+                /// open, another process takes it out, and the node's `files grant` and
+                /// `files refuse` read it as the one race sentence, typed as the question's is,
                 /// with nothing sent, no grant written and no idle line.
                 #[test]
                 #[serial]
@@ -47065,7 +47170,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         let race = |id: &str| {
                             format!(
-                                "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                                "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
                             )
                         };
 
@@ -47105,11 +47210,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// The verb-side expiry gate is load-bearing when the sweep at the top
                 /// of the verb cannot rewrite the store (its directory read-only): the
-                /// expired access request is still refused by `grant` and `refuse` with
+                /// expired access request is still refused by `files grant` and `files refuse` with
                 /// the missing-request sentence, nothing is printed before it, nothing
                 /// goes on the wire, no grant is written and no expiry line is pushed
                 /// (the sweep removed nothing to announce); the question twin reads the
-                /// same under `answer` and `dismiss`. Once the directory is writable
+                /// same under `envoy answer` and `envoy dismiss`. Once the directory is writable
                 /// again the next sweep announces both rows once and takes them out. A
                 /// user the directory mode does not bind (root) leaves after planting.
                 #[test]
@@ -47135,8 +47240,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             fx.stop().await;
                             return;
                         }
-                        let no_access = "No open access request has id old-a. `.mesh pending` lists the ones this node knows about.";
-                        let no_question = "No open question has id old-q. `.mesh pending` lists the ones this node knows about.";
+                        let no_access = "No open access request has id old-a. `.mesh files requests` lists the ones this node knows about.";
+                        let no_question = "No open question has id old-q. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.";
                         let cases = [
                             (".mesh files grant old-a", no_access),
                             (".mesh files refuse old-a", no_access),
@@ -47197,7 +47302,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// (a reply answering nothing of ours is downgraded to a message and sheds
                 /// its disposition) keep the peer-side clauses, while this node's own copy
                 /// of a dismissal made in the same session reads `you declined to answer`;
-                /// the three sit in one `.mesh inbox` and only the own copy is headed
+                /// the three sit in one `.mesh messaging inbox` and only the own copy is headed
                 /// `this node ->`.
                 #[test]
                 #[serial]
@@ -47341,7 +47446,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .plain();
                     assert_eq!(
                         line,
-                        "Dismissed 2; .mesh pending shows what is still open; 2 still being answered by the envoy: p1aaaaaa, p2bbbbbb. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 stay pending: s1cccccc. Retry with .mesh dismiss --all --silent."
+                        "Dismissed 2; .mesh envoy questions shows what is still open; 2 still being answered by the envoy: p1aaaaaa, p2bbbbbb. Dismiss each with .mesh envoy dismiss <id> once its hold lapses; 1 stay pending: s1cccccc. Retry with .mesh envoy dismiss --all --silent."
                     );
                     for shape in [
                         dismiss_all_summary(0, &[], &[], false).plain(),
@@ -47360,7 +47465,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "a full stop ends the line or a sentence inside it: {shape}"
                             );
                         }
-                        assert!(shape.contains(".mesh pending"), "{shape}");
+                        assert!(shape.contains(".mesh envoy questions"), "{shape}");
                         let held_at = shape.find("still being answered");
                         let stayed_at = shape.find("stay pending");
                         if let (Some(held_at), Some(stayed_at)) = (held_at, stayed_at) {
@@ -47368,12 +47473,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         if held_at.is_some() {
                             assert!(
-                                shape.contains(".mesh dismiss <id> once its hold lapses"),
+                                shape.contains(".mesh envoy dismiss <id> once its hold lapses"),
                                 "{shape}"
                             );
                         }
                         if stayed_at.is_some() {
-                            assert!(shape.contains(".mesh dismiss --all --silent"), "{shape}");
+                            assert!(
+                                shape.contains(".mesh envoy dismiss --all --silent"),
+                                "{shape}"
+                            );
                         }
                     }
                 }
@@ -47446,14 +47554,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             lines[4].starts_with(&format!(
                                 "Could not tell {stranger8} that you declined ("
                             )) && lines[4].ends_with(&format!(
-                                "); {stayed8} stays pending. Retry, or remove it without a message with .mesh dismiss {stayed_id} --silent."
+                                "); {stayed8} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {stayed_id} --silent."
                             )),
                             "the failure names the question short and the retry by the full id: {out}"
                         );
                         assert_eq!(
                             lines[5],
                             format!(
-                                "Dismissed 1; .mesh pending shows what is still open; 1 could not be told and stay pending: {stayed_id}. Retry, or .mesh dismiss --all --silent."
+                                "Dismissed 1; .mesh envoy questions shows what is still open; 1 could not be told and stay pending: {stayed_id}. Retry, or .mesh envoy dismiss --all --silent."
                             ),
                             "the stayed clause carries the full id: {out}"
                         );
@@ -47470,7 +47578,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                             .await,
                             format!(
-                                "'{stayed7}' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them."
+                                "'{stayed7}' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests` list them."
                             )
                         );
                         assert_eq!(
@@ -47491,7 +47599,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             out.lines().last(),
                             Some(
                                 format!(
-                                    "Dismissed {stayed8} without telling {stranger8}. .mesh pending shows what is still open."
+                                    "Dismissed {stayed8} without telling {stranger8}. .mesh envoy questions shows what is still open."
                                 )
                                 .as_str()
                             ),
@@ -47530,7 +47638,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             lines.last(),
                             Some(&format!(
-                                "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: {kept_id}. Retry with .mesh dismiss --all --silent."
+                                "Dismissed 0; .mesh envoy questions shows what is still open; 1 stay pending: {kept_id}. Retry with .mesh envoy dismiss --all --silent."
                             )),
                             "{out}"
                         );
@@ -47541,7 +47649,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A dismissal whose refused reply cannot leave names the asker as
-                /// `.mesh pending` does, by the name this node heard (the short destination
+                /// `.mesh envoy questions` does, by the name this node heard (the short destination
                 /// stands in only for a stranger), keeps the question, sends nothing,
                 /// pushes no `you declined` idle line and writes nothing into the envoy's
                 /// thread memory; the silent retry the line names, with the full id it
@@ -47606,9 +47714,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             err.starts_with("Could not tell Stub that you declined (")
                                 && err.contains("not trusted for messaging")
                                 && err.ends_with(&format!(
-                                    "); {id8} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
+                                    "); {id8} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {id} --silent."
                                 )),
-                            "the asker is named as .mesh pending names it: {err}"
+                            "the asker is named as .mesh envoy questions names it: {err}"
                         );
                         let printed = stdout_lines()[before..].to_vec();
                         assert_eq!(printed.len(), 3, "{printed:?}");
@@ -47647,7 +47755,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             out.lines().last(),
                             Some(
                                 format!(
-                                    "Dismissed {id8} without telling Stub. .mesh pending shows what is still open."
+                                    "Dismissed {id8} without telling Stub. .mesh envoy questions shows what is still open."
                                 )
                                 .as_str()
                             ),
@@ -47687,7 +47795,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             out.lines().last(),
                             Some(
                                 format!(
-                                    "Dismissed {id8}; Stub hears that {HUMAN_DECLINED}. .mesh pending shows what is still open."
+                                    "Dismissed {id8}; Stub hears that {HUMAN_DECLINED}. .mesh envoy questions shows what is still open."
                                 )
                                 .as_str()
                             ),
@@ -47823,7 +47931,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 row("p1").as_str(),
                                 "Telling 1 asker that you declined over the mesh...",
                                 "",
-                                "Dismissed 1; .mesh pending shows what is still open."
+                                "Dismissed 1; .mesh envoy questions shows what is still open."
                             ],
                             "{out}"
                         );
@@ -47912,20 +48020,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     )
                 }
 
-                /// The lines of `out` after the question block `.mesh answer` opens with:
-                /// the header naming `id` (a `peer`'s question, filed just now, ends with
-                /// its time left; this node's own carries none), its indented rows and
-                /// the `answer:` footer.
+                /// The lines of `out` after the question block `.mesh envoy answer` and
+                /// `.mesh messaging follow-up` open with: the header naming `id` (a `peer`'s
+                /// question, filed just now, ends with its time left; this node's own
+                /// carries none), its indented rows and the `answer:` footer.
                 fn after_question_block<'a>(out: &'a str, id: &str, peer: bool) -> Vec<&'a str> {
                     let mut lines = out.lines();
                     let header = lines.next().unwrap_or_default();
-                    let tail = if peer {
-                        format!(" . id {id} . expires in 6d")
+                    let (tail, verb) = if peer {
+                        (format!(" . id {id} . expires in 6d"), "envoy answer")
                     } else {
-                        format!(" . id {id}")
+                        (format!(" . id {id}"), "messaging follow-up")
                     };
                     assert!(header.ends_with(&tail), "{out}");
-                    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
+                    let footer = format!("  answer: .mesh {verb} {id} \"<text>\"");
                     let mut rest = lines.skip_while(|line| *line != footer);
                     assert_eq!(rest.next(), Some(footer.as_str()), "{out}");
                     rest.collect()
@@ -48313,7 +48421,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `.mesh answer` reaches the node after its own lookup, its hold check
+                /// `.mesh envoy answer` reaches the node after its own lookup, its hold check
                 /// and the attachment: a question another process closes in that window
                 /// is the race sentence, worded by the node, as the verb's error. The
                 /// block, the sending line and the attaching line have printed by then;
@@ -48377,7 +48485,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert_eq!(
                             err,
-                            "`p1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+                            "`p1` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open.",
                             "the node's race sentence, not a bare not-found"
                         );
                         let raw = stdout_lines()[before..].to_vec();
@@ -48437,7 +48545,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             (
                                 "--attach /etc/passwd",
                                 format!(
-                                    "`--attach` takes a path relative to {shown_root}, as `.mesh allow` does; '/etc/passwd' is not one."
+                                    "`--attach` takes a path relative to {shown_root}, as `.mesh files allow` does; '/etc/passwd' is not one."
                                 ),
                             ),
                             (
@@ -48510,7 +48618,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// `.mesh answer <id>` with no text on the line: a refused attachment is
+                /// `.mesh envoy answer <id>` with no text on the line: a refused attachment is
                 /// reported before the block and before any prompt, with nothing printed,
                 /// sent or closed; a good attachment is judged, then the block prints, then
                 /// the prompt asks once, and the typed text (trimmed) goes out to the trusted
@@ -49143,7 +49251,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .app
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
-                        let expected = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer q-1 --attach <path>.";
+                        let expected = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh envoy answer q-1 --attach <path>.";
 
                         for line in [
                             ".mesh envoy answer q-1 \"x\" --attach big.bin",
@@ -49248,7 +49356,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// A failed `--attach` reference lend also revokes its
                 /// grant: the peer refuses the message that carried the reference, so the
-                /// one-off grant lent for it is taken back on both `answer` and `message`, the
+                /// one-off grant lent for it is taken back on both `envoy answer` and `messaging send`, the
                 /// question stays pending, the human reads one line that is the send's and
                 /// not "the grant stands", and the retry once the peer takes it lends once.
                 #[test]
@@ -49322,7 +49430,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// The share set is not consulted for the INLINE form, and an access id
-                /// answered with `--attach` is sent to its own verb: a small file a `deny`
+                /// answered with `--attach` is sent to its own verb: a small file a `files deny`
                 /// rule names still travels inline since the human named it, while the
                 /// access id meets the cross-kind sentence with nothing read, sent or
                 /// lent.
@@ -49351,7 +49459,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let printed = stdout_lines().len();
                             assert_eq!(
                                 refusal(&mut fx.ctx, &line).await,
-                                "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`",
+                                "`a-1` is an access request, not a question; decide it with `.mesh files grant a-1` or `.mesh files refuse a-1`",
                                 "{line}"
                             );
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
@@ -49553,7 +49661,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .app
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
-                        let hold = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer q-1 --attach <path>.";
+                        let hold = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh envoy answer q-1 --attach <path>.";
 
                         for line in [
                             ".mesh envoy answer q-1 \"x\" --attach big.bin",
@@ -49579,7 +49687,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .await;
                         assert_eq!(
                             err,
-                            "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`"
+                            "`a-1` is an access request, not a question; decide it with `.mesh files grant a-1` or `.mesh files refuse a-1`"
                         );
                         assert_eq!(&stdout_lines()[printed..], &[] as &[String], "{err}");
 
@@ -49599,7 +49707,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// pending again, the human reads the send's one line (not "already
                 /// answered by another process"), no grant appears since nothing was
                 /// lent, and the retry once the peer takes it closes the question with the
-                /// bytes travelling inline exactly once. `message --yes` inline on the same
+                /// bytes travelling inline exactly once. `messaging send --yes` inline on the same
                 /// refusing peer errs the same way and lends nothing.
                 #[test]
                 #[serial]
@@ -50158,7 +50266,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             )
                         );
@@ -50203,7 +50311,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut bare.ctx, &line).await,
                             format!(
-                                "{dest} does not share files; it may run an older Coyote or have sharing off. .mesh info {dest} shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again.",
+                                "{dest} does not share files; it may run an older Coyote or have sharing off. .mesh people info {dest} shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again.",
                                 dest = bare.dest()
                             )
                         );
@@ -50274,7 +50382,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "a last card without the fetch capability explains nothing: the peer answered"
@@ -50286,7 +50394,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "The grant for `docs/a.md` from {} expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
+                                "The grant for `docs/a.md` from {} expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh files allow docs/a.md.",
                                 fx.dest(),
                                 rfc3339_utc(past)
                             ),
@@ -50303,7 +50411,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
@@ -50321,7 +50429,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
@@ -50339,7 +50447,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// The wire grammar admits a variation selector, so such a path goes to
                 /// the peer and a `not_shared` answer names it: the backticked form is the
-                /// path as `display_text` shows it, the `.mesh allow` clause the raw path
+                /// path as `display_text` shows it, the `.mesh files allow` clause the raw path
                 /// the other node must type. A control character never reaches the wire:
                 /// the grammar refuses it before the request is sent, and that refusal
                 /// shows the stripped form too.
@@ -50360,7 +50468,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             sentence,
                             format!(
-                                "{} did not serve `docs/heart.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow {raw}, or let the model request access with mesh__request_access.",
+                                "{} did not serve `docs/heart.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow {raw}, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             )
                         );
@@ -50380,7 +50488,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} {escaped}"))
                                 .await,
                             format!(
-                                "`docs/redalert.md` is not a path the mesh carries (rule `control`); pass the path exactly as `.mesh shares --peer {}` or mesh__list shows it.",
+                                "`docs/redalert.md` is not a path the mesh carries (rule `control`); pass the path exactly as `.mesh files list --peer {}` or mesh__list shows it.",
                                 fx.dest()
                             )
                         );
@@ -50393,7 +50501,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// End to end through the verb: `fetch <dest> <TAB>` offers the attachment
+                /// End to end through the verb: `files fetch <dest> <TAB>` offers the attachment
                 /// reference and the live grant this node holds on the peer; the verb's own
                 /// staged fetch takes the reference row off the list and a later `not_shared`
                 /// for that path names the very path the `Staged` line printed, while the
@@ -50467,7 +50575,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest8} if you need a fresh copy. This was answered from this node's own records without asking {dest8}; if {dest8} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest8}.",
+                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest8} if you need a fresh copy. This was answered from this node's own records without asking {dest8}; if {dest8} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest8}.",
                                 dest8 = fx.dest()
                             ),
                             "the refusal names the path the Staged line printed"
@@ -50483,7 +50591,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/b.md"))
                                 .await,
                             format!(
-                                "{} did not serve `docs/b.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/b.md, or let the model request access with mesh__request_access.",
+                                "{} did not serve `docs/b.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow docs/b.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "a grant that has not run out explains nothing"
@@ -50500,7 +50608,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// A `--if-sha256` match is the fetch as far as the peer's grant store
-                /// counts, so the one-off grant row leaves `fetch <dest> <TAB>` just as a
+                /// counts, so the one-off grant row leaves `files fetch <dest> <TAB>` just as a
                 /// staged copy would take it; the standing grant and the attachment
                 /// reference stay offered, since neither is spent and nothing landed. The
                 /// peer's later `not_shared` on the spent path reads the generic way:
@@ -50605,7 +50713,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
                                 .await,
                             format!(
-                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "a spent grant is not an expired one"
@@ -50626,11 +50734,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// A new key announcing the peer's destination is a new peer to this node:
                 /// what the old identity lent or granted is not its word. Through the
                 /// verbs: once the peer table binds the destination to the new identity,
-                /// the old identity's attachment and standing grant leave `fetch <dest>
+                /// the old identity's attachment and standing grant leave `files fetch <dest>
                 /// <TAB>` and a `not_shared` on the attachment this node already fetched
                 /// reads the generic way (the staged copy was the old identity's lend), both
                 /// before the new identity has said a word; its first lend then drops the
-                /// old claims, so the old identity's `forget` no longer counts them while
+                /// old claims, so the old identity's `access forget` no longer counts them while
                 /// the new identity's does, and sweeping the new identity leaves only the
                 /// destination's last listing, which is no claim.
                 #[test]
@@ -50731,7 +50839,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
                                 .await,
                             format!(
-                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "the fetched copy was the old identity's lend, so nothing explains the refusal"
@@ -50773,7 +50881,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
                                 .await,
                             format!(
-                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "the old lend is gone from memory too, so nothing explains the refusal"
@@ -50799,7 +50907,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             out,
                             format!(
-                                "Forgetting identity {rotated} erases:\n  identity {}\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {rotated} --confirm {token}",
+                                "Forgetting identity {rotated} erases:\n  identity {}\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {rotated} --confirm {token}",
                                 short(&rotated)
                             ),
                             "the new identity owns its trust grant and exactly the claim it made"
@@ -50828,7 +50936,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// Claims are the identity's word, the peer row is only what names the
                 /// identity at a destination. When the row ages out of the peer table the
-                /// claims stay in memory: `forget --identity` still counts them, but `fetch
+                /// claims stay in memory: `access forget --identity` still counts them, but `files fetch
                 /// <dest> <TAB>` offers only the destination's last listing, since the verb
                 /// itself sends a path request for a destination the table no longer holds,
                 /// though the transport still has a path to it, and refuses it when the
@@ -50954,7 +51062,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`../x` is not a path the mesh carries (rule `segment`); pass the path exactly as `.mesh shares --peer {}` or mesh__list shows it.",
+                                "`../x` is not a path the mesh carries (rule `segment`); pass the path exactly as `.mesh files list --peer {}` or mesh__list shows it.",
                                 fx.dest()
                             )
                         );
@@ -51004,13 +51112,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ),
                             (
                                 ".mesh files fetch stub docs/a.md".to_string(),
-                                "'stub' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+                                "'stub' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh people list` lists (8 or more characters)."
                                     .to_string(),
                             ),
                             (
                                 format!(".mesh files fetch {trusted} docs/a.md --if-sha256 abc"),
                                 format!(
-                                    "`--if-sha256` takes the 64-hex sha256 `.mesh fetch` printed last time; 'abc' is not one. {usage}"
+                                    "`--if-sha256` takes the 64-hex sha256 `.mesh files fetch` printed last time; 'abc' is not one. {usage}"
                                 ),
                             ),
                             (
@@ -51094,7 +51202,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let dest = fx.stub.destination_hex();
                         let peer = short(&dest);
                         let retry = format!(
-                            "Try `.mesh fetch {peer} docs/a.md` again; if it repeats, the peer may run a different Coyote."
+                            "Try `.mesh files fetch {peer} docs/a.md` again; if it repeats, the peer may run a different Coyote."
                         );
                         let line = format!(".mesh files fetch {dest} docs/a.md");
                         let marker = b"MARKER-BYTES-NEVER-SHOWN";
@@ -51809,7 +51917,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 assert_eq!(
                     err_of(&mut ctx, ".mesh envoy memory list"),
                     format!(
-                        "'list' is not a `.mesh memory` command; `forget` is the one it takes. {}",
+                        "'list' is not a `.mesh envoy memory` command; `forget` is the one it takes. {}",
                         render_verb_help("envoy", "memory")
                     )
                 );
@@ -52080,7 +52188,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let err = err_of(&mut ctx, ".mesh envoy memory forget 00000000 --yes");
                 assert_eq!(
                     err,
-                    "Identity 00000000 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh knocks` and `.mesh peers` list."
+                    "Identity 00000000 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh access requests` and `.mesh people list` list."
                 );
                 let out = run_async(out_of(
                     &mut ctx,
@@ -52214,7 +52322,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 );
                 assert_eq!(
                     err_of(&mut ctx, ".mesh envoy memory forget nope"),
-                    "'nope' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh knocks` and `.mesh peers` list (8 or more characters)."
+                    "'nope' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh access requests` and `.mesh people list` list (8 or more characters)."
                 );
                 assert_eq!(
                     err_of(
@@ -52222,7 +52330,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         &format!(".mesh envoy memory forget {ID_A} \"bad thread!\"")
                     ),
                     format!(
-                        "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {usage}"
+                        "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh envoy memory forget <identity> --dry-run` lists them. {usage}"
                     )
                 );
                 run_async(run(&mut ctx, ".mesh envoy memory forget")).unwrap();
@@ -52312,10 +52420,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The log is the operator's only record of a store that was emptied without
-            /// being read. `forget all` warns once per such store, naming the store
+            /// being read. `envoy memory forget all` warns once per such store, naming the store
             /// directory so the operator can find what went; the identity and thread
             /// scopes, which leave such a store as it is, warn of no emptying at all, and a
-            /// second `forget all` over the emptied directory has nothing left to warn
+            /// second `envoy memory forget all` over the emptied directory has nothing left to warn
             /// about.
             #[test]
             #[serial]
@@ -52371,7 +52479,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "{not json"
                 );
 
-                // `forget all` empties it and says so once, naming the directory.
+                // `envoy memory forget all` empties it and says so once, naming the directory.
                 let before = warn_snapshot();
                 let out =
                     run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
@@ -52459,7 +52567,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         out.lines().last(),
                         Some(
                             format!(
-                                "Forgot 2 records, but 1 remembered conversation could not be forgotten; see the log for the store that refused, then run .mesh memory forget {ID_A} again."
+                                "Forgot 2 records, but 1 remembered conversation could not be forgotten; see the log for the store that refused, then run .mesh envoy memory forget {ID_A} again."
                             )
                             .as_str()
                         ),
@@ -52495,7 +52603,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// nothing, so it has no refusal to report; forgetting one thread both
                 /// stores hold removes `inst-a`'s record and repeats the thread in the
                 /// remedy; forgetting `all` removes what the writable store still held and
-                /// names `.mesh memory forget all`; and once the store can be written, the
+                /// names `.mesh envoy memory forget all`; and once the store can be written, the
                 /// remedy clears the rest with no record-count suffix, two records being
                 /// two conversations.
                 #[test]
@@ -52542,7 +52650,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "Forgot 1 record, but 1 remembered conversation could not be forgotten; see the log for the store that refused, then run .mesh memory forget {ID_A} a-first again."
+                            "Forgot 1 record, but 1 remembered conversation could not be forgotten; see the log for the store that refused, then run .mesh envoy memory forget {ID_A} a-first again."
                         ),
                         "the thread scope's remedy repeats the thread"
                     );
@@ -52563,7 +52671,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "Forgetting 3 remembered conversations of 2 identities:",
                             row_a.as_str(),
                             row_b.as_str(),
-                            "Forgot 1 record, but 2 remembered conversations could not be forgotten; see the log for the store that refused, then run .mesh memory forget all again.",
+                            "Forgot 1 record, but 2 remembered conversations could not be forgotten; see the log for the store that refused, then run .mesh envoy memory forget all again.",
                         ],
                         "what the writable store held went; the refusing store's two conversations are named, not folded into a record-count suffix: {out}"
                     );
@@ -52660,7 +52768,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The store is named in the listing and the result. An identity scope leaves it
-            /// as it is and says so, naming `forget all` as the way to empty it; `forget
+            /// as it is and says so, naming `envoy memory forget all` as the way to empty it; `envoy memory forget
             /// all` counts it beside the conversations, empties it unread, index and record
             /// files alike, and counts its record files among the records.
             #[test]
@@ -52681,7 +52789,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 fs::write(&record, "version: 1\n").unwrap();
                 let mut ctx = ctx_with(MeshConfig::default(), true);
                 let short_a = short(ID_A);
-                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it.";
+                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh envoy memory forget all to empty it.";
 
                 let out =
                     run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
@@ -52819,7 +52927,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// An identity or thread scope that finds nothing in the stores it can read
             /// says so in those words when a store could not be read, and names
-            /// `forget all` as the way to empty it.
+            /// `envoy memory forget all` as the way to empty it.
             #[test]
             #[serial]
             fn forget_of_an_identity_nothing_is_remembered_of_names_the_store_it_could_not_read() {
@@ -52834,7 +52942,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 fs::write(&index, "{not json").unwrap();
                 let mut ctx = ctx_with(MeshConfig::default(), true);
                 let short_b = short(ID_B);
-                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it.";
+                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh envoy memory forget all to empty it.";
 
                 let out = run_async(out_of(
                     &mut ctx,
@@ -52966,7 +53074,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// Like the identity scope, the thread scope leaves the store even when the
             /// thread it is asked to forget does exist in the readable stores and goes, and
-            /// names `forget all` as the way to empty that store.
+            /// names `envoy memory forget all` as the way to empty that store.
             #[test]
             #[serial]
             fn forgetting_one_thread_leaves_an_unreadable_store_and_says_so_after_the_forgot_line()
@@ -52985,7 +53093,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 fs::write(&record, "version: 1\n").unwrap();
                 let mut ctx = ctx_with(MeshConfig::default(), true);
                 let short_a = short(ID_A);
-                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it.";
+                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh envoy memory forget all to empty it.";
 
                 let out = run_async(out_of(
                     &mut ctx,
@@ -53039,7 +53147,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// A link to a real store elsewhere is not listed, not counted among the
                 /// conversations, not counted as a store whose index cannot be read even
-                /// when its target's index is garbage, and `forget all` leaves everything
+                /// when its target's index is garbage, and `envoy memory forget all` leaves everything
                 /// behind the link exactly as it was.
                 #[test]
                 #[serial]

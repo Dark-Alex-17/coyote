@@ -22378,10 +22378,10 @@ mod tests {
             assert_eq!(refused["kind"], "not_trusted", "{tool}: {refused}");
             let text = refused["message"].as_str().unwrap();
             assert!(
-                text.contains(&format!(".mesh trust {b_dest}")),
+                text.contains(&format!(".mesh access trust {b_dest}")),
                 "{tool}: {text}"
             );
-            assert!(text.contains(".mesh peers"), "{tool}: {text}");
+            assert!(text.contains(".mesh people list"), "{tool}: {text}");
         }
         assert!(
             ctx.app.mesh.correlations().list().is_empty(),

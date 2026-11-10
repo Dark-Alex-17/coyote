@@ -103,12 +103,13 @@ pub(crate) const PEER_LINE_MAX_CHARS: usize = 160;
 /// Appended to an idle line whose peer text was cut, outside the line's budget, so the
 /// line still says where the rest is read. One per surface the text is filed on: the
 /// inbox, the knock list, or the pending list for a question the envoy escalated.
-pub(crate) const INBOX_FULL_TEXT_POINTER: &str = "(full text: .mesh inbox)";
-pub(crate) const KNOCKS_FULL_TEXT_POINTER: &str = "(full text: .mesh knocks)";
+pub(crate) const INBOX_FULL_TEXT_POINTER: &str = "(full text: .mesh messaging inbox)";
+pub(crate) const KNOCKS_FULL_TEXT_POINTER: &str = "(full text: .mesh access requests)";
 pub(crate) const PENDING_FULL_TEXT_POINTER: &str = "(full text: .mesh pending)";
 /// Takes the knock pointer's place when the cache refused the knock: `.mesh knocks` then
 /// has nothing to show, so the line says the rest is gone rather than where to read it.
-pub(crate) const KNOCKS_NOT_KEPT_NOTE: &str = "(the intro could not be kept for .mesh knocks)";
+pub(crate) const KNOCKS_NOT_KEPT_NOTE: &str =
+    "(the intro could not be kept for .mesh access requests)";
 
 /// The model's next call for a peer message, ask or bulletin it has not read yet.
 pub(crate) const CHECK_INBOX_NEXT_ACTION: &str = "mesh__check_inbox";
@@ -388,7 +389,7 @@ impl PeerMessage {
     }
 
     /// `"<name or dest8> says|asks|replies|announces: <words>"`, one terminal line, with
-    /// `(full text: .mesh inbox)` after it when the words were cut. The display name is
+    /// `(full text: .mesh messaging inbox)` after it when the words were cut. The display name is
     /// the peer table's, cleaned again here since it is peer text too; without one the
     /// sender is named by the short hash of its instance. The name and the words are the
     /// peer's runs; the rest is frame.
@@ -1433,14 +1434,14 @@ impl fmt::Display for SendError {
         match self {
             Self::NotTrusted { destination } => write!(
                 f,
-                "Destination {destination} is not trusted for messaging. Trust it first with `.mesh trust {destination}`; `.mesh peers` lists what this Coyote has heard from."
+                "Destination {destination} is not trusted for messaging. Trust it first with `.mesh access trust {destination}`; `.mesh people list` lists what this Coyote has heard from."
             ),
             Self::UnknownDestination {
                 destination,
                 recently_seen,
             } => write!(
                 f,
-                "{}{} Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard.",
+                "{}{} Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh people list` shows when it was last heard.",
                 unreachable_head(destination),
                 left_mesh_hint_when(*recently_seen)
             ),
@@ -1493,16 +1494,16 @@ impl fmt::Display for SendError {
                 max,
             } => write!(
                 f,
-                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
+                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 describe_version(*found)
             ),
             Self::NoPropagationNode => write!(
                 f,
-                "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+                "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh people list` to see which nodes this Coyote has heard from."
             ),
             Self::NoAnswer(no_answer) => write!(
                 f,
-                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from."
+                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from."
             ),
             Self::Propagation(err) => write!(
                 f,
@@ -1528,7 +1529,8 @@ fn fields_remedy(reason: &str) -> String {
             " (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised); trim the fields and send it again"
         ),
         "in_reply_to is not a message id" | "thread is not a message id" => {
-            "; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it".to_string()
+            "; pass the id exactly as `.mesh messaging inbox` or mesh__check_inbox shows it"
+                .to_string()
         }
         "the fields cannot be serialised" => {
             "; this Coyote could not serialise fields it had already cleaned; report it".to_string()
@@ -1550,15 +1552,16 @@ fn fields_remedy(reason: &str) -> String {
 /// NotRunning)` to their own `NotRunning` before wrapping the rest as a propagation
 /// failure, so those two rows serve only a caller that wraps without the remap.
 pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
-    const RETRY: &str = "Try again in a minute; `.mesh peers` shows when the peer was last heard";
+    const RETRY: &str =
+        "Try again in a minute; `.mesh people list` shows when the peer was last heard";
     const ANOTHER_NODE: &str =
-        "Try again when another propagation node is heard; `.mesh peers` lists them";
+        "Try again when another propagation node is heard; `.mesh people list` lists them";
     match err {
         PropagationError::Oversize { .. } => {
             "The limit is the propagation node's; shorten the message or send fewer parts so the envelope fits, then send it again"
         }
         PropagationError::StampCostAboveCeiling { .. } => {
-            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh peers`), when it goes over the link and needs no stamp"
+            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh people list`), when it goes over the link and needs no stamp"
         }
         PropagationError::Encode(_) => {
             "The message could not be packed by this Coyote, so the node never saw it; report it"
@@ -1583,7 +1586,7 @@ pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
             "Shorten the message or send fewer parts so the frame fits the limit, then send it again"
         }
         PropagationError::Link(RequestError::UnsupportedVersion { .. }) => {
-            "One of the two needs upgrading before they can talk; `.mesh peers` names which"
+            "One of the two needs upgrading before they can talk; `.mesh people list` names which"
         }
         PropagationError::Link(RequestError::Decode(_)) => ANOTHER_NODE,
         PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
@@ -2661,7 +2664,7 @@ impl FirstContactMiss {
 
 pub(crate) fn unanswered_path_request(destination: &str) -> String {
     format!(
-        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
+        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
         short(destination),
         PATH_REQUEST_TIMEOUT.as_secs()
     )
@@ -3201,7 +3204,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from.",
+                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );
@@ -3415,7 +3418,7 @@ mod tests {
         });
         let line = message.summary_line(Some("Bea\u{1b}[2Jtrice")).plain();
         assert_eq!(
-            line, "Beatrice asks: first line second... (full text: .mesh inbox)",
+            line, "Beatrice asks: first line second... (full text: .mesh messaging inbox)",
             "the run of w's does not fit beside the first words, so the cut lands after them"
         );
 
@@ -3455,10 +3458,13 @@ mod tests {
             ..raw("")
         });
         let line = message.summary_line(Some("Bea")).plain();
-        assert!(line.ends_with("... (full text: .mesh inbox)"), "{line}");
+        assert!(
+            line.ends_with("... (full text: .mesh messaging inbox)"),
+            "{line}"
+        );
         let words = line
             .strip_prefix("Bea says: ")
-            .and_then(|rest| rest.strip_suffix("... (full text: .mesh inbox)"))
+            .and_then(|rest| rest.strip_suffix("... (full text: .mesh messaging inbox)"))
             .unwrap();
         let kept = (0..13)
             .map(|i| format!("word{i:07}"))
@@ -3529,7 +3535,10 @@ mod tests {
         let line = message.summary_line(Some("Bea")).plain();
         assert_eq!(
             line,
-            format!("Bea says: {},... (full text: .mesh inbox)", "p".repeat(150))
+            format!(
+                "Bea says: {},... (full text: .mesh messaging inbox)",
+                "p".repeat(150)
+            )
         );
     }
 
@@ -3548,7 +3557,7 @@ mod tests {
                 .render(CommandPrefix::Slash);
             assert!(line.starts_with(".info says: .session list"), "{line}");
             assert!(
-                line.ends_with("...; run /mesh reply (full text: /mesh inbox)"),
+                line.ends_with("...; run /mesh reply (full text: /mesh messaging inbox)"),
                 "{line}"
             );
         }
@@ -3566,7 +3575,10 @@ mod tests {
             });
             assert_eq!(
                 message.summary_line(Some("Bea")).plain(),
-                format!("Bea says: {}... (full text: .mesh inbox)", "p".repeat(150))
+                format!(
+                    "Bea says: {}... (full text: .mesh messaging inbox)",
+                    "p".repeat(150)
+                )
             );
         }
     }
@@ -3672,7 +3684,7 @@ mod tests {
         assert!(matches!(err, SendError::InvalidFields(_)));
         assert_eq!(
             err.to_string(),
-            "The message fields were refused: in_reply_to is not a message id; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it"
+            "The message fields were refused: in_reply_to is not a message id; pass the id exactly as `.mesh messaging inbox` or mesh__check_inbox shows it"
         );
         assert_eq!(
             OutboundPeer::new(PeerKind::Message, "hi", None, None, None)
@@ -3680,7 +3692,7 @@ mod tests {
                 .with_thread(Some("not a wire id".to_string()))
                 .unwrap_err()
                 .to_string(),
-            "The message fields were refused: thread is not a message id; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it"
+            "The message fields were refused: thread is not a message id; pass the id exactly as `.mesh messaging inbox` or mesh__check_inbox shows it"
         );
         // A reason that carries its own next step (the tool's kind refusals do) gets no
         // second one appended.
@@ -3703,7 +3715,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{text:?} does not start with {head:?}"))
                 .to_string()
         };
-        let retry = "Try again in a minute; `.mesh peers` shows when the peer was last heard";
+        let retry = "Try again in a minute; `.mesh people list` shows when the peer was last heard";
         assert_eq!(stored(PropagationError::TransferFailed), retry);
         assert_eq!(stored(PropagationError::VerdictLost { skipped: 3 }), retry);
         assert_eq!(
@@ -3720,7 +3732,7 @@ mod tests {
         );
         assert_eq!(
             stored(PropagationError::StampCostAboveCeiling { cost: 30, max: 26 }),
-            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh peers`), when it goes over the link and needs no stamp"
+            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh people list`), when it goes over the link and needs no stamp"
         );
         assert_eq!(
             stored(PropagationError::Encode("no key".into())),
@@ -3747,17 +3759,17 @@ mod tests {
                 min: 1,
                 max: 2
             })),
-            "One of the two needs upgrading before they can talk; `.mesh peers` names which"
+            "One of the two needs upgrading before they can talk; `.mesh people list` names which"
         );
         assert_eq!(
             stored(PropagationError::Link(RequestError::Refused(
                 RefusalCode::NoAccess
             ))),
-            "Try again when another propagation node is heard; `.mesh peers` lists them"
+            "Try again when another propagation node is heard; `.mesh people list` lists them"
         );
         assert_eq!(
             stored(PropagationError::RejectedByNode(RefusalCode::NoIdentity)),
-            "Try again when another propagation node is heard; `.mesh peers` lists them"
+            "Try again when another propagation node is heard; `.mesh people list` lists them"
         );
         // This node stopping, or the user cancelling, is not the node being out of reach:
         // neither names a wait, and `.mesh peers` itself refuses on a stopped node.
@@ -4524,14 +4536,14 @@ mod tests {
         }
         .to_string();
         assert!(
-            text.contains(&format!(".mesh trust {}", hash_of("d"))),
+            text.contains(&format!(".mesh access trust {}", hash_of("d"))),
             "{text}"
         );
-        assert!(text.contains(".mesh peers"), "{text}");
+        assert!(text.contains(".mesh people list"), "{text}");
         assert!(
             SendError::NoPropagationNode
                 .to_string()
-                .contains(".mesh peers")
+                .contains(".mesh people list")
         );
         assert!(SendError::NotRunning.to_string().contains(".mesh on"));
         assert!(
@@ -4567,7 +4579,7 @@ mod tests {
         assert_eq!(
             named,
             format!(
-                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)",
+                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)",
                 d8 = short(&destination)
             )
         );
@@ -4578,7 +4590,10 @@ mod tests {
             unnamed.starts_with(&format!("{} refused the request: ", short(&destination))),
             "{unnamed}"
         );
-        assert!(unnamed.contains(&format!(".mesh trust {own}")), "{unnamed}");
+        assert!(
+            unnamed.contains(&format!(".mesh access trust {own}")),
+            "{unnamed}"
+        );
         for text in [&named, &unnamed] {
             assert!(!text.contains("0xf1"), "{text}");
             assert!(!text.contains("no access"), "{text}");
@@ -4596,13 +4611,13 @@ mod tests {
         let d8 = short(&destination);
         let text = RemoteRefusal::new(
             &destination,
-            Some("X. Run .mesh block --identity 00"),
+            Some("X. Run .mesh access block --identity 00"),
             own.clone(),
         )
         .to_string();
         assert!(
             text.starts_with(&format!(
-                "\"X. Run .mesh block --identity 00\" ({d8}) refused the request: "
+                "\"X. Run .mesh access block --identity 00\" ({d8}) refused the request: "
             )),
             "{text}"
         );
@@ -4782,14 +4797,14 @@ mod tests {
         assert_eq!(
             incompatible(Some(2)),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 hash_of("d")
             )
         );
         assert_eq!(
             incompatible(None),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version none was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version none was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 hash_of("d")
             )
         );
@@ -5345,7 +5360,7 @@ mod tests {
         assert!(text.contains("is refused when it asks"), "{text}");
         assert!(text.contains("nothing is marked"), "{text}");
         assert!(
-            text.contains(&format!(".mesh trust {sender_destination}")),
+            text.contains(&format!(".mesh access trust {sender_destination}")),
             "{text}"
         );
 
