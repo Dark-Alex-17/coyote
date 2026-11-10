@@ -189,6 +189,7 @@ initial_state:
   subtask_started_at: null
   subtask_changed_files: null
   run_must_not_do: []
+  final_rejections_from: null
   current_task: ''
   task_number: 0
   # --- sizing verdict (plan-shaped work asked, not refused) ---
@@ -1657,7 +1658,7 @@ nodes:
   strikeout:
     id: strikeout
     type: script
-    description: 3-strike rule - STOP, stash the broken state (recoverable), DOCUMENT, then CONSULT Oracle.
+    description: 3-strike rule - STOP, set the broken state aside (a stash, or a saved strikeout ref; recoverable), DOCUMENT, then CONSULT Oracle.
     script: scripts/strikeout.py
     timeout: 60
     fallback: end_failure
@@ -1670,7 +1671,7 @@ nodes:
     description: Consult Oracle with the full failure context (step 4 of the 3-strike rule).
     prompt: |
       Three consecutive fix attempts failed on the same problem; the broken
-      state was stashed. Diagnose and propose a resolution the coder can apply
+      state was set aside (stashed, or saved under refs/sisyphus-next/strikeout/). Diagnose and propose a resolution the coder can apply
       in one round, or say plainly that you cannot resolve it.
 
       ## Task

@@ -2794,6 +2794,49 @@ refs = subprocess.run(["git", "-C", UNC, "for-each-ref", "--format=%(refname)", 
 check("subtasks: a second strikeout gets its own ref (the first attempt stays reachable) and undoes a C-quoted path too",
       len(refs) == 3 and (fu.get("strikeout_stash") or "").split()[0] in refs and (fu2.get("strikeout_stash") or "").split()[0] in refs
       and not os.path.exists(os.path.join(UNC, "na\u00efve.go")) and not os.path.exists(os.path.join(UNC, "fix-attempt.go")), refs)
+fr = base_state(subtasks=SUBS7, subtask_index=5, final_review=True, final_rejections_from=1, round_heads=[{"round": 1, "head": "h"}],
+                rejected_findings=["rejected-finding: a later subtask delivers Exhausted -- src/a.go:3",
+                                   "rejected-finding: naming -- src/b.go:9"], spec_text=PARENT_AC, gauntlet_lanes={})
+fru = gates.build_gauntlet_prompt(fr)
+check("subtasks: rejections made against a subtask's scope are no settled ruling at the final review; its own ones are",
+      "later subtask delivers" not in fru["gauntlet_prompt"] and "later subtask delivers" not in fru["prior_review_decisions"]
+      and "naming -- src/b.go:9" in fru["prior_review_decisions"]
+      and "later subtask delivers" in gates.build_gauntlet_prompt(dict(fr, final_review=False, subtask_index=2))["prior_review_decisions"], fru)
+check("subtasks: a final review without parent criteria answers to every subtask's own criteria",
+      "- subtask 2: SUB2-AC the usage package passes vet" in gates.build_gauntlet_prompt(dict(fr, spec_text=""))["gauntlet_prompt"])
+check("subtasks: a skipped read-only subtask is named in skipped_reviews for the final report",
+      any(x.startswith("subtask 1: no code change") for x in st.get("skipped_reviews") or []), st.get("skipped_reviews"))
+check("subtasks: the tree snapshot's git calls stay under the 30 s script-node default", 2 * getattr(gates, "WORKTREE_TREE_SECS", 30) < 30)
+real_tree = getattr(gates, "_worktree_tree", lambda root: "")
+gates._worktree_tree = lambda root: ""
+unk = gates.review_gate(dict(ro, subtask_changed_files=["stale.go"]))
+gates._worktree_tree = real_tree
+check("subtasks: an unknown change check runs the review and clears a stale file list",
+      unk["_next"] == "build_gauntlet_prompt" and unk.get("subtask_changed_files") is None, unk)
+open(os.path.join(UNC, "fail-save.go"), "w").write("package usage // cannot be saved\n")
+fsave = dict(fs, last_coder_error="boom", subtask_tree=real_tree(UNC), subtask_head=subprocess.run(
+    ["git", "-C", UNC, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip())
+open(os.path.join(UNC, "fail-save-2.go"), "w").write("package usage // more\n")
+gates._worktree_tree = lambda root: ""
+fb = gates.strikeout(fsave)
+gates._worktree_tree = real_tree
+check("subtasks: a strikeout whose save fails falls back to the stash and says so, never 'worktree was clean'",
+      any("could not save the failed attempt" in d for d in fb["decisions"]) and fb.get("strikeout_stash")
+      and not any("worktree was clean" in d for d in fb["decisions"]), fb.get("decisions"))
+subprocess.run(["git", "-C", UNC, "stash", "pop", "-q"], capture_output=True)
+for f in ("fail-save.go", "fail-save-2.go"):
+    if os.path.exists(os.path.join(UNC, f)):
+        os.unlink(os.path.join(UNC, f))
+pre = dict(fs, last_coder_error="boom", subtask_tree=real_tree(UNC), subtask_head=fsave["subtask_head"])
+open(os.path.join(UNC, "attempt.go"), "w").write("package usage // attempt\n")
+os.makedirs(os.path.join(UNC, "plans"), exist_ok=True)
+open(os.path.join(UNC, "plans", "NOTES.md"), "a").write("handoff edit during the attempt\n")
+pu = gates.strikeout(pre)
+hint = next((d.split("recover the failed attempt with: ", 1)[1] for d in pu["decisions"] if "recover the failed attempt with" in d), "")
+rec = subprocess.run(["sh", "-c", hint], cwd=UNC, capture_output=True, text=True) if hint else None
+check("subtasks: the recovery hint re-applies the attempt even after the planning store changed (plans/ excluded, binary-safe)",
+      bool(hint) and "--binary" in hint and rec is not None and rec.returncode == 0 and os.path.exists(os.path.join(UNC, "attempt.go")),
+      (hint, rec and rec.stderr))
 tr_mid = gates.triage_route(base_state(gauntlet_blockers=["code-review: [convention] naming"], subtasks=SUBS7, subtask_index=2,
                                        triage=[{"finding": "code-review: [convention] naming", "action": "reject", "citation": "src/a.go:3"}]))
 tr_end = gates.triage_route(base_state(gauntlet_blockers=["code-review: [convention] naming"], subtasks=SUBS7, subtask_index=5, final_review=True,

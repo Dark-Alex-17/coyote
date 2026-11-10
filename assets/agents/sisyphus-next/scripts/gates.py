@@ -39,6 +39,9 @@ from _lib import raise_escalation as _raise_escalation  # noqa: E402
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 
 SUBTASK_FILES_SHOWN = 40     # files a per-subtask review prompt lists as the subtask's own
+# Each git call of _worktree_tree; two of them stay under the 30 s script-node default of next_subtask and
+# review_gate. A timeout reads as unknown: the review runs and a strikeout stashes as before.
+WORKTREE_TREE_SECS = 10
 GAUNTLET_LANES = ("code-review", "adversary", "security", "probe", "debris")
 RERUN_ONCE_LANES = ("adversary", "security", "probe")
 OPERATIONAL_RE = re.compile(
@@ -268,7 +271,7 @@ def intake(state):
         u["run_dir"] = ensure_run_dir(run_id)
         u["resume_mode"] = True
         for k in ("base_sha", "debt_base", "run_base_sha", "final_review", "subtask_tree", "subtask_head", "subtask_started_at",
-                  "run_must_not_do", "subtasks", "subtask_index", "current_task", "fix_round",
+                  "run_must_not_do", "final_rejections_from", "subtasks", "subtask_index", "current_task", "fix_round",
                   "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
                   "skipped_reviews", "debt_left_behind", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
@@ -730,6 +733,8 @@ def _start_final_review(state, u, n):
         "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False,
         "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": brief, "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
+        # rejections made against a subtask's scope are no ruling on the parent criteria
+        "final_rejections_from": len(as_list(state.get("rejected_findings"))),
         # a strikeout in the final review's fix rounds resets to the tree all subtasks left, never past it
         "subtask_tree": _worktree_tree(root), "subtask_head": git_out(root, "rev-parse", "HEAD", default=""),
         "subtask_started_at": int(time.time()),
@@ -762,6 +767,12 @@ def _subtask_amendments(state):
             if str(a).strip():
                 lines.append(f"subtask {i}: {a}")
     return lines
+
+
+def _review_decisions(state):
+    """The settled rejections the current review may lean on: all of them, or the final review's own only."""
+    rejected = as_list(state.get("rejected_findings"))
+    return rejected[as_int(state.get("final_rejections_from")):] if truthy(state.get("final_review")) else rejected
 
 
 def _subtask_phase(state):
@@ -1960,7 +1971,8 @@ def compose_fix(state):
     elif src == "rejected":
         lines += ["The user rejected the previous plan. Change the approach as follows before planning again:", note]
     elif src == "strikeout":
-        lines += ["Three fix attempts failed; the broken attempt was stashed. Apply the oracle's direction below in ONE round:",
+        lines += ["Three fix attempts failed; the broken attempt was set aside (stashed, or saved under "
+                  "refs/sisyphus-next/strikeout/; see the run's decisions). Apply the oracle's direction below in ONE round:",
                   "", state.get("oracle_result") or ""]
     elif src == "observability":
         lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
@@ -2056,7 +2068,9 @@ def _save_failed_attempt(state, u, root, start, head):
     ledger(state, u, f"strikeout: the failed attempt is saved as {ref}; {len(paths)} path(s) put back to the "
                      f"subtask's starting tree, earlier subtasks' uncommitted work kept"
                      + ("" if rc == 0 else " (the restore did not complete; the saved commit holds the attempt)"))
-    return f"{ref} {sha} (recover with: git diff {start} {sha} | git apply)"
+    hint = " ".join(["git diff --binary", start, sha, "-- .", *(f"'{x}'" for x in _plans_exclude(state, root)), "| git apply"])
+    ledger(state, u, f"strikeout: recover the failed attempt with: {hint}")
+    return f"{ref} {sha} (recover with: {hint})"
 
 
 def strikeout_route(state):
@@ -2191,6 +2205,8 @@ def review_gate(state):
                                  "whole-task diff (earlier subtasks' work starts before them)")
         ledger(state, u, f"review: subtask {n} changed no code outside the planning store; its conformance review is "
                          "skipped (the whole-task review follows)")
+        u["skipped_reviews"] = list(as_list(state.get("skipped_reviews"))) + [
+            f"subtask {n}: no code change, so its own criteria were not reviewed (the whole-task review covers the parent's)"]
         u["_next"] = "next_subtask"
     else:
         u["_next"] = "build_gauntlet_prompt"
@@ -2243,7 +2259,8 @@ def _worktree_tree(root):
             os.unlink(tmp)
         env = {**os.environ, "GIT_INDEX_FILE": tmp}
         for args in (["add", "-A"], ["write-tree"]):
-            p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, env=env, timeout=120)
+            p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, env=env,
+                               timeout=WORKTREE_TREE_SECS)
             if p.returncode != 0:
                 return ""
         return p.stdout.strip()
@@ -2323,6 +2340,10 @@ def build_gauntlet_prompt(state):
         spec = _subtask_spec(state, files)
     else:
         spec = (state.get("spec_text") or "").strip()
+        if not spec and truthy(state.get("final_review")):
+            # no parent criteria were stated: the whole task answers to every subtask's own criteria
+            spec = "\n".join(f"- subtask {i}: {c}" for i, s in enumerate(as_list(state.get("subtasks")), 1)
+                             for c in as_list(_subtask_at([s], 0).get("acceptance_criteria")) if str(c).strip())
         if spec and truthy(state.get("final_review")):
             spec += (f"\n\nScope: the whole task, all {len(as_list(state.get('subtasks')))} subtasks, over the diff from "
                      "the run base: every acceptance criterion above must hold.")
@@ -2333,7 +2354,7 @@ def build_gauntlet_prompt(state):
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
     if rounds:
-        prior = as_list(state.get("rejected_findings"))
+        prior = _review_decisions(state)
         if prior:
             lines += ["Prior review decisions:"] + [f"- {p}" for p in prior]
         last = rounds[-1] if isinstance(rounds[-1], dict) else {}
@@ -2353,7 +2374,7 @@ def build_gauntlet_prompt(state):
     u["gauntlet_prompt"] = "\n".join(lines)
     u["round_heads"] = rounds + [{"round": n, "head": head, "started": now_iso()}]
     u["head_sha"] = head
-    u["prior_review_decisions"] = "\n".join(as_list(state.get("rejected_findings")))
+    u["prior_review_decisions"] = "\n".join(_review_decisions(state))
     ledger(state, u, f"gauntlet: round {n} spawned @ {head or '(no git)'}")
     snapshot(state, u, f"gauntlet round {n}")
     return u
