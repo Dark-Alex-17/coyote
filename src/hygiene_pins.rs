@@ -1354,6 +1354,8 @@ const UNDISPATCHED_MESH_PATHS: &[(&str, &str)] = &[
     ("src/repl/mesh.rs", "reply"),
     ("src/repl/mesh.rs", "undeny"),
     ("tests/mesh_autostart_repl.rs", "reply"),
+    ("tests/mesh_wiki_docs.rs", "reply"),
+    ("tests/mesh_wiki_docs.rs", "replying"),
 ];
 
 /// Words that follow the bare `.mesh` name in prose, as in the unknown-command error,
@@ -1377,7 +1379,6 @@ const STALE_MESH_PATH_FILES: &[&str] = &[
     "src/repl/mod.rs",
     "tests/macro_bracketing.rs",
     "tests/mesh_autostart_repl.rs",
-    "tests/mesh_wiki_docs.rs",
     "tests/propagation_node_image.rs",
 ];
 

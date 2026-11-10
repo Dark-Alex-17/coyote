@@ -14,7 +14,7 @@
 //! fail rather than pass against nothing.
 //!
 //! There is no lib target, so the code side of each check is read from the repo's text:
-//! the REPL `VERBS` table, `interface_warnings` and `interface_row` in `src/repl/mesh.rs`,
+//! the REPL `COMMANDS` table, `interface_warnings` and `interface_row` in `src/repl/mesh.rs`,
 //! the failure texts and `InterfaceState` rows in `src/mesh/node.rs`, the hook counts and
 //! the `mesh__*` tool names under `src/`, the limits and the empty-`interfaces` bail in
 //! `src/config/mesh_config.rs`, the yaml twins (`assets/config-template.yaml`,
@@ -148,27 +148,70 @@ fn string_literals(source: &str) -> Vec<String> {
     literals
 }
 
-/// The `(verb, description, usage)` rows of `VERBS` in `src/repl/mesh.rs`.
-fn repl_verbs() -> Vec<(String, String, String)> {
+/// The `(path, summary, usage)` rows of `COMMANDS` in `src/repl/mesh.rs`; a path is
+/// `group verb`, or the verb alone for a top-level row.
+fn repl_commands() -> Vec<(String, String, String)> {
     let source = read(repo_root().join("src").join("repl").join("mesh.rs"));
     let start = source
-        .find("const VERBS")
-        .expect("src/repl/mesh.rs declares VERBS");
+        .find("const COMMANDS")
+        .expect("src/repl/mesh.rs declares COMMANDS");
     let block = &source[start..];
     let end = block
         .find("\n];")
-        .expect("the VERBS block ends with a `];` line");
+        .expect("the COMMANDS block ends with a `];` line");
     let literals = string_literals(&block[..end]);
     assert_eq!(
-        literals.len() % 3,
+        literals.len() % 4,
         0,
-        "VERBS holds {} string literals, not a multiple of three",
+        "COMMANDS holds {} string literals, not a multiple of four",
         literals.len()
     );
     literals
-        .chunks(3)
-        .map(|row| (row[0].clone(), row[1].clone(), row[2].clone()))
+        .chunks(4)
+        .map(|row| {
+            let path = if row[0].is_empty() {
+                row[1].clone()
+            } else {
+                format!("{} {}", row[0], row[1])
+            };
+            (path, row[3].clone(), row[2].clone())
+        })
         .collect()
+}
+
+/// The groups the `COMMANDS` paths name.
+fn groups_of<'a>(paths: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut groups: Vec<String> = paths
+        .into_iter()
+        .filter_map(|path| path.split_once(' ').map(|(group, _)| group.to_string()))
+        .collect();
+    groups.dedup();
+    groups
+}
+
+/// The command path `rest` opens with, as typed after `.mesh `, and its length in bytes:
+/// one word of lowercase letters and dashes, plus the next such word when the first
+/// names one of `groups` and a single space separates them.
+fn mesh_path_of(rest: &str, groups: &[String]) -> Option<(String, usize)> {
+    let word_len = |text: &str| {
+        text.find(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+            .unwrap_or(text.len())
+    };
+    let first = word_len(rest);
+    if first == 0 {
+        return None;
+    }
+    let word = &rest[..first];
+    if groups.iter().any(|group| group == word)
+        && let Some(tail) = rest[first..].strip_prefix(' ')
+    {
+        let second = word_len(tail);
+        if second > 0 {
+            let len = first + 1 + second;
+            return Some((rest[..len].to_string(), len));
+        }
+    }
+    Some((word.to_string(), first))
 }
 
 /// The cells of a markdown table row, split on unescaped pipes and trimmed.
@@ -198,12 +241,12 @@ fn unbacktick<'a>(cell: &'a str, what: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{what} cell is not a code span: {cell:?}"))
 }
 
-/// The `(verb, usage, description)` rows of the verb table on `Mesh-Commands.md`.
-fn wiki_verb_rows(page: &str) -> Vec<(String, String, String)> {
+/// The `(path, usage, description)` rows of the command table on `Mesh-Commands.md`.
+fn wiki_command_rows(page: &str) -> Vec<(String, String, String)> {
     let section = page
-        .split("\n## The verbs\n")
+        .split("\n## The commands\n")
         .nth(1)
-        .expect("Mesh-Commands.md has a `## The verbs` section");
+        .expect("Mesh-Commands.md has a `## The commands` section");
     let section = section.split("\n## ").next().unwrap();
     section
         .lines()
@@ -214,11 +257,11 @@ fn wiki_verb_rows(page: &str) -> Vec<(String, String, String)> {
             assert_eq!(
                 cells.len(),
                 4,
-                "verb table row has {} cells: {row:?}",
+                "command table row has {} cells: {row:?}",
                 cells.len()
             );
             (
-                unbacktick(&cells[0], "verb").to_string(),
+                unbacktick(&cells[0], "command").to_string(),
                 unbacktick(&cells[1], "usage").to_string(),
                 cells[2].clone(),
             )
@@ -293,49 +336,54 @@ fn pre_scope_vocabulary_hits(
 }
 
 #[test]
-fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
+fn every_command_row_in_the_wiki_table_matches_the_repl_commands_table() {
     let Some(wiki) = wiki_dir() else { return };
-    let verbs = repl_verbs();
+    let commands = repl_commands();
     assert_eq!(
-        verbs.len(),
-        30,
-        "parsed {} VERBS rows from src/repl/mesh.rs; if the table grew, update this count",
-        verbs.len()
+        commands.len(),
+        36,
+        "parsed {} COMMANDS rows from src/repl/mesh.rs; if the table grew, update this count",
+        commands.len()
     );
-    let rows = wiki_verb_rows(&read(wiki.join("Mesh-Commands.md")));
+    let rows = wiki_command_rows(&read(wiki.join("Mesh-Commands.md")));
     assert_eq!(
         rows.len(),
-        verbs.len(),
-        "Mesh-Commands.md's verb table has {} rows, src/repl/mesh.rs VERBS has {}",
+        commands.len(),
+        "Mesh-Commands.md's command table has {} rows, src/repl/mesh.rs COMMANDS has {}",
         rows.len(),
-        verbs.len()
+        commands.len()
     );
-    for (verb, description, usage) in &verbs {
+    for (path, description, usage) in &commands {
         let (_, documented_usage, documented_description) = rows
             .iter()
-            .find(|(row_verb, _, _)| row_verb == verb)
-            .unwrap_or_else(|| panic!("Mesh-Commands.md's verb table has no `{verb}` row"));
+            .find(|(row_path, _, _)| row_path == path)
+            .unwrap_or_else(|| panic!("Mesh-Commands.md's command table has no `{path}` row"));
         assert_eq!(
             documented_usage, usage,
-            "Mesh-Commands.md's usage for `{verb}` differs from src/repl/mesh.rs"
+            "Mesh-Commands.md's usage for `{path}` differs from src/repl/mesh.rs"
         );
         assert_eq!(
             documented_description, description,
-            "Mesh-Commands.md's \"What it does\" for `{verb}` differs from src/repl/mesh.rs"
+            "Mesh-Commands.md's \"What it does\" for `{path}` differs from src/repl/mesh.rs"
         );
     }
 }
 
-/// Every `.mesh <verb>` a mesh page spells inside a code span is a verb `run` in
-/// `src/repl/mesh.rs` dispatches: a reader who types what the page shows is never
-/// refused with the unknown-verb error. A `<placeholder>` or `[option]` after `.mesh`
-/// is not a verb and is not judged; fenced blocks are transcripts, not instructions, and
-/// are skipped.
+/// Every `.mesh <path>` a mesh page spells inside a code span is a group or a command
+/// path `run` in `src/repl/mesh.rs` dispatches: a reader who types what the page shows is
+/// never refused with the unknown-command error. A `<placeholder>` or `[option]` after
+/// `.mesh` is not a path and is not judged; fenced blocks are transcripts, not
+/// instructions, and are skipped.
 #[test]
-fn every_mesh_verb_a_page_spells_is_one_the_repl_dispatches() {
+fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
     let Some(wiki) = wiki_dir() else { return };
-    let verbs: Vec<String> = repl_verbs().into_iter().map(|(name, _, _)| name).collect();
-    assert!(verbs.iter().any(|verb| verb == "info"), "{verbs:?}");
+    let paths: Vec<String> = repl_commands()
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .collect();
+    let groups = groups_of(&paths);
+    assert!(paths.iter().any(|path| path == "people info"), "{paths:?}");
+    assert!(groups.iter().any(|group| group == "people"), "{groups:?}");
     // The page without its ``` fenced blocks.
     let prose_of = |text: &str| -> String {
         let mut inside = false;
@@ -369,35 +417,36 @@ fn every_mesh_verb_a_page_spells_is_one_the_repl_dispatches() {
             spans_of(&text)
                 .into_iter()
                 .filter_map(|span| {
-                    let verb = span.strip_prefix(".mesh ")?.split_whitespace().next()?;
-                    (!verb.is_empty()
-                        && verb.chars().all(|c| c.is_ascii_lowercase())
-                        && !verbs.iter().any(|known| known == verb))
-                    .then(|| format!("{label}: `{span}` names `{verb}`"))
+                    let rest = span.strip_prefix(".mesh ")?;
+                    let word = rest.split_whitespace().next()?;
+                    if !word.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                        return None;
+                    }
+                    let (path, _) = mesh_path_of(rest, &groups)?;
+                    (!paths.contains(&path) && !groups.contains(&path))
+                        .then(|| format!("{label}: `{span}` names `{path}`"))
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
     assert!(
         unknown.is_empty(),
-        "a mesh page spells a `.mesh` verb the REPL does not dispatch (its `run` has no arm for it, so typing it is refused as an unknown verb):\n{}",
+        "a mesh page spells a `.mesh` path the REPL does not dispatch (COMMANDS has no row for it, so typing it is refused as an unknown command):\n{}",
         unknown.join("\n")
     );
 }
 
-/// Every `.mesh <verb> ...` sample on `text`, as `(line number, verb, rest)`: inside a
+/// Every `.mesh <path> ...` sample on `text`, as `(line number, path, rest)`: inside a
 /// code span in prose, or anywhere on a line of a fenced block (one line may carry
-/// several). `rest` drops quoted strings and ends at a backtick, `;`, `,`, `(` or `)`,
-/// so the sentence around a sample is not read as its flags.
-fn mesh_command_samples(text: &str) -> Vec<(usize, String, String)> {
+/// several); a path reads a second word only after one of `groups`. `rest` drops quoted
+/// strings and ends at a backtick, `;`, `,`, `(` or `)`, so the sentence around a sample
+/// is not read as its flags.
+fn mesh_command_samples(text: &str, groups: &[String]) -> Vec<(usize, String, String)> {
     let rest_of = |chunk: &str| -> Option<(String, String)> {
-        let verb: String = chunk.chars().take_while(char::is_ascii_lowercase).collect();
-        if verb.is_empty() {
-            return None;
-        }
+        let (path, len) = mesh_path_of(chunk, groups)?;
         let mut rest = String::new();
         let mut quoted = false;
-        for c in chunk[verb.len()..].chars() {
+        for c in chunk[len..].chars() {
             match c {
                 '"' => quoted = !quoted,
                 _ if quoted => {}
@@ -405,7 +454,7 @@ fn mesh_command_samples(text: &str) -> Vec<(usize, String, String)> {
                 c => rest.push(c),
             }
         }
-        Some((verb, rest))
+        Some((path, rest))
     };
     let mut samples = Vec::new();
     let mut fenced = false;
@@ -423,8 +472,8 @@ fn mesh_command_samples(text: &str) -> Vec<(usize, String, String)> {
                 .collect()
         };
         for chunk in chunks {
-            if let Some((verb, rest)) = rest_of(chunk) {
-                samples.push((index + 1, verb, rest));
+            if let Some((path, rest)) = rest_of(chunk) {
+                samples.push((index + 1, path, rest));
             }
         }
     }
@@ -442,26 +491,31 @@ fn flags_in(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// `label:line: ...` for every flag a `.mesh <verb>` sample on `text` spells that the
-/// verb's `VERBS` usage does not name; `verbs` is `(verb, usage)`. Returns the hits and
-/// how many samples carried a flag.
-fn unknown_flag_hits(label: &str, text: &str, verbs: &[(String, String)]) -> (Vec<String>, usize) {
+/// `label:line: ...` for every flag a `.mesh <path>` sample on `text` spells that the
+/// path's `COMMANDS` usage does not name; `commands` is `(path, usage)`. Returns the hits
+/// and how many samples carried a flag.
+fn unknown_flag_hits(
+    label: &str,
+    text: &str,
+    commands: &[(String, String)],
+) -> (Vec<String>, usize) {
+    let groups = groups_of(commands.iter().map(|(path, _)| path));
     let mut hits = Vec::new();
     let mut flagged = 0;
-    for (line, verb, rest) in mesh_command_samples(text) {
+    for (line, path, rest) in mesh_command_samples(text, &groups) {
         let flags = flags_in(&rest);
         if flags.is_empty() {
             continue;
         }
         flagged += 1;
-        let Some((_, usage)) = verbs.iter().find(|(known, _)| *known == verb) else {
+        let Some((_, usage)) = commands.iter().find(|(known, _)| *known == path) else {
             continue;
         };
         let usage_flags = flags_in(usage);
         for flag in flags {
             if !usage_flags.contains(&flag) {
                 hits.push(format!(
-                    "{label}:{line}: `.mesh {verb}` takes no {flag} (usage: {usage})"
+                    "{label}:{line}: `.mesh {path}` takes no {flag} (usage: {usage})"
                 ));
             }
         }
@@ -469,29 +523,29 @@ fn unknown_flag_hits(label: &str, text: &str, verbs: &[(String, String)]) -> (Ve
     (hits, flagged)
 }
 
-/// Every `--flag` a mesh page shows on a `.mesh <verb>` sample, in prose code spans and in
-/// fenced transcripts alike, is one that verb's `VERBS` usage names, so a reader who
-/// copies a sample is never refused for a flag the verb does not take.
+/// Every `--flag` a mesh page shows on a `.mesh <path>` sample, in prose code spans and in
+/// fenced transcripts alike, is one that path's `COMMANDS` usage names, so a reader who
+/// copies a sample is never refused for a flag the command does not take.
 #[test]
-fn every_flag_a_mesh_sample_spells_is_in_that_verbs_usage() {
-    let verbs: Vec<(String, String)> = repl_verbs()
+fn every_flag_a_mesh_sample_spells_is_in_that_commands_usage() {
+    let commands: Vec<(String, String)> = repl_commands()
         .into_iter()
-        .map(|(verb, _, usage)| (verb, usage))
+        .map(|(path, _, usage)| (path, usage))
         .collect();
-    let request = &verbs
+    let request = &commands
         .iter()
-        .find(|(verb, _)| verb == "request")
-        .expect("VERBS has a request row")
+        .find(|(path, _)| path == "files request")
+        .expect("COMMANDS has a files request row")
         .1;
     assert!(
         flags_in(request).contains(&"--reason".to_string()),
-        "the `.mesh request` usage no longer names --reason: {request}"
+        "the `.mesh files request` usage no longer names --reason: {request}"
     );
-    let fixture = "prose `.mesh request bob a.md --reasons \"x\"` and `.mesh request bob a.md --reason \"x; --yes\"`\n\
+    let fixture = "prose `.mesh files request bob a.md --reasons \"x\"` and `.mesh files request bob a.md --reason \"x; --yes\"`\n\
          ```text\n\
-         > .mesh trust bob --label ci; then .mesh off --force (or --macro)\n\
+         > .mesh access trust bob --label ci; then .mesh off --force (or --macro)\n\
          ```\n";
-    let (hits, flagged) = unknown_flag_hits("fixture", fixture, &verbs);
+    let (hits, flagged) = unknown_flag_hits("fixture", fixture, &commands);
     assert_eq!(
         flagged, 4,
         "the fixture's flagged samples were not all read"
@@ -511,7 +565,7 @@ fn every_flag_a_mesh_sample_spells_is_in_that_verbs_usage() {
     let mut flagged = 0;
     for page in mesh_pages(&wiki) {
         let label = page.file_name().unwrap().to_string_lossy().to_string();
-        let (page_hits, page_flagged) = unknown_flag_hits(&label, &read(&page), &verbs);
+        let (page_hits, page_flagged) = unknown_flag_hits(&label, &read(&page), &commands);
         hits.extend(page_hits);
         flagged += page_flagged;
     }
@@ -521,25 +575,25 @@ fn every_flag_a_mesh_sample_spells_is_in_that_verbs_usage() {
     );
     assert!(
         hits.is_empty(),
-        "a mesh page shows a flag the verb's VERBS usage does not name:\n{}",
+        "a mesh page shows a flag the command's COMMANDS usage does not name:\n{}",
         hits.join("\n")
     );
 }
 
-/// The `.mesh info` section names the announces the `last announce` row counts, and each
+/// The `.mesh config show` section names the announces the `last announce` row counts, and each
 /// of them is something the node does: the start announce, a reconnect, the heartbeat.
 /// It must not name a `.mesh` verb that does not exist as one of them.
 #[test]
 fn the_last_announce_prose_names_only_announces_the_node_sends() {
     let Some(wiki) = wiki_dir() else { return };
     let label = "Mesh-Commands.md";
-    let info = section(label, &read(wiki.join(label)), "### `.mesh info`");
+    let info = section(label, &read(wiki.join(label)), "### `.mesh config show`");
     let flat = flat(&info);
     let sentence = flat
         .split(". ")
         .find(|sentence| sentence.contains("`last announce` is how long ago"))
         .unwrap_or_else(|| {
-            panic!("{label}'s `.mesh info` section does not explain `last announce`")
+            panic!("{label}'s `.mesh config show` section does not explain `last announce`")
         });
     for cause in ["start announce", "reconnect", "heartbeat"] {
         assert!(
@@ -547,21 +601,25 @@ fn the_last_announce_prose_names_only_announces_the_node_sends() {
             "{label}: the `last announce` sentence does not name the {cause}: {sentence}"
         );
     }
-    let verbs: Vec<String> = repl_verbs().into_iter().map(|(name, _, _)| name).collect();
+    let paths: Vec<String> = repl_commands()
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .collect();
+    let groups = groups_of(&paths);
     for span in code_spans(sentence) {
-        if let Some(verb) = span
+        if let Some((path, _)) = span
             .strip_prefix(".mesh ")
-            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|rest| mesh_path_of(rest, &groups))
         {
             assert!(
-                verbs.iter().any(|known| known == verb),
-                "{label}: the `last announce` sentence names `{span}`, a verb the REPL does not have: {sentence}"
+                paths.contains(&path) || groups.contains(&path),
+                "{label}: the `last announce` sentence names `{span}`, a command the REPL does not have: {sentence}"
             );
         }
     }
     assert!(
         flat.contains("never (announce is off)"),
-        "{label}: the `.mesh info` section does not quote the announce-off row text"
+        "{label}: the `.mesh config show` section does not quote the announce-off row text"
     );
 }
 
@@ -803,25 +861,25 @@ fn the_mesh_page_says_a_thread_is_omitted_to_start_and_anything_else_is_refused(
 mod request_bad_path_tests {
     use super::*;
 
-    /// `.mesh request` refuses a path the wire grammar refuses with one sentence, and
+    /// `.mesh files request` refuses a path the wire grammar refuses with one sentence, and
     /// the Commands page quotes it word for word. The code side is checked on every run.
     #[test]
     fn the_commands_page_quotes_the_request_bad_path_remedy() {
-        let sentence = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it.";
+        let sentence = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh files list --effective --all prints it.";
         let source = read(repo_root().join("src/repl/mesh.rs"));
         assert!(
             source.contains(&format!("\"{sentence}\"")),
-            "src/repl/mesh.rs no longer refuses a bad .mesh request path with {sentence:?}"
+            "src/repl/mesh.rs no longer refuses a bad .mesh files request path with {sentence:?}"
         );
         let Some(wiki) = wiki_dir() else { return };
         let page = read(wiki.join("Mesh-Commands.md"));
         let section = page
-            .split_once("### `.mesh request`")
+            .split_once("### `.mesh files request`")
             .and_then(|(_, rest)| rest.split("\n### ").next())
-            .expect("Mesh-Commands.md has a `.mesh request` section");
+            .expect("Mesh-Commands.md has a `.mesh files request` section");
         assert!(
             section.contains(&format!("`{sentence}`")),
-            "the `.mesh request` section does not quote {sentence:?}"
+            "the `.mesh files request` section does not quote {sentence:?}"
         );
     }
 }
@@ -1386,7 +1444,7 @@ fn every_staged_path_example_names_the_peer_directory_by_the_full_destination_ha
 /// 31 and 33), a placeholder or any non-hex name is not, several examples on one line are
 /// each judged with that line's number, and a CRLF checkout reads back as the LF text with
 /// the same hits. The wiki itself keeps at least one literal 32-hex staged path (the
-/// `.mesh inbox` example) so the check never passes vacuously.
+/// `.mesh messaging inbox` example) so the check never passes vacuously.
 #[test]
 fn the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike() {
     let Some(wiki) = wiki_dir() else { return };
@@ -1468,7 +1526,7 @@ fn the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike() {
         literal_examples
             .iter()
             .any(|at| at.starts_with("Mesh-Commands.md:")),
-        "the `.mesh inbox` example on Mesh-Commands.md shows no literal full-hash staged path: {literal_examples:?}"
+        "the `.mesh messaging inbox` example on Mesh-Commands.md shows no literal full-hash staged path: {literal_examples:?}"
     );
 }
 
@@ -1711,9 +1769,9 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
             "nothing is marked",
             "remembered for as long as the node runs from the refusal itself",
             "names the key first heard holding the instance",
-            "`.mesh trust <new destination>` admits the new key and clears the memory",
-            "`.mesh block` of either key clears it too",
-            "`.mesh untrust --identity <old key>` admits the new key",
+            "`.mesh access trust <new destination>` admits the new key and clears the memory",
+            "`.mesh access block` of either key clears it too",
+            "`.mesh access revoke --identity <old key>` admits the new key",
         ] {
             assert!(
                 text.contains(needle),
@@ -1748,10 +1806,10 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
         "was heard under identity",
         "is now presented under identity",
         "no record carries the instance, so nothing is marked",
-        "otherwise .mesh block",
+        "otherwise .mesh access block",
     ];
     let served = ["is served while it asks because collision_protection is off"];
-    let refused = ["is refused when it asks", "run .mesh trust"];
+    let refused = ["is refused when it asks", "run .mesh access trust"];
     for fragment in shared.iter().chain(&served).chain(&refused) {
         assert!(
             emitted.contains(fragment),
@@ -1802,13 +1860,13 @@ fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_b
         .join(" ");
 
     for phrase in [
-        ".mesh memory forget",
+        ".mesh envoy memory forget",
         "identity",
         "thread",
         "the proved sending destination",
         "forget every thread of the identity, whichever of its instances it was held for",
         "`mesh.envoy_memory.*`",
-        "whose index cannot be read is counted and named so you can empty it with `.mesh memory forget all`",
+        "whose index cannot be read is counted and named so you can empty it with `.mesh envoy memory forget all`",
         "256 threads across all peers",
         "16 per identity",
         "40 turns",
@@ -1976,7 +2034,7 @@ fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8()
     );
 }
 
-/// The `.mesh peers` section on `Mesh-Commands.md` lists the trust labels `trust_label`
+/// The `.mesh people list` section on `Mesh-Commands.md` lists the trust labels `trust_label`
 /// prints and reads `blocked (instance)` as the grant's standing, not as how the node
 /// answered the row: nothing there ties a label to `collision_protection` or to a served
 /// verdict.
@@ -1984,10 +2042,10 @@ fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8()
 fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_verdict() {
     let Some(wiki) = wiki_dir() else { return };
     let commands = read(wiki.join("Mesh-Commands.md"));
-    let heading = "\n### `.mesh peers`\n";
+    let heading = "\n### `.mesh people list`\n";
     let section_at = commands
         .find(heading)
-        .expect("Mesh-Commands.md has a `### .mesh peers` section");
+        .expect("Mesh-Commands.md has a `### .mesh people list` section");
     let section = commands[section_at + 1..]
         .split("\n### ")
         .next()
@@ -1998,12 +2056,12 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
 
     let lead = "Trust is one of ";
     let sentence_at = section.find(lead).unwrap_or_else(|| {
-        panic!("the `.mesh peers` section does not list the trust labels:\n{section}")
+        panic!("the `.mesh people list` section does not list the trust labels:\n{section}")
     });
     let sentence = section[sentence_at..].split(". ").next().unwrap();
     assert_eq!(
         sentence,
-        "Trust is one of `trusted`, `known`, `untrusted`, `blocked (instance)`, `blocked (identity)`; `trusted` is an instance this node serves, `known` an instance of an identity the list knows (it or another of its instances was trusted) that has no record of its own and no all-destinations grant, `untrusted` one the list knows nothing of, `blocked (instance)` one `.mesh block <destination>` refused, whatever its identity's standing, and `blocked (identity)` one whose identity `.mesh block --identity <identity>` refused"
+        "Trust is one of `trusted`, `known`, `untrusted`, `blocked (instance)`, `blocked (identity)`; `trusted` is an instance this node serves, `known` an instance of an identity the list knows (it or another of its instances was trusted) that has no record of its own and no all-destinations grant, `untrusted` one the list knows nothing of, `blocked (instance)` one `.mesh access block <destination>` refused, whatever its identity's standing, and `blocked (identity)` one whose identity `.mesh access block --identity <identity>` refused"
     );
     for phrase in [
         "collision_protection",
@@ -2014,7 +2072,7 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     ] {
         assert!(
             !section.contains(phrase),
-            "the `.mesh peers` section ties a trust label to the verdict ({phrase:?}):\n{section}"
+            "the `.mesh people list` section ties a trust label to the verdict ({phrase:?}):\n{section}"
         );
     }
 
@@ -2047,7 +2105,7 @@ fn trust_labels() -> Vec<String> {
     labels
 }
 
-/// The `.mesh peers` section quotes the two footer legends as the code renders them: the
+/// The `.mesh people list` section quotes the two footer legends as the code renders them: the
 /// sample's second-to-last line is `trust_legend`, its last line is `peers_legend`, and
 /// the prose repeats both. The marker legend's numbers come from the constants, so the
 /// expected line is built from `peers_legend`'s own format literal and the heartbeat,
@@ -2112,35 +2170,35 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh peers`");
+    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh people list`");
     let sample = peers_section
         .split("```text\n")
         .nth(1)
         .and_then(|block| block.split("\n```").next())
-        .expect("the `.mesh peers` section opens with a text sample");
+        .expect("the `.mesh people list` section opens with a text sample");
     let lines: Vec<&str> = sample.lines().collect();
     assert_eq!(
         lines[lines.len() - 2],
         trust_legend,
-        "the `.mesh peers` sample does not carry the trust legend the code prints before the marker legend"
+        "the `.mesh people list` sample does not carry the trust legend the code prints before the marker legend"
     );
     assert_eq!(
         lines[lines.len() - 1],
         legend,
-        "the `.mesh peers` sample does not end with the legend the code prints"
+        "the `.mesh people list` sample does not end with the legend the code prints"
     );
     let prose = flat(&prose_outside_fences(&peers_section));
     assert!(
         prose.contains(&trust_legend),
-        "the `.mesh peers` prose does not quote the trust legend {trust_legend:?}:\n{prose}"
+        "the `.mesh people list` prose does not quote the trust legend {trust_legend:?}:\n{prose}"
     );
     assert!(
         prose.contains(&legend),
-        "the `.mesh peers` prose does not quote the legend {legend:?}:\n{prose}"
+        "the `.mesh people list` prose does not quote the legend {legend:?}:\n{prose}"
     );
 }
 
-/// The rows of the `.mesh peers` sample on Mesh-Commands.md read as the code renders them,
+/// The rows of the `.mesh people list` sample on Mesh-Commands.md read as the code renders them,
 /// not only its legend: the table carries the header `render_peers` draws, the marker is
 /// the `state` cell after the age; the stale marker is the one `row_state` formats with
 /// the heartbeat count and the age-out derived from the constants; the superseded marker
@@ -2240,12 +2298,12 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh peers`");
+    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh people list`");
     let sample = peers_section
         .split("```text\n")
         .nth(1)
         .and_then(|block| block.split("\n```").next())
-        .expect("the `.mesh peers` section opens with a text sample");
+        .expect("the `.mesh people list` section opens with a text sample");
     let header = mesh_table_header("render_peers", "name", 7);
     assert_eq!(
         header,
@@ -2260,7 +2318,7 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         ],
         "render_peers heads the table differently; update the sample and this test"
     );
-    let table = boxed_table("the `.mesh peers` sample", sample);
+    let table = boxed_table("the `.mesh people list` sample", sample);
     assert_eq!(table[0], header, "the sample's header:\n{sample}");
     for cells in &table[1..] {
         assert!(
@@ -2318,7 +2376,9 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         .split("```text\n")
         .nth(2)
         .and_then(|block| block.split("\n```").next())
-        .expect("the `.mesh peers` section quotes the key-changed line in a second text sample");
+        .expect(
+            "the `.mesh people list` section quotes the key-changed line in a second text sample",
+        );
     assert!(
         fence.starts_with(&format!("<dest8> {remedy_lead}<new8> <age>; ")),
         "the quoted key-changed line is led by <dest8> and opens as key_change_line does: {fence:?}"
@@ -2459,7 +2519,7 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     );
 }
 
-/// The `.mesh peers` sample names your session and a labelled peer the way
+/// The `.mesh people list` sample names your session and a labelled peer the way
 /// `own_session_name` and `labelled_name` format them, and the "Names instead of hashes"
 /// bullet quotes the `Did you mean` ending `unknown_name` prints.
 #[test]
@@ -2490,13 +2550,13 @@ fn the_mesh_pages_name_sessions_and_labels_as_the_code_formats_them() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh peers`");
+    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh people list`");
     let sample = peers_section
         .split("```text\n")
         .nth(1)
         .and_then(|block| block.split("\n```").next())
-        .expect("the `.mesh peers` section opens with a text sample");
-    let names: Vec<String> = boxed_table("the `.mesh peers` sample", sample)[1..]
+        .expect("the `.mesh people list` section opens with a text sample");
+    let names: Vec<String> = boxed_table("the `.mesh people list` sample", sample)[1..]
         .iter()
         .map(|cells| cells[0].clone())
         .collect();
@@ -2508,7 +2568,7 @@ fn the_mesh_pages_name_sessions_and_labels_as_the_code_formats_them() {
     ] {
         assert!(
             names.contains(&cell),
-            "the `.mesh peers` sample has no {cell:?} row: {names:?}"
+            "the `.mesh people list` sample has no {cell:?} row: {names:?}"
         );
     }
     let bullet = page
@@ -2868,7 +2928,7 @@ fn the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enfor
         format!("`with_status: true` ({sweep} s / {sweep} s)"),
         format!("over one year ({cap})"),
         "neither ever lowers one".to_string(),
-        "`.mesh info`".to_string(),
+        "`.mesh config show`".to_string(),
         "`null` while unset".to_string(),
     ] {
         assert!(
@@ -3525,7 +3585,7 @@ fn method_body(path: &str, name: &str) -> String {
 /// interface that did not come up, one for a lost rnsd), the `Mesh relay` and
 /// `Local rnsd` failure texts, the hint appended when every configured interface is a
 /// loopback relay, the `lan` bind failure and the six `InterfaceState` rows of
-/// `.mesh info`.
+/// `.mesh config show`.
 /// Every piece of text around a placeholder is on both pages byte for byte. The code side
 /// is checked on every run.
 #[test]
@@ -3624,7 +3684,7 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
         ] {
             assert!(
                 page.contains(needle),
-                "{page_name} does not show the `.mesh info` interface state {needle:?}"
+                "{page_name} does not show the `.mesh config show` interface state {needle:?}"
             );
         }
     }
@@ -4004,9 +4064,9 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
 /// `src/mesh/message.rs` declares, one per surface the full text is filed on (the inbox,
 /// the knock cache, the pending store), and each site that cuts peer text spends the
 /// constant for its own surface: the inbox summary line, the knock line, and the
-/// escalated question's line, which points at `.mesh pending` because the question is
+/// escalated question's line, which points at `.mesh envoy questions` because the question is
 /// filed there when the line prints while the inbox copy lands only after the envoy run
-/// ends; on that line the pointer sits before the `.mesh answer` command. The marker the
+/// ends; on that line the pointer sits before the `.mesh envoy answer` command. The marker the
 /// kept text ends with is `CUT_MARKER` in `src/mesh/mod.rs`, spent by `capped_peer_text`.
 /// The Mesh page's inbox section quotes the three pointers, the marker, the word-boundary
 /// cut, the line budget in characters and the colour the `[mesh:...]` prefix is painted in
@@ -4015,15 +4075,15 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
 #[test]
 fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     let inbox_pointer = const_str("src/mesh/message.rs", "INBOX_FULL_TEXT_POINTER");
-    assert_eq!(inbox_pointer, "(full text: .mesh inbox)");
+    assert_eq!(inbox_pointer, "(full text: .mesh messaging inbox)");
     let knocks_pointer = const_str("src/mesh/message.rs", "KNOCKS_FULL_TEXT_POINTER");
-    assert_eq!(knocks_pointer, "(full text: .mesh knocks)");
+    assert_eq!(knocks_pointer, "(full text: .mesh access requests)");
     let pending_pointer = const_str("src/mesh/message.rs", "PENDING_FULL_TEXT_POINTER");
-    assert_eq!(pending_pointer, "(full text: .mesh pending)");
+    assert_eq!(pending_pointer, "(full text: .mesh envoy questions)");
     let not_kept_note = const_str("src/mesh/message.rs", "KNOCKS_NOT_KEPT_NOTE");
     assert_eq!(
         not_kept_note,
-        "(the intro could not be kept for .mesh knocks)"
+        "(the intro could not be kept for .mesh access requests)"
     );
     let summary = method_body("src/mesh/message.rs", "summary_line_with_tail");
     assert!(summary.contains("INBOX_FULL_TEXT_POINTER"), "{summary}");
@@ -4043,7 +4103,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
             ".peer(who)",
             r#"" asks: ""#,
             ".peer(words.text)",
-            "`.mesh answer \"",
+            "`.mesh envoy answer \"",
             ".peer(message_id)",
             r#"" \"<text>\"`""#,
         ],
@@ -4057,7 +4117,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     );
     let answer_at = frames
         .iter()
-        .position(|frame| frame.ends_with("`.mesh answer "))
+        .position(|frame| frame.ends_with("`.mesh envoy answer "))
         .unwrap_or_else(|| panic!("the escalation line opens no answer command: {frames:?}"));
     assert!(
         frames[..answer_at].iter().any(|frame| frame == " asks: "),
@@ -4067,14 +4127,14 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         frames[answer_at].starts_with("{pointer}; answer with `"),
         "the pending pointer does not sit before the answer command: {frames:?}"
     );
-    let opened = &frames[answer_at][frames[answer_at].find(".mesh answer ").unwrap()..];
+    let opened = &frames[answer_at][frames[answer_at].find(".mesh envoy answer ").unwrap()..];
     let closed = frames
         .get(answer_at + 1)
         .and_then(|frame| frame.strip_suffix('`'))
         .unwrap_or_else(|| panic!("the answer command's code span is not closed: {frames:?}"));
     assert_eq!(
         format!("{opened}{{message_id}}{closed}"),
-        ".mesh answer {message_id} \"<text>\"",
+        ".mesh envoy answer {message_id} \"<text>\"",
         "the escalation line no longer carries the whole answer command"
     );
     let paint = method_body("src/repl/printer.rs", "paint_prefix");
@@ -4106,7 +4166,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         marked.as_str(),
         budget.as_str(),
         hard_cut.as_str(),
-        "answer with .mesh answer <id> \"<text>\"",
+        "answer with .mesh envoy answer <id> \"<text>\"",
         "the `[mesh:...]` prefix is shown in the tool-call name colour when colour is on",
     ] {
         assert!(
@@ -4115,7 +4175,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         );
     }
     let envoy = flat(&section("Mesh.md", &page, "## The envoy"));
-    let needle = "`(full text: .mesh pending)` before the command when the text was cut";
+    let needle = "`(full text: .mesh envoy questions)` before the command when the text was cut";
     assert!(
         envoy.contains(needle),
         "Mesh.md's envoy section does not carry {needle:?}:\n{envoy}"
@@ -4186,7 +4246,7 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_cap_is_four_an
     }
 }
 
-/// `.mesh sync` quotes the two lines a propagation node that does not answer the request
+/// `.mesh messaging sync` quotes the two lines a propagation node that does not answer the request
 /// for its message list ends a sync with, word for word as the fetch writes them, and
 /// says how often the automatic sync repeats them.
 #[test]
@@ -4213,18 +4273,18 @@ fn mesh_sync_documents_a_propagation_node_that_does_not_answer_the_list_request(
     let text = flat(&section(
         "Mesh-Commands.md",
         &read(wiki.join("Mesh-Commands.md")),
-        "### `.mesh sync`",
+        "### `.mesh messaging sync`",
     ));
     for line in lines {
         let shown = line.replace("{node}", "<node8>").replace("{}", "60 s");
         assert!(
             text.contains(&format!("`{shown}`")),
-            "Mesh-Commands.md's .mesh sync section does not quote {shown:?}"
+            "Mesh-Commands.md's .mesh messaging sync section does not quote {shown:?}"
         );
     }
     assert!(
         text.contains("writes it to the log at most once an hour per node"),
-        "Mesh-Commands.md's .mesh sync section does not say how often the automatic sync logs a silent node"
+        "Mesh-Commands.md's .mesh messaging sync section does not say how often the automatic sync logs a silent node"
     );
 }
 
@@ -4287,7 +4347,7 @@ mod first_contact_wiki_pins {
             .find(|paragraph| paragraph.contains("Either side may join first"))
             .expect("Mesh.md has no paragraph saying \"Either side may join first\"");
         for verb in [
-            "`.mesh trust`",
+            "`.mesh access trust`",
             "`info`",
             "`knock`",
             "`status`",
@@ -4726,7 +4786,7 @@ fn the_platform_page_names_the_services_and_quotes_the_firewall_prompts() {
 #[test]
 fn every_section_link_into_the_restructured_pages_resolves_to_a_heading() {
     let Some(wiki) = wiki_dir() else { return };
-    assert_eq!(github_slug("### `.mesh info`"), "mesh-info");
+    assert_eq!(github_slug("### `.mesh config show`"), "mesh-config-show");
     assert_eq!(
         github_slug("## Talking to peers (tools)"),
         "talking-to-peers-tools"
@@ -4822,7 +4882,7 @@ fn boxed_table(label: &str, sample: &str) -> Vec<Vec<String>> {
     rows
 }
 
-/// The `.mesh info` sample on the Commands page is the key/value table
+/// The `.mesh config show` sample on the Commands page is the key/value table
 /// `render_info_table` draws, with its header, and shows an `interfaces[0]` row as
 /// `interface_row` formats it: label, two spaces, state. The rows are the node's state,
 /// `identity` first and the propagation nodes last, with no `node` or `selection` row
@@ -4855,14 +4915,14 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let info = section("Mesh-Commands.md", &page, "### `.mesh info`");
+    let info = section("Mesh-Commands.md", &page, "### `.mesh config show`");
     let sample = info
         .split("```text\n")
         .skip(1)
         .map(|block| block.split("\n```").next().unwrap())
         .find(|block| block.starts_with('┌'))
-        .expect("the `.mesh info` section has a text block that is a table");
-    let rows = boxed_table("the `.mesh info` sample", sample);
+        .expect("the `.mesh config show` section has a text block that is a table");
+    let rows = boxed_table("the `.mesh config show` sample", sample);
     assert_eq!(rows[0], header, "the sample's header:\n{sample}");
     let interface_rows: Vec<&Vec<String>> = rows
         .iter()
@@ -4871,7 +4931,7 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
     assert_eq!(
         interface_rows.len(),
         1,
-        "the `.mesh info` sample shows one interfaces[0] row:\n{sample}"
+        "the `.mesh config show` sample shows one interfaces[0] row:\n{sample}"
     );
     assert_eq!(
         interface_rows[0][1], "local rnsd at 127.0.0.1:37428  connected",
@@ -4894,11 +4954,14 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
     );
     assert!(
         info.contains(&format!("`{node_off}`")),
-        "the `.mesh info` section does not quote the node-off line {node_off:?}"
+        "the `.mesh config show` section does not quote the node-off line {node_off:?}"
     );
     let loopback_example = format!("`via rnsd at 127.0.0.1:37428{reach_tail}`");
     for (label, text) in [
-        ("Mesh-Commands.md's `.mesh info` section", flat(&info)),
+        (
+            "Mesh-Commands.md's `.mesh config show` section",
+            flat(&info),
+        ),
         (
             "Mesh-Deployment.md's host step",
             flat(&section(
@@ -4915,7 +4978,7 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
     }
     assert!(
         !info.contains("selection"),
-        "the `.mesh info` section still mentions a selection row"
+        "the `.mesh config show` section still mentions a selection row"
     );
 
     let deployment = read(wiki.join("Mesh-Deployment.md"));
@@ -4958,7 +5021,7 @@ fn mesh_table_header(render: &str, first: &str, columns: usize) -> Vec<String> {
     header
 }
 
-/// The `.mesh knocks` sample on the Commands page and the `.mesh shares` and
+/// The `.mesh access requests` sample on the Commands page and the `.mesh files list` and
 /// `--effective` samples on the File Sharing page are the tables `render_knocks`,
 /// `render_share_rules` and `render_effective_shares` draw, header for header; every
 /// verdict cell of the `--effective` sample is one of the words `render_effective_shares`
@@ -4993,38 +5056,38 @@ fn the_knocks_and_shares_samples_use_the_code_table_headers() {
 
     let Some(wiki) = wiki_dir() else { return };
     let commands = read(wiki.join("Mesh-Commands.md"));
-    let knocks_section = section("Mesh-Commands.md", &commands, "### `.mesh knocks`");
+    let knocks_section = section("Mesh-Commands.md", &commands, "### `.mesh access requests`");
     let samples = table_samples(&knocks_section);
     assert_eq!(
         samples.len(),
         1,
-        "the `.mesh knocks` section carries one table sample:\n{knocks_section}"
+        "the `.mesh access requests` section carries one table sample:\n{knocks_section}"
     );
     assert_eq!(
-        boxed_table("the `.mesh knocks` sample", samples[0])[0],
+        boxed_table("the `.mesh access requests` sample", samples[0])[0],
         knocks,
-        "the `.mesh knocks` sample's header:\n{}",
+        "the `.mesh access requests` sample's header:\n{}",
         samples[0]
     );
 
     let sharing = read(wiki.join("Mesh-File-Sharing.md"));
-    let shares_section = section("Mesh-File-Sharing.md", &sharing, "### `.mesh shares`");
+    let shares_section = section("Mesh-File-Sharing.md", &sharing, "### `.mesh files list`");
     let samples = table_samples(&shares_section);
     assert_eq!(
         samples.len(),
         2,
-        "the `.mesh shares` section carries the rules sample and the --effective sample:\n{shares_section}"
+        "the `.mesh files list` section carries the rules sample and the --effective sample:\n{shares_section}"
     );
     assert_eq!(
-        boxed_table("the `.mesh shares` sample", samples[0])[0],
+        boxed_table("the `.mesh files list` sample", samples[0])[0],
         rules,
-        "the `.mesh shares` sample's header:\n{}",
+        "the `.mesh files list` sample's header:\n{}",
         samples[0]
     );
-    let effective_table = boxed_table("the `.mesh shares --effective` sample", samples[1]);
+    let effective_table = boxed_table("the `.mesh files list --effective` sample", samples[1]);
     assert_eq!(
         effective_table[0], effective,
-        "the `.mesh shares --effective` sample's header:\n{}",
+        "the `.mesh files list --effective` sample's header:\n{}",
         samples[1]
     );
     for cells in &effective_table[1..] {
@@ -5045,24 +5108,41 @@ fn the_knocks_and_shares_samples_use_the_code_table_headers() {
     );
 }
 
-/// The Commands page's conventions list says every verb that waits on the network prints
-/// a progress line, an empty line, then the result, naming each such verb; each of those
-/// verbs calls `result_follows` in the code, as does `route_to` after the path-request
-/// line the bullet names (`dismiss` dispatches to `dismiss_one` and `dismiss_all`, each
-/// printing its own, and `request` hands its wait to `send_request`); and wherever the
+/// The Commands page's conventions list says every command that waits on the network
+/// prints a progress line, an empty line, then the result, naming each such command; the
+/// function each dispatches to calls `result_follows` in the code, as does `route_to` after
+/// the path-request line the bullet names (`envoy dismiss` dispatches to `dismiss_one` and
+/// `dismiss_all`, each printing its own, `people status` to `peer_status`, `access ask` to
+/// `knock`, and `files request` hands its wait to `send_request`); and wherever the
 /// Commands page (the File Sharing page too, for grant, request and fetch) quotes a
 /// progress line it is the one the code prints, placeholders filled as the pages spell
 /// them, followed by `, then an empty line, then`. The code side is checked on every run.
 #[test]
 fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_follow_it() {
-    let waiting_verbs = [
-        "status", "sync", "knock", "request", "fetch", "answer", "dismiss", "grant", "refuse",
+    let waiting_commands = [
+        "people status",
+        "messaging sync",
+        "access ask",
+        "files request",
+        "files fetch",
+        "envoy answer",
+        "envoy dismiss",
+        "files grant",
+        "files refuse",
     ];
-    for verb in waiting_verbs
-        .into_iter()
-        .filter(|verb| !matches!(*verb, "dismiss" | "request"))
-        .chain(["dismiss_one", "dismiss_all", "send_request", "route_to"])
-    {
+    for verb in [
+        "peer_status",
+        "sync",
+        "knock",
+        "send_request",
+        "fetch",
+        "answer",
+        "dismiss_one",
+        "dismiss_all",
+        "grant",
+        "refuse",
+        "route_to",
+    ] {
         assert!(
             fn_body("src/repl/mesh.rs", verb).contains("result_follows();"),
             "fn {verb} in src/repl/mesh.rs prints no empty line after its progress line"
@@ -5076,7 +5156,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
                 panic!("fn {verb} in src/repl/mesh.rs prints no literal containing {fragment:?}")
             })
     };
-    let status = progress_line("status", "for its status card; Ctrl-C cancels...");
+    let status = progress_line("peer_status", "for its status card; Ctrl-C cancels...");
     let sync = progress_line("sync", "; Ctrl-C cancels...");
     let knock = progress_line("knock", "Knocking on {}; Ctrl-C cancels...");
     let fetch = progress_line("fetch", "over the mesh (up to {} s)...");
@@ -5156,10 +5236,10 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
             "the convention bullet does not say {needle:?}: {bullet}"
         );
     }
-    for verb in waiting_verbs {
+    for command in waiting_commands {
         assert!(
-            bullet.contains(&format!("`{verb}`")),
-            "the convention bullet does not name `{verb}`: {bullet}"
+            bullet.contains(&format!("`{command}`")),
+            "the convention bullet does not name `{command}`: {bullet}"
         );
     }
     let follows = ", then an empty line, then";
@@ -5673,7 +5753,7 @@ fn the_two_sessions_prose_says_the_trust_file_is_shared_live_on_both_pages() {
     }
 }
 
-/// The knock entry quotes the four lines `.mesh knock` prints for a knock that drew no
+/// The knock entry quotes the four lines `.mesh access ask` prints for a knock that drew no
 /// reply or could not be held, and both the entry and the Trust Model's Knocks section say
 /// a knock is not first contact. The quoted lines are read from the source so a reworded
 /// report moves the page with it.
@@ -5696,9 +5776,9 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
     let stored = format!(
         "Knocked on {{dest8}}; no answer over the link, so a propagation node holds the knock until the peer fetches it. {first_contact}"
     );
-    let unanswered = "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it.";
-    let unreachable = "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh peers` to see which nodes this Coyote has heard from.";
-    let preview_tail = "A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.";
+    let unanswered = "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides. No propagation node is known yet to hold the knock for it.";
+    let unreachable = "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh people list` to see which nodes this Coyote has heard from.";
+    let preview_tail = "A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh access trust` on both sides.";
     assert!(
         repl.contains(&stored.replace(&first_contact, "{KNOCK_IS_NOT_FIRST_CONTACT}")),
         "src/repl/mesh.rs no longer prints the stored-after-silence report this test quotes"
@@ -5719,7 +5799,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
     let commands = flat(&section(
         "Mesh-Commands.md",
         &read(wiki.join("Mesh-Commands.md")),
-        "### `.mesh knock`",
+        "### `.mesh access ask`",
     ));
     for needle in [
         "A knock is not first contact".to_string(),
@@ -5731,7 +5811,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
     ] {
         assert!(
             commands.contains(&needle),
-            "Mesh-Commands.md's `.mesh knock` entry does not carry {needle:?}"
+            "Mesh-Commands.md's `.mesh access ask` entry does not carry {needle:?}"
         );
     }
     let knocks = flat(&section(
@@ -5788,10 +5868,10 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
 
     let message_rs = read(repo_root().join("src").join("mesh").join("message.rs"));
     let repl = read(repo_root().join("src").join("repl").join("mesh.rs"));
-    let send_tail = "Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard.";
-    let status_tail = "A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";
-    let knock_tail = "Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.";
-    let fetch_tail = "A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";
+    let send_tail = "Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh people list` shows when it was last heard.";
+    let status_tail = "A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.";
+    let knock_tail = "Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh people list` shows when it was last heard.";
+    let fetch_tail = "A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.";
     for (path, source, tail, hint_fn) in [
         (
             "src/mesh/message.rs",
@@ -5856,12 +5936,12 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     );
     assert!(
         status.contains(&format!("`{hint}` after `cannot reach.`"))
-            && status.contains("`.mesh message`"),
+            && status.contains("`.mesh messaging send`"),
         "Mesh-Commands.md's `.mesh status` entry does not say the refusals add {hint:?} after `cannot reach.`"
     );
     let link_timeout_line = format!(
         "No mesh link to the peer came up within {link_timeout}.0s. {hint} {}.",
-        "Try again in a minute; `.mesh peers` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later"
+        "Try again in a minute; `.mesh people list` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later"
     );
     assert!(
         status.contains(&link_timeout_line),
@@ -5893,14 +5973,18 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         ),
         "Mesh-Commands.md's `.mesh status` entry misattributes who answers a path request"
     );
-    let knock = flat(&section("Mesh-Commands.md", &commands, "### `.mesh knock`"));
+    let knock = flat(&section(
+        "Mesh-Commands.md",
+        &commands,
+        "### `.mesh access ask`",
+    ));
     assert!(
         knock.contains(&format!("{head} {knock_tail}")),
-        "Mesh-Commands.md's `.mesh knock` entry does not quote the path-request refusal"
+        "Mesh-Commands.md's `.mesh access ask` entry does not quote the path-request refusal"
     );
     assert!(
         knock.contains(&route_line),
-        "Mesh-Commands.md's `.mesh knock` entry does not quote the route line: {route_line:?}"
+        "Mesh-Commands.md's `.mesh access ask` entry does not quote the route line: {route_line:?}"
     );
     let gotchas = flat(&section(
         "Mesh-Deployment.md",
@@ -5910,8 +5994,8 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     for needle in [
         format!("{head} {send_tail}"),
         format!("asks the network for a path and waits up to {timeout} s for the answer"),
-        "a request to one peer (`.mesh status`, `.mesh message`, a `mesh__ask`) from a restarted node reaches a peer it already knew at once, without waiting for a heartbeat".to_string(),
-        "A bulletin (`.mesh broadcast`) still goes only to peers the transport already has a route to".to_string(),
+        "a request to one peer (`.mesh status`, `.mesh messaging send`, a `mesh__ask`) from a restarted node reaches a peer it already knew at once, without waiting for a heartbeat".to_string(),
+        "A bulletin (`.mesh messaging broadcast`) still goes only to peers the transport already has a route to".to_string(),
         "The answer to a path request is not a sighting: `last seen` does not move, and `mesh.peer.discovered` does not fire".to_string(),
         format!("reports such a peer unreachable at once rather than waiting {timeout} s for each"),
     ] {
@@ -6239,7 +6323,7 @@ fn the_autostart_notice_is_quoted_as_the_code_prints_it_without_a_second_off_poi
     }
 }
 
-/// The Commands page's `.mesh brief` section quotes the note confirmations as `brief`
+/// The Commands page's `.mesh envoy brief` section quotes the note confirmations as `brief`
 /// prints them (in a double-backtick span, since each names a command) and the TAB row
 /// the completer offers, and no mesh page spells the verbs renamed before the release as
 /// whole words: `.mesh reply`, `brief set`, `brief clear`, nor the destination form of
@@ -6259,7 +6343,7 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
     let note_cleared = confirmation("Note cleared;");
     for (label, text) in [("Note set", note_set), ("Note cleared", note_cleared)] {
         assert!(
-            text.contains("`.mesh brief"),
+            text.contains("`.mesh envoy brief"),
             "the {label} confirmation names the next command: {text:?}"
         );
     }
@@ -6268,17 +6352,17 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
     let brief = flat(&section(
         "Mesh-Commands.md",
         &read(wiki.join("Mesh-Commands.md")),
-        "### `.mesh brief`",
+        "### `.mesh envoy brief`",
     ));
     for needle in [
-        format!("- `.mesh brief note \"text\"`: `` `{note_set}` ``"),
-        format!("- `.mesh brief note clear`: `` `{note_cleared}` ``"),
+        format!("- `.mesh envoy brief note \"text\"`: `` `{note_set}` ``"),
+        format!("- `.mesh envoy brief note clear`: `` `{note_cleared}` ``"),
         "TAB offers: `note `, `auto`, `manual`, `off`; after `note`: `clear`.".to_string(),
         "a `sections:` line".to_string(),
     ] {
         assert!(
             brief.contains(&needle),
-            "Mesh-Commands.md's `.mesh brief` section does not carry {needle:?}:\n{brief}"
+            "Mesh-Commands.md's `.mesh envoy brief` section does not carry {needle:?}:\n{brief}"
         );
     }
 
@@ -6290,9 +6374,9 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
                 ".mesh reply",
                 "brief set",
                 "brief clear",
-                ".mesh forget <destination>",
-                ".mesh block <identity>",
-                ".mesh unblock <identity>",
+                ".mesh access forget <destination>",
+                ".mesh access block <identity>",
+                ".mesh access unblock <identity>",
             ] {
                 if spells_as_words(line, retired) {
                     hits.push(format!("{label}:{}: spells {retired}", index + 1));
@@ -6326,7 +6410,7 @@ fn spells_as_words_binds_on_word_boundaries() {
     assert!(!spells_as_words("brief clearly wins", "brief clear"));
 }
 
-/// The Commands page's `.mesh brief` section quotes every `sections:` label as
+/// The Commands page's `.mesh envoy brief` section quotes every `sections:` label as
 /// `brief_sections` builds it, with `<time>` and `<mode>` standing for the two
 /// placeholders, and describes the separator as a dot because the code joins the labels
 /// with an ASCII dot. No label and no separator carries a non-ASCII character, and the
@@ -6372,20 +6456,20 @@ fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let brief = section("Mesh-Commands.md", &page, "### `.mesh brief`");
+    let brief = section("Mesh-Commands.md", &page, "### `.mesh envoy brief`");
     assert!(
         !brief.contains('\u{b7}'),
-        "Mesh-Commands.md's `.mesh brief` section still carries a middle dot (U+00B7):\n{brief}"
+        "Mesh-Commands.md's `.mesh envoy brief` section still carries a middle dot (U+00B7):\n{brief}"
     );
     let flat_brief = flat(&brief);
     assert!(
         flat_brief.contains("separated by a dot"),
-        "Mesh-Commands.md's `.mesh brief` section does not say the labels are separated by a dot:\n{flat_brief}"
+        "Mesh-Commands.md's `.mesh envoy brief` section does not say the labels are separated by a dot:\n{flat_brief}"
     );
     for label in &labels {
         assert!(
             flat_brief.contains(&format!("`{label}`")),
-            "Mesh-Commands.md's `.mesh brief` section does not quote the section label `{label}`:\n{flat_brief}"
+            "Mesh-Commands.md's `.mesh envoy brief` section does not quote the section label `{label}`:\n{flat_brief}"
         );
     }
 }
@@ -6395,7 +6479,7 @@ fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_
 /// the transcript and never sent as such. The same section explains the digest with the
 /// two thresholds the code applies (new messages since the last digest, seconds since the
 /// last attempt), the heading the brief gives it, the two config keys that shape it, the
-/// note's role beside it, and the four section labels bare `.mesh brief` prints in the
+/// note's role beside it, and the four section labels bare `.mesh envoy brief` prints in the
 /// order the code joins them. The card-vs-brief box is read with its `> ` markers
 /// stripped, so a phrase it wraps across lines is pinned as the sentence it is. The mode
 /// table's `off` row says no brief is assembled and the card still goes to peers that ask.
@@ -6468,13 +6552,13 @@ fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
 }
 
 /// The Commands page carries the brief and status confirmations as the code prints them:
-/// the `.mesh brief` section quotes each per-mode line `brief_mode_line` returns and the
+/// the `.mesh envoy brief` section quotes each per-mode line `brief_mode_line` returns and the
 /// bare-brief sentence under `off`, the `.mesh status` section quotes the objective
 /// confirmation `status` prints (with `<objective>` in the placeholder's place), the
 /// `## The status card and the brief` lead says the card is served and the brief never
 /// is and points at the Mesh page, the `.mesh on` preview sample shows the status-card
 /// line and the auto brief line `render_on_preview` pushes and the prose under it quotes
-/// the off row, and the `.mesh message` section says a message is fire-and-forget with
+/// the off row, and the `.mesh messaging send` section says a message is fire-and-forget with
 /// the reply landing in the inbox.
 #[test]
 fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_preview_split() {
@@ -6507,7 +6591,7 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         }
         assert!(line.contains("config.yaml is not changed"), "{line:?}");
         assert!(
-            line.contains(".mesh brief"),
+            line.contains(".mesh envoy brief"),
             "the {mode} line names the next command: {line:?}"
         );
         assert!(line.is_ascii(), "{line:?}");
@@ -6516,13 +6600,14 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
     let off_bare = brief_literals
         .iter()
         .find(|literal| literal.contains("No brief is assembled in off mode"))
-        .expect("bare .mesh brief under off says no brief is assembled")
+        .expect("bare .mesh envoy brief under off says no brief is assembled")
         .split('\n')
         .next_back()
         .unwrap()
         .to_string();
     assert!(
-        off_bare.contains(".mesh brief auto") && off_bare.contains(".mesh brief manual"),
+        off_bare.contains(".mesh envoy brief auto")
+            && off_bare.contains(".mesh envoy brief manual"),
         "the off-mode sentence names both commands that turn the brief back on: {off_bare:?}"
     );
     assert!(
@@ -6533,7 +6618,9 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
     let not_yet = brief_literals
         .iter()
         .find(|literal| literal.contains("No brief is assembled yet"))
-        .expect("bare .mesh brief before the first turn boundary says no brief is assembled yet")
+        .expect(
+            "bare .mesh envoy brief before the first turn boundary says no brief is assembled yet",
+        )
         .split('\n')
         .next_back()
         .unwrap()
@@ -6545,14 +6632,14 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         .expect("the note confirmation under off says the note is held");
     assert!(
         note_held.starts_with("Note set, but brief mode is off, so")
-            && note_held.contains("`.mesh brief auto`")
-            && note_held.contains("`.mesh brief manual`"),
+            && note_held.contains("`.mesh envoy brief auto`")
+            && note_held.contains("`.mesh envoy brief manual`"),
         "{note_held:?}"
     );
     // Under off the bare verb shows no sections, so the confirmation must not send the
     // reader there.
     assert!(
-        !note_held.contains("Run `.mesh brief`"),
+        !note_held.contains("Run `.mesh envoy brief`"),
         "the off confirmation points at the modes, not at the bare verb: {note_held:?}"
     );
     let objective = string_literals(&fn_body("src/repl/mesh.rs", "status"))
@@ -6606,25 +6693,29 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let brief = flat(&section("Mesh-Commands.md", &page, "### `.mesh brief`"));
+    let brief = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy brief`",
+    ));
     for (mode, line) in ["auto", "manual", "off"].iter().zip(&mode_lines) {
         let needle = format!("- {mode}: `{line}`");
         assert!(
             brief.contains(&needle),
-            "Mesh-Commands.md's `.mesh brief` section does not carry {needle:?}:\n{brief}"
+            "Mesh-Commands.md's `.mesh envoy brief` section does not carry {needle:?}:\n{brief}"
         );
     }
     assert!(
         brief.contains(&format!("`{off_bare}`")),
-        "Mesh-Commands.md's `.mesh brief` section does not quote the off-mode bare-brief sentence:\n{brief}"
+        "Mesh-Commands.md's `.mesh envoy brief` section does not quote the off-mode bare-brief sentence:\n{brief}"
     );
     assert!(
         brief.contains(&format!("`{not_yet}`")),
-        "Mesh-Commands.md's `.mesh brief` section does not quote the not-yet bare-brief sentence:\n{brief}"
+        "Mesh-Commands.md's `.mesh envoy brief` section does not quote the not-yet bare-brief sentence:\n{brief}"
     );
     assert!(
         brief.contains(&format!("`` `{note_held}` ``")),
-        "Mesh-Commands.md's `.mesh brief` section does not quote the note confirmation under off:\n{brief}"
+        "Mesh-Commands.md's `.mesh envoy brief` section does not quote the note confirmation under off:\n{brief}"
     );
     let status = flat(&section("Mesh-Commands.md", &page, "### `.mesh status`"));
     assert!(
@@ -6659,20 +6750,24 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         off_row.trim_start(),
         section("Mesh-Commands.md", &page, "### `.mesh on`")
     );
-    let message = flat(&section("Mesh-Commands.md", &page, "### `.mesh message`"));
+    let message = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh messaging send`",
+    ));
     for needle in ["fire-and-forget", "lands in your inbox", "`mesh__ask`"] {
         assert!(
             message.contains(needle),
-            "Mesh-Commands.md's `.mesh message` section does not carry {needle:?}:\n{message}"
+            "Mesh-Commands.md's `.mesh messaging send` section does not carry {needle:?}:\n{message}"
         );
     }
 }
 
-/// Every user-facing string the `.mesh inbox` renderer, its header, row and
-/// disposition helpers, and the `.mesh pending` / `.mesh answer` block renderer with
+/// Every user-facing string the `.mesh messaging inbox` renderer, its header, row and
+/// disposition helpers, and the pending-lists / `.mesh envoy answer` block renderer with
 /// its header, footer, prompt and nothing-sent line build is ASCII: the segments are
 /// joined by a dot with spaces around it, the staged path is pointed at with `->`, and
-/// no glyph the wiki could not quote as prose reaches the terminal. The `.mesh inbox`
+/// no glyph the wiki could not quote as prose reaches the terminal. The `.mesh messaging inbox`
 /// arm hands the renderer the terminal width and the colour switch; under `cargo test`
 /// stdout is never a terminal, so that plumbing is pinned by source. Checked on every run.
 #[test]
@@ -6716,12 +6811,12 @@ fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
     );
 }
 
-/// The Commands page's `.mesh inbox` sample shows the block shape the renderer prints: a
+/// The Commands page's `.mesh messaging inbox` sample shows the block shape the renderer prints: a
 /// dot-separated header naming the sender, route and thread, an indented `file:` line
 /// pointing at a home-relative staged path, a block this node sent and the
 /// `answered, awaiting collect` tail; the prose names every header segment and the
 /// `from_self` key `mesh__check_inbox` adds, and says a `this node ->` block is either
-/// the envoy's reply or one typed with `.mesh answer`. The sibling pages that walk a
+/// the envoy's reply or one typed with `.mesh envoy answer`. The sibling pages that walk a
 /// first exchange quote the same shape, and no Mesh page still quotes the retired
 /// one-line shape or an `envoy ->` header. The code side, the labels `render_inbox`
 /// hands `indented_rows` and the route and disposition words, is checked on every run.
@@ -6779,12 +6874,12 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let inbox = section("Mesh-Commands.md", &page, "### `.mesh inbox`");
+    let inbox = section("Mesh-Commands.md", &page, "### `.mesh messaging inbox`");
     let sample = inbox
         .split("```text\n")
         .nth(1)
         .and_then(|block| block.split("\n```").next())
-        .expect("the `.mesh inbox` section opens with a text sample");
+        .expect("the `.mesh messaging inbox` section opens with a text sample");
     for needle in [
         " . from ",
         " . direct . ",
@@ -6794,7 +6889,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     ] {
         assert!(
             sample.contains(needle),
-            "the `.mesh inbox` sample lacks {needle:?}:\n{sample}"
+            "the `.mesh messaging inbox` sample lacks {needle:?}:\n{sample}"
         );
     }
     let lines: Vec<&str> = sample.lines().collect();
@@ -6802,13 +6897,13 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         lines
             .iter()
             .any(|line| line.starts_with("  file: ") && line.contains(" -> ~/")),
-        "the `.mesh inbox` sample has no indented `file:` line pointing at a `~/` staged path:\n{sample}"
+        "the `.mesh messaging inbox` sample has no indented `file:` line pointing at a `~/` staged path:\n{sample}"
     );
     assert!(
         lines
             .iter()
             .any(|line| line.starts_with("this node -> ") && line.contains(" . answering ")),
-        "the `.mesh inbox` sample has no block this node sent:\n{sample}"
+        "the `.mesh messaging inbox` sample has no block this node sent:\n{sample}"
     );
     let own_block: Vec<&str> = lines
         .iter()
@@ -6830,7 +6925,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     let blank = lines.iter().filter(|line| line.is_empty()).count();
     assert!(
         headers >= 3 && blank == headers - 1,
-        "the `.mesh inbox` sample does not show one blank line between its blocks ({headers} headers, {blank} blank lines):\n{sample}"
+        "the `.mesh messaging inbox` sample does not show one blank line between its blocks ({headers} headers, {blank} blank lines):\n{sample}"
     );
     assert!(
         lines
@@ -6848,7 +6943,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         "`from_self: true`",
         "marked when this node files them",
         "`this node -> <peer> (<dest8>)`",
-        "you typed the answer with `.mesh answer`",
+        "you typed the answer with `.mesh envoy answer`",
         "`from unknown ()`",
         "continuation rows hanging under the label",
         "`disposition: <word> (<what it means>)`",
@@ -6859,13 +6954,13 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     ] {
         assert!(
             prose.contains(needle),
-            "the `.mesh inbox` prose does not name {needle}:\n{prose}"
+            "the `.mesh messaging inbox` prose does not name {needle}:\n{prose}"
         );
     }
     for word in routes.iter().chain(&dispositions) {
         assert!(
             prose.contains(&format!("`{word}`")),
-            "the `.mesh inbox` prose does not spell the word `{word}`:\n{prose}"
+            "the `.mesh messaging inbox` prose does not spell the word `{word}`:\n{prose}"
         );
     }
 
@@ -6908,7 +7003,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     }
 }
 
-/// The Commands page's `.mesh pending` sample shows the three sections `render_pending`
+/// The Commands page's pending-lists sample shows the three sections `render_pending`
 /// prints in its order, each header carrying its count and the commands it names once,
 /// then numbered entries ending in `id <id8>` (a peer's with `expires in <span>`, this
 /// node's own led by `->`), the quoted question and `envoy asks:` indented under them;
@@ -6926,8 +7021,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let back = string_literals(&fn_body("src/mesh/node.rs", "return_line"));
     for needle in [
         "from {}",
-        " is back; your question {from} is still open; .mesh pending lists it",
-        " is back; your {n} questions, the oldest {from}, are still open; .mesh pending lists them",
+        " is back; your question {from} is still open; .mesh messaging sent lists it",
+        " is back; your {n} questions, the oldest {from}, are still open; .mesh messaging sent lists them",
     ] {
         assert!(
             back.iter().any(|literal| literal == needle),
@@ -6959,8 +7054,12 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     assert_eq!(
         string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")).first(),
-        Some(&"answer: .mesh answer {id} \"<text>\"".to_string()),
+        Some(&"answer: .mesh {group} {verb} {{id}} \"<text>\"".to_string()),
         "answer_footer's literal moved"
+    );
+    assert!(
+        fn_body("src/repl/mesh.rs", "answer_footer").contains("route.command()"),
+        "answer_footer no longer names the command its route dispatches to"
     );
     let header_source = fn_body("src/repl/mesh.rs", "question_header");
     let header = string_literals(&header_source);
@@ -7003,14 +7102,16 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         pending_literals,
         [
             "Waiting for YOU",
-            "answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
+            "answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
             "Access requests",
-            "grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>",
+            "grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
             "Asked by this node",
-            "collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
+            "collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
             "{title} ({})",
+            "every list has a section",
             "{title}: none",
-            "{counted:<column$}{commands}",
+            "{:<column$}{commands}",
+            "{title} ({})",
             "\n",
         ],
         "render_pending's titles, commands and header shapes moved"
@@ -7046,7 +7147,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     assert_eq!(
         nothing_sent,
         [
-            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\".",
+            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh {group} {verb} {{id}} \"<text>\".",
             "id",
         ]
     );
@@ -7056,7 +7157,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .expect("prompt_answer_text_with refuses a non-terminal with one literal");
     assert_eq!(
         refusal,
-        "`.mesh answer {id}` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer {id} \"<text>\"`."
+        "`.mesh {group} {verb} {id}` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh {group} {verb} {id} \"<text>\"`."
     );
     let answer = fn_body("src/repl/mesh.rs", "answer");
     assert!(
@@ -7101,12 +7202,16 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let pending = section("Mesh-Commands.md", &page, "### `.mesh pending`");
+    let pending = section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy questions`, `.mesh files requests` and `.mesh messaging sent`",
+    );
     let sample = pending
         .split("```text\n")
         .nth(1)
         .and_then(|block| block.split("\n```").next())
-        .expect("the `.mesh pending` section opens with a text sample");
+        .expect("the pending-lists section opens with a text sample");
     let lines: Vec<&str> = sample.lines().collect();
     let headers: Vec<&str> = lines
         .iter()
@@ -7116,13 +7221,13 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     assert_eq!(
         headers.len(),
         sections.len(),
-        "the `.mesh pending` sample shows one header per section:\n{sample}"
+        "the pending-lists sample shows one header per section:\n{sample}"
     );
     let mut counts = Vec::new();
     for (header, (title, commands)) in headers.iter().zip(&sections) {
         let rest = header.strip_prefix(title).unwrap_or_else(|| {
             panic!(
-                "the `.mesh pending` sample shows the sections in order, {title:?} here: {header:?}"
+                "the pending-lists sample shows the sections in order, {title:?} here: {header:?}"
             )
         });
         let (count, after) = rest
@@ -7157,7 +7262,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             .and_then(|rest| rest.split_once(". "))
             .filter(|(number, _)| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
             .unwrap_or_else(|| {
-                panic!("a `.mesh pending` sample line is neither a header, a numbered entry nor indented under one: {line:?}")
+                panic!("a pending-lists sample line is neither a header, a numbered entry nor indented under one: {line:?}")
             });
         entries[section_index] += 1;
         let id8 = head.rsplit(" . id ").next().unwrap();
@@ -7190,23 +7295,23 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     }
     assert!(
         entries.iter().all(|&count| count >= 1),
-        "the `.mesh pending` sample has an entry in every section:\n{sample}"
+        "the pending-lists sample has an entry in every section:\n{sample}"
     );
     assert_eq!(
         entries, counts,
-        "each `.mesh pending` sample header counts the entries under it:\n{sample}"
+        "each pending-lists sample header counts the entries under it:\n{sample}"
     );
     assert!(
         lines
             .iter()
             .any(|line| line.starts_with("     envoy asks: ")),
-        "the `.mesh pending` sample has no `envoy asks:` row of its own:\n{sample}"
+        "the pending-lists sample has no `envoy asks:` row of its own:\n{sample}"
     );
     assert!(
         lines
             .iter()
             .any(|line| line.starts_with("     \"") && line.ends_with('"')),
-        "the `.mesh pending` sample quotes no question:\n{sample}"
+        "the pending-lists sample quotes no question:\n{sample}"
     );
 
     let prose = flat(&pending);
@@ -7219,9 +7324,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "`<name> (<dest8>) asked <age> . expires in <span> . id <id8>`".to_string(),
         "`-> <name> (<dest8>) <age> . <state> . id <id8>`".to_string(),
         "`. peer left <age>`".to_string(),
-        "`[mesh:reply] <name> is back; your question from <age> is still open; .mesh pending lists it`"
+        "`[mesh:reply] <name> is back; your question from <age> is still open; .mesh messaging sent lists it`"
             .to_string(),
-        "`your <n> questions, the oldest from <age>, are still open; .mesh pending lists them`"
+        "`your <n> questions, the oldest from <age>, are still open; .mesh messaging sent lists them`"
             .to_string(),
         "`envoy asks: <what the envoy wanted decided>`".to_string(),
         "any 8 or more of an id's first characters".to_string(),
@@ -7234,28 +7339,32 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     for needle in &needles {
         assert!(
             prose.contains(needle.as_str()),
-            "the `.mesh pending` prose does not name {needle}:\n{prose}"
+            "the pending-lists prose does not name {needle}:\n{prose}"
         );
     }
 
-    let answer_prose = flat(&section("Mesh-Commands.md", &page, "### `.mesh answer`"));
+    let answer_prose = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy answer` and `.mesh messaging follow-up`",
+    ));
     for needle in [
-        "`.mesh answer <id>` first prints the question's block".to_string(),
+        "`.mesh envoy answer <id>` first prints the question's block".to_string(),
         "any 8 or more of its first characters, as long as they begin only one pending id"
             .to_string(),
         "'<prefix>' matches <N> pending ids: <id>..., <id>...; give one of these (or enough of its characters to tell it apart)."
             .to_string(),
-        "'<id>' is a whole pending id and also how <id>... begins, so it cannot pick one. Act on <id>... first, typed as `.mesh pending` lists it, then '<id>' picks the one left; or clear both with `.mesh dismiss --all`."
+        "'<id>' is a whole pending id and also how <id>... begins, so it cannot pick one. Act on <id>... first, typed as `.mesh envoy questions`, `.mesh messaging sent` or `.mesh files requests` lists it, then '<id>' picks the one left; or clear both with `.mesh envoy dismiss --all`."
             .to_string(),
-        "'<ID>' and '<id>' differ only in case, so neither can be picked; clear both with `.mesh dismiss --all`."
+        "'<ID>' and '<id>' differ only in case, so neither can be picked; clear both with `.mesh envoy dismiss --all`."
             .to_string(),
-        "<id> leaves `.mesh pending` when it expires".to_string(),
+        "<id> leaves `.mesh files requests` when it expires".to_string(),
         format!("the prompt `{prompt}`"),
         format!(
             "prints `{}`, and the question stays open",
-            nothing_sent[0].replace("{id}", "<id>")
+            nothing_sent[0].replace("{group} {verb} {{id}}", "envoy answer <id>")
         ),
-        refusal.replace("{id}", "<id>"),
+        refusal.replace("{group} {verb} {id}", "envoy answer <id>"),
         "An unknown id is refused before any block is printed".to_string(),
         "A refused attachment is reported before the block and before any prompt".to_string(),
         "`<id8> . <name> (<dest8>) . <age> . \"<question>\"`".to_string(),
@@ -7263,7 +7372,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     ] {
         assert!(
             answer_prose.contains(&needle),
-            "the `.mesh answer` prose does not carry {needle:?}:\n{answer_prose}"
+            "the `.mesh envoy answer` prose does not carry {needle:?}:\n{answer_prose}"
         );
     }
     assert!(
@@ -7276,25 +7385,25 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         &read(wiki.join("Mesh.md")),
         "## The envoy",
     ));
-    let needle = "Escalations reach you only through the REPL, as that idle line, `.mesh pending` and `.mesh answer`; a headless or ACP session has no way to see or answer them.";
+    let needle = "Escalations reach you only through the REPL, as that idle line, `.mesh envoy questions` and `.mesh envoy answer`; a headless or ACP session has no way to see or answer them.";
     assert!(
         envoy.contains(needle),
         "Mesh.md's envoy section does not say escalations need the REPL:\n{envoy}"
     );
 
     let retired = [
-        "answer one with `.mesh answer",
+        "answer one with `.mesh envoy answer",
         "received <time>",
         "timeout <time>",
         "<id> <dest8> open sent",
-        "; grant: .mesh grant <id>",
+        "; grant: .mesh files grant <id>",
     ];
     for path in mesh_pages(&wiki) {
         let text = flat(&read(&path));
         for needle in retired {
             assert!(
                 !text.contains(needle),
-                "{} still quotes the retired `.mesh pending` line shape {needle:?}",
+                "{} still quotes the retired pending-lists line shape {needle:?}",
                 path.display()
             );
         }
@@ -7302,8 +7411,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
 }
 
 /// What a sender is told when a propagation node holds a message or request for a peer
-/// that had gone reads on the wiki in the words the source prints: `.mesh message`,
-/// `.mesh request`, and the `departed` object of the `mesh__*` tools.
+/// that had gone reads on the wiki in the words the source prints: `.mesh messaging send`,
+/// `.mesh files request`, and the `departed` object of the `mesh__*` tools.
 #[test]
 fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
     let source = read(repo_root().join("src/mesh/message.rs"));
@@ -7327,7 +7436,7 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
     let no_route = " has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard {})";
     assert_eq!(status, [" left {}", no_route], "Departure::status moved");
     let see_back = const_str("src/repl/mesh.rs", "SEE_WHEN_IT_IS_BACK");
-    assert_eq!(see_back, ".mesh peers shows when it announces again.");
+    assert_eq!(see_back, ".mesh people list shows when it announces again.");
     let own_reply = fn_body("src/repl/mesh.rs", "own_reply_sent_line");
     assert!(
         own_reply.contains("held_reply_sentence(short(destination), departed, now)"),
@@ -7340,7 +7449,7 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
         format!("`Sent <id8> to <dest8>: <name> left 2h ago{held}<name>{end}. {see_back}`"),
         format!("`<name>{}`", no_route.replace("{}", "<age>")),
         format!(
-            "`request <id8> to <dest8>: pending; <dest8> left 2h ago{held}<dest8>{end} (the decision arrives as an idle line; .mesh inbox lists it)`"
+            "`request <id8> to <dest8>: pending; <dest8> left 2h ago{held}<dest8>{end} (the decision arrives as an idle line; .mesh messaging inbox lists it)`"
         ),
         format!(
             "`Sent <id8> to <dest8> as a reply to <id8> (via store-and-forward). <dest8> left 2h ago{held_reply}. {see_back}`"
@@ -7370,7 +7479,7 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
 /// A held reply is left on the propagation node for the session whose question or thread
 /// it answers: the Mesh page says so, with the question tried before the thread and the
 /// thread's collision risk; the Configuration page says what it means for a session that
-/// never syncs on its own; and the Commands page's `.mesh sync` section quotes the two
+/// never syncs on its own; and the Commands page's `.mesh messaging sync` section quotes the two
 /// lines that count such replies as the code builds them.
 #[test]
 fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
@@ -7437,13 +7546,13 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
     }
 }
 
-/// The Commands page's `.mesh dismiss` section quotes what the verb prints as the code
+/// The Commands page's `.mesh envoy dismiss` section quotes what the verb prints as the code
 /// formats it: the two `Dismissed` lines, the three refusals (an unknown id, an access
 /// id, a question this node asked), the hold refusal, the send-failure sentence, the
 /// `--all` list row, confirmation questions, dry-run line, summaries and the empty-list
-/// line, with the completion row shape. Its `.mesh pending` section says how long a
+/// line, with the completion row shape. Its pending-lists section says how long a
 /// peer's row lives and quotes the two expiry idle lines; the Mesh page's envoy section
-/// says the same in one sentence. Its `.mesh inbox` section names `.mesh dismiss` as a
+/// says the same in one sentence. Its `.mesh messaging inbox` section names `.mesh envoy dismiss` as a
 /// source of this node's own replies and quotes the two disposition clauses those
 /// carry. The code side (the literals, and `PENDING_TTL` being the seven days the pages
 /// name) is checked on every run.
@@ -7467,9 +7576,8 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     );
     let one = string_literals(&line_source);
     let silent_line =
-        "Dismissed {id} without telling {name}. .mesh pending shows what is still open.";
-    let told_line =
-        "Dismissed {id}; {name} hears that {declined}. .mesh pending shows what is still open.";
+        "Dismissed {id} without telling {name}. .mesh envoy questions shows what is still open.";
+    let told_line = "Dismissed {id}; {name} hears that {declined}. .mesh envoy questions shows what is still open.";
     for needle in [silent_line, told_line] {
         assert!(
             one.iter().any(|literal| literal == needle),
@@ -7517,7 +7625,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         "dismiss_all no longer prints DRY_RUN_NOTHING_CHANGED:\n{all_source}"
     );
     let none_open =
-        "No open questions to dismiss; `.mesh pending` lists what this node knows about.";
+        "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about.";
     let confirm_silent = "Dismiss {open_questions} without telling the askers?";
     let confirm_told = "Dismiss {open_questions}? Each asker hears that {HUMAN_DECLINED}.";
     let telling_all = "Telling {} that you declined over the mesh...";
@@ -7540,13 +7648,14 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         "dismiss_all_summary",
         &summary_source,
         &[
-            r#""Dismissed {dismissed}; .mesh pending shows what is still open""#,
+            r#""Dismissed {dismissed}; .mesh envoy questions shows what is still open""#,
             r#""; {} still being answered by the envoy: ""#,
             ".then(ids(held))",
-            r#"". Dismiss each with .mesh dismiss <id> once its hold lapses""#,
-            r#"("stay pending", "Retry with .mesh dismiss --all --silent")"#,
+            r#"". Dismiss each with .mesh envoy dismiss <id> once its hold lapses""#,
+            r#""stay pending","#,
+            r#""Retry with .mesh envoy dismiss --all --silent","#,
             r#""could not be told and stay pending","#,
-            r#""Retry, or .mesh dismiss --all --silent","#,
+            r#""Retry, or .mesh envoy dismiss --all --silent","#,
             r#"format!("; {} {head}: ", stayed.len())"#,
             ".then(ids(stayed))",
             r#"format!(". {tail}")"#,
@@ -7554,11 +7663,11 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         ],
     );
     let summary_literals = string_literals(&summary_source);
-    let summary_base = "Dismissed {dismissed}; .mesh pending shows what is still open";
+    let summary_base = "Dismissed {dismissed}; .mesh envoy questions shows what is still open";
     let stayed =
-        "; {} could not be told and stay pending: {}. Retry, or .mesh dismiss --all --silent";
-    let stayed_silent = "; {} stay pending: {}. Retry with .mesh dismiss --all --silent";
-    let held_tail = "; {} still being answered by the envoy: {}. Dismiss each with .mesh dismiss <id> once its hold lapses";
+        "; {} could not be told and stay pending: {}. Retry, or .mesh envoy dismiss --all --silent";
+    let stayed_silent = "; {} stay pending: {}. Retry with .mesh envoy dismiss --all --silent";
+    let held_tail = "; {} still being answered by the envoy: {}. Dismiss each with .mesh envoy dismiss <id> once its hold lapses";
     assert!(
         summary_literals
             .iter()
@@ -7580,7 +7689,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         .expect("asked_by_this_node words this node's own question with one literal");
     assert_eq!(
         own,
-        " is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+        " is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
     );
     assert_in_source_order(
         "asked_by_this_node",
@@ -7594,7 +7703,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         unknown_runs,
         [
             "No open question has id ",
-            ". `.mesh pending` lists the ones this node knows about."
+            ". `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
         ]
     );
     assert_in_source_order(
@@ -7603,7 +7712,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         &[
             r#""No open question has id ""#,
             ".peer(id)",
-            r#"". `.mesh pending"#,
+            r#"". `.mesh envoy questions"#,
         ],
     );
     let unknown = [unknown_runs.join("{id}")];
@@ -7612,7 +7721,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     assert_eq!(
         access,
         [
-            "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`",
+            "`{id}` is an access request, not a question; decide it with `.mesh files grant {id}` or `.mesh files refuse {id}`",
             "id"
         ]
     );
@@ -7630,7 +7739,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     assert_eq!(
         held,
         [
-            "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}.",
+            "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss {id}.",
             "id"
         ]
     );
@@ -7672,14 +7781,14 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         .replace("{short}", "{}");
     assert_eq!(
         could_not,
-        "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
+        "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {id} --silent."
     );
     let race_source = fn_body("src/mesh/node.rs", "already_closed");
     let race = string_literals(&race_source);
     assert_eq!(
         race,
         [
-            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+            "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open.",
             "id"
         ]
     );
@@ -7785,12 +7894,15 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
             "mesh_completion_escalated_questions"
         )
         .contains("describe_question("),
-        "`.mesh dismiss <TAB>` rows no longer come from describe_question"
+        "`.mesh envoy dismiss <TAB>` rows no longer come from describe_question"
     );
     assert!(
-        method_body("src/config/request_context.rs", "mesh_completion_questions")
-            .contains("describe_question("),
-        "`.mesh answer <TAB>` rows no longer come from describe_question"
+        method_body(
+            "src/config/request_context.rs",
+            "mesh_completion_asked_questions"
+        )
+        .contains("describe_question("),
+        "`.mesh messaging follow-up <TAB>` rows no longer come from describe_question"
     );
     let clauses = fn_body("src/repl/mesh.rs", "disposition_clause");
     let own_clause = |disposition: &str| -> String {
@@ -7820,7 +7932,11 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
             .replace("{dismissed}", "<N>")
             .replace("{HUMAN_DECLINED}", &declined)
     };
-    let dismiss = flat(&section("Mesh-Commands.md", &page, "### `.mesh dismiss`"));
+    let dismiss = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy dismiss`",
+    ));
     let summary = |tail: &str| {
         format!(
             "{}{}.",
@@ -7849,7 +7965,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
                 .replace("{err:#}", "<error>"),
         ),
         placeholders(&race[0]),
-        "whether it closed before `.mesh dismiss` looked it up or while the verb was running".to_string(),
+        "whether it closed before `.mesh envoy dismiss` looked it up or while the verb was running".to_string(),
         placeholders(none_open),
         placeholders(confirm_told),
         placeholders(confirm_silent),
@@ -7875,12 +7991,18 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     ] {
         assert!(
             dismiss.contains(&needle),
-            "the `.mesh dismiss` prose does not carry {needle:?}:\n{dismiss}"
+            "the `.mesh envoy dismiss` prose does not carry {needle:?}:\n{dismiss}"
         );
     }
     for (heading, verb) in [
-        ("### `.mesh answer`", ".mesh answer"),
-        ("### `.mesh grant` and `.mesh refuse`", ".mesh grant"),
+        (
+            "### `.mesh envoy answer` and `.mesh messaging follow-up`",
+            ".mesh envoy answer",
+        ),
+        (
+            "### `.mesh files grant` and `.mesh files refuse`",
+            ".mesh files grant",
+        ),
     ] {
         let prose = flat(&section("Mesh-Commands.md", &page, heading));
         assert!(
@@ -7896,23 +8018,27 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     let grant = flat(&section(
         "Mesh-Commands.md",
         &page,
-        "### `.mesh grant` and `.mesh refuse`",
+        "### `.mesh files grant` and `.mesh files refuse`",
     ));
     for needle in [
-        "whole or as any 8 or more of its first characters, as `.mesh answer` takes it",
-        "An id of a question this node asked is refused with the line `.mesh dismiss` gives it.",
+        "whole or as any 8 or more of its first characters, as `.mesh envoy answer` takes it",
+        "An id of a question this node asked is refused with the line `.mesh envoy dismiss` gives it.",
     ] {
         assert!(
             grant.contains(needle),
-            "the `.mesh grant` and `.mesh refuse` prose does not carry {needle:?}:\n{grant}"
+            "the `.mesh files grant` and `.mesh files refuse` prose does not carry {needle:?}:\n{grant}"
         );
     }
-    let answer = flat(&section("Mesh-Commands.md", &page, "### `.mesh answer`"));
+    let answer = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy answer` and `.mesh messaging follow-up`",
+    ));
     assert!(
         answer.contains(
-            "whether it closed before `.mesh answer` looked it up or while the verb was running"
+            "whether it closed before `.mesh envoy answer` looked it up or while the verb was running"
         ),
-        "the `.mesh answer` prose does not say when the other process may have closed the question:\n{answer}"
+        "the `.mesh envoy answer` prose does not say when the other process may have closed the question:\n{answer}"
     );
     let lookup_hits: Vec<String> = page
         .lines()
@@ -7925,7 +8051,11 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         "Mesh-Commands.md still describes the race in the code's words:\n{}",
         lookup_hits.join("\n")
     );
-    let pending = flat(&section("Mesh-Commands.md", &page, "### `.mesh pending`"));
+    let pending = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy questions`, `.mesh files requests` and `.mesh messaging sent`",
+    ));
     for needle in [
         "expire 7 days after they arrive".to_string(),
         "`expires in <span>`".to_string(),
@@ -7933,22 +8063,26 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         format!("(a store already holding its {cap}-row cap lets the oldest rows go unannounced)"),
         format!("`[mesh:message] {}`", placeholders(&expired_question)),
         format!("`[mesh:message] {}`", placeholders(&expired_access)),
-        "`.mesh dismiss <id>` closes one earlier".to_string(),
+        "`.mesh envoy dismiss <id>` closes one earlier".to_string(),
     ] {
         assert!(
             pending.contains(&needle),
-            "the `.mesh pending` prose does not carry {needle:?}:\n{pending}"
+            "the pending-lists prose does not carry {needle:?}:\n{pending}"
         );
     }
-    let inbox = flat(&section("Mesh-Commands.md", &page, "### `.mesh inbox`"));
+    let inbox = flat(&section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh messaging inbox`",
+    ));
     for needle in [
-        "`.mesh dismiss`".to_string(),
+        "`.mesh envoy dismiss`".to_string(),
         format!("`disposition: answered ({own_answered})`"),
         format!("`disposition: refused ({own_refused})`"),
     ] {
         assert!(
             inbox.contains(&needle),
-            "the `.mesh inbox` prose does not carry {needle:?}:\n{inbox}"
+            "the `.mesh messaging inbox` prose does not carry {needle:?}:\n{inbox}"
         );
     }
     let envoy = flat(&section(
@@ -7956,17 +8090,17 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         &read(wiki.join("Mesh.md")),
         "## The envoy",
     ));
-    let needle = "An escalated question you never answer expires after 7 days; the node then prints one `[mesh:message]` line saying it expired unanswered, and the peer is told nothing. `.mesh dismiss <id>` closes one earlier and tells the peer you declined.";
+    let needle = "An escalated question you never answer expires after 7 days; the node then prints one `[mesh:message]` line saying it expired unanswered, and the peer is told nothing. `.mesh envoy dismiss <id>` closes one earlier and tells the peer you declined.";
     assert!(
         envoy.contains(needle),
         "Mesh.md's envoy section does not say how an unanswered escalation ends:\n{envoy}"
     );
 }
 
-/// What a `.mesh pending` header shows for a peer this node has never heard: the name slot
+/// What a pending-lists header shows for a peer this node has never heard: the name slot
 /// is filled by `peer_name_at`, which falls back to the short destination, so the header
 /// reads `<dest8> (<dest8>)` (as the pty and REPL probes pin) and never `unknown`. The
-/// Commands page's `.mesh pending` prose must describe that fallback, not a word the
+/// Commands page's pending-lists prose must describe that fallback, not a word the
 /// renderer cannot print for an unheard peer.
 #[test]
 fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() {
@@ -7980,7 +8114,11 @@ fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() 
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let pending = section("Mesh-Commands.md", &page, "### `.mesh pending`");
+    let pending = section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy questions`, `.mesh files requests` and `.mesh messaging sent`",
+    );
     let prose = flat(&pending);
     for claim in [
         "`unknown` when this node has never heard",
@@ -7989,18 +8127,18 @@ fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() 
     ] {
         assert!(
             !prose.contains(claim),
-            "the `.mesh pending` prose promises `unknown` for an unheard peer, but the header \
+            "the pending-lists prose promises `unknown` for an unheard peer, but the header \
              shows the short destination twice: {claim:?}\n{prose}"
         );
     }
     assert!(
         prose.contains("short destination") || prose.contains("`<dest8> (<dest8>)`"),
-        "the `.mesh pending` prose does not say an unheard peer is shown by its short \
+        "the pending-lists prose does not say an unheard peer is shown by its short \
          destination:\n{prose}"
     );
 }
 
-/// `.mesh pending` lists the questions the other sessions on the config dir asked, each
+/// `.mesh messaging sent` lists the questions the other sessions on the config dir asked, each
 /// with a line naming the session that asked it and saying to collect it there. The
 /// renderer's words for the three cases and the Commands page's must agree; the
 /// composed lines are pinned by the REPL test of the same rows.
@@ -8019,7 +8157,7 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     }
     assert!(
         fn_body("src/repl/mesh.rs", "asked_by").contains("own_session_name(session)"),
-        "asked_by no longer names a running session as `.mesh peers` does"
+        "asked_by no longer names a running session as `.mesh people list` does"
     );
     let other = string_literals(&method_body("src/repl/mesh.rs", "other_session"));
     assert!(
@@ -8031,7 +8169,11 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
-    let pending = section("Mesh-Commands.md", &page, "### `.mesh pending`");
+    let pending = section(
+        "Mesh-Commands.md",
+        &page,
+        "### `.mesh envoy questions`, `.mesh files requests` and `.mesh messaging sent`",
+    );
     let prose = flat(&pending);
     for needle in [
         "asked by (you: temp) . collect it from that session",
@@ -8043,7 +8185,7 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     ] {
         assert!(
             prose.contains(needle),
-            "the `.mesh pending` section does not show {needle:?}:\n{prose}"
+            "the pending-lists section does not show {needle:?}:\n{prose}"
         );
     }
 }
@@ -8187,13 +8329,18 @@ fn the_mesh_page_describes_the_per_session_sent_threads_list() {
     );
 }
 
-/// The value of the one `const NAME: &str = "...";` line in `path`.
+/// The value of the one `const NAME: &str = "...";` declaration in `path`, which rustfmt
+/// may wrap onto the next line.
 fn const_str(path: &str, name: &str) -> String {
     let source = read(repo_root().join(path));
-    let line = source
-        .lines()
-        .find(|line| line.contains(&format!("const {name}: &str = ")))
+    let head = format!("const {name}: &str =");
+    let start = source
+        .find(&head)
         .unwrap_or_else(|| panic!("{path} does not define const {name}"));
+    let end = source[start..]
+        .find("\";")
+        .unwrap_or_else(|| panic!("{path} const {name} does not end with `\";`"));
+    let line = &source[start..=start + end];
     string_literals(line)
         .pop()
         .unwrap_or_else(|| panic!("{path} const {name} is not a string literal: {line:?}"))
@@ -8323,6 +8470,7 @@ fn trust_verb_fragments() -> Vec<String> {
         "block_identity",
         "unblock",
         "unblocked_standing",
+        "classify_untrust",
         "classify_forget",
         "confirmed_identity_arg",
     ]
@@ -8357,7 +8505,7 @@ fn trust_verb_fragments() -> Vec<String> {
 /// Whether a code span on the trust pages quotes something a verb prints: not a command,
 /// a flag, a lone word or placeholder, a TAB completion label, the one elided `run: ...`,
 /// the `all destinations` scope label, which a verb prints only as part of a row, or the
-/// two-word trust labels `.mesh peers` lists a blocked row under.
+/// two-word trust labels `.mesh people list` lists a blocked row under.
 fn quotes_verb_output(span: &str) -> bool {
     const NOT_OUTPUT: [&str; 6] = [
         "<label> . <short hash> . trusted <since>",
@@ -8377,8 +8525,8 @@ fn quotes_verb_output(span: &str) -> bool {
     span.contains(' ') && !span.starts_with("--") && !command && !NOT_OUTPUT.contains(&span)
 }
 
-/// Every sentence the Commands page quotes under `.mesh untrust`, `.mesh forget` and
-/// `.mesh block`/`.mesh unblock`, and under the Trust Model page's verb table, is one the
+/// Every sentence the Commands page quotes under `.mesh access revoke`, `.mesh access forget` and
+/// `.mesh access block`/`.mesh access unblock`, and under the Trust Model page's verb table, is one the
 /// code prints: a literal of the emitting functions with its placeholders filled by the
 /// literals they splice in, `<dest8>`, `<identity>`, `N` and the like standing for the
 /// values. The pool is checked on every run; the pages behind the wiki gate.
@@ -8387,7 +8535,7 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     let pool = trust_verb_fragments();
     for (span, fragment) in [
         (
-            "Destination <dest8> belongs to identity <id8>, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block <destination>. To stop trusting the whole identity, run .mesh untrust --identity <identity>.",
+            "Destination <dest8> belongs to identity <id8>, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block <destination>. To stop trusting the whole identity, run .mesh access revoke --identity <identity>.",
             "Destination <> belongs to identity <>, which this node trusts fully",
         ),
         (
@@ -8421,12 +8569,12 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     let model = read(wiki.join("Mesh-Trust-Model.md"));
     let mut misquoted = Vec::new();
     for (label, page, heading) in [
-        ("Mesh-Commands.md", &commands, "### `.mesh untrust`"),
-        ("Mesh-Commands.md", &commands, "### `.mesh forget`"),
+        ("Mesh-Commands.md", &commands, "### `.mesh access revoke`"),
+        ("Mesh-Commands.md", &commands, "### `.mesh access forget`"),
         (
             "Mesh-Commands.md",
             &commands,
-            "### `.mesh block` and `.mesh unblock`",
+            "### `.mesh access block` and `.mesh access unblock`",
         ),
         (
             "Mesh-Trust-Model.md",
@@ -8460,7 +8608,7 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     );
     let headline = "Destination <dest8> belongs to identity <id8>";
     for (label, page, heading) in [
-        ("Mesh-Commands.md", &commands, "### `.mesh untrust`"),
+        ("Mesh-Commands.md", &commands, "### `.mesh access revoke`"),
         (
             "Mesh-Trust-Model.md",
             &model,
@@ -8476,7 +8624,7 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     }
 }
 
-/// The Commands page's `.mesh forget` section quotes the confirmed headline, the
+/// The Commands page's `.mesh access forget` section quotes the confirmed headline, the
 /// stranger refusal and the remembered-claims row as `forget` prints them, with `<id8>`,
 /// `<identity>` and `N` standing for the values. The literals are pinned on every run;
 /// the page behind the wiki gate.
@@ -8526,17 +8674,17 @@ fn the_mesh_forget_section_quotes_the_headline_the_refusal_and_the_claims_row_as
     let spans = code_spans(&section(
         label,
         &read(wiki.join(label)),
-        "### `.mesh forget`",
+        "### `.mesh access forget`",
     ));
     for text in &expected {
         assert!(
             spans.iter().any(|span| span == text),
-            "{label}'s `.mesh forget` section does not quote {text:?}: {spans:?}"
+            "{label}'s `.mesh access forget` section does not quote {text:?}: {spans:?}"
         );
     }
 }
 
-/// The Commands page's `.mesh forget` opening sentence names the three classes of
+/// The Commands page's `.mesh access forget` opening sentence names the three classes of
 /// remembered claim the verb sweeps - attachment references, grants and access requests -
 /// in the nouns the claims row counts them by, so the prose and the row agree.
 #[test]
@@ -8550,13 +8698,13 @@ fn the_forget_entry_prose_names_every_remembered_claim_class_the_row_counts() {
     let prose = flat(&section(
         label,
         &read(wiki.join(label)),
-        "### `.mesh forget`",
+        "### `.mesh access forget`",
     ));
     let sentence =
         "the attachment references, grants and access requests remembered from its instances";
     assert!(
         prose.contains(sentence),
-        "{label}'s `.mesh forget` entry does not open with {sentence:?}:\n{prose}"
+        "{label}'s `.mesh access forget` entry does not open with {sentence:?}:\n{prose}"
     );
     for counted in ["attachments", "grants", "access requests"] {
         assert!(
@@ -8660,44 +8808,44 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
         at += found + quoted.len();
     }
 
-    let trust = flat(&section(label, &page, "### `.mesh trust`"));
+    let trust = flat(&section(label, &page, "### `.mesh access trust`"));
     let proven = "each with a verifiable name hash and minus a blocked identity's";
     assert!(
         trust.contains(proven),
-        "{label}'s `.mesh trust` TAB sentence does not say {proven:?}"
+        "{label}'s `.mesh access trust` TAB sentence does not say {proven:?}"
     );
     let block = flat(&section(
         label,
         &page,
-        "### `.mesh block` and `.mesh unblock`",
+        "### `.mesh access block` and `.mesh access unblock`",
     ));
     let exclusion = "minus the blocked destinations and a blocked identity's instances";
     assert!(
         block.contains(exclusion),
-        "{label}'s `.mesh block` TAB sentence does not say {exclusion:?}"
+        "{label}'s `.mesh access block` TAB sentence does not say {exclusion:?}"
     );
-    let knock = flat(&section(label, &page, "### `.mesh knock`"));
+    let knock = flat(&section(label, &page, "### `.mesh access ask`"));
     let refused = format!("{exclusion} (the verb refuses both)");
     assert!(
         knock.contains(&refused),
-        "{label}'s `.mesh knock` TAB sentence does not say {refused:?}"
+        "{label}'s `.mesh access ask` TAB sentence does not say {refused:?}"
     );
-    let untrust = flat(&section(label, &page, "### `.mesh untrust`"));
+    let untrust = flat(&section(label, &page, "### `.mesh access revoke`"));
     for refused in [
         "an instance covered by an identity grant alone has no record and is not offered",
         "a record whose identity is trusted for all destinations is left out, since `untrust` refuses it and points at `--identity`",
     ] {
         assert!(
             untrust.contains(refused),
-            "{label}'s `.mesh untrust` TAB sentence does not say {refused:?}"
+            "{label}'s `.mesh access revoke` TAB sentence does not say {refused:?}"
         );
     }
     let allow_peer = "`--peer <TAB>` offers the destination records, then the trusted identities";
     assert!(
         commands.contains(allow_peer),
-        "{label}'s `.mesh allow` TAB sentence does not say {allow_peer:?}"
+        "{label}'s `.mesh files allow` TAB sentence does not say {allow_peer:?}"
     );
-    let fetch_heading = "### `.mesh fetch`";
+    let fetch_heading = "### `.mesh files fetch`";
     let tab_sentence = |page_label: &str, text: &str| {
         let at = text.find("TAB offers:").unwrap_or_else(|| {
             panic!("{page_label}'s `{fetch_heading}` section has no TAB sentence")
@@ -8723,7 +8871,7 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
     let share_peer = "`--peer <TAB>` offers trusted destinations, then trusted identities";
     assert!(
         sharing.contains(share_peer),
-        "{label}'s `.mesh allow` TAB sentence does not say {share_peer:?}"
+        "{label}'s `.mesh files allow` TAB sentence does not say {share_peer:?}"
     );
     let sharing_fetch = tab_sentence(label, &flat(&section(label, &sharing_page, fetch_heading)));
     assert_eq!(
@@ -8772,7 +8920,7 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
 
 /// Both pages quote the four fetch refusals `not_shared_sentence` in src/mesh/fetch.rs
 /// renders, the format arguments standing as placeholders: the three a `not_shared`
-/// answer is read into, in the `.mesh fetch` section with no mention of the retired
+/// answer is read into, in the `.mesh files fetch` section with no mention of the retired
 /// card check, and the no-file-service sentence the `NotServed` refusal prints. Both also
 /// quote the tail the REPL's `fetch` adds when the already-fetched copy has since gone.
 #[test]
@@ -8835,9 +8983,9 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         "the local answer no longer names the mesh__list refresh: {local_tail}"
     );
     for literal in [
-        ".mesh message {peer}",
-        ".mesh info {peer}",
-        ".mesh allow {path}",
+        ".mesh messaging send {peer}",
+        ".mesh people info {peer}",
+        ".mesh files allow {path}",
         "mesh__request_access",
     ] {
         assert!(
@@ -8871,7 +9019,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         ("Mesh-Commands.md", "<path>"),
     ] {
         let page = read(wiki.join(label));
-        let fetch = flat(&section(label, &page, "### `.mesh fetch`"));
+        let fetch = flat(&section(label, &page, "### `.mesh files fetch`"));
         for literal in &literals {
             let expected = literal
                 .replace("{peer}", "<dest8>")
@@ -8885,13 +9033,13 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             );
             assert!(
                 fetch.contains(&expected),
-                "{label}'s `.mesh fetch` section does not quote {expected:?}:\n{fetch}"
+                "{label}'s `.mesh files fetch` section does not quote {expected:?}:\n{fetch}"
             );
         }
         let gone = format!("`{gone_tail}` follows when the staged copy is gone");
         assert!(
             fetch.contains(&gone),
-            "{label}'s `.mesh fetch` section does not say {gone:?}:\n{fetch}"
+            "{label}'s `.mesh files fetch` section does not say {gone:?}:\n{fetch}"
         );
         for needle in [
             local_tail.as_str(),
@@ -8900,7 +9048,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         ] {
             assert!(
                 fetch.contains(needle),
-                "{label}'s `.mesh fetch` section does not say {needle:?}:\n{fetch}"
+                "{label}'s `.mesh files fetch` section does not say {needle:?}:\n{fetch}"
             );
         }
         let memory_checks = if label == "Mesh-File-Sharing.md" {
@@ -8910,7 +9058,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         };
         assert!(
             fetch.contains(memory_checks),
-            "{label}'s `.mesh fetch` section does not introduce the memory checks with {memory_checks:?}:\n{fetch}"
+            "{label}'s `.mesh files fetch` section does not introduce the memory checks with {memory_checks:?}:\n{fetch}"
         );
     }
 }
@@ -9026,13 +9174,14 @@ fn both_tool_tables_name_the_not_shared_reason_words_the_fetch_tool_returns() {
     }
 }
 
-/// Every verb cell of the Trust Model page's `deny, block, untrust, prune` table is a
-/// `.mesh` verb of `VERBS` in the form its usage cell spells, and the four verbs that
-/// write a refusal or a removal each have a row.
+/// Every command cell of the Trust Model page's `deny, block, untrust, prune` table is a
+/// `.mesh` path of `COMMANDS` in the form its usage cell spells, and the four commands
+/// that write a refusal or a removal each have a row.
 #[test]
 fn the_trust_model_state_table_names_every_trust_verb_the_repl_takes() {
     let Some(wiki) = wiki_dir() else { return };
-    let verbs = repl_verbs();
+    let commands = repl_commands();
+    let groups = groups_of(commands.iter().map(|(path, _, _)| path));
     let label = "Mesh-Trust-Model.md";
     let table = section(
         label,
@@ -9052,31 +9201,41 @@ fn the_trust_model_state_table_names_every_trust_verb_the_repl_takes() {
     );
     let mut named = Vec::new();
     for cell in &cells {
-        let (verb, form) = cell
+        let (path, form) = cell
             .strip_prefix(".mesh ")
-            .and_then(|rest| rest.split_once(' '))
+            .and_then(|rest| {
+                let (path, len) = mesh_path_of(rest, &groups)?;
+                Some((path, rest[len..].strip_prefix(' ')?))
+            })
             .unwrap_or_else(|| {
-                panic!("{label}'s verb cell is not `.mesh <verb> <form>`: {cell:?}")
+                panic!("{label}'s command cell is not `.mesh <path> <form>`: {cell:?}")
             });
-        let (_, _, usage) = verbs
+        let (_, _, usage) = commands
             .iter()
-            .find(|(name, _, _)| name == verb)
-            .unwrap_or_else(|| panic!("{label}'s verb table names `{verb}`, which VERBS lacks"));
+            .find(|(known, _, _)| *known == path)
+            .unwrap_or_else(|| {
+                panic!("{label}'s command table names `{path}`, which COMMANDS lacks")
+            });
         assert!(
             usage.contains(form),
-            "{label}'s verb table spells `{cell}`; the VERBS usage for `{verb}` is `{usage}`"
+            "{label}'s command table spells `{cell}`; the COMMANDS usage for `{path}` is `{usage}`"
         );
-        named.push(verb);
+        named.push(path);
     }
-    for verb in ["untrust", "block", "unblock", "forget"] {
+    for path in [
+        "access revoke",
+        "access block",
+        "access unblock",
+        "access forget",
+    ] {
         assert!(
-            named.contains(&verb),
-            "{label}'s verb table has no `.mesh {verb}` row: {cells:?}"
+            named.iter().any(|named| named == path),
+            "{label}'s command table has no `.mesh {path}` row: {cells:?}"
         );
     }
 }
 
-/// The `.mesh trust` section of the Commands page quotes the destination-trust success
+/// The `.mesh access trust` section of the Commands page quotes the destination-trust success
 /// line as `src/repl/mesh.rs` prints it: every static piece of the `format!` literals
 /// appears in the quoted span for a first grant, and the section goes on to quote the
 /// tail a repeat grant prints and the one an identity trusted for all destinations gets.
@@ -9110,13 +9269,15 @@ fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints
 
     let Some(wiki) = wiki_dir() else { return };
     let label = "Mesh-Commands.md";
-    let trust_section = section(label, &read(wiki.join(label)), "### `.mesh trust`");
+    let trust_section = section(label, &read(wiki.join(label)), "### `.mesh access trust`");
     let spans = code_spans(&trust_section);
     let quoted = spans
         .iter()
         .find(|span| span.starts_with("Trusted <dest8> (identity <id8>) - added."))
         .unwrap_or_else(|| {
-            panic!("{label}'s `.mesh trust` section does not quote the success line: {spans:?}")
+            panic!(
+                "{label}'s `.mesh access trust` section does not quote the success line: {spans:?}"
+            )
         });
     for fragment in fragments {
         assert!(
@@ -9131,18 +9292,18 @@ fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints
     ] {
         assert!(
             text.contains(&tail),
-            "{label}'s `.mesh trust` section does not quote the {variant} tail {tail:?}"
+            "{label}'s `.mesh access trust` section does not quote the {variant} tail {tail:?}"
         );
     }
 }
 
-/// The `.mesh knocks` sample on the Commands page carries the line `render_knocks` prints
+/// The `.mesh access requests` sample on the Commands page carries the line `render_knocks` prints
 /// for an identity whose knocks the rate limit dropped, with every static piece of the
 /// `format!` literal, the wait it names and the tail that points at the newest cached
 /// knock; the prose quotes the tail an identity with no cached knock gets. Both pages
 /// state the burst and the refill period as the constants set them and say a count at
 /// the gate's cap reads `N+`, and the Trust Model page's Knocks section says
-/// `.mesh knocks` counts the dropped ones. The literals' shapes are checked on every run.
+/// `.mesh access requests` counts the dropped ones. The literals' shapes are checked on every run.
 #[test]
 fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it() {
     let literals = string_literals(&fn_body("src/repl/mesh.rs", "render_knocks"));
@@ -9182,11 +9343,17 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
 
     let Some(wiki) = wiki_dir() else { return };
     let label = "Mesh-Commands.md";
-    let sample = section(label, &read(wiki.join(label)), "### `.mesh knocks`");
+    let sample = section(
+        label,
+        &read(wiki.join(label)),
+        "### `.mesh access requests`",
+    );
     let quoted = sample
         .lines()
         .find(|line| line.contains("dropped in the last"))
-        .unwrap_or_else(|| panic!("{label}'s `.mesh knocks` sample has no drop line: {sample}"));
+        .unwrap_or_else(|| {
+            panic!("{label}'s `.mesh access requests` sample has no drop line: {sample}")
+        });
     for fragment in fragments {
         assert!(
             quoted.contains(&fragment),
@@ -9201,7 +9368,7 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
     ] {
         assert!(
             prose.contains(&needle),
-            "{label}'s `.mesh knocks` section does not say {needle:?}"
+            "{label}'s `.mesh access requests` section does not say {needle:?}"
         );
     }
 
@@ -9209,7 +9376,7 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
     let knocks = flat(&section(label, &read(wiki.join(label)), "## Knocks"));
     for needle in [
         format!("{burst} knocks land back to back and then one per {refill_minutes} minutes"),
-        "`.mesh knocks` counts the ones that were dropped".to_string(),
+        "`.mesh access requests` counts the ones that were dropped".to_string(),
         capped_count,
     ] {
         assert!(
@@ -9241,7 +9408,7 @@ fn the_trust_model_glossary_names_the_four_standings_in_order() {
 
 /// Every page that quotes what a peer's `NoAccess` prints carries each static piece of
 /// the `RemoteRefusal` Display in `src/mesh/request/error.rs`: the `.mesh status`,
-/// `.mesh message` and `.mesh knock` sections of the Commands page, the Knocks section of
+/// `.mesh messaging send` and `.mesh access ask` sections of the Commands page, the Knocks section of
 /// the Trust Model page and the Platform page's rejoin step. The `.mesh status` quote ends
 /// with the live-only tail `StatusError` appends, every quote shows the peer's name in
 /// quotes and closes on the trust fact, the Mesh page quotes the `next_action` that goes
@@ -9268,7 +9435,9 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         .expect("RemoteRefusal's Display formats ` refused the request: ...`");
     let fragments = format_fragments(literal);
     assert!(
-        fragments.iter().any(|piece| piece.contains(".mesh trust")),
+        fragments
+            .iter()
+            .any(|piece| piece.contains(".mesh access trust")),
         "the refusal no longer names the trust command: {literal:?}"
     );
     assert!(
@@ -9300,9 +9469,13 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     let message = flat(&section(
         "Mesh-Commands.md",
         &commands,
-        "### `.mesh message`",
+        "### `.mesh messaging send`",
     ));
-    let knock = flat(&section("Mesh-Commands.md", &commands, "### `.mesh knock`"));
+    let knock = flat(&section(
+        "Mesh-Commands.md",
+        &commands,
+        "### `.mesh access ask`",
+    ));
     let knocks = flat(&section(
         "Mesh-Trust-Model.md",
         &read(wiki.join("Mesh-Trust-Model.md")),
@@ -9311,8 +9484,11 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     let platform = flat(&read(wiki.join("Mesh-Platform-Support.md")));
     for (label, text) in [
         ("Mesh-Commands.md's `.mesh status` section", &status),
-        ("Mesh-Commands.md's `.mesh message` section", &message),
-        ("Mesh-Commands.md's `.mesh knock` section", &knock),
+        (
+            "Mesh-Commands.md's `.mesh messaging send` section",
+            &message,
+        ),
+        ("Mesh-Commands.md's `.mesh access ask` section", &knock),
         ("Mesh-Trust-Model.md's Knocks section", &knocks),
         ("Mesh-Platform-Support.md", &platform),
     ] {
@@ -9363,7 +9539,7 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         "knock <destination>` asks it to",
         "knock <dest8> asks it to",
         "Refused <dest8>;",
-        ".mesh trust <hash> lifts that",
+        ".mesh access trust <hash> lifts that",
     ];
     for page in mesh_pages(&wiki) {
         let text = read(&page);
@@ -9375,8 +9551,8 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     }
 }
 
-/// A size refusal blames the limit of the node that holds it: `.mesh fetch` is the client,
-/// so its sentence names the peer's limit; `.mesh grant` judges a file against this node's
+/// A size refusal blames the limit of the node that holds it: `.mesh files fetch` is the client,
+/// so its sentence names the peer's limit; `.mesh files grant` judges a file against this node's
 /// own `mesh.fetch.max_bytes`, so its pre-flight names this node's. The File-Sharing page
 /// quotes both sentences in one blockquote, with `<dest8>`, `<limit>`, `<size>` and `<id>`
 /// standing for the values.
@@ -9399,7 +9575,7 @@ fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
         .expect("too_large_refusal builds the refusal naming the peer's limit");
     assert!(
         fetch_literal.starts_with("{peer} "),
-        "the `.mesh fetch` size refusal names the peer first: {fetch_literal:?}"
+        "the `.mesh files fetch` size refusal names the peer first: {fetch_literal:?}"
     );
     let fetch_side = fetch_literal
         .replace("{peer}", "<dest8>")
@@ -9450,7 +9626,10 @@ fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
 
     let Some(wiki) = wiki_dir() else { return };
     let note = flat(&blockquote_prose(&read(wiki.join("Mesh-File-Sharing.md"))));
-    for (side, sentence) in [(".mesh fetch", fetch_side), (".mesh grant", grant_side)] {
+    for (side, sentence) in [
+        (".mesh files fetch", fetch_side),
+        (".mesh files grant", grant_side),
+    ] {
         let quoted = format!("`` {sentence} ``");
         assert!(
             note.contains(&quoted),
@@ -9863,7 +10042,7 @@ fn the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local()
     for needle in [
         "`local` makes Coyote a shared-instance client of the host's own `rnsd`",
         "the shipped `local rnsd at 127.0.0.1:37428` (on Linux and Android the abstract socket, `local rnsd at @rns/default`) is that daemon.",
-        &format!("the `reach` row of `.mesh info` reads `{reach}`"),
+        &format!("the `reach` row of `.mesh config show` reads `{reach}`"),
         &format!("reads `{reach}` (`@rns/default` in place of the address on Linux and Android)."),
         "The daemon keeps its 4242 listener on loopback for a `type: private` session on this host; sessions on this host do not need it.",
         "For other hosts to use this one as their relay, set its `listen_ip` to an address they can reach and firewall the port (see [Mesh Platform Support](Mesh-Platform-Support)).",
