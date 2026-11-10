@@ -236,32 +236,32 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 78]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh people",
-            "See the nodes heard on the mesh and what one of them is doing",
+            "See the people and sessions you have heard from, and what one session is doing",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh access",
-            "Decide which peers this node trusts, blocks or forgets, and answer knocks",
+            "Decide whom you trust, block or forget, and answer requests to be trusted",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh messaging",
-            "Send to peers, read the inbox and follow up on the questions this node asked",
+            "Send to people's sessions, read your inbox and follow up on what you asked",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh envoy",
-            "Shape what your envoy tells peers and handle what it escalates to you",
+            "Shape what your envoy tells other sessions and handle what it escalates to you",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh files",
-            "Share files with peers, decide their access requests and fetch theirs",
+            "Share files, decide requests for them and fetch other sessions' files",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh config",
-            "Show the mesh settings and rotate this node's identity",
+            "Show your mesh settings and rotate your mesh identity",
             AssertState::pass(),
         ),
         ReplCommand::new(

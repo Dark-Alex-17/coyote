@@ -83,27 +83,27 @@ use std::time::{Duration, Instant, SystemTime};
 pub(crate) const GROUPS: &[(&str, &str)] = &[
     (
         "people",
-        "See the nodes heard on the mesh and what one of them is doing",
+        "See the people and sessions you have heard from, and what one session is doing",
     ),
     (
         "access",
-        "Decide which peers this node trusts, blocks or forgets, and answer knocks",
+        "Decide whom you trust, block or forget, and answer requests to be trusted",
     ),
     (
         "messaging",
-        "Send to peers, read the inbox and follow up on the questions this node asked",
+        "Send to people's sessions, read your inbox and follow up on what you asked",
     ),
     (
         "envoy",
-        "Shape what your envoy tells peers and handle what it escalates to you",
+        "Shape what your envoy tells other sessions and handle what it escalates to you",
     ),
     (
         "files",
-        "Share files with peers, decide their access requests and fetch theirs",
+        "Share files, decide requests for them and fetch other sessions' files",
     ),
     (
         "config",
-        "Show the mesh settings and rotate this node's identity",
+        "Show your mesh settings and rotate your mesh identity",
     ),
 ];
 
@@ -360,12 +360,15 @@ pub(crate) async fn run(
     };
     let (group, verb, rest) = if is_group(first) {
         match split_verb(rest) {
-            None | Some(("help", None)) => {
+            None | Some(("help" | "--help", None)) => {
                 out_text(&render_group_help(first));
                 return Ok(());
             }
             Some((verb, rest)) => (first, verb, rest),
         }
+    } else if first == "--help" && rest.is_none() {
+        out_text(&render_help());
+        return Ok(());
     } else {
         ("", first, rest)
     };
@@ -383,11 +386,17 @@ pub(crate) async fn run(
         ("", "on") => turn_on(ctx, rest).await,
         ("", "off") => turn_off(ctx, rest).await,
         ("", "status") => status(ctx, rest),
-        ("", "help") => {
-            parse_args(rest, &[], "", "help")?;
-            out_text(&render_help());
-            Ok(())
-        }
+        ("", "help") => match rest {
+            Some(group) if is_group(group) => {
+                out_text(&render_group_help(group));
+                Ok(())
+            }
+            _ => {
+                parse_args(rest, &[], "", "help")?;
+                out_text(&render_help());
+                Ok(())
+            }
+        },
         ("people", "list") => peers(ctx).await,
         ("people", "info") => info(ctx, &abort_signal, rest).await,
         ("people", "status") => peer_status(ctx, &abort_signal, rest).await,
@@ -1322,7 +1331,17 @@ fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
             }),
     );
     let inbound = match ctx.app.mesh.inbound_store() {
-        Some(store) => store.list(now)?,
+        Some(store) => match store.list(now) {
+            Ok(records) => records,
+            Err(err) if list == PendingList::Asked => {
+                debug!(
+                    "inbound store unreadable while listing the questions this node asked: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+                Vec::new()
+            }
+            Err(err) => return Err(err),
+        },
         None => Vec::new(),
     };
     let (mut access, mut escalated) = (Vec::new(), Vec::new());
@@ -16436,6 +16455,65 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{prefix} {verb}"
                         );
                     }
+                }
+            }
+
+            /// Every spelling of a group's help prints that group's listing, `--help` alone
+            /// prints the full one and `--help` after a path prints that path's usage without
+            /// running it, each in the prefix the session was switched to.
+            #[test]
+            #[serial]
+            fn help_spellings_print_their_listing_in_the_configured_prefix() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-help-dispatch");
+                for (prefix, sigil, mesh) in PREFIXES {
+                    let mut ctx = off_ctx();
+                    ctx.mesh_enabled_in_config = true;
+                    let _prefix =
+                        live_prefix_override::install(ctx.app.mesh.command_prefix().clone());
+                    set_prefix(&mut ctx, prefix);
+                    let printed = |ctx: &mut RequestContext, line: &str| {
+                        let _capture = capture::install();
+                        run_async(run(ctx, &format!("{sigil}mesh {line}"))).unwrap();
+                        assert!(
+                            capture::lines()
+                                .iter()
+                                .all(|(stream, _)| *stream == capture::Stream::Out),
+                            "{prefix} {line}: {:?}",
+                            capture::lines()
+                        );
+                        stdout_of_capture()
+                    };
+                    let people = live_prefix()
+                        .render_hints(&render_group_help("people"))
+                        .into_owned();
+                    for line in ["people", "people help", "people --help", "help people"] {
+                        assert_eq!(
+                            printed(&mut ctx, line),
+                            std::slice::from_ref(&people),
+                            "{prefix} {line}"
+                        );
+                    }
+                    assert!(
+                        people.contains(&format!("\n  {mesh} people list\n")),
+                        "{people}"
+                    );
+                    if prefix == CommandPrefix::Slash {
+                        assert!(!people.contains(".mesh"), "{people}");
+                    }
+                    assert_eq!(
+                        printed(&mut ctx, "--help"),
+                        [live_prefix().render_hints(&render_help())],
+                        "{prefix}"
+                    );
+                    assert_eq!(
+                        printed(&mut ctx, "access revoke --help"),
+                        [live_prefix().render_hints(&render_verb_help("access", "revoke"))],
+                        "{prefix}"
+                    );
+                    let err = run_async(run(&mut ctx, &format!("{sigil}mesh help bogus")))
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("bogus"), "{prefix}: {err}");
                 }
             }
 
@@ -45333,6 +45411,81 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert!(fx.grants().is_empty());
                         assert!(fx.ctx.app.mesh.correlations().is_open(SECOND));
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn envoy_answer_to_an_asked_question_points_at_follow_up_and_sends_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-envoy-answer-asked");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-envoy-answer-asked").await;
+                        ask_stub(&fx, SECOND, SECOND);
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh envoy answer {SECOND} \"x\""))
+                                .await,
+                            format!(
+                                "{SECOND} is a question this node asked, not one escalated to you; follow up on it with `.mesh messaging follow-up {SECOND} \"<text>\"`."
+                            )
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.ctx.app.mesh.correlations().is_open(SECOND));
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn follow_up_to_an_escalated_question_points_at_envoy_answer_and_sends_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-escalated");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-follow-up-escalated").await;
+                        fx.file("q-1", InboundKind::Question, &[]);
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh messaging follow-up q-1 \"x\"").await,
+                            "q-1 is a question a peer escalated to you, not one this node asked; answer it with `.mesh envoy answer q-1 \"<text>\"`."
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert_eq!(fx.pending_ids(), ["q-1"]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The questions this node asked live in their own store, so an unreadable
+                /// inbound store leaves `messaging sent` as it was; the two listings of the
+                /// rows peers sent still refuse.
+                #[test]
+                #[serial]
+                fn messaging_sent_still_lists_when_the_inbound_store_is_unreadable() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-sent-inbound-unreadable");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-sent-inbound-unreadable").await;
+                        ask_stub(&fx, SECOND, SECOND);
+                        let before = out_of(&mut fx.ctx, ".mesh messaging sent").await.unwrap();
+                        assert!(before.contains(&SECOND[..8]), "{before}");
+
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        std::fs::write(store.path(), "not a record\n").unwrap();
+
+                        assert_eq!(
+                            out_of(&mut fx.ctx, ".mesh messaging sent").await.unwrap(),
+                            before
+                        );
+                        for path in ["envoy questions", "files requests"] {
+                            assert!(
+                                run(&mut fx.ctx, &format!(".mesh {path}")).await.is_err(),
+                                "{path}"
+                            );
+                        }
                         fx.stop().await;
                     });
                 }

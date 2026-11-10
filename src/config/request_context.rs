@@ -218,6 +218,72 @@ fn push_missing(values: &mut Vec<(String, Option<String>)>, extra: Vec<(String, 
     }
 }
 
+/// The `.mesh` paths whose arguments complete. `mesh_completion` matches on these names
+/// rather than on literals, so a test can hold each one against the command table and a
+/// renamed row cannot silently lose its completion.
+mod mesh_path {
+    pub(super) const ON: (&str, &str) = ("", "on");
+    pub(super) const OFF: (&str, &str) = ("", "off");
+    pub(super) const STATUS: (&str, &str) = ("", "status");
+    pub(super) const PEOPLE_INFO: (&str, &str) = ("people", "info");
+    pub(super) const PEOPLE_STATUS: (&str, &str) = ("people", "status");
+    pub(super) const ACCESS_TRUST: (&str, &str) = ("access", "trust");
+    pub(super) const ACCESS_REVOKE: (&str, &str) = ("access", "revoke");
+    pub(super) const ACCESS_BLOCK: (&str, &str) = ("access", "block");
+    pub(super) const ACCESS_UNBLOCK: (&str, &str) = ("access", "unblock");
+    pub(super) const ACCESS_FORGET: (&str, &str) = ("access", "forget");
+    pub(super) const ACCESS_ASK: (&str, &str) = ("access", "ask");
+    pub(super) const MESSAGING_SEND: (&str, &str) = ("messaging", "send");
+    pub(super) const MESSAGING_BROADCAST: (&str, &str) = ("messaging", "broadcast");
+    pub(super) const MESSAGING_INBOX: (&str, &str) = ("messaging", "inbox");
+    pub(super) const MESSAGING_FOLLOW_UP: (&str, &str) = ("messaging", "follow-up");
+    pub(super) const ENVOY_BRIEF: (&str, &str) = ("envoy", "brief");
+    pub(super) const ENVOY_MEMORY: (&str, &str) = ("envoy", "memory");
+    pub(super) const ENVOY_ANSWER: (&str, &str) = ("envoy", "answer");
+    pub(super) const ENVOY_DISMISS: (&str, &str) = ("envoy", "dismiss");
+    pub(super) const FILES_LIST: (&str, &str) = ("files", "list");
+    pub(super) const FILES_ALLOW: (&str, &str) = ("files", "allow");
+    pub(super) const FILES_DENY: (&str, &str) = ("files", "deny");
+    pub(super) const FILES_UNSHARE: (&str, &str) = ("files", "unshare");
+    pub(super) const FILES_GRANT: (&str, &str) = ("files", "grant");
+    pub(super) const FILES_REFUSE: (&str, &str) = ("files", "refuse");
+    pub(super) const FILES_REQUEST: (&str, &str) = ("files", "request");
+    pub(super) const FILES_FETCH: (&str, &str) = ("files", "fetch");
+    pub(super) const CONFIG_ROTATE_IDENTITY: (&str, &str) = ("config", "rotate-identity");
+
+    #[cfg(test)]
+    pub(super) const ALL: &[(&str, &str)] = &[
+        ON,
+        OFF,
+        STATUS,
+        PEOPLE_INFO,
+        PEOPLE_STATUS,
+        ACCESS_TRUST,
+        ACCESS_REVOKE,
+        ACCESS_BLOCK,
+        ACCESS_UNBLOCK,
+        ACCESS_FORGET,
+        ACCESS_ASK,
+        MESSAGING_SEND,
+        MESSAGING_BROADCAST,
+        MESSAGING_INBOX,
+        MESSAGING_FOLLOW_UP,
+        ENVOY_BRIEF,
+        ENVOY_MEMORY,
+        ENVOY_ANSWER,
+        ENVOY_DISMISS,
+        FILES_LIST,
+        FILES_ALLOW,
+        FILES_DENY,
+        FILES_UNSHARE,
+        FILES_GRANT,
+        FILES_REFUSE,
+        FILES_REQUEST,
+        FILES_FETCH,
+        CONFIG_ROTATE_IDENTITY,
+    ];
+}
+
 /// Flags for `.mesh inbox`, `rest` being everything after the verb: `--purge-files`
 /// until it is given, then `--yes` and `--dry-run`, each dropping once its partner is
 /// present.
@@ -7079,53 +7145,60 @@ impl RequestContext {
             [] => return Vec::new(),
         };
         match ((group, verb), rest) {
-            (("files", "allow" | "deny" | "unshare" | "list"), [_, ..]) => {
-                self.mesh_completion_share_verb(verb, rest)
-            }
-            (("people", "info"), [_]) => {
+            (
+                mesh_path::FILES_ALLOW
+                | mesh_path::FILES_DENY
+                | mesh_path::FILES_UNSHARE
+                | mesh_path::FILES_LIST,
+                [_, ..],
+            ) => self.mesh_completion_share_verb(verb, rest),
+            (mesh_path::PEOPLE_INFO, [_]) => {
                 self.mesh_completion_destinations(DestinationFilter::HeardOrKnocked)
             }
-            (("people", "status"), [_]) | (("messaging", "send"), ["--yes", _]) => {
+            (mesh_path::PEOPLE_STATUS, [_]) | (mesh_path::MESSAGING_SEND, ["--yes", _]) => {
                 self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard)
             }
-            (("messaging", "send"), [_]) => {
+            (mesh_path::MESSAGING_SEND, [_]) => {
                 let mut values =
                     self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard);
                 values.push(("--yes".to_string(), None));
                 values
             }
-            (("access", "ask"), [_]) => {
+            (mesh_path::ACCESS_ASK, [_]) => {
                 let mut values = self.mesh_completion_destinations(DestinationFilter::Heard);
                 values.push(("--yes".to_string(), None));
                 values.push(("--intro ".to_string(), None));
                 values
             }
-            (("envoy", "answer") | ("messaging", "follow-up" | "send"), [_, _, ..]) => {
-                self.mesh_completion_message_verb(verb, rest)
-            }
-            (("files", "grant" | "refuse"), [_, ..]) => {
+            (
+                mesh_path::ENVOY_ANSWER
+                | mesh_path::MESSAGING_FOLLOW_UP
+                | mesh_path::MESSAGING_SEND,
+                [_, _, ..],
+            ) => self.mesh_completion_message_verb(verb, rest),
+            (mesh_path::FILES_GRANT | mesh_path::FILES_REFUSE, [_, ..]) => {
                 self.mesh_completion_decision_verb(verb, rest)
             }
-            (("files", "fetch"), [_, ..]) => self.mesh_completion_fetch(rest),
-            (("files", "request"), [_, ..]) => self.mesh_completion_request(rest),
-            (("messaging", "inbox"), [_, ..]) => mesh_completion_inbox(rest),
-            (("envoy", "memory"), [_]) => super::map_completion_values(vec!["forget "]),
-            (("envoy", "memory"), ["forget", forget @ ..]) if !forget.is_empty() => {
+            (mesh_path::FILES_FETCH, [_, ..]) => self.mesh_completion_fetch(rest),
+            (mesh_path::FILES_REQUEST, [_, ..]) => self.mesh_completion_request(rest),
+            (mesh_path::MESSAGING_INBOX, [_, ..]) => mesh_completion_inbox(rest),
+            (mesh_path::ENVOY_MEMORY, [_]) => super::map_completion_values(vec!["forget "]),
+            (mesh_path::ENVOY_MEMORY, ["forget", forget @ ..]) if !forget.is_empty() => {
                 self.mesh_completion_memory_forget(forget)
             }
-            (("access", "trust"), [_]) => {
+            (mesh_path::ACCESS_TRUST, [_]) => {
                 let mut values = self.mesh_completion_destinations(DestinationFilter::Trustable);
                 values.push(("--identity ".to_string(), None));
                 values
             }
-            (("access", "trust"), ["--identity", _]) => self.mesh_completion_identities(false),
-            (("access", "revoke"), ["--stale", _]) => {
+            (mesh_path::ACCESS_TRUST, ["--identity", _]) => self.mesh_completion_identities(false),
+            (mesh_path::ACCESS_REVOKE, ["--stale", _]) => {
                 super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "])
             }
-            (("config", "rotate-identity"), [_]) => {
+            (mesh_path::CONFIG_ROTATE_IDENTITY, [_]) => {
                 super::map_completion_values(vec!["--dry-run", "--confirm "])
             }
-            (("access", "revoke"), [_]) => {
+            (mesh_path::ACCESS_REVOKE, [_]) => {
                 let mut values =
                     self.mesh_completion_destinations(DestinationFilter::TrustedRecord);
                 values.push(("--identity ".to_string(), None));
@@ -7133,51 +7206,51 @@ impl RequestContext {
                 values.push(("--stale".to_string(), None));
                 values
             }
-            (("access", "revoke"), ["--identity", _]) => {
+            (mesh_path::ACCESS_REVOKE, ["--identity", _]) => {
                 self.mesh_completion_untrustable_identities()
             }
-            (("access", "revoke"), ["--dry-run", _]) => {
+            (mesh_path::ACCESS_REVOKE, ["--dry-run", _]) => {
                 let mut values =
                     self.mesh_completion_destinations(DestinationFilter::TrustedRecord);
                 values.push(("--identity ".to_string(), None));
                 values
             }
-            (("access", "forget"), [_]) => {
+            (mesh_path::ACCESS_FORGET, [_]) => {
                 super::map_completion_values(vec!["--identity ", "--dry-run"])
             }
-            (("access", "forget"), ["--identity", _]) => {
+            (mesh_path::ACCESS_FORGET, ["--identity", _]) => {
                 let mut values = self.mesh_completion_trusted_identities();
                 push_missing(&mut values, self.mesh_completion_blocked());
                 values
             }
-            (("access", "block"), [_]) => {
+            (mesh_path::ACCESS_BLOCK, [_]) => {
                 let mut values = self.mesh_completion_destinations(DestinationFilter::Blockable);
                 values.push(("--identity ".to_string(), None));
                 values
             }
-            (("access", "block"), ["--identity", _]) => self.mesh_completion_identities(true),
-            (("access", "unblock"), [_]) => {
+            (mesh_path::ACCESS_BLOCK, ["--identity", _]) => self.mesh_completion_identities(true),
+            (mesh_path::ACCESS_UNBLOCK, [_]) => {
                 let mut values = self.mesh_completion_destinations(DestinationFilter::Denied);
                 values.push(("--identity ".to_string(), None));
                 values
             }
-            (("access", "unblock"), ["--identity", _]) => self.mesh_completion_blocked(),
-            (("envoy", "answer"), [_]) => {
+            (mesh_path::ACCESS_UNBLOCK, ["--identity", _]) => self.mesh_completion_blocked(),
+            (mesh_path::ENVOY_ANSWER, [_]) => {
                 self.mesh_completion_escalated_questions("answer", SystemTime::now())
             }
-            (("messaging", "follow-up"), [_]) => self.mesh_completion_asked_questions(),
-            (("envoy", "dismiss"), [_]) => {
+            (mesh_path::MESSAGING_FOLLOW_UP, [_]) => self.mesh_completion_asked_questions(),
+            (mesh_path::ENVOY_DISMISS, [_]) => {
                 self.mesh_completion_escalated_questions("dismiss", SystemTime::now())
             }
-            (("envoy", "brief"), [_]) => {
+            (mesh_path::ENVOY_BRIEF, [_]) => {
                 super::map_completion_values(vec!["note ", "auto", "manual", "off"])
             }
-            (("envoy", "brief"), ["note", _]) => super::map_completion_values(vec!["clear"]),
-            (("", "on"), [_]) => super::map_completion_values(vec!["--yes", "--fresh"]),
-            (("", "off") | ("messaging", "broadcast"), [_]) => {
+            (mesh_path::ENVOY_BRIEF, ["note", _]) => super::map_completion_values(vec!["clear"]),
+            (mesh_path::ON, [_]) => super::map_completion_values(vec!["--yes", "--fresh"]),
+            (mesh_path::OFF | mesh_path::MESSAGING_BROADCAST, [_]) => {
                 super::map_completion_values(vec!["--yes"])
             }
-            (("", "status"), [_]) => super::map_completion_values(vec!["clear"]),
+            (mesh_path::STATUS, [_]) => super::map_completion_values(vec!["clear"]),
             _ => Vec::new(),
         }
     }
@@ -37820,6 +37893,65 @@ mod tests {
             .map(|(value, _)| value)
             .collect();
         assert_eq!(rotate, ["--dry-run", "--confirm "]);
+    }
+
+    #[test]
+    fn every_path_mesh_completion_matches_is_a_command_row() {
+        for &(group, verb) in mesh_path::ALL {
+            assert!(
+                crate::repl::mesh::COMMANDS
+                    .iter()
+                    .any(|(g, v, ..)| *g == group && *v == verb),
+                "`{group} {verb}` completes but is no row of the command table"
+            );
+        }
+    }
+
+    /// The flat verbs the grouped paths replaced, each of which used to complete flags or
+    /// destinations.
+    const RETIRED_MESH_VERBS: [&str; 16] = [
+        "trust",
+        "untrust",
+        "forget",
+        "block",
+        "unblock",
+        "rotate",
+        "brief",
+        "broadcast",
+        "message",
+        "knock",
+        "peers",
+        "info",
+        "pending",
+        "answer",
+        "shares",
+        "allow",
+    ];
+
+    #[test]
+    fn repl_complete_mesh_offers_nothing_after_a_retired_verb_while_the_mesh_is_off() {
+        let ctx = create_test_ctx();
+        for verb in RETIRED_MESH_VERBS {
+            let offered = ctx.repl_complete(".mesh", &[verb, ""], "");
+            assert!(offered.is_empty(), "{verb}: {offered:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_offers_nothing_after_a_retired_verb_while_the_mesh_is_on() {
+        let _guard = HelperConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-retired-verbs").await;
+        assert!(
+            !fixture.complete(&["people", "info", ""]).is_empty(),
+            "the fixture has peers to offer"
+        );
+        for verb in RETIRED_MESH_VERBS {
+            let offered = fixture.complete(&[verb, ""]);
+            assert!(offered.is_empty(), "{verb}: {offered:?}");
+        }
+        fixture.stop().await;
     }
 
     #[cfg(unix)]
