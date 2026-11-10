@@ -8988,3 +8988,216 @@ fn dot_update_y_typed_ahead_with_the_command_does_not_accept_the_confirm_modal()
     pty.send(b"\x7f").unwrap();
     assert_ui_alive_then_quit(&mut pty, "the cancelled update");
 }
+
+// ---------------------------------------------------------------------
+// The Input modal's empty-field default, the Password modal's empty
+// re-ask, and `--update` with only stdout piped.
+// ---------------------------------------------------------------------
+
+/// Whether some occurrence of `needle` at or after `from` is painted
+/// under the DIM attribute: an SGR `2` (`\x1b[2m`, or `2` inside a
+/// combined `\x1b[...;2;...m`) opened within the 64 bytes before it with
+/// no `\x1b[22m`/`\x1b[0m` closing it in between.
+fn painted_dim(raw: &[u8], from: usize, needle: &[u8]) -> bool {
+    let mut at = from;
+    while let Some(found) = find(raw, needle, at) {
+        let start = found.saturating_sub(64);
+        let window = &raw[start..found];
+        let opened = [&b"\x1b[2m"[..], &b";2m"[..], &b"\x1b[2;"[..], &b";2;"[..]]
+            .iter()
+            .filter_map(|marker| rfind(window, marker))
+            .max();
+        if let Some(open) = opened {
+            let after = &window[open..];
+            if find(after, b"\x1b[22m", 0).is_none() && find(after, b"\x1b[0m", 0).is_none() {
+                return true;
+            }
+        }
+        at = found + needle.len();
+    }
+    false
+}
+
+/// `Set chunk size:` under the UI shows its default `1000` as a dim
+/// placeholder; Enter on the untouched field answers the default (the
+/// next question's default is 1/20th of the chunk size: `50`), and a
+/// field typed into and then backspaced back to empty answers the
+/// default too, exactly as the plain REPL's `(1000)` does. Esc on the
+/// overlay question leaves nothing on disk both times.
+#[test]
+#[serial]
+fn dot_rag_enter_on_the_empty_chunk_size_modal_takes_the_dim_placeholder_default() {
+    let dir = fresh_config_dir("rag-input-empty-default");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let mut rows = 48;
+    for (name, keys, how) in [
+        ("new-rag-e5d", &b"\r"[..], "Enter on the untouched field"),
+        ("new-rag-e5e", &b"7\x7f\r"[..], "`7`, Backspace, Enter"),
+    ] {
+        let command = format!(".rag {name}");
+        let before = pty.raw().len();
+        pty.send(format!("{command}\r").as_bytes()).unwrap();
+        wait_for_the_modal(
+            &mut pty,
+            before,
+            &command,
+            &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
+        );
+        let frame = walk_to_the_chunk_size_modal(&mut pty, &command, &mut rows);
+        assert!(
+            squeezed(&frame).contains("Setchunksize:1000"),
+            "`{command}`: the `Set chunk size:` Input modal does not show its default 1000:\n{frame}"
+        );
+        let painted_at = pty.raw().len();
+        let frame = next_wizard_frame(&mut pty, &mut rows);
+        assert!(
+            painted_dim(pty.raw(), painted_at, b"1000"),
+            "`{command}`: the default 1000 is not painted dim as a placeholder:\n{frame}\n--- raw ---\n{}",
+            String::from_utf8_lossy(&pty.raw()[painted_at..]).escape_debug()
+        );
+
+        pty.read_for(HOTKEY_GAP);
+        pty.send(keys).unwrap();
+        let frame = next_wizard_frame(&mut pty, &mut rows);
+        let flat = squeezed(&frame);
+        assert!(
+            flat.contains("Setchunkoverlay:") && flat.contains("Esc=cancel"),
+            "`{command}`: {how} did not move the wizard on to `Set chunk overlay:`:\n{frame}"
+        );
+        assert!(
+            flat.contains("Setchunkoverlay:50"),
+            "`{command}`: {how} did not take chunk size 1000 (overlay default 50):\n{frame}"
+        );
+        assert!(
+            !flat.contains("Setchunkoverlay:500") && !flat.contains("Setchunkoverlay:0"),
+            "`{command}`: {how} took a chunk size other than the default 1000:\n{frame}"
+        );
+
+        esc_cancels_the_modal(&mut pty, &command);
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        for footprint in [name, "/rags/"] {
+            let written = new_files_named(&dir, &files_before, footprint);
+            assert!(
+                written.is_empty(),
+                "`{command}`: the cancelled wizard still wrote {written:?}:\n{since}"
+            );
+        }
+    }
+    assert_ui_alive_then_quit(&mut pty, "the cancelled wizards");
+}
+
+/// `.vault add <name>` under the UI with Enter on an empty Password
+/// modal: nothing is stored, the question is re-asked in the modal with
+/// its reason spelled out as a sentence (the plain REPL re-asks with
+/// `A response is required.`), the terminal is never released, and Esc
+/// then leaves no vault file behind.
+#[test]
+#[serial]
+fn dot_vault_add_with_an_empty_password_modal_is_reasked_and_esc_stores_nothing() {
+    let dir = fresh_config_dir("vault-add-empty-reask");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".vault add vault-secret-e6f\r").unwrap();
+    wait_for_the_modal(&mut pty, before, ".vault add", &["Enterthesecretvalue:"]);
+
+    pty.read_for(HOTKEY_GAP);
+    let entered_at = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    let frame = repainted_frame(&mut pty, 50, 120);
+    let flat = squeezed(&frame);
+    assert!(
+        flat.contains("Enterthesecretvalue:") && flat.contains("Esc=cancel"),
+        "Enter on the empty Password modal closed it instead of re-asking:\n{frame}"
+    );
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[entered_at..]));
+    assert!(
+        !squeezed(&since).contains("addedtothevault"),
+        "an empty secret value was stored:\n{since}"
+    );
+    assert!(
+        flat.contains("Aresponseisrequired."),
+        "the re-asked Password modal does not give the plain REPL's reason `A response is \
+         required.` as a sentence:\n{frame}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the re-asked Password modal released the terminal:\n{frame}"
+    );
+
+    esc_cancels_the_modal(&mut pty, ".vault add");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    for footprint in ["e6f", "vault.yml"] {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "the cancelled `.vault add` still wrote {written:?}:\n{since}"
+        );
+    }
+    assert_ui_alive_then_quit(&mut pty, "the cancelled vault add");
+}
+
+/// `--update` on a Cargo install with stdin on the terminal but stdout
+/// redirected to a file (a user capturing the output): the confirm has
+/// nowhere to paint, so the update is refused in the shared shape naming
+/// `--force` (accepted plain-REPL delta), exits non-zero, never asks
+/// `Update anyway?`, and the binary is untouched.
+#[test]
+#[serial]
+fn update_with_a_piped_stdout_and_a_tty_on_stdin_is_refused_in_the_shared_shape() {
+    let dir = fresh_config_dir("update-piped-stdout");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let cargo_copy = cargo_installed_binary(&dir);
+    let binary_before = fs::metadata(&cargo_copy).unwrap();
+    let captured = dir.join("update-stdout.txt");
+
+    let mut pty = spawn_binary_under(
+        &cargo_copy,
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/tty",
+        &format!(" --update >'{}'", captured.display()),
+    );
+    let on_tty = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let on_stdout = fs::read_to_string(&captured).unwrap_or_default();
+    let everything = format!("--- tty (stderr) ---\n{on_tty}\n--- stdout file ---\n{on_stdout}");
+
+    assert_ne!(exit_code(&on_tty), 0, "{everything}");
+    let (action, remedy) = refusal_shape(&everything).unwrap_or_else(|| {
+        panic!("the piped-stdout update is not refused in the shared shape:\n{everything}")
+    });
+    assert_eq!(action, "update a Cargo install", "{everything}");
+    assert!(
+        remedy.contains("--force"),
+        "the refusal's remedy does not name `--force`:\n{everything}"
+    );
+    assert!(
+        !everything.contains("Update anyway?"),
+        "the confirm was asked with nowhere to paint it:\n{everything}"
+    );
+    assert!(
+        !everything.contains("Re-run in the plain REPL"),
+        "the refusal blames the UI, but no UI stood in the way:\n{everything}"
+    );
+    let binary_after = fs::metadata(&cargo_copy).unwrap();
+    assert!(
+        binary_after.len() == binary_before.len()
+            && binary_after.modified().unwrap() == binary_before.modified().unwrap(),
+        "the refused update touched the binary at {}",
+        cargo_copy.display()
+    );
+    assert_tty_restored(&on_tty);
+}
