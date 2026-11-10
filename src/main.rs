@@ -683,8 +683,7 @@ async fn run(
             if json_output {
                 ctx.render_mode = RenderMode::Silent;
             }
-            let graph_run = graph::active_agent_graph_name(&ctx).is_some();
-            let run_stats = (json_output && !graph_run).then(|| ctx.begin_run_stats()); // TASK-433: graph runs print no --json wrapper yet
+            let run_stats = json_output.then(|| ctx.begin_run_stats());
             let started_at = Instant::now();
             let model = ctx.current_model().id();
             let session_id = ctx.session.as_ref().map(|s| s.name().to_string());

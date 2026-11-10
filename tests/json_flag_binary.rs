@@ -7,14 +7,16 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use serde_json::{Value, json};
 
 const REPLY: &str = "**hello** from the stub";
 const TOOL: &str = "agent__list_sessions";
+const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct TempDir(PathBuf);
 
@@ -230,9 +232,18 @@ fn run(dir: &Path, args: &[&str]) -> Output {
     run_with_stdin(dir, args, None, &[])
 }
 
+/// Runs the binary with a scrubbed environment: every inherited `COYOTE_*`
+/// variable is dropped before the test's own are set, and a run that
+/// outlives `RUN_TIMEOUT` is killed.
 fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("COYOTE_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
         .args(args)
         .current_dir(dir)
         .envs(envs.iter().copied())
@@ -244,11 +255,7 @@ fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str,
         // Loopback must not be sent through a host proxy.
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -262,7 +269,39 @@ fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str,
         let mut pipe = child.stdin.take().unwrap();
         pipe.write_all(text.as_bytes()).unwrap();
     }
-    child.wait_with_output().unwrap()
+    wait_bounded(child, args)
+}
+
+fn wait_bounded(mut child: Child, args: &[&str]) -> Output {
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "coyote {args:?} did not exit within {}s",
+                RUN_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
 }
 
 fn combined(output: &Output) -> String {
@@ -497,7 +536,9 @@ fn a_first_time_agent_rag_build_goes_to_stderr_under_json() {
         "under --json the RAG build progress moves to stderr:\n{}",
         combined(&output)
     );
-    assert!(output.stdout.is_empty(), "{}", combined(&output)); // TASK-433: graph runs print the --json wrapper here
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!(REPLY), "{report}");
+    assert_eq!(report["is_error"], json!(false), "{report}");
 }
 
 #[test]
@@ -534,7 +575,7 @@ fn a_failed_model_call_prints_the_error_wrapper_and_exits_1() {
 }
 
 #[test]
-fn a_graph_agent_run_renders_no_reply_on_stdout() {
+fn a_graph_agent_run_prints_its_output_as_the_only_object() {
     let dir = TempDir::new("graph");
     write_config(&dir.0, serve(Behaviour::Answer), false);
     let agent_dir = dir.0.join("agents").join("ask-graph");
@@ -555,9 +596,11 @@ fn a_graph_agent_run_renders_no_reply_on_stdout() {
     let output = run(&dir.0, &["--json", "--agent", "ask-graph", "hi"]);
 
     assert!(output.status.success(), "{}", combined(&output));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("from the stub"), "{}", combined(&output));
-    assert!(output.stdout.is_empty(), "{}", combined(&output)); // TASK-433: graph runs print the --json wrapper here
+    let report = the_only_object(&output);
+    assert_keys_in_order(&report);
+    assert_eq!(report["result"], json!(REPLY), "{report}");
+    assert_eq!(report["is_error"], json!(false), "{report}");
+    assert_eq!(report["num_turns"], json!(1), "{report}");
 }
 
 // ---- usage block, stdin and -f prompts, failed turns, rejected flags ----
@@ -650,7 +693,8 @@ fn a_failed_call_counts_as_a_turn_and_adds_no_usage() {
     assert_eq!(output.status.code(), Some(1), "{}", combined(&output));
     let report = the_only_object(&output);
     assert_keys_in_order(&report);
-    assert!(report["num_turns"].as_u64().unwrap_or(0) >= 1, "{report}");
+    // The plain path sends the request once; a 500 is not retried.
+    assert_eq!(report["num_turns"], json!(1), "{report}");
     assert_eq!(usage_keys(&report), USAGE_KEYS, "{report}");
     for key in USAGE_KEYS {
         assert_eq!(report["usage"][key], Value::Null, "{key}: {report}");
@@ -689,7 +733,11 @@ fn stdout_printing_flags_are_rejected_alongside_json_before_anything_runs() {
     for flag in flags {
         let mut args = vec!["--json"];
         args.extend_from_slice(flag);
-        args.push("hi");
+        // `--memory-migrate` also rejects a prompt, which would mask the
+        // `--json` conflict, so that row runs without one.
+        if flag[0] != "--memory-migrate" {
+            args.push("hi");
+        }
         let output = run(&dir.0, &args);
         assert_eq!(
             output.status.code(),
@@ -698,6 +746,11 @@ fn stdout_printing_flags_are_rejected_alongside_json_before_anything_runs() {
             combined(&output)
         );
         assert!(output.stdout.is_empty(), "{flag:?}\n{}", combined(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--json"),
+            "{flag:?}\n{}",
+            combined(&output)
+        );
     }
     assert!(!dir.0.join("COYOTE.md").exists(), "--init-instructions ran");
 }

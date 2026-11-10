@@ -1,4 +1,5 @@
 use crate::config::RunStatsSnapshot;
+use crate::utils::strip_think_tag;
 use serde::Serialize;
 use std::time::Duration;
 
@@ -26,7 +27,8 @@ pub struct JsonUsage {
 }
 
 impl JsonResult {
-    /// `outcome` is the final assistant text, or the rendered error.
+    /// `outcome` is the final assistant text, or the rendered error. A
+    /// leading `<think>` block is dropped from the text.
     pub fn new(
         outcome: Result<String, String>,
         model: String,
@@ -35,7 +37,7 @@ impl JsonResult {
         elapsed: Duration,
     ) -> Self {
         let (result, error) = match outcome {
-            Ok(text) => (Some(text), None),
+            Ok(text) => (Some(strip_think_tag(&text).into_owned()), None),
             Err(err) => (None, Some(err)),
         };
         Self {
@@ -84,6 +86,19 @@ mod tests {
             serde_json::to_string(&report).unwrap(),
             r#"{"result":"hello","is_error":false,"error":null,"model":"openai:gpt-4o","session_id":null,"num_turns":2,"duration_ms":1234,"usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":null,"cache_creation_input_tokens":null},"total_cost_usd":null}"#
         );
+    }
+
+    #[test]
+    fn a_leading_think_block_is_stripped_from_the_result() {
+        let report = JsonResult::new(
+            Ok("<think>\nweighing it up\n</think>\n\nfinal".into()),
+            "stub:m".into(),
+            None,
+            RunStatsSnapshot::default(),
+            Duration::ZERO,
+        );
+
+        assert_eq!(report.result.as_deref(), Some("final"));
     }
 
     #[test]
