@@ -2101,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn node_without_output_schema_sends_the_same_request_as_before() {
+    fn node_without_output_schema_sends_the_same_request_as_a_bare_tool_free_role() {
         let ctx = plain_ctx();
         let node = node_with(None);
         let model = structured_model();
@@ -2113,11 +2113,11 @@ mod tests {
             .without_structured_output()
             .prepare_completion_data(&model, false)
             .unwrap();
-        let mut legacy_role = Role::new("llm_node", "");
-        legacy_role.set_model(ctx.current_model().clone());
-        legacy_role.set_enabled_tools(Some(vec![]));
-        legacy_role.set_enabled_mcp_servers(Some(vec![]));
-        let legacy = Input::from_str(&ctx, "user", Some(legacy_role))
+        let mut bare_role = Role::new("llm_node", "");
+        bare_role.set_model(ctx.current_model().clone());
+        bare_role.set_enabled_tools(Some(vec![]));
+        bare_role.set_enabled_mcp_servers(Some(vec![]));
+        let bare = Input::from_str(&ctx, "user", Some(bare_role))
             .unwrap()
             .prepare_completion_data(&model, false)
             .unwrap();
@@ -2125,7 +2125,7 @@ mod tests {
         assert!(input.role().structured_output().is_none());
         assert!(data.structured_output.is_none());
         assert_eq!(format!("{data:?}"), format!("{baseline:?}"));
-        assert_eq!(format!("{data:?}"), format!("{legacy:?}"));
+        assert_eq!(format!("{data:?}"), format!("{bare:?}"));
     }
 
     /// Runs a schema node and returns, for each call, the system and user
