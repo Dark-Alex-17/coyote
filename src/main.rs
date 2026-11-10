@@ -1008,6 +1008,15 @@ fn resolve_oauth_client(
             0 => bail!("No OAuth-capable clients configured."),
             1 => find_by_name(&candidates[0]).unwrap(),
             _ => {
+                if !crate::config::conflict::menu_can_use_terminal() {
+                    return Err(crate::config::conflict::refuse_non_interactive(
+                        format_args!(
+                            "pick between the OAuth-capable clients ({})",
+                            candidates.join(", ")
+                        ),
+                        "; or pass --authenticate <CLIENT_NAME>.",
+                    ));
+                }
                 let choice = crate::prompt::select_closed(
                     prompter,
                     "Select a client to authenticate:",
@@ -1036,6 +1045,7 @@ mod tests {
     use crate::prompt::{
         HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
     };
+    use serial_test::serial;
 
     fn oauth_client(name: &str) -> ClientConfig {
         serde_yaml::from_str(&format!("type: claude\nname: {name}\nauth: oauth\n")).unwrap()
@@ -1044,7 +1054,9 @@ mod tests {
     /// With more than one OAuth-capable client and none named, the pick is
     /// a closed Select through the prompter.
     #[test]
+    #[serial]
     fn resolve_oauth_client_asks_which_client_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let clients = [oauth_client("work"), oauth_client("home")];
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("home".into())]);
 
@@ -1059,8 +1071,35 @@ mod tests {
         assert_eq!(requests[0].options, ["work", "home"]);
     }
 
+    /// Without a terminal the pick is refused up front in the shared
+    /// refusal shape, naming the flag that skips the menu.
     #[test]
+    #[serial]
+    fn resolve_oauth_client_without_a_tty_is_refused_before_any_prompt() {
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let clients = [oauth_client("work"), oauth_client("home")];
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = resolve_oauth_client(None, &clients, &prompter)
+            .map(|(name, _)| name)
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Refusing to pick between the OAuth-capable clients (work, home)"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("; or pass --authenticate <CLIENT_NAME>."),
+            "{message}"
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
     fn resolve_oauth_client_with_no_human_is_refused() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let clients = [oauth_client("work"), oauth_client("home")];
 
         let err = resolve_oauth_client(None, &clients, &HeadlessPrompter)

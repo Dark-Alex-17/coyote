@@ -196,11 +196,8 @@ pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) ->
             .context("Failed to read password from input. Password file not created.")?;
         std::fs::write(&password_file, password.as_bytes())?;
         set_password_file_permissions(&password_file)?;
+        println!("✓ Password file '{}' created.", password_file.display());
         local_provider.password_file = Some(password_file);
-        println!(
-            "✓ Password file '{}' created.",
-            vault_password_file.display()
-        );
     }
 
     Ok(())

@@ -2008,7 +2008,7 @@ fn required_input(
     loop {
         let answer = input(prompter, &question, default, help)?;
         if answer.is_empty() {
-            question = reask("This field is required", label);
+            question = reask("This field is required.", label);
             continue;
         }
         return Ok(answer);
@@ -2043,7 +2043,7 @@ fn ask_qdrant_host(prompter: &dyn Prompter) -> Result<String> {
     loop {
         let answer = input(prompter, &question, None, None)?;
         if answer.is_empty() {
-            question = reask("This field is required", label);
+            question = reask("This field is required.", label);
             continue;
         }
         if answer.contains('[') || answer.contains(']') {
@@ -2092,14 +2092,16 @@ fn choose_collection(prompter: &dyn Prompter, collections: Vec<String>) -> Resul
 /// cannot happen by accident; `attach` already refuses to run
 /// non-interactively, so there is no unattended path through this prompt.
 fn confirm_empty_collection(prompter: &dyn Prompter, collection: &str) -> Result<()> {
-    println!(
-        "⚠️  Collection '{collection}' contains no points. Queries will return \
+    let warning = format!(
+        "Collection '{collection}' contains no points. Queries will return \
          nothing until something writes to it."
     );
-    let attach_anyway = confirm(
+    println!("⚠️  {warning}");
+    let attach_anyway = crate::prompt::confirm_with_help(
         prompter,
         "Attach to this empty collection anyway?".to_string(),
         false,
+        &warning,
     )?;
     if !attach_anyway {
         bail!("Collection '{collection}' is empty; nothing to attach to.");
@@ -2214,7 +2216,7 @@ fn set_chunk_size(model: &Model, prompter: &dyn Prompter) -> Result<usize> {
         "Set chunk size:",
         model.default_chunk_size(),
         help_message.as_deref(),
-        "Must be a integer",
+        "Must be an integer.",
     )
 }
 
@@ -2226,7 +2228,7 @@ fn set_graph_hops(default_value: usize, prompter: &dyn Prompter) -> Result<usize
         Some(
             "Number of hops to expand from matched entities (0 = seed nodes only, 1 = direct neighbors, 2 = neighbors of neighbors)",
         ),
-        "Must be a non-negative integer",
+        "Must be a non-negative integer.",
     )
 }
 
@@ -2236,7 +2238,7 @@ fn set_chunk_overlay(default_value: usize, prompter: &dyn Prompter) -> Result<us
         "Set chunk overlay:",
         default_value,
         None,
-        "Must be a integer",
+        "Must be an integer.",
     )
 }
 
@@ -3422,6 +3424,13 @@ mod tests {
         assert_eq!(req.action, PromptAction::Confirm);
         assert_eq!(req.question, "Attach to this empty collection anyway?");
         assert_eq!(req.default, Some(json!(false)));
+        assert!(
+            req.help
+                .as_deref()
+                .is_some_and(|help| help.contains("Collection 'docs' contains no points")),
+            "{:?}",
+            req.help
+        );
 
         let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
         let err = confirm_empty_collection(&declined, "docs").unwrap_err();
@@ -3559,12 +3568,19 @@ mod tests {
         assert_eq!(first.question, "Vault secret name for API key:");
         assert_eq!(
             second.question,
-            reask("This field is required", "Vault secret name for API key:")
+            reask("This field is required.", "Vault secret name for API key:")
         );
 
         let counted = ScriptedPrompter::new(vec![text("abc"), text("7")]);
         assert_eq!(
-            count_input(&counted, "Set chunk size:", 1000, None, "Must be a integer").unwrap(),
+            count_input(
+                &counted,
+                "Set chunk size:",
+                1000,
+                None,
+                "Must be an integer."
+            )
+            .unwrap(),
             7
         );
         let [first, second] = counted.requests().try_into().unwrap();
@@ -3572,7 +3588,7 @@ mod tests {
         assert_eq!(first.default, Some(json!("1000")));
         assert_eq!(
             second.question,
-            reask("Must be a integer", "Set chunk size:")
+            reask("Must be an integer.", "Set chunk size:")
         );
         assert_eq!(second.default, Some(json!("1000")));
 
@@ -3586,7 +3602,7 @@ mod tests {
         assert_eq!(first.question, "Host (e.g. qdrant.company.com:6333):");
         assert_eq!(
             second.question,
-            "This field is required Host (e.g. qdrant.company.com:6333):"
+            "This field is required. Host (e.g. qdrant.company.com:6333):"
         );
         assert_eq!(
             third.question,

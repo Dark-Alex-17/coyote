@@ -294,12 +294,16 @@ pub(crate) fn confirm_with_help(
 }
 
 /// A select whose answer must be one of `options`; an answer outside them
-/// is rejected here so no caller has to.
+/// is rejected here so no caller has to, and a select with nothing to
+/// offer is refused before any prompter sees it.
 pub(crate) fn select_closed(
     prompter: &dyn Prompter,
     question: &str,
     options: Vec<String>,
 ) -> Result<String> {
+    if options.is_empty() {
+        bail!("'{question}' has no options to choose from");
+    }
     let req = PromptRequest {
         options: options.clone(),
         closed: true,
@@ -1025,6 +1029,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(NeedsHuman::caused(&err), "{err}");
+    }
+
+    #[test]
+    fn select_closed_with_no_options_is_refused_before_asking() {
+        let prompter = ScriptedPrompter::refusing();
+        let err = select_closed(&prompter, "pick one pm-sc4", Vec::new()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'pick one pm-sc4' has no options to choose from"
+        );
+        assert!(prompter.requests().is_empty());
     }
 
     #[test]

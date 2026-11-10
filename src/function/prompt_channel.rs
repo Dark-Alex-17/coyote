@@ -1247,7 +1247,9 @@ pub(crate) fn parse_request(
             job_id,
             origin,
             help: None,
-            closed: false,
+            // The answer is mapped back to the raw option by index, so a
+            // custom answer could never reach the tool: the select is closed.
+            closed: !raw_options.is_empty(),
         },
         raw_options,
     })
@@ -1684,6 +1686,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         assert_eq!(req.tool.as_deref(), Some("tool-x"));
         assert_eq!(req.call_id.as_deref(), Some("call-1"));
         assert_eq!(req.job_id.as_deref(), Some("job_1"));
+        assert!(req.closed);
 
         for bad in [
             r#"{"coyote_prompt": not-json}"#,
@@ -1708,6 +1711,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             .req;
 
         assert!(req.options.is_empty());
+        assert!(!req.closed);
     }
 
     #[test]
