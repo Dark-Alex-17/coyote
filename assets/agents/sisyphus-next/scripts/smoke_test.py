@@ -2781,9 +2781,25 @@ check("subtasks: the final review lists the user's subtask amendments as settled
       "- subtask 2: vet shadowing is accepted" in fgp and PARENT_AC in fgp, fgp)
 open(os.path.join(UNC, "fix-attempt.go"), "w").write("package usage // broken\n")
 fu = gates.strikeout(dict(fs, last_coder_error="boom"))
+check("subtasks: the final review's diff stat covers the whole task, earlier subtasks' files included",
+      "usage.go" in (fs.get("diff_stat") or "") and "usage.go" in (fs.get("changed_files") or []), fs.get("diff_stat"))
 check("subtasks: a final-review strikeout undoes only the fix attempt, every subtask's uncommitted work kept",
       not os.path.exists(os.path.join(UNC, "fix-attempt.go")) and os.path.exists(os.path.join(UNC, "usage.go"))
       and os.path.exists(os.path.join(UNC, "exhausted.go")) and "refs/sisyphus-next/strikeout/" in (fu.get("strikeout_stash") or ""), fu.get("decisions"))
+open(os.path.join(UNC, "fix-attempt.go"), "w").write("package usage // broken again\n")
+open(os.path.join(UNC, "na\u00efve.go"), "w").write("package usage // quoted path\n")
+fu2 = gates.strikeout(dict(fs, last_coder_error="boom"))
+refs = subprocess.run(["git", "-C", UNC, "for-each-ref", "--format=%(refname)", "refs/sisyphus-next/strikeout/"],
+                      capture_output=True, text=True).stdout.split()
+check("subtasks: a second strikeout gets its own ref (the first attempt stays reachable) and undoes a C-quoted path too",
+      len(refs) == 3 and (fu.get("strikeout_stash") or "").split()[0] in refs and (fu2.get("strikeout_stash") or "").split()[0] in refs
+      and not os.path.exists(os.path.join(UNC, "na\u00efve.go")) and not os.path.exists(os.path.join(UNC, "fix-attempt.go")), refs)
+tr_mid = gates.triage_route(base_state(gauntlet_blockers=["code-review: [convention] naming"], subtasks=SUBS7, subtask_index=2,
+                                       triage=[{"finding": "code-review: [convention] naming", "action": "reject", "citation": "src/a.go:3"}]))
+tr_end = gates.triage_route(base_state(gauntlet_blockers=["code-review: [convention] naming"], subtasks=SUBS7, subtask_index=5, final_review=True,
+                                       triage=[{"finding": "code-review: [convention] naming", "action": "reject", "citation": "src/a.go:3"}]))
+check("subtasks: every blocker rejected with a citation -> the next subtask mid-run, observability at the final review",
+      tr_mid["_next"] == "next_subtask" and tr_end["_next"] == "observability_gate", (tr_mid.get("_next"), tr_end.get("_next")))
 
 single = base_state(subtasks=[{"title": "task", "outcome": "x", "acceptance_criteria": []}], subtask_index=1, spec_text=PARENT_AC,
                     round_heads=[], gauntlet_lanes={})

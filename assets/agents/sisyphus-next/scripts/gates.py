@@ -696,7 +696,7 @@ def next_subtask(state):
         "context_pack_degraded": False, "explore_findings": [], "librarian_findings": [],
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
-        "scope_confirmed": False,
+        "scope_confirmed": False, "subtask_changed_files": None,
     })
     root = state.get("git_root") or state.get("project_dir") or "."
     head = git_out(root, "rev-parse", "HEAD", default="")
@@ -733,6 +733,10 @@ def _start_final_review(state, u, n):
         # a strikeout in the final review's fix rounds resets to the tree all subtasks left, never past it
         "subtask_tree": _worktree_tree(root), "subtask_head": git_out(root, "rev-parse", "HEAD", default=""),
         "subtask_started_at": int(time.time()),
+        # the publish tail and its prompts describe the whole task, not the last subtask
+        "changed_files": changed_files_since(root, base) if base else as_list(state.get("changed_files")),
+        "diff_stat": tail(git_out(root, "diff", "--stat", base) if base else git_out(root, "diff", "--stat", "HEAD"), 3000),
+        "head_sha": git_out(root, "rev-parse", "HEAD", default=state.get("head_sha", "")),
     })
     ledger(state, u, f"subtasks: all {n} reviewed against their own criteria -> one whole-task review over "
                      f"{base or 'the worktree'}..HEAD against the parent task's acceptance criteria")
@@ -1997,7 +2001,10 @@ def strikeout(state):
             and start != git_out(root, "rev-parse", f"{head}^{{tree}}", default=""):
         # the worktree also holds earlier subtasks' uncommitted work: save the failed attempt, undo only its paths
         stash = _save_failed_attempt(state, u, root, start, head)
-    elif dirty:
+        if not stash:
+            ledger(state, u, "strikeout: could not save the failed attempt as a commit; stashing the whole worktree instead "
+                             "(earlier subtasks' uncommitted work is in that stash too)")
+    if dirty and not stash:
         code, out, err = git(root, "stash", "push", "-u", "-m", f"sisyphus-next strikeout {state.get('run_id', '')}")
         stash = out.strip() or err.strip()
     attempts = f"{STRIKE_LIMIT} consecutive failed fix attempts. Last error:\n{state.get('last_coder_error') or ''}"
@@ -2025,20 +2032,30 @@ def _save_failed_attempt(state, u, root, start, head):
     sha = p.stdout.strip() if p.returncode == 0 else ""
     if not sha:
         return ""
-    ref = f"refs/sisyphus-next/strikeout/{state.get('run_id') or 'run'}-{as_int(state.get('subtask_index'))}"
-    git(root, "update-ref", ref, sha)
-    paths = git_out(root, "diff", "--name-only", "--no-renames", start, now, "--", ".", *_plans_exclude(state, root),
-                    default="").splitlines()
+    scope = "final" if truthy(state.get("final_review")) else f"subtask{as_int(state.get('subtask_index'))}"
+    ref = f"refs/sisyphus-next/strikeout/{state.get('run_id') or 'run'}-{scope}-{sha[:12]}"
+    # a new ref per attempt (zero old value: never overwrite), so a second strikeout never orphans the first
+    if git(root, "update-ref", ref, sha, "0" * 40)[0] != 0:
+        return ""
+    code, out, _ = git(root, "diff", "-z", "--name-only", "--no-renames", start, now, "--", ".", *_plans_exclude(state, root))
+    if code != 0:
+        return ""
+    paths = _nul_names(out)
     kept = [x for x in paths if git(root, "cat-file", "-e", f"{start}:{x}")[0] == 0]
-    for x in set(paths) - set(kept):
-        try:
-            os.unlink(os.path.join(root, x))
-        except OSError:
-            pass
-    rc = git(root, "restore", f"--source={start}", "--worktree", "--", *kept)[0] if kept else 0
-    ledger(state, u, f"strikeout: the failed attempt is saved as {ref} ({sha[:12]}); {len(paths)} path(s) put back to the "
+    gone = [x for x in paths if x not in kept]
+    rc = 0
+    if gone:
+        rc |= git(root, "rm", "-q", "--cached", "--ignore-unmatch", "--", *_literal(gone))[0]
+        for x in gone:
+            try:
+                os.unlink(os.path.join(root, x))
+            except OSError:
+                pass
+    if kept:
+        rc |= git(root, "restore", f"--source={start}", "--staged", "--worktree", "--", *_literal(kept))[0]
+    ledger(state, u, f"strikeout: the failed attempt is saved as {ref}; {len(paths)} path(s) put back to the "
                      f"subtask's starting tree, earlier subtasks' uncommitted work kept"
-                     + ("" if rc == 0 else " (the restore failed; see the saved commit)"))
+                     + ("" if rc == 0 else " (the restore did not complete; the saved commit holds the attempt)"))
     return f"{ref} {sha} (recover with: git diff {start} {sha} | git apply)"
 
 
@@ -2158,7 +2175,7 @@ def review_gate(state):
           and not truthy(state.get("final_review"))):
         u["review_skipped_note"] = "review skipped: trivial single-file change with no spec (coder self_review is sufficient)"
         u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
-    elif _subtask_phase(state) and (changed := _subtask_changes(state)) is not None and not _cache_files(u, changed):
+    elif _subtask_phase(state) and not _cache_files(u, changed := _subtask_changes(state)):
         # a read-only or research subtask has nothing to conform; the final whole-task review still checks the parent
         n = as_int(state.get("subtask_index"))
         if changed["pulled"]:
@@ -2183,9 +2200,19 @@ def review_gate(state):
 
 
 def _cache_files(u, changed):
-    """Keep this round's file list for build_gauntlet_prompt (the same worktree, one tree hash per round)."""
-    u["subtask_changed_files"] = list(changed["files"])
-    return changed["files"]
+    """Keep this round's file list for build_gauntlet_prompt (one tree hash per round); True unless nothing changed.
+
+    An unknown result (git could not say) clears the list and counts as changed, so the review runs."""
+    u["subtask_changed_files"] = list(changed["files"]) if changed is not None else None
+    return changed is None or bool(changed["files"])
+
+
+def _nul_names(out):
+    return [n for n in (out or "").split("\0") if n.strip()]
+
+
+def _literal(paths):
+    return [f":(literal){p}" for p in paths]
 
 
 def _plans_exclude(state, root):
@@ -2241,14 +2268,14 @@ def _subtask_changes(state):
     if not start or not now or not head:
         return None
     spec = ["--", ".", *_plans_exclude(state, root)]
-    code, out, _ = git(root, "diff", "--name-only", "--no-renames", start, now, *spec)
+    code, out, _ = git(root, "diff", "-z", "--name-only", "--no-renames", start, now, *spec)
     if code != 0:
         return None
-    files = [f for f in out.splitlines() if f.strip()]
+    files = _nul_names(out)
     result = {"files": files, "pulled": 0, "head": head}
     if files and start_head and head != start_head:
-        moved = git_out(root, "diff", "--name-only", "--no-renames", start_head, head, default="").splitlines()
-        stray = git_out(root, "diff", "--name-only", "--no-renames", head, now, "--", *files, default="x")
+        moved = _nul_names(git_out(root, "diff", "-z", "--name-only", "--no-renames", start_head, head, default=""))
+        stray = git_out(root, "diff", "--name-only", "--no-renames", head, now, "--", *_literal(files), default="x")
         stamps = git_out(root, "log", "--format=%ct", f"{start_head}..{head}", default="").split()
         since = as_int(state.get("subtask_started_at"))
         upstream = git_out(root, "rev-parse", "--verify", "--quiet", "@{upstream}", default="")
@@ -2272,15 +2299,8 @@ def _posture(state):
 # The in-repo planning store (<project_dir>/plans) carries uncommitted handoff
 # and status edits; only changes outside it leave the re-review delta incomplete.
 def _code_tree_dirty(state, root):
-    pathspec = []
-    plans = os.path.join(state.get("project_dir") or root, "plans")
-    if os.path.isdir(plans):
-        try:
-            rel = os.path.relpath(os.path.realpath(plans), os.path.realpath(root))
-        except ValueError:
-            rel = ".."
-        if rel != "." and rel != ".." and not rel.startswith(".." + os.sep):
-            pathspec = ["--", ".", f":(exclude,literal){rel}"]
+    exclude = _plans_exclude(state, root)
+    pathspec = ["--", ".", *exclude] if exclude else []
     return bool(git_out(root, "status", "--porcelain", "--untracked-files=normal", *pathspec))
 
 

@@ -99,7 +99,7 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:1962:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/gates.py:1966:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
 scripts/smoke_test.py:2456:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
 scripts/smoke_test.py:2457:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
@@ -292,13 +292,15 @@ the planning store left out. A subtask that changed nothing (a read-only or rese
 skips its conformance review, so it is never failed for having no implementation. A HEAD that
 moved only by commits that are on the upstream branch and were made before the subtask started,
 the worktree matching it, is a pull: no change. The run base moves past such a pull only while
-no earlier subtask has changed code; after that the pulled commits stay in the whole-task diff.
+no earlier subtask has committed (HEAD still at the run base; uncommitted earlier work stays in
+the diff either way); after that the pulled commits stay in the whole-task diff.
 When nothing commits between subtasks the review's `Diff:` also carries earlier subtasks' work,
 so the prompt names the files this subtask changed.
 
 A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
-attempt as a commit under `refs/sisyphus-next/strikeout/` and puts back only the paths it
-changed; elsewhere it stashes as before. A passed or accepted subtask round goes to
+attempt as a commit under its own `refs/sisyphus-next/strikeout/` ref (never overwritten) and
+puts back only the paths it changed, index included; if that save fails, or elsewhere, it
+stashes as before. A passed or accepted subtask round goes to
 `next_subtask`, never to the publish tail. After the last subtask `next_subtask` starts one
 final whole-task review (`final_review`, the diff from `run_base_sha`, the parent task's
 `spec_text` with the subtask amendments listed as settled rulings, fresh round budgets, and a
