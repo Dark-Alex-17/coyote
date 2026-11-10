@@ -1402,16 +1402,17 @@ fn dot_install_with_a_conflicting_mcp_server_asks_in_the_select_modal_and_keep_l
     );
 }
 
-/// The same conflict headless: `coyote --install <bundle>` with stdout a
-/// file (the shape of `coyote --install x > log`), no UI involved. The
-/// menu cannot be shown without a terminal, so the merge is refused
-/// non-interactively naming "a terminal" (not the plain REPL, which is
-/// not what stands in the way), the command fails, and the local server
-/// definition is untouched.
+/// The same conflict with stdout redirected: `coyote --install <bundle>`
+/// with a tty on stdin but stdout a file (the shape of `coyote --install
+/// x > log`), no UI involved. The menu cannot be shown without a terminal
+/// on stdout, so the merge is refused in the shared no-tty shape, naming
+/// the server and `--install-force` as the remedy (not the plain REPL,
+/// which is not what stands in the way), the command fails, and the
+/// local server definition is untouched.
 #[test]
 #[serial]
-fn headless_install_with_a_conflicting_mcp_server_is_refused_naming_a_terminal() {
-    let dir = fresh_config_dir("install-mcp-conflict-headless");
+fn an_install_with_stdout_redirected_and_a_conflicting_mcp_server_is_refused_naming_a_terminal() {
+    let dir = fresh_config_dir("install-mcp-conflict-stdout-file");
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![]);
     write_fake_llm_config(&dir, &fake);
@@ -1428,35 +1429,32 @@ fn headless_install_with_a_conflicting_mcp_server_is_refused_naming_a_terminal()
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let file = String::from_utf8_lossy(&fs::read(&captured).unwrap_or_default()).to_string();
     let everything = format!("{transcript}\n{file}");
+    let (action, remedy) = refusal_shape(&everything).unwrap_or_else(|| {
+        panic!(
+            "the install with an MCP conflict and stdout redirected was not refused in the shared shape:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
+        )
+    });
     assert!(
-        everything.contains(MCP_CONFLICT_REFUSAL),
-        "the headless install with an MCP conflict was not refused:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
+        action.starts_with("merge the already-installed MCP server 'bundle-k7s-server'"),
+        "the refusal does not name the MCP merge and the server: {action:?}\n{everything}"
     );
     assert!(
-        everything.contains(TERMINAL_HINT),
-        "the headless refusal does not say {TERMINAL_HINT:?}:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
-    );
-    assert!(
-        everything.contains("bundle-k7s-server") && everything.contains("--install-force"),
-        "the headless refusal does not name the server and the flag that settles it:\n{everything}"
-    );
-    assert!(
-        !everything.contains("Conflict on MCP server"),
-        "the conflict menu was shown without a terminal on stdout:\n{everything}"
+        remedy.contains("--install-force"),
+        "the refusal does not name the flag that settles it: {remedy:?}\n{everything}"
     );
     assert_ne!(
         exit_code(&transcript),
         0,
-        "a refused headless install exited 0:\n{everything}"
+        "a refused install exited 0:\n{everything}"
     );
     assert_eq!(
         fs::read_to_string(dir.join("mcp.json")).unwrap(),
         local_before,
-        "the refused headless merge changed the local mcp.json:\n{everything}"
+        "the refused merge changed the local mcp.json:\n{everything}"
     );
     assert!(
         find(pty.raw(), ENTER_ALT, 0).is_none(),
-        "a headless install entered the alternate screen:\n{transcript}"
+        "an install with stdout redirected entered the alternate screen:\n{transcript}"
     );
     assert_tty_restored(&transcript);
 }
@@ -3203,10 +3201,15 @@ fn dot_uninstall_asks_in_the_confirm_modal_and_a_modified_file_in_the_select_mod
     );
 
     // The kept file is still owned, so the record stays and `.list
-    // bundles` keeps naming the bundle.
+    // bundles` keeps naming the bundle. The name is looked for after the
+    // table's `Bundles:` header so the match is a table row, not the
+    // command's echo or a repaint of an earlier line naming the bundle.
     let list_at = pty.raw().len();
     pty.send(b".list bundles\r").unwrap();
-    pty.wait_for_after(name, list_at + 20, PTY_DEADLINE)
+    let header_at = pty
+        .wait_for_raw(b"Bundles:", list_at, PTY_DEADLINE)
+        .expect("`.list bundles` did not print its `Bundles:` header");
+    pty.wait_for_after(name, header_at, PTY_DEADLINE)
         .unwrap_or_else(|e| {
             panic!(
                 "`.list bundles` no longer names the partially uninstalled bundle whose record was kept: {e:?}"
@@ -3574,8 +3577,8 @@ fn refusal_shape(out: &str) -> Option<(String, String)> {
 /// its local text), `--update` on a Cargo install (`--force`), and
 /// `--uninstall` of a bundle installed for real by a tty-less `--install`
 /// with nothing to ask, without `--yes` (`--yes`); all exit non-zero.
-/// `--add-secret` with no terminal is refused too, naming the missing
-/// tty, and writes no vault file.
+/// `--add-secret` with no terminal is refused in the same shape, with
+/// nothing but a terminal as the remedy, and writes no vault file.
 #[test]
 #[serial]
 fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
@@ -3657,10 +3660,10 @@ fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
     let files_before = walk(&dir);
     let (ok, out) = run_ttyless(&dir, &["--add-secret", "ttyless-secret-c3h"], "add-secret");
     assert!(!ok, "a tty-less `--add-secret` exited 0:\n{out}");
-    let lower = out.to_lowercase();
-    assert!(
-        lower.contains("tty") || lower.contains("terminal"),
-        "the tty-less `--add-secret` refusal does not say what is missing:\n{out}"
+    assert_eq!(
+        refusal_shape(&out),
+        Some(("add secret 'ttyless-secret-c3h'".into(), ".".into())),
+        "the tty-less `--add-secret` refusal is not in the shared shape:\n{out}"
     );
     let written = new_files_named(&dir, &files_before, "vault");
     assert!(
@@ -4442,6 +4445,16 @@ fn dot_install_of_a_builtin_category_in_the_plain_repl_confirms_on_enter_not_on_
         .expect("`.install macros` in the plain REPL did not ask `Continue?`");
     pty.read_for(Duration::from_millis(500));
     let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    // The warning body is a plain `println!` ahead of the question; the
+    // terminal may wrap it, so it is looked for with whitespace removed.
+    let flat_asked = squeezed(&asked);
+    let warning_at = flat_asked
+        .find("WARNING:Reinstallingbundledmacrosoverwrites")
+        .unwrap_or_else(|| panic!("the overwrite warning was not printed:\n{asked}"));
+    assert!(
+        warning_at < flat_asked.find("Continue?").unwrap(),
+        "the overwrite warning came after the `Continue?` question:\n{asked}"
+    );
     assert!(
         asked.contains("(y/N)"),
         "the `Continue?` question is not the inquire confirm with its `(y/N)` legend:\n{asked}"

@@ -206,35 +206,60 @@ pub fn ttyless_command(binary: &Path, dir: &Path) -> Command {
 
 /// Runs the binary with no terminal at all (detached, stdin /dev/null,
 /// pipes for stdout/stderr) and returns `(success, stdout+stderr)`,
-/// failing the test if it hangs on a prompt.
+/// failing the test if it has not exited by `PTY_DEADLINE`.
 pub fn run_ttyless(dir: &Path, args: &[&str], what: &str) -> (bool, String) {
     run_ttyless_binary(built_binary(), dir, args, what)
 }
 
 /// [`run_ttyless`] for a copy of the binary living elsewhere (the
 /// self-update path classifies the install by where the executable is).
+/// Both pipes are drained on their own threads while the child runs, so
+/// a chatty child cannot block on a full pipe and be mistaken for a hang;
+/// a child that is still running at the deadline is killed, reaped and
+/// reported with whatever it had written by then.
 pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) -> (bool, String) {
     let mut cmd = ttyless_command(binary, dir);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap();
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             panic!(
-                "{what}: `coyote {}` with no terminal hung on a prompt",
-                args.join(" ")
+                "{what}: `coyote {}` with no terminal did not exit within {PTY_DEADLINE:?}; \
+                 captured so far:\n{}",
+                args.join(" "),
+                both_streams(stdout, stderr)
             );
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-    let out = child.wait_with_output().unwrap();
-    let everything = format!(
+    };
+    (status.success(), both_streams(stdout, stderr))
+}
+
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+fn both_streams(
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+) -> String {
+    format!(
         "--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.success(), everything)
+        String::from_utf8_lossy(&stdout.join().unwrap()),
+        String::from_utf8_lossy(&stderr.join().unwrap())
+    )
 }
 
 pub fn tty_flag_tokens(transcript: &str) -> Vec<&str> {
@@ -565,9 +590,11 @@ pub fn cargo_installed_binary(dir: &Path) -> PathBuf {
     copy
 }
 
-/// Waits for the modal `command` raises after `before`: every squeezed
-/// marker and the modal's `Esc = cancel` legend are on screen and the
-/// terminal was never released.
+/// Waits for the modal `command` raises after `before`: every marker and
+/// the modal's `Esc = cancel` legend are on screen and the terminal was
+/// never released. Markers and screen are compared with all whitespace
+/// removed, so a marker may be written as natural text even though the
+/// modal wraps it.
 pub fn wait_for_the_modal(
     pty: &mut Pty,
     before: usize,
@@ -575,11 +602,17 @@ pub fn wait_for_the_modal(
     modal_markers: &[&str],
 ) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let markers: Vec<String> = modal_markers
+        .iter()
+        .map(|marker| squeezed(marker))
+        .collect();
     let modal = loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         let flat = squeezed(&since);
-        if modal_markers.iter().all(|marker| flat.contains(marker)) && flat.contains("Esc=cancel") {
+        if markers.iter().all(|marker| flat.contains(marker.as_str()))
+            && flat.contains("Esc=cancel")
+        {
             break since;
         }
         assert!(

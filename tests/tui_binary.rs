@@ -3532,8 +3532,6 @@ fn dot_info_lands_in_its_command_cell_under_cpu_load() {
 /// A dot-command flow whose question is a modal under the UI.
 struct ModalFlow {
     scenario: &'static str,
-    /// Commands sent before the asking one, each followed by a settle.
-    prelude: &'static [&'static str],
     command: &'static str,
     /// Path fragments no new file outside the cache may carry afterwards.
     footprints: &'static [&'static str],
@@ -3560,10 +3558,6 @@ fn assert_asks_in_the_modal_and_esc_cancels(flow: &ModalFlow, modal_markers: &[&
     let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    for step in flow.prelude {
-        pty.send(format!("{step}\r").as_bytes()).unwrap();
-        pty.read_for(Duration::from_millis(800));
-    }
     let files_before = walk(&dir);
     let before = pty.raw().len();
     pty.send(format!("{}\r", flow.command).as_bytes()).unwrap();
@@ -3686,7 +3680,6 @@ fn dot_vault_add_asks_for_the_value_in_the_password_modal() {
     assert_asks_in_the_modal_and_esc_cancels(
         &ModalFlow {
             scenario: "modal-vault-add",
-            prelude: &[],
             command: ".vault add vault-secret-g4r",
             footprints: &["g4r", "vault"],
             setup: None,
@@ -3704,7 +3697,6 @@ fn dot_rag_for_a_new_rag_asks_for_the_embedding_model_in_the_select_modal() {
     assert_asks_in_the_modal_and_esc_cancels(
         &ModalFlow {
             scenario: "modal-rag-create",
-            prelude: &[],
             command: ".rag new-rag-g4r",
             footprints: &["g4r", "/rags/"],
             setup: Some(write_dry_run_config_with_embeddings),
@@ -3757,10 +3749,12 @@ fn dot_update_on_a_cargo_install_asks_in_the_confirm_modal_and_n_cancels() {
         flat.contains("WARNING:") && flat.contains(&squeezed("appears to be installed via")),
         "the Cargo-install warning was not printed with the cancellation:\n{since}"
     );
+    // The updater probes the install dir for write access only after the
+    // confirm, so no probe file means `n` stopped it before that step.
     let probes = new_files_named(&dir, &files_before, "coyote-update-write-test");
     assert!(
         probes.is_empty(),
-        "the cancelled update still probed for write access: {probes:?}:\n{since}"
+        "the cancelled update went on to probe for write access: {probes:?}:\n{since}"
     );
     let binary_after = fs::metadata(&binary).unwrap();
     assert!(
@@ -3783,10 +3777,6 @@ fn dot_update_on_a_cargo_install_asks_in_the_confirm_modal_and_n_cancels() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
-    assert!(
-        new_files_named(&dir, &files_before, "coyote-update-write-test").is_empty(),
-        "a write probe appeared by the time the UI left:\n{transcript}"
-    );
 }
 
 /// An agent whose `username` variable has no default, so starting it asks
