@@ -721,3 +721,49 @@ pub fn answer_and_expect_session(mut pty: Pty, key: &[u8], name: &str, empty: bo
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+/// The question `Agent::init` asks when the agent has documents attached,
+/// as the plain REPL has always worded it.
+pub const INIT_RAG_QUESTION: &str = "The agent has documents attached, init RAG?";
+
+/// An agent with one markdown document beside its config, so starting it
+/// asks whether to initialize its RAG.
+pub fn write_agent_with_documents(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("notes.md"),
+        "# Notes\n\nThe probe document for the agent's knowledge base.\n",
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!(
+            "name: {name}\n\
+             description: an agent with documents\n\
+             version: 0.1.0\n\
+             instructions: |\n\
+             \x20 You are an assistant with notes. Reply briefly.\n\
+             documents:\n\
+             \x20 - notes.md\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// The one shape every no-tty refusal has: `Refusing to <action>
+/// non-interactively. Re-run in a terminal<remedy>`. Returns the action
+/// and the remedy, or `None` when no line of `out` has the shape.
+pub fn refusal_shape(out: &str) -> Option<(String, String)> {
+    const HEAD: &str = "Refusing to ";
+    const MIDDLE: &str = " non-interactively. Re-run in a terminal";
+    out.lines().find_map(|line| {
+        let line = line.trim_start_matches("Error: ");
+        let rest = line.strip_prefix(HEAD)?;
+        let at = rest.find(MIDDLE)?;
+        Some((
+            rest[..at].to_string(),
+            rest[at + MIDDLE.len()..].to_string(),
+        ))
+    })
+}
