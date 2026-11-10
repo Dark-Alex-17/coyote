@@ -6081,16 +6081,16 @@ fn seed_rag_with_a_failing_document(dir: &Path, name: &str) -> (PathBuf, String)
     (rag_path, seeded)
 }
 
-/// `.rebuild rag` over a document whose loader fails: in the REPL the
-/// sync asks whether to go on without it; under the UI there is no one to
-/// ask, so the load's warning row is followed by `Aborted` naming the
-/// plain REPL as the way to choose, not by a hidden `Continue?` the UI
-/// would sit on. The rag file is left
+/// `.rebuild rag` over a document whose loader fails: the sync's
+/// `Some documents failed to load. Continue?` is the Confirm modal under
+/// the UI (not a raw-tty `[y/N]` prompt, not an abort naming the plain
+/// REPL); `n` aborts with `Aborted: some documents failed to load` after
+/// the load and warning rows for the document. The rag file is left
 /// exactly as it was, the terminal is never released, and the UI keeps
 /// taking keys and leaves clean.
 #[test]
 #[serial]
-fn dot_rebuild_rag_with_a_failing_document_aborts_naming_the_plain_repl() {
+fn dot_rebuild_rag_with_a_failing_document_asks_continue_in_the_confirm_modal_and_n_aborts() {
     let dir = fresh_config_dir("rebuild-rag-failed-doc");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_a_failing_loader(&dir);
@@ -6104,32 +6104,29 @@ fn dot_rebuild_rag_with_a_failing_document_aborts_naming_the_plain_repl() {
     pty.send(format!(".rag {name}\r").as_bytes()).unwrap();
     pty.read_for(Duration::from_millis(1500));
     let before = pty.raw().len();
-    let sent = std::time::Instant::now();
     pty.send(b".rebuild rag\r").unwrap();
-    let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    let since = loop {
-        pty.read_for(Duration::from_millis(200));
-        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
-        assert!(
-            !since.contains("Continue?"),
-            "the `Some documents failed to load. Continue?` question was painted under the UI:\n{since}"
-        );
-        assert!(
-            !since.contains("No RAG"),
-            "`.rag {name}` did not seat the rag, so the rebuild had nothing to work on:\n{since}"
-        );
-        if squeezed(&since).contains("Aborted") {
-            break since;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "`.rebuild rag` over a failing document neither aborted nor asked within the deadline:\n{since}"
-        );
-    };
-    let took = sent.elapsed();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        before,
+        ".rebuild rag",
+        &["Somedocumentsfailedtoload.Continue?", "y=yes"],
+    );
     assert!(
-        took < Duration::from_secs(10),
-        "the abort took {took:?}; a hidden question was waited on first:\n{since}"
+        !modal.contains("No RAG"),
+        "`.rag {name}` did not seat the rag, so the rebuild had nothing to work on:\n{modal}"
+    );
+    let flat_modal = squeezed(&modal);
+    assert!(
+        !flat_modal.contains("[y/N]") && !flat_modal.contains("(y/N)"),
+        "`Continue?` was asked on the raw tty, not in the modal:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "Aborted: some documents failed to load",
+        "the abort after `n` on the modal",
     );
     pty.read_for(Duration::from_millis(800));
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
@@ -6139,7 +6136,7 @@ fn dot_rebuild_rag_with_a_failing_document_aborts_naming_the_plain_repl() {
     // enough to place it.
     assert!(
         squeezed_since.contains("Load/") && squeezed_since.contains("rebuild-rag-failed-doc"),
-        "the load row for the document was not printed before the abort:\n{since}"
+        "the load row for the document was not printed before the question:\n{since}"
     );
     assert!(
         // The warning row leads with the warning sign (U+26A0).
@@ -6147,12 +6144,8 @@ fn dot_rebuild_rag_with_a_failing_document_aborts_naming_the_plain_repl() {
         "the warning row for the failed document was not printed:\n{since}"
     );
     assert!(
-        squeezed_since.contains(&squeezed("Aborted: some documents failed to load")),
-        "the abort does not say which question it stands in for:\n{since}"
-    );
-    assert!(
-        squeezed_since.contains(&squeezed("Re-run in the plain REPL")),
-        "the abort does not name the plain REPL as the way to choose:\n{since}"
+        !squeezed_since.contains(&squeezed("Re-run in the plain REPL")),
+        "the abort after `n` still names the plain REPL as the way to choose:\n{since}"
     );
     assert!(
         !squeezed_since.contains(&squeezed("Re-run in a terminal")),
@@ -6173,19 +6166,71 @@ fn dot_rebuild_rag_with_a_failing_document_aborts_naming_the_plain_repl() {
         "the aborted rebuild released the terminal:\n{since}"
     );
 
-    let info_at = pty.raw().len();
-    pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
-        .expect("`.info` after the aborted rebuild never rendered");
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert_tty_restored(&transcript);
+    let transcript = assert_ui_alive_then_quit(&mut pty, "the aborted rebuild");
     assert_eq!(
         fs::read_to_string(&rag_path).unwrap(),
         seeded,
         "the rag file changed by the time the UI left:\n{transcript}"
     );
+}
+
+/// `y` on the same modal lets the rebuild go on past the failed
+/// document; with no other document the corpus is empty, so the rebuild
+/// reports `No RAG files` instead of the abort, the rag file is left as
+/// it was, and the UI keeps taking keys and leaves clean.
+#[test]
+#[serial]
+fn dot_rebuild_rag_with_a_failing_document_and_y_goes_on_to_report_the_empty_corpus() {
+    let dir = fresh_config_dir("rebuild-rag-failed-doc-y");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_a_failing_loader(&dir);
+    let name = "kb-r8";
+    let (rag_path, seeded) = seed_rag_with_a_failing_document(&dir, name);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(40, 120).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(format!(".rag {name}\r").as_bytes()).unwrap();
+    pty.read_for(Duration::from_millis(1500));
+    let before = pty.raw().len();
+    pty.send(b".rebuild rag\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        before,
+        ".rebuild rag",
+        &["Somedocumentsfailedtoload.Continue?", "y=yes"],
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "No RAG files",
+        "the empty-corpus report after `y` on the modal",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    assert!(
+        !squeezed(&since).contains(&squeezed("Aborted: some documents failed to load")),
+        "`y` on the modal still aborted the rebuild:\n{since}"
+    );
+    assert!(
+        !since.contains("exit="),
+        "the rebuild over an empty corpus quit the UI:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&rag_path).unwrap(),
+        seeded,
+        "the rebuild over an empty corpus rewrote the rag file:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the rebuild over an empty corpus released the terminal:\n{since}"
+    );
+
+    assert_ui_alive_then_quit(&mut pty, "the rebuild over an empty corpus");
 }
 
 /// A local `mcp.json` holding the bundle's server under a different
