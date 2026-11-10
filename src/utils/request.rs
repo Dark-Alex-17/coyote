@@ -150,7 +150,8 @@ pub async fn fetch_with_loaders(
                     save_file.write_all(&chunk).await?;
                 }
                 let contents = if size == 0 {
-                    println!("{}", warning_text(&format!("No content at '{path}'")));
+                    fetch_warning_sink(JSON_OUTPUT.load(Ordering::SeqCst))
+                        .println(warning_text(&format!("No content at '{path}'")));
                     String::new()
                 } else {
                     run_loader_command(&save_path, &extension, loader_command)?
@@ -487,6 +488,10 @@ fn match_link(path: &str, link: &str) -> bool {
                 .trim_end_matches("/index.htm")
 }
 
+fn fetch_warning_sink(json_output: bool) -> OutputSink {
+    OutputSink::pick(json_output, OutputSink::Stderr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +500,12 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     const TEST_CAP: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_no_content_warning_moves_to_stderr_under_json() {
+        assert_eq!(fetch_warning_sink(false), OutputSink::Stdout);
+        assert_eq!(fetch_warning_sink(true), OutputSink::Stderr);
+    }
 
     async fn serve_raw(head: String, body: Vec<u8>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

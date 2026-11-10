@@ -81,11 +81,6 @@ impl OutputSink {
         if json_output { when_json } else { Self::Stdout }
     }
 
-    /// `pick` against the process-wide `--json` flag.
-    pub fn when_json(sink: OutputSink) -> Self {
-        Self::pick(JSON_OUTPUT.load(Ordering::SeqCst), sink)
-    }
-
     pub fn println(self, line: impl Display) {
         match self {
             Self::Stdout => println!("{line}"),
