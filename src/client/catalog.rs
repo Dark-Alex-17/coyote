@@ -1706,6 +1706,21 @@ rules:
         }
     }
 
+    #[test]
+    fn embedded_catalog_has_no_deepseek_structured_output() {
+        for provider in &embedded_catalog() {
+            for model in &provider.models {
+                assert!(
+                    !(model.name.to_lowercase().contains("deepseek")
+                        && model.supports_structured_output),
+                    "{}:{} supports structured output",
+                    provider.provider,
+                    model.name
+                );
+            }
+        }
+    }
+
     fn provider_entry(provider: &str, model_names: &[&str]) -> ProviderModels {
         ProviderModels {
             provider: provider.to_string(),
