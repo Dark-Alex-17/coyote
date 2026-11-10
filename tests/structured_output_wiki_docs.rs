@@ -58,7 +58,9 @@ fn wiki_dir() -> Option<PathBuf> {
 }
 
 fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 /// The text from the heading line that equals `heading` up to the next
@@ -307,11 +309,24 @@ fn json_section_every_documented_conflicting_flag_is_rejected_by_argument_parsin
         .flat_map(|span| span.split('/').map(str::to_string).collect::<Vec<_>>())
         .filter(|f| f.starts_with('-'))
         .collect();
-    assert!(
-        flags.len() > 40,
-        "parsed only {} flags: {flags:?}",
-        flags.len()
-    );
+    let pinned = [
+        "--execute",
+        "--code",
+        "--dry-run",
+        "--macro",
+        "--acp-server",
+        "--memory-migrate",
+        "--rebuild-rag",
+        "--info",
+        "--list-models",
+        "--delete-secret",
+    ];
+    for flag in pinned {
+        assert!(
+            flags.iter().any(|f| f == flag),
+            "{flag} missing from the conflict list: {flags:?}"
+        );
+    }
     let dir = TempDir::new("conflicts");
     for flag in &flags {
         let mut args = vec!["--json", flag.as_str()];
@@ -387,4 +402,69 @@ fn json_section_failed_run_prints_the_documented_object_with_exit_1() {
         !output.stderr.is_empty(),
         "the usual error line goes to stderr"
     );
+}
+
+#[test]
+fn graph_agents_native_section_pins_the_call_sites_fallback_and_parse_order() {
+    let Some(wiki) = wiki_dir() else { return };
+    let text = section(
+        &read(&wiki.join("Graph-Agents.md")),
+        "### Native structured output",
+    );
+    // Quotes wrap across lines, inside the NOTE block too, so match them on
+    // the text with blockquote markers dropped and whitespace collapsed.
+    let flat = text
+        .lines()
+        .map(|line| line.trim_start().trim_start_matches('>'))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    for call_site in [
+        "`llm` node",
+        "the extraction step",
+        "[session router](#routing)",
+    ] {
+        assert!(text.contains(call_site), "call site {call_site:?} missing");
+    }
+    assert!(text.contains("tools and functions are sent exactly as"));
+
+    let source = read(&repo_root().join("src/graph/structured.rs"));
+    let open = "warn!(\"";
+    let start = source
+        .find(&format!("{open}provider rejected the native"))
+        .expect("src/graph/structured.rs no longer has the native-format rejection warn! literal")
+        + open.len();
+    let warning = &source[start..start + source[start..].find('"').unwrap()];
+    let (prefix, suffix) = warning
+        .split_once("({reason})")
+        .expect("the rejection warning no longer interpolates ({reason})");
+    let quoted = format!("{prefix}(<reason>){suffix}");
+    assert!(
+        flat.contains(&quoted),
+        "section does not quote the warning as logged: {quoted:?}"
+    );
+
+    assert!(text.contains("once more without the format"));
+    assert!(flat.contains("sticks for the rest of that node run"));
+
+    let parsing = &flat[flat
+        .find("**Parsing the reply.**")
+        .expect("the parsing paragraph")..];
+    let positions: Vec<usize> = ["JSON fast path", "extractor", "repair retry"]
+        .iter()
+        .map(|step| {
+            parsing
+                .find(step)
+                .unwrap_or_else(|| panic!("parsing paragraph lacks {step:?}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "parse chain out of order: {positions:?}"
+    );
+
+    assert!(text.contains("declares no"));
+    assert!(text.contains("`additionalProperties: false`"));
+    assert!(flat.contains("Declare `properties` on every object"));
 }

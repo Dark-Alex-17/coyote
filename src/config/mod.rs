@@ -1532,18 +1532,15 @@ clients:
 
     #[test]
     fn config_template_documents_supports_structured_output() {
-        let key = "supports_structured_output: true";
+        let fragment = "#       supports_structured_output: true";
         let example = include_str!("../../config.example.yaml");
-        assert!(CONFIG_TEMPLATE.contains(&format!("\n#       {key}")));
-        assert!(example.contains(&format!("\n  #       {key}")));
+        assert!(CONFIG_TEMPLATE.contains(&format!("\n{fragment}")));
+        assert!(example.contains(&format!("\n  {fragment}")));
         let documented = |text: &str| {
-            text.lines()
-                .find(|line| line.contains(key))
-                .unwrap()
-                .trim()
-                .trim_start_matches('#')
-                .trim()
-                .to_string()
+            let line = text.lines().find(|line| line.contains(fragment)).unwrap();
+            assert!(line.is_ascii(), "{line}");
+            assert!(!line.contains("TASK-"), "{line}"); // debris-exempt
+            line.trim().trim_start_matches('#').trim().to_string()
         };
         assert_eq!(documented(CONFIG_TEMPLATE), documented(example));
     }
