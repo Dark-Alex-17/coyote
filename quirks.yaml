@@ -7,9 +7,6 @@
 # `models:` entries are self-complete. `rules` apply ONLY to API-sourced
 # models, never to hand-owned `models:` entries. Legacy verbatim-preserved
 # entries are grouped under a `# legacy -- pruning candidates` comment.
-#
-# The DeepSeek rules turn off structured output: native strict structured
-# output stops DeepSeek models from calling declared tools.
 
 - provider: openai
   exclude:
@@ -351,6 +348,7 @@
   exclude:
     - "voxtral-*"
   rules:
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*deepseek*"
       supports_structured_output: false
   models:
@@ -555,6 +553,7 @@
       default_reasoning_effort: high
     - match: "claude-sonnet-4-6"
       default_reasoning_effort: high
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*deepseek*"
       supports_structured_output: false
   variants:
@@ -762,6 +761,7 @@
       default_reasoning_effort: high
     - match: "us.anthropic.claude-sonnet-4-6"
       default_reasoning_effort: high
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*deepseek*"
       supports_structured_output: false
   variants:
@@ -888,6 +888,7 @@
   rules:
     - match: "@cf/*"
       require_max_tokens: true
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*deepseek*"
       supports_structured_output: false
   models:
@@ -953,6 +954,7 @@
       patch:
         body:
           enable_thinking: false
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*deepseek*"
       supports_structured_output: false
   variants:
@@ -1044,6 +1046,7 @@
 
 - provider: deepseek
   rules:
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*"
       supports_structured_output: false
   models:
@@ -1212,6 +1215,7 @@
       patch:
         body:
           include_reasoning: true
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*deepseek*"
       supports_structured_output: false
   models:
@@ -1371,6 +1375,7 @@
 
 - provider: deepinfra
   rules:
+    # Native strict structured output stops DeepSeek models from calling declared tools.
     - match: "*deepseek*"
       supports_structured_output: false
   models:

@@ -1300,7 +1300,7 @@ rules:
     }
 
     #[test]
-    fn deepseek_rule_clears_structured_output_after_openrouter_fill() {
+    fn deepseek_rules_clear_structured_output_across_sources() {
         let modelsdev = json!({
             "deepseek": {"models": {"deepseek-v4-flash": {"structured_output": false}}},
             "deepinfra": {"models": {"deepseek-ai/DeepSeek-V4-Flash": {"structured_output": true}}},
