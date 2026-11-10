@@ -242,7 +242,12 @@ check("record_subtasks: empty at the top level -> sizing_verdict [architect, nar
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=0, intent="implementation"))
 check("next_subtask: first -> plan_research, counters reset", u["_next"] == "plan_research" and u["fix_strikes"] == 0 and u["task_number"] == 1 and f"Subtask 1/{SUBTASK_MAX}" in u["current_task"])
 u = gates.next_subtask(base_state(subtasks=subs, subtask_index=SUBTASK_MAX))
-check("next_subtask: B3 exhausted -> final_report", u["_next"] == "final_report")
+check("next_subtask: B3 exhausted on a multi-subtask run -> the one final whole-task review (review_gate)",
+      u["_next"] == "review_gate" and u["final_review"] is True, u)
+u = gates.next_subtask(base_state(subtasks=subs, subtask_index=SUBTASK_MAX, final_review=True))
+check("next_subtask: B3 exhausted after the final review -> final_report", u["_next"] == "final_report")
+u = gates.next_subtask(base_state(subtasks=subs[:1], subtask_index=1))
+check("next_subtask: a single-subtask run has no extra final review -> final_report", u["_next"] == "final_report")
 u = gates.next_subtask(base_state(subtasks=subs[:1], subtask_index=0, intent="trivial"))
 check("next_subtask: trivial skips research -> compose_brief", u["_next"] == "compose_brief")
 
@@ -2492,6 +2497,359 @@ check("route_gauntlet: an empty forged ## Blockers -> triage_findings, not revie
 tabbed = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| adversary | BLOCKED | DIVERGES |\n\n"
           "## Lane selection\n- adversary: always on\n\n## Blockers\n- adversary: DIVERGES - real\n##\tNext\n- not a blocker\n")
 check("_parse_gauntlet: a column-0 ##<TAB> heading ends the Blockers section", gates._parse_gauntlet(tabbed)[4] == ["adversary: DIVERGES - real"])
+
+# ---------------------------------------------------------------- per-subtask review criteria (confirm3 task 7)
+# The parity confirmation split a task into 5 subtasks; subtask 1 was read-only, and every gauntlet round reviewed
+# it against the WHOLE task's acceptance criteria, so the adversary kept reporting "no implementation" until
+# lane_stuck aborted the run. Each subtask is now reviewed against its own criteria, a subtask that changed no code
+# skips its conformance review, the run moves on to the next subtask, and one final review checks the parent criteria.
+SUB_REPO = os.path.join(TMP, "subtask-repo")
+os.makedirs(SUB_REPO)
+
+
+def sub_git(*a):
+    return subprocess.run(["git", "-C", SUB_REPO, *a], check=True, capture_output=True, text=True).stdout.strip()
+
+
+sub_git("init", "-q")
+open(os.path.join(SUB_REPO, "go.mod"), "w").write("module billing\n")
+sub_git("add", ".")
+sub_git("commit", "-q", "-m", "init")
+SUB_BASE = sub_git("rev-parse", "HEAD")
+PARENT_AC = ("- PARENT-AC-1 usage.Service.Current returns the window view\n"
+             "- PARENT-AC-2 usage.Service.Exhausted returns the exhausted features")
+SUBS7 = [
+    {"title": "Sync branch and verify the T3/T6 contracts TASK-007 depends on", "outcome": "the contracts are confirmed",
+     "constraints": "Read-only apart from `git pull`.", "acceptance_criteria": ["`test ! -e usage/usage.go`"]},
+    {"title": "Implement usage.Service and Current", "outcome": "usage/usage.go has Current",
+     "constraints": "", "acceptance_criteria": ["the usage package compiles", "SUB2-AC the usage package passes vet"]},
+    {"title": "Implement Exhausted", "outcome": "Exhausted", "constraints": "", "acceptance_criteria": ["SUB3-AC exhausted"]},
+    {"title": "Tests", "outcome": "tests", "constraints": "", "acceptance_criteria": ["SUB4-AC tests"]},
+    {"title": "Docs", "outcome": "docs", "constraints": "", "acceptance_criteria": ["SUB5-AC docs"]},
+]
+PASS_REPLY = ("GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | MERGE-READY |\n"
+              "| adversary | GREEN | CONFORMS |\n")
+BLOCKED_REPLY = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| adversary | BLOCKED | DIVERGES |\n\n"
+                 "## Lane selection\n- adversary: spec present\n\n## Blockers\n"
+                 "- adversary: DIVERGES -- complaint 1: PARENT-AC-2 Unmet -- usage/usage.go\n")
+
+
+def sub_step(st, *names):
+    for name in names:
+        upd = gates.GATES[name](st)
+        st.update({k: v for k, v in upd.items() if k != "_next"})
+        st["_next"] = upd.get("_next")
+    return st
+
+
+st = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, base_sha=SUB_BASE, head_sha=SUB_BASE, intent="implementation",
+                brief="Implement TASK-007 (usage package: current window view, exhausted rule)", spec_text=PARENT_AC,
+                has_spec=True, subtasks=SUBS7, subtask_index=0, round_heads=[], gauntlet_lanes={})
+sub_step(st, "next_subtask")
+check("subtasks: subtask 1 starts with the run base recorded for the final review",
+      st["_next"] == "plan_research" and st.get("run_base_sha") == SUB_BASE and st.get("subtask_index") == 1, st.get("_next"))
+prompt = gates.render_coder_prompt(dict(st, coder_brief={"context_block": "ctx"}))
+coder_text = prompt.get("coder_prompt") or json.dumps(prompt)
+check("subtasks: the coder sees the parent criteria as context only, its own criteria in ## TASK",
+      "Parent task acceptance criteria (context only" in coder_text and "PARENT-AC-1" in coder_text
+      and "Acceptance criteria (verbatim):" not in coder_text and "`test ! -e usage/usage.go`" in coder_text, coder_text[:600])
+sub_step(st, "review_gate")
+check("subtasks: confirm3 - a read-only first subtask (HEAD == its base, clean tree) skips its conformance review and moves on",
+      st["_next"] == "next_subtask" and not st.get("gauntlet_prompt")
+      and any("changed no code" in d for d in st["decisions"]), st.get("_next"))
+lane_stuck_free = st["_next"] != "build_gauntlet_prompt"
+sub_step(st, "next_subtask")
+check("subtasks: the run goes on to subtask 2 (it no longer ends after subtask 1)",
+      st["_next"] == "plan_research" and st.get("subtask_index") == 2 and "Subtask 2/5" in (st.get("current_task") or "") and st.get("round_heads") == [])
+for i in range(2, 6):
+    start = sub_git("rev-parse", "HEAD")
+    open(os.path.join(SUB_REPO, f"part{i}.go"), "w").write(f"package usage // part {i}\n")
+    sub_git("add", ".")
+    sub_git("commit", "-q", "-m", f"subtask {i}")
+    sub_step(st, "review_gate")
+    routed = st["_next"]
+    sub_step(st, "build_gauntlet_prompt")
+    gp = st["gauntlet_prompt"]
+    own = SUBS7[i - 1]["acceptance_criteria"][-1]
+    check(f"subtasks: subtask {i}'s gauntlet reviews its own criteria over its own diff, never the parent criteria",
+          routed == "build_gauntlet_prompt" and f"Subtask {i}/5" in gp and own in gp and "PARENT-AC" not in gp
+          and st["base_sha"] == start and f"Diff: {start}" in gp and "final whole-task review" in gp, (routed, gp))
+    if i == 2:
+        # a per-subtask round that blocks is fixed within the subtask, as before
+        st["gauntlet_result"] = BLOCKED_REPLY
+        sub_step(st, "route_gauntlet")
+        check("subtasks: a blocked subtask round still goes to triage (nothing weakened per subtask)",
+              st["_next"] == "triage_findings", st.get("_next"))
+        st["round_heads"] = st["round_heads"][:-1]
+        sub_step(st, "build_gauntlet_prompt")
+    st["gauntlet_result"] = PASS_REPLY
+    sub_step(st, "route_gauntlet")
+    check(f"subtasks: subtask {i} passes -> next_subtask, not the publish tail", st["_next"] == "next_subtask", st.get("_next"))
+    sub_step(st, "next_subtask")
+check("subtasks: after the last subtask -> one final whole-task review from the run base",
+      st["_next"] == "review_gate" and st.get("final_review") is True and st["base_sha"] == SUB_BASE
+      and st.get("round_heads") == [] and st.get("review_rounds") == 0 and st.get("lane_block_streak") == {}, st.get("_next"))
+sub_step(st, "review_gate")
+routed = st["_next"]
+sub_step(st, "build_gauntlet_prompt")
+gp = st["gauntlet_prompt"]
+check("subtasks: the final review checks every parent criterion over the whole task diff",
+      routed == "build_gauntlet_prompt" and "PARENT-AC-1" in gp and "PARENT-AC-2" in gp and f"Diff: {SUB_BASE}" in gp
+      and "Subtask " not in gp and "the whole task, all 5 subtasks" in gp, gp)
+st["gauntlet_result"] = BLOCKED_REPLY
+sub_step(st, "route_gauntlet")
+check("subtasks: a parent criterion unmet at the final review blocks -> triage, so the parent criteria stay enforced",
+      st["_next"] == "triage_findings" and any("PARENT-AC-2" in b for b in (st.get("gauntlet_blockers") or [])), st.get("_next"))
+sub_step(st, "triage_route")
+check("subtasks: the final review's fix round keeps the final review (whole-task scope)",
+      st["_next"] == "compose_fix" and st.get("final_review") is True, st.get("_next"))
+st["gauntlet_result"] = PASS_REPLY
+sub_step(st, "route_gauntlet")
+check("subtasks: the final review passes -> the observability / publish tail", st["_next"] == "observability_gate", st.get("_next"))
+check("subtasks: confirm3 can no longer reach lane_stuck through a read-only first subtask",
+      lane_stuck_free and not any("lane_stuck" in d for d in st["decisions"]), st["decisions"][-5:])
+HEAD_NOW = sub_git("rev-parse", "HEAD")
+ro = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, base_sha=HEAD_NOW, subtask_head=HEAD_NOW,
+                subtask_tree=sub_git("rev-parse", "HEAD^{tree}"), subtasks=SUBS7, subtask_index=1, intent="implementation")
+check("subtasks: the final review never takes the read-only skip (the same clean tree skips mid-run)",
+      gates.review_gate(dict(ro, final_review=True))["_next"] == "build_gauntlet_prompt" and gates.review_gate(ro)["_next"] == "next_subtask")
+check("subtasks: a trivial multi-subtask run never skips its final whole-task review",
+      gates.review_gate(dict(ro, final_review=True, intent="trivial", changed_files=["a"]))["_next"] == "build_gauntlet_prompt")
+for kind, ans in (("yellow_findings", "Accept it (recorded)"), ("review_incomplete", "Accept NEEDS-HUMAN"),
+                  ("lane_stuck", "Accept the findings unresolved and proceed"), ("probe_gap", "Surface the gap and proceed")):
+    mid = gates.apply_answer(base_state(escalation=escalation(kind, "q", []), last_answer=ans, subtasks=SUBS7, subtask_index=2))
+    end = gates.apply_answer(base_state(escalation=escalation(kind, "q", []), last_answer=ans, subtasks=SUBS7, subtask_index=5,
+                                        final_review=True))
+    check(f"subtasks: {kind} accepted mid-run -> the next subtask; at the final review -> observability",
+          mid["_next"] == "next_subtask" and end["_next"] == "observability_gate", (mid.get("_next"), end.get("_next")))
+
+# the uncommitted flow: nothing commits between subtasks, so a later subtask's diff carries earlier work
+UNC = os.path.join(TMP, "uncommitted-repo")
+os.makedirs(os.path.join(UNC, "plans"))
+
+
+def unc_git(*a, env=None):
+    return subprocess.run(["git", "-C", UNC, *a], check=True, capture_output=True, text=True,
+                          env={**os.environ, **(env or {})}).stdout.strip()
+
+
+unc_git("init", "-q")
+open(os.path.join(UNC, "main.go"), "w").write("package main\n")
+unc_git("add", "main.go")
+unc_git("commit", "-q", "-m", "init")
+UNC_BASE = unc_git("rev-parse", "HEAD")
+us = base_state(project_dir=UNC, git_root=UNC, base_sha=UNC_BASE, head_sha=UNC_BASE, intent="implementation", spec_text=PARENT_AC,
+                brief="Implement the usage package", subtasks=SUBS7[:3], subtask_index=0, round_heads=[], gauntlet_lanes={})
+sub_step(us, "next_subtask")
+open(os.path.join(UNC, "usage.go"), "w").write("package usage\n")
+open(os.path.join(UNC, "plans", "NOTES.md"), "w").write("notes\n")
+sub_step(us, "review_gate")
+first = us.get("_next")
+sub_step(us, "build_gauntlet_prompt")
+check("subtasks: an uncommitted change (an untracked new file) counts as a code change; plans/ edits never do",
+      first == "build_gauntlet_prompt" and "Files this subtask changed" in us.get("gauntlet_prompt", "")
+      and "usage.go" in us.get("gauntlet_prompt", "") and "NOTES.md" not in us.get("gauntlet_prompt", ""), (first, us.get("gauntlet_prompt")))
+us["gauntlet_result"] = PASS_REPLY
+sub_step(us, "route_gauntlet", "next_subtask")
+open(os.path.join(UNC, "plans", "NOTES.md"), "a").write("more\n")
+sub_step(us, "review_gate")
+check("subtasks: a read-only subtask after an earlier subtask's uncommitted work still skips (content since its own start)",
+      us.get("_next") == "next_subtask" and any("changed no code outside the planning store" in d for d in us["decisions"]), us.get("_next"))
+sub_step(us, "next_subtask")
+open(os.path.join(UNC, "usage.go"), "a").write("func Exhausted() {}\n")
+open(os.path.join(UNC, "exhausted.go"), "w").write("package usage\n")
+sub_step(us, "review_gate", "build_gauntlet_prompt")
+gp3 = us.get("gauntlet_prompt", "")
+listed = [l for l in gp3.splitlines() if l.startswith("Files this subtask changed")]
+check("subtasks: a later subtask's review names only its own files, the earlier uncommitted work called out as such",
+      len(listed) == 1 and "exhausted.go" in listed[0] and "usage.go" in listed[0] and "main.go" not in listed[0]
+      and "earlier subtask's uncommitted work" in listed[0], listed)
+before = open(os.path.join(UNC, "usage.go")).read()
+us_strike = dict(us, last_coder_error="boom")
+upd = gates.strikeout(us_strike)
+after = open(os.path.join(UNC, "usage.go")).read() if os.path.exists(os.path.join(UNC, "usage.go")) else "(stashed away)"
+saved = (upd.get("strikeout_stash") or "").split()
+ref_ok = len(saved) > 1 and subprocess.run(["git", "-C", UNC, "rev-parse", saved[0]], capture_output=True, text=True).stdout.strip() == saved[1]
+check("subtasks: a strikeout saves the failed attempt as a commit and keeps earlier subtasks' uncommitted work in the worktree",
+      after == "package usage\n" and before != after and not os.path.exists(os.path.join(UNC, "exhausted.go"))
+      and ref_ok and any("earlier subtasks' uncommitted work kept" in d for d in upd["decisions"]), (after, upd.get("decisions")))
+recover = subprocess.run(["sh", "-c", f"git diff {us['subtask_tree']} {saved[1]} | git apply"], cwd=UNC, capture_output=True, text=True) if ref_ok else None
+check("subtasks: the saved failed attempt re-applies cleanly on top of the restored worktree (no stash-pop conflict)",
+      recover is not None and recover.returncode == 0 and open(os.path.join(UNC, "usage.go")).read() == before
+      and os.path.exists(os.path.join(UNC, "exhausted.go")), recover and recover.stderr)
+
+# a pull in the read-only first subtask moves HEAD by commits the run did not author
+PULL = os.path.join(TMP, "pull-repo")
+os.makedirs(PULL)
+
+
+def pull_git(*a, env=None):
+    return subprocess.run(["git", "-C", PULL, *a], check=True, capture_output=True, text=True,
+                          env={**os.environ, **(env or {})}).stdout.strip()
+
+
+pull_git("init", "-q")
+open(os.path.join(PULL, "a.go"), "w").write("package a\n")
+pull_git("add", ".")
+pull_git("commit", "-q", "-m", "init")
+PULL_BASE = pull_git("rev-parse", "HEAD")
+pull_git("checkout", "-q", "-b", "upstream")
+open(os.path.join(PULL, "b.go"), "w").write("package a // upstream\n")
+pull_git("add", ".")
+old = {"GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z"}
+pull_git("commit", "-q", "-m", "upstream work", env=old)
+UPSTREAM = pull_git("rev-parse", "HEAD")
+pull_git("checkout", "-q", "-")
+ps0 = base_state(project_dir=PULL, git_root=PULL, base_sha=PULL_BASE, head_sha=PULL_BASE, intent="implementation",
+                 subtasks=SUBS7[:2], subtask_index=0, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={})
+sub_step(ps0, "next_subtask")
+pull_git("merge", "-q", "--ff-only", UPSTREAM)
+check("subtasks: without an upstream branch a HEAD move is never taken for a pull (backdated own commits stay reviewed)",
+      gates.review_gate(ps0)["_next"] == "build_gauntlet_prompt")
+pull_git("reset", "-q", "--hard", PULL_BASE)
+pull_git("branch", "-q", "--set-upstream-to=upstream")
+ps = base_state(project_dir=PULL, git_root=PULL, base_sha=PULL_BASE, head_sha=PULL_BASE, intent="implementation",
+                subtasks=SUBS7[:2], subtask_index=0, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={})
+sub_step(ps, "next_subtask")
+pull_git("merge", "-q", "--ff-only", UPSTREAM)
+sub_step(ps, "review_gate")
+check("subtasks: confirm3's 'read-only apart from git pull' - a fast-forward pull is no code change, and the run base moves past it",
+      ps.get("_next") == "next_subtask" and ps.get("run_base_sha") == UPSTREAM
+      and any("only pulled 1 upstream commit" in d for d in ps["decisions"]), (ps.get("_next"), ps.get("run_base_sha")))
+open(os.path.join(PULL, "c.go"), "w").write("package a // own\n")
+pull_git("add", ".")
+pull_git("commit", "-q", "-m", "own work")
+ps2 = base_state(project_dir=PULL, git_root=PULL, base_sha=UPSTREAM, subtask_head=UPSTREAM, subtask_tree=pull_git("rev-parse", f"{UPSTREAM}^{{tree}}"),
+                 subtask_started_at=int(time.time()) - 3600, subtasks=SUBS7[:2], subtask_index=1, intent="implementation")
+check("subtasks: a commit made during the subtask is its own work, never taken for a pull",
+      gates.review_gate(ps2)["_next"] == "build_gauntlet_prompt")
+OWN = pull_git("rev-parse", "HEAD")
+pull_git("checkout", "-q", "upstream")
+open(os.path.join(PULL, "d.go"), "w").write("package a // more upstream\n")
+pull_git("add", ".")
+pull_git("commit", "-q", "-m", "more upstream", env=old)
+pull_git("merge", "-q", "--no-edit", OWN, env=old)
+UP2 = pull_git("rev-parse", "HEAD")
+pull_git("checkout", "-q", "-")
+ps3 = base_state(project_dir=PULL, git_root=PULL, base_sha=OWN, run_base_sha=UPSTREAM, subtask_head=OWN,
+                 subtask_tree=pull_git("rev-parse", "HEAD^{tree}"), subtask_started_at=int(time.time()) - 60,
+                 subtasks=SUBS7[:2], subtask_index=2, intent="implementation")
+pull_git("merge", "-q", "--ff-only", UP2)
+u3 = gates.review_gate(ps3)
+check("subtasks: a pull after an earlier subtask changed code skips the review but keeps the run base (earlier work starts before it)",
+      u3["_next"] == "next_subtask" and "run_base_sha" not in u3 and u3.get("base_sha") == UP2
+      and any("stay in the whole-task diff" in d for d in u3["decisions"]), u3)
+prior = {"base_sha": "b1", "run_base_sha": "b0", "final_review": False, "subtask_tree": "t1", "subtask_head": "h1",
+         "subtask_started_at": 123, "run_must_not_do": ["Do NOT edit src/x.go"], "subtasks": SUBS7, "subtask_index": 1}
+RID = "20990101T000000-cafef00d"
+os.makedirs(os.path.join(os.environ["SISYPHUS_RUNS_ROOT"], RID), exist_ok=True)
+open(os.path.join(os.environ["SISYPHUS_RUNS_ROOT"], RID, "state.json"), "w").write(json.dumps(prior))
+re_ = gates.intake({"initial_prompt": f"continue\nSisyphus run id: {RID}", "project_dir": REPO})
+check("subtasks: a re-entry carries the subtask snapshot keys, so a resumed read-only subtask still skips its review",
+      all(re_.get(k) == prior[k] for k in ("subtask_tree", "subtask_head", "subtask_started_at", "run_base_sha", "run_must_not_do")),
+      {k: re_.get(k) for k in prior})
+
+# a plan amendment made during a subtask amends that subtask's criterion
+am = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, subtasks=SUBS7, subtask_index=2, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={},
+                escalation=escalation("plan_defect", "q", [option("Stop; the plan needs amending (report it)", True),
+                                                          option("Continue; treat the criterion as amended (state the amendment)")]),
+                last_answer="Continue; treat the criterion as amended: vet warnings about shadowing are accepted")
+upd = gates.apply_answer(am)
+am.update({k: v for k, v in upd.items() if k != "_next"})
+gpa = gates.build_gauntlet_prompt(am)["gauntlet_prompt"]
+check("subtasks: a plan_defect amendment during a subtask reaches that subtask's next gauntlet round, not the parent criteria",
+      upd["_next"] == "build_gauntlet_prompt" and "AMENDED by the user: Continue; treat the criterion as amended: vet warnings" in gpa
+      and "spec_text" not in upd and SUBS7[1].get("amendments") is None, gpa)
+
+# batch cadence: the parent runs the panel, so every subtask moves on and the final review is skipped too
+bs = base_state(subtasks=SUBS7, subtask_index=2, review_cadence="batch")
+check("subtasks: batch cadence -> each subtask on to the next one, the final review to whetstone",
+      gates.review_gate(bs)["_next"] == "next_subtask" and gates.review_gate(dict(bs, final_review=True))["_next"] == "whetstone_gate")
+fs = base_state(project_dir=UNC, git_root=UNC, base_sha=UNC_BASE, run_base_sha=UNC_BASE, brief="Implement the usage package",
+                spec_text=PARENT_AC, subtasks=[dict(SUBS7[0]), dict(SUBS7[1], amendments=["vet shadowing is accepted"]), SUBS7[2]],
+                subtask_index=3, round_heads=[], gauntlet_lanes={}, intent="implementation",
+                run_must_not_do=["Do NOT edit src/teammate.go (serialize: owner)"],
+                coder_brief={"task": "Subtask 3/3", "must_not_do_extra": ["Do NOT touch the CLI"], "skill_nudges": ["code-review"]})
+sub_step(fs, "next_subtask")
+fprompt = gates.render_coder_prompt(dict(fs, fix_instructions="- fix PARENT-AC-2", fix_round=1)).get("coder_prompt", "")
+check("subtasks: the final review's fix coder gets a whole-task brief with every scope guard, never a degraded one",
+      "degraded" not in fprompt and "Do NOT edit src/teammate.go (serialize: owner)" in fprompt and "Do NOT touch the CLI" in fprompt
+      and "Whole-task fix scope" in fprompt and "Implement the usage package" in fprompt
+      and "Acceptance criteria (verbatim):" in fprompt, fprompt[:800])
+fgp = gates.build_gauntlet_prompt(fs)["gauntlet_prompt"]
+check("subtasks: the final review lists the user's subtask amendments as settled rulings, the parent criteria unchanged",
+      "- subtask 2: vet shadowing is accepted" in fgp and PARENT_AC in fgp, fgp)
+open(os.path.join(UNC, "fix-attempt.go"), "w").write("package usage // broken\n")
+fu = gates.strikeout(dict(fs, last_coder_error="boom"))
+check("subtasks: the final review's diff stat covers the whole task, earlier subtasks' files included",
+      "usage.go" in (fs.get("diff_stat") or "") and "usage.go" in (fs.get("changed_files") or []), fs.get("diff_stat"))
+check("subtasks: a final-review strikeout undoes only the fix attempt, every subtask's uncommitted work kept",
+      not os.path.exists(os.path.join(UNC, "fix-attempt.go")) and os.path.exists(os.path.join(UNC, "usage.go"))
+      and os.path.exists(os.path.join(UNC, "exhausted.go")) and "refs/sisyphus-next/strikeout/" in (fu.get("strikeout_stash") or ""), fu.get("decisions"))
+open(os.path.join(UNC, "fix-attempt.go"), "w").write("package usage // broken again\n")
+open(os.path.join(UNC, "na\u00efve.go"), "w").write("package usage // quoted path\n")
+fu2 = gates.strikeout(dict(fs, last_coder_error="boom"))
+refs = subprocess.run(["git", "-C", UNC, "for-each-ref", "--format=%(refname)", "refs/sisyphus-next/strikeout/"],
+                      capture_output=True, text=True).stdout.split()
+check("subtasks: a second strikeout gets its own ref (the first attempt stays reachable) and undoes a C-quoted path too",
+      len(refs) == 3 and (fu.get("strikeout_stash") or "").split()[0] in refs and (fu2.get("strikeout_stash") or "").split()[0] in refs
+      and not os.path.exists(os.path.join(UNC, "na\u00efve.go")) and not os.path.exists(os.path.join(UNC, "fix-attempt.go")), refs)
+fr = base_state(subtasks=SUBS7, subtask_index=5, final_review=True, final_rejections_from=1, round_heads=[{"round": 1, "head": "h"}],
+                rejected_findings=["rejected-finding: a later subtask delivers Exhausted -- src/a.go:3",
+                                   "rejected-finding: naming -- src/b.go:9"], spec_text=PARENT_AC, gauntlet_lanes={})
+fru = gates.build_gauntlet_prompt(fr)
+check("subtasks: rejections made against a subtask's scope are no settled ruling at the final review; its own ones are",
+      "later subtask delivers" not in fru["gauntlet_prompt"] and "later subtask delivers" not in fru["prior_review_decisions"]
+      and "naming -- src/b.go:9" in fru["prior_review_decisions"]
+      and "later subtask delivers" in gates.build_gauntlet_prompt(dict(fr, final_review=False, subtask_index=2))["prior_review_decisions"], fru)
+check("subtasks: a final review without parent criteria answers to every subtask's own criteria",
+      "- subtask 2: SUB2-AC the usage package passes vet" in gates.build_gauntlet_prompt(dict(fr, spec_text=""))["gauntlet_prompt"])
+check("subtasks: a skipped read-only subtask is named in skipped_reviews for the final report",
+      any(x.startswith("subtask 1: no code change") for x in st.get("skipped_reviews") or []), st.get("skipped_reviews"))
+check("subtasks: the tree snapshot's git calls stay under the 30 s script-node default", 2 * getattr(gates, "WORKTREE_TREE_SECS", 30) < 30)
+real_tree = getattr(gates, "_worktree_tree", lambda root: "")
+gates._worktree_tree = lambda root: ""
+unk = gates.review_gate(dict(ro, subtask_changed_files=["stale.go"]))
+gates._worktree_tree = real_tree
+check("subtasks: an unknown change check runs the review and clears a stale file list",
+      unk["_next"] == "build_gauntlet_prompt" and unk.get("subtask_changed_files") is None, unk)
+open(os.path.join(UNC, "fail-save.go"), "w").write("package usage // cannot be saved\n")
+fsave = dict(fs, last_coder_error="boom", subtask_tree=real_tree(UNC), subtask_head=subprocess.run(
+    ["git", "-C", UNC, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip())
+open(os.path.join(UNC, "fail-save-2.go"), "w").write("package usage // more\n")
+gates._worktree_tree = lambda root: ""
+fb = gates.strikeout(fsave)
+gates._worktree_tree = real_tree
+check("subtasks: a strikeout whose save fails falls back to the stash and says so, never 'worktree was clean'",
+      any("could not save the failed attempt" in d for d in fb["decisions"]) and fb.get("strikeout_stash")
+      and not any("worktree was clean" in d for d in fb["decisions"]), fb.get("decisions"))
+subprocess.run(["git", "-C", UNC, "stash", "pop", "-q"], capture_output=True)
+for f in ("fail-save.go", "fail-save-2.go"):
+    if os.path.exists(os.path.join(UNC, f)):
+        os.unlink(os.path.join(UNC, f))
+pre = dict(fs, last_coder_error="boom", subtask_tree=real_tree(UNC), subtask_head=fsave["subtask_head"])
+open(os.path.join(UNC, "attempt.go"), "w").write("package usage // attempt\n")
+os.makedirs(os.path.join(UNC, "plans"), exist_ok=True)
+open(os.path.join(UNC, "plans", "NOTES.md"), "a").write("handoff edit during the attempt\n")
+pu = gates.strikeout(pre)
+hint = next((d.split("recover the failed attempt with: ", 1)[1] for d in pu["decisions"] if "recover the failed attempt with" in d), "")
+rec = subprocess.run(["sh", "-c", hint], cwd=UNC, capture_output=True, text=True) if hint else None
+check("subtasks: the recovery hint re-applies the attempt even after the planning store changed (plans/ excluded, binary-safe)",
+      bool(hint) and "--binary" in hint and rec is not None and rec.returncode == 0 and os.path.exists(os.path.join(UNC, "attempt.go")),
+      (hint, rec and rec.stderr))
+tr_mid = gates.triage_route(base_state(gauntlet_blockers=["code-review: [convention] naming"], subtasks=SUBS7, subtask_index=2,
+                                       triage=[{"finding": "code-review: [convention] naming", "action": "reject", "citation": "src/a.go:3"}]))
+tr_end = gates.triage_route(base_state(gauntlet_blockers=["code-review: [convention] naming"], subtasks=SUBS7, subtask_index=5, final_review=True,
+                                       triage=[{"finding": "code-review: [convention] naming", "action": "reject", "citation": "src/a.go:3"}]))
+check("subtasks: every blocker rejected with a citation -> the next subtask mid-run, observability at the final review",
+      tr_mid["_next"] == "next_subtask" and tr_end["_next"] == "observability_gate", (tr_mid.get("_next"), tr_end.get("_next")))
+
+single = base_state(subtasks=[{"title": "task", "outcome": "x", "acceptance_criteria": []}], subtask_index=1, spec_text=PARENT_AC,
+                    round_heads=[], gauntlet_lanes={})
+gp1 = gates.build_gauntlet_prompt(single)["gauntlet_prompt"]
+single_ok = ("PARENT-AC-1" in gp1 and "Subtask " not in gp1 and "Scope:" not in gp1
+             and gates.route_gauntlet(dict(single, gauntlet_result=PASS_REPLY, round_heads=[{}]))["_next"] == "observability_gate")
+check("subtasks: a single-subtask run is reviewed against the task's criteria as before, PASS -> observability", single_ok, gp1)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

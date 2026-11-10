@@ -56,7 +56,7 @@ Recorded census against the staging tree (files that differ; hunks per file as c
 `diff -u <staging file> <file> | grep -c '^@@'`):
 
 ```
-graph.yaml                      27 hunks (variables: build_lock, pr_tracking; the max_loop_iterations comment counts SUBTASK_MAX (6) subtasks; initial_state oracle_retries seed + debt_hits comment and manual fallback pipeline; initial_state debris_exemptions_new; initial_state review-watch seeds: ci_polls_run, pr_ref and the pr_review_* counters and lists, pr_review_untrusted, pr_review_reply_pending, the pr_review_perms cache and pr_review_truncated included; assess_fault fallback edge; build_lock and project_dir inputs on run_coder; debt_scan fallback; build_lock and project_dir inputs on run_gauntlet; triage_findings schema property rename; git_ops instructions em dashes, 2 lines; ci_poll timeout from 120 to 180 with its CI_POLL_SLEEP + GH_CALL_SECS comment; new ci_route timeout 300 with its CI_LOG_RUNS_MAX * GH_CALL_SECS + 30 comment; ci_apply timeout from 120 to 300 with the same comment + new pr_review_poll (timeout 900, with its REVIEW_POLL_SLEEP + GH_CALL_SECS + REVIEW_PERM_SECS + 90 comment), pr_review_route, pr_review_triage (llm, own output_schema, comment bodies framed as untrusted data), pr_review_apply, pr_review_resolve (timeout 600) and pr_review_reply (timeout 600) nodes; build_lock inputs on run_step; the session report exposes discussion; the bare go-ahead and discussion continue sentences in the route instructions; carry: discussion_run_id; the handoff_path, draft_* and assess_faulted seeds; the sizing_reason, subtask_estimate, proposed_breakdown, sizing_rounds, sizing_note, architect_handoff and handoff_report seeds; the reply_* , choice_parks, discussion, discussion_run_id, discussion_message and settled_answer seeds; the intake description names the continue re-entry, the handoff pickup and the drafted brief, and the confirm_handoff, draft_brief, draft_route, draft_fault, confirm_draft and draft_edit nodes; the assess sizing verdict instructions (at most 6 subtasks, unsure sizing stays compound) and its sizing_reason, subtask_estimate and proposed_breakdown schema properties; the route_intent and record_subtasks descriptions name the sizing verdict, and plan_subtasks takes at most 6 subtasks and reads the sizing note; the ask_choice_2, ask_choice_3 and ask_choice_4 approval nodes; the parse_answer description names the interpretation and the multiple-choice picks, the interpret_reply option names the exact text, and the interpret_route, choice_park, choice_resume and choice_reask nodes; the end_handoff and end_discussion terminal nodes)
+graph.yaml                      27 hunks (variables: build_lock, pr_tracking; the max_loop_iterations comment counts SUBTASK_MAX (6) subtask reviews plus the final whole-task review; initial_state oracle_retries seed + debt_hits comment and manual fallback pipeline; initial_state debris_exemptions_new; initial_state review-watch seeds: ci_polls_run, pr_ref and the pr_review_* counters and lists, pr_review_untrusted, pr_review_reply_pending, the pr_review_perms cache and pr_review_truncated included; assess_fault fallback edge; build_lock and project_dir inputs on run_coder; debt_scan fallback; build_lock and project_dir inputs on run_gauntlet; triage_findings schema property rename; git_ops instructions em dashes, 2 lines; ci_poll timeout from 120 to 180 with its CI_POLL_SLEEP + GH_CALL_SECS comment; new ci_route timeout 300 with its CI_LOG_RUNS_MAX * GH_CALL_SECS + 30 comment; ci_apply timeout from 120 to 300 with the same comment + new pr_review_poll (timeout 900, with its REVIEW_POLL_SLEEP + GH_CALL_SECS + REVIEW_PERM_SECS + 90 comment), pr_review_route, pr_review_triage (llm, own output_schema, comment bodies framed as untrusted data), pr_review_apply, pr_review_resolve (timeout 600) and pr_review_reply (timeout 600) nodes; build_lock inputs on run_step; the session report exposes discussion; the bare go-ahead and discussion continue sentences in the route instructions; carry: discussion_run_id; the handoff_path, draft_* and assess_faulted seeds; the sizing_reason, subtask_estimate, proposed_breakdown, sizing_rounds, sizing_note, architect_handoff and handoff_report seeds; the reply_* , choice_parks, discussion, discussion_run_id, discussion_message and settled_answer seeds; the intake description names the continue re-entry, the handoff pickup and the drafted brief, and the confirm_handoff, draft_brief, draft_route, draft_fault, confirm_draft and draft_edit nodes; the assess sizing verdict instructions (at most 6 subtasks, unsure sizing stays compound) and its sizing_reason, subtask_estimate and proposed_breakdown schema properties; the route_intent and record_subtasks descriptions name the sizing verdict, and plan_subtasks takes at most 6 subtasks and reads the sizing note; the ask_choice_2, ask_choice_3 and ask_choice_4 approval nodes; the parse_answer description names the interpretation and the multiple-choice picks, the interpret_reply option names the exact text, and the interpret_route, choice_park, choice_resume and choice_reask nodes; the end_handoff and end_discussion terminal nodes)
 scripts/_lib.py                 8 hunks  (the GH_CALL_SECS, CI_LOG_RUNS_MAX, REVIEW_POLL_SLEEP, REVIEW_MAX_POLLS, REVIEW_WALL_SECS, REVIEW_MAX_ROUNDS, REVIEW_CI_POLL_BUDGET, REVIEW_CI_POLL_CEILING, RESOLVE_DEADLINE_SECS and REVIEW_PERM_SECS bounds, with DISCUSSION_PARKS_MAX and DRAFT_ROUNDS_MAX; SUBTASK_MAX 6 and CHOICE_OPTIONS_MIN / CHOICE_OPTIONS_MAX; new cache_dir + runs_root docstring and base path, one hunk; run-dir permissions: ensure_run_dir 0700, the _open_private helper (binary descriptor, bare newline endings, descriptor closed if fdopen fails), write_artifact / append_artifact 0600; CONTINUE_RE, the go-ahead vocabulary (GO_AHEAD_WORDS_MAX, GO_WORDS, GO_AHEAD_FILLER), RUN_VARIABLES and bare_go_ahead; render_question lists a multiple-choice escalation's options under the static choice_label labels; raise_escalation resets reply_interpreted; the handoff frontmatter helpers read_file, frontmatter and set_frontmatter)
 scripts/audit_graph.py          6 hunks  (docstring: entry scripts name a GATES key equal to their file stem; the route_intent and record_subtasks BOUNDED entries name SUBTASK_MAX 6 and the sizing verdict bound; the ci_poll BOUNDED entry names REVIEW_CI_POLL_CEILING + BOUNDED entries for pr_review_poll and pr_review_route; the apply_answer BOUNDED entry names DRAFT_ROUNDS_MAX + BOUNDED entries for interpret_route and choice_park; new gate_names over the GATES dict; the terminal prompts read from _TERMINAL_PROMPTS; known_gates collected once; the unknown-gate and gate-not-stem problems)
 scripts/check_session_block.sh  1 hunk   (GRAPH_ONLY_VARS: pr_tracking left out of the variable mirror and named in its ok line)
@@ -99,9 +99,9 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:1858:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:2451:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:2452:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/gates.py:1978:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:2456:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:2457:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
@@ -277,6 +277,37 @@ architect and narrow options, while a delegated one ends at `end_redirect`. `siz
 bounds the verdicts at `CLARIFY_MAX` (3) per run, after which the work is redirected. The
 wrapper's ignored `choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages` tail
 turns the key rows red.
+
+## Per-subtask review and the final whole-task review
+
+A compound run works through its sealed subtasks one at a time. Each subtask's review round
+checks that subtask's own outcome, constraints, acceptance criteria and any amendment the user
+made to them (`build_gauntlet_prompt` writes them as the `Plan / acceptance criteria:` block,
+with a scope line saying later subtasks deliver the rest), and the coder sees the parent task's
+criteria as context only.
+
+`next_subtask` records the worktree's tree when a subtask starts (`subtask_tree`, uncommitted
+earlier work included; re-entry carries it), and the change check compares content against it,
+the planning store left out. A subtask that changed nothing (a read-only or research step)
+skips its conformance review, so it is never failed for having no implementation. A HEAD that
+moved only by commits that are on the upstream branch and were made before the subtask started,
+the worktree matching it, is a pull: no change. The run base moves past such a pull only while
+no earlier subtask has committed (HEAD still at the run base; uncommitted earlier work stays in
+the diff either way); after that the pulled commits stay in the whole-task diff.
+When nothing commits between subtasks the review's `Diff:` also carries earlier subtasks' work,
+so the prompt names the files this subtask changed.
+
+A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
+attempt as a commit under its own `refs/sisyphus-next/strikeout/` ref (never overwritten) and
+puts back only the paths it changed, index included; if that save fails, or elsewhere, it
+stashes as before. A passed or accepted subtask round goes to
+`next_subtask`, never to the publish tail. After the last subtask `next_subtask` starts one
+final whole-task review (`final_review`, the diff from `run_base_sha`, the parent task's
+`spec_text` with the subtask amendments listed as settled rulings, fresh round budgets, and a
+whole-task coder brief carrying every scope guard the subtasks collected) through
+`review_gate`; only that review goes on to the observability pass and publishing, so every
+parent acceptance criterion is still enforced. A single-subtask run is reviewed against the
+task's criteria once, as before.
 
 ## Verify
 

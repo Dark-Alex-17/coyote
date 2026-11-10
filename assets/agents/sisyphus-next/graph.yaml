@@ -71,7 +71,8 @@ variables:
 settings:
   # Engine backstop only: every cycle carries its own named bound in a script. Worst legitimate visit count of the most-visited node
   # (run_gauntlet: 1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
-  # per subtask, x6 subtasks (SUBTASK_MAX) = 36); user-driven review retries ride the headroom.
+  # per review, x7 reviews (SUBTASK_MAX subtasks + the final whole-task review) = 42); user-driven review retries
+  # ride the headroom.
   max_loop_iterations: 100
   log_state_snapshots: true
   validate_before_run: true
@@ -181,6 +182,14 @@ initial_state:
   # --- subtasks (A11) ---
   subtasks: []
   subtask_index: 0
+  run_base_sha: ''
+  final_review: false
+  subtask_tree: ''
+  subtask_head: ''
+  subtask_started_at: null
+  subtask_changed_files: null
+  run_must_not_do: []
+  final_rejections_from: null
   current_task: ''
   task_number: 0
   # --- sizing verdict (plan-shaped work asked, not refused) ---
@@ -768,7 +777,7 @@ nodes:
   next_subtask:
     id: next_subtask
     type: script
-    description: Pop the next subtask (B3, list-bounded) or finish.
+    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish.
     script: scripts/next_subtask.py
     fallback: end_failure
 
@@ -1649,7 +1658,7 @@ nodes:
   strikeout:
     id: strikeout
     type: script
-    description: 3-strike rule - STOP, stash the broken state (recoverable), DOCUMENT, then CONSULT Oracle.
+    description: 3-strike rule - STOP, set the broken state aside (a stash, or a saved strikeout ref; recoverable), DOCUMENT, then CONSULT Oracle.
     script: scripts/strikeout.py
     timeout: 60
     fallback: end_failure
@@ -1662,7 +1671,7 @@ nodes:
     description: Consult Oracle with the full failure context (step 4 of the 3-strike rule).
     prompt: |
       Three consecutive fix attempts failed on the same problem; the broken
-      state was stashed. Diagnose and propose a resolution the coder can apply
+      state was set aside (stashed, or saved under refs/sisyphus-next/strikeout/). Diagnose and propose a resolution the coder can apply
       in one round, or say plainly that you cannot resolve it.
 
       ## Task
@@ -1764,7 +1773,7 @@ nodes:
   review_gate:
     id: review_gate
     type: script
-    description: batch cadence skips the panel (the parent owns it); trivial one-file no-spec work skips with a note; else the gauntlet.
+    description: batch cadence skips the panel (the parent owns it); trivial one-file no-spec work skips with a note; a subtask that changed no code skips its conformance review; else the gauntlet. A skipped subtask goes on to the next one.
     script: scripts/review_gate.py
     fallback: end_failure
 
