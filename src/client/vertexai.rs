@@ -487,10 +487,10 @@ pub fn gemini_build_chat_completions_body(
                         } else {
                             let mut turns = vec![
                                 json!({ "role": "model", "parts": model_parts }),
-                                json!({ "role": "function", "parts": function_parts }),
+                                json!({ "role": "user", "parts": function_parts }),
                             ];
-                            // Gemini rejects image parts inside the function turn, so
-                            // tool images follow it in their own user turn.
+                            // Gemini rejects image parts inside the function-response turn,
+                            // so tool images follow it in their own user turn.
                             if !image_parts.is_empty() {
                                 turns.push(json!({ "role": "user", "parts": image_parts }));
                             }
@@ -775,7 +775,7 @@ mod tests {
         ]);
 
         let function_content = &body["contents"][2];
-        assert_eq!(function_content["role"], "function", "body: {body}");
+        assert_eq!(function_content["role"], "user", "body: {body}");
         assert_eq!(
             function_content["parts"],
             json!([function_response_json(), function_response_json()]),
@@ -792,6 +792,24 @@ mod tests {
             "body: {body}"
         );
         assert_eq!(body["contents"].as_array().unwrap().len(), 4, "body: {body}");
+    }
+
+    #[test]
+    fn gemini_plain_tool_result_round_sends_function_responses_in_a_user_turn() {
+        let body = gemini_body_for(vec![fs_read_result("call_A")]);
+
+        assert_eq!(
+            body["contents"],
+            json!([
+                { "role": "user", "parts": [{ "text": "hello" }] },
+                {
+                    "role": "model",
+                    "parts": [{ "functionCall": { "name": "fs_read", "args": { "path": "x" } } }],
+                },
+                { "role": "user", "parts": [function_response_json()] },
+            ]),
+            "body: {body}"
+        );
     }
 
     #[test]
