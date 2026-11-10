@@ -501,6 +501,34 @@ mod tests {
         assert!(!store.has_secrets_file());
     }
 
+    /// A run with no human refuses the secret value with the typed
+    /// password refusal, draws nothing on the terminal and writes no
+    /// vault file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn headless_add_secret_is_a_typed_password_refusal_with_nothing_on_stdout() {
+        let store = TempVault::new("headless");
+        let (saved, mut reader) = crate::testing::capture_stdout();
+
+        let err = store
+            .vault
+            .add_secret("never", &HeadlessPrompter)
+            .unwrap_err();
+
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(
+            matches!(
+                err.root_cause().downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Password))
+            ),
+            "{err:#}"
+        );
+        assert!(!store.has_secrets_file());
+    }
+
     #[test]
     fn secret_re_matches_double_braces() {
         let captures = SECRET_RE.captures("{{MY_SECRET}}").unwrap().unwrap();

@@ -314,14 +314,27 @@ mod tests {
         );
     }
 
+    /// A run with no human refuses the conflict menu with the typed
+    /// select refusal and draws nothing on the terminal.
+    #[cfg(unix)]
     #[test]
     #[serial]
-    fn select_choice_with_no_human_is_refused() {
+    fn headless_select_choice_is_a_typed_select_refusal_with_nothing_on_stdout() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (saved, mut reader) = crate::testing::capture_stdout();
 
         let err = select_choice("Conflict on example.yaml", &HeadlessPrompter).unwrap_err();
 
-        assert!(NeedsHuman::caused(&err), "{err:#}");
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(
+            matches!(
+                err.root_cause().downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Select))
+            ),
+            "{err:#}"
+        );
     }
 
     #[test]

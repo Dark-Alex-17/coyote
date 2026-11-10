@@ -3340,6 +3340,29 @@ mod tests {
         assert_eq!(req.help, None);
     }
 
+    /// A run with no human refuses the host question with the typed
+    /// input refusal and draws nothing on the terminal.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn headless_ask_qdrant_host_is_a_typed_input_refusal_with_nothing_on_stdout() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (saved, mut reader) = crate::testing::capture_stdout();
+
+        let err = ask_qdrant_host(&HeadlessPrompter).unwrap_err();
+
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(
+            matches!(
+                err.root_cause().downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Input))
+            ),
+            "{err:#}"
+        );
+    }
+
     /// The API key question is a confirm defaulting to yes; `yes` is
     /// followed by the secret name input defaulting to `QDRANT_API_KEY`,
     /// `no` ends the question with no secret name.
