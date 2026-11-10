@@ -7391,10 +7391,7 @@ impl RequestContext {
                 // `Rag::init` refuses the same way, but only after the
                 // previous temp rag is gone; refusing first keeps it.
                 if !crate::config::conflict::menu_can_use_terminal() {
-                    return Err(crate::config::conflict::refuse_non_interactive(
-                        format_args!("initialize RAG knowledge base '{}'", super::TEMP_RAG_NAME),
-                        ".",
-                    ));
+                    return Err(Rag::refuse_init(super::TEMP_RAG_NAME));
                 }
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
                 if rag_path.exists() {

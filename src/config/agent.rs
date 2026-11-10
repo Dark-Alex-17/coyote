@@ -406,9 +406,18 @@ impl Agent {
                     true,
                 ) {
                     Ok(answer) => answer,
-                    Err(e) if NeedsHuman::caused(&e) => false,
+                    Err(e) if NeedsHuman::caused(&e) => {
+                        debug!(
+                            "Agent '{name}' has documents but no human to ask about RAG; starting without it"
+                        );
+                        false
+                    }
                     Err(e) => return Err(e),
                 };
+            } else {
+                debug!(
+                    "Agent '{name}' has documents but no terminal to ask about RAG; starting without it"
+                );
             }
             if ans {
                 let document_paths =
@@ -1432,7 +1441,7 @@ async fn init_graph_rags(
                         format_args!(
                             "build the knowledge base for rag node '{node_id}' of agent '{agent_name}'"
                         ),
-                        ". Set `embedding_model`, `chunk_size`, and `chunk_overlap` on the node, or run the agent once interactively.",
+                        ", or set `embedding_model`, `chunk_size`, and `chunk_overlap` on the node.",
                     ));
                 }
 
@@ -1440,7 +1449,10 @@ async fn init_graph_rags(
                     prompter.as_ref(),
                     format!("Initialize RAG knowledge base for rag node '{node_id}'?"),
                     true,
-                )?;
+                )
+                .with_context(|| {
+                    format!("rag node '{node_id}' of agent '{agent_name}' needs its knowledge base built")
+                })?;
 
                 if !ans {
                     bail!(
@@ -2864,12 +2876,54 @@ nodes: {}
         );
         assert!(
             message.contains(
-                "non-interactively. Re-run in a terminal. Set `embedding_model`, `chunk_size`, \
-                 and `chunk_overlap` on the node, or run the agent once interactively."
+                "non-interactively. Re-run in a terminal, or set `embedding_model`, \
+                 `chunk_size`, and `chunk_overlap` on the node."
             ),
             "got: {message}"
         );
         assert!(prompter.requests().is_empty());
+    }
+
+    /// With a terminal but no human the rag node confirm is refused; the
+    /// refusal names the node and agent so a log reader knows what to
+    /// build.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_headless_run_with_an_unbuilt_rag_node_names_the_node_in_the_refusal() {
+        let _guard = TestConfigDirGuard::new("agent-rag-node-headless");
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let name = unique("rag_node_headless");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: lookup\nnodes:\n  lookup:\n    type: rag\n    documents: [notes.md]\n    next: done\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::new(HeadlessPrompter),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "rag node 'lookup' of agent '{name}' needs its knowledge base built"
+            )),
+            "{err:#}"
+        );
     }
 
     fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {

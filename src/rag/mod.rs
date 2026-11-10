@@ -16,7 +16,7 @@ use self::provider::RagProvider;
 use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
 use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::hooks::RagSyncHooks;
-use crate::prompt::{Prompter, confirm, input, reask, select_closed};
+use crate::prompt::{Prompter, confirm, confirm_with_help, input, reask, select_closed};
 use crate::sandbox::mcp_credentials;
 use crate::vault::{Vault, interpolate_secrets};
 
@@ -147,6 +147,11 @@ pub struct RagInitRun<'a> {
 impl Rag {
     fn create_embeddings_client(&self, model: Model) -> Result<Box<dyn Client>> {
         init_client(&self.app_config, model)
+    }
+
+    /// The refusal for a knowledge base nothing can ask about.
+    pub(crate) fn refuse_init(name: &str) -> anyhow::Error {
+        refuse_non_interactive(format_args!("initialize RAG knowledge base '{name}'"), ".")
     }
 
     pub async fn init_with_config(
@@ -303,10 +308,7 @@ impl Rag {
             prompter,
         } = run;
         if !menu_can_use_terminal() {
-            return Err(refuse_non_interactive(
-                format_args!("initialize RAG knowledge base '{name}'"),
-                ".",
-            ));
+            return Err(Self::refuse_init(name));
         }
         println!("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app, prompter)?;
@@ -2097,7 +2099,7 @@ fn confirm_empty_collection(prompter: &dyn Prompter, collection: &str) -> Result
          nothing until something writes to it."
     );
     println!("⚠️  {warning}");
-    let attach_anyway = crate::prompt::confirm_with_help(
+    let attach_anyway = confirm_with_help(
         prompter,
         "Attach to this empty collection anyway?".to_string(),
         false,
