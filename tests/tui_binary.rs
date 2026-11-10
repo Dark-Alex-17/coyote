@@ -6245,7 +6245,6 @@ fn write_conflicting_local_mcp(dir: &Path) -> String {
 
 const MCP_CONFLICT_REFUSAL: &str =
     "Refusing to merge the already-installed MCP server 'bundle-k7s-server' non-interactively";
-const REPL_HINT: &str = "Re-run in the plain REPL";
 const TERMINAL_HINT: &str = "Re-run in a terminal";
 
 /// `.install <local bundle>` whose `mcp.json` defines a server the local
@@ -6316,8 +6315,7 @@ fn dot_install_with_a_conflicting_mcp_server_asks_in_the_select_modal_and_keep_l
         "the merge was refused after the menu was answered:\n{since}"
     );
     assert!(
-        !squeezed_since.contains(&squeezed(REPL_HINT))
-            && !squeezed_since.contains(&squeezed(TERMINAL_HINT)),
+        !squeezed_since.contains(&squeezed(TERMINAL_HINT)),
         "the install under the UI points at another UI:\n{since}"
     );
     assert!(
@@ -6396,10 +6394,6 @@ fn headless_install_with_a_conflicting_mcp_server_is_refused_naming_a_terminal()
     assert!(
         everything.contains(TERMINAL_HINT),
         "the headless refusal does not say {TERMINAL_HINT:?}:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
-    );
-    assert!(
-        !everything.contains(REPL_HINT),
-        "the headless refusal says {REPL_HINT:?}, but no UI stood in the way:\n--- terminal ---\n{transcript}\n--- stdout file ---\n{file}"
     );
     assert!(
         everything.contains("bundle-k7s-server") && everything.contains("--install-force"),

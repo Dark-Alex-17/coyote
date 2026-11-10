@@ -118,28 +118,15 @@ pub(crate) fn menu_can_use_terminal() -> bool {
     crate::tui::active() || on_tty
 }
 
-/// Where a refused menu can be answered instead: the plain REPL when the
-/// full-screen UI is what stands in the way, a terminal otherwise.
-pub(crate) fn rerun_hint() -> &'static str {
-    if crate::tui::active() {
-        "Re-run in the plain REPL"
-    } else {
-        "Re-run in a terminal"
-    }
-}
-
 /// The refusal for a question nothing can show; every site builds it
-/// here so the message has one shape. `remedy` follows the re-run hint
-/// directly, so it begins with its own separator (" or pass --force.",
-/// ", with --yes (updates).") or is just a period.
+/// here so the message has one shape. `remedy` follows "Re-run in a
+/// terminal" directly, so it begins with its own separator (" or pass
+/// --force.", ", with --yes (updates).") or is just a period.
 pub(crate) fn refuse_non_interactive(
     action: impl std::fmt::Display,
     remedy: impl std::fmt::Display,
 ) -> anyhow::Error {
-    anyhow!(
-        "Refusing to {action} non-interactively. {}{remedy}",
-        rerun_hint()
-    )
+    anyhow!("Refusing to {action} non-interactively. Re-run in a terminal{remedy}")
 }
 
 fn select_choice(prompt: &str, prompter: &dyn Prompter) -> Result<String> {
@@ -370,6 +357,9 @@ mod tests {
         assert_eq!(menu_can_use_terminal(), *IS_STDOUT_TERMINAL);
     }
 
+    /// The refusal has one shape whether or not the full-screen UI is up:
+    /// every menu it can reach asks through the prompter, so the UI is
+    /// never what stands in the way.
     #[test]
     #[serial]
     fn the_refusal_names_the_action_and_where_to_re_run() {
@@ -384,7 +374,7 @@ mod tests {
         let err = refuse_non_interactive("pick a bundle", ".");
         assert_eq!(
             err.to_string(),
-            "Refusing to pick a bundle non-interactively. Re-run in the plain REPL."
+            "Refusing to pick a bundle non-interactively. Re-run in a terminal."
         );
     }
 

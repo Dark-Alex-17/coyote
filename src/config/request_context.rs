@@ -7388,6 +7388,14 @@ impl RequestContext {
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
+                // `Rag::init` refuses the same way, but only after the
+                // previous temp rag is gone; refusing first keeps it.
+                if !crate::config::conflict::menu_can_use_terminal() {
+                    return Err(crate::config::conflict::refuse_non_interactive(
+                        format_args!("initialize RAG knowledge base '{}'", super::TEMP_RAG_NAME),
+                        ".",
+                    ));
+                }
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
                 if rag_path.exists() {
                     remove_file(&rag_path).with_context(|| {
@@ -11927,6 +11935,36 @@ mod tests {
             "the rebuild kept the previous temp rag at {}",
             rag_path.display()
         );
+        assert!(ctx.rag.is_none());
+    }
+
+    /// `.rag` with no name and nowhere to ask is refused the way the
+    /// wizard refuses, before the previous temp rag is removed: a refused
+    /// rebuild must not cost the knowledge base it would have replaced.
+    #[test]
+    #[serial]
+    fn use_rag_without_a_name_and_without_a_tty_refuses_before_removing_the_temp_rag() {
+        let _guard = TestConfigDirGuard::new();
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let mut ctx = create_test_ctx();
+        let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(&rag_path, "driver: yaml\n").unwrap();
+        let scripted = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompter = scripted.clone();
+        let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Refusing to initialize RAG knowledge base 'temp' non-interactively."),
+            "{err}"
+        );
+        assert!(
+            rag_path.exists(),
+            "the refused rebuild removed the previous temp rag at {}",
+            rag_path.display()
+        );
+        assert!(scripted.requests().is_empty());
         assert!(ctx.rag.is_none());
     }
 
