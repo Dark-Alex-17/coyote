@@ -596,15 +596,28 @@ pub fn wait_for_the_modal(
 }
 
 /// Esc on the modal, then a repaint forced by a resize so the frame can
-/// be checked for the modal's legend being gone.
+/// be checked for the modal's legend being gone. The size alternates
+/// between two values from call to call: a resize to the size the pty
+/// already has is a no-op, and then no repaint follows.
 pub fn esc_cancels_the_modal(pty: &mut Pty, command: &str) {
+    static TOGGLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pty.read_for(HOTKEY_GAP);
     let pressed_at = pty.raw().len();
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(800));
-    pty.resize(60, 110).unwrap();
+    let rows = if TOGGLE.fetch_xor(true, std::sync::atomic::Ordering::Relaxed) {
+        60
+    } else {
+        59
+    };
+    let resized_at = pty.raw().len();
+    pty.resize(rows, 110).unwrap();
     pty.read_for(Duration::from_millis(800));
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(
+        pty.raw().len() > resized_at,
+        "no repaint followed the resize after Esc on the modal of `{command}`:\n{since}"
+    );
     assert!(
         !squeezed(&since).contains("Esc=cancel"),
         "the modal of `{command}` is still up after Esc:\n{since}"

@@ -307,6 +307,7 @@ mod tests {
     #[serial]
     fn package_managed_update_without_a_tty_is_refused() {
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let prompter = ScriptedPrompter::refusing();
 
         let err =

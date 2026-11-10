@@ -2555,19 +2555,27 @@ fn headless_agent_with_documents_starts_without_rag_silently() {
 /// from any controlling tty, stdin at /dev/null, stdout and stderr
 /// pipes) reaching a rerouted question (`.vault add`, `.rag <new>`) is
 /// refused the way the plain REPL always refused it: the run ends on its
-/// own instead of hanging on a prompt, exits non-zero, says the input is
-/// not a terminal, writes nothing for the secret or the rag, and the
-/// macro does not go on to its next step.
+/// own instead of hanging on a prompt, exits non-zero, says what is
+/// missing (the secret reader reports the input is not a tty; the rag
+/// step refuses in the shared shape, naming the knowledge base), writes
+/// nothing for the secret or the rag, and the macro does not go on to
+/// its next step.
 #[test]
 #[serial]
 fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
-    for (scenario, step, footprints) in [
+    for (scenario, step, footprints, refused_action) in [
         (
             "vault-add",
             ".vault add probe-secret-m7q",
             &["m7q", "vault.yml"][..],
+            None,
         ),
-        ("rag-create", ".rag probe-rag-m7q", &["m7q", "/rags/"][..]),
+        (
+            "rag-create",
+            ".rag probe-rag-m7q",
+            &["m7q", "/rags/"][..],
+            Some("initialize RAG knowledge base 'probe-rag-m7q'"),
+        ),
     ] {
         let dir = fresh_config_dir(&format!("ttyless-macro-{scenario}"));
         let _guard = TempDirGuard(dir.clone());
@@ -2609,14 +2617,27 @@ fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
             !out.status.success(),
             "{scenario}: a refused tty-less `{step}` exited 0:\n{everything}"
         );
-        let lower = everything.to_lowercase();
-        assert!(
-            lower.contains("not a tty")
-                || lower.contains("terminal")
-                || lower.contains("human")
-                || lower.contains("interactive"),
-            "{scenario}: the refusal of `{step}` does not say what is missing:\n{everything}"
-        );
+        match refused_action {
+            Some(action_prefix) => {
+                let (action, _remedy) = refusal_shape(&everything).unwrap_or_else(|| {
+                    panic!("{scenario}: the refusal of `{step}` is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{everything}")
+                });
+                assert!(
+                    action.starts_with(action_prefix),
+                    "{scenario}: the refusal names the action {action:?}, not `{action_prefix}...`:\n{everything}"
+                );
+            }
+            None => {
+                let lower = everything.to_lowercase();
+                assert!(
+                    lower.contains("not a tty")
+                        || lower.contains("terminal")
+                        || lower.contains("human")
+                        || lower.contains("interactive"),
+                    "{scenario}: the refusal of `{step}` does not say what is missing:\n{everything}"
+                );
+            }
+        }
         for footprint in footprints {
             let written = new_files_named(&dir, &files_before, footprint);
             assert!(
@@ -3789,8 +3810,10 @@ fn dot_rag_chunk_size_typed_into_the_input_modal_replaces_the_default_like_the_p
 }
 
 /// The plain-REPL twin of the case above, the contract the modal is held
-/// to: inquire shows the default as `(1000)`, `500` typed over it is the
-/// answer, and the next question's default is `(25)`.
+/// to: Enter on the Select echoes the chosen row in full (the model id
+/// with its description columns, as the wizard renders it), inquire shows
+/// the default as `(1000)`, `500` typed over it is the answer, and the
+/// next question's default is `(25)`.
 #[test]
 #[serial]
 fn dot_rag_chunk_size_typed_in_the_plain_repl_replaces_the_default() {
@@ -3808,6 +3831,12 @@ fn dot_rag_chunk_size_typed_in_the_plain_repl_replaces_the_default() {
         .expect("`.rag <new>` in the plain REPL did not ask for the embedding model");
     pty.read_for(Duration::from_millis(500));
     pty.send(b"\r").unwrap();
+    pty.wait_for_after(
+        "Select embedding model: dryrun:dry-embed-a (max-tokens:-;max-batch:100;price:-)",
+        before,
+        PTY_DEADLINE,
+    )
+    .expect("Enter on the plain REPL's Select did not echo the chosen model's full row");
     let mut answered = 0;
     loop {
         let text = pty.read_for(Duration::from_millis(800));
@@ -3997,27 +4026,49 @@ fn dot_update_y_typed_ahead_with_the_command_does_not_accept_the_confirm_modal()
 // ---------------------------------------------------------------------
 
 /// Whether some occurrence of `needle` at or after `from` is painted
-/// under the DIM attribute: an SGR `2` (`\x1b[2m`, or `2` inside a
-/// combined `\x1b[...;2;...m`) opened within the 64 bytes before it with
-/// no `\x1b[22m`/`\x1b[0m` closing it in between.
+/// under the DIM attribute: the SGR sequences within the 64 bytes before
+/// it, read in order, leave DIM on (a `2` parameter standing on its own,
+/// with no `22` or `0` after it). The arguments of an extended colour are
+/// stepped over, so the `2` of a `38;2;r;g;b` truecolour is not mistaken
+/// for the attribute.
 fn painted_dim(raw: &[u8], from: usize, needle: &[u8]) -> bool {
     let mut at = from;
     while let Some(found) = find(raw, needle, at) {
         let start = found.saturating_sub(64);
-        let window = &raw[start..found];
-        let opened = [&b"\x1b[2m"[..], &b";2m"[..], &b"\x1b[2;"[..], &b";2;"[..]]
+        let dim = sgr_params(&raw[start..found])
             .iter()
-            .filter_map(|marker| rfind(window, marker))
-            .max();
-        if let Some(open) = opened {
-            let after = &window[open..];
-            if find(after, b"\x1b[22m", 0).is_none() && find(after, b"\x1b[0m", 0).is_none() {
-                return true;
-            }
+            .fold(false, |dim, params| dim_after(params).unwrap_or(dim));
+        if dim {
+            return true;
         }
         at = found + needle.len();
     }
     false
+}
+
+/// What one SGR parameter list does to DIM: `Some(true)` when it switches
+/// it on, `Some(false)` when it resets it (`22`, or `0` for everything),
+/// `None` when it leaves it alone; the last word in the list wins.
+fn dim_after(params: &[u16]) -> Option<bool> {
+    let mut dim = None;
+    let mut i = 0;
+    while i < params.len() {
+        match params[i] {
+            38 | 48 | 58 => {
+                i += match params.get(i + 1) {
+                    Some(5) => 3,
+                    Some(2) => 5,
+                    _ => 1,
+                };
+                continue;
+            }
+            2 => dim = Some(true),
+            0 | 22 => dim = Some(false),
+            _ => {}
+        }
+        i += 1;
+    }
+    dim
 }
 
 /// `Set chunk size:` under the UI shows its default `1000` as a dim

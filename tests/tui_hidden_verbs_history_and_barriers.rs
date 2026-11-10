@@ -507,13 +507,13 @@ fn assert_formerly_hidden_verbs_are_listed(prefix_yaml: &str, sigil: char, scena
 #[test]
 #[serial]
 fn formerly_hidden_verbs_are_listed_in_the_palette_cold_and_warm_under_dot() {
-    assert_formerly_hidden_verbs_are_listed("", '.', "hidden-warm-dot");
+    assert_formerly_hidden_verbs_are_listed("", '.', "listed-warm-dot");
 }
 
 #[test]
 #[serial]
 fn formerly_hidden_verbs_are_listed_in_the_palette_cold_and_warm_under_slash() {
-    assert_formerly_hidden_verbs_are_listed("command_prefix: slash\n", '/', "hidden-warm-slash");
+    assert_formerly_hidden_verbs_are_listed("command_prefix: slash\n", '/', "listed-warm-slash");
 }
 
 /// A formerly hidden verb typed in full still runs: `.rag`, `.vault` and
@@ -524,7 +524,7 @@ fn formerly_hidden_verbs_are_listed_in_the_palette_cold_and_warm_under_slash() {
 #[test]
 #[serial]
 fn a_formerly_hidden_verb_typed_in_full_still_runs_and_the_ui_survives() {
-    let dir = fresh_config_dir("hidden-typed");
+    let dir = fresh_config_dir("listed-typed");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);

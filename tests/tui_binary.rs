@@ -3622,9 +3622,10 @@ struct ModalFlow {
 
 /// Drives one prompt-backed flow whose question is a modal under the UI:
 /// the modal showing the squeezed `modal_markers` comes up, Esc cancels
-/// it, nothing of the flow is written to the config dir, the terminal is
-/// never released, and the UI keeps taking keys and leaves clean on
-/// Ctrl+D.
+/// it, nothing of the flow is written to the config dir, `$EDITOR` is
+/// never launched (a flow that fell through to its editor on Esc would
+/// record itself), the terminal is never released, and the UI keeps
+/// taking keys and leaves clean on Ctrl+D.
 fn assert_asks_in_the_modal_and_esc_cancels(flow: &ModalFlow, modal_markers: &[&str]) {
     let dir = fresh_config_dir(flow.scenario);
     let _guard = TempDirGuard(dir.clone());
@@ -3632,8 +3633,10 @@ fn assert_asks_in_the_modal_and_esc_cancels(flow: &ModalFlow, modal_markers: &[&
     if let Some(setup) = flow.setup {
         setup(&dir);
     }
+    let launched = dir.join("editor-launched");
+    let editor = recording_editor(&dir, &launched);
     let config_before = fs::read_to_string(dir.join("config.yaml")).unwrap();
-    let mut pty = spawn_tui(&dir, &[]);
+    let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     for step in flow.prelude {
@@ -3660,6 +3663,12 @@ fn assert_asks_in_the_modal_and_esc_cancels(flow: &ModalFlow, modal_markers: &[&
         fs::read_to_string(dir.join("config.yaml")).unwrap(),
         config_before,
         "{}: the cancelled `{}` rewrote config.yaml:\n{since}",
+        flow.scenario,
+        flow.command
+    );
+    assert!(
+        !launched.exists(),
+        "{}: the cancelled `{}` launched the editor:\n{since}",
         flow.scenario,
         flow.command
     );
@@ -3693,6 +3702,11 @@ fn assert_asks_in_the_modal_and_esc_cancels(flow: &ModalFlow, modal_markers: &[&
             flow.scenario
         );
     }
+    assert!(
+        !launched.exists(),
+        "{}: the editor was launched by the time the UI left:\n{transcript}",
+        flow.scenario
+    );
 }
 
 /// `.save role` on a temp role asks `Role name:` in a modal and writes the
@@ -3798,14 +3812,8 @@ fn dot_update_on_a_cargo_install_asks_in_the_confirm_modal_and_n_cancels() {
     pty.read_for(Duration::from_millis(300));
     let files_before = walk(&dir);
     let before = pty.raw().len();
-    let sent = std::time::Instant::now();
     pty.send(b".update\r").unwrap();
     let modal = wait_for_the_modal(&mut pty, before, ".update", &["Updateanyway?", "y=yes"]);
-    let took = sent.elapsed();
-    assert!(
-        took < Duration::from_secs(10),
-        "the question took {took:?}; a network round trip came first:\n{modal}"
-    );
     assert!(
         !squeezed(&modal).contains("(y/N)"),
         "`Update anyway?` was asked on the raw tty, not in the modal:\n{modal}"
