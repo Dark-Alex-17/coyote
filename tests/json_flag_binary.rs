@@ -45,6 +45,9 @@ enum Behaviour {
     ServerError,
     /// Calls `TOOL` until a request carries a tool result, then answers.
     CallToolThenAnswer,
+    /// Calls the named tool with identical arguments until the request
+    /// carries that many tool results, then answers.
+    CallNamedToolThenAnswer(&'static str, usize),
 }
 
 /// A loopback chat-completions server that answers each request by its
@@ -62,9 +65,10 @@ fn serve(behaviour: Behaviour) -> u16 {
             };
             let request = serde_json::from_str::<Value>(&body).unwrap_or_default();
             let streaming = request["stream"] == json!(true);
-            let has_tool_result = request["messages"]
-                .as_array()
-                .is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"));
+            let tool_results = request["messages"].as_array().map_or(0, |messages| {
+                messages.iter().filter(|m| m["role"] == "tool").count()
+            });
+            let has_tool_result = tool_results > 0;
             let (status, content_type, payload) = match behaviour {
                 Behaviour::ServerError => (
                     "500 Internal Server Error",
@@ -73,12 +77,23 @@ fn serve(behaviour: Behaviour) -> u16 {
                         .to_string(),
                 ),
                 Behaviour::CallToolThenAnswer if !has_tool_result => {
-                    ("200 OK", "application/json", tool_call_completion())
+                    ("200 OK", "application/json", tool_call_completion(TOOL, 0))
                 }
-                Behaviour::Answer | Behaviour::CallToolThenAnswer if streaming => {
+                Behaviour::CallNamedToolThenAnswer(name, calls) if tool_results < calls => (
+                    "200 OK",
+                    "application/json",
+                    tool_call_completion(name, tool_results),
+                ),
+                Behaviour::Answer
+                | Behaviour::CallToolThenAnswer
+                | Behaviour::CallNamedToolThenAnswer(..)
+                    if streaming =>
+                {
                     ("200 OK", "text/event-stream", sse_completion())
                 }
-                Behaviour::Answer | Behaviour::CallToolThenAnswer => {
+                Behaviour::Answer
+                | Behaviour::CallToolThenAnswer
+                | Behaviour::CallNamedToolThenAnswer(..) => {
                     ("200 OK", "application/json", plain_completion())
                 }
             };
@@ -138,7 +153,7 @@ fn plain_completion() -> String {
     .to_string()
 }
 
-fn tool_call_completion() -> String {
+fn tool_call_completion(name: &str, seq: usize) -> String {
     json!({
         "id": "stub",
         "object": "chat.completion",
@@ -150,9 +165,9 @@ fn tool_call_completion() -> String {
                 "role": "assistant",
                 "content": null,
                 "tool_calls": [{
-                    "id": "call_0",
+                    "id": format!("call_{seq}"),
                     "type": "function",
-                    "function": { "name": TOOL, "arguments": "{}" }
+                    "function": { "name": name, "arguments": "{}" }
                 }]
             },
             "finish_reason": "tool_calls"
@@ -656,6 +671,105 @@ fn loading_an_installed_skill_leaves_stdout_to_the_object() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("Loaded skill 'helper'"),
         "{}",
+        combined(&output)
+    );
+}
+
+// ---- usage probe: script-tool relay and the loop warning ----
+
+const SCRIPT_TOOL: &str = "shout";
+const RELAYED: &str = "RELAYED-FROM-THE-TOOL";
+const LOOP_WARNING: &str = "Tool-call loop detected";
+
+/// An agent whose one script tool prints `RELAYED` to its own stdout (the
+/// depth-0 relay carries it) and returns a JSON result through `LLM_OUTPUT`.
+fn write_script_tool_agent(dir: &Path) {
+    let agent_dir = dir.join("agents").join("shouter");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        "name: shouter\n\
+         model: stub:stub-model\n\
+         instructions: You shout.\n",
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("tools.sh"),
+        format!(
+            "#!/usr/bin/env bash\n\
+             set -eo pipefail\n\
+             # @env LLM_OUTPUT=/dev/stdout\n\
+             # @describe shouter tools\n\
+             \n\
+             # @cmd Shout once.\n\
+             {SCRIPT_TOOL}() {{ echo '{RELAYED}'; printf '{{\"ok\":true}}' >> \"$LLM_OUTPUT\"; }}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn script_tool_run(label: &str, calls: usize, json_flag: bool) -> Output {
+    let dir = TempDir::new(label);
+    write_config(
+        &dir.0,
+        serve(Behaviour::CallNamedToolThenAnswer(SCRIPT_TOOL, calls)),
+        false,
+    );
+    write_script_tool_agent(&dir.0);
+    let mut args = vec!["-a", "shouter", "hi"];
+    if json_flag {
+        args.insert(0, "--json");
+    }
+    run(&dir.0, &args)
+}
+
+#[test]
+fn usage_probe_a_script_tool_relay_goes_to_stderr_under_json() {
+    if cfg!(windows) {
+        eprintln!("skipping: the tool is a bash script");
+        return;
+    }
+    let plain = script_tool_run("relay-plain", 1, false);
+    assert!(plain.status.success(), "{}", combined(&plain));
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains(RELAYED),
+        "without --json the relay is on stdout:\n{}",
+        combined(&plain)
+    );
+
+    let output = script_tool_run("relay-json", 1, true);
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!(REPLY), "{report}");
+    assert_eq!(report["num_turns"], json!(2), "{report}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(RELAYED),
+        "under --json the relay moves to stderr:\n{}",
+        combined(&output)
+    );
+}
+
+#[test]
+fn usage_probe_the_loop_warning_goes_to_stderr_under_json() {
+    if cfg!(windows) {
+        eprintln!("skipping: the tool is a bash script");
+        return;
+    }
+    let plain = script_tool_run("loop-plain", 4, false);
+    assert!(plain.status.success(), "{}", combined(&plain));
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains(LOOP_WARNING),
+        "without --json the loop warning is on stdout:\n{}",
+        combined(&plain)
+    );
+
+    let output = script_tool_run("loop-json", 4, true);
+    assert!(output.status.success(), "{}", combined(&output));
+    let report = the_only_object(&output);
+    assert_eq!(report["result"], json!(REPLY), "{report}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(LOOP_WARNING),
+        "under --json the loop warning moves to stderr:\n{}",
         combined(&output)
     );
 }
