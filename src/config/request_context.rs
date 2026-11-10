@@ -6986,8 +6986,9 @@ impl RequestContext {
 
     /// Identity records for `.mesh access revoke --identity <TAB>`: those the verb takes, which
     /// is a record granting all destinations, or one with no instance bound to it. A
-    /// binding-only record whose instances stand holds nothing to withdraw, so `untrust`
-    /// refuses it and names `untrust <destination>` and `forget --identity` instead.
+    /// binding-only record whose instances stand holds nothing to withdraw, so `revoke`
+    /// refuses it and names `access revoke <destination>` and `access forget --identity`
+    /// instead.
     /// Empty while the mesh is off.
     fn mesh_completion_untrustable_identities(&self) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
